@@ -5,6 +5,9 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     strategy:
@@ -42,10 +45,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
       - name: Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            cpe_test-windows-latest/cpe_test.exe
-            cpe_test-macos-latest/cpe_test
-            cpe_test-ubuntu-latest/cpe_test
+            artifacts/cpe_test-windows-latest/cpe_test.exe
+            artifacts/cpe_test-macos-latest/cpe_test
+            artifacts/cpe_test-ubuntu-latest/cpe_test
