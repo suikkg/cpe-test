@@ -89,7 +89,7 @@ impl Default for Config {
             ipv4_prefixes: vec!["192.168.".into()],
             require_same_subnet_for_iperf: true,
             limit_udp_by_link_speed: true,
-            screenshot: false,
+            screenshot: true,
             resume: false,
             open_report: true,
             iperf: IperfCfg::default(),
