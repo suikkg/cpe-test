@@ -1,0 +1,407 @@
+# CPE 子网测试工具
+
+> 两台电脑间自动化 ping + iperf3 灌包测试，零 Python/零 PowerShell，单二进制分发
+
+[![Rust](https://img.shields.io/badge/Rust-1.96%2B-orange)](https://rustup.rs)
+[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS-lightgrey)
+
+---
+
+## 目录
+
+- [概览](#概览)
+- [快速开始](#快速开始)
+- [命令行用法](#命令行用法)
+- [配置文件](#配置文件)
+- [模块架构](#模块架构)
+- [角色分类体系](#角色分类体系)
+- [截图与报告](#截图与报告)
+- [RESUME 断点续跑](#resume-断点续跑)
+- [跨平台策略](#跨平台策略)
+- [编译与部署](#编译与部署)
+- [常见问题](#常见问题)
+
+---
+
+## 概览
+
+CPE（Customer Premises Equipment）子网测试工具用于在**两台电脑之间**自动化执行网络连通性和吞吐量测试，生成结构化的 HTML 报告。
+
+**核心特性：**
+
+- **Zero PowerShell** — 网卡扫描走 ipconfig + GetIfTable2 API + netsh wlan，不依赖 PowerShell 或 wmic
+- **Zero 线程安全隐患** — 无 COM 多线程问题；agent 是固定线程池 + Arc\<Mutex\>，panic 不崩服务
+- **单二进制分发** — 一个 exe 文件完成主控/辅测双模式，不需要 pip install
+- **REST + JSON** — 主控 ↔ 辅测走标准 HTTP，带超时/重试/错误码
+- **跨平台** — 最终两台 Windows，开发期间 macOS 可做全流程模拟测试
+
+---
+
+## 快速开始
+
+### 第 1 步：准备文件
+
+把以下 4 个文件放到两台电脑的同一目录：
+
+```
+cpe_test.exe          ← 本工具（单文件）
+iperf3.exe            ← 从 iperf.fr 下载（只测 ping 可不放）
+start_agent.bat       ← 辅测机双击
+start_master.bat      ← 主控机双击
+```
+
+### 第 2 步：辅测机启动 agent
+
+双击 `start_agent.bat`，窗口里会显示本机 IP：
+
+```
+本机 IP 列表（把主控能 ping 通的那个告诉主控机）:
+    以太网 = 192.168.8.101
+    WLAN  = 10.228.46.50
+agent 已启动，监听 0.0.0.0:28801
+```
+
+- **记录 IP**（选主控能连上的那个，一般是管理口）
+- 防火墙提示时**全部放行**
+- **不关窗口**
+
+### 第 3 步：主控机测试
+
+双击 `start_master.bat`，输入辅测机 IP，一路回车：
+
+```
+请输入辅测机 IP: 192.168.8.101
+```
+
+程序自动扫描双端网卡 → 生成任务 → 执行 → 弹出 HTML 报告。
+
+---
+
+## 命令行用法
+
+```
+cpe_test                    交互选择模式（双击运行就是这个）
+cpe_test agent              辅测机启动常驻服务
+    --port N                指定监听端口（默认 28801）
+
+cpe_test master             主控发起测试
+    --agent-host IP         辅测机 IP
+    --agent-port N          辅测机端口（默认 28801）
+    --config FILE           指定配置文件（默认找 ./config.json）
+    --auto                  免交互：按配置文件 tests 全部执行
+    --resume                24 小时内已 PASS 的任务跳过
+    --no-open               结束后不自动打开报告
+    --screenshot            每个 iperf 任务后截图
+    --prefix A.,B.          临时指定 IPv4 前缀过滤
+
+cpe_test scan               查看本机网卡识别结果
+    --prefix A.,B.
+```
+
+---
+
+## 配置文件
+
+配置文件 `config.json` 放到 exe 同目录，所有测试参数通过 JSON 控制，**不需要改代码**。
+
+完整字段：
+
+```json
+{
+  "agent_host": "192.168.8.101",
+  "agent_port": 28801,
+  "ipv4_prefixes": ["192.168."],
+  "require_same_subnet_for_iperf": true,
+  "limit_udp_by_link_speed": true,
+  "screenshot": false,
+  "resume": false,
+  "open_report": true,
+
+  "iperf": {
+    "duration": 120,
+    "tcp_windows": ["64k", "1m", "4m"],
+    "udp_profiles": [
+      { "bandwidth": "1m" },
+      { "bandwidth": "500m" },
+      { "bandwidth": "1000m", "length": "64" },
+      { "bandwidth": "2500m" }
+    ]
+  },
+
+  "ping": {
+    "count": 100,
+    "payload_sizes": [32, 1400]
+  },
+
+  "tests": [
+    {
+      "name": "2.5G口灌包",
+      "src": "master:SGMII2.5G",
+      "dst": "agent:SGMII2.5G",
+      "direction": ["A->B", "bidir"],
+      "kinds": ["iperf", "ping"],
+      "transports": ["tcp", "udp"],
+      "ip": ["v4"],
+      "streams": 5,
+      "iperf_duration": 300
+    }
+  ]
+}
+```
+
+### IP 自适应
+
+配置写 `"master:SGMII2.5G"` 这种**角色引用**，运行时自动解析成当前机器的实际 IP。
+换电脑不用改配置：角色识别对了，IP 自动跟着变。
+
+兜底方案：`"master:NAME=以太网 2"` 按接口名精确匹配。
+
+### tests[] 字段说明
+
+| 字段 | 类型 | 说明 | 默认 |
+|------|------|------|------|
+| `name` | string | 测试名称 | — |
+| `src` / `dst` | string | `"side:ROLE"` 或 `"side:NAME=接口名"` | — |
+| `direction` | string/array | `"A->B" / "B->A" / "bidir" / "both"` | A->B |
+| `kinds` | array | `["iperf"] / ["ping"] / ["iperf","ping"]` | ["iperf"] |
+| `transports` | array | `["tcp"] / ["udp"] / ["tcp","udp"]` | ["tcp"] |
+| `ip` | array | `["v4"] / ["v6"]` | ["v4"] |
+| `streams` | int | 并发流数（TCP = -P，UDP = 独立进程） | 1 |
+| `iperf_duration` | int | 覆盖全局灌包时长（秒） | — |
+| `ping_count` | int | 覆盖全局 ping 包数 | — |
+| `ping_payload_sizes` | array | 覆盖全局负载字节 | — |
+| `tcp_windows` | array | 覆盖全局 TCP window 档位 | — |
+| `udp_profiles` | array | 覆盖全局 UDP 带宽档位 | — |
+
+---
+
+## 模块架构
+
+```
+cpe_test/
+├── Cargo.toml
+├── src/
+│   ├── main.rs              # CLI 入口 + 模式选择（master/agent/scan）
+│   │
+│   ├── agent/
+│   │   ├── mod.rs
+│   │   └── server.rs        # REST server（tiny_http），16 线线程池
+│   │
+│   ├── master/
+│   │   ├── mod.rs
+│   │   ├── ui.rs            # 交互式菜单（复刻旧版交互逻辑）
+│   │   ├── executor.rs      # 任务调度/执行/截图/结果库
+│   │   └── builder.rs       # spec → 任务单元生成 + 端口分配
+│   │
+│   ├── nic/
+│   │   ├── mod.rs           # scan_host() + 格式输出
+│   │   ├── classify.rs      # 角色分类（纯逻辑，不分平台）
+│   │   ├── scan_windows.rs  # ipconfig + GetIfTable2 + netsh wlan
+│   │   ├── scan_macos.rs    # ifconfig + system_profiler + networksetup
+│   │   └── monitor.rs       # NIC RX 监控（GetIfTable2 / netstat -ibn）
+│   │
+│   ├── cmd/
+│   │   ├── mod.rs
+│   │   ├── ipconfig.rs      # 解析 ipconfig /all（中英文）
+│   │   ├── netsh.rs         # 解析 netsh wlan show interfaces
+│   │   └── iperf.rs         # iperf3 命令构造 + 文本输出解析 + server 进程管理
+│   │
+│   ├── ping.rs              # ping 命令构造 + 执行 + 解析（中/英/BSD 三格式）
+│   ├── protocol.rs          # HTTP JSON 请求/响应类型定义
+│   ├── config.rs            # JSON 配置文件加载
+│   ├── util.rs              # 子进程(超时/GBK)、日志、时间、辅助函数
+│   ├── http_client.rs       # 极简 HTTP/1.1 客户端（零第三方依赖）
+│   ├── screenshot.rs        # 截图（Windows GDI / macOS screencapture）
+│   └── report.rs            # HTML 报告生成（单文件，内嵌样式）
+│
+├── config.example.json      # 配置文件示例
+├── dist/
+│   ├── start_agent.bat      # 辅测启动脚本
+│   └── start_master.bat     # 主控启动脚本
+└── 使用说明.md               # 小白版图文教程
+```
+
+### 核心交互流程
+
+```
+辅测机                         主控机
+  ┌──────────┐                ┌──────────────┐
+  │  agent   │  HTTP POST     │   master     │
+  │  :28801  │◄──────────────►│ 交互菜单/cfg │
+  └────┬─────┘                └──────┬───────┘
+       │                             │
+  ┌────┴─────┐                 ┌─────┴──────┐
+  │ nic/scan │                 │ master/    │
+  │ ping     │                 │ builder    │
+  │ iperf    │                 │ executor   │
+  │ monitor  │                 │ report     │
+  │ screenshot│                └────────────┘
+  └──────────┘
+```
+
+1. 主控启动 → 扫描本机 + POST `/info` 获取辅测机网卡
+2. 配置文件或交互菜单 → 生成 `SpecNorm`（src/dst/方向/协议/流数）
+3. builder → 解析角色名称为具体 IP，分配端口，生成 `Unit` 列表
+4. executor → 逐个执行单元，并发跑多腿（bidir/UDP 多流）
+   - 接收端启动 RX 监控 → 启动 iperf3 server → 
+   - 发送端跑 iperf3 client → 停下 server + 监控 → 
+   - 收集结果 → 保存到 `task_results.json`
+5. 全部完成后生成 HTML 报告 + 自动打开
+
+---
+
+## 角色分类体系
+
+```
+角色             判定规则（按优先级从高到低）
+───────────────  ───────────────────────────────────────────────
+WIFI5G           是 WiFi 且频段 = 5GHz
+WIFI2.4G         是 WiFi 且频段 = 2.4GHz
+WIFI6G           是 WiFi 且频段 = 6GHz
+WIFI             是 WiFi 但频段未知
+10GUSB           描述含 "usb" 且速率 4001-12000 Mbps（兼容 4.2G bug）
+RNDIS            描述含 "rndis" / "remote ndis"
+10GETH           速率 9000-12000 Mbps（描述不含 USB）
+SGMII2.5G        速率 2400-2600 Mbps
+SGMII1G          速率 900-1100 Mbps
+RNDIS(兜底)      速率 3400-4000 Mbps
+UNKNOWN          以上都不匹配
+```
+
+角色排序权重：`10GETH > 10GUSB > SGMII2.5G > SGMII1G > RNDIS > WIFI5G > WIFI6G > WIFI2.4G > WIFI > UNKNOWN`
+
+---
+
+## 截图与报告
+
+### 截图流程
+
+```
+主控 → 截图请求（label=测试名_方向）
+       │
+       ├── 若接收端是本机 → capture_png() → PNG 字节
+       └── 若接收端是辅测 → POST /screenshot → base64 PNG
+               │
+               ├── 两端各自尝试截图
+               └── 任一成功 → 保存到 iperf_outputs/
+                                命名: screenshot_{label}_{主控/辅测}_{时间戳}.png
+                                报告链接: ./iperf_outputs/screenshot_xxx.png
+```
+
+- 两端都尝试截图，全部成功则报告中出现多个 `查看截图` 链接
+- 辅测机不存盘，传完即丢（无磁盘残留）
+
+### 报告列
+
+| 列 | 说明 |
+|------|------|
+| 时间 / Task ID / Parent ID | 任务标识 |
+| 任务 / IP / 传输 / 参数 | 测试描述 |
+| 源/目标 PC / 接口 / IP | 网络端点 |
+| 结果 | PASS / FAIL / SKIP |
+| 接收网卡平均 Mbps | **网卡口径实测吞吐**（最准确） |
+| 对向接收 Mbps | 双向时对端实测吞吐 |
+| iperf 发送/接收 Mbps | iperf3 自报速率 |
+| UDP/Ping 丢包率 | 丢包百分比 |
+| Ping 平均 ms | 平均时延 |
+| 截图 / 执行命令 | 用于复现 |
+
+---
+
+## RESUME 断点续跑
+
+24 小时内已 PASS 的任务自动跳过：
+
+```bash
+cpe_test master --auto --resume
+```
+
+跳过依据：`task_results.json` 中 task_id（MD5 稳定哈希）的 ok=true 且时间 < 24h。
+
+---
+
+## 跨平台策略
+
+| 平台 | 角色 | 说明 |
+|------|------|------|
+| macOS | 主控/辅测 | 开发测试用，ping/iperf/报告全流程可用 |
+| Windows | 主控/辅测 | 最终生产环境 |
+
+### 网卡扫描差异
+
+| 功能 | Windows | macOS |
+|------|---------|-------|
+| 接口枚举 | `ipconfig /all` | `ifconfig -a` |
+| 速率 | `GetIfTable2` API | `ifconfig -m` 解析 media 行 |
+| WiFi | `netsh wlan show interfaces` | `networksetup` + `system_profiler` |
+| RX 监控 | `GetIfTable2.InOctets` | `netstat -ibn` |
+
+---
+
+## 编译与部署
+
+### macOS 本地调试
+
+```bash
+cargo build --release
+cargo test
+./target/release/cpe_test scan
+```
+
+### macOS → Windows 交叉编译
+
+```bash
+rustup target add x86_64-pc-windows-gnu
+brew install mingw-w64
+cargo build --release --target x86_64-pc-windows-gnu
+# 产物: target/x86_64-pc-windows-gnu/release/cpe_test.exe
+```
+
+### Windows 本地编译（推荐，更稳定）
+
+```bash
+# 装一次 rustup: https://rustup.rs （5 分钟）
+cargo build --release
+# 产物: target\release\cpe_test.exe
+```
+
+编译后把 `cpe_test.exe` + `iperf3.exe` + 启动脚本放到两台 Windows 电脑同一目录即可。
+
+---
+
+## 常见问题
+
+### agent 连不上
+
+1. 辅测机的 agent 窗口开着吗？
+2. IP 输对了吗？（用辅测机窗口里显示的）
+3. 防火墙放行了吗？最快验证：`ping 辅测机IP`
+4. 还不行关掉防火墙试一下
+
+### 未找到 iperf3
+
+把 `iperf3.exe`（含同目录的 cygwin1.dll 等）放到 `cpe_test.exe` 同目录。
+只测 ping 可以不装 iperf3。
+
+### 网卡列表空白/不全
+
+- 运行 `cpe_test scan --prefix 你本机的网段` 验证
+- 默认只认 `192.168.` 开头的 IP，改 `config.json` 的 `ipv4_prefixes`
+- 断开的网卡不显示
+
+### 灌包全 FAIL 但 ping 通
+
+- 两端都放了 iperf3 吗？
+- 防火墙拦了 56000+ 端口？
+- 两端 IP 不同网段？关掉 `require_same_subnet_for_iperf`
+
+### UDP 大档位没生成任务
+
+默认按发送口速率裁剪。关掉 `limit_udp_by_link_speed` 即可。
+
+### 截图空白/无
+
+- Windows agent 需要 GDI 授权（通常首次跑会自动弹窗）
+- macOS 终端需要系统设置 → 隐私 → 屏幕录制 授权
+- 可忽略，不影响测试结果

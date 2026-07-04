@@ -1,0 +1,9 @@
+/target
+report_*.html
+master_*.log
+task_results.json
+iperf_outputs/
+config.json
+.cpe_last_agent
+cpe_win_pkg.zip
+cpe_test_v3.0.0_未验证.zip

@@ -1,0 +1,46 @@
+{
+  "agent_host": "10.228.46.50",
+  "agent_port": 28801,
+  "ipv4_prefixes": ["192.168."],
+  "require_same_subnet_for_iperf": true,
+  "limit_udp_by_link_speed": true,
+  "screenshot": false,
+  "resume": false,
+  "open_report": true,
+
+  "iperf": {
+    "duration": 120,
+    "tcp_windows": ["64k", "1m", "4m"],
+    "udp_profiles": [
+      { "bandwidth": "1m" },
+      { "bandwidth": "100m" },
+      { "bandwidth": "500m" },
+      { "bandwidth": "1000m", "length": "64" },
+      { "bandwidth": "2500m" }
+    ]
+  },
+
+  "ping": {
+    "count": 100,
+    "payload_sizes": [32, 1400]
+  },
+
+  "pairs": [
+    { "master": "10GUSB",    "agent": "10GETH"    },
+    { "master": "SGMII1G",   "agent": "SGMII1G"   },
+    { "master": "SGMII2.5G", "agent": "SGMII2.5G" }
+  ],
+
+  "universal_params": {
+    "directions": ["A->B", "B->A", "bidir"],
+    "kinds": ["iperf", "ping"],
+    "transports": ["tcp", "udp"],
+    "ip": ["v4", "v6"],
+    "streams": 5,
+    "iperf_duration": 300,
+    "ping_count": 100,
+    "ping_payload_sizes": [32, 1400]
+  },
+
+  "tests": []
+}
