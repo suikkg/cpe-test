@@ -183,12 +183,9 @@ pub fn run_master(opts: MasterOpts) -> i32 {
         } else {
             interactive_build_specs(&cfg, &master_info, &agent_info)
         }
-    } else if let Some(ref pairs) = cfg.pairs {
-        // pairs 模式：从角色对自动生成全量测试
-        generate_specs_from_pairs(pairs, &cfg, &master_info, &agent_info)
     } else {
         if opts.auto {
-            logln("!! --auto 模式需要配置 tests[] 或 pairs");
+            logln("!! --auto 模式需要配置文件里有 tests[]");
             return 2;
         }
         interactive_build_specs(&cfg, &master_info, &agent_info)
@@ -486,100 +483,6 @@ fn enumerate_pairs(
 }
 
 /// 从 config.json 的 pairs 字段自动生成测试规格
-fn generate_specs_from_pairs(
-    pairs: &crate::config::Pairs,
-    cfg: &Config,
-    master: &HostInfo,
-    agent: &HostInfo,
-) -> Vec<SpecNorm> {
-    use crate::config::PairSpec as Ps;
-    let pair_list: Vec<Ps> = match pairs {
-        crate::config::Pairs::All(_) => {
-            // 枚举全部跨机配对
-            let mut v = Vec::new();
-            for m in &master.interfaces {
-                for a in &agent.interfaces {
-                    if m.role == "UNKNOWN" && a.role == "UNKNOWN" {
-                        continue;
-                    }
-                    v.push(Ps {
-                        master: format!("NAME={}", m.name),
-                        agent: format!("NAME={}", a.name),
-                    });
-                }
-            }
-            v
-        }
-        crate::config::Pairs::List(list) => list.clone(),
-    };
-
-    let default_params = cfg.universal_params.clone();
-    let mut out = Vec::new();
-    for p in &pair_list {
-        let src = match builder::resolve_endpoint(&format!("master:{}", p.master), master, agent) {
-            Ok(e) => e,
-            Err(e) => {
-                logln(&format!("!! 跳过配对 master:{}: {e}", p.master));
-                continue;
-            }
-        };
-        let dst = match builder::resolve_endpoint(&format!("agent:{}", p.agent), master, agent) {
-            Ok(e) => e,
-            Err(e) => {
-                logln(&format!("!! 跳过配对 agent:{}: {e}", p.agent));
-                continue;
-            }
-        };
-        let directions = default_params.as_ref()
-            .map(|p| p.directions.directions())
-            .unwrap_or_else(|| vec!["ab".into()]);
-        let kinds = default_params.as_ref()
-            .map(|p| p.kinds.clone())
-            .unwrap_or_else(|| vec!["iperf".into()]);
-        let transports = default_params.as_ref()
-            .and_then(|p| if !p.transports.is_empty() { Some(p.transports.clone()) } else { None })
-            .unwrap_or_else(|| vec!["tcp".into()]);
-        let ipvers = default_params.as_ref()
-            .map(|p| p.ip.clone())
-            .unwrap_or_else(|| vec!["v4".into()]);
-        let streams = default_params.as_ref()
-            .map(|p| p.streams)
-            .unwrap_or(1);
-        let duration = default_params.as_ref()
-            .and_then(|p| p.iperf_duration)
-            .unwrap_or(cfg.iperf.duration);
-        let ping_count = default_params.as_ref()
-            .and_then(|p| p.ping_count)
-            .unwrap_or(cfg.ping.count);
-        let payload_sizes = default_params.as_ref()
-            .and_then(|p| p.ping_payload_sizes.clone())
-            .unwrap_or_else(|| cfg.ping.payload_sizes.clone());
-        let tcp_windows = default_params.as_ref()
-            .and_then(|p| p.tcp_windows.clone())
-            .unwrap_or_else(|| cfg.iperf.tcp_windows.clone());
-        let udp_profiles = default_params.as_ref()
-            .and_then(|p| p.udp_profiles.clone())
-            .unwrap_or_else(|| cfg.iperf.udp_profiles.clone());
-
-        out.push(SpecNorm {
-            name: format!("{}<->{}", p.master, p.agent),
-            src,
-            dst,
-            directions,
-            kinds,
-            transports,
-            ipvers,
-            streams,
-            duration,
-            ping_count,
-            payload_sizes,
-            tcp_windows,
-            udp_profiles,
-            udp_limit: cfg.limit_udp_by_link_speed,
-        });
-    }
-    out
-}
 
 struct UniversalParams {
     directions: Vec<String>,

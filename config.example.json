@@ -25,22 +25,27 @@
     "payload_sizes": [32, 1400]
   },
 
-  "pairs": [
-    { "master": "10GUSB",    "agent": "10GETH"    },
-    { "master": "SGMII1G",   "agent": "SGMII1G"   },
-    { "master": "SGMII2.5G", "agent": "SGMII2.5G" }
-  ],
-
-  "universal_params": {
-    "directions": ["A->B", "B->A", "bidir"],
-    "kinds": ["iperf", "ping"],
-    "transports": ["tcp", "udp"],
-    "ip": ["v4", "v6"],
-    "streams": 5,
-    "iperf_duration": 300,
-    "ping_count": 100,
-    "ping_payload_sizes": [32, 1400]
-  },
-
-  "tests": []
+  "tests": [
+    {
+      "name": "2.5G口互灌",
+      "src": "master:SGMII2.5G",
+      "dst": "agent:SGMII2.5G",
+      "direction": ["A->B", "B->A", "bidir"],
+      "kinds": ["iperf", "ping"],
+      "transports": ["tcp", "udp"],
+      "ip": ["v4"],
+      "streams": 5
+    },
+    {
+      "name": "10G口配对",
+      "src": "master:10GUSB",
+      "dst": "agent:10GETH",
+      "direction": ["A->B", "B->A", "bidir"],
+      "kinds": ["iperf", "ping"],
+      "transports": ["tcp", "udp"],
+      "ip": ["v4", "v6"],
+      "streams": 5,
+      "iperf_duration": 300
+    }
+  ]
 }

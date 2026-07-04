@@ -23,62 +23,7 @@ pub struct Config {
     pub open_report: bool,
     pub iperf: IperfCfg,
     pub ping: PingCfg,
-    /// 自动配对生成测试：字符串 "all" 或具体角色对列表
-    #[serde(default)]
-    pub pairs: Option<Pairs>,
-    /// pairs 模式下的统一测试参数
-    #[serde(default)]
-    pub universal_params: Option<UniversalParams>,
     pub tests: Vec<TestSpec>,
-}
-
-/// pairs 字段：可以是 "all" 字符串，也可以是角色对数组
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum Pairs {
-    All(String),
-    List(Vec<PairSpec>),
-}
-
-impl Pairs {
-    pub fn is_all(&self) -> bool {
-        match self {
-            Pairs::All(s) => s.trim() == "all",
-            _ => false,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PairSpec {
-    /// master 侧的角色 或 NAME=接口名
-    pub master: String,
-    /// agent 侧的角色 或 NAME=接口名
-    pub agent: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct UniversalParams {
-    #[serde(default = "default_direction")]
-    pub directions: OneOrMany,
-    #[serde(default = "default_kinds")]
-    pub kinds: Vec<String>,
-    #[serde(default = "default_transports")]
-    pub transports: Vec<String>,
-    #[serde(default = "default_ip")]
-    pub ip: Vec<String>,
-    #[serde(default = "default_streams")]
-    pub streams: u32,
-    #[serde(default)]
-    pub iperf_duration: Option<u64>,
-    #[serde(default)]
-    pub ping_count: Option<u32>,
-    #[serde(default)]
-    pub ping_payload_sizes: Option<Vec<u32>>,
-    #[serde(default)]
-    pub tcp_windows: Option<Vec<String>>,
-    #[serde(default)]
-    pub udp_profiles: Option<Vec<UdpProfile>>,
 }
 
 impl Default for Config {
@@ -94,8 +39,6 @@ impl Default for Config {
             open_report: true,
             iperf: IperfCfg::default(),
             ping: PingCfg::default(),
-            pairs: None,
-            universal_params: None,
             tests: Vec::new(),
         }
     }
