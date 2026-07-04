@@ -748,9 +748,9 @@ impl Ctx {
     }
 }
 
-/// v6 link-local 地址加 zone（仅 macOS 主控端需要，Windows 端不要）
-fn add_zone(addr: &str, zone: &str, side: Side) -> String {
-    if side == Side::Master && !zone.is_empty() && addr.starts_with("fe80") {
+/// v6 link-local 地址加 zone（仅 macOS 需要，Windows 不加）
+fn add_zone(addr: &str, zone: &str, _side: Side) -> String {
+    if cfg!(target_os = "macos") && !zone.is_empty() && addr.starts_with("fe80") {
         format!("{}%{}", addr, zone)
     } else {
         addr.to_string()
