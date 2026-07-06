@@ -119,6 +119,15 @@ cpe_test scan               查看本机网卡识别结果
   "resume": false,
   "open_report": true,
 
+  "pairs": "all",
+  "universal_params": {
+    "directions": ["A->B", "bidir"],
+    "kinds": ["iperf", "ping"],
+    "transports": ["tcp", "udp"],
+    "ip": ["v4"],
+    "streams": 5,
+    "iperf_duration": 300
+  },
   "iperf": {
     "duration": 120,
     "tcp_windows": ["64k", "1m", "4m"],
@@ -175,6 +184,35 @@ cpe_test scan               查看本机网卡识别结果
 | `tcp_windows` | array | 覆盖全局 TCP window 档位 | — |
 | `udp_profiles` | array | 覆盖全局 UDP 带宽档位 | — |
 
+### pairs 自动配对（比 tests[] 更省事的写法）
+
+如果你的测试场景是"主控上 N 个网口 × 辅测上 M 个网口，全部互相测一遍"，
+不用逐个写 tests[]，用 `pairs` 一行搞定：
+
+```json
+{
+  "pairs": "all",
+  "universal_params": {
+    "directions": ["A->B", "bidir"],
+    "kinds": ["iperf", "ping"],
+    "transports": ["tcp", "udp"],
+    "ip": ["v4"],
+    "streams": 1,
+    "iperf_duration": 120
+  }
+}
+```
+
+`pairs` 支持两种值：
+
+| 值 | 含义 |
+|---|---|
+| `"all"` | 自动枚举主控 × 辅测所有网口两两组合（同 UNKNOWN 跳过） |
+| `[{...}, ...]` | 手动列出角色对，每项 `{"master":"SGMII2.5G", "agent":"SGMII2.5G"}` |
+
+`universal_params` 是统一应用给所有配对的测试参数，字段与 `tests[]` 中的对应字段完全一致，不写则用全局默认值（`iperf.duration` / `ping.count` 等）。
+
+**优先级**：`tests[]` 非空时优先使用 `tests[]`。只有 `tests[]` 为空且 `pairs` 有值时，才走自动配对。
 ---
 
 ## 模块架构
