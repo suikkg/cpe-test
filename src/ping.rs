@@ -57,6 +57,22 @@ pub fn run(req: &PingReq) -> PingOut {
     r
 }
 
+/// 逐行核查"未经证实的回复"：只要一行看起来像"逐包回复"（带来源地址），
+/// 却没有带上真实的 RTT 时间，就不算数——不管它的错误提示是
+/// "无法访问目标主机""TTL 超时"，还是以后 Windows 更新后出现的、
+/// 从没见过的新措辞。比起维护一份"所有已知错误提示语"的黑名单
+/// （永远不可能穷举，新措辞出现就会漏判为成功），反过来只认
+/// "确实测到时间"这一条硬指标更可靠，也不用管 Windows 版本/
+/// 语言包的用词差异。
+fn count_fake_success_replies(text: &str) -> u32 {
+    let reply_marker = Regex::new(r"(?i)的回复[:：]|Reply from\b|bytes from\b").expect("regex");
+    let has_rtt = Regex::new(r"(?i)时间[<=]\s*\d|time[<=]\s*\d").expect("regex");
+
+    text.lines()
+        .filter(|line| reply_marker.is_match(line) && !has_rtt.is_match(line))
+        .count() as u32
+}
+
 /// 解析 ping 输出。全都匹配不上 => 按全丢处理
 pub fn parse(text: &str, count: u32) -> PingOut {
     // 丢包统计
@@ -100,6 +116,24 @@ pub fn parse(text: &str, count: u32) -> PingOut {
         (count, 0, count, 100.0)
     };
 
+    // 统计行本身会说谎：Windows/BSD 把"目标不可达""TTL 超时""需要分片"等
+    // ICMP 错误应答也计入"已接收"，因为本机确实收到了一个回复包，只是
+    // 不是来自目标主机的 echo reply。所以 sent/received/loss% 全部正确
+    // 却仍可能 100% 都没 ping 通，必须逐行核查回复内容来修正。
+    let fake = count_fake_success_replies(text);
+    let (received, lost, loss_pct) = if fake > 0 {
+        let received = received.saturating_sub(fake);
+        let lost = sent.saturating_sub(received);
+        let loss_pct = if sent > 0 {
+            lost as f64 / sent as f64 * 100.0
+        } else {
+            100.0
+        };
+        (received, lost, loss_pct)
+    } else {
+        (received, lost, loss_pct)
+    };
+
     // RTT
     let rtt_cn =
         Regex::new(r"(?s)最短\s*=\s*(<?\d+)ms.*?最长\s*=\s*(<?\d+)ms.*?平均\s*=\s*(<?\d+)ms")
@@ -129,6 +163,11 @@ pub fn parse(text: &str, count: u32) -> PingOut {
     };
 
     let ok = received > 0 && loss_pct < 100.0;
+    let (rtt_min, rtt_max, rtt_avg) = if ok {
+        (rtt_min, rtt_max, rtt_avg)
+    } else {
+        (None, None, None)
+    };
     PingOut {
         ok,
         sent,
@@ -231,5 +270,68 @@ round-trip min/avg/max/stddev = 1.312/1.605/1.998/0.281 ms
         let r = parse(t, 4);
         assert!(!r.ok);
         assert_eq!(r.loss_pct, 100.0);
+    }
+
+    // --- 回归测试：目标不可达等 ICMP 错误应答被系统误计为"已接收" ---
+
+    const CN_UNREACHABLE: &str = r#"
+正在 Ping 192.168.1.99 具有 32 字节的数据:
+来自 192.168.1.5 的回复: 无法访问目标主机。
+来自 192.168.1.5 的回复: 无法访问目标主机。
+来自 192.168.1.5 的回复: 无法访问目标主机。
+来自 192.168.1.5 的回复: 无法访问目标主机。
+
+192.168.1.99 的 Ping 统计信息:
+    数据包: 已发送 = 4，已接收 = 4，丢失 = 0 (0% 丢失)，
+"#;
+
+    #[test]
+    fn test_cn_unreachable_is_not_success() {
+        let r = parse(CN_UNREACHABLE, 4);
+        assert!(!r.ok, "目标不可达不应判定为 ping 成功");
+        assert_eq!(r.sent, 4);
+        assert_eq!(r.received, 0);
+        assert_eq!(r.lost, 4);
+        assert_eq!(r.loss_pct, 100.0);
+    }
+
+    const EN_UNREACHABLE: &str = r#"
+Pinging 192.168.1.99 with 32 bytes of data:
+Reply from 192.168.1.5: Destination host unreachable.
+Reply from 192.168.1.5: Destination host unreachable.
+Reply from 192.168.1.5: Destination host unreachable.
+Reply from 192.168.1.5: Destination host unreachable.
+
+Ping statistics for 192.168.1.99:
+    Packets: Sent = 4, Received = 4, Lost = 0 (0% loss),
+"#;
+
+    #[test]
+    fn test_en_unreachable_is_not_success() {
+        let r = parse(EN_UNREACHABLE, 4);
+        assert!(!r.ok);
+        assert_eq!(r.received, 0);
+        assert_eq!(r.lost, 4);
+        assert_eq!(r.loss_pct, 100.0);
+    }
+
+    const CN_PARTIAL_UNREACHABLE: &str = r#"
+正在 Ping 192.168.1.99 具有 32 字节的数据:
+来自 192.168.1.99 的回复: 字节=32 时间=1ms TTL=64
+来自 192.168.1.5 的回复: 无法访问目标主机。
+来自 192.168.1.99 的回复: 字节=32 时间=1ms TTL=64
+来自 192.168.1.5 的回复: 无法访问目标主机。
+
+192.168.1.99 的 Ping 统计信息:
+    数据包: 已发送 = 4，已接收 = 4，丢失 = 0 (0% 丢失)，
+"#;
+
+    #[test]
+    fn test_cn_partial_unreachable_counts_real_success_only() {
+        let r = parse(CN_PARTIAL_UNREACHABLE, 4);
+        assert!(r.ok);
+        assert_eq!(r.received, 2);
+        assert_eq!(r.lost, 2);
+        assert_eq!(r.loss_pct, 50.0);
     }
 }
