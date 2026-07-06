@@ -2,9 +2,10 @@
 
 > 两台电脑间自动化 ping + iperf3 灌包测试，零 Python/零 PowerShell，单二进制分发
 
-[![Rust](https://img.shields.io/badge/Rust-1.96%2B-orange)](https://rustup.rs)
+[![Rust](https://img.shields.io/badge/Rust-1.82%2B-orange)](https://rustup.rs)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS-lightgrey)
+[![CI](https://github.com/suikkg/cpe-test/actions/workflows/build.yml/badge.svg)](https://github.com/suikkg/cpe-test/actions/workflows/build.yml)
 
 ---
 
@@ -181,6 +182,8 @@ cpe_test scan               查看本机网卡识别结果
 ```
 cpe_test/
 ├── Cargo.toml
+├── Cargo.lock
+├── config.example.json      # 配置文件示例
 ├── src/
 │   ├── main.rs              # CLI 入口 + 模式选择（master/agent/scan）
 │   │
@@ -207,7 +210,8 @@ cpe_test/
 │   │   ├── netsh.rs         # 解析 netsh wlan show interfaces
 │   │   └── iperf.rs         # iperf3 命令构造 + 文本输出解析 + server 进程管理
 │   │
-│   ├── ping.rs              # ping 命令构造 + 执行 + 解析（中/英/BSD 三格式）
+│   ├── ping.rs              # ping 命令构造 + 执行 + 输出解析
+│   │                        # （中/英/BSD 三格式，白名单策略排除 ICMP 错误应答）
 │   ├── protocol.rs          # HTTP JSON 请求/响应类型定义
 │   ├── config.rs            # JSON 配置文件加载
 │   ├── util.rs              # 子进程(超时/GBK)、日志、时间、辅助函数
@@ -215,10 +219,16 @@ cpe_test/
 │   ├── screenshot.rs        # 截图（Windows GDI / macOS screencapture）
 │   └── report.rs            # HTML 报告生成（单文件，内嵌样式）
 │
-├── config.example.json      # 配置文件示例
-├── dist/
-│   ├── start_agent.bat      # 辅测启动脚本
-│   └── start_master.bat     # 主控启动脚本
+├── .github/
+│   └── workflows/
+│       └── build.yml        # CI：Windows / macOS / Linux 自动编译 + Release
+│
+├── dist/                     # 部署用启动脚本（随 Release 分发）
+│   ├── start_agent.bat
+│   └── start_master.bat
+│
+├── NIC_README.md             # 网卡扫描技术详解
+├── README.md
 └── 使用说明.md               # 小白版图文教程
 ```
 
@@ -327,6 +337,7 @@ cpe_test master --auto --resume
 |------|------|------|
 | macOS | 主控/辅测 | 开发测试用，ping/iperf/报告全流程可用 |
 | Windows | 主控/辅测 | 最终生产环境 |
+| Linux | 编译/CI | GitHub Actions 自动编译，部分功能可用 |
 
 ### 网卡扫描差异
 
@@ -336,6 +347,29 @@ cpe_test master --auto --resume
 | 速率 | `GetIfTable2` API | `ifconfig -m` 解析 media 行 |
 | WiFi | `netsh wlan show interfaces` | `networksetup` + `system_profiler` |
 | RX 监控 | `GetIfTable2.InOctets` | `netstat -ibn` |
+
+### ping 输出解析
+
+`ping.rs` 同时兼容 **Windows 中文 / Windows 英文 / macOS(BSD)** 三种 ping 输出格式：
+
+```
+Windows(中文):  来自 192.168.1.3 的回复: 字节=32 时间<1ms
+Windows(英文):  Reply from 192.168.1.3: bytes=32 time<1ms
+macOS:          64 bytes from 192.168.1.3: icmp_seq=0 ttl=64 time=1.605 ms
+```
+
+**白名单策略**：regression 发现 Windows 的 ping 统计行（"已发送=X，已接收=Y"）会把
+ICMP 错误应答（"无法访问目标主机"、"TTL 传输中过期"、"一般故障"等）也计为"已接收"，
+因为本机确实收到了一个回复包，只是不是来自目标主机的 echo reply。
+
+修复：不维护错误消息黑名单，而是反向只认**有 RTT 时间**的回复行。逐行匹配回复标记
+（`的回复:` / `Reply from` / `bytes from`），若该行无 `时间[<=]\d` 或 `time[<=]\d`
+则不计入真正成功。`saturating_sub` 安全扣减，避免跨平台计数差异导致下溢。
+
+```
+统计行显示:           已发送=4，已接收=4，丢失=0 (0%丢失)
+逐行核查后修正:       已接收=0，丢失=4，丢包率=100%  ← ok=false
+```
 
 ---
 
@@ -367,6 +401,16 @@ cargo build --release
 ```
 
 编译后把 `cpe_test.exe` + `iperf3.exe` + 启动脚本放到两台 Windows 电脑同一目录即可。
+
+### GitHub Actions CI
+
+每次推送 tag（`v*`）自动编译 Windows / macOS / Linux 三平台，发布到 Release 页面。
+手动触发：Actions → Build Release → Run workflow。
+
+配置文件 `.github/workflows/build.yml`：
+- `windows-latest` → `x86_64-pc-windows-msvc` 
+- `macos-latest` → `aarch64-apple-darwin`
+- `ubuntu-latest` → `x86_64-unknown-linux-gnu`
 
 ---
 
