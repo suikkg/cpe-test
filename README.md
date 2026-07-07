@@ -14,6 +14,7 @@
 - [概览](#概览)
 - [快速开始](#快速开始)
 - [命令行用法](#命令行用法)
+- [网卡速率监控](#网卡速率监控)
 - [配置文件](#配置文件)
 - [模块架构](#模块架构)
 - [角色分类体系](#角色分类体系)
@@ -33,8 +34,9 @@ CPE（Customer Premises Equipment）子网测试工具用于在**两台电脑之
 
 - **Zero PowerShell** — 网卡扫描走 ipconfig + GetIfTable2 API + netsh wlan，不依赖 PowerShell 或 wmic
 - **Zero 线程安全隐患** — 无 COM 多线程问题；agent 是固定线程池 + Arc\<Mutex\>，panic 不崩服务
-- **单二进制分发** — 一个 exe 文件完成主控/辅测双模式，不需要 pip install
+- **单二进制分发** — 一个 exe 文件完成主控/辅测/监控三模式，不需要 pip install
 - **REST + JSON** — 主控 ↔ 辅测走标准 HTTP，带超时/重试/错误码
+- **独立网卡监控** — 不依赖子网测试流程，单独对某网口做逐秒速率采样，输出 CSV
 - **跨平台** — 最终两台 Windows，开发期间 macOS 可做全流程模拟测试
 
 ---
@@ -98,6 +100,74 @@ cpe_test master             主控发起测试
 
 cpe_test scan               查看本机网卡识别结果
     --prefix A.,B.
+
+cpe_test monitor            独立网卡速率监控 (按 Ctrl+C 停止)
+    --iface NAME / -n NAME  网卡名称 (不指定则用上次选择或交互选)
+    --interval N / -i N     采样间隔秒数 (默认 1)
+    --duration N / -d N     监控时长秒数 (0=不限，默认 0)
+    --csv FILE / -c FILE    输出 CSV 文件路径 (可选)
+```
+
+---
+
+## 网卡速率监控
+
+`cpe_test monitor` 是独立于子网测试的网卡速率采样工具，适合**单台电脑**单独对某个网口做实时速率观测。
+
+### 核心特性
+
+- **DU Meter 同源精度** — 走 `GetIfTable2.InOctets` (Windows) / `netstat -ibn` (macOS)，64位累计字节差值法，不丢包
+- **逐秒采样** — 可配采样间隔（1/2/5/10s），实时打印当前 Mbps
+- **自动 CSV** — 测试期间实时追加写入，Ctrl+C 结束时自动在文件顶部注入平均值/峰值等统计摘要
+- **记住上次网卡** — 第一次选完网卡后保存到 `.cpe_monitor_iface`，下次直接回车即可
+
+### 用法示例
+
+```bash
+# 交互模式：列出网卡，选择后开始监控
+cpe_test monitor
+
+# 直接指定网卡，每秒采样，输出到 CSV
+cpe_test monitor -n "以太网" -c speed_log.csv
+
+# 每 5 秒采样一次，跑 120 秒自动停止
+cpe_test monitor -n "以太网" -i 5 -d 120 -c r.csv
+```
+
+### 运行时输出
+
+```
+网卡: [以太网]  间隔: 1s  按 Ctrl+C 停止
+
+时间          速率(Mbps)
+--------------------------
+12:00:01        1690.10
+12:00:02        1688.50
+^C
+==================================================
+网卡: 以太网
+时长: 2s (2 次采样)
+平均: 1689.30 Mbps
+峰值: 1690.10 Mbps
+最低: 1688.50 Mbps
+CSV : speed_log.csv
+```
+
+### CSV 文件格式
+
+文件顶部自动写入统计摘要（`#` 号行可被 pandas/Excel 自动跳过）：
+
+```csv
+# === CPE NIC Monitor Report ===
+# Interface,以太网
+# Interval,1s
+# Duration,120s
+# Average (Mbps),1685.30
+# Peak (Mbps),1750.45
+# ================================
+Time,Speed(Mbps)
+12:00:01,1690.10
+12:00:02,1688.50
 ```
 
 ---
@@ -223,7 +293,7 @@ cpe_test/
 ├── Cargo.lock
 ├── config.example.json      # 配置文件示例
 ├── src/
-│   ├── main.rs              # CLI 入口 + 模式选择（master/agent/scan）
+│   ├── main.rs              # CLI 入口 + 模式选择（master/agent/scan/monitor）
 │   │
 │   ├── agent/
 │   │   ├── mod.rs
@@ -240,7 +310,7 @@ cpe_test/
 │   │   ├── classify.rs      # 角色分类（纯逻辑，不分平台）
 │   │   ├── scan_windows.rs  # ipconfig + GetIfTable2 + netsh wlan
 │   │   ├── scan_macos.rs    # ifconfig + system_profiler + networksetup
-│   │   └── monitor.rs       # NIC RX 监控（GetIfTable2 / netstat -ibn）
+│   │   └── monitor.rs       # NIC RX 监控（GetIfTable2/netstat -ibn；含独立连续监控模式）
 │   │
 │   ├── cmd/
 │   │   ├── mod.rs
