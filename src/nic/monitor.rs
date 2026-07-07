@@ -149,7 +149,7 @@ pub fn run_continuous(opts: &ContinuousOpts) -> Result<(), String> {
 
     if let Some(p) = opts.csv_path {
         if !std::path::Path::new(p).exists() {
-            std::fs::write(p, "Time,Speed(Mbps)\n")
+            std::fs::write(p, "\u{FEFF}Time,Speed(Mbps)\n")
                 .map_err(|e| format!("创建CSV失败: {e}"))?;
         }
     }
@@ -247,7 +247,7 @@ fn rewrite_csv_with_header(
 ) -> Result<(), String> {
     let mut f =
         std::fs::File::create(path).map_err(|e| format!("重写CSV失败: {e}"))?;
-    writeln!(f, "# === CPE NIC Monitor Report ===").map_err(|e| format!("{e}"))?;
+    writeln!(f, "\u{FEFF}# === CPE NIC Monitor Report ===").map_err(|e| format!("{e}"))?;
     writeln!(f, "# Interface,{}", iface).map_err(|e| format!("{e}"))?;
     writeln!(f, "# Interval,{}s", interval).map_err(|e| format!("{e}"))?;
     writeln!(f, "# Duration,{}s", duration).map_err(|e| format!("{e}"))?;
