@@ -2,9 +2,10 @@
 
 > 两台电脑间自动化 ping + iperf3 灌包测试，零 Python/零 PowerShell，单二进制分发
 
-[![Rust](https://img.shields.io/badge/Rust-1.96%2B-orange)](https://rustup.rs)
+[![Rust](https://img.shields.io/badge/Rust-1.82%2B-orange)](https://rustup.rs)
 [![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 ![Platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS-lightgrey)
+[![CI](https://github.com/suikkg/cpe-test/actions/workflows/build.yml/badge.svg)](https://github.com/suikkg/cpe-test/actions/workflows/build.yml)
 
 ---
 
@@ -13,6 +14,7 @@
 - [概览](#概览)
 - [快速开始](#快速开始)
 - [命令行用法](#命令行用法)
+- [网卡速率监控](#网卡速率监控)
 - [配置文件](#配置文件)
 - [模块架构](#模块架构)
 - [角色分类体系](#角色分类体系)
@@ -32,8 +34,9 @@ CPE（Customer Premises Equipment）子网测试工具用于在**两台电脑之
 
 - **Zero PowerShell** — 网卡扫描走 ipconfig + GetIfTable2 API + netsh wlan，不依赖 PowerShell 或 wmic
 - **Zero 线程安全隐患** — 无 COM 多线程问题；agent 是固定线程池 + Arc\<Mutex\>，panic 不崩服务
-- **单二进制分发** — 一个 exe 文件完成主控/辅测双模式，不需要 pip install
+- **单二进制分发** — 一个 exe 文件完成主控/辅测/监控三模式，不需要 pip install
 - **REST + JSON** — 主控 ↔ 辅测走标准 HTTP，带超时/重试/错误码
+- **独立网卡监控** — 不依赖子网测试流程，单独对某网口做逐秒速率采样，输出 CSV
 - **跨平台** — 最终两台 Windows，开发期间 macOS 可做全流程模拟测试
 
 ---
@@ -97,6 +100,74 @@ cpe_test master             主控发起测试
 
 cpe_test scan               查看本机网卡识别结果
     --prefix A.,B.
+
+cpe_test monitor            独立网卡速率监控 (按 Ctrl+C 停止)
+    --iface NAME / -n NAME  网卡名称 (不指定则用上次选择或交互选)
+    --interval N / -i N     采样间隔秒数 (默认 1)
+    --duration N / -d N     监控时长秒数 (0=不限，默认 0)
+    --csv FILE / -c FILE    输出 CSV 文件路径 (可选)
+```
+
+---
+
+## 网卡速率监控
+
+`cpe_test monitor` 是独立于子网测试的网卡速率采样工具，适合**单台电脑**单独对某个网口做实时速率观测。
+
+### 核心特性
+
+- **DU Meter 同源精度** — 走 `GetIfTable2.InOctets` (Windows) / `netstat -ibn` (macOS)，64位累计字节差值法，不丢包
+- **逐秒采样** — 可配采样间隔（1/2/5/10s），实时打印当前 Mbps
+- **自动 CSV** — 测试期间实时追加写入，Ctrl+C 结束时自动在文件顶部注入平均值/峰值等统计摘要
+- **记住上次网卡** — 第一次选完网卡后保存到 `.cpe_monitor_iface`，下次直接回车即可
+
+### 用法示例
+
+```bash
+# 交互模式：列出网卡，选择后开始监控
+cpe_test monitor
+
+# 直接指定网卡，每秒采样，输出到 CSV
+cpe_test monitor -n "以太网" -c speed_log.csv
+
+# 每 5 秒采样一次，跑 120 秒自动停止
+cpe_test monitor -n "以太网" -i 5 -d 120 -c r.csv
+```
+
+### 运行时输出
+
+```
+网卡: [以太网]  间隔: 1s  按 Ctrl+C 停止
+
+时间          速率(Mbps)
+--------------------------
+12:00:01        1690.10
+12:00:02        1688.50
+^C
+==================================================
+网卡: 以太网
+时长: 2s (2 次采样)
+平均: 1689.30 Mbps
+峰值: 1690.10 Mbps
+最低: 1688.50 Mbps
+CSV : speed_log.csv
+```
+
+### CSV 文件格式
+
+文件顶部自动写入统计摘要（`#` 号行可被 pandas/Excel 自动跳过）：
+
+```csv
+# === CPE NIC Monitor Report ===
+# Interface,以太网
+# Interval,1s
+# Duration,120s
+# Average (Mbps),1685.30
+# Peak (Mbps),1750.45
+# ================================
+Time,Speed(Mbps)
+12:00:01,1690.10
+12:00:02,1688.50
 ```
 
 ---
@@ -118,6 +189,15 @@ cpe_test scan               查看本机网卡识别结果
   "resume": false,
   "open_report": true,
 
+  "pairs": "all",
+  "universal_params": {
+    "directions": ["A->B", "bidir"],
+    "kinds": ["iperf", "ping"],
+    "transports": ["tcp", "udp"],
+    "ip": ["v4"],
+    "streams": 5,
+    "iperf_duration": 300
+  },
   "iperf": {
     "duration": 120,
     "tcp_windows": ["64k", "1m", "4m"],
@@ -174,6 +254,35 @@ cpe_test scan               查看本机网卡识别结果
 | `tcp_windows` | array | 覆盖全局 TCP window 档位 | — |
 | `udp_profiles` | array | 覆盖全局 UDP 带宽档位 | — |
 
+### pairs 自动配对（比 tests[] 更省事的写法）
+
+如果你的测试场景是"主控上 N 个网口 × 辅测上 M 个网口，全部互相测一遍"，
+不用逐个写 tests[]，用 `pairs` 一行搞定：
+
+```json
+{
+  "pairs": "all",
+  "universal_params": {
+    "directions": ["A->B", "bidir"],
+    "kinds": ["iperf", "ping"],
+    "transports": ["tcp", "udp"],
+    "ip": ["v4"],
+    "streams": 1,
+    "iperf_duration": 120
+  }
+}
+```
+
+`pairs` 支持两种值：
+
+| 值 | 含义 |
+|---|---|
+| `"all"` | 自动枚举主控 × 辅测所有网口两两组合（同 UNKNOWN 跳过） |
+| `[{...}, ...]` | 手动列出角色对，每项 `{"master":"SGMII2.5G", "agent":"SGMII2.5G"}` |
+
+`universal_params` 是统一应用给所有配对的测试参数，字段与 `tests[]` 中的对应字段完全一致，不写则用全局默认值（`iperf.duration` / `ping.count` 等）。
+
+**优先级**：`tests[]` 非空时优先使用 `tests[]`。只有 `tests[]` 为空且 `pairs` 有值时，才走自动配对。
 ---
 
 ## 模块架构
@@ -181,8 +290,10 @@ cpe_test scan               查看本机网卡识别结果
 ```
 cpe_test/
 ├── Cargo.toml
+├── Cargo.lock
+├── config.example.json      # 配置文件示例
 ├── src/
-│   ├── main.rs              # CLI 入口 + 模式选择（master/agent/scan）
+│   ├── main.rs              # CLI 入口 + 模式选择（master/agent/scan/monitor）
 │   │
 │   ├── agent/
 │   │   ├── mod.rs
@@ -199,7 +310,7 @@ cpe_test/
 │   │   ├── classify.rs      # 角色分类（纯逻辑，不分平台）
 │   │   ├── scan_windows.rs  # ipconfig + GetIfTable2 + netsh wlan
 │   │   ├── scan_macos.rs    # ifconfig + system_profiler + networksetup
-│   │   └── monitor.rs       # NIC RX 监控（GetIfTable2 / netstat -ibn）
+│   │   └── monitor.rs       # NIC RX 监控（GetIfTable2/netstat -ibn；含独立连续监控模式）
 │   │
 │   ├── cmd/
 │   │   ├── mod.rs
@@ -207,7 +318,8 @@ cpe_test/
 │   │   ├── netsh.rs         # 解析 netsh wlan show interfaces
 │   │   └── iperf.rs         # iperf3 命令构造 + 文本输出解析 + server 进程管理
 │   │
-│   ├── ping.rs              # ping 命令构造 + 执行 + 解析（中/英/BSD 三格式）
+│   ├── ping.rs              # ping 命令构造 + 执行 + 输出解析
+│   │                        # （中/英/BSD 三格式，白名单策略排除 ICMP 错误应答）
 │   ├── protocol.rs          # HTTP JSON 请求/响应类型定义
 │   ├── config.rs            # JSON 配置文件加载
 │   ├── util.rs              # 子进程(超时/GBK)、日志、时间、辅助函数
@@ -215,10 +327,16 @@ cpe_test/
 │   ├── screenshot.rs        # 截图（Windows GDI / macOS screencapture）
 │   └── report.rs            # HTML 报告生成（单文件，内嵌样式）
 │
-├── config.example.json      # 配置文件示例
-├── dist/
-│   ├── start_agent.bat      # 辅测启动脚本
-│   └── start_master.bat     # 主控启动脚本
+├── .github/
+│   └── workflows/
+│       └── build.yml        # CI：Windows / macOS / Linux 自动编译 + Release
+│
+├── dist/                     # 部署用启动脚本（随 Release 分发）
+│   ├── start_agent.bat
+│   └── start_master.bat
+│
+├── NIC_README.md             # 网卡扫描技术详解
+├── README.md
 └── 使用说明.md               # 小白版图文教程
 ```
 
@@ -327,6 +445,7 @@ cpe_test master --auto --resume
 |------|------|------|
 | macOS | 主控/辅测 | 开发测试用，ping/iperf/报告全流程可用 |
 | Windows | 主控/辅测 | 最终生产环境 |
+| Linux | 编译/CI | GitHub Actions 自动编译，部分功能可用 |
 
 ### 网卡扫描差异
 
@@ -336,6 +455,29 @@ cpe_test master --auto --resume
 | 速率 | `GetIfTable2` API | `ifconfig -m` 解析 media 行 |
 | WiFi | `netsh wlan show interfaces` | `networksetup` + `system_profiler` |
 | RX 监控 | `GetIfTable2.InOctets` | `netstat -ibn` |
+
+### ping 输出解析
+
+`ping.rs` 同时兼容 **Windows 中文 / Windows 英文 / macOS(BSD)** 三种 ping 输出格式：
+
+```
+Windows(中文):  来自 192.168.1.3 的回复: 字节=32 时间<1ms
+Windows(英文):  Reply from 192.168.1.3: bytes=32 time<1ms
+macOS:          64 bytes from 192.168.1.3: icmp_seq=0 ttl=64 time=1.605 ms
+```
+
+**白名单策略**：regression 发现 Windows 的 ping 统计行（"已发送=X，已接收=Y"）会把
+ICMP 错误应答（"无法访问目标主机"、"TTL 传输中过期"、"一般故障"等）也计为"已接收"，
+因为本机确实收到了一个回复包，只是不是来自目标主机的 echo reply。
+
+修复：不维护错误消息黑名单，而是反向只认**有 RTT 时间**的回复行。逐行匹配回复标记
+（`的回复:` / `Reply from` / `bytes from`），若该行无 `时间[<=]\d` 或 `time[<=]\d`
+则不计入真正成功。`saturating_sub` 安全扣减，避免跨平台计数差异导致下溢。
+
+```
+统计行显示:           已发送=4，已接收=4，丢失=0 (0%丢失)
+逐行核查后修正:       已接收=0，丢失=4，丢包率=100%  ← ok=false
+```
 
 ---
 
@@ -367,6 +509,16 @@ cargo build --release
 ```
 
 编译后把 `cpe_test.exe` + `iperf3.exe` + 启动脚本放到两台 Windows 电脑同一目录即可。
+
+### GitHub Actions CI
+
+每次推送 tag（`v*`）自动编译 Windows / macOS / Linux 三平台，发布到 Release 页面。
+手动触发：Actions → Build Release → Run workflow。
+
+配置文件 `.github/workflows/build.yml`：
+- `windows-latest` → `x86_64-pc-windows-msvc` 
+- `macos-latest` → `aarch64-apple-darwin`
+- `ubuntu-latest` → `x86_64-unknown-linux-gnu`
 
 ---
 

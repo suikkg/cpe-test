@@ -74,6 +74,83 @@ fn real_main(args: Vec<String>) -> i32 {
             println!("(如果少了网卡：检查网线/WiFi 是否连接，或加 --prefix 指定你的网段前缀)");
             0
         }
+        "monitor" => {
+            let f = parse_flags(&args[1..]);
+            let (cfg, _) = config::load_config(f.get("config").map(|s| s.as_str()));
+            let interval: u64 = f
+                .get("interval")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1);
+            let duration: u64 = f
+                .get("duration")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0);
+            let csv_path = f.get("csv").map(|s| s.as_str());
+
+            let iface: String = if let Some(name) = f.get("iface") {
+                let _ = std::fs::write(".cpe_monitor_iface", name);
+                name.to_string()
+            } else {
+                let info = nic::scan_host(&cfg.ipv4_prefixes);
+                let ifs = &info.interfaces;
+                if ifs.is_empty() {
+                    eprintln!("未发现可用网卡（匹配前缀 {:?}），请检查网线/WiFi 连接。", cfg.ipv4_prefixes);
+                    return 1;
+                }
+                let saved = std::fs::read_to_string(".cpe_monitor_iface")
+                    .ok()
+                    .map(|s| s.trim().to_string());
+                let saved_idx = saved.as_ref().and_then(|s| {
+                    ifs.iter().position(|n| n.name.eq_ignore_ascii_case(s))
+                });
+                // 始终展示网卡列表
+                println!("{}", nic::format_nic_table("【本机】", &info));
+                for (i, n) in ifs.iter().enumerate() {
+                    let mut extra = String::new();
+                    if n.speed_mbps > 0 {
+                        extra.push_str(&format!("  {}Mbps", n.speed_mbps));
+                    }
+                    if !n.wifi_band.is_empty() {
+                        extra.push_str(&format!("  {}", n.wifi_band));
+                    }
+                    println!(" [{}] {}  {:<12}  {:<16}  {}", i + 1, n.role, n.name, n.ipv4, extra);
+                }
+                let (name, prompt) = if let Some(idx) = saved_idx {
+                    (&ifs[idx].name, format!("回车使用上次网卡 [{}], 或输入序号切换: ", ifs[idx].name))
+                } else {
+                    (&ifs[0].name, format!("选择网卡序号(回车=1): "))
+                };
+                let choice = ask(&prompt);
+                let final_name = if choice.is_empty() {
+                    name.clone()
+                } else if let Ok(n) = choice.parse::<usize>() {
+                    if n >= 1 && n <= ifs.len() {
+                        let picked = ifs[n - 1].name.clone();
+                        let _ = std::fs::write(".cpe_monitor_iface", &picked);
+                        picked
+                    } else {
+                        name.clone()
+                    }
+                } else {
+                    name.clone()
+                };
+                if saved_idx.is_none() {
+                    let _ = std::fs::write(".cpe_monitor_iface", &final_name);
+                }
+                final_name
+            };
+
+            if let Err(e) = nic::monitor::run_continuous(&nic::monitor::ContinuousOpts {
+                iface: &iface,
+                interval_secs: interval,
+                duration_secs: duration,
+                csv_path: csv_path,
+            }) {
+                eprintln!("监控错误: {e}");
+                return 1;
+            }
+            0
+        }
         "-h" | "--help" | "help" => {
             print_help();
             0
@@ -128,8 +205,13 @@ fn print_help() {
       --resume                24小时内已 PASS 的任务跳过
       --no-open               结束后不自动打开报告
       --prefix A.,B.          临时指定 IPv4 前缀过滤
-  cpe_test scan               查看本机网卡识别结果
-      --prefix A.,B.
+   cpe_test scan               查看本机网卡识别结果
+       --prefix A.,B.
+   cpe_test monitor            独立网卡速率监控 (按 Ctrl+C 停止)
+       --iface NAME / -n NAME  网卡名称 (不指定则用上次选择或交互选)
+       --interval N / -i N     采样间隔秒数 (默认 1)
+       --duration N / -d N     监控时长秒数 (0=不限，默认 0)
+       --csv FILE / -c FILE    输出 CSV 文件路径 (可选)
 
 文件:
   config.json                 配置文件（可选，同目录）
@@ -142,6 +224,12 @@ fn print_help() {
 }
 
 fn parse_flags(args: &[String]) -> std::collections::HashMap<String, String> {
+    let short_map: &[(&str, &str)] = &[
+        ("i", "interval"),
+        ("n", "iface"),
+        ("c", "csv"),
+        ("d", "duration"),
+    ];
     let mut map = std::collections::HashMap::new();
     let mut i = 0;
     while i < args.len() {
@@ -156,6 +244,23 @@ fn parse_flags(args: &[String]) -> std::collections::HashMap<String, String> {
                 i += 2;
             } else {
                 map.insert(key.to_string(), String::new());
+                i += 1;
+            }
+        } else if a.starts_with('-') && a.len() == 2 {
+            let ch = &a[1..2];
+            if let Some(&(_, long)) = short_map.iter().find(|&&(s, _)| s == ch) {
+                let next_is_val = args
+                    .get(i + 1)
+                    .map(|n| !n.starts_with('-'))
+                    .unwrap_or(false);
+                if next_is_val {
+                    map.insert(long.to_string(), args[i + 1].clone());
+                    i += 2;
+                } else {
+                    map.insert(long.to_string(), String::new());
+                    i += 1;
+                }
+            } else {
                 i += 1;
             }
         } else {
