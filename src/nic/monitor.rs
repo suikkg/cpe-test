@@ -1,11 +1,15 @@
 //! 接收端网卡 RX 字节监控：start 记起点，stop 记终点，算平均 Mbps。
 //! Windows 用 GetIfTable2（不丢包、比 psutil 准），macOS 用 netstat -ibn。
+//!
+//! 独立连续监控模式：`run_continuous` 按可配置间隔采样，Ctrl+C 时输出
+//! 平均/峰值并写 CSV（不依赖 agent/master 子网测试流程）。
 
 use crate::protocol::MonitorStopOut;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
-use std::time::Instant;
+use std::io::Write;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// 有效测量的最小阈值（Mbps），低于它视为没有流量
 pub const MIN_VALID_RX_MBPS: f64 = 0.01;
@@ -118,6 +122,143 @@ impl MonitorMgr {
         let mut g = self.inner.lock().unwrap();
         g.retain(|_, e| e.t0.elapsed() <= max_age);
     }
+}
+
+// ---------------- 独立连续监控（不依赖 agent/master 子网测试流程） ----------------
+
+pub struct ContinuousOpts<'a> {
+    pub iface: &'a str,
+    pub interval_secs: u64,
+    pub duration_secs: u64,
+    pub csv_path: Option<&'a str>,
+}
+
+pub fn run_continuous(opts: &ContinuousOpts) -> Result<(), String> {
+    let running = Arc::new(AtomicBool::new(true));
+    let r = running.clone();
+    ctrlc::set_handler(move || {
+        r.store(false, Ordering::SeqCst);
+    })
+    .map_err(|e| format!("设置 Ctrl+C 处理器失败: {e}"))?;
+
+    let t_start = Instant::now();
+    let mut old_bytes = read_rx_bytes(opts.iface)?;
+    let mut old_time = t_start;
+    let wait = Duration::from_secs(opts.interval_secs);
+    let mut records: Vec<(String, f64)> = Vec::new();
+
+    if let Some(p) = opts.csv_path {
+        if !std::path::Path::new(p).exists() {
+            std::fs::write(p, "Time,Speed(Mbps)\n")
+                .map_err(|e| format!("创建CSV失败: {e}"))?;
+        }
+    }
+
+    println!(
+        "\n网卡: [{}]  间隔: {}s  按 Ctrl+C 停止\n",
+        opts.iface, opts.interval_secs
+    );
+    println!("{:<12} {:>12}", "时间", "速率(Mbps)");
+    println!("{}", "-".repeat(26));
+
+    loop {
+        std::thread::sleep(wait);
+
+        if opts.duration_secs > 0 && t_start.elapsed().as_secs() >= opts.duration_secs {
+            running.store(false, Ordering::SeqCst);
+        }
+        if !running.load(Ordering::SeqCst) {
+            break;
+        }
+
+        match read_rx_bytes(opts.iface) {
+            Ok(new_bytes) => {
+                let now = Instant::now();
+                let dt = (now - old_time).as_secs_f64().max(0.001);
+                let delta = new_bytes.saturating_sub(old_bytes);
+                let mbps = delta as f64 * 8.0 / dt / 1_000_000.0;
+
+                let t = chrono::Local::now().format("%H:%M:%S").to_string();
+                println!("{:<12} {:>12.2}", t, mbps);
+                records.push((t.clone(), mbps));
+
+                if let Some(p) = opts.csv_path {
+                    let mut f = std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(p)
+                        .map_err(|e| format!("打开CSV失败: {e}"))?;
+                    writeln!(f, "{},{:.2}", t, mbps)
+                        .map_err(|e| format!("写入CSV失败: {e}"))?;
+                }
+
+                old_bytes = new_bytes;
+                old_time = now;
+            }
+            Err(e) => eprintln!("读取网卡数据失败: {e}"),
+        }
+    }
+
+    if records.is_empty() {
+        println!("\n未捕获到数据");
+        return Ok(());
+    }
+
+    let speeds: Vec<f64> = records.iter().map(|r| r.1).collect();
+    let avg = speeds.iter().sum::<f64>() / speeds.len() as f64;
+    let max = speeds
+        .iter()
+        .fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+    let min = speeds
+        .iter()
+        .fold(f64::INFINITY, |a, &b| a.min(b));
+    let elapsed = t_start.elapsed().as_secs();
+
+    println!("\n{}", "=".repeat(50));
+    println!("网卡: {}", opts.iface);
+    println!("时长: {}s ({} 次采样)", elapsed, records.len());
+    println!("平均: {:.2} Mbps", avg);
+    println!("峰值: {:.2} Mbps", max);
+    println!("最低: {:.2} Mbps", min);
+
+    if let Some(p) = opts.csv_path {
+        rewrite_csv_with_header(
+            p,
+            opts.iface,
+            opts.interval_secs,
+            elapsed,
+            avg,
+            max,
+            &records,
+        )?;
+        println!("CSV : {}", p);
+    }
+
+    Ok(())
+}
+
+fn rewrite_csv_with_header(
+    path: &str,
+    iface: &str,
+    interval: u64,
+    duration: u64,
+    avg: f64,
+    max: f64,
+    records: &[(String, f64)],
+) -> Result<(), String> {
+    let mut f =
+        std::fs::File::create(path).map_err(|e| format!("重写CSV失败: {e}"))?;
+    writeln!(f, "# === CPE NIC Monitor Report ===").map_err(|e| format!("{e}"))?;
+    writeln!(f, "# Interface,{}", iface).map_err(|e| format!("{e}"))?;
+    writeln!(f, "# Interval,{}s", interval).map_err(|e| format!("{e}"))?;
+    writeln!(f, "# Duration,{}s", duration).map_err(|e| format!("{e}"))?;
+    writeln!(f, "# Average (Mbps),{:.2}", avg).map_err(|e| format!("{e}"))?;
+    writeln!(f, "# Peak (Mbps),{:.2}", max).map_err(|e| format!("{e}"))?;
+    writeln!(f, "# ================================").map_err(|e| format!("{e}"))?;
+    writeln!(f, "Time,Speed(Mbps)").map_err(|e| format!("{e}"))?;
+    for (t, s) in records {
+        writeln!(f, "{},{:.2}", t, s).map_err(|e| format!("{e}"))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
