@@ -3,8 +3,9 @@
 //! 配置写 "master:SGMII2.5G" 这类角色引用，运行时解析成实际网卡/IP。
 //! 换电脑不用改配置：角色识别对了，IP 自动跟着变。
 
-use crate::config::{Config, TestSpec, UdpProfile};
+use crate::config::{Config, RateCheckCfg, RateMode, RateTargets, TestSpec, UdpProfile};
 use crate::protocol::{HostInfo, NicInfo};
+use crate::rate;
 use crate::util::{md5_hex, same_slash24};
 
 pub const PORT_BASE: u16 = 56000;
@@ -61,6 +62,9 @@ pub struct SpecNorm {
     pub tcp_windows: Vec<String>,
     pub udp_profiles: Vec<UdpProfile>,
     pub udp_limit: bool,
+    pub rate_mode: RateMode,
+    pub rate_targets: RateTargets,
+    pub rate_check: RateCheckCfg,
 }
 
 #[derive(Clone, Debug)]
@@ -75,6 +79,9 @@ pub struct IperfTask {
     pub duration: u64,
     pub extra: Vec<String>,
     pub stream_idx: usize,
+    pub rate_mode: RateMode,
+    pub rx_target_mbps: Option<f64>,
+    pub offered_mbps: Option<f64>,
 }
 
 #[derive(Clone, Debug)]
@@ -89,7 +96,10 @@ pub struct PingTask {
 #[derive(Clone, Debug)]
 pub enum LegKind {
     IperfSingle(IperfTask),
-    IperfGroup { name: String, streams: Vec<IperfTask> },
+    IperfGroup {
+        name: String,
+        streams: Vec<IperfTask>,
+    },
     Ping(PingTask),
 }
 
@@ -152,7 +162,10 @@ pub fn resolve_endpoint(
         other => return Err(format!("端点侧别无效(master/agent): {other}")),
     };
     let rest = rest.trim();
-    let nic = if let Some(name) = rest.strip_prefix("NAME=").or_else(|| rest.strip_prefix("name=")) {
+    let nic = if let Some(name) = rest
+        .strip_prefix("NAME=")
+        .or_else(|| rest.strip_prefix("name="))
+    {
         let n = name.trim();
         host.interfaces
             .iter()
@@ -226,7 +239,10 @@ pub fn spec_from_config(
         transports: t.transports.iter().map(|k| k.to_lowercase()).collect(),
         ipvers: t.ip.iter().map(|k| k.to_lowercase()).collect(),
         streams: t.streams.clamp(1, 32),
-        duration: t.iperf_duration.unwrap_or(cfg.iperf.duration).clamp(1, 86400),
+        duration: t
+            .iperf_duration
+            .unwrap_or(cfg.iperf.duration)
+            .clamp(1, 86400),
         ping_count: t.ping_count.unwrap_or(cfg.ping.count).clamp(1, 100_000),
         payload_sizes: t
             .ping_payload_sizes
@@ -241,32 +257,63 @@ pub fn spec_from_config(
             .clone()
             .unwrap_or_else(|| cfg.iperf.udp_profiles.clone()),
         udp_limit: cfg.limit_udp_by_link_speed,
+        rate_mode: t.rate_mode.unwrap_or(cfg.iperf.rate_check.mode),
+        rate_targets: t.rate_targets_mbps.clone().unwrap_or_default(),
+        rate_check: cfg.iperf.rate_check.clone(),
     })
 }
 
-/// UDP 按发送口速率允许的流数（WiFi 发送口/未知速率不裁剪）
-fn allowed_udp_streams(sender: &Endpoint, prof: &UdpProfile, want: u32, limit: bool) -> u32 {
-    if !limit || sender.nic.is_wifi || sender.nic.role.starts_with("WIFI") {
+/// UDP 按整条路径的可信负载上限裁剪流数。
+/// RNDIS 3.7G 协商按约 2.5G，10GUSB 的 4.2G 已知显示 bug 不按 4.2G 裁剪。
+fn allowed_udp_streams(
+    sender: &Endpoint,
+    receiver: &Endpoint,
+    prof: &UdpProfile,
+    want: u32,
+    limit: bool,
+    rate_cfg: &RateCheckCfg,
+) -> u32 {
+    if !limit {
         return want;
     }
-    let speed = sender.nic.speed_mbps;
-    if speed == 0 {
+    let Some(speed) = rate::path_payload_ceiling_mbps(&sender.nic, &receiver.nic, rate_cfg) else {
         return want;
-    }
+    };
     let Some(bw) = prof.bandwidth_mbps() else {
         return want;
     };
     if bw <= 0.0 {
         return want;
     }
-    let max_n = (speed as f64 / bw).floor() as u32;
+    let max_n = (speed / bw).floor() as u32;
     max_n.min(want)
 }
 
-fn dir_pairs<'a>(
-    spec: &'a SpecNorm,
-    dir: &str,
-) -> Vec<(&'a Endpoint, &'a Endpoint, &'static str)> {
+fn udp_estimated_secs(
+    duration: u64,
+    total_streams: u64,
+    mode: RateMode,
+    rate_cfg: &RateCheckCfg,
+) -> u64 {
+    let stagger_ms = total_streams
+        .saturating_sub(1)
+        .saturating_mul(rate_cfg.launch_interval_ms.clamp(0, 1_000));
+    let discovery_ms = if mode == RateMode::Discover {
+        3_u64
+            .saturating_mul(rate_cfg.discovery_step_secs)
+            .saturating_mul(1_000)
+    } else {
+        0
+    };
+    duration
+        .saturating_add(rate_cfg.background_secs.min(30))
+        .saturating_add(rate_cfg.startup_timeout_secs)
+        .saturating_add(rate_cfg.settle_secs)
+        .saturating_add(5)
+        .saturating_add(stagger_ms.saturating_add(discovery_ms).div_ceil(1_000))
+}
+
+fn dir_pairs<'a>(spec: &'a SpecNorm, dir: &str) -> Vec<(&'a Endpoint, &'a Endpoint, &'static str)> {
     match dir {
         "ab" => vec![(&spec.src, &spec.dst, "")],
         "ba" => vec![(&spec.dst, &spec.src, "")],
@@ -277,6 +324,251 @@ fn dir_pairs<'a>(
 
 fn ep_id(e: &Endpoint) -> String {
     format!("{}|{}|{}", e.pc, e.nic.name, e.nic.ipv4)
+}
+
+/// 向 resume 语义串写入一个长度编码字段。
+///
+/// 不能只用 `|` 拼接：主机名、接口名等外部字符串本身可能包含分隔符，进而让两组
+/// 不同参数得到同一个待哈希字符串。字段名固定、值带字节长度后，编码可以无歧义解析。
+fn push_resume_field(identity: &mut String, name: &str, value: &str) {
+    identity.push('|');
+    identity.push_str(name);
+    identity.push('=');
+    identity.push_str(&value.len().to_string());
+    identity.push(':');
+    identity.push_str(value);
+}
+
+fn rate_mode_identity(mode: RateMode) -> &'static str {
+    match mode {
+        RateMode::Auto => "auto",
+        RateMode::Verify => "verify",
+        RateMode::Observe => "observe",
+        RateMode::Discover => "discover",
+    }
+}
+
+/// 使用 IEEE-754 位模式记录浮点配置，避免显示精度或 locale 改变 resume ID。
+fn f64_identity(value: f64) -> String {
+    format!("{:016x}", value.to_bits())
+}
+
+fn option_f64_identity(value: Option<f64>) -> String {
+    value
+        .map(f64_identity)
+        .unwrap_or_else(|| "none".to_string())
+}
+
+fn option_str_identity(value: Option<&str>) -> String {
+    value
+        .map(|text| format!("some:{}:{text}", text.len()))
+        .unwrap_or_else(|| "none".to_string())
+}
+
+fn push_rate_targets_identity(identity: &mut String, prefix: &str, targets: &RateTargets) {
+    push_resume_field(
+        identity,
+        &format!("{prefix}.forward"),
+        &option_f64_identity(targets.forward),
+    );
+    push_resume_field(
+        identity,
+        &format!("{prefix}.ab"),
+        &option_f64_identity(targets.ab),
+    );
+    push_resume_field(
+        identity,
+        &format!("{prefix}.ba"),
+        &option_f64_identity(targets.ba),
+    );
+}
+
+/// 记录所有会改变 UDP 执行或正式 verdict 的全局参数。
+///
+/// 这里有意记录原始配置而不是只记录最终目标：例如 `offered_headroom_pct` 同时改变
+/// 最低发送负载和所需成功流数，`sample_interval_ms`/`settle_secs` 会改变可判定窗口，
+/// `max_udp_loss_pct` 会直接改变 PASS/FAIL。新验收字段加入 RateCheckCfg 时也应同步加入。
+fn push_rate_check_identity(identity: &mut String, cfg: &RateCheckCfg) {
+    push_resume_field(identity, "rate_check.mode", rate_mode_identity(cfg.mode));
+    push_rate_targets_identity(identity, "rate_check.targets", &cfg.targets_mbps);
+    for (name, value) in [
+        ("sample_interval_ms", cfg.sample_interval_ms),
+        ("background_secs", cfg.background_secs),
+        ("startup_timeout_secs", cfg.startup_timeout_secs),
+        ("settle_secs", cfg.settle_secs),
+        ("launch_interval_ms", cfg.launch_interval_ms),
+        ("min_concurrent_streams", cfg.min_concurrent_streams as u64),
+        ("flow_retries", cfg.flow_retries as u64),
+        ("discovery_step_secs", cfg.discovery_step_secs),
+    ] {
+        push_resume_field(identity, &format!("rate_check.{name}"), &value.to_string());
+    }
+    for (name, value) in [
+        ("min_active_ratio", cfg.min_active_ratio),
+        ("offered_headroom_pct", cfg.offered_headroom_pct),
+        ("evb_usb_to_eth_target_mbps", cfg.evb_usb_to_eth_target_mbps),
+        ("evb_eth_to_usb_target_mbps", cfg.evb_eth_to_usb_target_mbps),
+        ("cpe_path_ceiling_mbps", cfg.cpe_path_ceiling_mbps),
+    ] {
+        push_resume_field(
+            identity,
+            &format!("rate_check.{name}"),
+            &f64_identity(value),
+        );
+    }
+    push_resume_field(
+        identity,
+        "rate_check.max_udp_loss_pct",
+        &option_f64_identity(cfg.max_udp_loss_pct),
+    );
+}
+
+fn push_endpoint_identity(identity: &mut String, prefix: &str, endpoint: &Endpoint) {
+    let side = match endpoint.side {
+        Side::Master => "master",
+        Side::Agent => "agent",
+    };
+    for (name, value) in [
+        ("side", side),
+        ("pc", endpoint.pc.as_str()),
+        ("name", endpoint.nic.name.as_str()),
+        ("role", endpoint.nic.role.as_str()),
+        ("ipv4", endpoint.nic.ipv4.as_str()),
+        ("ipv6_ll", endpoint.nic.ipv6_ll.as_str()),
+        ("ipv6_global", endpoint.nic.ipv6_global.as_str()),
+    ] {
+        push_resume_field(identity, &format!("{prefix}.{name}"), value);
+    }
+    push_resume_field(
+        identity,
+        &format!("{prefix}.speed_mbps"),
+        &endpoint.nic.speed_mbps.to_string(),
+    );
+}
+
+fn push_iperf_task_identity(identity: &mut String, prefix: &str, task: &IperfTask) {
+    push_resume_field(
+        identity,
+        &format!("{prefix}.v6"),
+        if task.v6 { "true" } else { "false" },
+    );
+    push_resume_field(
+        identity,
+        &format!("{prefix}.udp"),
+        if task.udp { "true" } else { "false" },
+    );
+    push_resume_field(identity, &format!("{prefix}.profile"), &task.profile_name);
+    push_endpoint_identity(identity, &format!("{prefix}.src"), &task.src);
+    push_endpoint_identity(identity, &format!("{prefix}.dst"), &task.dst);
+    push_resume_field(
+        identity,
+        &format!("{prefix}.duration"),
+        &task.duration.to_string(),
+    );
+    push_resume_field(
+        identity,
+        &format!("{prefix}.stream_idx"),
+        &task.stream_idx.to_string(),
+    );
+    push_resume_field(
+        identity,
+        &format!("{prefix}.rate_mode"),
+        rate_mode_identity(task.rate_mode),
+    );
+    push_resume_field(
+        identity,
+        &format!("{prefix}.rx_target_mbps"),
+        &option_f64_identity(task.rx_target_mbps),
+    );
+    push_resume_field(
+        identity,
+        &format!("{prefix}.offered_mbps"),
+        &option_f64_identity(task.offered_mbps),
+    );
+    push_resume_field(
+        identity,
+        &format!("{prefix}.extra_count"),
+        &task.extra.len().to_string(),
+    );
+    for (idx, arg) in task.extra.iter().enumerate() {
+        push_resume_field(identity, &format!("{prefix}.extra.{idx}"), arg);
+    }
+    // `port` 是构建顺序决定的临时资源，不属于测试/验收语义，不能写入 resume ID。
+}
+
+/// UDP resume ID schema v2：覆盖实际 offered load、裁剪后的流数、方向目标、模式和
+/// 全部验收阈值。v1 历史 PASS 因 schema 前缀变化不会再被错误复用。
+fn udp_resume_unit_id_v2(
+    spec: &SpecNorm,
+    ip_tag: &str,
+    direction: &str,
+    profile: &UdpProfile,
+    legs: &[Leg],
+) -> String {
+    let mut identity = "iperf_v2".to_string();
+    push_resume_field(&mut identity, "transport", "udp");
+    push_resume_field(&mut identity, "ip", ip_tag);
+    push_resume_field(&mut identity, "direction", direction);
+    push_resume_field(&mut identity, "duration", &spec.duration.to_string());
+    push_resume_field(
+        &mut identity,
+        "requested_streams",
+        &spec.streams.to_string(),
+    );
+    push_resume_field(
+        &mut identity,
+        "udp_limit",
+        if spec.udp_limit { "true" } else { "false" },
+    );
+    push_resume_field(&mut identity, "profile.bandwidth", &profile.bandwidth);
+    push_resume_field(
+        &mut identity,
+        "profile.length",
+        &option_str_identity(profile.length.as_deref()),
+    );
+    push_resume_field(
+        &mut identity,
+        "configured_rate_mode",
+        rate_mode_identity(spec.rate_mode),
+    );
+    push_rate_targets_identity(&mut identity, "scenario_targets", &spec.rate_targets);
+    push_rate_check_identity(&mut identity, &spec.rate_check);
+    push_endpoint_identity(&mut identity, "spec.src", &spec.src);
+    push_endpoint_identity(&mut identity, "spec.dst", &spec.dst);
+    push_resume_field(&mut identity, "leg_count", &legs.len().to_string());
+
+    for (leg_idx, leg) in legs.iter().enumerate() {
+        let prefix = format!("leg.{leg_idx}");
+        push_resume_field(&mut identity, &format!("{prefix}.tag"), &leg.tag);
+        match &leg.kind {
+            LegKind::IperfSingle(task) => {
+                push_resume_field(&mut identity, &format!("{prefix}.kind"), "single");
+                push_resume_field(&mut identity, &format!("{prefix}.stream_count"), "1");
+                push_iperf_task_identity(&mut identity, &format!("{prefix}.stream.0"), task);
+            }
+            LegKind::IperfGroup { streams, .. } => {
+                push_resume_field(&mut identity, &format!("{prefix}.kind"), "group");
+                push_resume_field(
+                    &mut identity,
+                    &format!("{prefix}.stream_count"),
+                    &streams.len().to_string(),
+                );
+                for (stream_idx, task) in streams.iter().enumerate() {
+                    push_iperf_task_identity(
+                        &mut identity,
+                        &format!("{prefix}.stream.{stream_idx}"),
+                        task,
+                    );
+                }
+            }
+            LegKind::Ping(_) => {
+                // 本函数仅由 UDP 构建分支调用；保留类型标记可防未来误用时发生碰撞。
+                push_resume_field(&mut identity, &format!("{prefix}.kind"), "ping-invalid");
+            }
+        }
+    }
+
+    md5_hex(&identity)
 }
 
 /// 生成全部任务单元。返回 (units, 提示信息列表)
@@ -296,16 +588,7 @@ pub fn build_units(
                 continue;
             }
             let arrow = if bidir { "<->" } else { "->" };
-            let route_str = format!(
-                "{} {} {}",
-                pairs[0].0.brief(),
-                arrow,
-                if bidir {
-                    pairs[0].1.brief()
-                } else {
-                    pairs[0].1.brief()
-                }
-            );
+            let route_str = format!("{} {} {}", pairs[0].0.brief(), arrow, pairs[0].1.brief());
 
             for ipver in &spec.ipvers {
                 let v6 = ipver == "v6";
@@ -334,8 +617,7 @@ pub fn build_units(
                             if tr == "tcp" {
                                 for w in &spec.tcp_windows {
                                     let pname = format!("tcp_w{}_P{}", w, spec.streams);
-                                    let plabel =
-                                        format!("TCP -w {} -P {}", w, spec.streams);
+                                    let plabel = format!("TCP -w {} -P {}", w, spec.streams);
                                     let mut legs = Vec::new();
                                     for (s, d, tag) in &pairs {
                                         let t = IperfTask {
@@ -354,6 +636,9 @@ pub fn build_units(
                                                 spec.streams.to_string(),
                                             ],
                                             stream_idx: 0,
+                                            rate_mode: spec.rate_mode,
+                                            rx_target_mbps: None,
+                                            offered_mbps: None,
                                         };
                                         legs.push(Leg {
                                             tag: tag.to_string(),
@@ -392,9 +677,11 @@ pub fn build_units(
                                     for (s, _d, _tag) in &pairs {
                                         let n = allowed_udp_streams(
                                             s,
+                                            _d,
                                             prof,
                                             spec.streams,
                                             spec.udp_limit,
+                                            &spec.rate_check,
                                         );
                                         if n == 0 {
                                             blocked = Some(format!(
@@ -414,9 +701,7 @@ pub fn build_units(
                                     }
                                     let mut legs = Vec::new();
                                     let mut max_n = 1;
-                                    for ((s, d, tag), n) in
-                                        pairs.iter().zip(leg_streams.iter())
-                                    {
+                                    for ((s, d, tag), n) in pairs.iter().zip(leg_streams.iter()) {
                                         let n = *n;
                                         max_n = max_n.max(n);
                                         let mut extra: Vec<String> =
@@ -425,6 +710,19 @@ pub fn build_units(
                                             extra.push("-l".into());
                                             extra.push(l.clone());
                                         }
+                                        let flow_direction =
+                                            if bidir { tag.to_string() } else { dir.clone() };
+                                        let target = rate::resolve_target_mbps(
+                                            spec.rate_mode,
+                                            &spec.rate_targets,
+                                            &flow_direction,
+                                            &s.nic,
+                                            &d.nic,
+                                            &spec.rate_check,
+                                        );
+                                        let effective_mode =
+                                            rate::effective_mode(spec.rate_mode, target);
+                                        let offered_mbps = prof.bandwidth_mbps();
                                         let mk = |idx: usize, port: u16| IperfTask {
                                             v6,
                                             udp: true,
@@ -436,6 +734,9 @@ pub fn build_units(
                                             duration: spec.duration,
                                             extra: extra.clone(),
                                             stream_idx: idx,
+                                            rate_mode: effective_mode,
+                                            rx_target_mbps: target,
+                                            offered_mbps,
                                         };
                                         let kind = if n <= 1 {
                                             LegKind::IperfSingle(mk(0, alloc_port(next_port)))
@@ -466,22 +767,20 @@ pub fn build_units(
                                         stream_note,
                                         route_str
                                     );
-                                    let id = md5_hex(&format!(
-                                        "iperf_v1|{}|udp|{}|{}|{}|{}|{}|{}",
-                                        ip_tag,
-                                        prof.name(),
-                                        spec.duration,
-                                        spec.streams,
-                                        ep_id(&spec.src),
-                                        ep_id(&spec.dst),
-                                        dir
-                                    ));
+                                    let id = udp_resume_unit_id_v2(spec, ip_tag, dir, prof, &legs);
+                                    let total_streams =
+                                        leg_streams.iter().map(|count| *count as u64).sum();
                                     units.push(Unit {
                                         id,
                                         title,
                                         bidir,
                                         legs,
-                                        est_secs: spec.duration + 10,
+                                        est_secs: udp_estimated_secs(
+                                            spec.duration,
+                                            total_streams,
+                                            spec.rate_mode,
+                                            &spec.rate_check,
+                                        ),
                                     });
                                 }
                             }
@@ -584,6 +883,9 @@ mod tests {
             tcp_windows: vec!["64k".into()],
             udp_profiles: vec![UdpProfile::bw("500m")],
             udp_limit: true,
+            rate_mode: RateMode::Auto,
+            rate_targets: RateTargets::default(),
+            rate_check: RateCheckCfg::default(),
         }
     }
 
@@ -614,6 +916,7 @@ mod tests {
         assert_eq!(units.len(), 1);
         assert!(units[0].bidir);
         assert_eq!(units[0].legs.len(), 2);
+        assert_eq!(units[0].est_secs, 39);
         // 2500/500 = 5 >= 3 允许 3 流
         for leg in &units[0].legs {
             match &leg.kind {
@@ -639,7 +942,7 @@ mod tests {
     }
 
     #[test]
-    fn test_udp_limit_wifi_unrestricted() {
+    fn test_udp_limit_wifi_uses_path_ceiling() {
         let mut spec = base_spec();
         let mut e = ep(Side::Master, "wlan", "WIFI5G", "192.168.1.5", 866);
         e.nic.is_wifi = true;
@@ -648,8 +951,162 @@ mod tests {
         spec.udp_profiles = vec![UdpProfile::bw("2500m")];
         let mut port = PORT_BASE;
         let (units, notices) = build_units(&[spec], true, &mut port);
-        assert_eq!(units.len(), 1);
+        assert!(units.is_empty());
+        assert_eq!(notices.len(), 1);
+    }
+
+    #[test]
+    fn test_rndis_3700_is_capped_to_2500_payload() {
+        let mut spec = base_spec();
+        spec.src = ep(Side::Master, "usb", "RNDIS", "192.168.1.2", 3700);
+        spec.dst = ep(Side::Agent, "10g", "10GETH", "192.168.1.3", 10000);
+        spec.transports = vec!["udp".into()];
+        spec.streams = 20;
+        spec.udp_profiles = vec![UdpProfile::bw("500m")];
+        let mut port = PORT_BASE;
+        let (units, notices) = build_units(&[spec], true, &mut port);
         assert!(notices.is_empty());
+        match &units[0].legs[0].kind {
+            LegKind::IperfGroup { streams, .. } => assert_eq!(streams.len(), 5),
+            _ => panic!("expect group"),
+        }
+    }
+
+    #[test]
+    fn test_evb_auto_direction_targets() {
+        let mut spec = base_spec();
+        spec.src = ep(Side::Master, "usb", "10GUSB", "192.168.1.2", 4200);
+        spec.dst = ep(Side::Agent, "10g", "10GETH", "192.168.1.3", 10000);
+        spec.directions = vec!["bidir".into()];
+        spec.transports = vec!["udp".into()];
+        spec.streams = 20;
+        spec.udp_profiles = vec![UdpProfile::bw("500m")];
+        let mut port = PORT_BASE;
+        let (units, notices) = build_units(&[spec], true, &mut port);
+        assert!(notices.is_empty());
+        assert_eq!(units.len(), 1);
+        for leg in &units[0].legs {
+            let first = match &leg.kind {
+                LegKind::IperfGroup { streams, .. } => &streams[0],
+                _ => panic!("expect group"),
+            };
+            if leg.tag == "ab" {
+                assert_eq!(first.rx_target_mbps, Some(6400.0));
+            } else {
+                assert_eq!(first.rx_target_mbps, Some(8400.0));
+            }
+            assert_eq!(first.rate_mode, RateMode::Verify);
+        }
+    }
+
+    fn build_single_udp_id(spec: SpecNorm, first_port: u16) -> String {
+        let mut port = first_port;
+        let (units, notices) = build_units(&[spec], true, &mut port);
+        assert!(notices.is_empty());
+        assert_eq!(units.len(), 1);
+        units[0].id.clone()
+    }
+
+    fn evb_udp_spec() -> SpecNorm {
+        let mut spec = base_spec();
+        spec.src = ep(Side::Master, "usb", "10GUSB", "192.168.1.2", 4200);
+        spec.dst = ep(Side::Agent, "10g", "10GETH", "192.168.1.3", 10000);
+        spec.transports = vec!["udp".into()];
+        spec.streams = 20;
+        spec.udp_profiles = vec![UdpProfile::bw("500m")];
+        spec
+    }
+
+    #[test]
+    fn test_udp_resume_v2_ignores_runtime_port_but_tracks_verdict_semantics() {
+        let base = evb_udp_spec();
+        let base_id = build_single_udp_id(base.clone(), PORT_BASE);
+        let legacy_v1_id = md5_hex(&format!(
+            "iperf_v1|V4|udp|{}|{}|{}|{}|{}|ab",
+            base.udp_profiles[0].name(),
+            base.duration,
+            base.streams,
+            ep_id(&base.src),
+            ep_id(&base.dst),
+        ));
+        assert_ne!(
+            base_id, legacy_v1_id,
+            "v2 必须让旧 schema 下缓存的 PASS 无条件失效"
+        );
+        assert_eq!(
+            base_id,
+            build_single_udp_id(base.clone(), PORT_BASE + 1000),
+            "临时端口变化不应让相同测试失去 resume 能力"
+        );
+
+        let assert_id_changed = |name: &str, change: fn(&mut SpecNorm)| {
+            let mut changed = base.clone();
+            change(&mut changed);
+            assert_ne!(
+                base_id,
+                build_single_udp_id(changed, PORT_BASE),
+                "{name} 必须使旧 PASS 失效"
+            );
+        };
+
+        // 即使 Auto 和 Verify 最终都解析为 Verify，也不能复用不同配置模式下的 PASS。
+        assert_id_changed("rate_mode", |spec| spec.rate_mode = RateMode::Verify);
+        assert_id_changed("scenario target", |spec| {
+            spec.rate_targets.ab = Some(6200.0)
+        });
+        assert_id_changed("global target", |spec| {
+            spec.rate_check.targets_mbps.ab = Some(6200.0)
+        });
+        assert_id_changed("offered load", |spec| {
+            spec.udp_profiles = vec![UdpProfile::bw("400m")]
+        });
+        assert_id_changed("sample interval", |spec| {
+            spec.rate_check.sample_interval_ms = 500
+        });
+        assert_id_changed("background window", |spec| {
+            spec.rate_check.background_secs = 5
+        });
+        assert_id_changed("startup timeout", |spec| {
+            spec.rate_check.startup_timeout_secs = 20
+        });
+        assert_id_changed("settle window", |spec| spec.rate_check.settle_secs = 8);
+        assert_id_changed("launch interval", |spec| {
+            spec.rate_check.launch_interval_ms = 100
+        });
+        assert_id_changed("minimum streams", |spec| {
+            spec.rate_check.min_concurrent_streams = 3
+        });
+        assert_id_changed("active ratio", |spec| {
+            spec.rate_check.min_active_ratio = 0.8
+        });
+        assert_id_changed("offered headroom", |spec| {
+            spec.rate_check.offered_headroom_pct = 10.0
+        });
+        assert_id_changed("flow retries", |spec| spec.rate_check.flow_retries = 2);
+        assert_id_changed("discovery step", |spec| {
+            spec.rate_check.discovery_step_secs = 15
+        });
+        assert_id_changed("EVB target", |spec| {
+            spec.rate_check.evb_usb_to_eth_target_mbps = 6300.0
+        });
+        assert_id_changed("path ceiling", |spec| {
+            spec.rate_check.cpe_path_ceiling_mbps = 2200.0
+        });
+        assert_id_changed("loss threshold", |spec| {
+            spec.rate_check.max_udp_loss_pct = Some(0.1)
+        });
+    }
+
+    #[test]
+    fn test_udp_resume_v2_tracks_effective_leg_shape() {
+        let mut base = evb_udp_spec();
+        base.src = ep(Side::Master, "rndis", "RNDIS", "192.168.1.2", 3700);
+        base.rate_mode = RateMode::Observe;
+        let five_stream_id = build_single_udp_id(base.clone(), PORT_BASE);
+
+        base.rate_check.cpe_path_ceiling_mbps = 2000.0;
+        let four_stream_id = build_single_udp_id(base, PORT_BASE);
+        assert_ne!(five_stream_id, four_stream_id);
     }
 
     #[test]

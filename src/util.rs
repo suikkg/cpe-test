@@ -2,8 +2,9 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -21,6 +22,7 @@ pub fn decode_bytes(b: &[u8]) -> String {
 pub struct CmdOut {
     pub ok: bool,
     pub timed_out: bool,
+    pub cancelled: bool,
     pub stdout: String,
     pub stderr: String,
 }
@@ -50,6 +52,7 @@ pub fn run_cmd(prog: &str, args: &[&str], timeout: Duration) -> CmdOut {
             return CmdOut {
                 ok: false,
                 timed_out: false,
+                cancelled: false,
                 stdout: String::new(),
                 stderr: format!("启动命令失败: {prog} ({e})"),
             }
@@ -81,16 +84,20 @@ pub fn run_cmd(prog: &str, args: &[&str], timeout: Duration) -> CmdOut {
     CmdOut {
         ok,
         timed_out,
+        cancelled: false,
         stdout,
         stderr,
     }
 }
 
-/// 执行命令并逐行回调 stdout（实时速率显示用），超时强杀
-pub fn run_streaming<F: FnMut(&str)>(
+/// 执行命令并逐行回调；cancel=true 时主动终止子进程。
+/// 异步 agent job 和主控本地 job 共用这一实现，避免 HTTP handler
+/// 被长时间 iperf3 进程占住。
+pub fn run_streaming_controlled<F: FnMut(&str)>(
     prog: &str,
     args: &[&str],
     timeout: Duration,
+    cancel: Option<&AtomicBool>,
     mut on_line: F,
 ) -> CmdOut {
     let mut c = Command::new(prog);
@@ -104,6 +111,7 @@ pub fn run_streaming<F: FnMut(&str)>(
             return CmdOut {
                 ok: false,
                 timed_out: false,
+                cancelled: false,
                 stdout: String::new(),
                 stderr: format!("启动命令失败: {prog} ({e})"),
             }
@@ -135,7 +143,16 @@ pub fn run_streaming<F: FnMut(&str)>(
     let deadline = Instant::now() + timeout;
     let mut collected = String::new();
     let mut timed_out = false;
+    let mut cancelled = false;
     loop {
+        if cancel
+            .map(|flag| flag.load(Ordering::SeqCst))
+            .unwrap_or(false)
+        {
+            cancelled = true;
+            let _ = child.kill();
+            break;
+        }
         let now = Instant::now();
         if now >= deadline {
             timed_out = true;
@@ -160,7 +177,7 @@ pub fn run_streaming<F: FnMut(&str)>(
         collected.push_str(&s);
     }
     let ok = match child.wait_timeout(Duration::from_secs(5)) {
-        Ok(Some(st)) => st.success() && !timed_out,
+        Ok(Some(st)) => st.success() && !timed_out && !cancelled,
         _ => {
             let _ = child.kill();
             let _ = child.wait();
@@ -171,6 +188,7 @@ pub fn run_streaming<F: FnMut(&str)>(
     CmdOut {
         ok,
         timed_out,
+        cancelled,
         stdout: collected,
         stderr,
     }
@@ -261,7 +279,11 @@ static IPERF3: OnceLock<Option<String>> = OnceLock::new();
 pub fn find_iperf3() -> Option<String> {
     IPERF3
         .get_or_init(|| {
-            let fname = if cfg!(windows) { "iperf3.exe" } else { "iperf3" };
+            let fname = if cfg!(windows) {
+                "iperf3.exe"
+            } else {
+                "iperf3"
+            };
             if let Ok(exe) = std::env::current_exe() {
                 if let Some(dir) = exe.parent() {
                     let p = dir.join(fname);
@@ -284,44 +306,6 @@ pub fn iperf3_version() -> Option<String> {
     let bin = find_iperf3()?;
     let out = run_cmd(&bin, &["--version"], Duration::from_secs(8));
     out.merged().lines().next().map(|s| s.trim().to_string())
-}
-
-// ---------------- 端口监听检测 ----------------
-
-/// 检查本机某 TCP 端口是否处于 LISTEN（iperf3 server 就绪探测；
-/// iperf3 即使 UDP 测试，控制通道也是 TCP LISTEN）
-pub fn port_listening(port: u16) -> bool {
-    let args: &[&str] = if cfg!(windows) {
-        &["-an", "-p", "TCP"]
-    } else {
-        &["-an", "-p", "tcp"]
-    };
-    let out = run_cmd("netstat", args, Duration::from_secs(10));
-    let colon = format!(":{port} ");
-    let dot = format!(".{port} ");
-    for line in out.stdout.lines() {
-        let up = line.to_uppercase();
-        if !up.contains("LISTEN") {
-            continue;
-        }
-        let padded = format!("{line} ");
-        if padded.contains(&colon) || padded.contains(&dot) {
-            return true;
-        }
-    }
-    false
-}
-
-/// 轮询等待端口 LISTEN
-pub fn wait_port_listen(port: u16, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if port_listening(port) {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    port_listening(port)
 }
 
 // ---------------- 交互输入 ----------------
@@ -361,7 +345,8 @@ pub fn md5_hex(s: &str) -> String {
 }
 
 /// 临时目录里的文件路径
-pub fn temp_file(name: &str) -> PathBuf {
+#[cfg(target_os = "macos")]
+pub fn temp_file(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(name)
 }
 

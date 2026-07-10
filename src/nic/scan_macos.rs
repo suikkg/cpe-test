@@ -180,7 +180,11 @@ pub fn scan_all(prefixes: &[String]) -> Vec<NicInfo> {
         } else {
             probe_speed(&b.name)
         };
-        let band = if is_wifi { wifi_band.clone() } else { String::new() };
+        let band = if is_wifi {
+            wifi_band.clone()
+        } else {
+            String::new()
+        };
         let role = classify_role(&port_name, speed, is_wifi, &band);
         out.push(NicInfo {
             name: b.name.clone(),

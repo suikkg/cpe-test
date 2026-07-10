@@ -1,6 +1,6 @@
 # Rust 如何读取网卡信息（cpe_test 实现详解）
 
-本文档以 `cpe_test` 项目为例，介绍 Rust 在 Windows / macOS 上如何扫描网卡、获取 IP、速率、WiFi 频段和 RX 流量。
+本文档以 `cpe_test` 项目为例，介绍 Rust 在 Windows / macOS / Linux 上如何扫描网卡、获取 IP、速率、WiFi 频段，以及连续采集 RX/TX 流量。
 
 ---
 
@@ -12,7 +12,7 @@ nic/
 ├── classify.rs      # 角色分类（纯逻辑，不分平台）
 ├── scan_windows.rs  # Windows: ipconfig + GetIfTable2 + netsh
 ├── scan_macos.rs    # macOS:   ifconfig + system_profiler + networksetup
-└── monitor.rs       # RX 监控：GetIfTable2 / netstat -ibn
+└── monitor.rs       # RX/TX 连续采样：GetIfTable2 / netstat -ibn / Linux sysfs
 ```
 
 编译时自动选择：
@@ -117,6 +117,7 @@ pub fn if_rows() -> Vec<IfRow> {
             // r.Type           — 71 = WiFi (IF_TYPE_IEEE80211)
             // r.OperStatus     — 0=down, 1=up
             // r.InOctets       — 累计 RX 字节（监控用）
+            // r.OutOctets      — 累计 TX 字节（监控用）
         }
         FreeMibTable(table as *const _);  // ← 释放内存
     }
@@ -284,37 +285,69 @@ pub fn classify_role(desc: &str, speed_mbps: u64, is_wifi: bool, band: &str) -> 
 
 ---
 
-## 五、RX 流量监控
+## 五、RX/TX 连续流量监控
+
+UDP 验收不再只在开始和结束各读一次计数器。`MonitorMgr` 从第一条流启动前开始按 200～5000ms 周期连续采样，并为每个样本记录：
+
+```text
+elapsed_ms, interval_ms,
+rx_bytes, tx_bytes,
+rx_delta_bytes, tx_delta_bytes,
+rx_mbps, tx_mbps,
+valid, error
+```
+
+同一个测试单元里，每个唯一端点只启动一个监控器。双向测试共享同一份端点样本，避免两个方向各开一个线程、时间点又不一致。监控起点使用本地 `Instant`，主控把样本加上 monitor start offset 后，与流的 `Traffic/Retry/Ended` 事件放到同一条相对时间线上，不依赖两台电脑系统时钟同步。
 
 ### Windows
 
-直接用已获取的 `MIB_IF_ROW2.InOctets`（累计字节数）：
+`GetIfTable2` 同时读取 `MIB_IF_ROW2.InOctets` 和 `OutOctets`：
 
 ```rust
-// monitor.rs — start/stop 模式
-pub fn read_rx_bytes(iface: &str) -> Result<u64, String> {
-    let rows = if_rows();  // 再调一次 GetIfTable2
-    rows.iter()
-        .find(|r| r.alias == iface)
-        .map(|r| r.in_octets)
-        .ok_or("接口不存在")
+pub fn read_counters(iface: &str) -> Result<(u64, u64), String> {
+    let row = if_rows()
+        .into_iter()
+        .find(|row| row.alias == iface)
+        .ok_or("接口不存在")?;
+    Ok((row.in_octets, row.out_octets))
 }
 ```
 
-两次数值相减 ÷ 时间 = 平均 Mbps：
+相邻两次累计值相减，再除以真实采样间隔：
+
 ```rust
-let delta = end_bytes - start_bytes;
-let avg_mbps = delta as f64 * 8.0 / secs / 1_000_000.0;
+let rx_mbps = rx_delta as f64 * 8.0 / secs / 1_000_000.0;
+let tx_mbps = tx_delta as f64 * 8.0 / secs / 1_000_000.0;
 ```
+
+若任一计数器回退（驱动 reset、接口重连或溢出异常），该样本会标记 `valid=false` 并记录旧值、新值；不会用 `saturating_sub` 把异常样本伪装成 0 Mbps 后继续参与判定。
 
 ### macOS
 
-`netstat -ibn` 的 `<Link#N>` 行取 `Ibytes` 列：
+`netstat -ibn` 的 `<Link#N>` 行同时取 `Ibytes` 和 `Obytes`。因为 Address 列可能为空、整行会移位，解析器从行尾固定位置取值：`Ibytes = cols[len-5]`，`Obytes = cols[len-2]`。
 
+```text
+en0  1500  <Link#14>  aa:bb:cc:dd:ee:ff  ...  9083840014  ...  749169011  0
+                                                   Ibytes          Obytes
 ```
-en0   1500  <Link#14>   aa:bb:cc:dd:ee:ff   9219567    0  9083840014  ...
-                                                ↑Ibytes  ↑Opkts    ↑Obytes
+
+### Linux
+
+直接读取：
+
+```text
+/sys/class/net/<iface>/statistics/rx_bytes
+/sys/class/net/<iface>/statistics/tx_bytes
 ```
+
+### UDP 稳态统计如何使用样本
+
+1. 起流前默认采 3 秒背景流量，以 RX/TX 中位数作为 baseline。
+2. 根据每条流首个有效 `Traffic` 和最终 `Ended` 事件重建活跃区间；若发生重试，只使用最后一次 Retry 后的有效流量。
+3. 双向测试要求两个方向同时达到各自最低活跃流数，取最长连续交集。
+4. 交集开头再丢弃默认 5 秒 settle，只截取用户要求的 180 秒作为计分窗口。
+5. 样本先扣 baseline，再计算平均、5 秒滚动 P10、中位、P95、最低、最高和覆盖率。
+6. 有效窗口不足或覆盖率低于 95% 时返回 `NOT_EVALUATED`，不会把采样问题混成 CPE 速率失败。
 
 ---
 
@@ -326,7 +359,7 @@ en0   1500  <Link#14>   aa:bb:cc:dd:ee:ff   9219567    0  9083840014  ...
 | 速率 | `wmic nic get Speed` | `GetIfTable2.ReceiveLinkSpeed` | ✅ wmic 已从 Win11 移除 |
 | IPv6 fe80 | `psutil` 偶尔丢 | `ipconfig /all` 解析 | ✅ 永远可用 |
 | WiFi 频段 | `netsh wlan show` (仅 Windows) | 同左 + `system_profiler` (macOS) | ✅ 同 |
-| RX 监控 | `psutil.net_io_counters()`（丢包） | `GetIfTable2.InOctets` | ✅ API 准 |
+| RX/TX 监控 | `psutil.net_io_counters()`（接口映射易错） | `GetIfTable2.InOctets/OutOctets` + 连续有效性检查 | ✅ API 准 |
 | 编码 | 手动 GBK decode | `encoding_rs::GBK` | ✅ 自动 |
 | 线程安全 | COM 不能在子线程 | 无 COM，无问题 | ✅ |
 

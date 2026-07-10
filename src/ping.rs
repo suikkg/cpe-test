@@ -142,10 +142,9 @@ pub fn parse(text: &str, count: u32) -> PingOut {
         r"(?si)Minimum\s*=\s*(<?\d+)ms.*?Maximum\s*=\s*(<?\d+)ms.*?Average\s*=\s*(<?\d+)ms",
     )
     .expect("regex");
-    let rtt_bsd = Regex::new(
-        r"(?:round-trip|rtt)[^=]*=\s*(\d+(?:\.\d+)?)/(\d+(?:\.\d+)?)/(\d+(?:\.\d+)?)",
-    )
-    .expect("regex");
+    let rtt_bsd =
+        Regex::new(r"(?:round-trip|rtt)[^=]*=\s*(\d+(?:\.\d+)?)/(\d+(?:\.\d+)?)/(\d+(?:\.\d+)?)")
+            .expect("regex");
 
     let (rtt_min, rtt_max, rtt_avg) = if let Some(c) = rtt_cn.captures(text) {
         (parse_ms(&c[1]), parse_ms(&c[2]), parse_ms(&c[3]))
@@ -153,11 +152,7 @@ pub fn parse(text: &str, count: u32) -> PingOut {
         (parse_ms(&c[1]), parse_ms(&c[2]), parse_ms(&c[3]))
     } else if let Some(c) = rtt_bsd.captures(text) {
         // BSD 顺序是 min/avg/max
-        (
-            c[1].parse().ok(),
-            c[3].parse().ok(),
-            c[2].parse().ok(),
-        )
+        (c[1].parse().ok(), c[3].parse().ok(), c[2].parse().ok())
     } else {
         (None, None, None)
     };

@@ -3,10 +3,10 @@
 pub mod classify;
 pub mod monitor;
 
-#[cfg(windows)]
-pub mod scan_windows;
 #[cfg(target_os = "macos")]
 pub mod scan_macos;
+#[cfg(windows)]
+pub mod scan_windows;
 
 use crate::protocol::HostInfo;
 #[cfg(not(any(windows, target_os = "macos")))]

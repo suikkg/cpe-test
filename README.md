@@ -36,6 +36,9 @@ CPE（Customer Premises Equipment）子网测试工具用于在**两台电脑之
 - **Zero 线程安全隐患** — 无 COM 多线程问题；agent 是固定线程池 + Arc\<Mutex\>，panic 不崩服务
 - **单二进制分发** — 一个 exe 文件完成主控/辅测/监控三模式，不需要 pip install
 - **REST + JSON** — 主控 ↔ 辅测走标准 HTTP，带超时/重试/错误码
+- **20/32 流真实并发** — agent 的 HTTP worker 只创建/查询后台 iperf 作业，不再被 180 秒 client 占住
+- **UDP 连续采样** — 从起流前持续记录双端 RX/TX、流连接/重试/结束事件，结束后重建共同有效窗口
+- **已知/未知目标分离** — EVB 已知目标正式验收；CPE、SGMII、RNDIS、WiFi 未知能力默认只测量，不伪造 PASS
 - **独立网卡监控** — 不依赖子网测试流程，单独对某网口做逐秒速率采样，输出 CSV
 - **跨平台** — 最终两台 Windows，开发期间 macOS 可做全流程模拟测试
 
@@ -196,10 +199,12 @@ Time,Speed(Mbps)
     "transports": ["tcp", "udp"],
     "ip": ["v4"],
     "streams": 5,
-    "iperf_duration": 300
+    "iperf_duration": 180,
+    "rate_mode": "auto",
+    "rate_targets_mbps": {"forward": null, "ab": null, "ba": null}
   },
   "iperf": {
-    "duration": 120,
+    "duration": 180,
     "tcp_windows": ["64k", "1m", "4m"],
     "udp_profiles": [
       { "bandwidth": "1m" },
@@ -224,7 +229,8 @@ Time,Speed(Mbps)
       "transports": ["tcp", "udp"],
       "ip": ["v4"],
       "streams": 5,
-      "iperf_duration": 300
+      "iperf_duration": 180,
+      "rate_mode": "observe"
     }
   ]
 }
@@ -248,7 +254,9 @@ Time,Speed(Mbps)
 | `transports` | array | `["tcp"] / ["udp"] / ["tcp","udp"]` | ["tcp"] |
 | `ip` | array | `["v4"] / ["v6"]` | ["v4"] |
 | `streams` | int | 并发流数（TCP = -P，UDP = 独立进程） | 1 |
-| `iperf_duration` | int | 覆盖全局灌包时长（秒） | — |
+| `iperf_duration` | int | 覆盖全局 UDP **有效测量窗口**时长（秒）；实际进程会自动增加起流/稳定/重试缓冲 | — |
+| `rate_mode` | string | `auto` / `verify` / `observe` / `discover` | 全局值 |
+| `rate_targets_mbps` | object | `forward` 或双向 `ab`/`ba` 的明确验收目标；未知时保持 null | — |
 | `ping_count` | int | 覆盖全局 ping 包数 | — |
 | `ping_payload_sizes` | array | 覆盖全局负载字节 | — |
 | `tcp_windows` | array | 覆盖全局 TCP window 档位 | — |
@@ -268,7 +276,8 @@ Time,Speed(Mbps)
     "transports": ["tcp", "udp"],
     "ip": ["v4"],
     "streams": 1,
-    "iperf_duration": 120
+    "iperf_duration": 180,
+    "rate_mode": "auto"
   }
 }
 ```
@@ -283,6 +292,104 @@ Time,Speed(Mbps)
 `universal_params` 是统一应用给所有配对的测试参数，字段与 `tests[]` 中的对应字段完全一致，不写则用全局默认值（`iperf.duration` / `ping.count` 等）。
 
 **优先级**：`tests[]` 非空时优先使用 `tests[]`。只有 `tests[]` 为空且 `pairs` 有值时，才走自动配对。
+
+### UDP 并发速率判定
+
+UDP 单流、并发组和双向测试现在走同一套调度器：先把所有方向的 server 全部准备好，再按方向交错启动 client。网卡监控从起流前开始连续采样，直到最后一条流结束；最终根据流事件重建“哪些流在同一时刻真正有流量”的时间线。
+
+`iperf.duration`（默认 180 秒）表示报告中用于判定的**有效稳态窗口**，不是 `iperf3 -t` 的固定进程墙钟时长。程序会自动加入背景采样、错峰起流、连接超时、稳定等待和一次失败流重试缓冲，所以一次 180 秒测试通常会运行约 200 秒；报告会分别列出“有效秒数/要求秒数”。
+
+失败流不会造成无限等待：
+
+- iperf3 的瞬态连接错误先按原机制重试，组调度器还会在 `startup_timeout_secs` 内重启对应 server/client，默认再重试 1 次。
+- 2 条流的方向最低要求仍是 2 条。若最终只有 1 条成功，结果是 `NOT_EVALUATED / ACTIVE_STREAMS_LOW`，表示负载搭建不足，不会用单流速率误判 CPE 为 `RATE_FAIL`。
+- 默认 `min_active_ratio=0.9`：5 条流要求至少 4 条，20 条要求至少 18 条；已知目标还会叠加 `ceil(目标 × 1.05 / 单流带宽)` 的 offered-load 要求。
+- 运行中不阻塞等待并提前锁死窗口；结束后统一取满足活跃流条件的最长连续区间，迟到或提前结束只会如实改变该区间边界。
+- 双向结果分别判断 AB/BA 目标，但使用“两边都达到各自最低活跃流数”的共同窗口，避免一边已满载、另一边仍在爬升时提前计分。
+
+#### 速率模式
+
+| 模式 | 适用场景 | 报告行为 |
+|------|----------|----------|
+| `auto` | 推荐默认 | 有显式目标或明确 EVB 10GUSB↔10GETH 路径时转 `verify`，否则转 `observe` |
+| `verify` | 已知验收线 | 检查 TX offered load、RX 平均/P10、有效窗口和可选 UDP 丢包率；未提供显式或 EVB 自动目标时返回 `NOT_EVALUATED / TARGET_MISSING` |
+| `observe` | CPE 理论/实际值未知 | 完整测量并输出速率统计，结果为 `MEASURED`，不伪造 PASS |
+| `discover` | 首次摸底容量 | 约按 25%/50%/75%/100% 流数分阶段加压，报告附 `active_streams → avg/P10 RX` 表 |
+
+自动目标只用于明确的 EVB 载体路径：
+
+- `10GUSB/NCM → 10GETH`：默认 RX 目标 6400 Mbps。
+- `10GETH → 10GUSB/NCM`：默认 RX 目标 8400 Mbps。
+- NCM 显示 4.2G 是已知协商显示问题，按 10GUSB 能力处理；显示 10G 时同样处理。
+- RNDIS 即使显示约 3.7G，默认可信负载上限仍为约 2500 Mbps。
+- SGMII2.5G 上限约 2500 Mbps，SGMII1G 上限约 1000 Mbps；WiFi 取协商速率与 2500 Mbps 的较小值。
+- NCM/10GUSB 经过 CPE 子网中的 SGMII、RNDIS 或 WiFi 时，offered load 按整条路径最低瓶颈裁剪，且默认仍是 `observe`，不会把 2.5G 上限直接当成产品 PASS 线。
+
+EVB 自动目标可以在全局配置中调整：
+
+```json
+{
+  "iperf": {
+    "rate_check": {
+      "evb_usb_to_eth_target_mbps": 6400,
+      "evb_eth_to_usb_target_mbps": 8400
+    }
+  }
+}
+```
+
+也可以按单个场景覆盖。下面配置中 `src=10GUSB`、`dst=10GETH`，所以 `ab` 是 USB→ETH，`ba` 是 ETH→USB：
+
+```json
+{
+  "name": "EVB 双向自定义目标",
+  "src": "master:10GUSB",
+  "dst": "agent:10GETH",
+  "direction": "bidir",
+  "transports": ["udp"],
+  "rate_mode": "verify",
+  "rate_targets_mbps": {"ab": 6400, "ba": 8400}
+}
+```
+
+目标优先级为：`tests[].rate_targets_mbps`（或 pairs 的 `universal_params.rate_targets_mbps`）→ 全局 `rate_check.targets_mbps` → 上述 EVB 角色自动目标。`ab` 始终表示配置中的 `src → dst`，`ba` 表示 `dst → src`；单向场景也可以使用 `forward`，因此交换 src/dst 后不要机械照抄 ab/ba 数值。
+
+如果 CPE 已有经过评审的验收目标，应显式写入测试项：
+
+```json
+{
+  "name": "CPE 双向回归",
+  "src": "master:10GUSB",
+  "dst": "agent:SGMII2.5G",
+  "direction": "bidir",
+  "transports": ["udp"],
+  "streams": 5,
+  "rate_mode": "verify",
+  "rate_targets_mbps": {"ab": 2350, "ba": 2200}
+}
+```
+
+#### `rate_check` 参数
+
+| 字段 | 默认 | 含义 |
+|------|------|------|
+| `sample_interval_ms` | 1000 | RX/TX 连续采样周期，限制为 200～5000ms |
+| `background_secs` | 3 | 起流前背景基线采样；统计会扣除中位背景流量 |
+| `startup_timeout_secs` | 15 | 允许失败流快速重试及建立共同窗口的启动阶段 |
+| `settle_secs` | 5 | 达到最低活跃流数后丢弃的稳定等待时间 |
+| `launch_interval_ms` | 50 | 流之间错峰启动间隔；双向按流序号交错 |
+| `min_concurrent_streams` | 2 | 多流测试允许正式计分的绝对最低流数 |
+| `min_active_ratio` | 0.9 | 请求流数的最低活跃比例 |
+| `offered_headroom_pct` | 5 | 验证目标所需的发送负载余量 |
+| `flow_retries` | 1 | startup 阶段组级 server/client 重启次数 |
+| `discovery_step_secs` | 10 | discover 每个负载阶梯的保持时间 |
+| `evb_usb_to_eth_target_mbps` | 6400 | EVB USB/NCM → 10G 以太方向的目标 |
+| `evb_eth_to_usb_target_mbps` | 8400 | EVB 10G 以太 → USB/NCM 方向的目标 |
+| `cpe_path_ceiling_mbps` | 2500 | RNDIS/SGMII2.5G/受限 CPE 路径的默认负载上限，不是 PASS 目标 |
+| `max_udp_loss_pct` | null | 可选 UDP 丢包率上限；null 表示不作为门槛 |
+
+完整的人工与自动验收矩阵见 [UDP并发灌包验收场景.md](UDP并发灌包验收场景.md)。
+
 ---
 
 ## 模块架构
@@ -297,7 +404,7 @@ cpe_test/
 │   │
 │   ├── agent/
 │   │   ├── mod.rs
-│   │   └── server.rs        # REST server（tiny_http），16 线线程池
+│   │   └── server.rs        # REST server（16 worker）+ 非阻塞 iperf client job API
 │   │
 │   ├── master/
 │   │   ├── mod.rs
@@ -310,18 +417,19 @@ cpe_test/
 │   │   ├── classify.rs      # 角色分类（纯逻辑，不分平台）
 │   │   ├── scan_windows.rs  # ipconfig + GetIfTable2 + netsh wlan
 │   │   ├── scan_macos.rs    # ifconfig + system_profiler + networksetup
-│   │   └── monitor.rs       # NIC RX 监控（GetIfTable2/netstat -ibn；含独立连续监控模式）
+│   │   └── monitor.rs       # NIC RX/TX 连续采样（Windows/macOS/Linux）
 │   │
 │   ├── cmd/
 │   │   ├── mod.rs
 │   │   ├── ipconfig.rs      # 解析 ipconfig /all（中英文）
 │   │   ├── netsh.rs         # 解析 netsh wlan show interfaces
-│   │   └── iperf.rs         # iperf3 命令构造 + 文本输出解析 + server 进程管理
+│   │   └── iperf.rs         # iperf3 解析、流事件、server 和异步 client job 管理
 │   │
 │   ├── ping.rs              # ping 命令构造 + 执行 + 输出解析
 │   │                        # （中/英/BSD 三格式，白名单策略排除 ICMP 错误应答）
 │   ├── protocol.rs          # HTTP JSON 请求/响应类型定义
 │   ├── config.rs            # JSON 配置文件加载
+│   ├── rate.rs              # EVB/CPE 路径上限、已知/未知速率目标策略
 │   ├── util.rs              # 子进程(超时/GBK)、日志、时间、辅助函数
 │   ├── http_client.rs       # 极简 HTTP/1.1 客户端（零第三方依赖）
 │   ├── screenshot.rs        # 截图（Windows GDI / macOS screencapture）
@@ -336,6 +444,7 @@ cpe_test/
 │   └── start_master.bat
 │
 ├── NIC_README.md             # 网卡扫描技术详解
+├── UDP并发灌包验收场景.md     # UDP 重构人工/自动验收矩阵
 ├── README.md
 └── 使用说明.md               # 小白版图文教程
 ```
@@ -361,10 +470,12 @@ cpe_test/
 1. 主控启动 → 扫描本机 + POST `/info` 获取辅测机网卡
 2. 配置文件或交互菜单 → 生成 `SpecNorm`（src/dst/方向/协议/流数）
 3. builder → 解析角色名称为具体 IP，分配端口，生成 `Unit` 列表
-4. executor → 逐个执行单元，并发跑多腿（bidir/UDP 多流）
-   - 接收端启动 RX 监控 → 启动 iperf3 server → 
-   - 发送端跑 iperf3 client → 停下 server + 监控 → 
-   - 收集结果 → 保存到 `task_results.json`
+4. executor → 逐个执行单元；UDP 单流/多流/双向统一调度
+   - 所有方向的 server 全量预启动，失败时快速重试
+   - 每个唯一端点只启动一个 RX/TX 连续采样器并采背景基线
+   - 双向流按序号交错启动；远端 client 通过 `/iperf/client/start|status|stop` 后台作业执行
+   - 根据 Traffic/Retry/Ended 事件重建活跃流时间线，取双向共同有效窗口
+   - 分开计算 AB/BA 的 TX/RX 平均、P10、覆盖率、丢包率与原因码
 5. 全部完成后生成 HTML 报告 + 自动打开
 
 ---
@@ -378,8 +489,8 @@ WIFI5G           是 WiFi 且频段 = 5GHz
 WIFI2.4G         是 WiFi 且频段 = 2.4GHz
 WIFI6G           是 WiFi 且频段 = 6GHz
 WIFI             是 WiFi 但频段未知
-10GUSB           描述含 "usb" 且速率 4001-12000 Mbps（兼容 4.2G bug）
-RNDIS            描述含 "rndis" / "remote ndis"
+10GUSB           高速 USB/NCM，速率 4001-12000 Mbps（兼容 NCM 4.2G bug）
+RNDIS            描述含 "rndis" / "remote ndis"，优先于 USB/10G 字样
 10GETH           速率 9000-12000 Mbps（描述不含 USB）
 SGMII2.5G        速率 2400-2600 Mbps
 SGMII1G          速率 900-1100 Mbps
@@ -409,6 +520,7 @@ UNKNOWN          以上都不匹配
 
 - 两端都尝试截图，全部成功则报告中出现多个 `查看截图` 链接
 - 辅测机不存盘，传完即丢（无磁盘残留）
+- 请求失败、HTTP 状态异常、JSON/Base64 解析失败、截图 API 报错和本地写文件失败，都会把具体原因写入 `master_日期时间.log`
 
 ### 报告列
 
@@ -417,8 +529,12 @@ UNKNOWN          以上都不匹配
 | 时间 / Task ID / Parent ID | 任务标识 |
 | 任务 / IP / 传输 / 参数 | 测试描述 |
 | 源/目标 PC / 接口 / IP | 网络端点 |
-| 结果 | PASS / FAIL / SKIP |
-| 接收网卡平均 Mbps | **网卡口径实测吞吐**（最准确） |
+| 结果 | PASS / RATE_FAIL / UNSTABLE / MEASURED / NOT_EVALUATED / SETUP_ERROR / SKIP |
+| 执行状态 / 原因码 / 原因详情 | 区分性能不达标、负载不足、窗口不足、连接或采样环境异常 |
+| 请求/活跃/要求流、重试 | 展示真实并发建立情况；2 流只通 1 流时可直接定位 |
+| 目标、TX 均值/P10 | 验证是否向 CPE 提供了足够 offered load |
+| 接收网卡平均/P10/中位/P95/最低/最高 Mbps | **共同有效窗口内的网卡口径吞吐** |
+| 有效/要求秒、采样覆盖率 | 验证是否取得完整 180 秒有效窗口 |
 | 对向接收 Mbps | 双向时对端实测吞吐 |
 | iperf 发送/接收 Mbps | iperf3 自报速率 |
 | UDP/Ping 丢包率 | 丢包百分比 |
@@ -435,7 +551,7 @@ UNKNOWN          以上都不匹配
 cpe_test master --auto --resume
 ```
 
-跳过依据：`task_results.json` 中 task_id（MD5 稳定哈希）的 ok=true 且时间 < 24h。
+跳过依据：`task_results.json` 中 task_id（MD5 稳定哈希）的 ok=true 且时间 < 24h。只有正式 `PASS` 会写入可跳过状态；`MEASURED`、`NOT_EVALUATED` 等不会被当成已通过。
 
 ---
 
@@ -454,7 +570,7 @@ cpe_test master --auto --resume
 | 接口枚举 | `ipconfig /all` | `ifconfig -a` |
 | 速率 | `GetIfTable2` API | `ifconfig -m` 解析 media 行 |
 | WiFi | `netsh wlan show interfaces` | `networksetup` + `system_profiler` |
-| RX 监控 | `GetIfTable2.InOctets` | `netstat -ibn` |
+| RX/TX 监控 | `GetIfTable2.InOctets/OutOctets` | `netstat -ibn` 的 Ibytes/Obytes |
 
 ### ping 输出解析
 
@@ -550,10 +666,18 @@ cargo build --release
 
 ### UDP 大档位没生成任务
 
-默认按发送口速率裁剪。关掉 `limit_udp_by_link_speed` 即可。
+默认按整条路径的可信负载上限裁剪：RNDIS/SGMII2.5G 约 2.5G、SGMII1G 约 1G，WiFi 取协商速率与 2.5G 的较小值。关掉 `limit_udp_by_link_speed` 可以强制生成，但可能只是在制造发送端拥塞，不建议作为正式验收口径。
+
+### 2 条 UDP 流只通了 1 条，会不会直接判性能 FAIL
+
+不会。失败流会先在启动阶段重试；若最终仍是 1/2，报告为 `NOT_EVALUATED / ACTIVE_STREAMS_LOW`，表示 offered load 搭建不足。该轮不会拿单流速率判断 CPE 吞吐，也不会写入 RESUME PASS。
+
+### 20/32 条流是否仍会被 agent 的 16 worker 分两批
+
+不会。`/iperf/client/start` 只创建后台作业并立即返回，长时间运行的 iperf3 不占 HTTP worker；主控通过 status 轮询事件。日志中的 `[UDP进度] active=...` 和报告“请求/活跃/要求流”可验证实际并发数。
 
 ### 截图空白/无
 
 - Windows agent 需要 GDI 授权（通常首次跑会自动弹窗）
 - macOS 终端需要系统设置 → 隐私 → 屏幕录制 授权
-- 可忽略，不影响测试结果
+- 截图失败不改变吞吐判定；具体 API/HTTP/解析/写盘原因会记录在 `master_日期时间.log`

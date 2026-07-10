@@ -1,7 +1,9 @@
 //! 解析 `ipconfig /all` 输出（Windows，中英文兼容，GBK 已在 run_cmd 解码）
 
+#[cfg(windows)]
 use crate::util::run_cmd;
 use regex::Regex;
+#[cfg(windows)]
 use std::time::Duration;
 
 #[derive(Debug, Clone, Default)]
@@ -16,6 +18,7 @@ pub struct IpcfgAdapter {
     pub disconnected: bool,
 }
 
+#[cfg(windows)]
 pub fn scan() -> Vec<IpcfgAdapter> {
     let out = run_cmd("ipconfig", &["/all"], Duration::from_secs(20));
     parse(&out.merged())
@@ -80,10 +83,11 @@ pub fn parse(text: &str) -> Vec<IpcfgAdapter> {
                         a.ipv6_ll = Some(vl.clone());
                     }
                 }
-            } else if (vl.starts_with('2') || vl.starts_with('3')) && vl.contains(':') {
-                if a.ipv6_global.is_none() {
-                    a.ipv6_global = Some(vl.split('%').next().unwrap_or(&vl).to_string());
-                }
+            } else if (vl.starts_with('2') || vl.starts_with('3'))
+                && vl.contains(':')
+                && a.ipv6_global.is_none()
+            {
+                a.ipv6_global = Some(vl.split('%').next().unwrap_or(&vl).to_string());
             }
         } else if (key.contains("媒体状态") || key_l.contains("media state"))
             && (val.contains("已断开") || val.to_lowercase().contains("disconnected"))

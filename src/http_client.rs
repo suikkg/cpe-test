@@ -63,7 +63,9 @@ fn request(
     let mut line_buf = String::new();
     loop {
         line_buf.clear();
-        let n = reader.read_line(&mut line_buf).map_err(|e| format!("读头失败: {e}"))?;
+        let n = reader
+            .read_line(&mut line_buf)
+            .map_err(|e| format!("读头失败: {e}"))?;
         if n == 0 {
             return Err("连接意外关闭".into());
         }
@@ -75,8 +77,10 @@ fn request(
     }
 
     let head_text = head_lines.join("\r\n");
-    let status = parse_status(&head_lines.first().unwrap_or(&String::new()))?;
-    let is_chunked = head_text.to_lowercase().contains("transfer-encoding: chunked");
+    let status = parse_status(head_lines.first().map(String::as_str).unwrap_or(""))?;
+    let is_chunked = head_text
+        .to_lowercase()
+        .contains("transfer-encoding: chunked");
 
     // 读响应体
     let body_str = if is_chunked {
@@ -86,9 +90,13 @@ fn request(
         let mut buf = Vec::new();
         if let Some(len) = cl {
             buf.resize(len, 0);
-            reader.read_exact(&mut buf).map_err(|e| format!("读响应体失败: {e}"))?;
+            reader
+                .read_exact(&mut buf)
+                .map_err(|e| format!("读响应体失败: {e}"))?;
         } else {
-            reader.read_to_end(&mut buf).map_err(|e| format!("读响应体失败: {e}"))?;
+            reader
+                .read_to_end(&mut buf)
+                .map_err(|e| format!("读响应体失败: {e}"))?;
         }
         String::from_utf8_lossy(&buf).into_owned()
     };
@@ -102,7 +110,9 @@ fn read_chunked_body<R: BufRead>(reader: &mut R) -> Result<String, String> {
     let mut size_buf = String::new();
     loop {
         size_buf.clear();
-        reader.read_line(&mut size_buf).map_err(|e| format!("读 chunk 大小失败: {e}"))?;
+        reader
+            .read_line(&mut size_buf)
+            .map_err(|e| format!("读 chunk 大小失败: {e}"))?;
         let size_str = size_buf.trim();
         // 可能有 chunk extension (;...)
         let size_str = size_str.split(';').next().unwrap_or(size_str);
@@ -114,7 +124,9 @@ fn read_chunked_body<R: BufRead>(reader: &mut R) -> Result<String, String> {
             break;
         }
         let mut chunk_data = vec![0u8; size];
-        reader.read_exact(&mut chunk_data).map_err(|e| format!("读 chunk 数据失败: {e}"))?;
+        reader
+            .read_exact(&mut chunk_data)
+            .map_err(|e| format!("读 chunk 数据失败: {e}"))?;
         out.extend_from_slice(&chunk_data);
         // 读掉 chunk 后的 \r\n
         let _ = reader.read_line(&mut String::new());

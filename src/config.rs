@@ -13,7 +13,7 @@ pub struct Config {
     pub ipv4_prefixes: Vec<String>,
     /// 跨机 iperf 要求两端同 /24（ping 不受限）
     pub require_same_subnet_for_iperf: bool,
-    /// UDP 按发送口协商速率裁剪档位（WiFi 发送口不裁剪）
+    /// UDP 按整条路径的可信负载上限裁剪档位/流数。
     pub limit_udp_by_link_speed: bool,
     /// 每个 iperf 任务结束后在接收端截图
     pub screenshot: bool,
@@ -38,15 +38,6 @@ pub struct Config {
 pub enum Pairs {
     All(String),
     List(Vec<PairSpec>),
-}
-
-impl Pairs {
-    pub fn is_all(&self) -> bool {
-        match self {
-            Pairs::All(s) => s.trim() == "all",
-            _ => false,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,6 +70,12 @@ pub struct UniversalParams {
     pub tcp_windows: Option<Vec<String>>,
     #[serde(default)]
     pub udp_profiles: Option<Vec<UdpProfile>>,
+    /// auto / verify / observe / discover
+    #[serde(default)]
+    pub rate_mode: Option<RateMode>,
+    /// 双向可分别配置 ab/ba；单向可用 forward。
+    #[serde(default)]
+    pub rate_targets_mbps: Option<RateTargets>,
 }
 
 impl Default for Config {
@@ -110,12 +107,13 @@ pub struct IperfCfg {
     pub tcp_windows: Vec<String>,
     /// UDP 带宽档位
     pub udp_profiles: Vec<UdpProfile>,
+    pub rate_check: RateCheckCfg,
 }
 
 impl Default for IperfCfg {
     fn default() -> Self {
         IperfCfg {
-            duration: 120,
+            duration: 180,
             tcp_windows: vec!["64k".into(), "1m".into(), "4m".into()],
             udp_profiles: vec![
                 UdpProfile::bw("1m"),
@@ -127,6 +125,87 @@ impl Default for IperfCfg {
                 },
                 UdpProfile::bw("2500m"),
             ],
+            rate_check: RateCheckCfg::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RateMode {
+    #[default]
+    Auto,
+    Verify,
+    Observe,
+    Discover,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct RateTargets {
+    pub forward: Option<f64>,
+    pub ab: Option<f64>,
+    pub ba: Option<f64>,
+}
+
+impl RateTargets {
+    pub fn for_direction(&self, direction: &str) -> Option<f64> {
+        match direction {
+            "ab" => self.ab.or(self.forward),
+            "ba" => self.ba.or(self.forward),
+            _ => self.forward,
+        }
+        .filter(|v| v.is_finite() && *v > 0.0)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RateCheckCfg {
+    pub mode: RateMode,
+    pub targets_mbps: RateTargets,
+    pub sample_interval_ms: u64,
+    pub background_secs: u64,
+    pub startup_timeout_secs: u64,
+    pub settle_secs: u64,
+    pub launch_interval_ms: u64,
+    pub min_concurrent_streams: u32,
+    pub min_active_ratio: f64,
+    pub offered_headroom_pct: f64,
+    pub flow_retries: u32,
+    pub discovery_step_secs: u64,
+    /// EVB 10GUSB/NCM -> 10GETH 的已知接收目标。
+    /// 兼容旧字段 evb_usb_tx_target_mbps（以 USB 发送方向命名）。
+    #[serde(alias = "evb_usb_tx_target_mbps")]
+    pub evb_usb_to_eth_target_mbps: f64,
+    /// EVB 10GETH -> 10GUSB/NCM 的已知接收目标。
+    /// 兼容旧字段 evb_usb_rx_target_mbps（以 USB 接收方向命名）。
+    #[serde(alias = "evb_usb_rx_target_mbps")]
+    pub evb_eth_to_usb_target_mbps: f64,
+    /// RNDIS/SGMII2.5G/受限 CPE 子网的默认负载上限，不直接作为 PASS 目标。
+    pub cpe_path_ceiling_mbps: f64,
+    pub max_udp_loss_pct: Option<f64>,
+}
+
+impl Default for RateCheckCfg {
+    fn default() -> Self {
+        Self {
+            mode: RateMode::Auto,
+            targets_mbps: RateTargets::default(),
+            sample_interval_ms: 1000,
+            background_secs: 3,
+            startup_timeout_secs: 15,
+            settle_secs: 5,
+            launch_interval_ms: 50,
+            min_concurrent_streams: 2,
+            min_active_ratio: 0.90,
+            offered_headroom_pct: 5.0,
+            flow_retries: 1,
+            discovery_step_secs: 10,
+            evb_usb_to_eth_target_mbps: 6400.0,
+            evb_eth_to_usb_target_mbps: 8400.0,
+            cpe_path_ceiling_mbps: 2500.0,
+            max_udp_loss_pct: None,
         }
     }
 }
@@ -227,6 +306,10 @@ pub struct TestSpec {
     pub tcp_windows: Option<Vec<String>>,
     #[serde(default)]
     pub udp_profiles: Option<Vec<UdpProfile>>,
+    #[serde(default)]
+    pub rate_mode: Option<RateMode>,
+    #[serde(default)]
+    pub rate_targets_mbps: Option<RateTargets>,
 }
 
 fn default_direction() -> OneOrMany {
@@ -342,10 +425,13 @@ mod tests {
     fn test_defaults() {
         let c = Config::default();
         assert_eq!(c.agent_port, 28801);
-        assert_eq!(c.iperf.duration, 120);
+        assert_eq!(c.iperf.duration, 180);
         assert_eq!(c.iperf.tcp_windows, vec!["64k", "1m", "4m"]);
         assert_eq!(c.iperf.udp_profiles.len(), 5);
         assert_eq!(c.ping.count, 100);
+        assert_eq!(c.iperf.rate_check.mode, RateMode::Auto);
+        assert_eq!(c.iperf.rate_check.evb_usb_to_eth_target_mbps, 6400.0);
+        assert_eq!(c.iperf.rate_check.evb_eth_to_usb_target_mbps, 8400.0);
     }
 
     #[test]
@@ -391,5 +477,82 @@ mod tests {
             length: Some("64".into()),
         };
         assert_eq!(p.label(), "UDP -b 1000m -l 64");
+    }
+
+    #[test]
+    fn test_rate_check_parse() {
+        let j = r#"{
+            "iperf": {
+                "rate_check": {
+                    "mode": "verify",
+                    "targets_mbps": {"ab": 6400, "ba": 8400},
+                    "min_active_ratio": 0.8,
+                    "flow_retries": 2
+                }
+            }
+        }"#;
+        let c: Config = serde_json::from_str(j).unwrap();
+        assert_eq!(c.iperf.rate_check.mode, RateMode::Verify);
+        assert_eq!(c.iperf.rate_check.targets_mbps.ab, Some(6400.0));
+        assert_eq!(c.iperf.rate_check.targets_mbps.ba, Some(8400.0));
+        assert_eq!(c.iperf.rate_check.min_active_ratio, 0.8);
+        assert_eq!(c.iperf.rate_check.flow_retries, 2);
+    }
+
+    #[test]
+    fn test_per_scenario_rate_mode_and_targets_parse() {
+        let j = r#"{
+            "universal_params": {
+                "rate_mode": "discover",
+                "rate_targets_mbps": {"forward": 2500}
+            },
+            "tests": [{
+                "name": "evb",
+                "src": "master:10GUSB",
+                "dst": "agent:10GETH",
+                "rate_mode": "verify",
+                "rate_targets_mbps": {"ab": 6400, "ba": 8400}
+            }]
+        }"#;
+        let c: Config = serde_json::from_str(j).unwrap();
+        let universal = c.universal_params.unwrap();
+        assert_eq!(universal.rate_mode, Some(RateMode::Discover));
+        assert_eq!(universal.rate_targets_mbps.unwrap().forward, Some(2500.0));
+        assert_eq!(c.tests[0].rate_mode, Some(RateMode::Verify));
+        assert_eq!(
+            c.tests[0].rate_targets_mbps.as_ref().unwrap().ab,
+            Some(6400.0)
+        );
+        assert_eq!(
+            c.tests[0].rate_targets_mbps.as_ref().unwrap().ba,
+            Some(8400.0)
+        );
+    }
+
+    #[test]
+    fn test_evb_direction_target_names_and_legacy_aliases() {
+        let current: Config = serde_json::from_str(
+            r#"{
+                "iperf": {"rate_check": {
+                    "evb_usb_to_eth_target_mbps": 6100,
+                    "evb_eth_to_usb_target_mbps": 8300
+                }}
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(current.iperf.rate_check.evb_usb_to_eth_target_mbps, 6100.0);
+        assert_eq!(current.iperf.rate_check.evb_eth_to_usb_target_mbps, 8300.0);
+
+        let legacy: Config = serde_json::from_str(
+            r#"{
+                "iperf": {"rate_check": {
+                    "evb_usb_tx_target_mbps": 6200,
+                    "evb_usb_rx_target_mbps": 8200
+                }}
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.iperf.rate_check.evb_usb_to_eth_target_mbps, 6200.0);
+        assert_eq!(legacy.iperf.rate_check.evb_eth_to_usb_target_mbps, 8200.0);
     }
 }

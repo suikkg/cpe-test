@@ -168,14 +168,88 @@ pub struct IperfClientReq {
 pub struct IperfClientOut {
     pub ok: bool,
     pub timed_out: bool,
+    #[serde(default)]
+    pub cancelled: bool,
     pub cmd: String,
     pub output: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum IperfEventKind {
+    #[default]
+    Started,
+    Connected,
+    Traffic,
+    Retry,
+    Error,
+    Ended,
+}
+
+/// iperf3 实时事件。elapsed_ms 以单个 client job 启动为零点，
+/// 主控可叠加本地 launch offset，避免直接比较两台机器的系统时钟。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct IperfFlowEvent {
+    pub kind: IperfEventKind,
+    pub elapsed_ms: u64,
+    #[serde(default)]
+    pub mbps: Option<f64>,
+    #[serde(default)]
+    pub line: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct IperfClientStartReq {
+    pub request: IperfClientReq,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct IperfClientStartOut {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct IperfClientStatusReq {
+    pub id: String,
+    /// 从该事件下标开始返回，避免长测试反复传输全部 interval。
+    #[serde(default)]
+    pub cursor: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct IperfClientStatusOut {
+    pub id: String,
+    pub done: bool,
+    pub next_cursor: usize,
+    #[serde(default)]
+    pub events: Vec<IperfFlowEvent>,
+    /// 仅 done=true 时返回最终结果。
+    #[serde(default)]
+    pub result: Option<IperfClientOut>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct IperfClientStopReq {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct IperfClientStopOut {
+    pub existed: bool,
+    pub was_done: bool,
 }
 
 // ---------- /monitor ----------
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MonitorStartReq {
     pub iface: String,
+    /// 连续采样周期。默认 1000ms，Windows 可按需降低到 500ms。
+    #[serde(default = "default_monitor_interval_ms")]
+    pub interval_ms: u64,
+}
+
+fn default_monitor_interval_ms() -> u64 {
+    1000
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -191,8 +265,32 @@ pub struct MonitorStopReq {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MonitorStopOut {
     pub avg_mbps: f64,
+    #[serde(default)]
+    pub tx_avg_mbps: f64,
     pub seconds: f64,
     pub bytes: u64,
+    #[serde(default)]
+    pub tx_bytes: u64,
+    #[serde(default)]
+    pub samples: Vec<MonitorSample>,
+    #[serde(default)]
+    pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MonitorSample {
+    /// 以 monitor start 为零点，避免依赖两台机器系统时钟同步。
+    pub elapsed_ms: u64,
+    pub interval_ms: u64,
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+    pub rx_delta_bytes: u64,
+    pub tx_delta_bytes: u64,
+    pub rx_mbps: f64,
+    pub tx_mbps: f64,
+    pub valid: bool,
+    #[serde(default)]
+    pub error: String,
 }
 
 // ---------- /screenshot ----------

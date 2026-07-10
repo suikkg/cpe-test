@@ -7,3 +7,7 @@ config.json
 .cpe_last_agent
 cpe_win_pkg.zip
 cpe_test_v3.0.0_未验证.zip
+
+# 本地系统与 IDE 元数据
+.DS_Store
+.idea/

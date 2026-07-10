@@ -1,11 +1,12 @@
 //! agent REST server（tiny_http，固定线程池，无 async）
 //!
 //! 端点（全部 POST JSON，另有 GET /health）：
-//!   /info /ping /iperf/server/start /iperf/server/stop /iperf/client/run
+//!   /info /ping /iperf/server/start /iperf/server/stop
+//!   /iperf/client/run（兼容） /iperf/client/start /status /stop
 //!   /monitor/start /monitor/stop /screenshot /health
 //! 响应统一 {"ok":bool,"error":...,"data":{...}}，HTTP 状态恒 200。
 
-use crate::cmd::iperf::IperfServerMgr;
+use crate::cmd::iperf::{IperfClientJobMgr, IperfServerMgr};
 use crate::config::Config;
 use crate::nic::monitor::MonitorMgr;
 use crate::nic::scan_host;
@@ -23,11 +24,13 @@ const WORKERS: usize = 16;
 const MAX_BODY: u64 = 100 * 1024 * 1024;
 /// 每 30 秒清理一次过期状态（见 PROJECT_PLAN）
 const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
-const SERVER_MAX_AGE: Duration = Duration::from_secs(600);
-const MONITOR_MAX_AGE: Duration = Duration::from_secs(1800);
+const SERVER_MAX_AGE: Duration = Duration::from_secs(90_000);
+const CLIENT_JOB_MAX_AGE: Duration = Duration::from_secs(90_000);
+const MONITOR_MAX_AGE: Duration = Duration::from_secs(90_000);
 
 pub struct AgentState {
     pub servers: IperfServerMgr,
+    pub clients: IperfClientJobMgr,
     pub monitors: MonitorMgr,
     pub default_prefixes: Vec<String>,
 }
@@ -35,7 +38,10 @@ pub struct AgentState {
 /// 启动 agent（阻塞不返回）
 pub fn run(port: u16, cfg: &Config) {
     println!("==============================================");
-    println!("  CPE 子网测试工具 v{} — 辅测 agent", env!("CARGO_PKG_VERSION"));
+    println!(
+        "  CPE 子网测试工具 v{} — 辅测 agent",
+        env!("CARGO_PKG_VERSION")
+    );
     println!("==============================================");
 
     match find_iperf3() {
@@ -79,6 +85,7 @@ pub fn run(port: u16, cfg: &Config) {
     let server = Arc::new(server);
     let state = Arc::new(AgentState {
         servers: IperfServerMgr::new(),
+        clients: IperfClientJobMgr::new(),
         monitors: MonitorMgr::new(),
         default_prefixes: cfg.ipv4_prefixes.clone(),
     });
@@ -101,6 +108,7 @@ pub fn run(port: u16, cfg: &Config) {
     loop {
         std::thread::sleep(SWEEP_INTERVAL);
         state.servers.sweep(SERVER_MAX_AGE);
+        state.clients.sweep(CLIENT_JOB_MAX_AGE);
         state.monitors.sweep(MONITOR_MAX_AGE);
     }
 }
@@ -160,7 +168,10 @@ fn route(method: &Method, url: &str, body: &str, st: &Arc<AgentState>) -> String
                 Ok(r) => r,
                 Err(e) => return e,
             };
-            println!("    执行 ping: {} -> {} (n={})", req.src, req.dst, req.count);
+            println!(
+                "    执行 ping: {} -> {} (n={})",
+                req.src, req.dst, req.count
+            );
             ok_json(ping::run(&req))
         }
         (Method::Post, "/iperf/server/start") => {
@@ -208,12 +219,44 @@ fn route(method: &Method, url: &str, body: &str, st: &Arc<AgentState>) -> String
             });
             ok_json(out)
         }
+        (Method::Post, "/iperf/client/start") => {
+            let req: IperfClientStartReq = match parse(body) {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
+            let Some(bin) = find_iperf3() else {
+                return err_json("辅测机未找到 iperf3，请把 iperf3.exe 放到 agent 程序同目录");
+            };
+            let id = st.clients.start(bin, req.request);
+            println!("    iperf3 client 异步作业已创建: {id}");
+            ok_json(IperfClientStartOut { id })
+        }
+        (Method::Post, "/iperf/client/status") => {
+            let req: IperfClientStatusReq = match parse(body) {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
+            match st.clients.status(&req.id, req.cursor) {
+                Ok(out) => ok_json(out),
+                Err(e) => err_json(&e),
+            }
+        }
+        (Method::Post, "/iperf/client/stop") => {
+            let req: IperfClientStopReq = match parse(body) {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
+            match st.clients.stop(&req.id) {
+                Ok((existed, was_done)) => ok_json(IperfClientStopOut { existed, was_done }),
+                Err(e) => err_json(&e),
+            }
+        }
         (Method::Post, "/monitor/start") => {
             let req: MonitorStartReq = match parse(body) {
                 Ok(r) => r,
                 Err(e) => return e,
             };
-            match st.monitors.start(&req.iface) {
+            match st.monitors.start(&req.iface, req.interval_ms) {
                 Ok(id) => ok_json(MonitorStartOut { id }),
                 Err(e) => err_json(&e),
             }

@@ -1,7 +1,9 @@
 //! 解析 `netsh wlan show interfaces`（Windows WiFi 频段/SSID/状态，中英文兼容）
 
+#[cfg(windows)]
 use crate::util::run_cmd;
 use regex::Regex;
+#[cfg(windows)]
 use std::time::Duration;
 
 #[derive(Debug, Clone, Default)]
@@ -14,6 +16,7 @@ pub struct WlanInfo {
     pub connected: bool,
 }
 
+#[cfg(windows)]
 pub fn scan() -> Vec<WlanInfo> {
     let out = run_cmd(
         "netsh",
@@ -48,7 +51,10 @@ pub fn parse(text: &str) -> Vec<WlanInfo> {
         if key_l == "ssid" {
             // 排除 BSSID（key 精确等于 SSID 才算）
             w.ssid = val.to_string();
-        } else if key_l == "band" || key.contains("频带") || key.contains("带区") || key.contains("波段")
+        } else if key_l == "band"
+            || key.contains("频带")
+            || key.contains("带区")
+            || key.contains("波段")
         {
             w.band = normalize_band(val);
         } else if key_l == "state" || key == "状态" {

@@ -4,9 +4,7 @@
 use crate::cmd::iperf::IperfServerMgr;
 use crate::config::{load_config, Config};
 use crate::http_client;
-use crate::master::builder::{
-    self, build_units, Endpoint, Side, SpecNorm, Unit,
-};
+use crate::master::builder::{self, build_units, Endpoint, Side, SpecNorm, Unit};
 use crate::master::executor::{Ctx, ResultDb};
 use crate::nic::monitor::MonitorMgr;
 use crate::nic::{format_nic_table, scan_host};
@@ -163,10 +161,7 @@ pub fn run_master(opts: MasterOpts) -> i32 {
         } else {
             let c = choose_single(
                 "检测到配置文件里有 tests，选择配置方式:",
-                &[
-                    "按配置文件执行(推荐)".into(),
-                    "交互式选择".into(),
-                ],
+                &["按配置文件执行(推荐)".into(), "交互式选择".into()],
                 0,
             );
             c == 0
@@ -200,7 +195,8 @@ pub fn run_master(opts: MasterOpts) -> i32 {
 
     // ---- 生成任务单元 ----
     let mut next_port = builder::PORT_BASE;
-    let (mut units, notices) = build_units(&specs, cfg.require_same_subnet_for_iperf, &mut next_port);
+    let (mut units, notices) =
+        build_units(&specs, cfg.require_same_subnet_for_iperf, &mut next_port);
     for n in &notices {
         logln(&format!("提示: {n}"));
     }
@@ -255,8 +251,6 @@ pub fn run_master(opts: MasterOpts) -> i32 {
         agent_host: agent_host.clone(),
         agent_port: cfg.agent_port,
         cfg: cfg.clone(),
-        master_pc: master_info.hostname.clone(),
-        agent_pc: agent_info.hostname.clone(),
         outdir,
         local_servers: IperfServerMgr::new(),
         local_monitors: MonitorMgr::new(),
@@ -292,10 +286,14 @@ pub fn run_master(opts: MasterOpts) -> i32 {
     }
 
     logln(&format!(
-        "\n========== 全部完成 ==========\n单元总数: {}  PASS: {}  FAIL: {}  跳过: {}  耗时: {}",
-        sum.pass + sum.fail + sum.skip,
+        "\n========== 全部完成 ==========\n单元总数: {}  PASS: {}  FAIL: {}  UNSTABLE: {}  MEASURED: {}  NOT_EVALUATED: {}  SETUP_ERROR: {}  跳过: {}  耗时: {}",
+        sum.pass + sum.fail + sum.measured + sum.skip,
         sum.pass,
         sum.fail,
+        sum.unstable,
+        sum.measured,
+        sum.not_evaluated,
+        sum.setup_error,
         sum.skip,
         elapsed
     ));
@@ -340,11 +338,7 @@ fn agent_info(host: &str, port: u16, prefixes: &[String]) -> Result<HostInfo, St
 
 // ---------------- 交互式任务构建 ----------------
 
-fn interactive_build_specs(
-    cfg: &Config,
-    master: &HostInfo,
-    agent: &HostInfo,
-) -> Vec<SpecNorm> {
+fn interactive_build_specs(cfg: &Config, master: &HostInfo, agent: &HostInfo) -> Vec<SpecNorm> {
     let mode = choose_single(
         "选择配置方式:",
         &[
@@ -436,10 +430,7 @@ fn interactive_build_specs(
 }
 
 /// 配对枚举：跨机同角色 + 主控同机两两 + 辅测同机两两
-fn enumerate_pairs(
-    master: &HostInfo,
-    agent: &HostInfo,
-) -> Vec<(Endpoint, Endpoint, String)> {
+fn enumerate_pairs(master: &HostInfo, agent: &HostInfo) -> Vec<(Endpoint, Endpoint, String)> {
     let mut out = Vec::new();
     let mep = |n: &crate::protocol::NicInfo| Endpoint {
         side: Side::Master,
@@ -464,22 +455,14 @@ fn enumerate_pairs(
     for i in 0..master.interfaces.len() {
         for j in (i + 1)..master.interfaces.len() {
             let (a, b) = (&master.interfaces[i], &master.interfaces[j]);
-            out.push((
-                mep(a),
-                mep(b),
-                format!("主控同机 {}<->{}", a.role, b.role),
-            ));
+            out.push((mep(a), mep(b), format!("主控同机 {}<->{}", a.role, b.role)));
         }
     }
     // 辅测同机
     for i in 0..agent.interfaces.len() {
         for j in (i + 1)..agent.interfaces.len() {
             let (a, b) = (&agent.interfaces[i], &agent.interfaces[j]);
-            out.push((
-                aep(a),
-                aep(b),
-                format!("辅测同机 {}<->{}", a.role, b.role),
-            ));
+            out.push((aep(a), aep(b), format!("辅测同机 {}<->{}", a.role, b.role)));
         }
     }
     out
@@ -530,36 +513,57 @@ fn generate_specs_from_pairs(
                 continue;
             }
         };
-        let directions = default_params.as_ref()
+        let directions = default_params
+            .as_ref()
             .map(|p| p.directions.directions())
             .unwrap_or_else(|| vec!["ab".into()]);
-        let kinds = default_params.as_ref()
+        let kinds = default_params
+            .as_ref()
             .map(|p| p.kinds.clone())
             .unwrap_or_else(|| vec!["iperf".into()]);
-        let transports = default_params.as_ref()
-            .and_then(|p| if !p.transports.is_empty() { Some(p.transports.clone()) } else { None })
+        let transports = default_params
+            .as_ref()
+            .and_then(|p| {
+                if !p.transports.is_empty() {
+                    Some(p.transports.clone())
+                } else {
+                    None
+                }
+            })
             .unwrap_or_else(|| vec!["tcp".into()]);
-        let ipvers = default_params.as_ref()
+        let ipvers = default_params
+            .as_ref()
             .map(|p| p.ip.clone())
             .unwrap_or_else(|| vec!["v4".into()]);
-        let streams = default_params.as_ref()
-            .map(|p| p.streams)
-            .unwrap_or(1);
-        let duration = default_params.as_ref()
+        let streams = default_params.as_ref().map(|p| p.streams).unwrap_or(1);
+        let duration = default_params
+            .as_ref()
             .and_then(|p| p.iperf_duration)
             .unwrap_or(cfg.iperf.duration);
-        let ping_count = default_params.as_ref()
+        let ping_count = default_params
+            .as_ref()
             .and_then(|p| p.ping_count)
             .unwrap_or(cfg.ping.count);
-        let payload_sizes = default_params.as_ref()
+        let payload_sizes = default_params
+            .as_ref()
             .and_then(|p| p.ping_payload_sizes.clone())
             .unwrap_or_else(|| cfg.ping.payload_sizes.clone());
-        let tcp_windows = default_params.as_ref()
+        let tcp_windows = default_params
+            .as_ref()
             .and_then(|p| p.tcp_windows.clone())
             .unwrap_or_else(|| cfg.iperf.tcp_windows.clone());
-        let udp_profiles = default_params.as_ref()
+        let udp_profiles = default_params
+            .as_ref()
             .and_then(|p| p.udp_profiles.clone())
             .unwrap_or_else(|| cfg.iperf.udp_profiles.clone());
+        let rate_mode = default_params
+            .as_ref()
+            .and_then(|p| p.rate_mode)
+            .unwrap_or(cfg.iperf.rate_check.mode);
+        let rate_targets = default_params
+            .as_ref()
+            .and_then(|p| p.rate_targets_mbps.clone())
+            .unwrap_or_default();
 
         out.push(SpecNorm {
             name: format!("{}<->{}", p.master, p.agent),
@@ -576,6 +580,9 @@ fn generate_specs_from_pairs(
             tcp_windows,
             udp_profiles,
             udp_limit: cfg.limit_udp_by_link_speed,
+            rate_mode,
+            rate_targets,
+            rate_check: cfg.iperf.rate_check.clone(),
         });
     }
     out
@@ -619,11 +626,7 @@ fn ask_universal_params(cfg: &Config, mode: usize) -> UniversalParams {
 
     let kind_sel = choose_single(
         "测试类型:",
-        &[
-            "灌包 iperf3".into(),
-            "ping 连通".into(),
-            "灌包+ping".into(),
-        ],
+        &["灌包 iperf3".into(), "ping 连通".into(), "灌包+ping".into()],
         0,
     );
     let kinds: Vec<String> = match kind_sel {
@@ -681,8 +684,11 @@ fn ask_universal_params(cfg: &Config, mode: usize) -> UniversalParams {
         cfg.iperf.duration
     };
     let (ping_count, payload_sizes) = if kinds.iter().any(|k| k == "ping") {
-        let c = ask_int(&format!("ping 包数(默认{}): ", cfg.ping.count), cfg.ping.count as u64)
-            .clamp(1, 100_000) as u32;
+        let c = ask_int(
+            &format!("ping 包数(默认{}): ", cfg.ping.count),
+            cfg.ping.count as u64,
+        )
+        .clamp(1, 100_000) as u32;
         let p = ask_ints_csv(
             &format!(
                 "ping -l 负载字节数逗号分隔(默认{}): ",
@@ -735,6 +741,9 @@ fn spec_from_params(
         tcp_windows: cfg.iperf.tcp_windows.clone(),
         udp_profiles: cfg.iperf.udp_profiles.clone(),
         udp_limit: p.udp_limit,
+        rate_mode: cfg.iperf.rate_check.mode,
+        rate_targets: cfg.iperf.rate_check.targets_mbps.clone(),
+        rate_check: cfg.iperf.rate_check.clone(),
     }
 }
 
@@ -787,7 +796,10 @@ fn choose_multi(title: &str, options: &[String], defaults: &[usize]) -> Vec<usiz
     }
     let def_str: Vec<String> = defaults.iter().map(|d| (d + 1).to_string()).collect();
     loop {
-        let inp = ask(&format!("多选(逗号分隔, 回车=默认[{}]): ", def_str.join(",")));
+        let inp = ask(&format!(
+            "多选(逗号分隔, 回车=默认[{}]): ",
+            def_str.join(",")
+        ));
         if inp.trim().is_empty() {
             return defaults.to_vec();
         }
@@ -817,10 +829,7 @@ fn ask_ints_csv(prompt: &str, default: &[u32]) -> Vec<u32> {
         if inp.trim().is_empty() {
             return default.to_vec();
         }
-        let parsed: Result<Vec<u32>, _> = inp
-            .split(',')
-            .map(|s| s.trim().parse::<u32>())
-            .collect();
+        let parsed: Result<Vec<u32>, _> = inp.split(',').map(|s| s.trim().parse::<u32>()).collect();
         match parsed {
             Ok(v) if !v.is_empty() => return v,
             _ => logln("!! 请输入逗号分隔的数字，如 32,1400"),
