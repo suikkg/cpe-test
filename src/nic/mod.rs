@@ -38,7 +38,7 @@ pub fn scan_host(ipv4_prefixes: &[String]) -> HostInfo {
 }
 
 /// IPv4 是否匹配任一前缀（前缀列表为空 = 全放行）
-#[cfg(any(windows, target_os = "macos", test))]
+#[cfg(any(windows, target_os = "macos"))]
 pub fn ipv4_match(ip: &str, prefixes: &[String]) -> bool {
     if prefixes.is_empty() {
         return true;
