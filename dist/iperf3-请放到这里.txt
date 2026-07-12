@@ -1,0 +1,7 @@
+此发布包不内置第三方 iperf3 Windows 二进制。
+
+如需运行 iperf 灌包测试，请将与测试电脑架构匹配的 iperf3 Windows 发行包中
+iperf3.exe 以及其同目录全部 DLL，一起复制到本文件所在目录（即 cpe_test.exe 同目录）。
+
+常见发行版依赖 cygwin1.dll；只复制 iperf3.exe 可能无法启动。
+只运行 ping 测试时不需要 iperf3。

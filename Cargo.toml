@@ -1,6 +1,6 @@
 [package]
 name = "cpe_test"
-version = "4.0.0"
+version = "4.1.0"
 edition = "2021"
 description = "CPE 子网测试工具：主控/辅测双机自动化 ping + iperf3 灌包测试"
 
@@ -22,6 +22,7 @@ windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
     "Win32_System_Console",
     "Win32_Graphics_Gdi",
     "Win32_UI_WindowsAndMessaging",

@@ -4,11 +4,11 @@
 use crate::cmd::iperf::IperfServerMgr;
 use crate::config::{load_config, Config};
 use crate::http_client;
-use crate::master::builder::{self, build_units, Endpoint, Side, SpecNorm, Unit};
-use crate::master::executor::{Ctx, ResultDb};
+use crate::master::builder::{self, build_units, Endpoint, LegKind, Side, SpecNorm, Unit};
+use crate::master::executor::{Ctx, IperfPreflightBlock, ResultDb};
 use crate::nic::monitor::MonitorMgr;
 use crate::nic::{format_nic_table, scan_host};
-use crate::protocol::{HealthOut, HostInfo, InfoReq, Resp};
+use crate::protocol::{HealthOut, HostInfo, InfoReq, Resp, RELIABLE_LIFECYCLE_CAPABILITY};
 use crate::report::{write_report, ReportMeta};
 use crate::util::{
     ask, find_iperf3, iperf3_version, log_to_file, logln, now_compact, now_full, open_path,
@@ -31,6 +31,7 @@ pub struct MasterOpts {
 }
 
 const LAST_AGENT_FILE: &str = ".cpe_last_agent";
+const IPERF_PREFLIGHT_FAILED: &str = "IPERF_PREFLIGHT_FAILED";
 
 pub fn run_master(opts: MasterOpts) -> i32 {
     let (mut cfg, cfg_path) = load_config(opts.config_path.as_deref());
@@ -115,6 +116,14 @@ pub fn run_master(opts: MasterOpts) -> i32 {
         health.os,
         health.version,
         health.iperf3.clone().unwrap_or_else(|| "未找到!".into())
+    ));
+    logln(&format!(
+        "辅测机协议能力: {}",
+        if health.capabilities.is_empty() {
+            "未声明（旧版 agent）".into()
+        } else {
+            health.capabilities.join(", ")
+        }
     ));
 
     // ---- 双端扫描 ----
@@ -227,6 +236,33 @@ pub fn run_master(opts: MasterOpts) -> i32 {
                 Err(e) => logln(&format!("!! {e}")),
             }
         }
+    } else {
+        logln(&format!("\n[auto] 共 {} 个任务，直接开始执行", units.len()));
+        for (i, u) in units.iter().enumerate() {
+            logln(&format!("  [{}] {}", i + 1, u.title));
+        }
+    }
+
+    // 灌包前置条件失败时，不启动任何 iperf 进程；对应单元由执行器原位标记为
+    // SETUP_ERROR，纯 Ping 单元仍按原顺序运行，避免诊断能力被灌包依赖连带阻断。
+    let iperf_preflight = iperf_preflight_block(&units, &health, local_iperf.is_some());
+    if let Some(block) = &iperf_preflight {
+        let blocked = units.iter().filter(|unit| unit_has_iperf(unit)).count();
+        let remaining = units.len().saturating_sub(blocked);
+        logln(&format!(
+            "!! 灌包前置检查未通过：{}: {}",
+            block.reason_code, block.reason_detail
+        ));
+        logln(&format!(
+            "!! {blocked} 个 iperf 单元将标记为 SETUP_ERROR，且不会启动 iperf3 进程。"
+        ));
+        if remaining > 0 {
+            logln(&format!("继续执行其余 {remaining} 个 Ping 单元。"));
+        } else {
+            logln("所选任务中没有可直接执行的 Ping 单元；记录灌包失败后，程序仍会按故障诊断策略决定是否追加 Ping。");
+        }
+    }
+    if !opts.auto {
         let c = ask(&format!(
             "已选 {} 个任务，确认执行? (回车=开始, n=取消): ",
             units.len()
@@ -234,11 +270,6 @@ pub fn run_master(opts: MasterOpts) -> i32 {
         if c.eq_ignore_ascii_case("n") {
             logln("已取消。");
             return 1;
-        }
-    } else {
-        logln(&format!("\n[auto] 共 {} 个任务，直接开始执行", units.len()));
-        for (i, u) in units.iter().enumerate() {
-            logln(&format!("  [{}] {}", i + 1, u.title));
         }
     }
 
@@ -257,8 +288,31 @@ pub fn run_master(opts: MasterOpts) -> i32 {
         rows: Mutex::new(Vec::new()),
         db: Mutex::new(ResultDb::load(PathBuf::from("task_results.json"))),
     };
-    let sum = ctx.run_all(&units);
-    ctx.local_servers.stop_all();
+    let mut sum = ctx.run_all_with_preflight(&units, iperf_preflight.as_ref());
+    if sum.needs_iperf_failure_diagnostics() {
+        let diagnostics = builder::build_iperf_failure_diagnostics(&units);
+        logln(&format!(
+            "\n!! 本轮 {} 个 iperf 单元没有产生任何有效速率测量（其中 SETUP_ERROR={}）。",
+            sum.iperf_units, sum.iperf_setup_errors
+        ));
+        if diagnostics.is_empty() {
+            logln("!! 无法从所选 iperf 任务提取可用的 IPv4 端点，未生成自动 Ping 诊断。");
+        } else {
+            logln(&format!(
+                "开始追加 {} 个故障诊断：每个唯一 IPv4 方向使用 32 字节短 Ping，并对涉及网卡绑定源地址 Ping IPv4 网关。",
+                diagnostics.len()
+            ));
+            for (index, unit) in diagnostics.iter().enumerate() {
+                logln(&format!("  [诊断 {}] {}", index + 1, unit.title));
+            }
+            let diagnostic_summary = ctx.run_all_from(&diagnostics, units.len());
+            sum.merge(diagnostic_summary);
+        }
+    }
+    let final_cleanup_errors = ctx.local_servers.stop_all();
+    for error in &final_cleanup_errors {
+        logln(&format!("!! 主控最终资源清理未确认: {error}"));
+    }
 
     // ---- 报告 ----
     let elapsed_s = t0.elapsed().as_secs();
@@ -286,7 +340,7 @@ pub fn run_master(opts: MasterOpts) -> i32 {
     }
 
     logln(&format!(
-        "\n========== 全部完成 ==========\n单元总数: {}  PASS: {}  FAIL: {}  UNSTABLE: {}  MEASURED: {}  NOT_EVALUATED: {}  SETUP_ERROR: {}  跳过: {}  耗时: {}",
+        "\n========== 全部完成 ==========\n单元总数: {}  PASS: {}  FAIL: {}  UNSTABLE: {}  MEASURED: {}  NOT_EVALUATED: {}  SETUP_ERROR: {}  跳过: {}  最终清理错误: {}  耗时: {}",
         sum.pass + sum.fail + sum.measured + sum.skip,
         sum.pass,
         sum.fail,
@@ -295,16 +349,71 @@ pub fn run_master(opts: MasterOpts) -> i32 {
         sum.not_evaluated,
         sum.setup_error,
         sum.skip,
+        final_cleanup_errors.len(),
         elapsed
     ));
     if cfg.open_report && report_path.exists() {
         open_path(&report_path);
     }
-    if sum.fail > 0 {
+    if sum.fail > 0 || !final_cleanup_errors.is_empty() {
         1
     } else {
         0
     }
+}
+
+fn unit_has_iperf(unit: &Unit) -> bool {
+    unit.legs.iter().any(|leg| {
+        matches!(
+            &leg.kind,
+            LegKind::IperfSingle(_) | LegKind::IperfGroup { .. }
+        )
+    })
+}
+
+fn units_have_iperf(units: &[Unit]) -> bool {
+    units.iter().any(unit_has_iperf)
+}
+
+fn iperf_preflight_block(
+    units: &[Unit],
+    health: &HealthOut,
+    local_iperf_available: bool,
+) -> Option<IperfPreflightBlock> {
+    if !units_have_iperf(units) {
+        return None;
+    }
+
+    let mut reasons = Vec::new();
+    if !agent_supports_reliable_lifecycle(health) {
+        let version = if health.version.trim().is_empty() {
+            "未知版本"
+        } else {
+            health.version.as_str()
+        };
+        reasons.push(format!(
+            "辅测机 agent {version} 缺少可靠灌包生命周期能力 {RELIABLE_LIFECYCLE_CAPABILITY}，请替换为与主控配套的新版 agent"
+        ));
+    }
+    if !local_iperf_available {
+        reasons.push("主控机未找到 iperf3，请安装或将 iperf3 放到主控程序同目录".into());
+    }
+    if health.iperf3.is_none() {
+        reasons
+            .push("辅测机未找到 iperf3，请安装或将 iperf3.exe 及配套 DLL 放到 agent 同目录".into());
+    }
+
+    (!reasons.is_empty()).then(|| IperfPreflightBlock {
+        reason_code: IPERF_PREFLIGHT_FAILED.into(),
+        reason_detail: reasons.join("；"),
+    })
+}
+
+fn agent_supports_reliable_lifecycle(health: &HealthOut) -> bool {
+    health
+        .capabilities
+        .iter()
+        .any(|capability| capability == RELIABLE_LIFECYCLE_CAPABILITY)
 }
 
 // ---------------- agent 通讯（连接阶段） ----------------
@@ -832,7 +941,137 @@ fn ask_ints_csv(prompt: &str, default: &[u32]) -> Vec<u32> {
         let parsed: Result<Vec<u32>, _> = inp.split(',').map(|s| s.trim().parse::<u32>()).collect();
         match parsed {
             Ok(v) if !v.is_empty() => return v,
-            _ => logln("!! 请输入逗号分隔的数字，如 32,1400"),
+            _ => logln("!! 请输入逗号分隔的数字，如 32,1600,65500"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::RateMode;
+    use crate::master::builder::{IperfTask, Leg, PingPurpose, PingTask};
+    use crate::protocol::NicInfo;
+
+    fn endpoint(side: Side, name: &str) -> Endpoint {
+        Endpoint {
+            side,
+            pc: side.cn().into(),
+            nic: NicInfo {
+                name: name.into(),
+                ipv4: "127.0.0.1".into(),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn ping_unit() -> Unit {
+        let master = endpoint(Side::Master, "master0");
+        let agent = endpoint(Side::Agent, "agent0");
+        Unit {
+            id: "ping-only".into(),
+            title: "ping-only".into(),
+            bidir: false,
+            est_secs: 1,
+            legs: vec![Leg {
+                tag: String::new(),
+                kind: LegKind::Ping(PingTask {
+                    v6: false,
+                    src: master.clone(),
+                    dst: agent.clone(),
+                    count: 1,
+                    payload: 32,
+                    purpose: PingPurpose::SubnetTest,
+                }),
+            }],
+        }
+    }
+
+    fn iperf_unit() -> Unit {
+        let master = endpoint(Side::Master, "master0");
+        let agent = endpoint(Side::Agent, "agent0");
+        Unit {
+            id: "iperf".into(),
+            title: "iperf".into(),
+            bidir: false,
+            est_secs: 1,
+            legs: vec![Leg {
+                tag: String::new(),
+                kind: LegKind::IperfSingle(IperfTask {
+                    v6: false,
+                    udp: true,
+                    profile_name: "udp".into(),
+                    profile_label: "UDP".into(),
+                    src: master,
+                    dst: agent,
+                    port: 56_000,
+                    duration: 1,
+                    extra: Vec::new(),
+                    stream_idx: 0,
+                    rate_mode: RateMode::Auto,
+                    rx_target_mbps: None,
+                    offered_mbps: None,
+                }),
+            }],
+        }
+    }
+
+    fn ready_health() -> HealthOut {
+        HealthOut {
+            version: "4.0.0".into(),
+            iperf3: Some("iperf 3.x".into()),
+            capabilities: vec![RELIABLE_LIFECYCLE_CAPABILITY.into()],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn iperf_capability_gate_distinguishes_ping_only_and_old_agents() {
+        let ping_only = ping_unit();
+        let iperf = iperf_unit();
+        assert!(!units_have_iperf(std::slice::from_ref(&ping_only)));
+        assert!(units_have_iperf(&[ping_only, iperf]));
+
+        let old_agent = HealthOut::default();
+        assert!(!agent_supports_reliable_lifecycle(&old_agent));
+        let current_agent = ready_health();
+        assert!(agent_supports_reliable_lifecycle(&current_agent));
+    }
+
+    #[test]
+    fn ping_only_is_never_blocked_by_iperf_preflight() {
+        let decision = iperf_preflight_block(&[ping_unit()], &HealthOut::default(), false);
+        assert_eq!(decision, None);
+    }
+
+    #[test]
+    fn mixed_selection_collects_all_iperf_preflight_failures() {
+        let health = HealthOut {
+            version: "3.0.0".into(),
+            ..Default::default()
+        };
+        let decision = iperf_preflight_block(&[ping_unit(), iperf_unit()], &health, false)
+            .expect("混合任务中的 iperf 应被前置阻断");
+
+        assert_eq!(decision.reason_code, IPERF_PREFLIGHT_FAILED);
+        assert!(decision
+            .reason_detail
+            .contains(RELIABLE_LIFECYCLE_CAPABILITY));
+        assert!(decision.reason_detail.contains("主控机未找到 iperf3"));
+        assert!(decision.reason_detail.contains("辅测机未找到 iperf3"));
+    }
+
+    #[test]
+    fn pure_iperf_preflight_failure_produces_an_explicit_block() {
+        let decision = iperf_preflight_block(&[iperf_unit()], &HealthOut::default(), false)
+            .expect("纯 iperf 也必须产生明确失败，不能被当成成功批次");
+        assert_eq!(decision.reason_code, IPERF_PREFLIGHT_FAILED);
+        assert!(!decision.reason_detail.is_empty());
+    }
+
+    #[test]
+    fn ready_iperf_selection_has_no_preflight_block() {
+        let decision = iperf_preflight_block(&[iperf_unit()], &ready_health(), true);
+        assert_eq!(decision, None);
     }
 }

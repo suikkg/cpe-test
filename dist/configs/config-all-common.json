@@ -1,0 +1,14 @@
+{
+  "agent_port": 28801,
+  "ipv4_prefixes": ["192.168."],
+  "require_same_subnet_for_iperf": true,
+  "limit_udp_by_link_speed": true,
+  "screenshot": false,
+  "resume": false,
+  "open_report": true,
+  "iperf": {"duration": 180, "tcp_windows": ["64k", "1m", "4m"], "udp_profiles": [{"bandwidth": "100m"}, {"bandwidth": "500m"}, {"bandwidth": "1000m", "length": "64"}, {"bandwidth": "2500m"}], "rate_check": {"mode": "auto", "sample_interval_ms": 1000, "background_secs": 3, "startup_timeout_secs": 15, "settle_secs": 5, "launch_interval_ms": 50, "min_concurrent_streams": 2, "min_active_ratio": 0.9, "offered_headroom_pct": 5, "flow_retries": 1}},
+  "ping": {"count": 100, "payload_sizes": [32, 1600, 65500]},
+  "pairs": [{"master": "10GUSB", "agent": "10GETH"}, {"master": "SGMII1G", "agent": "SGMII1G"}, {"master": "SGMII2.5G", "agent": "SGMII2.5G"}, {"master": "WIFI5G", "agent": "WIFI5G"}],
+  "universal_params": {"directions": ["A->B", "B->A", "bidir"], "kinds": ["iperf", "ping"], "transports": ["tcp", "udp"], "ip": ["v4"], "streams": 5, "iperf_duration": 180, "rate_mode": "auto", "ping_count": 100, "ping_payload_sizes": [32, 1600, 65500]},
+  "tests": []
+}

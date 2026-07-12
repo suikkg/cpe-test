@@ -102,6 +102,10 @@ pub struct Row {
     /// 辅测端截图路径
     pub screenshot_agent: String,
     pub command: String,
+    /// 独立落盘的 iperf client/server/事件原始记录。
+    pub raw_log: String,
+    /// 独立落盘的 OS 网卡累计计数器逐样本 CSV。
+    pub nic_samples: String,
     /// (标题, 原始输出)
     pub raws: Vec<(String, String)>,
     pub is_grouptotal: bool,
@@ -138,6 +142,14 @@ fn screenshot_link(path: &str) -> String {
         String::new()
     } else {
         format!("<a href=\"{}\">查看截图</a>", esc(path))
+    }
+}
+
+fn artifact_link(path: &str, label: &str) -> String {
+    if path.is_empty() {
+        String::new()
+    } else {
+        format!("<a href=\"{}\">{}</a>", esc(path), esc(label))
     }
 }
 
@@ -373,7 +385,7 @@ summary { cursor: pointer; font-weight: bold; }
 
     h.push_str("<h2>原始输出</h2>\n");
     for r in rows.iter() {
-        if r.raws.is_empty() {
+        if r.raws.is_empty() && r.raw_log.is_empty() && r.nic_samples.is_empty() {
             continue;
         }
         h.push_str(&format!(
@@ -382,6 +394,17 @@ summary { cursor: pointer; font-weight: bold; }
             esc(&r.task),
             r.verdict.label()
         ));
+        if !r.raw_log.is_empty() || !r.nic_samples.is_empty() {
+            let links = [
+                artifact_link(&r.raw_log, "独立原始记录"),
+                artifact_link(&r.nic_samples, "网卡逐样本 CSV"),
+            ]
+            .into_iter()
+            .filter(|link| !link.is_empty())
+            .collect::<Vec<_>>()
+            .join(" · ");
+            h.push_str(&format!("<p>{links}</p>\n"));
+        }
         for (title, text) in &r.raws {
             h.push_str(&format!(
                 "<h3>{}</h3><pre>{}</pre>\n",
@@ -416,6 +439,7 @@ mod tests {
             execution_status: ExecutionStatus::Completed,
             is_unit_summary: true,
             rx_avg: Some(2379.123456),
+            raw_log: "./iperf_outputs/iperf_tcp.log".into(),
             raws: vec![("client".into(), "<output>".into())],
             ..Default::default()
         }];
@@ -426,6 +450,8 @@ mod tests {
         assert!(html.contains("PASS: 1"));
         assert!(html.contains("2379.123"));
         assert!(html.contains("&lt;output&gt;"));
+        assert!(html.contains("./iperf_outputs/iperf_tcp.log"));
+        assert!(html.contains("独立原始记录"));
         let _ = std::fs::remove_file(&p);
         let _ = std::fs::remove_dir(&dir);
     }

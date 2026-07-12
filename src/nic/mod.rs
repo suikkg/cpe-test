@@ -60,6 +60,9 @@ pub fn format_nic_table(side: &str, host: &HostInfo) -> String {
         if !n.wifi_band.is_empty() {
             extra.push(n.wifi_band.clone());
         }
+        if !n.gateway_v4.is_empty() {
+            extra.push(format!("gw:{}", n.gateway_v4));
+        }
         if !n.ipv6_ll.is_empty() {
             extra.push(format!("v6:{}", n.ipv6_ll));
         }

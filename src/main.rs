@@ -225,7 +225,7 @@ fn print_help() {
   config.json                 配置文件（可选，同目录）
   report_*.html               测试报告
   task_results.json           结果库（RESUME 用）
-  iperf_outputs/              截图等输出
+  iperf_outputs/              iperf 原文、NIC 逐样本 CSV、截图等附件
 "#,
         env!("CARGO_PKG_VERSION")
     );

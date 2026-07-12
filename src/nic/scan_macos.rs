@@ -9,6 +9,7 @@ use crate::protocol::NicInfo;
 use crate::util::run_cmd;
 use regex::Regex;
 use std::collections::HashMap;
+use std::net::Ipv4Addr;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Default)]
@@ -141,6 +142,30 @@ fn airport_info() -> (String, u64) {
     (band, rate)
 }
 
+fn parse_route_gateway_v4(text: &str) -> String {
+    text.lines()
+        .find_map(|line| {
+            let gateway = line.trim().strip_prefix("gateway:")?.trim();
+            let addr = gateway.parse::<Ipv4Addr>().ok()?;
+            (!addr.is_unspecified()).then(|| addr.to_string())
+        })
+        .unwrap_or_default()
+}
+
+/// 按 BSD 接口作用域获取默认网关，避免把另一张同时在线网卡的默认路由误配过来。
+fn probe_gateway_v4(iface: &str) -> String {
+    let out = run_cmd(
+        "route",
+        &["-n", "get", "-inet", "-ifscope", iface, "default"],
+        Duration::from_secs(5),
+    );
+    if out.ok {
+        parse_route_gateway_v4(&out.stdout)
+    } else {
+        String::new()
+    }
+}
+
 pub fn scan_all(prefixes: &[String]) -> Vec<NicInfo> {
     let text = run_cmd("ifconfig", &["-a"], Duration::from_secs(10)).stdout;
     let blocks = parse_ifconfig(&text);
@@ -191,6 +216,7 @@ pub fn scan_all(prefixes: &[String]) -> Vec<NicInfo> {
             description: port_name,
             role,
             ipv4: b.ipv4.clone().unwrap_or_default(),
+            gateway_v4: probe_gateway_v4(&b.name),
             ipv6_ll: b.ipv6_ll.clone().unwrap_or_default(),
             ipv6_global: b.ipv6_global.clone().unwrap_or_default(),
             zone: b.name.clone(), // macOS 的 v6 zone 就是接口名
@@ -230,5 +256,19 @@ en5: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
         assert_eq!(v[1].ipv6_global.as_deref(), Some("2408:8207:aabb:ccdd::1"));
         assert!(!v[1].inactive);
         assert!(v[2].inactive);
+    }
+
+    #[test]
+    fn test_parse_route_gateway_v4() {
+        let route = r#"   route to: default
+destination: default
+       mask: default
+    gateway: 192.168.8.1
+  interface: en0
+"#;
+        assert_eq!(parse_route_gateway_v4(route), "192.168.8.1");
+        assert!(parse_route_gateway_v4("gateway: 0.0.0.0\n").is_empty());
+        assert!(parse_route_gateway_v4("gateway: fe80::1%en0\n").is_empty());
+        assert!(parse_route_gateway_v4("route: not in table\n").is_empty());
     }
 }

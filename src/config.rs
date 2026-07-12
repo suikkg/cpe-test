@@ -269,7 +269,7 @@ impl Default for PingCfg {
     fn default() -> Self {
         PingCfg {
             count: 100,
-            payload_sizes: vec![32],
+            payload_sizes: vec![32, 1600, 65500],
         }
     }
 }
@@ -429,6 +429,7 @@ mod tests {
         assert_eq!(c.iperf.tcp_windows, vec!["64k", "1m", "4m"]);
         assert_eq!(c.iperf.udp_profiles.len(), 5);
         assert_eq!(c.ping.count, 100);
+        assert_eq!(c.ping.payload_sizes, vec![32, 1600, 65500]);
         assert_eq!(c.iperf.rate_check.mode, RateMode::Auto);
         assert_eq!(c.iperf.rate_check.evb_usb_to_eth_target_mbps, 6400.0);
         assert_eq!(c.iperf.rate_check.evb_eth_to_usb_target_mbps, 8400.0);
@@ -440,7 +441,7 @@ mod tests {
             "agent_host": "10.228.46.50",
             "ipv4_prefixes": ["192.168.", "10.10."],
             "iperf": {"duration": 60},
-            "ping": {"count": 10, "payload_sizes": [32, 1400]},
+            "ping": {"count": 10, "payload_sizes": [32, 1600, 65500]},
             "tests": [
                 {"name":"t1","src":"master:SGMII2.5G","dst":"agent:SGMII2.5G",
                  "direction":"bidir","kinds":["iperf","ping"],"transports":["tcp","udp"],

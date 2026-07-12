@@ -44,7 +44,7 @@
 
   "ping": {
     "count": 100,
-    "payload_sizes": [32, 1400]
+    "payload_sizes": [32, 1600, 65500]
   },
 
   "pairs": [
@@ -67,7 +67,7 @@
       "ba": null
     },
     "ping_count": 100,
-    "ping_payload_sizes": [32, 1400]
+    "ping_payload_sizes": [32, 1600, 65500]
   },
 
   "tests": []

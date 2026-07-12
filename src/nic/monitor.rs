@@ -4,7 +4,7 @@
 //! 独立连续监控模式：`run_continuous` 按可配置间隔采样，Ctrl+C 时输出
 //! 平均/峰值并写 CSV（不依赖 agent/master 子网测试流程）。
 
-use crate::protocol::{MonitorSample, MonitorStopOut};
+use crate::protocol::{MonitorSample, MonitorStatusOut, MonitorStopOut};
 use std::collections::HashMap;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -265,6 +265,10 @@ fn run_monitor_loop<F>(
 
 struct MonEntry {
     iface: String,
+    /// 资源归属。空字符串表示旧调用点创建的无 owner 监控。
+    owner_id: String,
+    /// 此 entry 自身的租约；0 表示由 `sweep` 传入的 legacy 上限决定。
+    lease_secs: u64,
     start_rx: u64,
     start_tx: u64,
     t0: Instant,
@@ -294,7 +298,32 @@ impl MonitorMgr {
         }
     }
 
+    /// 旧调用点兼容包装；自动化路径使用带 owner/lease 的 start_owned。
+    #[allow(dead_code)]
     pub fn start(&self, iface: &str, interval_ms: u64) -> Result<String, String> {
+        self.start_owned(iface, interval_ms, "", 0)
+    }
+
+    /// 启动带资源归属和动态租约的连续监控。
+    ///
+    /// `owner_id` 用于一个测试单元结束或异常退出时批量回收监控；`lease_secs`
+    /// 为 0 时保持旧行为，由 agent 调用 `sweep` 时传入的 legacy 上限兜底。
+    pub fn start_owned(
+        &self,
+        iface: &str,
+        interval_ms: u64,
+        owner_id: &str,
+        lease_secs: u64,
+    ) -> Result<String, String> {
+        if lease_secs > 0
+            && Instant::now()
+                .checked_add(Duration::from_secs(lease_secs))
+                .is_none()
+        {
+            return Err(format!(
+                "monitor lease_secs={lease_secs} 过大，无法表示截止时间"
+            ));
+        }
         let (start_rx, start_tx) = read_counters(iface)?;
         let interval_ms = interval_ms.clamp(200, 5_000);
         let id = format!("mon{}", self.seq.fetch_add(1, Ordering::SeqCst));
@@ -324,6 +353,8 @@ impl MonitorMgr {
             id.clone(),
             MonEntry {
                 iface: iface.to_string(),
+                owner_id: owner_id.to_string(),
+                lease_secs,
                 start_rx,
                 start_tx,
                 t0,
@@ -334,6 +365,27 @@ impl MonitorMgr {
             },
         );
         Ok(id)
+    }
+
+    /// 返回运行中 monitor 的最近一次样本，不停止采样线程。
+    ///
+    /// `latest_sample` 直接来自 OS 累计字节计数器的相邻差值，可用于实时日志；
+    /// 完整统计和覆盖率仍应以 `stop` 返回的全部样本为准。
+    pub fn status(&self, id: &str) -> Result<MonitorStatusOut, String> {
+        let entries = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = entries
+            .get(id)
+            .ok_or_else(|| format!("监控 ID 不存在: {id}"))?;
+        let samples = entry.samples.lock().unwrap_or_else(|e| e.into_inner());
+        let errors = entry.errors.lock().unwrap_or_else(|e| e.into_inner());
+        Ok(MonitorStatusOut {
+            id: id.to_string(),
+            iface: entry.iface.clone(),
+            sample_count: samples.len(),
+            latest_sample: samples.last().cloned(),
+            error_count: errors.len(),
+            latest_error: errors.last().cloned().unwrap_or_default(),
+        })
     }
 
     pub fn stop(&self, id: &str) -> Result<MonitorStopOut, String> {
@@ -385,12 +437,49 @@ impl MonitorMgr {
         })
     }
 
-    /// 清理超龄监控
-    pub fn sweep(&self, max_age: std::time::Duration) {
-        let expired: Vec<String> = {
-            let g = self.inner.lock().unwrap();
+    /// 停止指定 owner 的全部监控。
+    ///
+    /// 先同时唤醒全部匹配监控，再逐项 join/结算，因此多个端点不会串行各等
+    /// 一个采样周期；一个 entry 的失败也不会阻止其余资源回收。
+    pub fn stop_owner(&self, owner_id: &str) -> Vec<(String, Result<MonitorStopOut, String>)> {
+        let mut targets: Vec<(String, Arc<StopSignal>)> = {
+            let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             g.iter()
-                .filter(|(_, e)| e.t0.elapsed() > max_age)
+                .filter(|(_, entry)| entry.owner_id == owner_id)
+                .map(|(id, entry)| (id.clone(), Arc::clone(&entry.stop)))
+                .collect()
+        };
+        targets.sort_by(|(left, _), (right, _)| left.cmp(right));
+        let stopped_at = Instant::now();
+        for (_, stop) in &targets {
+            stop.request_stop(stopped_at);
+        }
+        targets
+            .into_iter()
+            .map(|(id, _)| id)
+            .map(|id| {
+                let result = self.stop(&id);
+                (id, result)
+            })
+            .collect()
+    }
+
+    /// 清理租约过期的监控。
+    ///
+    /// 新 entry 使用自身 `lease_secs`；旧调用点以 0 表示未设置租约，继续使用
+    /// 调用方传入的 `legacy_max_age`，避免固定短 TTL 误杀合法的长时间测试。
+    pub fn sweep(&self, legacy_max_age: std::time::Duration) {
+        let expired: Vec<String> = {
+            let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            g.iter()
+                .filter(|(_, e)| {
+                    let max_age = if e.lease_secs == 0 {
+                        legacy_max_age
+                    } else {
+                        Duration::from_secs(e.lease_secs)
+                    };
+                    e.t0.elapsed() >= max_age
+                })
                 .map(|(id, _)| id.clone())
                 .collect()
         };
@@ -535,6 +624,31 @@ fn rewrite_csv_with_header(
 mod tests {
     use super::*;
 
+    fn fake_entry(owner_id: &str, lease_secs: u64, age: Duration) -> MonEntry {
+        let t0 = Instant::now() - age;
+        MonEntry {
+            iface: "fake0".into(),
+            owner_id: owner_id.into(),
+            lease_secs,
+            start_rx: 1_000,
+            start_tx: 2_000,
+            t0,
+            stop: Arc::new(StopSignal::new()),
+            samples: Arc::new(Mutex::new(vec![MonitorSample {
+                elapsed_ms: millis_u64(age),
+                interval_ms: millis_u64(age).max(1),
+                rx_bytes: 1_100,
+                tx_bytes: 2_200,
+                rx_delta_bytes: 100,
+                tx_delta_bytes: 200,
+                valid: true,
+                ..Default::default()
+            }])),
+            errors: Arc::new(Mutex::new(Vec::new())),
+            handle: None,
+        }
+    }
+
     const NETSTAT: &str = r#"Name       Mtu   Network       Address            Ipkts Ierrs     Ibytes    Opkts Oerrs     Obytes  Coll
 lo0        16384 <Link#1>                         269362     0   88650008   269362     0   88650008     0
 lo0        16384 127           127.0.0.1          269362     -   88650008   269362     -   88650008     -
@@ -658,5 +772,105 @@ en0        1500  192.168.8     192.168.8.100     9219567     - 9083840014  52962
         assert_eq!(recovered.tx_delta_bytes, 100_000);
         assert!((recovered.rx_mbps - 0.8).abs() < 1e-12);
         assert!((recovered.tx_mbps - 0.4).abs() < 1e-12);
+    }
+
+    #[test]
+    fn stop_owner_stops_only_matching_entries_and_returns_each_result() {
+        let mgr = MonitorMgr::new();
+        {
+            let mut g = mgr.inner.lock().unwrap();
+            g.insert(
+                "mon-owner-a-2".into(),
+                fake_entry("owner-a", 60, Duration::from_secs(2)),
+            );
+            g.insert(
+                "mon-owner-b".into(),
+                fake_entry("owner-b", 60, Duration::from_secs(2)),
+            );
+            g.insert(
+                "mon-owner-a-1".into(),
+                fake_entry("owner-a", 60, Duration::from_secs(2)),
+            );
+        }
+
+        let stopped = mgr.stop_owner("owner-a");
+        assert_eq!(
+            stopped
+                .iter()
+                .map(|(id, _)| id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["mon-owner-a-1", "mon-owner-a-2"]
+        );
+        assert!(stopped.iter().all(|(_, result)| result.is_ok()));
+
+        let g = mgr.inner.lock().unwrap();
+        assert_eq!(g.len(), 1);
+        assert!(g.contains_key("mon-owner-b"));
+    }
+
+    #[test]
+    fn sweep_uses_entry_lease_and_legacy_fallback_independently() {
+        let mgr = MonitorMgr::new();
+        {
+            let mut g = mgr.inner.lock().unwrap();
+            g.insert(
+                "dynamic-expired".into(),
+                fake_entry("dynamic", 1, Duration::from_secs(2)),
+            );
+            g.insert(
+                "dynamic-live".into(),
+                fake_entry("dynamic", 60, Duration::from_secs(2)),
+            );
+            g.insert(
+                "legacy-live".into(),
+                fake_entry("", 0, Duration::from_secs(2)),
+            );
+            g.insert(
+                "legacy-expired".into(),
+                fake_entry("", 0, Duration::from_secs(20)),
+            );
+        }
+
+        mgr.sweep(Duration::from_secs(10));
+
+        let g = mgr.inner.lock().unwrap();
+        assert!(!g.contains_key("dynamic-expired"));
+        assert!(g.contains_key("dynamic-live"));
+        assert!(g.contains_key("legacy-live"));
+        assert!(!g.contains_key("legacy-expired"));
+    }
+
+    #[test]
+    fn monitor_rejects_unrepresentable_dynamic_lease_before_touching_interface() {
+        let mgr = MonitorMgr::new();
+        let error = mgr
+            .start_owned("interface-must-not-be-read", 1_000, "owner", u64::MAX)
+            .unwrap_err();
+        assert!(error.contains("lease_secs"));
+        assert!(error.contains("过大"));
+    }
+
+    #[test]
+    fn status_returns_latest_sample_without_stopping_monitor() {
+        let mgr = MonitorMgr::new();
+        {
+            let mut g = mgr.inner.lock().unwrap();
+            g.insert(
+                "mon-live".into(),
+                fake_entry("owner-live", 60, Duration::from_secs(2)),
+            );
+        }
+
+        let status = mgr.status("mon-live").unwrap();
+        assert_eq!(status.id, "mon-live");
+        assert_eq!(status.iface, "fake0");
+        assert_eq!(status.sample_count, 1);
+        let latest = status.latest_sample.unwrap();
+        assert!(latest.valid);
+        assert_eq!(latest.rx_delta_bytes, 100);
+        assert_eq!(latest.tx_delta_bytes, 200);
+        assert!(mgr.inner.lock().unwrap().contains_key("mon-live"));
+
+        assert!(mgr.status("missing-monitor").is_err());
     }
 }

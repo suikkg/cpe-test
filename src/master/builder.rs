@@ -7,8 +7,11 @@ use crate::config::{Config, RateCheckCfg, RateMode, RateTargets, TestSpec, UdpPr
 use crate::protocol::{HostInfo, NicInfo};
 use crate::rate;
 use crate::util::{md5_hex, same_slash24};
+use std::collections::{BTreeMap, HashSet};
 
 pub const PORT_BASE: u16 = 56000;
+pub const DIAGNOSTIC_PING_COUNT: u32 = 3;
+pub const DIAGNOSTIC_SUBNET_PAYLOAD: u32 = 32;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Side {
@@ -91,6 +94,17 @@ pub struct PingTask {
     pub dst: Endpoint,
     pub count: u32,
     pub payload: u32,
+    pub purpose: PingPurpose,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PingPurpose {
+    /// 配置/交互菜单明确选择的常规子网连通性测试。
+    SubnetTest,
+    /// 所有 iperf 均无有效测量时自动追加的子网诊断。
+    SubnetDiagnostic,
+    /// 异常网卡绑定源地址到该接口 IPv4 网关的载体诊断。
+    GatewayDiagnostic,
 }
 
 #[derive(Clone, Debug)]
@@ -117,6 +131,150 @@ pub struct Unit {
     pub bidir: bool,
     pub legs: Vec<Leg>,
     pub est_secs: u64,
+}
+
+fn subnet_ping_key(src: &Endpoint, dst: &Endpoint, payload: u32) -> String {
+    format!("{}|{}|{payload}", src.key(), dst.key())
+}
+
+/// 当本轮所有 iperf 都没有产生有效测量时，按失败任务涉及的方向和网卡
+/// 构造一组短时、去重的诊断任务：
+///
+/// - 每个唯一 IPv4 方向固定使用 32 字节短 Ping；
+/// - 每块涉及网卡绑定自己的 IPv4 源地址 Ping 自己的 IPv4 网关；
+/// - 已经在本轮选择中的同方向 32 字节常规 Ping 不重复执行；
+/// - 网关为空也保留诊断单元，由执行器报告 GATEWAY_NOT_FOUND，而不是伪装成丢包。
+pub fn build_iperf_failure_diagnostics(selected_units: &[Unit]) -> Vec<Unit> {
+    let mut iperf_tasks = Vec::new();
+    let mut existing_subnet_pings = HashSet::new();
+    for unit in selected_units {
+        for leg in &unit.legs {
+            match &leg.kind {
+                LegKind::IperfSingle(task) => iperf_tasks.push(task.clone()),
+                LegKind::IperfGroup { streams, .. } => {
+                    iperf_tasks.extend(streams.iter().cloned());
+                }
+                LegKind::Ping(task)
+                    if !task.v6 && task.purpose != PingPurpose::GatewayDiagnostic =>
+                {
+                    existing_subnet_pings.insert(subnet_ping_key(
+                        &task.src,
+                        &task.dst,
+                        task.payload,
+                    ));
+                }
+                LegKind::Ping(_) => {}
+            }
+        }
+    }
+    if iperf_tasks.is_empty() {
+        return Vec::new();
+    }
+
+    let mut directions: BTreeMap<String, (Endpoint, Endpoint)> = BTreeMap::new();
+    let mut endpoints: BTreeMap<String, Endpoint> = BTreeMap::new();
+    for task in iperf_tasks {
+        if !task.src.nic.ipv4.is_empty() && !task.dst.nic.ipv4.is_empty() {
+            let direction_key = format!("{}|{}", task.src.key(), task.dst.key());
+            directions
+                .entry(direction_key)
+                .or_insert_with(|| (task.src.clone(), task.dst.clone()));
+        }
+        for endpoint in [&task.src, &task.dst] {
+            if !endpoint.nic.ipv4.is_empty() {
+                endpoints
+                    .entry(endpoint.key())
+                    .or_insert_with(|| endpoint.clone());
+            }
+        }
+    }
+
+    let mut diagnostics = Vec::new();
+    for (src, dst) in directions.into_values() {
+        if existing_subnet_pings.contains(&subnet_ping_key(&src, &dst, DIAGNOSTIC_SUBNET_PAYLOAD)) {
+            continue;
+        }
+        let title = format!(
+            "[故障诊断] 子网 PING V4 -l {} n={} | {} -> {}",
+            DIAGNOSTIC_SUBNET_PAYLOAD,
+            DIAGNOSTIC_PING_COUNT,
+            src.brief(),
+            dst.brief()
+        );
+        let id = md5_hex(&format!(
+            "iperf_failure_subnet_ping_v1|{}|{}|{}",
+            src.key(),
+            dst.key(),
+            DIAGNOSTIC_SUBNET_PAYLOAD
+        ));
+        diagnostics.push(Unit {
+            id,
+            title,
+            bidir: false,
+            legs: vec![Leg {
+                tag: "subnet-diagnostic".into(),
+                kind: LegKind::Ping(PingTask {
+                    v6: false,
+                    src,
+                    dst,
+                    count: DIAGNOSTIC_PING_COUNT,
+                    payload: DIAGNOSTIC_SUBNET_PAYLOAD,
+                    purpose: PingPurpose::SubnetDiagnostic,
+                }),
+            }],
+            est_secs: DIAGNOSTIC_PING_COUNT as u64 + 5,
+        });
+    }
+
+    for endpoint in endpoints.into_values() {
+        let gateway = endpoint.nic.gateway_v4.trim().to_string();
+        let gateway_label = if gateway.is_empty() {
+            "未发现 IPv4 网关".to_string()
+        } else {
+            gateway.clone()
+        };
+        let gateway_endpoint = Endpoint {
+            side: endpoint.side,
+            pc: endpoint.pc.clone(),
+            nic: NicInfo {
+                name: format!("{} 的 IPv4 网关", endpoint.nic.name),
+                description: "IPv4 默认网关".into(),
+                role: "GATEWAY".into(),
+                ipv4: gateway.clone(),
+                ..Default::default()
+            },
+        };
+        let title = format!(
+            "[故障诊断] 网卡/载体 PING 网关 V4 -l 32 n={} | {} -> {}",
+            DIAGNOSTIC_PING_COUNT,
+            endpoint.brief(),
+            gateway_label
+        );
+        let id = md5_hex(&format!(
+            "iperf_failure_gateway_ping_v1|{}|{}",
+            endpoint.key(),
+            gateway
+        ));
+        diagnostics.push(Unit {
+            id,
+            title,
+            bidir: false,
+            legs: vec![Leg {
+                tag: "gateway-diagnostic".into(),
+                kind: LegKind::Ping(PingTask {
+                    v6: false,
+                    src: endpoint,
+                    dst: gateway_endpoint,
+                    count: DIAGNOSTIC_PING_COUNT,
+                    payload: 32,
+                    purpose: PingPurpose::GatewayDiagnostic,
+                }),
+            }],
+            est_secs: DIAGNOSTIC_PING_COUNT as u64 + 5,
+        });
+    }
+
+    diagnostics
 }
 
 /// v6 地址三元组（client 绑定 / client 目标 / server 绑定），link-local 自动带 zone
@@ -801,6 +959,7 @@ pub fn build_units(
                                     dst: (*d).clone(),
                                     count: spec.ping_count,
                                     payload: *payload,
+                                    purpose: PingPurpose::SubnetTest,
                                 }),
                             });
                         }
@@ -1127,14 +1286,129 @@ mod tests {
         let mut spec = base_spec();
         spec.kinds = vec!["ping".into()];
         spec.directions = vec!["ab".into(), "bidir".into()];
-        spec.payload_sizes = vec![32, 1400];
+        spec.payload_sizes = vec![32, 1600, 65500];
         let mut port = PORT_BASE;
         let (units, _) = build_units(&[spec], true, &mut port);
-        // 2 方向 × 2 payload
-        assert_eq!(units.len(), 4);
+        // 2 方向 × 3 payload
+        assert_eq!(units.len(), 6);
         let bidirs: Vec<_> = units.iter().filter(|u| u.bidir).collect();
-        assert_eq!(bidirs.len(), 2);
+        assert_eq!(bidirs.len(), 3);
         assert_eq!(bidirs[0].legs.len(), 2);
+        let payloads: Vec<u32> = units
+            .iter()
+            .filter_map(|unit| match &unit.legs[0].kind {
+                LegKind::Ping(task) => Some(task.payload),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(payloads, vec![32, 1600, 65500, 32, 1600, 65500]);
+    }
+
+    #[test]
+    fn iperf_failure_diagnostics_use_32_bytes_and_both_gateways() {
+        let mut spec = base_spec();
+        spec.src.nic.gateway_v4 = "192.168.1.1".into();
+        spec.dst.nic.gateway_v4 = "192.168.1.254".into();
+        let mut port = PORT_BASE;
+        let (units, _) = build_units(&[spec], true, &mut port);
+        let diagnostics = build_iperf_failure_diagnostics(&units);
+
+        assert_eq!(diagnostics.len(), 3, "1 个子网 Ping + 两端网关");
+        let mut subnet_payloads = Vec::new();
+        let mut gateways = Vec::new();
+        for unit in &diagnostics {
+            let LegKind::Ping(task) = &unit.legs[0].kind else {
+                panic!("诊断单元必须是 Ping");
+            };
+            assert_eq!(task.count, DIAGNOSTIC_PING_COUNT);
+            match task.purpose {
+                PingPurpose::SubnetDiagnostic => {
+                    subnet_payloads.push(task.payload);
+                    assert_eq!(task.src.nic.ipv4, "192.168.1.2");
+                    assert_eq!(task.dst.nic.ipv4, "192.168.1.3");
+                }
+                PingPurpose::GatewayDiagnostic => {
+                    assert_eq!(task.payload, 32);
+                    assert_eq!(task.src.side, task.dst.side);
+                    gateways.push((task.src.nic.ipv4.clone(), task.dst.nic.ipv4.clone()));
+                }
+                PingPurpose::SubnetTest => panic!("自动诊断不应标记为常规 Ping"),
+            }
+        }
+        assert_eq!(subnet_payloads, vec![DIAGNOSTIC_SUBNET_PAYLOAD]);
+        assert!(gateways.contains(&("192.168.1.2".into(), "192.168.1.1".into())));
+        assert!(gateways.contains(&("192.168.1.3".into(), "192.168.1.254".into())));
+    }
+
+    #[test]
+    fn iperf_failure_diagnostics_keep_missing_gateway_for_not_evaluated_report() {
+        let mut spec = base_spec();
+        spec.src.nic.gateway_v4.clear();
+        spec.dst.nic.gateway_v4.clear();
+        let mut port = PORT_BASE;
+        let (units, _) = build_units(&[spec], true, &mut port);
+        let diagnostics = build_iperf_failure_diagnostics(&units);
+
+        let gateway_tasks: Vec<&PingTask> = diagnostics
+            .iter()
+            .filter_map(|unit| match &unit.legs[0].kind {
+                LegKind::Ping(task) if task.purpose == PingPurpose::GatewayDiagnostic => Some(task),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(gateway_tasks.len(), 2);
+        assert!(gateway_tasks
+            .iter()
+            .all(|task| task.dst.nic.ipv4.is_empty()));
+    }
+
+    #[test]
+    fn existing_subnet_ping_is_not_duplicated_by_failure_diagnostics() {
+        let mut spec = base_spec();
+        spec.kinds = vec!["iperf".into(), "ping".into()];
+        spec.payload_sizes = vec![32, 1600, 65500];
+        let mut port = PORT_BASE;
+        let (units, _) = build_units(&[spec], true, &mut port);
+        let diagnostics = build_iperf_failure_diagnostics(&units);
+
+        assert_eq!(
+            diagnostics
+                .iter()
+                .filter(|unit| matches!(
+                    &unit.legs[0].kind,
+                    LegKind::Ping(PingTask {
+                        purpose: PingPurpose::SubnetDiagnostic,
+                        ..
+                    })
+                ))
+                .count(),
+            0
+        );
+        assert_eq!(diagnostics.len(), 2, "仍需检查两端网卡网关");
+    }
+
+    #[test]
+    fn non_32_regular_ping_does_not_suppress_32_byte_failure_diagnostic() {
+        let mut spec = base_spec();
+        spec.kinds = vec!["iperf".into(), "ping".into()];
+        spec.payload_sizes = vec![1600, 65500];
+        let mut port = PORT_BASE;
+        let (units, _) = build_units(&[spec], true, &mut port);
+        let diagnostics = build_iperf_failure_diagnostics(&units);
+
+        let subnet_payloads: Vec<u32> = diagnostics
+            .iter()
+            .filter_map(|unit| match &unit.legs[0].kind {
+                LegKind::Ping(PingTask {
+                    payload,
+                    purpose: PingPurpose::SubnetDiagnostic,
+                    ..
+                }) => Some(*payload),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(subnet_payloads, vec![DIAGNOSTIC_SUBNET_PAYLOAD]);
+        assert_eq!(diagnostics.len(), 3, "32 字节子网 Ping + 两端网关");
     }
 
     #[test]

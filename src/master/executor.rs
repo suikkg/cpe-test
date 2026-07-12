@@ -3,7 +3,9 @@
 use crate::cmd::iperf::{self, IperfServerMgr};
 use crate::config::{Config, RateCheckCfg, RateMode};
 use crate::http_client;
-use crate::master::builder::{v6_addrs, IperfTask, Leg, LegKind, PingTask, Side, Unit};
+use crate::master::builder::{
+    v6_addrs, IperfTask, Leg, LegKind, PingPurpose, PingTask, Side, Unit,
+};
 use crate::nic::monitor::{MonitorMgr, MIN_VALID_RX_MBPS};
 use crate::ping;
 use crate::protocol::*;
@@ -12,8 +14,10 @@ use crate::util::{find_iperf3, logln, md5_hex, now_compact, now_full, sanitize};
 use base64::Engine;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -22,6 +26,11 @@ const MIN_RATE_SAMPLE_COVERAGE: f64 = 0.95;
 const ROLLING_RATE_WINDOW_MS: u64 = 5_000;
 const ROLLING_COVERAGE_TOLERANCE_MS: u64 = 50;
 const FLOW_TIMELINE_TOLERANCE_MS: u64 = 2_000;
+const RESOURCE_LEASE_GRACE_SECS: u64 = 300;
+const RELIABLE_HTTP_ATTEMPTS: usize = 3;
+const RELIABLE_HTTP_RETRY_DELAY: Duration = Duration::from_millis(250);
+const RESOURCE_CLEANUP_WAIT_SECS: u64 = 10;
+static RESOURCE_OWNER_SEQ: AtomicU64 = AtomicU64::new(1);
 
 pub struct Ctx {
     pub agent_host: String,
@@ -34,6 +43,114 @@ pub struct Ctx {
     pub db: Mutex<ResultDb>,
 }
 
+struct UnitResourceGuard<'a> {
+    ctx: &'a Ctx,
+    owner_id: String,
+    remote_resources: bool,
+    armed: bool,
+}
+
+#[derive(Clone, Copy)]
+struct LifecycleLease<'a> {
+    owner_id: &'a str,
+    lease_secs: u64,
+}
+
+impl<'a> UnitResourceGuard<'a> {
+    fn new(ctx: &'a Ctx, owner_id: String, remote_resources: bool) -> Self {
+        Self {
+            ctx,
+            owner_id,
+            remote_resources,
+            armed: true,
+        }
+    }
+
+    fn cleanup_now(&mut self) -> Result<(), String> {
+        match self.cleanup_attempt() {
+            Ok(()) => {
+                self.armed = false;
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn cleanup_attempt(&self) -> Result<(), String> {
+        catch_unwind(AssertUnwindSafe(|| {
+            self.ctx
+                .cleanup_owner_resources(&self.owner_id, self.remote_resources)
+        }))
+        .unwrap_or_else(|payload| {
+            Err(format!(
+                "owner={} 资源清理 panic: {}",
+                self.owner_id,
+                panic_text(payload.as_ref())
+            ))
+        })
+    }
+}
+
+impl Drop for UnitResourceGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            if let Err(e) = self.cleanup_attempt() {
+                logln(&format!(
+                    "    [资源兜底清理失败] owner={}：{}",
+                    self.owner_id, e
+                ));
+            }
+        }
+    }
+}
+
+fn unit_has_iperf(unit: &Unit) -> bool {
+    unit.legs.iter().any(|leg| {
+        matches!(
+            &leg.kind,
+            LegKind::IperfSingle(_) | LegKind::IperfGroup { .. }
+        )
+    })
+}
+
+fn unit_uses_agent_resources(unit: &Unit) -> bool {
+    unit.legs.iter().any(|leg| match &leg.kind {
+        LegKind::IperfSingle(task) => task.src.side == Side::Agent || task.dst.side == Side::Agent,
+        LegKind::IperfGroup { streams, .. } => streams
+            .iter()
+            .any(|task| task.src.side == Side::Agent || task.dst.side == Side::Agent),
+        LegKind::Ping(_) => false,
+    })
+}
+
+fn unit_resource_owner(unit: &Unit, sequence: usize) -> String {
+    let nonce = RESOURCE_OWNER_SEQ.fetch_add(1, Ordering::SeqCst);
+    format!(
+        "unit-{}-{sequence}-{nonce}-{}-{}",
+        std::process::id(),
+        now_compact(),
+        &md5_hex(&unit.id)[..8]
+    )
+}
+
+fn unit_resource_lease_secs(unit: &Unit) -> u64 {
+    unit.est_secs
+        .saturating_add(RESOURCE_LEASE_GRACE_SECS)
+        .max(RESOURCE_LEASE_GRACE_SECS)
+}
+
+fn lifecycle_request_id(owner_id: &str, kind: &str, port: u16, attempt: usize) -> String {
+    format!("{owner_id}:{kind}:{port}:{attempt}")
+}
+
+fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "未知 panic".into())
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct RunSummary {
     pub pass: usize,
@@ -43,6 +160,39 @@ pub struct RunSummary {
     pub setup_error: usize,
     pub unstable: usize,
     pub skip: usize,
+    /// 本轮选择并处理的 iperf 测试单元数（包括被前置检查拦截的单元）。
+    pub iperf_units: usize,
+    /// 至少产生一项有效 iperf/NIC 速率测量的 iperf 单元数。
+    pub iperf_usable_units: usize,
+    /// 最终判为 SETUP_ERROR 的 iperf 单元数。
+    pub iperf_setup_errors: usize,
+}
+
+impl RunSummary {
+    pub fn merge(&mut self, other: RunSummary) {
+        self.pass += other.pass;
+        self.fail += other.fail;
+        self.measured += other.measured;
+        self.not_evaluated += other.not_evaluated;
+        self.setup_error += other.setup_error;
+        self.unstable += other.unstable;
+        self.skip += other.skip;
+        self.iperf_units += other.iperf_units;
+        self.iperf_usable_units += other.iperf_usable_units;
+        self.iperf_setup_errors += other.iperf_setup_errors;
+    }
+
+    /// 只要本轮确实选择了 iperf，但一项有效速率测量都没有，就需要追加
+    /// 子网 Ping 与网卡到网关 Ping，区分网络/载体异常和 iperf 搭建异常。
+    pub fn needs_iperf_failure_diagnostics(&self) -> bool {
+        self.iperf_units > 0 && self.iperf_usable_units == 0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IperfPreflightBlock {
+    pub reason_code: String,
+    pub reason_detail: String,
 }
 
 struct LegOutcome {
@@ -52,6 +202,75 @@ struct LegOutcome {
     rx_avg: Option<f64>,
     main_rows: Vec<usize>,
     tag: String,
+}
+
+fn preflight_block_outcomes(unit: &Unit, block: &IperfPreflightBlock) -> Vec<LegOutcome> {
+    let mut outcomes: Vec<LegOutcome> = unit
+        .legs
+        .iter()
+        .filter_map(|leg| match &leg.kind {
+            LegKind::IperfSingle(_) | LegKind::IperfGroup { .. } => Some(LegOutcome {
+                verdict: Verdict::SetupError,
+                reason_code: block.reason_code.clone(),
+                reason_detail: block.reason_detail.clone(),
+                rx_avg: None,
+                main_rows: Vec::new(),
+                tag: leg.tag.clone(),
+            }),
+            LegKind::Ping(_) => None,
+        })
+        .collect();
+    if outcomes.is_empty() {
+        outcomes.push(LegOutcome {
+            verdict: Verdict::SetupError,
+            reason_code: block.reason_code.clone(),
+            reason_detail: block.reason_detail.clone(),
+            rx_avg: None,
+            main_rows: Vec::new(),
+            tag: String::new(),
+        });
+    }
+    outcomes
+}
+
+fn execute_unit_safely<F, C>(execute: F, cleanup: C) -> Vec<LegOutcome>
+where
+    F: FnOnce() -> Vec<LegOutcome>,
+    C: FnOnce() -> Result<(), String>,
+{
+    let mut outcomes = match catch_unwind(AssertUnwindSafe(execute)) {
+        Ok(outcomes) => outcomes,
+        Err(payload) => {
+            let detail = format!("测试单元执行 panic: {}", panic_text(payload.as_ref()));
+            logln(&format!("    [单元异常隔离] {detail}"));
+            vec![LegOutcome {
+                verdict: Verdict::SetupError,
+                reason_code: "UNIT_PANIC".into(),
+                reason_detail: detail,
+                rx_avg: None,
+                main_rows: vec![],
+                tag: String::new(),
+            }]
+        }
+    };
+    let cleanup_result = catch_unwind(AssertUnwindSafe(cleanup)).unwrap_or_else(|payload| {
+        Err(format!(
+            "测试单元资源清理 panic: {}",
+            panic_text(payload.as_ref())
+        ))
+    });
+    if let Err(error) = cleanup_result {
+        logln(&format!("    [资源清理未确认] {error}"));
+        outcomes.push(LegOutcome {
+            verdict: Verdict::SetupError,
+            reason_code: "RESOURCE_CLEANUP_FAILED".into(),
+            reason_detail: error,
+            rx_avg: None,
+            main_rows: vec![],
+            tag: "cleanup".into(),
+        });
+    }
+    outcomes
 }
 
 #[derive(Clone)]
@@ -95,6 +314,11 @@ struct RateStats {
     min_mbps: Option<f64>,
     max_mbps: Option<f64>,
     coverage: f64,
+    /// 实际可形成的完整 5 秒滚动窗口占理论窗口数的比例。
+    ///
+    /// 总采样覆盖率高并不代表稳定性窗口也完整：一次跨越多个失败周期的
+    /// 恢复样本可以补齐平均速率覆盖，却不能证明其中任意 5 秒都稳定。
+    rolling_coverage: f64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -106,14 +330,39 @@ struct EffectiveWindow {
     complete: bool,
 }
 
-#[derive(Default)]
-struct LiveUdpFlow {
+#[derive(Debug, Clone, Default)]
+struct LiveFlowState {
     connected: bool,
     active: bool,
     ended: bool,
     last_mbps: Option<f64>,
     error: String,
     retries: usize,
+}
+
+struct IperfProgressSnapshot<'a> {
+    protocol: &'a str,
+    tag: &'a str,
+    active: usize,
+    total: usize,
+    connected: usize,
+    ended: usize,
+    nic_rx_mbps: Option<f64>,
+    iperf_mbps: Option<f64>,
+    errors: usize,
+    monitor_error: String,
+}
+
+struct IperfRawArtifact<'a> {
+    owner_id: &'a str,
+    lidx: usize,
+    stream_pos: usize,
+    tag: &'a str,
+    task: &'a IperfTask,
+    client: &'a IperfClientOut,
+    server_output: &'a str,
+    events: &'a [IperfFlowEvent],
+    error: &'a str,
 }
 
 impl Ctx {
@@ -143,14 +392,87 @@ impl Ctx {
             .ok_or_else(|| format!("辅测机 {path} 响应缺少 data"))
     }
 
+    fn agent_post_reliable<TReq: Serialize, TOut: DeserializeOwned>(
+        &self,
+        path: &str,
+        req: &TReq,
+        timeout: Duration,
+    ) -> Result<TOut, String> {
+        let mut errors = Vec::new();
+        for attempt in 1..=RELIABLE_HTTP_ATTEMPTS {
+            match self.agent_post(path, req, timeout) {
+                Ok(out) => return Ok(out),
+                Err(e) => {
+                    errors.push(format!("第{attempt}次: {e}"));
+                    if attempt < RELIABLE_HTTP_ATTEMPTS {
+                        std::thread::sleep(RELIABLE_HTTP_RETRY_DELAY);
+                    }
+                }
+            }
+        }
+        Err(errors.join("；"))
+    }
+
     // ---------------- 双端统一操作 ----------------
 
     fn ping_at(&self, side: Side, req: &PingReq) -> Result<PingOut, String> {
         match side {
             Side::Master => Ok(ping::run(req)),
             Side::Agent => {
-                self.agent_post("/ping", req, Duration::from_secs(req.count as u64 * 5 + 60))
+                let mut out: PingOut =
+                    self.agent_post("/ping", req, Duration::from_secs(req.count as u64 * 5 + 60))?;
+                // 旧版 agent 可能仍把 ICMP Redirect/不可达计入 received。
+                // 主控拿到完整 raw 后统一按当前规则重解析，既兼容旧协议字段，
+                // 也保证本地与远端 Ping 使用同一套 Echo Reply 证据口径。
+                if !out.raw.trim().is_empty() {
+                    let parsed = ping::parse(&out.raw, req.count);
+                    out.ok = parsed.ok;
+                    out.sent = parsed.sent;
+                    out.received = parsed.received;
+                    out.lost = parsed.lost;
+                    out.loss_pct = parsed.loss_pct;
+                    out.rtt_min = parsed.rtt_min;
+                    out.rtt_avg = parsed.rtt_avg;
+                    out.rtt_max = parsed.rtt_max;
+                }
+                Ok(out)
             }
+        }
+    }
+
+    fn cleanup_owner_resources(
+        &self,
+        owner_id: &str,
+        remote_resources: bool,
+    ) -> Result<(), String> {
+        let mut errors = Vec::new();
+
+        if remote_resources {
+            match self.agent_post_reliable::<_, ResourceCleanupOut>(
+                "/resources/cleanup",
+                &ResourceCleanupReq {
+                    owner_id: owner_id.to_string(),
+                    wait_secs: RESOURCE_CLEANUP_WAIT_SECS,
+                },
+                Duration::from_secs(30),
+            ) {
+                Ok(out) => errors.extend(out.errors),
+                Err(e) => errors.push(format!("辅测机 owner 清理未确认: {e}")),
+            }
+        }
+
+        let local_servers = self.local_servers.stop_owner(owner_id, Duration::ZERO);
+        errors.extend(local_servers.errors);
+        for (id, result) in self.local_monitors.stop_owner(owner_id) {
+            if let Err(e) = result {
+                errors.push(format!("主控 monitor {id} 清理失败: {e}"));
+            }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("；"))
         }
     }
 
@@ -160,36 +482,97 @@ impl Ctx {
                 let bin = find_iperf3().ok_or("主控机未找到 iperf3，请把 iperf3 放到程序同目录")?;
                 self.local_servers.start(&bin, req)
             }
-            Side::Agent => self
-                .agent_post::<_, IperfServerStartOut>(
-                    "/iperf/server/start",
-                    req,
-                    Duration::from_secs(40),
-                )
-                .map(|o| o.cmd),
+            Side::Agent => match self.agent_post_reliable::<_, IperfServerStartOut>(
+                "/iperf/server/start",
+                req,
+                Duration::from_secs(40),
+            ) {
+                Ok(out) => Ok(out.cmd),
+                Err(start_error) => {
+                    // start 的响应可能丢失，而进程其实已经启动。用同一个
+                    // request_id 做补偿 stop；精确 stop 不会误杀后续新实例。
+                    let cleanup = if req.request_id.is_empty() {
+                        Ok(IperfServerStopOut::default())
+                    } else {
+                        self.server_stop_confirmed(side, req.port, &req.request_id, Duration::ZERO)
+                    };
+                    Err(match cleanup {
+                        Ok(_) => {
+                            format!("{start_error}（已补偿清理 request_id={}）", req.request_id)
+                        }
+                        Err(cleanup_error) => format!(
+                            "{start_error}；补偿清理 request_id={} 也失败: {cleanup_error}",
+                            req.request_id
+                        ),
+                    })
+                }
+            },
         }
     }
 
-    fn server_stop(&self, side: Side, port: u16) -> IperfServerStopOut {
+    fn server_stop_confirmed(
+        &self,
+        side: Side,
+        port: u16,
+        request_id: &str,
+        wait: Duration,
+    ) -> Result<IperfServerStopOut, String> {
         match side {
-            Side::Master => self.local_servers.stop(port, Duration::from_secs(3)),
+            Side::Master => self
+                .local_servers
+                .stop_checked(port, request_id, wait)
+                .and_then(|out| {
+                    if out.terminated {
+                        Ok(out)
+                    } else {
+                        Err(format!("主控 server 端口 {port} 停止未确认"))
+                    }
+                }),
             Side::Agent => self
-                .agent_post(
+                .agent_post_reliable(
                     "/iperf/server/stop",
-                    &IperfServerStopReq { port, wait_secs: 3 },
+                    &IperfServerStopReq {
+                        port,
+                        wait_secs: wait.as_secs(),
+                        request_id: request_id.to_string(),
+                    },
                     Duration::from_secs(30),
                 )
-                .unwrap_or_else(|e| IperfServerStopOut {
-                    existed: false,
-                    output: format!("(获取 server 输出失败: {e})"),
+                .and_then(|out: IperfServerStopOut| {
+                    if out.terminated {
+                        Ok(out)
+                    } else {
+                        Err(format!("辅测机 server 端口 {port} 停止未确认"))
+                    }
                 }),
         }
+    }
+
+    fn client_stop_confirmed(&self, id: &str) -> Result<IperfClientStopOut, String> {
+        self.agent_post_reliable(
+            "/iperf/client/stop",
+            &IperfClientStopReq {
+                id: id.to_string(),
+                wait_secs: RESOURCE_CLEANUP_WAIT_SECS,
+            },
+            Duration::from_secs(20),
+        )
+        .and_then(|out: IperfClientStopOut| {
+            if out.terminated {
+                Ok(out)
+            } else {
+                Err(format!("远端 client job {id} 停止未确认"))
+            }
+        })
     }
 
     fn client_run_tracked<F>(
         &self,
         side: Side,
         req: &IperfClientReq,
+        owner_id: &str,
+        request_id: &str,
+        lease_secs: u64,
         mut on_event: F,
     ) -> IperfClientOut
     where
@@ -219,44 +602,82 @@ impl Ctx {
                 )
             }
             Side::Agent => {
-                let started: IperfClientStartOut = match self.agent_post(
+                let start_call = Instant::now();
+                let start_req = IperfClientStartReq {
+                    request: req.clone(),
+                    request_id: request_id.to_string(),
+                    owner_id: owner_id.to_string(),
+                    lease_secs,
+                };
+                let started: IperfClientStartOut = match self.agent_post_reliable(
                     "/iperf/client/start",
-                    &IperfClientStartReq {
-                        request: req.clone(),
-                    },
+                    &start_req,
                     Duration::from_secs(20),
                 ) {
                     Ok(v) => v,
                     Err(e) => {
+                        let cleanup = self.client_stop_confirmed(request_id);
                         return IperfClientOut {
-                            output: format!("(远端异步作业启动失败: {e})"),
-                            ..Default::default()
-                        }
-                    }
-                };
-                let deadline = std::time::Instant::now()
-                    + Duration::from_secs(req.duration.saturating_add(180));
-                let mut cursor = 0usize;
-                loop {
-                    if std::time::Instant::now() >= deadline {
-                        let _ = self.agent_post::<_, IperfClientStopOut>(
-                            "/iperf/client/stop",
-                            &IperfClientStopReq {
-                                id: started.id.clone(),
-                            },
-                            Duration::from_secs(10),
-                        );
-                        return IperfClientOut {
-                            timed_out: true,
+                            cancelled: cleanup.is_err(),
                             output: format!(
-                                "(远端异步作业 {} 超过 {} 秒仍未结束)",
-                                started.id,
-                                req.duration.saturating_add(180)
+                                "(远端异步作业启动失败: {e}; 补偿清理: {})",
+                                cleanup
+                                    .map(|_| "已确认".to_string())
+                                    .unwrap_or_else(|cleanup_error| cleanup_error)
                             ),
                             ..Default::default()
                         };
                     }
-                    let status: IperfClientStatusOut = match self.agent_post(
+                };
+                if !request_id.is_empty() && started.id != request_id {
+                    let _ = self.client_stop_confirmed(&started.id);
+                    let _ = self.client_stop_confirmed(request_id);
+                    return IperfClientOut {
+                        cancelled: true,
+                        output: format!(
+                            "远端 client 返回了非预期 job id：期望 {request_id}，实际 {}",
+                            started.id
+                        ),
+                        ..Default::default()
+                    };
+                }
+                let response_elapsed_ms = start_call.elapsed().as_millis() as u64;
+                let remote_origin_ms = if started.elapsed_ms > 0 {
+                    response_elapsed_ms.saturating_sub(started.elapsed_ms)
+                } else {
+                    response_elapsed_ms / 2
+                };
+                let max_remote_secs = req.duration.saturating_add(180);
+                let Some(deadline) =
+                    std::time::Instant::now().checked_add(Duration::from_secs(max_remote_secs))
+                else {
+                    let cleanup = self.client_stop_confirmed(&started.id);
+                    return IperfClientOut {
+                        cancelled: cleanup.is_err(),
+                        output: format!(
+                            "远端 client duration={} 秒过大，无法建立等待截止时间；停止确认: {}",
+                            req.duration,
+                            cleanup.map(|_| "成功".to_string()).unwrap_or_else(|e| e)
+                        ),
+                        ..Default::default()
+                    };
+                };
+                let mut cursor = 0usize;
+                loop {
+                    if std::time::Instant::now() >= deadline {
+                        let cleanup = self.client_stop_confirmed(&started.id);
+                        return IperfClientOut {
+                            timed_out: true,
+                            output: format!(
+                                "(远端异步作业 {} 超过 {} 秒仍未结束；停止确认: {})",
+                                started.id,
+                                max_remote_secs,
+                                cleanup.map(|_| "成功".to_string()).unwrap_or_else(|e| e)
+                            ),
+                            ..Default::default()
+                        };
+                    }
+                    let status: IperfClientStatusOut = match self.agent_post_reliable(
                         "/iperf/client/status",
                         &IperfClientStatusReq {
                             id: started.id.clone(),
@@ -266,38 +687,42 @@ impl Ctx {
                     ) {
                         Ok(v) => v,
                         Err(e) => {
-                            let _ = self.agent_post::<_, IperfClientStopOut>(
-                                "/iperf/client/stop",
-                                &IperfClientStopReq {
-                                    id: started.id.clone(),
-                                },
-                                Duration::from_secs(10),
-                            );
+                            let cleanup = self.client_stop_confirmed(&started.id);
                             return IperfClientOut {
-                                output: format!("(远端异步作业查询失败: {e})"),
+                                cancelled: cleanup.is_err(),
+                                output: format!(
+                                    "(远端异步作业查询失败: {e}; 停止确认: {})",
+                                    cleanup
+                                        .map(|_| "成功".to_string())
+                                        .unwrap_or_else(|cleanup_error| cleanup_error)
+                                ),
                                 ..Default::default()
                             };
                         }
                     };
                     cursor = status.next_cursor;
-                    for event in status.events {
+                    for mut event in status.events {
+                        event.elapsed_ms = event.elapsed_ms.saturating_add(remote_origin_ms);
                         if event.kind == IperfEventKind::Error {
                             logln(&format!("      [远端 {}] {}", started.id, event.line));
                         }
                         on_event(event);
                     }
                     if status.done {
-                        let result = status.result.unwrap_or_else(|| IperfClientOut {
+                        let mut result = status.result.unwrap_or_else(|| IperfClientOut {
                             output: format!("(远端异步作业 {} 已结束但缺少结果)", started.id),
                             ..Default::default()
                         });
-                        let _ = self.agent_post::<_, IperfClientStopOut>(
-                            "/iperf/client/stop",
-                            &IperfClientStopReq {
-                                id: started.id.clone(),
-                            },
-                            Duration::from_secs(10),
-                        );
+                        if let Err(e) = self.client_stop_confirmed(&started.id) {
+                            result.ok = false;
+                            result.cancelled = true;
+                            if !result.output.ends_with('\n') && !result.output.is_empty() {
+                                result.output.push('\n');
+                            }
+                            result
+                                .output
+                                .push_str(&format!("远端 client 结束后清理未确认: {e}"));
+                        }
                         return result;
                     }
                     std::thread::sleep(Duration::from_millis(250));
@@ -306,11 +731,13 @@ impl Ctx {
         }
     }
 
-    fn client_run(&self, side: Side, req: &IperfClientReq) -> IperfClientOut {
-        self.client_run_tracked(side, req, |_| {})
-    }
-
-    fn mon_start(&self, side: Side, iface: &str) -> Result<String, String> {
+    fn mon_start(
+        &self,
+        side: Side,
+        iface: &str,
+        owner_id: &str,
+        lease_secs: u64,
+    ) -> Result<String, String> {
         let interval_ms = self
             .cfg
             .iperf
@@ -318,13 +745,18 @@ impl Ctx {
             .sample_interval_ms
             .clamp(200, 5_000);
         match side {
-            Side::Master => self.local_monitors.start(iface, interval_ms),
+            Side::Master => {
+                self.local_monitors
+                    .start_owned(iface, interval_ms, owner_id, lease_secs)
+            }
             Side::Agent => self
                 .agent_post::<_, MonitorStartOut>(
                     "/monitor/start",
                     &MonitorStartReq {
                         iface: iface.to_string(),
                         interval_ms,
+                        owner_id: owner_id.to_string(),
+                        lease_secs,
                     },
                     Duration::from_secs(20),
                 )
@@ -341,6 +773,85 @@ impl Ctx {
                 Duration::from_secs(20),
             ),
         }
+    }
+
+    fn mon_status(&self, side: Side, id: &str) -> Result<MonitorStatusOut, String> {
+        match side {
+            Side::Master => self.local_monitors.status(id),
+            Side::Agent => self.agent_post(
+                "/monitor/status",
+                &MonitorStatusReq { id: id.to_string() },
+                Duration::from_secs(3),
+            ),
+        }
+    }
+
+    fn write_output_artifact(&self, filename: &str, contents: &str, label: &str) -> String {
+        if let Err(error) = std::fs::create_dir_all(&self.outdir) {
+            logln(&format!(
+                "    [{label}] 无法创建输出目录 {}: {error}",
+                self.outdir.display()
+            ));
+            return String::new();
+        }
+        let full = self.outdir.join(filename);
+        let tmp = self.outdir.join(format!(".{filename}.tmp"));
+        if let Err(error) =
+            std::fs::write(&tmp, contents).and_then(|_| std::fs::rename(&tmp, &full))
+        {
+            let _ = std::fs::remove_file(&tmp);
+            logln(&format!(
+                "    [{label}] 写入失败 {}: {error}",
+                full.display()
+            ));
+            return String::new();
+        }
+        logln(&format!("    [{label}] 已保存: {}", full.display()));
+        self.outdir
+            .file_name()
+            .map(|dir| format!("./{}/{}", dir.to_string_lossy(), filename))
+            .unwrap_or_else(|| full.to_string_lossy().into_owned())
+    }
+
+    fn save_iperf_raw_record(&self, artifact: IperfRawArtifact<'_>) -> String {
+        let filename = raw_iperf_filename(
+            artifact.owner_id,
+            artifact.lidx,
+            artifact.stream_pos,
+            artifact.tag,
+            artifact.task,
+        );
+        let contents = build_iperf_raw_record(
+            artifact.task,
+            artifact.client,
+            artifact.server_output,
+            artifact.events,
+            artifact.error,
+        );
+        self.write_output_artifact(&filename, &contents, "原始记录")
+    }
+
+    fn save_monitor_samples(
+        &self,
+        owner_id: &str,
+        side: Side,
+        iface: &str,
+        endpoint_identity: &str,
+        out: &MonitorStopOut,
+    ) -> String {
+        let side_slug = match side {
+            Side::Master => "master",
+            Side::Agent => "agent",
+        };
+        let filename = format!(
+            "nic_samples_{}_{}_{}_{}.csv",
+            sanitize(owner_id),
+            side_slug,
+            sanitize(iface),
+            &md5_hex(endpoint_identity)[..8]
+        );
+        let contents = build_monitor_samples_csv(side.cn(), iface, out);
+        self.write_output_artifact(&filename, &contents, "网卡原始样本")
     }
 
     /// 两端都尝试截图，任一成功就保存。返回报告用相对路径（多个用分号隔开）
@@ -495,18 +1006,45 @@ impl Ctx {
 
     // ---------------- 执行入口 ----------------
 
-    pub fn run_all(&self, units: &[Unit]) -> RunSummary {
+    pub fn run_all_from(&self, units: &[Unit], sequence_offset: usize) -> RunSummary {
+        self.run_all_internal(units, sequence_offset, None)
+    }
+
+    pub fn run_all_with_preflight(
+        &self,
+        units: &[Unit],
+        block: Option<&IperfPreflightBlock>,
+    ) -> RunSummary {
+        self.run_all_internal(units, 0, block)
+    }
+
+    fn run_all_internal(
+        &self,
+        units: &[Unit],
+        sequence_offset: usize,
+        iperf_block: Option<&IperfPreflightBlock>,
+    ) -> RunSummary {
         let mut sum = RunSummary::default();
         let total = units.len();
         for (i, unit) in units.iter().enumerate() {
+            let useq = sequence_offset + i;
+            let is_iperf_unit = unit_has_iperf(unit);
+            if is_iperf_unit {
+                sum.iperf_units += 1;
+            }
+            let blocked = is_iperf_unit.then_some(()).and(iperf_block);
             logln(&format!("\n[{}/{}] {}", i + 1, total, unit.title));
-            if self.cfg.resume {
+            if self.cfg.resume && blocked.is_none() {
                 let fresh = { self.db.lock().unwrap().fresh_pass(&unit.id) };
                 if let Some(t) = fresh {
                     logln(&format!("  已PASS，上次时间: {t}，跳过 (RESUME)"));
                     sum.skip += 1;
+                    if is_iperf_unit {
+                        // 24 小时内已有 PASS 结果时，不因本轮 resume 跳过而重复触发故障诊断。
+                        sum.iperf_usable_units += 1;
+                    }
                     self.push_row(Row {
-                        sort_key: (i, 0, 0, 0),
+                        sort_key: (useq, 0, 0, 0),
                         time: now_full(),
                         task_id: unit.id.clone(),
                         parent_id: unit.id.clone(),
@@ -521,36 +1059,68 @@ impl Ctx {
                 }
             }
 
-            let outcomes: Vec<LegOutcome> = if let Some(plans) = self.udp_leg_plans(unit) {
-                self.run_udp_unit(i, unit, &plans)
-            } else if unit.legs.len() <= 1 {
-                unit.legs
-                    .iter()
-                    .map(|leg| self.run_leg(i, unit, 0, leg))
-                    .collect()
-            } else {
-                std::thread::scope(|s| {
-                    let handles: Vec<_> = unit
-                        .legs
-                        .iter()
-                        .enumerate()
-                        .map(|(li, leg)| s.spawn(move || self.run_leg(i, unit, li, leg)))
-                        .collect();
-                    handles
-                        .into_iter()
-                        .map(|h| {
-                            h.join().unwrap_or(LegOutcome {
-                                verdict: Verdict::SetupError,
-                                reason_code: "LEG_THREAD_PANIC".into(),
-                                reason_detail: "方向执行线程 panic".into(),
-                                rx_avg: None,
-                                main_rows: vec![],
-                                tag: String::new(),
-                            })
+            if let Some(block) = blocked {
+                logln(&format!(
+                    "  [iperf 前置检查拦截] {}: {}",
+                    block.reason_code, block.reason_detail
+                ));
+            }
+
+            let owner_id = unit_resource_owner(unit, useq);
+            let lease_secs = unit_resource_lease_secs(unit);
+            let mut resource_guard = (is_iperf_unit && blocked.is_none()).then(|| {
+                UnitResourceGuard::new(self, owner_id.clone(), unit_uses_agent_resources(unit))
+            });
+            let outcomes = execute_unit_safely(
+                || {
+                    if let Some(block) = blocked {
+                        preflight_block_outcomes(unit, block)
+                    } else if let Some(plans) = self.udp_leg_plans(unit) {
+                        self.run_udp_unit(useq, unit, &plans, &owner_id, lease_secs)
+                    } else if unit.legs.len() <= 1 {
+                        unit.legs
+                            .iter()
+                            .map(|leg| self.run_leg(useq, unit, 0, leg, &owner_id, lease_secs))
+                            .collect()
+                    } else {
+                        std::thread::scope(|s| {
+                            let handles: Vec<_> = unit
+                                .legs
+                                .iter()
+                                .enumerate()
+                                .map(|(li, leg)| {
+                                    let owner_id = owner_id.clone();
+                                    s.spawn(move || {
+                                        self.run_leg(useq, unit, li, leg, &owner_id, lease_secs)
+                                    })
+                                })
+                                .collect();
+                            handles
+                                .into_iter()
+                                .map(|h| {
+                                    h.join().unwrap_or(LegOutcome {
+                                        verdict: Verdict::SetupError,
+                                        reason_code: "LEG_THREAD_PANIC".into(),
+                                        reason_detail: "方向执行线程 panic".into(),
+                                        rx_avg: None,
+                                        main_rows: vec![],
+                                        tag: String::new(),
+                                    })
+                                })
+                                .collect()
                         })
-                        .collect()
-                })
-            };
+                    }
+                },
+                || {
+                    resource_guard
+                        .as_mut()
+                        .map(UnitResourceGuard::cleanup_now)
+                        .unwrap_or(Ok(()))
+                },
+            );
+            // cleanup_now 失败时 guard 仍保持 armed；立即 drop 再做一次兜底，
+            // 不把可能残留的端口/进程拖到报告生成和下一测试单元。
+            drop(resource_guard);
 
             // 双向：互填「对向接收 Mbps」
             if unit.bidir && outcomes.len() == 2 {
@@ -567,6 +1137,14 @@ impl Ctx {
             }
 
             let unit_verdict = aggregate_unit_verdict(&outcomes);
+            if is_iperf_unit {
+                if blocked.is_none() && self.outcomes_have_usable_iperf_measurement(&outcomes) {
+                    sum.iperf_usable_units += 1;
+                }
+                if unit_verdict == Verdict::SetupError {
+                    sum.iperf_setup_errors += 1;
+                }
+            }
             let unit_reason = outcome_matching_verdict(&outcomes, unit_verdict);
             let unit_ok = unit_verdict.is_pass();
             match unit_verdict {
@@ -605,7 +1183,7 @@ impl Ctx {
                 .collect();
             logln(&format!("  ==> 单元结果: {}", unit_verdict.label()));
             self.push_row(Row {
-                sort_key: (i, 0, 0, 0),
+                sort_key: (useq, 0, 0, 0),
                 time: now_full(),
                 task_id: unit.id.clone(),
                 parent_id: unit.id.clone(),
@@ -633,15 +1211,46 @@ impl Ctx {
                 db.set(&unit.id, unit_ok, &unit.title);
                 db.save();
             }
-            std::thread::sleep(Duration::from_secs(1));
+            if blocked.is_none() && is_iperf_unit {
+                std::thread::sleep(Duration::from_secs(1));
+            }
         }
         sum
     }
 
-    fn run_leg(&self, useq: usize, unit: &Unit, lidx: usize, leg: &Leg) -> LegOutcome {
+    fn outcomes_have_usable_iperf_measurement(&self, outcomes: &[LegOutcome]) -> bool {
+        let rows = self.rows.lock().unwrap();
+        outcomes.iter().any(|outcome| {
+            outcome.main_rows.iter().any(|index| {
+                rows.get(*index)
+                    .map(row_has_usable_iperf_measurement)
+                    .unwrap_or(false)
+            })
+        })
+    }
+
+    fn run_leg(
+        &self,
+        useq: usize,
+        unit: &Unit,
+        lidx: usize,
+        leg: &Leg,
+        owner_id: &str,
+        lease_secs: u64,
+    ) -> LegOutcome {
         match &leg.kind {
             LegKind::Ping(t) => self.run_ping_leg(useq, unit, lidx, &leg.tag, t),
-            LegKind::IperfSingle(t) => self.run_iperf_single(useq, unit, lidx, &leg.tag, t),
+            LegKind::IperfSingle(t) => self.run_iperf_single(
+                useq,
+                unit,
+                lidx,
+                &leg.tag,
+                t,
+                LifecycleLease {
+                    owner_id,
+                    lease_secs,
+                },
+            ),
             LegKind::IperfGroup { .. } => {
                 let detail = "UDP 并发组未进入统一调度器（空流组、混合协议或内部任务结构异常）";
                 logln(&format!("    [内部调度错误] {detail}"));
@@ -687,40 +1296,136 @@ impl Ctx {
             payload: t.payload,
             v6: t.v6,
         };
-        logln(&format!(
-            "  [ping{}] {} -> {} (n={}, -l {}) 执行中...",
-            fmt_tag(tag),
-            src_addr,
-            dst_addr,
-            t.count,
-            t.payload
-        ));
-        let out = match self.ping_at(t.src.side, &req) {
-            Ok(o) => o,
-            Err(e) => PingOut {
-                ok: false,
-                sent: t.count,
-                received: 0,
-                lost: t.count,
-                loss_pct: 100.0,
-                raw: format!("(执行失败: {e})"),
-                ..Default::default()
-            },
+        let gateway_missing =
+            t.purpose == PingPurpose::GatewayDiagnostic && dst_addr.trim().is_empty();
+        if gateway_missing {
+            logln(&format!(
+                "  [ping{}] {} 未发现 IPv4 网关，无法执行绑定源地址的网关诊断。",
+                fmt_tag(tag),
+                src_addr
+            ));
+        } else {
+            logln(&format!(
+                "  [ping{}] {} -> {} (n={}, -l {}) 执行中...",
+                fmt_tag(tag),
+                src_addr,
+                dst_addr,
+                t.count,
+                t.payload
+            ));
+        }
+        let (out, transport_error) = if gateway_missing {
+            (
+                PingOut {
+                    ok: false,
+                    sent: 0,
+                    received: 0,
+                    lost: 0,
+                    loss_pct: 0.0,
+                    raw: "未发现该网卡的 IPv4 默认网关，未发送 Ping。".into(),
+                    ..Default::default()
+                },
+                None,
+            )
+        } else {
+            match self.ping_at(t.src.side, &req) {
+                Ok(out) => (out, None),
+                Err(error) => (
+                    PingOut {
+                        ok: false,
+                        raw: format!("辅测机 Ping 请求执行失败: {error}"),
+                        ..Default::default()
+                    },
+                    Some(error),
+                ),
+            }
+        };
+        let exec_kind = if transport_error.is_some() {
+            Some(ping::PingExecErrorKind::Execution)
+        } else if gateway_missing {
+            None
+        } else {
+            ping::execution_error_kind(&out)
+        };
+        let exec_detail = transport_error.or_else(|| ping::execution_error(&out));
+        let verdict = if gateway_missing {
+            Verdict::NotEvaluated
+        } else if exec_kind.is_some() {
+            Verdict::SetupError
+        } else if out.ok {
+            Verdict::Pass
+        } else {
+            Verdict::RateFail
+        };
+        let execution_status = if gateway_missing {
+            ExecutionStatus::Partial
+        } else {
+            match exec_kind {
+                Some(ping::PingExecErrorKind::Timeout) => ExecutionStatus::TimedOut,
+                Some(_) => ExecutionStatus::Error,
+                None => ExecutionStatus::Completed,
+            }
+        };
+        let reason_code = if gateway_missing {
+            "GATEWAY_NOT_FOUND"
+        } else if exec_kind == Some(ping::PingExecErrorKind::Timeout) {
+            "PING_TIMEOUT"
+        } else if exec_kind.is_some() {
+            "PING_EXEC_ERROR"
+        } else if out.ok {
+            ""
+        } else {
+            match t.purpose {
+                PingPurpose::SubnetTest => "PING_UNREACHABLE",
+                PingPurpose::SubnetDiagnostic => "PING_SUBNET_UNREACHABLE",
+                PingPurpose::GatewayDiagnostic => "PING_GATEWAY_UNREACHABLE",
+            }
+        }
+        .to_string();
+        let reason_detail = if gateway_missing {
+            format!(
+                "网卡 {}({}) 没有发现 IPv4 默认网关；无法用网关 Ping 判断该网卡/载体状态",
+                t.src.nic.name, t.src.nic.ipv4
+            )
+        } else if let Some(detail) = exec_detail {
+            detail
+        } else if out.ok {
+            String::new()
+        } else {
+            format!(
+                "Ping 命令正常完成，但未收到目标 Echo Reply（收/发={}/{}，丢包率 {:.1}%）",
+                out.received, out.sent, out.loss_pct
+            )
         };
         logln(&format!(
-            "    结果: {} 收/发={}/{} 丢包={:.1}% 平均={}ms",
-            if out.ok { "PASS" } else { "FAIL" },
+            "    结果: {} 收/发={}/{} 丢包={} 平均={}ms{}",
+            verdict.label(),
             out.received,
             out.sent,
-            out.loss_pct,
+            if gateway_missing || exec_kind.is_some() {
+                "-".into()
+            } else {
+                format!("{:.1}%", out.loss_pct)
+            },
             out.rtt_avg
                 .map(|v| v.to_string())
-                .unwrap_or_else(|| "-".into())
+                .unwrap_or_else(|| "-".into()),
+            if reason_detail.is_empty() {
+                String::new()
+            } else {
+                format!(" ({reason_detail})")
+            }
         ));
-        let kind_label = if unit.bidir {
-            format!("★双向-{tag}")
+        let kind_label = match t.purpose {
+            PingPurpose::SubnetTest if unit.bidir => format!("★双向子网PING-{tag}"),
+            PingPurpose::SubnetTest => "子网PING（收到至少一个 Echo Reply 即连通）".into(),
+            PingPurpose::SubnetDiagnostic => "故障诊断-子网PING".into(),
+            PingPurpose::GatewayDiagnostic => "故障诊断-网卡到网关PING".into(),
+        };
+        let raw_text = if out.cmd.is_empty() {
+            out.raw.clone()
         } else {
-            "PING".into()
+            format!("$ {}\n{}", out.cmd, out.raw)
         };
         let idx = self.push_row(Row {
             sort_key: (useq, lidx, 0, 0),
@@ -737,48 +1442,23 @@ impl Ctx {
             dst_pc: t.dst.pc.clone(),
             dst_iface: t.dst.nic.name.clone(),
             dst_ip: dst_addr,
-            verdict: if out.ok {
-                Verdict::Pass
-            } else {
-                Verdict::RateFail
-            },
-            execution_status: ExecutionStatus::Completed,
-            reason_code: if out.ok {
-                String::new()
-            } else {
-                "PING_FAILED".into()
-            },
-            reason_detail: if out.ok {
-                String::new()
-            } else {
-                format!("丢包率 {:.1}%", out.loss_pct)
-            },
+            verdict,
+            execution_status,
+            reason_code: reason_code.clone(),
+            reason_detail: reason_detail.clone(),
             kind_label,
-            ping_loss: Some(out.loss_pct),
-            ping_avg: out.rtt_avg,
+            ping_loss: (!gateway_missing && exec_kind.is_none()).then_some(out.loss_pct),
+            ping_avg: (!gateway_missing && exec_kind.is_none())
+                .then_some(out.rtt_avg)
+                .flatten(),
             command: out.cmd.clone(),
-            raws: vec![(
-                format!("ping{} 输出", fmt_tag(tag)),
-                format!("$ {}\n{}", out.cmd, out.raw),
-            )],
+            raws: vec![(format!("ping{} 输出", fmt_tag(tag)), raw_text)],
             ..Default::default()
         });
         LegOutcome {
-            verdict: if out.ok {
-                Verdict::Pass
-            } else {
-                Verdict::RateFail
-            },
-            reason_code: if out.ok {
-                String::new()
-            } else {
-                "PING_FAILED".into()
-            },
-            reason_detail: if out.ok {
-                String::new()
-            } else {
-                format!("丢包率 {:.1}%", out.loss_pct)
-            },
+            verdict,
+            reason_code,
+            reason_detail,
             rx_avg: None,
             main_rows: vec![idx],
             tag: tag.to_string(),
@@ -791,6 +1471,9 @@ impl Ctx {
         &self,
         t: &IperfTask,
         duration: u64,
+        owner_id: &str,
+        lease_secs: u64,
+        attempt: usize,
     ) -> Result<(IperfServerStartReq, IperfClientReq), String> {
         let (client_bind, client_target, server_bind) = if t.v6 {
             let v = v6_addrs(&t.src.nic, &t.dst.nic)
@@ -812,6 +1495,9 @@ impl Ctx {
                 bind_ip: server_bind,
                 port: t.port,
                 v6: t.v6,
+                request_id: lifecycle_request_id(owner_id, "server", t.port, attempt),
+                owner_id: owner_id.to_string(),
+                lease_secs,
             },
             IperfClientReq {
                 dst: client_target,
@@ -826,8 +1512,17 @@ impl Ctx {
     }
 
     /// 核心执行：server(dst侧) -> client(src侧) -> 停 server。不含监控。
-    fn exec_iperf_core(&self, t: &IperfTask) -> (bool, iperf::IperfParsed, IperfClientOut, String) {
-        let (sreq, creq) = match self.build_iperf_requests(t, t.duration) {
+    fn exec_iperf_core<F>(
+        &self,
+        t: &IperfTask,
+        owner_id: &str,
+        lease_secs: u64,
+        on_event: F,
+    ) -> (bool, iperf::IperfParsed, IperfClientOut, String)
+    where
+        F: FnMut(IperfFlowEvent),
+    {
+        let (sreq, creq) = match self.build_iperf_requests(t, t.duration, owner_id, lease_secs, 0) {
             Ok(v) => v,
             Err(e) => {
                 let out = IperfClientOut {
@@ -849,10 +1544,21 @@ impl Ctx {
             };
             return (false, iperf::IperfParsed::default(), out, String::new());
         }
-        let client = self.client_run(t.src.side, &creq);
-        let server_out = self.server_stop(t.dst.side, t.port).output;
+        let client = self.client_run_tracked(
+            t.src.side,
+            &creq,
+            owner_id,
+            &lifecycle_request_id(owner_id, "client", t.port, 0),
+            lease_secs,
+            on_event,
+        );
+        let stop = self.server_stop_confirmed(t.dst.side, t.port, &sreq.request_id, Duration::ZERO);
+        let (server_out, stop_ok) = match stop {
+            Ok(out) => (out.output, true),
+            Err(e) => (format!("(iperf3 server 停止未确认: {e})"), false),
+        };
         let parsed = iperf::parse_output(&client.output);
-        let raw_ok = client.ok && !client.timed_out;
+        let raw_ok = client.ok && !client.timed_out && !client.cancelled && stop_ok;
         (raw_ok, parsed, client, server_out)
     }
 
@@ -863,6 +1569,7 @@ impl Ctx {
         lidx: usize,
         tag: &str,
         t: &IperfTask,
+        lifecycle: LifecycleLease<'_>,
     ) -> LegOutcome {
         let time = now_full();
         logln(&format!(
@@ -874,16 +1581,123 @@ impl Ctx {
             t.port,
             t.duration
         ));
-        let mon_id = match self.mon_start(t.dst.side, &t.dst.nic.name) {
+        let mon_id = match self.mon_start(
+            t.dst.side,
+            &t.dst.nic.name,
+            lifecycle.owner_id,
+            lifecycle.lease_secs,
+        ) {
             Ok(id) => Some(id),
             Err(e) => {
                 logln(&format!("    (接收端网卡监控启动失败: {e})"));
                 None
             }
         };
-        let (raw_ok, parsed, client, server_out) = self.exec_iperf_core(t);
-        let mon_out = mon_id.and_then(|id| self.mon_stop(t.dst.side, &id).ok());
+        let live = Arc::new(Mutex::new(LiveFlowState::default()));
+        let mut events = Vec::new();
+        let parallel_streams = if t.udp {
+            1
+        } else {
+            tcp_parallel_streams(&t.extra)
+        };
+        let mon_id_for_progress = mon_id.clone();
+        let live_for_progress = Arc::clone(&live);
+        let progress_tag = tag.to_string();
+        let progress_protocol = if t.udp { "UDP" } else { "TCP" };
+        let (raw_ok, parsed, client, server_out) = std::thread::scope(|scope| {
+            let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+            let progress = scope.spawn(move || {
+                let mut monitor_enabled = mon_id_for_progress.is_some();
+                loop {
+                    match done_rx.recv_timeout(Duration::from_secs(1)) {
+                        Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                    }
+                    let state = live_for_progress
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clone();
+                    let mut monitor_error = String::new();
+                    let nic_rx_mbps = if monitor_enabled {
+                        match mon_id_for_progress.as_deref() {
+                            Some(id) => match self.mon_status(t.dst.side, id) {
+                                Ok(status) => match status.latest_sample {
+                                    Some(sample) if sample.valid => Some(sample.rx_mbps),
+                                    Some(sample) => {
+                                        monitor_error = if sample.error.is_empty() {
+                                            "网卡样本无效".into()
+                                        } else {
+                                            sample.error
+                                        };
+                                        None
+                                    }
+                                    None => {
+                                        monitor_error = "等待首个网卡样本".into();
+                                        None
+                                    }
+                                },
+                                Err(error) => {
+                                    monitor_enabled = false;
+                                    monitor_error = error;
+                                    None
+                                }
+                            },
+                            None => None,
+                        }
+                    } else {
+                        None
+                    };
+                    let active = usize::from(
+                        (!state.ended && state.active)
+                            || nic_rx_mbps.is_some_and(|rate| rate > MIN_VALID_RX_MBPS),
+                    );
+                    logln(&format_iperf_progress(&IperfProgressSnapshot {
+                        protocol: progress_protocol,
+                        tag: &progress_tag,
+                        active,
+                        total: 1,
+                        connected: usize::from(state.connected),
+                        ended: usize::from(state.ended),
+                        nic_rx_mbps,
+                        iperf_mbps: active_iperf_rate(&state),
+                        errors: usize::from(!state.error.is_empty()),
+                        monitor_error,
+                    }));
+                }
+            });
+            let result =
+                self.exec_iperf_core(t, lifecycle.owner_id, lifecycle.lease_secs, |event| {
+                    {
+                        let mut state =
+                            live.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        if event.kind != IperfEventKind::Traffic
+                            || is_live_progress_rate_line(&event.line, parallel_streams)
+                        {
+                            apply_flow_event(&mut state, &event);
+                        }
+                    }
+                    events.push(event);
+                });
+            let _ = done_tx.send(());
+            let _ = progress.join();
+            result
+        });
+        let mon_out = mon_id
+            .as_deref()
+            .and_then(|id| self.mon_stop(t.dst.side, id).ok());
         let rx_avg = mon_out.as_ref().map(|m| m.avg_mbps);
+        let nic_samples = mon_out
+            .as_ref()
+            .map(|out| {
+                self.save_monitor_samples(
+                    lifecycle.owner_id,
+                    t.dst.side,
+                    &t.dst.nic.name,
+                    &t.dst.key(),
+                    out,
+                )
+            })
+            .unwrap_or_default();
 
         let meas_ok =
             parsed.has_measurement() || rx_avg.map(|v| v > MIN_VALID_RX_MBPS).unwrap_or(false);
@@ -902,6 +1716,22 @@ impl Ctx {
         } else {
             "NO_VALID_MEASUREMENT".into()
         };
+        let raw_error = if raw_ok {
+            String::new()
+        } else {
+            client.output.lines().last().unwrap_or_default().to_string()
+        };
+        let raw_log = self.save_iperf_raw_record(IperfRawArtifact {
+            owner_id: lifecycle.owner_id,
+            lidx,
+            stream_pos: 0,
+            tag,
+            task: t,
+            client: &client,
+            server_output: &server_out,
+            events: &events,
+            error: &raw_error,
+        });
 
         logln(&format!(
             "    结果: {} 发送={} 接收={} 网卡实测={}",
@@ -962,12 +1792,18 @@ impl Ctx {
             screenshot_master,
             screenshot_agent,
             command: client.cmd.clone(),
+            raw_log,
+            nic_samples,
             raws: vec![
                 (
                     format!("iperf3 client{} 输出", fmt_tag(tag)),
                     format!("$ {}\n{}", client.cmd, client.output),
                 ),
                 (format!("iperf3 server{} 输出", fmt_tag(tag)), server_out),
+                (
+                    format!("流事件{}", fmt_tag(tag)),
+                    format_flow_events(&events, &raw_error),
+                ),
             ],
             ..Default::default()
         });
@@ -990,15 +1826,36 @@ impl Ctx {
     fn start_udp_server_with_retry(
         &self,
         task: &IperfTask,
-        req: &IperfServerStartReq,
-    ) -> Result<(), String> {
+        base_req: &IperfServerStartReq,
+    ) -> Result<IperfServerStartReq, String> {
         let mut errors = Vec::new();
         for attempt in 0..=UDP_SERVER_START_RETRIES {
-            match self.server_start(task.dst.side, req) {
-                Ok(_) => return Ok(()),
+            let mut req = base_req.clone();
+            if attempt > 0 {
+                req.request_id = format!("{}-start{attempt}", base_req.request_id);
+            }
+            match self.server_start(task.dst.side, &req) {
+                Ok(_) => return Ok(req),
                 Err(e) => {
                     errors.push(format!("第{}次: {e}", attempt + 1));
                     if attempt < UDP_SERVER_START_RETRIES {
+                        // server_start 的各实现本身会做失败补偿；这里再用同一
+                        // request_id 做一次幂等确认，作为“允许占用同端口的新
+                        // request 开始”的硬门槛。无法确认退出时绝不盲目重试。
+                        if let Err(cleanup_error) = self.server_stop_confirmed(
+                            task.dst.side,
+                            req.port,
+                            &req.request_id,
+                            Duration::ZERO,
+                        ) {
+                            errors.push(format!(
+                                "第{}次失败后的 server 清理未确认，禁止继续占用端口 {} 重试: {}",
+                                attempt + 1,
+                                req.port,
+                                cleanup_error
+                            ));
+                            break;
+                        }
                         std::thread::sleep(Duration::from_millis(500));
                     }
                 }
@@ -1011,7 +1868,7 @@ impl Ctx {
         &self,
         prepared: PreparedUdpFlow,
         epoch: &Instant,
-        live: &Arc<Mutex<HashMap<(usize, usize), LiveUdpFlow>>>,
+        live: &Arc<Mutex<HashMap<(usize, usize), LiveFlowState>>>,
     ) -> UdpFlowRun {
         if prepared.server_req.is_none() || prepared.client_req.is_none() {
             if let Ok(mut g) = live.lock() {
@@ -1039,9 +1896,10 @@ impl Ctx {
         }
 
         std::thread::sleep(Duration::from_millis(prepared.launch_delay_ms));
-        let server_req = prepared.server_req.clone().unwrap();
+        let mut current_server_req = prepared.server_req.clone().unwrap();
         let client_req = prepared.client_req.clone().unwrap();
         let mut all_events = Vec::new();
+        let mut all_client_output = Vec::new();
         let mut all_server_output = Vec::new();
         let mut final_client = IperfClientOut::default();
         let mut final_parsed = iperf::IperfParsed::default();
@@ -1058,38 +1916,56 @@ impl Ctx {
             let live_ref = Arc::clone(live);
             let mut attempt_events: Vec<IperfFlowEvent> = Vec::new();
             let attempt_started = Instant::now();
-            let client =
-                self.client_run_tracked(prepared.task.src.side, &client_req, |mut event| {
+            let client_request_id = lifecycle_request_id(
+                &current_server_req.owner_id,
+                "client",
+                prepared.task.port,
+                attempt,
+            );
+            let client = self.client_run_tracked(
+                prepared.task.src.side,
+                &client_req,
+                &current_server_req.owner_id,
+                &client_request_id,
+                current_server_req.lease_secs,
+                |mut event| {
                     event.elapsed_ms = event.elapsed_ms.saturating_add(attempt_start_ms);
                     if let Ok(mut g) = live_ref.lock() {
                         let state = g.entry(key).or_default();
-                        match event.kind {
-                            IperfEventKind::Connected => state.connected = true,
-                            IperfEventKind::Traffic => {
-                                state.active = true;
-                                state.last_mbps = event.mbps;
-                            }
-                            IperfEventKind::Retry => state.retries += 1,
-                            IperfEventKind::Error => state.error = event.line.clone(),
-                            IperfEventKind::Ended => state.ended = true,
-                            IperfEventKind::Started => {}
-                        }
+                        apply_flow_event(state, &event);
                     }
                     attempt_events.push(event);
-                });
+                },
+            );
             let parsed = iperf::parse_output(&client.output);
             let raw_ok =
                 client.ok && !client.timed_out && !client.cancelled && parsed.has_measurement();
 
             all_events.extend(attempt_events);
+            all_client_output.push(format!(
+                "=== group attempt {} ===\n{}",
+                attempt + 1,
+                client.output
+            ));
             final_client = client;
             final_parsed = parsed;
-            final_ok = raw_ok;
-            let server_out = self
-                .server_stop(prepared.task.dst.side, prepared.task.port)
-                .output;
+            let stop = self.server_stop_confirmed(
+                prepared.task.dst.side,
+                prepared.task.port,
+                &current_server_req.request_id,
+                Duration::ZERO,
+            );
+            let (server_out, stop_ok) = match stop {
+                Ok(out) => (out.output, true),
+                Err(e) => (format!("server 停止未确认: {e}"), false),
+            };
+            final_ok = raw_ok && stop_ok;
             all_server_output.push(format!("=== attempt {} ===\n{}", attempt + 1, server_out));
-            if raw_ok {
+            if !stop_ok {
+                final_error = "server 停止未确认，禁止在同端口继续重试".into();
+                break;
+            }
+            if final_ok {
                 break;
             }
 
@@ -1146,12 +2022,23 @@ impl Ctx {
                 mbps: None,
                 line: format!("group retry {retries}"),
             });
-            if let Err(e) = self.start_udp_server_with_retry(&prepared.task, &server_req) {
-                final_error = format!("重试时 server 启动失败: {e}");
-                break;
+            let mut next_server_req = current_server_req.clone();
+            next_server_req.request_id = lifecycle_request_id(
+                &current_server_req.owner_id,
+                "server",
+                prepared.task.port,
+                attempt + 1,
+            );
+            match self.start_udp_server_with_retry(&prepared.task, &next_server_req) {
+                Ok(started_req) => current_server_req = started_req,
+                Err(e) => {
+                    final_error = format!("重试时 server 启动失败: {e}");
+                    break;
+                }
             }
         }
 
+        final_client.output = all_client_output.join("\n");
         if let Ok(mut g) = live.lock() {
             let state = g
                 .entry((prepared.leg_pos, prepared.stream_pos))
@@ -1179,7 +2066,14 @@ impl Ctx {
         }
     }
 
-    fn run_udp_unit(&self, useq: usize, unit: &Unit, plans: &[UdpLegPlan]) -> Vec<LegOutcome> {
+    fn run_udp_unit(
+        &self,
+        useq: usize,
+        unit: &Unit,
+        plans: &[UdpLegPlan],
+        owner_id: &str,
+        lease_secs: u64,
+    ) -> Vec<LegOutcome> {
         let epoch = Instant::now();
         let total_flows: usize = plans.iter().map(|p| p.streams.len()).sum();
         logln(&format!(
@@ -1198,14 +2092,16 @@ impl Ctx {
                     let mode = plan.streams[stream_pos].rate_mode;
                     let stage_delay = if mode == RateMode::Discover {
                         discovery_stage(stream_pos, plan.streams.len())
-                            * rate_cfg.discovery_step_secs
-                            * 1000
+                            .saturating_mul(rate_cfg.discovery_step_secs)
+                            .saturating_mul(1_000)
                     } else {
                         0
                     };
                     launch_delays.insert(
                         (leg_pos, stream_pos),
-                        stage_delay + slot * rate_cfg.launch_interval_ms.clamp(0, 1_000),
+                        stage_delay.saturating_add(
+                            slot.saturating_mul(rate_cfg.launch_interval_ms.clamp(0, 1_000)),
+                        ),
                     );
                     slot += 1;
                 }
@@ -1231,7 +2127,7 @@ impl Ctx {
                     .saturating_add(rate_cfg.settle_secs)
                     .saturating_add(5)
                     .saturating_add(remaining_launch_secs);
-                match self.build_iperf_requests(task, process_duration) {
+                match self.build_iperf_requests(task, process_duration, owner_id, lease_secs, 0) {
                     Ok((server_req, client_req)) => prepared.push(PreparedUdpFlow {
                         leg_pos,
                         stream_pos,
@@ -1259,18 +2155,37 @@ impl Ctx {
                 .into_iter()
                 .map(|mut flow| {
                     scope.spawn(move || {
-                        if let Some(req) = flow.server_req.as_ref() {
-                            if let Err(e) = self.start_udp_server_with_retry(&flow.task, req) {
-                                flow.server_error = e;
-                                flow.server_req = None;
-                                flow.client_req = None;
+                        if let Some(req) = flow.server_req.clone() {
+                            match catch_unwind(AssertUnwindSafe(|| {
+                                self.start_udp_server_with_retry(&flow.task, &req)
+                            })) {
+                                Ok(Ok(started_req)) => flow.server_req = Some(started_req),
+                                Ok(Err(e)) => {
+                                    flow.server_error = e;
+                                    flow.server_req = None;
+                                    flow.client_req = None;
+                                }
+                                Err(payload) => {
+                                    flow.server_error = format!(
+                                        "server 准备线程 panic: {}",
+                                        panic_text(payload.as_ref())
+                                    );
+                                    flow.server_req = None;
+                                    flow.client_req = None;
+                                }
                             }
                         }
                         flow
                     })
                 })
                 .collect();
-            handles.into_iter().map(|h| h.join().unwrap()).collect()
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join()
+                        .unwrap_or_else(|_| unreachable!("准备线程已内部隔离 panic"))
+                })
+                .collect()
         });
 
         let server_ready = prepared
@@ -1281,7 +2196,7 @@ impl Ctx {
             "    server 准备完成: {server_ready}/{total_flows}"
         ));
 
-        let mut monitor_ids: HashMap<String, (Side, String, u64)> = HashMap::new();
+        let mut monitor_ids: HashMap<String, (Side, String, u64, String)> = HashMap::new();
         for plan in plans {
             for task in &plan.streams {
                 for endpoint in [&task.src, &task.dst] {
@@ -1289,11 +2204,18 @@ impl Ctx {
                     if monitor_ids.contains_key(&key) {
                         continue;
                     }
-                    match self.mon_start(endpoint.side, &endpoint.nic.name) {
+                    let before_ms = epoch.elapsed().as_millis() as u64;
+                    match self.mon_start(endpoint.side, &endpoint.nic.name, owner_id, lease_secs) {
                         Ok(id) => {
+                            let after_ms = epoch.elapsed().as_millis() as u64;
                             monitor_ids.insert(
                                 key,
-                                (endpoint.side, id, epoch.elapsed().as_millis() as u64),
+                                (
+                                    endpoint.side,
+                                    id,
+                                    before_ms + (after_ms - before_ms) / 2,
+                                    endpoint.nic.name.clone(),
+                                ),
                             );
                         }
                         Err(e) => logln(&format!(
@@ -1311,82 +2233,144 @@ impl Ctx {
             std::thread::sleep(Duration::from_secs(background_secs));
         }
 
-        let live: Arc<Mutex<HashMap<(usize, usize), LiveUdpFlow>>> =
+        let live: Arc<Mutex<HashMap<(usize, usize), LiveFlowState>>> =
             Arc::new(Mutex::new(HashMap::new()));
         let results: Vec<UdpFlowRun> = std::thread::scope(|scope| {
             let handles: Vec<_> = prepared
                 .into_iter()
                 .map(|flow| {
                     let live = Arc::clone(&live);
-                    scope.spawn(move || self.run_prepared_udp_flow(flow, &epoch, &live))
+                    let fallback = (
+                        flow.leg_pos,
+                        flow.stream_pos,
+                        flow.task.clone(),
+                        flow.server_req.clone(),
+                    );
+                    scope.spawn(move || {
+                        catch_unwind(AssertUnwindSafe(|| {
+                            self.run_prepared_udp_flow(flow, &epoch, &live)
+                        }))
+                        .unwrap_or_else(|payload| {
+                            if let Some(req) = &fallback.3 {
+                                let _ = self.server_stop_confirmed(
+                                    fallback.2.dst.side,
+                                    fallback.2.port,
+                                    &req.request_id,
+                                    Duration::ZERO,
+                                );
+                            }
+                            UdpFlowRun {
+                                leg_pos: fallback.0,
+                                stream_pos: fallback.1,
+                                task: fallback.2,
+                                raw_ok: false,
+                                parsed: iperf::IperfParsed::default(),
+                                client: IperfClientOut {
+                                    output: format!(
+                                        "UDP 流线程 panic: {}",
+                                        panic_text(payload.as_ref())
+                                    ),
+                                    ..Default::default()
+                                },
+                                server_output: String::new(),
+                                events: vec![],
+                                retries: 0,
+                                error: "UDP 流线程 panic".into(),
+                            }
+                        })
+                    })
                 })
                 .collect();
 
+            let mut monitor_status_disabled = HashSet::new();
             while handles.iter().any(|h| !h.is_finished()) {
                 std::thread::sleep(Duration::from_secs(1));
-                let g = live.lock().unwrap();
-                let mut parts = Vec::new();
                 for (leg_pos, plan) in plans.iter().enumerate() {
-                    let mut connected = 0usize;
-                    let mut active = 0usize;
-                    let mut ended = 0usize;
-                    let mut rate = 0.0;
-                    let mut errors = 0usize;
-                    for stream_pos in 0..plan.streams.len() {
-                        if let Some(state) = g.get(&(leg_pos, stream_pos)) {
-                            connected += usize::from(state.connected);
-                            active += usize::from(state.active && !state.ended);
-                            ended += usize::from(state.ended);
-                            rate += state.last_mbps.unwrap_or(0.0);
-                            errors += usize::from(!state.error.is_empty());
+                    let (connected, active, ended, iperf_mbps, errors) = {
+                        let g = live.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                        let mut connected = 0usize;
+                        let mut active = 0usize;
+                        let mut ended = 0usize;
+                        let mut rate = 0.0;
+                        let mut has_rate = false;
+                        let mut errors = 0usize;
+                        for stream_pos in 0..plan.streams.len() {
+                            if let Some(state) = g.get(&(leg_pos, stream_pos)) {
+                                connected += usize::from(state.connected);
+                                active += usize::from(state.active && !state.ended);
+                                ended += usize::from(state.ended);
+                                if let Some(value) = active_iperf_rate(state) {
+                                    rate += value;
+                                    has_rate = true;
+                                }
+                                errors += usize::from(!state.error.is_empty());
+                            }
                         }
-                    }
-                    parts.push(format!(
-                        "{} active={}/{} connected={} ended={} rate≈{:.1}Mbps err={}",
-                        if plan.tag.is_empty() {
-                            "单向"
-                        } else {
-                            &plan.tag
-                        },
+                        (connected, active, ended, has_rate.then_some(rate), errors)
+                    };
+                    let mut monitor_error = String::new();
+                    let nic_rx_mbps = plan.streams.first().and_then(|task| {
+                        let key = task.dst.key();
+                        let (side, id, _, _) = monitor_ids.get(&key)?;
+                        if monitor_status_disabled.contains(&key) {
+                            return None;
+                        }
+                        match self.mon_status(*side, id) {
+                            Ok(status) => match status.latest_sample {
+                                Some(sample) if sample.valid => Some(sample.rx_mbps),
+                                Some(sample) => {
+                                    monitor_error = if sample.error.is_empty() {
+                                        "网卡样本无效".into()
+                                    } else {
+                                        sample.error
+                                    };
+                                    None
+                                }
+                                None => {
+                                    monitor_error = "等待首个网卡样本".into();
+                                    None
+                                }
+                            },
+                            Err(error) => {
+                                monitor_status_disabled.insert(key);
+                                monitor_error = error;
+                                None
+                            }
+                        }
+                    });
+                    logln(&format_iperf_progress(&IperfProgressSnapshot {
+                        protocol: "UDP",
+                        tag: &plan.tag,
                         active,
-                        plan.streams.len(),
                         connected,
+                        total: plan.streams.len(),
                         ended,
-                        rate,
-                        errors
-                    ));
+                        nic_rx_mbps,
+                        iperf_mbps,
+                        errors,
+                        monitor_error,
+                    }));
                 }
-                logln(&format!("    [UDP进度] {}", parts.join(" | ")));
             }
             handles
                 .into_iter()
                 .map(|h| {
-                    h.join().unwrap_or_else(|_| UdpFlowRun {
-                        leg_pos: 0,
-                        stream_pos: 0,
-                        task: plans[0].streams[0].clone(),
-                        raw_ok: false,
-                        parsed: iperf::IperfParsed::default(),
-                        client: IperfClientOut {
-                            output: "UDP 流线程 panic".into(),
-                            ..Default::default()
-                        },
-                        server_output: String::new(),
-                        events: vec![],
-                        retries: 0,
-                        error: "UDP 流线程 panic".into(),
-                    })
+                    h.join()
+                        .unwrap_or_else(|_| unreachable!("流线程已内部隔离 panic"))
                 })
                 .collect()
         });
 
         let mut monitor_outputs: HashMap<String, MonitorStopOut> = HashMap::new();
-        for (key, (side, id, start_offset_ms)) in monitor_ids {
+        let mut monitor_sample_files: HashMap<String, String> = HashMap::new();
+        for (key, (side, id, start_offset_ms, iface)) in monitor_ids {
             match self.mon_stop(side, &id) {
                 Ok(mut out) => {
                     for sample in &mut out.samples {
                         sample.elapsed_ms = sample.elapsed_ms.saturating_add(start_offset_ms);
                     }
+                    let sample_file = self.save_monitor_samples(owner_id, side, &iface, &key, &out);
+                    monitor_sample_files.insert(key.clone(), sample_file);
                     monitor_outputs.insert(key, out);
                 }
                 Err(e) => logln(&format!("    (网卡监控停止失败: {e})")),
@@ -1449,6 +2433,11 @@ impl Ctx {
                 &tx_stats,
                 first.rx_target_mbps.is_some(),
             );
+            let rate_window_coverage_sufficient = rate_window_coverage_sufficient(
+                &rx_stats,
+                &tx_stats,
+                first.rx_target_mbps.is_some(),
+            );
             let rx_meets_target = first
                 .rx_target_mbps
                 .map(|target| {
@@ -1504,6 +2493,18 @@ impl Ctx {
                         } else {
                             ""
                         }
+                    ),
+                )
+            } else if !rate_window_coverage_sufficient {
+                (
+                    Verdict::NotEvaluated,
+                    "RATE_WINDOW_COVERAGE_LOW".to_string(),
+                    format!(
+                        "完整5秒滚动窗口覆盖不足（RX {:.1}%/P10={}，TX {:.1}%/P10={}，要求均至少95%），不能用少量窗口或跨周期恢复样本替代稳定性判定",
+                        rx_stats.rolling_coverage * 100.0,
+                        fmt_opt(rx_stats.p10_mbps),
+                        tx_stats.rolling_coverage * 100.0,
+                        fmt_opt(tx_stats.p10_mbps)
                     ),
                 )
             } else if first.rx_target_mbps.is_none() && first.rate_mode == RateMode::Verify {
@@ -1612,6 +2613,21 @@ impl Ctx {
             ));
 
             for flow in &leg_flows {
+                let raw_log = self.save_iperf_raw_record(IperfRawArtifact {
+                    owner_id,
+                    lidx: plan.lidx,
+                    stream_pos: flow.stream_pos,
+                    tag: &plan.tag,
+                    task: &flow.task,
+                    client: &flow.client,
+                    server_output: &flow.server_output,
+                    events: &flow.events,
+                    error: &flow.error,
+                });
+                let nic_samples = monitor_sample_files
+                    .get(&flow.task.dst.key())
+                    .cloned()
+                    .unwrap_or_default();
                 self.push_row(Row {
                     sort_key: (useq, plan.lidx, flow.stream_pos + 1, 0),
                     time: now_full(),
@@ -1669,6 +2685,8 @@ impl Ctx {
                     required_streams: 1,
                     retry_count: flow.retries,
                     command: flow.client.cmd.clone(),
+                    raw_log,
+                    nic_samples,
                     raws: vec![
                         (
                             format!(
@@ -1760,6 +2778,10 @@ impl Ctx {
                 screenshot_master,
                 screenshot_agent,
                 is_grouptotal: true,
+                nic_samples: monitor_sample_files
+                    .get(&first.dst.key())
+                    .cloned()
+                    .unwrap_or_default(),
                 raws: if discovery_table.is_empty() {
                     vec![]
                 } else {
@@ -1808,6 +2830,24 @@ fn text_preview(text: &str, max_chars: usize) -> String {
     text.chars().take(max_chars).collect()
 }
 
+fn row_has_usable_iperf_measurement(row: &Row) -> bool {
+    if row.verdict == Verdict::SetupError
+        || matches!(
+            row.execution_status,
+            ExecutionStatus::Error | ExecutionStatus::TimedOut | ExecutionStatus::Cancelled
+        )
+    {
+        return false;
+    }
+    let usable_rate =
+        |value: Option<f64>| value.is_some_and(|rate| rate.is_finite() && rate > MIN_VALID_RX_MBPS);
+    usable_rate(row.rx_avg)
+        || usable_rate(row.tx_mbps)
+        || usable_rate(row.rx_mbps)
+        || usable_rate(row.tx_avg)
+        || row.active_streams > 0
+}
+
 fn aggregate_unit_verdict(outcomes: &[LegOutcome]) -> Verdict {
     if outcomes.is_empty() {
         return Verdict::SetupError;
@@ -1851,6 +2891,18 @@ fn rate_sample_coverage_sufficient(
 ) -> bool {
     rx_stats.coverage >= MIN_RATE_SAMPLE_COVERAGE
         && (!target_present || tx_stats.coverage >= MIN_RATE_SAMPLE_COVERAGE)
+}
+
+fn rate_window_coverage_sufficient(
+    rx_stats: &RateStats,
+    tx_stats: &RateStats,
+    target_present: bool,
+) -> bool {
+    !target_present
+        || (rx_stats.p10_mbps.is_some()
+            && tx_stats.p10_mbps.is_some()
+            && rx_stats.rolling_coverage >= MIN_RATE_SAMPLE_COVERAGE
+            && tx_stats.rolling_coverage >= MIN_RATE_SAMPLE_COVERAGE)
 }
 
 fn should_retry_udp_flow(
@@ -1928,19 +2980,218 @@ fn format_flow_events(events: &[IperfFlowEvent], error: &str) -> String {
     out
 }
 
-fn iperf_interval_end_ms(line: &str) -> Option<u64> {
+fn apply_flow_event(state: &mut LiveFlowState, event: &IperfFlowEvent) {
+    match event.kind {
+        IperfEventKind::Connected => state.connected = true,
+        IperfEventKind::Traffic => {
+            state.active = true;
+            state.last_mbps = event.mbps;
+        }
+        IperfEventKind::Retry => state.retries += 1,
+        IperfEventKind::Error => state.error = event.line.clone(),
+        IperfEventKind::Ended => {
+            state.ended = true;
+            state.active = false;
+        }
+        IperfEventKind::Started => {}
+    }
+}
+
+fn active_iperf_rate(state: &LiveFlowState) -> Option<f64> {
+    (state.active && !state.ended)
+        .then_some(state.last_mbps)
+        .flatten()
+}
+
+fn format_iperf_progress(snapshot: &IperfProgressSnapshot<'_>) -> String {
+    let tag = if snapshot.tag.is_empty() {
+        "单向"
+    } else {
+        snapshot.tag
+    };
+    let rate = |value: Option<f64>| {
+        value
+            .map(|value| format!("{value:.1}Mbps"))
+            .unwrap_or_else(|| "-".into())
+    };
+    let mut line = format!(
+        "    [灌包进度][{}][{}] active={}/{} connected={} ended={} nic-rx={} iperf={} err={}",
+        snapshot.protocol,
+        tag,
+        snapshot.active,
+        snapshot.total,
+        snapshot.connected,
+        snapshot.ended,
+        rate(snapshot.nic_rx_mbps),
+        rate(snapshot.iperf_mbps),
+        snapshot.errors
+    );
+    if !snapshot.monitor_error.is_empty() {
+        line.push_str(&format!(
+            " monitor={}",
+            snapshot.monitor_error.replace(['\r', '\n'], " ")
+        ));
+    }
+    line
+}
+
+fn is_live_progress_rate_line(line: &str, parallel_streams: usize) -> bool {
+    let lower = line.to_lowercase();
+    if lower.contains(" sender") || lower.contains(" receiver") {
+        return false;
+    }
+    iperf_interval_ms(line).is_some() && (parallel_streams <= 1 || lower.contains("[sum]"))
+}
+
+fn tcp_parallel_streams(extra: &[String]) -> usize {
+    extra
+        .windows(2)
+        .find_map(|pair| {
+            pair[0]
+                .eq_ignore_ascii_case("-p")
+                .then(|| pair[1].parse::<usize>().ok())
+                .flatten()
+        })
+        .unwrap_or(1)
+        .max(1)
+}
+
+fn raw_iperf_filename(
+    owner_id: &str,
+    lidx: usize,
+    stream_pos: usize,
+    tag: &str,
+    task: &IperfTask,
+) -> String {
+    format!(
+        "iperf_raw_{}_l{:02}_s{:02}_{}_{}_p{}.log",
+        sanitize(owner_id),
+        lidx,
+        stream_pos,
+        if task.udp { "udp" } else { "tcp" },
+        sanitize(if tag.is_empty() { "oneway" } else { tag }),
+        task.port
+    )
+}
+
+fn build_iperf_raw_record(
+    task: &IperfTask,
+    client: &IperfClientOut,
+    server_output: &str,
+    events: &[IperfFlowEvent],
+    error: &str,
+) -> String {
+    format!(
+        "# CPE iperf3 raw record\n\
+# saved_at,{}\n\
+# transport,{}\n\
+# profile,{}\n\
+# source,{} / {} / {}\n\
+# destination,{} / {} / {}\n\
+# port,{}\n\
+# duration_secs,{}\n\
+# client_ok,{}\n\
+# client_timed_out,{}\n\
+# client_cancelled,{}\n\
+# error,{}\n\
+\n=== CLIENT COMMAND ===\n$ {}\n\
+\n=== CLIENT STDOUT+STDERR / ALL ATTEMPTS ===\n{}\n\
+\n=== SERVER STDOUT+STDERR / ALL ATTEMPTS ===\n{}\n\
+\n=== FLOW EVENTS ===\n{}",
+        now_full(),
+        if task.udp { "UDP" } else { "TCP" },
+        task.profile_label,
+        task.src.side.cn(),
+        task.src.nic.name,
+        task.src.nic.ipv4,
+        task.dst.side.cn(),
+        task.dst.nic.name,
+        task.dst.nic.ipv4,
+        task.port,
+        task.duration,
+        client.ok,
+        client.timed_out,
+        client.cancelled,
+        error.replace(['\r', '\n'], " "),
+        client.cmd,
+        client.output,
+        server_output,
+        format_flow_events(events, error)
+    )
+}
+
+fn csv_field(value: &str) -> String {
+    if value.contains([',', '"', '\r', '\n']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
+fn build_monitor_samples_csv(endpoint: &str, iface: &str, out: &MonitorStopOut) -> String {
+    let mut csv = format!(
+        "# CPE OS NIC counter samples\n\
+# endpoint,{}\n\
+# interface,{}\n\
+# seconds,{:.6}\n\
+# average_rx_mbps,{:.6}\n\
+# average_tx_mbps,{:.6}\n\
+elapsed_ms,interval_ms,rx_bytes,tx_bytes,rx_delta_bytes,tx_delta_bytes,rx_mbps,tx_mbps,valid,error\n",
+        csv_field(endpoint),
+        csv_field(iface),
+        out.seconds,
+        out.avg_mbps,
+        out.tx_avg_mbps
+    );
+    for sample in &out.samples {
+        csv.push_str(&format!(
+            "{},{},{},{},{},{},{:.6},{:.6},{},{}\n",
+            sample.elapsed_ms,
+            sample.interval_ms,
+            sample.rx_bytes,
+            sample.tx_bytes,
+            sample.rx_delta_bytes,
+            sample.tx_delta_bytes,
+            sample.rx_mbps,
+            sample.tx_mbps,
+            sample.valid,
+            csv_field(&sample.error)
+        ));
+    }
+    if !out.errors.is_empty() {
+        csv.push_str("# monitor_errors\n");
+        for error in &out.errors {
+            csv.push_str(&format!("# {}\n", csv_field(error)));
+        }
+    }
+    csv
+}
+
+fn iperf_interval_ms(line: &str) -> Option<(u64, u64)> {
+    fn seconds_to_ms(raw: &str) -> Option<u64> {
+        if raw.is_empty()
+            || !raw
+                .chars()
+                .all(|ch| ch.is_ascii_digit() || ch == '.' || ch == ',')
+        {
+            return None;
+        }
+        let seconds = raw.replace(',', ".").parse::<f64>().ok()?;
+        if !seconds.is_finite() || !(0.0..=u64::MAX as f64 / 1_000.0).contains(&seconds) {
+            return None;
+        }
+        Some((seconds * 1_000.0).round() as u64)
+    }
+
     let fields: Vec<&str> = line.split_whitespace().collect();
     fields.windows(2).find_map(|pair| {
         if pair[1] != "sec" {
             return None;
         }
-        let (_, end) = pair[0].split_once('-')?;
-        let end = end
-            .trim_matches(|ch: char| !ch.is_ascii_digit() && ch != '.' && ch != ',')
-            .replace(',', ".")
-            .parse::<f64>()
-            .ok()?;
-        (end.is_finite() && end > 0.0).then_some((end * 1_000.0).round() as u64)
+        let (start, end) = pair[0].split_once('-')?;
+        let start_ms = seconds_to_ms(start)?;
+        let end_ms = seconds_to_ms(end)?;
+        (end_ms > start_ms).then_some((start_ms, end_ms))
     })
 }
 
@@ -2008,13 +3259,14 @@ fn flow_active_interval(flow: &UdpFlowRun) -> Option<(u64, u64)> {
     // 避免把一次过早结束的短测量误扩成完整测试。
     let reported_duration_ms = traffic_events
         .iter()
-        .filter_map(|event| iperf_interval_end_ms(&event.line))
+        .filter_map(|event| iperf_interval_ms(&event.line))
+        .map(|(start_ms, end_ms)| end_ms - start_ms)
         .max();
     if let Some(duration_ms) = reported_duration_ms
         .filter(|duration_ms| duration_ms.saturating_add(FLOW_TIMELINE_TOLERANCE_MS) >= expected_ms)
     {
         let start = end.saturating_sub(duration_ms).max(attempt_floor);
-        if end > start {
+        if flow_duration_is_plausible(start, end, expected_ms) {
             return Some((start, end));
         }
     }
@@ -2274,6 +3526,40 @@ fn rolling_time_window_averages(
     rolling
 }
 
+fn nominal_monitor_interval_ms(out: &MonitorStopOut, window: &EffectiveWindow) -> Option<u64> {
+    let mut all = Vec::new();
+    let mut interior = Vec::new();
+    for sample in &out.samples {
+        if sample.interval_ms == 0
+            || sample.elapsed_ms <= window.start_ms
+            || sample.elapsed_ms.saturating_sub(sample.interval_ms) >= window.end_ms
+        {
+            continue;
+        }
+        all.push(sample.interval_ms);
+        // stop 唤醒产生的最后一个样本通常短于正常周期，优先用完全处于
+        // 窗口内部的周期推断 nominal interval，避免边界样本拉低结果。
+        if sample.elapsed_ms.saturating_sub(sample.interval_ms) >= window.start_ms
+            && sample.elapsed_ms < window.end_ms
+        {
+            interior.push(sample.interval_ms);
+        }
+    }
+    let intervals = if interior.is_empty() {
+        &mut all
+    } else {
+        &mut interior
+    };
+    if intervals.is_empty() {
+        return None;
+    }
+    intervals.sort_unstable();
+    // 取较保守的下中位数，避免“一个正常周期 + 一个跨周期恢复样本”把
+    // nominal interval 放大到足以让恢复样本伪装成稳定窗口。MonitorMgr
+    // 的真实配置上限为 5 秒，额外封顶也能识别线程长时间失调度的样本。
+    Some(intervals[(intervals.len() - 1) / 2].min(ROLLING_RATE_WINDOW_MS))
+}
+
 fn monitor_rate_stats(
     out: &MonitorStopOut,
     window: &EffectiveWindow,
@@ -2286,67 +3572,119 @@ fn monitor_rate_stats(
     let mut baseline_values: Vec<f64> = out
         .samples
         .iter()
-        .filter(|sample| sample.valid && sample.elapsed_ms < first_active_ms)
+        .filter(|sample| {
+            sample.valid
+                && sample.interval_ms > 0
+                && sample.elapsed_ms > 0
+                && sample.elapsed_ms <= first_active_ms
+                && (if rx { sample.rx_mbps } else { sample.tx_mbps }).is_finite()
+        })
         .map(|sample| if rx { sample.rx_mbps } else { sample.tx_mbps })
         .collect();
     baseline_values.sort_by(|a, b| a.total_cmp(b));
     let baseline = percentile(&baseline_values, 0.5).unwrap_or(0.0);
+    let nominal_interval_ms = nominal_monitor_interval_ms(out, window);
+    let max_rolling_sample_ms = nominal_interval_ms.map(|nominal| {
+        nominal
+            .saturating_mul(3)
+            .saturating_div(2)
+            .saturating_add(ROLLING_COVERAGE_TOLERANCE_MS)
+    });
 
-    let mut rate_samples: Vec<(u64, u64, f64)> = out
+    // 每个速率样本代表 [elapsed-interval, elapsed) 的一段时间，而不是一个
+    // 等权点。先裁到正式判定窗口，再去掉因毫秒取整或异常输入造成的重叠。
+    let mut clipped_samples: Vec<(u64, u64, f64, bool)> = out
         .samples
         .iter()
         .filter(|sample| {
             sample.valid
-                && sample.elapsed_ms >= window.start_ms
-                && sample.elapsed_ms <= window.end_ms
+                && sample.interval_ms > 0
+                && sample.elapsed_ms > window.start_ms
+                && sample.elapsed_ms.saturating_sub(sample.interval_ms) < window.end_ms
+                && (if rx { sample.rx_mbps } else { sample.tx_mbps }).is_finite()
         })
-        .map(|sample| {
+        .filter_map(|sample| {
             let value = if rx { sample.rx_mbps } else { sample.tx_mbps };
-            (
-                sample.elapsed_ms,
-                sample.interval_ms,
+            let start_ms = sample
+                .elapsed_ms
+                .saturating_sub(sample.interval_ms)
+                .max(window.start_ms);
+            let end_ms = sample.elapsed_ms.min(window.end_ms);
+            (end_ms > start_ms).then_some((
+                start_ms,
+                end_ms,
                 (value - baseline).max(0.0),
-            )
+                max_rolling_sample_ms
+                    .is_some_and(|max_interval| sample.interval_ms <= max_interval),
+            ))
         })
         .collect();
-    rate_samples.sort_by_key(|(elapsed_ms, _, _)| *elapsed_ms);
+    clipped_samples.sort_by_key(|(start_ms, end_ms, _, _)| (*start_ms, *end_ms));
+
+    let mut rate_samples: Vec<(u64, u64, f64)> = Vec::with_capacity(clipped_samples.len());
+    let mut rolling_rate_samples: Vec<(u64, u64, f64)> = Vec::with_capacity(clipped_samples.len());
+    let mut covered_until_ms = window.start_ms;
+    let mut rolling_covered_until_ms = window.start_ms;
+    for (sample_start_ms, sample_end_ms, rate, rolling_eligible) in clipped_samples {
+        let non_overlapping_start_ms = sample_start_ms.max(covered_until_ms);
+        if sample_end_ms > non_overlapping_start_ms {
+            rate_samples.push((
+                sample_end_ms,
+                sample_end_ms - non_overlapping_start_ms,
+                rate,
+            ));
+            covered_until_ms = sample_end_ms;
+        }
+        if rolling_eligible {
+            let rolling_start_ms = sample_start_ms.max(rolling_covered_until_ms);
+            if sample_end_ms > rolling_start_ms {
+                rolling_rate_samples.push((sample_end_ms, sample_end_ms - rolling_start_ms, rate));
+                rolling_covered_until_ms = sample_end_ms;
+            }
+        }
+    }
+
     let mut rates: Vec<f64> = rate_samples.iter().map(|(_, _, rate)| *rate).collect();
     if rates.is_empty() {
         return RateStats::default();
     }
-    let avg = rates.iter().sum::<f64>() / rates.len() as f64;
+    let covered_ms: u64 = rate_samples
+        .iter()
+        .map(|(_, interval_ms, _)| *interval_ms)
+        .sum();
+    if covered_ms == 0 {
+        return RateStats::default();
+    }
+    let avg = rate_samples
+        .iter()
+        .map(|(_, interval_ms, rate)| *rate * *interval_ms as f64)
+        .sum::<f64>()
+        / covered_ms as f64;
     let min = rates.iter().copied().fold(f64::INFINITY, f64::min);
     let max = rates.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let rolling = {
-        let timed =
-            rolling_time_window_averages(&rate_samples, window.start_ms, ROLLING_RATE_WINDOW_MS);
-        if timed.is_empty() {
-            rates.clone()
-        } else {
-            timed
-        }
-    };
+    let rolling = rolling_time_window_averages(
+        &rolling_rate_samples,
+        window.start_ms,
+        ROLLING_RATE_WINDOW_MS,
+    );
     rates.sort_by(|a, b| a.total_cmp(b));
     let mut rolling_sorted = rolling;
     rolling_sorted.sort_by(|a, b| a.total_cmp(b));
-    let mut sample_intervals_ms: Vec<f64> = out
-        .samples
-        .iter()
-        .filter(|sample| {
-            sample.interval_ms > 0
-                && sample.elapsed_ms >= window.start_ms
-                && sample.elapsed_ms <= window.end_ms
+    let window_ms = window.end_ms - window.start_ms;
+    let expected_rolling_windows = nominal_interval_ms
+        .filter(|nominal| *nominal > 0 && window_ms >= ROLLING_RATE_WINDOW_MS)
+        .map(|nominal| {
+            window_ms
+                .saturating_sub(ROLLING_RATE_WINDOW_MS)
+                .saturating_div(nominal)
+                .saturating_add(1)
         })
-        .map(|sample| sample.interval_ms as f64)
-        .collect();
-    sample_intervals_ms.sort_by(|a, b| a.total_cmp(b));
-    let nominal_interval_ms = percentile(&sample_intervals_ms, 0.50)
-        .unwrap_or(1_000.0)
-        .max(1.0);
-    // 窗口两端均包含样本，因此完整覆盖的期望数量为 duration/interval + 1。
-    // 不能写死 1 秒，否则 500ms 会掩盖丢样，2s/5s 会被误判覆盖不足。
-    let expected_samples =
-        ((window.end_ms - window.start_ms) as f64 / nominal_interval_ms).floor() + 1.0;
+        .unwrap_or(0);
+    let rolling_coverage = if expected_rolling_windows == 0 {
+        0.0
+    } else {
+        (rolling_sorted.len() as f64 / expected_rolling_windows as f64).min(1.0)
+    };
     RateStats {
         avg_mbps: Some(avg),
         p10_mbps: percentile(&rolling_sorted, 0.10),
@@ -2354,7 +3692,8 @@ fn monitor_rate_stats(
         p95_mbps: percentile(&rates, 0.95),
         min_mbps: Some(min),
         max_mbps: Some(max),
-        coverage: (rates.len() as f64 / expected_samples).min(1.0),
+        coverage: (covered_ms as f64 / window_ms as f64).min(1.0),
+        rolling_coverage,
     }
 }
 
@@ -2469,8 +3808,40 @@ impl ResultDb {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::master::builder::Endpoint;
+    use crate::master::builder::{Endpoint, PingPurpose, PingTask};
     use crate::protocol::NicInfo;
+
+    #[test]
+    fn unit_panic_is_converted_cleanup_runs_and_next_unit_can_continue() {
+        let cleaned = std::sync::atomic::AtomicBool::new(false);
+        let panic_outcomes = execute_unit_safely(
+            || panic!("synthetic unit panic"),
+            || {
+                cleaned.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        );
+        assert!(cleaned.load(Ordering::SeqCst));
+        assert_eq!(panic_outcomes.len(), 1);
+        assert_eq!(panic_outcomes[0].reason_code, "UNIT_PANIC");
+
+        let next_outcomes = execute_unit_safely(
+            || {
+                vec![LegOutcome {
+                    verdict: Verdict::Pass,
+                    reason_code: String::new(),
+                    reason_detail: String::new(),
+                    rx_avg: None,
+                    main_rows: Vec::new(),
+                    tag: String::new(),
+                }]
+            },
+            || Err("synthetic cleanup failure".into()),
+        );
+        assert_eq!(next_outcomes.len(), 2);
+        assert_eq!(next_outcomes[0].verdict, Verdict::Pass);
+        assert_eq!(next_outcomes[1].reason_code, "RESOURCE_CLEANUP_FAILED");
+    }
 
     fn endpoint(side: Side, name: &str, ip: &str) -> Endpoint {
         Endpoint {
@@ -2484,6 +3855,29 @@ mod tests {
                 ..Default::default()
             },
         }
+    }
+
+    fn isolated_ctx(agent_port: u16) -> (Ctx, PathBuf) {
+        let db_path = std::env::temp_dir().join(format!(
+            "cpe_test_executor_{}_{}.json",
+            std::process::id(),
+            RESOURCE_OWNER_SEQ.fetch_add(1, Ordering::SeqCst)
+        ));
+        let ctx = Ctx {
+            agent_host: "127.0.0.1".into(),
+            agent_port,
+            cfg: Config {
+                screenshot: false,
+                open_report: false,
+                ..Default::default()
+            },
+            outdir: std::env::temp_dir(),
+            local_servers: IperfServerMgr::new(),
+            local_monitors: MonitorMgr::new(),
+            rows: Mutex::new(Vec::new()),
+            db: Mutex::new(ResultDb::load(db_path.clone())),
+        };
+        (ctx, db_path)
     }
 
     fn udp_plan(
@@ -2792,7 +4186,7 @@ mod tests {
         };
         let stats = monitor_rate_stats(&out, &window, true, 3_000);
         assert_eq!(stats.avg_mbps, Some(1_000.0));
-        assert_eq!(stats.p10_mbps, Some(900.0));
+        assert_eq!(stats.p10_mbps, None);
         assert_eq!(stats.median_mbps, Some(1_000.0));
         assert_eq!(stats.coverage, 1.0);
     }
@@ -2823,7 +4217,85 @@ mod tests {
 
         out.samples[2].valid = false;
         let missing_one = monitor_rate_stats(&out, &window, true, 0);
-        assert!((missing_one.coverage - 5.0 / 6.0).abs() < f64::EPSILON);
+        assert!((missing_one.coverage - 0.8).abs() < f64::EPSILON);
+
+        // 读取失败后恢复的有效样本会用同一段完整时间计算字节差和速率；
+        // interval_ms 跨过失败周期时，应恢复这段时间的覆盖，而不是按样本数扣分。
+        out.samples[2].valid = false;
+        out.samples[3].interval_ms = 4_000;
+        let recovered = monitor_rate_stats(&out, &window, true, 0);
+        assert_eq!(recovered.coverage, 1.0);
+    }
+
+    #[test]
+    fn test_rate_average_is_weighted_by_valid_time_and_clipped_to_window() {
+        let out = MonitorStopOut {
+            samples: vec![
+                MonitorSample {
+                    elapsed_ms: 1_000,
+                    interval_ms: 1_000,
+                    rx_mbps: 100.0,
+                    valid: true,
+                    ..Default::default()
+                },
+                MonitorSample {
+                    elapsed_ms: 4_000,
+                    interval_ms: 3_000,
+                    rx_mbps: 300.0,
+                    valid: true,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let full = EffectiveWindow {
+            start_ms: 0,
+            end_ms: 4_000,
+            available_secs: 4.0,
+            required_secs: 4,
+            complete: true,
+        };
+        let full_stats = monitor_rate_stats(&out, &full, true, 0);
+        assert_eq!(full_stats.avg_mbps, Some(250.0));
+        assert_eq!(full_stats.coverage, 1.0);
+        assert_eq!(full_stats.p10_mbps, None);
+
+        // 第二个样本横跨窗口两端，只有 [2s, 3s) 的一秒应纳入统计。
+        let clipped = EffectiveWindow {
+            start_ms: 2_000,
+            end_ms: 3_000,
+            available_secs: 1.0,
+            required_secs: 1,
+            complete: true,
+        };
+        let clipped_stats = monitor_rate_stats(&out, &clipped, true, 0);
+        assert_eq!(clipped_stats.avg_mbps, Some(300.0));
+        assert_eq!(clipped_stats.coverage, 1.0);
+
+        // 异常/合成输入可能乱序且区间嵌套；覆盖率必须按区间并集计算，
+        // 不能因为先看到内层区间而丢掉外层区间的前半段。
+        let nested_out = MonitorStopOut {
+            samples: vec![
+                MonitorSample {
+                    elapsed_ms: 2_000,
+                    interval_ms: 1_000,
+                    rx_mbps: 300.0,
+                    valid: true,
+                    ..Default::default()
+                },
+                MonitorSample {
+                    elapsed_ms: 4_000,
+                    interval_ms: 4_000,
+                    rx_mbps: 100.0,
+                    valid: true,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let nested_stats = monitor_rate_stats(&nested_out, &full, true, 0);
+        assert_eq!(nested_stats.avg_mbps, Some(100.0));
+        assert_eq!(nested_stats.coverage, 1.0);
     }
 
     #[test]
@@ -2855,6 +4327,44 @@ mod tests {
         assert!(rate_sample_coverage_sufficient(
             &rx_stats,
             &complete_tx_stats,
+            true
+        ));
+
+        let missing_p10 = RateStats {
+            coverage: 1.0,
+            ..Default::default()
+        };
+        let complete_p10 = RateStats {
+            coverage: 1.0,
+            p10_mbps: Some(10_000.0),
+            rolling_coverage: 1.0,
+            ..Default::default()
+        };
+        assert!(!rate_window_coverage_sufficient(
+            &missing_p10,
+            &complete_p10,
+            true
+        ));
+        assert!(!rate_window_coverage_sufficient(
+            &complete_p10,
+            &missing_p10,
+            true
+        ));
+        assert!(rate_window_coverage_sufficient(
+            &missing_p10,
+            &missing_p10,
+            false
+        ));
+
+        let sparse_rolling = RateStats {
+            coverage: 1.0,
+            p10_mbps: Some(10_000.0),
+            rolling_coverage: MIN_RATE_SAMPLE_COVERAGE - 0.01,
+            ..Default::default()
+        };
+        assert!(!rate_window_coverage_sufficient(
+            &sparse_rolling,
+            &complete_p10,
             true
         ));
     }
@@ -2917,6 +4427,89 @@ mod tests {
         };
         let slow_stats = monitor_rate_stats(&slow_out, &slow_window, true, 0);
         assert_eq!(slow_stats.p10_mbps, Some(0.0));
+
+        let short_window = EffectiveWindow {
+            start_ms: 0,
+            end_ms: 4_800,
+            available_secs: 4.8,
+            required_secs: 4,
+            complete: true,
+        };
+        let short_stats = monitor_rate_stats(&fast_out, &short_window, true, 0);
+        assert_eq!(short_stats.coverage, 1.0);
+        assert_eq!(short_stats.p10_mbps, None);
+
+        let fragmented_out = MonitorStopOut {
+            samples: vec![
+                MonitorSample {
+                    elapsed_ms: 4_900,
+                    interval_ms: 4_900,
+                    rx_mbps: 100.0,
+                    valid: true,
+                    ..Default::default()
+                },
+                MonitorSample {
+                    elapsed_ms: 9_900,
+                    interval_ms: 4_900,
+                    rx_mbps: 100.0,
+                    valid: true,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let fragmented_window = EffectiveWindow {
+            start_ms: 0,
+            end_ms: 10_000,
+            available_secs: 10.0,
+            required_secs: 10,
+            complete: true,
+        };
+        let fragmented_stats = monitor_rate_stats(&fragmented_out, &fragmented_window, true, 0);
+        assert!((fragmented_stats.coverage - 0.98).abs() < f64::EPSILON);
+        assert_eq!(fragmented_stats.p10_mbps, None);
+    }
+
+    #[test]
+    fn test_recovery_sample_restores_average_but_not_rolling_window_coverage() {
+        let out = MonitorStopOut {
+            samples: (1..=20)
+                .map(|second| {
+                    if second == 6 {
+                        MonitorSample {
+                            elapsed_ms: second * 1_000,
+                            interval_ms: 1_000,
+                            valid: false,
+                            ..Default::default()
+                        }
+                    } else {
+                        MonitorSample {
+                            elapsed_ms: second * 1_000,
+                            // 第 7 秒恢复时，字节差/速率正确覆盖 [5s, 7s)，
+                            // 可用于总平均值，但不能证明其中任一 5 秒窗口稳定。
+                            interval_ms: if second == 7 { 2_000 } else { 1_000 },
+                            rx_mbps: 100.0,
+                            valid: true,
+                            ..Default::default()
+                        }
+                    }
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let window = EffectiveWindow {
+            start_ms: 0,
+            end_ms: 20_000,
+            available_secs: 20.0,
+            required_secs: 20,
+            complete: true,
+        };
+        let stats = monitor_rate_stats(&out, &window, true, 0);
+        assert_eq!(stats.avg_mbps, Some(100.0));
+        assert_eq!(stats.coverage, 1.0);
+        assert_eq!(stats.p10_mbps, Some(100.0));
+        assert!((stats.rolling_coverage - 0.625).abs() < f64::EPSILON);
+        assert!(!rate_window_coverage_sufficient(&stats, &stats, true));
     }
 
     #[test]
@@ -3004,6 +4597,33 @@ mod tests {
     }
 
     #[test]
+    fn test_iperf_interval_parser_returns_start_and_end() {
+        assert_eq!(
+            iperf_interval_ms("[  5]   5.00-180.00 sec  12.0 GBytes  500 Mbits/sec sender"),
+            Some((5_000, 180_000))
+        );
+        assert_eq!(
+            iperf_interval_ms("[  5]   0,25-1,75 sec  100 MBytes  500 Mbits/sec"),
+            Some((250, 1_750))
+        );
+        assert_eq!(iperf_interval_ms("[  5] 1.00-1.00 sec"), None);
+        assert_eq!(iperf_interval_ms("[  5] 2.00-1.00 sec"), None);
+        assert_eq!(iperf_interval_ms("[  5] invalid sec"), None);
+    }
+
+    #[test]
+    fn test_flow_interval_uses_iperf_end_minus_start_duration() {
+        let master = endpoint(Side::Master, "master0", "192.168.1.2");
+        let agent = endpoint(Side::Agent, "agent0", "192.168.1.3");
+        let plan = udp_plan(0, "ab", 1, &master, &agent, 175);
+        let mut flow = udp_flow(0, 0, &plan.streams[0], 200_000, 200_000, true);
+        flow.events[0].line = "[  5]   5.00-180.00 sec  12.0 GBytes  500 Mbits/sec sender".into();
+
+        // 行内真正覆盖 175 秒；不能把区间终点 180 秒误当成持续时间。
+        assert_eq!(flow_active_interval(&flow), Some((25_000, 200_000)));
+    }
+
+    #[test]
     fn test_retry_count_includes_client_and_group_retry_events() {
         let events = vec![
             IperfFlowEvent {
@@ -3055,8 +4675,453 @@ mod tests {
     }
 
     #[test]
+    fn preflight_block_marks_iperf_without_touching_ping_legs() {
+        let master = endpoint(Side::Master, "master0", "192.168.1.2");
+        let agent = endpoint(Side::Agent, "agent0", "192.168.1.3");
+        let iperf = IperfTask {
+            v6: false,
+            udp: false,
+            profile_name: "tcp_w64k".into(),
+            profile_label: "TCP -w 64k".into(),
+            src: master,
+            dst: agent,
+            port: 56_000,
+            duration: 1,
+            extra: vec!["-w".into(), "64k".into()],
+            stream_idx: 0,
+            rate_mode: RateMode::Observe,
+            rx_target_mbps: None,
+            offered_mbps: None,
+        };
+        let unit = Unit {
+            id: "blocked".into(),
+            title: "blocked".into(),
+            bidir: false,
+            legs: vec![Leg {
+                tag: "ab".into(),
+                kind: LegKind::IperfSingle(iperf),
+            }],
+            est_secs: 1,
+        };
+        let block = IperfPreflightBlock {
+            reason_code: "IPERF_PREFLIGHT_FAILED".into(),
+            reason_detail: "两端缺少 iperf3".into(),
+        };
+        let outcomes = preflight_block_outcomes(&unit, &block);
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].verdict, Verdict::SetupError);
+        assert_eq!(outcomes[0].reason_code, "IPERF_PREFLIGHT_FAILED");
+        assert_eq!(outcomes[0].tag, "ab");
+        assert!(outcomes[0].main_rows.is_empty());
+    }
+
+    #[test]
+    fn preflight_block_takes_priority_over_resume_pass() {
+        let master = endpoint(Side::Master, "master0", "192.168.1.2");
+        let agent = endpoint(Side::Agent, "agent0", "192.168.1.3");
+        let unit = Unit {
+            id: "blocked-resume".into(),
+            title: "blocked-resume".into(),
+            bidir: false,
+            legs: vec![Leg {
+                tag: String::new(),
+                kind: LegKind::IperfSingle(IperfTask {
+                    v6: false,
+                    udp: false,
+                    profile_name: "tcp_w64k".into(),
+                    profile_label: "TCP -w 64k".into(),
+                    src: master,
+                    dst: agent,
+                    port: 56_000,
+                    duration: 1,
+                    extra: vec![],
+                    stream_idx: 0,
+                    rate_mode: RateMode::Observe,
+                    rx_target_mbps: None,
+                    offered_mbps: None,
+                }),
+            }],
+            est_secs: 1,
+        };
+        let db_path = std::env::temp_dir().join(format!(
+            "cpe_test_preflight_resume_{}_{}.json",
+            std::process::id(),
+            RESOURCE_OWNER_SEQ.fetch_add(1, Ordering::SeqCst)
+        ));
+        let mut db = ResultDb::load(db_path.clone());
+        db.set(&unit.id, true, &unit.title);
+        db.save();
+        let cfg = Config {
+            resume: true,
+            ..Default::default()
+        };
+        let ctx = Ctx {
+            agent_host: "127.0.0.1".into(),
+            agent_port: 1,
+            cfg,
+            outdir: std::env::temp_dir(),
+            local_servers: IperfServerMgr::new(),
+            local_monitors: MonitorMgr::new(),
+            rows: Mutex::new(Vec::new()),
+            db: Mutex::new(ResultDb::load(db_path.clone())),
+        };
+        let block = IperfPreflightBlock {
+            reason_code: "IPERF_PREFLIGHT_FAILED".into(),
+            reason_detail: "缺少 iperf3".into(),
+        };
+        let summary = ctx.run_all_with_preflight(&[unit], Some(&block));
+        assert_eq!(summary.skip, 0);
+        assert_eq!(summary.setup_error, 1);
+        assert_eq!(summary.iperf_units, 1);
+        assert_eq!(summary.iperf_usable_units, 0);
+        assert!(summary.needs_iperf_failure_diagnostics());
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn missing_gateway_is_not_reported_as_network_packet_loss() {
+        let src = endpoint(Side::Master, "eth0", "192.168.1.2");
+        let dst = Endpoint {
+            side: Side::Master,
+            pc: "主控".into(),
+            nic: NicInfo {
+                name: "eth0 的 IPv4 网关".into(),
+                role: "GATEWAY".into(),
+                ipv4: String::new(),
+                ..Default::default()
+            },
+        };
+        let unit = Unit {
+            id: "gateway-missing".into(),
+            title: "gateway-missing".into(),
+            bidir: false,
+            legs: vec![Leg {
+                tag: "gateway-diagnostic".into(),
+                kind: LegKind::Ping(PingTask {
+                    v6: false,
+                    src,
+                    dst,
+                    count: 3,
+                    payload: 32,
+                    purpose: PingPurpose::GatewayDiagnostic,
+                }),
+            }],
+            est_secs: 1,
+        };
+        let (ctx, db_path) = isolated_ctx(0);
+        let summary = ctx.run_all_with_preflight(&[unit], None);
+        assert_eq!(summary.not_evaluated, 1);
+        assert_eq!(summary.setup_error, 0);
+        let rows = ctx.rows.lock().unwrap();
+        let detail = rows.iter().find(|row| !row.is_unit_summary).unwrap();
+        assert_eq!(detail.verdict, Verdict::NotEvaluated);
+        assert_eq!(detail.execution_status, ExecutionStatus::Partial);
+        assert_eq!(detail.reason_code, "GATEWAY_NOT_FOUND");
+        assert_eq!(detail.ping_loss, None);
+        drop(rows);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn agent_ping_http_failure_is_setup_error_not_one_hundred_percent_loss() {
+        let unit = Unit {
+            id: "agent-ping-http-error".into(),
+            title: "agent-ping-http-error".into(),
+            bidir: false,
+            legs: vec![Leg {
+                tag: String::new(),
+                kind: LegKind::Ping(PingTask {
+                    v6: false,
+                    src: endpoint(Side::Agent, "agent0", "192.168.1.3"),
+                    dst: endpoint(Side::Master, "master0", "192.168.1.2"),
+                    count: 1,
+                    payload: 32,
+                    purpose: PingPurpose::SubnetDiagnostic,
+                }),
+            }],
+            est_secs: 1,
+        };
+        let (ctx, db_path) = isolated_ctx(0);
+        let summary = ctx.run_all_with_preflight(&[unit], None);
+        assert_eq!(summary.setup_error, 1);
+        let rows = ctx.rows.lock().unwrap();
+        let detail = rows.iter().find(|row| !row.is_unit_summary).unwrap();
+        assert_eq!(detail.verdict, Verdict::SetupError);
+        assert_eq!(detail.execution_status, ExecutionStatus::Error);
+        assert_eq!(detail.reason_code, "PING_EXEC_ERROR");
+        assert_eq!(detail.ping_loss, None);
+        assert!(detail.reason_detail.contains("辅测机 /ping 调用失败"));
+        drop(rows);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn mixed_preflight_failure_still_runs_independent_ping_unit() {
+        let iperf_unit = Unit {
+            id: "mixed-iperf".into(),
+            title: "mixed-iperf".into(),
+            bidir: false,
+            legs: vec![Leg {
+                tag: String::new(),
+                kind: LegKind::IperfSingle(IperfTask {
+                    v6: false,
+                    udp: false,
+                    profile_name: "tcp".into(),
+                    profile_label: "TCP".into(),
+                    src: endpoint(Side::Master, "master0", "192.168.1.2"),
+                    dst: endpoint(Side::Agent, "agent0", "192.168.1.3"),
+                    port: 56_000,
+                    duration: 1,
+                    extra: vec![],
+                    stream_idx: 0,
+                    rate_mode: RateMode::Observe,
+                    rx_target_mbps: None,
+                    offered_mbps: None,
+                }),
+            }],
+            est_secs: 1,
+        };
+        let ping_unit = Unit {
+            id: "mixed-ping".into(),
+            title: "mixed-ping".into(),
+            bidir: false,
+            legs: vec![Leg {
+                tag: "gateway-diagnostic".into(),
+                kind: LegKind::Ping(PingTask {
+                    v6: false,
+                    src: endpoint(Side::Master, "master0", "192.168.1.2"),
+                    dst: Endpoint {
+                        side: Side::Master,
+                        pc: "主控".into(),
+                        nic: NicInfo {
+                            name: "网关".into(),
+                            role: "GATEWAY".into(),
+                            ipv4: String::new(),
+                            ..Default::default()
+                        },
+                    },
+                    count: 3,
+                    payload: 32,
+                    purpose: PingPurpose::GatewayDiagnostic,
+                }),
+            }],
+            est_secs: 1,
+        };
+        let block = IperfPreflightBlock {
+            reason_code: "IPERF_PREFLIGHT_FAILED".into(),
+            reason_detail: "缺少 iperf3".into(),
+        };
+        let (ctx, db_path) = isolated_ctx(0);
+        let summary = ctx.run_all_with_preflight(&[iperf_unit, ping_unit], Some(&block));
+        assert_eq!(summary.setup_error, 1);
+        assert_eq!(summary.not_evaluated, 1);
+        assert_eq!(summary.iperf_units, 1);
+        let rows = ctx.rows.lock().unwrap();
+        assert!(rows
+            .iter()
+            .any(|row| row.reason_code == "IPERF_PREFLIGHT_FAILED"));
+        assert!(rows
+            .iter()
+            .any(|row| row.reason_code == "GATEWAY_NOT_FOUND"));
+        drop(rows);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn diagnostics_trigger_only_when_every_iperf_unit_has_no_measurement() {
+        let mut summary = RunSummary {
+            iperf_units: 3,
+            iperf_setup_errors: 3,
+            ..Default::default()
+        };
+        assert!(summary.needs_iperf_failure_diagnostics());
+
+        summary.iperf_usable_units = 1;
+        assert!(!summary.needs_iperf_failure_diagnostics());
+
+        let ping_only = RunSummary::default();
+        assert!(!ping_only.needs_iperf_failure_diagnostics());
+    }
+
+    #[test]
+    fn usable_iperf_measurement_requires_real_rate_or_active_stream() {
+        assert!(!row_has_usable_iperf_measurement(&Row::default()));
+        assert!(!row_has_usable_iperf_measurement(&Row {
+            rx_mbps: Some(0.0),
+            ..Default::default()
+        }));
+        assert!(!row_has_usable_iperf_measurement(&Row {
+            verdict: Verdict::SetupError,
+            execution_status: ExecutionStatus::Error,
+            rx_avg: Some(500.0),
+            active_streams: 1,
+            ..Default::default()
+        }));
+        assert!(row_has_usable_iperf_measurement(&Row {
+            rx_mbps: Some(100.0),
+            ..Default::default()
+        }));
+        assert!(row_has_usable_iperf_measurement(&Row {
+            active_streams: 1,
+            ..Default::default()
+        }));
+    }
+
+    #[test]
+    fn run_summary_merge_keeps_iperf_diagnostic_counters() {
+        let mut left = RunSummary {
+            pass: 1,
+            iperf_units: 2,
+            iperf_usable_units: 0,
+            iperf_setup_errors: 2,
+            ..Default::default()
+        };
+        left.merge(RunSummary {
+            fail: 1,
+            not_evaluated: 1,
+            ..Default::default()
+        });
+        assert_eq!(left.pass, 1);
+        assert_eq!(left.fail, 1);
+        assert_eq!(left.not_evaluated, 1);
+        assert_eq!(left.iperf_units, 2);
+        assert_eq!(left.iperf_setup_errors, 2);
+        assert!(left.needs_iperf_failure_diagnostics());
+    }
+
+    #[test]
     fn test_text_preview_is_utf8_safe() {
         assert_eq!(text_preview("截图失败：权限不足", 4), "截图失败");
         assert_eq!(text_preview("short", 100), "short");
+    }
+
+    #[test]
+    fn progress_line_uses_nic_rate_and_only_active_iperf_rates() {
+        let line = format_iperf_progress(&IperfProgressSnapshot {
+            protocol: "TCP",
+            tag: "ab",
+            active: 1,
+            total: 1,
+            connected: 1,
+            ended: 0,
+            nic_rx_mbps: Some(2368.4),
+            iperf_mbps: Some(2379.0),
+            errors: 0,
+            monitor_error: String::new(),
+        });
+        assert!(line.contains("[灌包进度][TCP][ab]"));
+        assert!(line.contains("nic-rx=2368.4Mbps"));
+        assert!(line.contains("iperf=2379.0Mbps"));
+
+        let mut state = LiveFlowState::default();
+        apply_flow_event(
+            &mut state,
+            &IperfFlowEvent {
+                kind: IperfEventKind::Traffic,
+                mbps: Some(500.0),
+                ..Default::default()
+            },
+        );
+        assert_eq!(active_iperf_rate(&state), Some(500.0));
+        apply_flow_event(
+            &mut state,
+            &IperfFlowEvent {
+                kind: IperfEventKind::Ended,
+                ..Default::default()
+            },
+        );
+        assert_eq!(active_iperf_rate(&state), None);
+    }
+
+    #[test]
+    fn tcp_parallel_progress_uses_sum_and_ignores_final_summary() {
+        assert!(is_live_progress_rate_line(
+            "[SUM]   0.00-1.00 sec  280 MBytes  2348 Mbits/sec",
+            5
+        ));
+        assert!(!is_live_progress_rate_line(
+            "[  5]   0.00-1.00 sec  56 MBytes  470 Mbits/sec",
+            5
+        ));
+        assert!(!is_live_progress_rate_line(
+            "[SUM]   0.00-180.00 sec  50 GBytes  2379 Mbits/sec sender",
+            5
+        ));
+        assert!(is_live_progress_rate_line(
+            "[  5]   0.00-1.00 sec  56 MBytes  470 Mbits/sec",
+            1
+        ));
+    }
+
+    #[test]
+    fn raw_iperf_record_contains_both_sides_events_and_error() {
+        let master = endpoint(Side::Master, "master0", "192.168.1.2");
+        let agent = endpoint(Side::Agent, "agent0", "192.168.1.3");
+        let task = IperfTask {
+            v6: false,
+            udp: false,
+            profile_name: "tcp_w1m_P5".into(),
+            profile_label: "TCP -w 1m -P 5".into(),
+            src: master,
+            dst: agent,
+            port: 56_000,
+            duration: 180,
+            extra: vec!["-P".into(), "5".into()],
+            stream_idx: 0,
+            rate_mode: RateMode::Observe,
+            rx_target_mbps: None,
+            offered_mbps: None,
+        };
+        let client = IperfClientOut {
+            cmd: "iperf3 -c 192.168.1.3".into(),
+            output: "CLIENT RAW".into(),
+            ..Default::default()
+        };
+        let events = vec![IperfFlowEvent {
+            kind: IperfEventKind::Traffic,
+            elapsed_ms: 1_000,
+            mbps: Some(123.0),
+            line: "EVENT RAW".into(),
+        }];
+        let text = build_iperf_raw_record(&task, &client, "SERVER RAW", &events, "sample error");
+        assert!(text.contains("CLIENT RAW"));
+        assert!(text.contains("SERVER RAW"));
+        assert!(text.contains("EVENT RAW"));
+        assert!(text.contains("sample error"));
+
+        let filename = raw_iperf_filename("unit:1", 2, 3, "ab", &task);
+        assert!(filename.ends_with(".log"));
+        assert!(!filename.contains(':'));
+        assert!(filename.contains("tcp"));
+        assert!(filename.contains("p56000"));
+    }
+
+    #[test]
+    fn nic_sample_csv_keeps_counter_deltas_rates_validity_and_errors() {
+        let out = MonitorStopOut {
+            avg_mbps: 100.0,
+            tx_avg_mbps: 90.0,
+            seconds: 1.0,
+            bytes: 12_500_000,
+            tx_bytes: 11_250_000,
+            samples: vec![MonitorSample {
+                elapsed_ms: 1_000,
+                interval_ms: 1_000,
+                rx_bytes: 1_012_500_000,
+                tx_bytes: 2_011_250_000,
+                rx_delta_bytes: 12_500_000,
+                tx_delta_bytes: 11_250_000,
+                rx_mbps: 100.0,
+                tx_mbps: 90.0,
+                valid: false,
+                error: "counter reset".into(),
+            }],
+            errors: vec!["counter reset".into()],
+        };
+        let csv = build_monitor_samples_csv("agent", "Ethernet 2", &out);
+        assert!(csv.contains("elapsed_ms,interval_ms,rx_bytes,tx_bytes"));
+        assert!(csv.contains("1000,1000,1012500000,2011250000,12500000,11250000,100.000000,90.000000,false,counter reset"));
+        assert!(csv.contains("# endpoint,agent"));
+        assert!(csv.contains("# interface,Ethernet 2"));
     }
 }

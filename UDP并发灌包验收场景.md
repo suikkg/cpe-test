@@ -55,7 +55,8 @@
 - HTML 的测试单元汇总行。
 - 每个方向的组合计行。
 - 流明细行及“流事件”原始输出。
-- 主控日志中的 `[UDP进度]`、`[UDP流重试]`、有效窗口和截图日志。
+- 主控日志中的 `[灌包进度][UDP]`、`[UDP流重试]`、有效窗口和截图日志。
+- `iperf_outputs/iperf_raw_*.log` 的全部 client/server 重试原文，以及 `nic_samples_*.csv` 的 OS 网卡逐样本记录。
 
 报告通过率只按测试单元汇总行统计。20 条流明细加 1 个组合测试仍只能算 1 个测试单元，不能算 21 个。
 
@@ -164,7 +165,7 @@
 步骤：
 
 1. 分别配置 20 条和 32 条远端 client 流，持续至少 30 秒。
-2. 观察 agent 日志及主控 `[UDP进度]`。
+2. 观察 agent 日志及主控 `[灌包进度][UDP]`。
 
 预期：
 
@@ -281,6 +282,43 @@
 
 预期：AB 和 BA 使用同一个共同时间区间，但分别读取各自接收端 RX、发送端 TX并分别对目标判定；不能把两个方向速率相加后只给一个 PASS/FAIL。
 
+### W07：iperf stdout 缓冲后集中输出
+
+步骤：使用会块缓冲 stdout 的旧版 iperf3，或在测试桩中让全部 interval 行在进程结束时集中到达；输出同时包含非零起点区间（例如 `5.00-180.00 sec`）。
+
+预期：
+
+- 活跃时长优先取 iperf 行内 `结束秒 - 开始秒`，示例按 175 秒而不是 180 秒，更不能按日志集中到达的几毫秒计算。
+- 该时间只用于裁剪网卡样本；正式 RX 平均/P10 仍来自接收网卡计数器，iperf3 自报速率只保留为诊断列。
+- 无法解析可信 interval 时才回退到 Traffic/Connected/Started 事件；短测量不能被扩成完整 180 秒。
+
+### W08：恢复样本不能伪造稳定窗口
+
+步骤：让网卡计数器读取失败一个或多个周期，随后恢复；恢复样本的 `interval_ms` 跨越失败周期，并保持总字节差正确。
+
+预期：恢复样本按完整时间参与加权平均和总覆盖率，但不能单独生成多个完整 5 秒窗口。有明确目标时，RX/TX 任一侧完整滚动窗口覆盖率低于 95% 均为 `NOT_EVALUATED / RATE_WINDOW_COVERAGE_LOW`；不足 5 秒时 P10 必须为空，不能退化成瞬时样本 P10。
+
+### W09：失败重试前同步释放端口
+
+步骤：让某流首轮 client 或 server 启动失败，观察组级重试；再制造一次 server kill/wait 无法确认的测试桩结果。
+
+预期：
+
+- 正常失败路径先停止 client，再按本轮 request ID 精确停止 server；确认进程退出、wait 回收和 reader 结束后，才使用新 request ID 在同端口重试。
+- stop 未确认时禁止同端口继续重试，并在单元结果中出现资源清理错误；不能靠等待固定毫秒数猜测端口已经释放。
+- 迟到的旧 request stop 不会杀死同端口的新 request。
+
+### W10：响应丢失、owner 清理与旧 agent 门禁
+
+步骤：分别丢弃一次 server/client start 响应、重复发送同一请求；让测试单元 panic；再用不声明 `reliable_lifecycle_v1` 的旧 agent 运行包含 iperf 的任务。
+
+预期：
+
+- 同一 request ID、相同参数只复用已有进程/作业并续租，不创建第二份；stop-before-start tombstone 阻止迟到 start 复活。
+- 单元正常结束、错误和 panic 后均按唯一 owner ID 清理 client → server → monitor；重复 cleanup 幂等，owner A 不影响 owner B。
+- 清理未确认产生 `RESOURCE_CLEANUP_FAILED`；单元 panic 产生 `UNIT_PANIC`，随后单元继续执行。
+- 旧 agent 在任何 iperf 进程启动前被主控明确拦截并提示升级；ping-only 任务仍可执行。
+
 ## 六、正式判定边界
 
 ### V01：发送负载不足
@@ -356,9 +394,10 @@
 
 ```bash
 cargo fmt --check
-cargo test
-cargo clippy --all-targets -- -D warnings
-cargo check
+cargo test --locked
+cargo clippy --locked --all-targets -- -D warnings
+cargo build --release --locked
+git diff --check
 ```
 
 自动化单元测试至少覆盖：
@@ -368,8 +407,13 @@ cargo check
 - 5 流/2 流双向中，小方向只有 1 条时不能形成共同窗口。
 - 完整和不足 180 秒的共同窗口。
 - 背景扣除、P10 和采样覆盖率。
+- 非零起始 iperf 区间按 `end-start` 计算，缓冲集中输出不缩短活跃窗口。
+- 网卡平均按时间加权，恢复长样本不能伪造 5 秒滚动窗口，RX/TX 滚动覆盖不足不能正式判定。
 - discover 的 25%/50%/75%/100% 阶梯。
 - 32 个异步 client job 同时处于运行态，不受 16 worker 限制。
+- server 真实端口在 stop 成功返回后可立即重新绑定；旧 stop 不杀新 request。
+- client stop 等待 worker/子进程/reader 完整退出，重复 start/stop 和 stop-before-start 均幂等安全。
+- owner 清理隔离、动态 lease、单元 panic 后清理和旧 agent capability gate。
 - UDP lost/total 解析与加权丢包基础数据。
 - 报告只统计测试单元汇总行。
 - RNDIS 3.7G、NCM 4.2G/10G、EVB 8.4G/6.4G 和 CPE 路径裁剪。
