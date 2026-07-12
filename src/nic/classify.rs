@@ -26,6 +26,7 @@ pub const ROLE_ORDER: [&str; 10] = [
 ///   7. 速率 900-1100 → SGMII1G
 ///   8. 速率 3400-4000 → RNDIS（RNDIS 协商 ~3.7G 兜底）
 ///   9. → UNKNOWN
+#[cfg(any(windows, target_os = "macos", test))]
 pub fn classify_role(description: &str, speed_mbps: u64, is_wifi: bool, band: &str) -> String {
     if is_wifi {
         return match band {
