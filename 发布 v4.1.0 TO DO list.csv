@@ -1,6 +1,0 @@
-step,status
-核对变更与版本策略,DONE
-更新版本和发布说明,DONE
-执行格式与测试验证,DONE
-提交推送并创建标签,IN_PROGRESS
-确认远端发布状态,TODO
