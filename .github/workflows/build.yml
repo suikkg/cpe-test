@@ -65,14 +65,14 @@ jobs:
           from pathlib import Path
           from zipfile import ZipFile
 
-          bundle = Path("dist/cpe_test-v4.2.0-windows-config-docs.zip")
+          bundle = Path("dist/cpe_test-v4.2.1-windows-config-docs.zip")
           checksum = Path(f"{bundle}.sha256")
           expected_hash = checksum.read_text(encoding="utf-8").split()[0]
           actual_hash = sha256(bundle.read_bytes()).hexdigest()
           if actual_hash != expected_hash:
               raise SystemExit(f"bundle SHA-256 mismatch: {actual_hash}")
 
-          prefix = "cpe_test-v4.2.0-windows-config-docs"
+          prefix = "cpe_test-v4.2.1-windows-config-docs"
           source_for = {
               "Windows配置与文档包说明.md": Path("dist/Windows配置与文档包说明.md"),
               "README.md": Path("README.md"),
@@ -494,9 +494,13 @@ jobs:
           body: |
             cpe_test ${{ github.ref_name }} 的已验证跨平台发布包。
 
-            本版新增 iperf3 UDP `-w <socket buffer>` 配置与 Windows 10+ 专用 Microsoft ctsTraffic 后端。Windows 包已包含固定并校验过的 ctsTraffic 2.0.4.0 x64；iperf3 仍需按包内说明自行放置。
+            v4.2.1 收紧了 ctsTraffic 的平台、参数和运行期判定。主控和 agent 现在都会检查真实 Windows 版本，仅确认 major 版本不低于 10 时启用 CTS；Windows 7/8/8.1、版本无法确认以及 macOS/Linux 会 fail-closed，但不阻断已选的 iperf3/Ping。Windows 包已包含固定并校验过的 ctsTraffic 2.0.4.0 x64；iperf3 仍需按包内说明自行放置。
+
+            配置文件中的非法 CTS TCP/UDP `window`、UDP `bandwidth`/`length`、`streams`、`duration` 现在会明确记录 `SETUP_ERROR / CTSTRAFFIC_ARGS_INVALID`，且不启动 CTS 进程；交互式越界输入会要求重输。`duration=0` 不代表无限，也不会被静默修正为 1 秒；无限测试需手工运行 ctsTraffic 原生命令并手工停止。已有 CTS 工具测量后，server 在显式停止前异常退出或超时会记录 `RATE_FAIL / CTSTRAFFIC_RUNTIME_ERRORS`，不再误归为搭建错误。
 
             UDP 单流是每个方向独立的硬连通门槛：总尝试数为 `max(flow_retries + 1, 3)`；双向 AB、BA 各自拥有独立预算并并行执行。安全耗尽且仍无工具自身吞吐证据时，iperf3 返回 `RATE_FAIL / SINGLE_UDP_STREAM_FAILED`，ctsTraffic 返回 `RATE_FAIL / CTSTRAFFIC_SINGLE_UDP_STREAM_FAILED`。缺工具、平台不支持、非法参数或资源清理未确认仍属于 `SETUP_ERROR`；一旦已有工具测量，则按真实运行错误、丢包/丢帧和目标速率判定，不继续连通重试。
+
+            CI 和本地测试不能代替真实网卡、驱动、防火墙与 CPE 环境；发布后仍建议在两台真实 Windows 10+ 设备上完成 CTS TCP/UDP 双机数据流验收。
 
             所有归档的 SHA-256 请见 `SHA256SUMS`。
           files: |

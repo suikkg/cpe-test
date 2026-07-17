@@ -13,8 +13,8 @@ use crate::protocol::{
 };
 use crate::report::{write_report, ReportMeta};
 use crate::util::{
-    ask, ctstraffic_version, find_ctstraffic, find_iperf3, iperf3_version, log_to_file, logln,
-    now_compact, now_full, open_path, parse_selection,
+    ask, ctstraffic_platform_supported, ctstraffic_version, find_ctstraffic, find_iperf3,
+    iperf3_version, log_to_file, logln, now_compact, now_full, open_path, parse_selection,
 };
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -170,13 +170,17 @@ pub fn run_master(opts: MasterOpts) -> i32 {
     if health.iperf3.is_none() {
         logln("!! 辅测机未找到 iperf3：ping 可测，灌包会失败。");
     }
+    let local_cts_platform_supported = ctstraffic_platform_supported();
     let local_cts = find_ctstraffic();
-    match ctstraffic_version() {
-        Some(version) => logln(&format!("主控 ctsTraffic: {version}")),
-        None if cfg!(windows) => {
-            logln("!! 主控未找到 ctsTraffic.exe：CTS 单元会失败；iperf3 和 ping 不受影响。")
+    if !local_cts_platform_supported {
+        logln("主控 ctsTraffic: 当前平台或系统版本不支持（仅 Windows 10+）");
+    } else {
+        match ctstraffic_version() {
+            Some(version) => logln(&format!("主控 ctsTraffic: {version}")),
+            None => {
+                logln("!! 主控未找到 ctsTraffic.exe：CTS 单元会失败；iperf3 和 ping 不受影响。")
+            }
         }
-        None => logln("主控 ctsTraffic: 当前平台不支持（仅 Windows 10+）"),
     }
 
     // ---- 生成测试规格 ----
@@ -261,8 +265,12 @@ pub fn run_master(opts: MasterOpts) -> i32 {
 
     // 按后端独立前置检查：缺 ctsTraffic 只拦 CTS，不能连带拦截可用的 iperf/ping。
     let iperf_preflight = iperf_preflight_block(&units, &health, local_iperf.is_some());
-    let cts_preflight =
-        ctstraffic_preflight_block(&units, &health, local_cts.is_some(), cfg!(windows));
+    let cts_preflight = ctstraffic_preflight_block(
+        &units,
+        &health,
+        local_cts.is_some(),
+        local_cts_platform_supported,
+    );
     let mut preflight_blocks: HashMap<String, IperfPreflightBlock> = HashMap::new();
     if let Some(block) = &iperf_preflight {
         let blocked_units: Vec<&Unit> = units.iter().filter(|unit| unit_has_iperf(unit)).collect();
@@ -468,14 +476,17 @@ fn ctstraffic_preflight_block(
     units: &[Unit],
     health: &HealthOut,
     local_cts_available: bool,
-    local_windows: bool,
+    local_platform_supported: bool,
 ) -> Option<IperfPreflightBlock> {
     if !units.iter().any(unit_has_ctstraffic) {
         return None;
     }
     let mut reasons = Vec::new();
-    if !local_windows {
-        reasons.push("主控平台不是 Windows 10+；ctsTraffic 不支持 macOS/Linux".into());
+    if !local_platform_supported {
+        reasons.push(
+            "主控平台不是 Windows 10+ 或系统版本无法确认；ctsTraffic 不支持旧版 Windows/macOS/Linux"
+                .into(),
+        );
     }
     if !health.os.eq_ignore_ascii_case("windows") {
         reasons.push(format!(
@@ -489,13 +500,13 @@ fn ctstraffic_preflight_block(
     }
     if !agent_supports_ctstraffic(health) {
         reasons.push(format!(
-            "辅测机 agent 缺少 CTS 生命周期能力 {CTS_TRAFFIC_CAPABILITY}，请两端同时升级"
+            "辅测机 agent 未声明 CTS 生命周期能力 {CTS_TRAFFIC_CAPABILITY}；请确认辅测机为 Windows 10+，并将两端同时升级"
         ));
     }
-    if !local_cts_available {
+    if local_platform_supported && !local_cts_available {
         reasons.push("主控机未找到 ctsTraffic.exe，请放到 cpe_test.exe 同目录或 PATH".into());
     }
-    if health.ctstraffic.is_none() {
+    if agent_supports_ctstraffic(health) && health.ctstraffic.is_none() {
         reasons.push("辅测机未找到 ctsTraffic.exe，请放到 agent 同目录或 PATH".into());
     }
     (!reasons.is_empty()).then(|| IperfPreflightBlock {
@@ -770,8 +781,8 @@ fn generate_specs_from_pairs(
             kinds,
             transports,
             ipvers,
-            streams,
-            duration,
+            streams: streams.clamp(1, 32),
+            duration: duration.clamp(1, 86_400),
             ping_count,
             payload_sizes,
             tcp_windows,
@@ -781,6 +792,7 @@ fn generate_specs_from_pairs(
             rate_targets,
             rate_check: cfg.iperf.rate_check.clone(),
             ctstraffic: cfg.ctstraffic.clone(),
+            ctstraffic_config_error: builder::ctstraffic_config_error(streams, duration),
         });
     }
     out
@@ -796,6 +808,26 @@ struct UniversalParams {
     ping_count: u32,
     payload_sizes: Vec<u32>,
     udp_limit: bool,
+}
+
+fn validate_traffic_scalar(label: &str, value: u64, min: u64, max: u64) -> Result<u64, String> {
+    if (min..=max).contains(&value) {
+        Ok(value)
+    } else {
+        Err(format!("{label} 必须在 {min}..={max}，当前为 {value}"))
+    }
+}
+
+fn ask_traffic_scalar(prompt: &str, default: u64, label: &str, min: u64, max: u64) -> u64 {
+    loop {
+        let value = ask_int(prompt, default);
+        match validate_traffic_scalar(label, value, min, max) {
+            Ok(value) => return value,
+            Err(error) => logln(&format!(
+                "!! {error}，请重新输入；CTS 自动化不会静默修正该值。"
+            )),
+        }
+    }
 }
 
 fn ask_universal_params(cfg: &Config, mode: usize) -> UniversalParams {
@@ -882,20 +914,24 @@ fn ask_universal_params(cfg: &Config, mode: usize) -> UniversalParams {
         .iter()
         .any(|kind| kind == "iperf" || kind == "ctstraffic");
     let streams = if has_traffic {
-        ask_int(
+        ask_traffic_scalar(
             "并发流数(iperf3 TCP=-P、UDP=多进程；CTS=-Connections，默认1): ",
             1,
-        )
-        .clamp(1, 32) as u32
+            "并发流数",
+            1,
+            32,
+        ) as u32
     } else {
         1
     };
     let duration = if has_traffic {
-        ask_int(
+        ask_traffic_scalar(
             &format!("灌包时长秒(默认{}): ", cfg.iperf.duration),
             cfg.iperf.duration,
+            "灌包时长",
+            1,
+            86_400,
         )
-        .clamp(1, 86400)
     } else {
         cfg.iperf.duration
     };
@@ -950,8 +986,8 @@ fn spec_from_params(
         kinds: p.kinds.clone(),
         transports: p.transports.clone(),
         ipvers: p.ipvers.clone(),
-        streams: p.streams,
-        duration: p.duration,
+        streams: p.streams.clamp(1, 32),
+        duration: p.duration.clamp(1, 86_400),
         ping_count: p.ping_count,
         payload_sizes: p.payload_sizes.clone(),
         tcp_windows: cfg.iperf.tcp_windows.clone(),
@@ -961,6 +997,7 @@ fn spec_from_params(
         rate_targets: cfg.iperf.rate_check.targets_mbps.clone(),
         rate_check: cfg.iperf.rate_check.clone(),
         ctstraffic: cfg.ctstraffic.clone(),
+        ctstraffic_config_error: builder::ctstraffic_config_error(p.streams, p.duration),
     }
 }
 
@@ -1153,6 +1190,7 @@ mod tests {
                     rate_mode: RateMode::Observe,
                     rx_target_mbps: None,
                     offered_mbps: Some(1_500.0),
+                    setup_error: None,
                 }),
             }],
         }
@@ -1175,6 +1213,44 @@ mod tests {
             capabilities: vec![CTS_TRAFFIC_CAPABILITY.into()],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn interactive_traffic_scalars_are_rejected_instead_of_silently_clamped() {
+        assert_eq!(validate_traffic_scalar("streams", 1, 1, 32), Ok(1));
+        assert_eq!(validate_traffic_scalar("streams", 32, 1, 32), Ok(32));
+        assert!(validate_traffic_scalar("streams", 0, 1, 32).is_err());
+        assert!(validate_traffic_scalar("streams", 33, 1, 32).is_err());
+        assert!(validate_traffic_scalar("duration", 0, 1, 86_400).is_err());
+        assert!(validate_traffic_scalar("duration", 86_401, 1, 86_400).is_err());
+
+        let params = UniversalParams {
+            directions: vec!["ab".into()],
+            kinds: vec!["ctstraffic".into()],
+            transports: vec!["udp".into()],
+            ipvers: vec!["v4".into()],
+            streams: 0,
+            duration: 0,
+            ping_count: 1,
+            payload_sizes: vec![32],
+            udp_limit: true,
+        };
+        let cfg = Config::default();
+        let spec = spec_from_params(
+            "interactive-invalid",
+            endpoint(Side::Master, "master0"),
+            endpoint(Side::Agent, "agent0"),
+            &params,
+            &cfg,
+        );
+        assert_eq!(spec.streams, 1, "iperf execution remains safely normalized");
+        assert_eq!(
+            spec.duration, 1,
+            "iperf execution remains safely normalized"
+        );
+        let error = spec.ctstraffic_config_error.unwrap();
+        assert!(error.contains("streams 必须在 1..=32"));
+        assert!(error.contains("duration 必须在 1..=86400"));
     }
 
     #[test]

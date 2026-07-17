@@ -14,7 +14,8 @@ use crate::nic::monitor::MonitorMgr;
 use crate::nic::scan_host;
 use crate::protocol::*;
 use crate::util::{
-    ctstraffic_version, find_ctstraffic, find_iperf3, iperf3_version, now_hms, os_name,
+    ctstraffic_platform_supported, ctstraffic_version, find_ctstraffic, find_iperf3,
+    iperf3_version, now_hms, os_name,
 };
 use crate::{ping, screenshot};
 use base64::Engine;
@@ -140,12 +141,15 @@ pub fn run(port: u16, cfg: &Config) {
             "!! 警告: 未找到 iperf3。ping 可用，但灌包测试会失败。\n!!       请把 iperf3 可执行文件放到本程序同目录。"
         ),
     }
-    match ctstraffic_version() {
-        Some(version) => println!("ctsTraffic: {version}"),
-        None if cfg!(windows) => println!(
-            "!! 提示: 未找到 ctsTraffic.exe；iperf3/ping 仍可用，CTS 测试会被前置检查拦截。"
-        ),
-        None => println!("ctsTraffic: 当前平台不支持（仅 Windows 10+）"),
+    if !ctstraffic_platform_supported() {
+        println!("ctsTraffic: 当前平台或系统版本不支持（仅 Windows 10+）");
+    } else {
+        match ctstraffic_version() {
+            Some(version) => println!("ctsTraffic: {version}"),
+            None => println!(
+                "!! 提示: 未找到 ctsTraffic.exe；iperf3/ping 仍可用，CTS 测试会被前置检查拦截。"
+            ),
+        }
     }
 
     // 展示本机所有网卡详情，方便小白抄给主控
@@ -251,7 +255,7 @@ fn route(method: &Method, url: &str, body: &str, st: &Arc<AgentState>) -> String
                 RELIABLE_LIFECYCLE_CAPABILITY.into(),
                 LIVE_NIC_PROGRESS_CAPABILITY.into(),
             ];
-            if cfg!(windows) {
+            if ctstraffic_platform_supported() {
                 capabilities.push(CTS_TRAFFIC_CAPABILITY.into());
             }
             ok_json(HealthOut {
@@ -401,8 +405,10 @@ fn route(method: &Method, url: &str, body: &str, st: &Arc<AgentState>) -> String
                 Ok(r) => r,
                 Err(e) => return e,
             };
-            if !cfg!(windows) {
-                return err_json("ctsTraffic 仅支持 Windows 10+，当前 agent 平台不支持");
+            if !ctstraffic_platform_supported() {
+                return err_json(
+                    "ctsTraffic 仅支持 Windows 10+，当前 agent 平台不支持或系统版本检测未通过",
+                );
             }
             let Some(bin) = find_ctstraffic() else {
                 return err_json(
@@ -605,10 +611,10 @@ mod tests {
             capabilities
                 .iter()
                 .any(|capability| capability == CTS_TRAFFIC_CAPABILITY),
-            cfg!(windows),
-            "CTS capability 只能由 Windows agent 声明"
+            ctstraffic_platform_supported(),
+            "CTS capability 只能由通过 Windows 10+ 门槛的 agent 声明"
         );
-        if !cfg!(windows) {
+        if !ctstraffic_platform_supported() {
             assert_eq!(health.ctstraffic, None);
         }
 

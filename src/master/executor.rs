@@ -218,33 +218,30 @@ struct LegOutcome {
     tag: String,
 }
 
+fn preflight_block_outcome(tag: &str, block: &IperfPreflightBlock) -> LegOutcome {
+    LegOutcome {
+        verdict: Verdict::SetupError,
+        reason_code: block.reason_code.clone(),
+        reason_detail: block.reason_detail.clone(),
+        rx_avg: None,
+        main_rows: Vec::new(),
+        tag: tag.to_string(),
+    }
+}
+
 fn preflight_block_outcomes(unit: &Unit, block: &IperfPreflightBlock) -> Vec<LegOutcome> {
     let mut outcomes: Vec<LegOutcome> = unit
         .legs
         .iter()
         .filter_map(|leg| match &leg.kind {
             LegKind::IperfSingle(_) | LegKind::IperfGroup { .. } | LegKind::CtsTraffic(_) => {
-                Some(LegOutcome {
-                    verdict: Verdict::SetupError,
-                    reason_code: block.reason_code.clone(),
-                    reason_detail: block.reason_detail.clone(),
-                    rx_avg: None,
-                    main_rows: Vec::new(),
-                    tag: leg.tag.clone(),
-                })
+                Some(preflight_block_outcome(&leg.tag, block))
             }
             LegKind::Ping(_) => None,
         })
         .collect();
     if outcomes.is_empty() {
-        outcomes.push(LegOutcome {
-            verdict: Verdict::SetupError,
-            reason_code: block.reason_code.clone(),
-            reason_detail: block.reason_detail.clone(),
-            rx_avg: None,
-            main_rows: Vec::new(),
-            tag: String::new(),
-        });
+        outcomes.push(preflight_block_outcome("", block));
     }
     outcomes
 }
@@ -1411,6 +1408,55 @@ impl Ctx {
         self.run_all_internal(units, 0, Some(blocks))
     }
 
+    /// 平台/能力/二进制预检会阻止实际启动流量进程，但 builder 已识别出的
+    /// CTS 参数错误必须保留更精确的 `CTSTRAFFIC_ARGS_INVALID`。这里逐 leg
+    /// 处理，避免将来一个双向单元中只有一条 leg 非法时误放行另一条 leg。
+    fn preflight_block_outcomes_with_cts_args(
+        &self,
+        useq: usize,
+        unit: &Unit,
+        block: &IperfPreflightBlock,
+        owner_id: &str,
+        lease_secs: u64,
+    ) -> Vec<LegOutcome> {
+        let has_cts_args_error = unit.legs.iter().any(|leg| {
+            matches!(
+                &leg.kind,
+                LegKind::CtsTraffic(task) if task.setup_error.is_some()
+            )
+        });
+        if !has_cts_args_error {
+            return preflight_block_outcomes(unit, block);
+        }
+
+        let mut outcomes = Vec::new();
+        for (lidx, leg) in unit.legs.iter().enumerate() {
+            match &leg.kind {
+                LegKind::CtsTraffic(task) if task.setup_error.is_some() => {
+                    outcomes.push(self.run_ctstraffic_leg(
+                        useq,
+                        unit,
+                        lidx,
+                        &leg.tag,
+                        task,
+                        LifecycleLease {
+                            owner_id,
+                            lease_secs,
+                        },
+                    ));
+                }
+                LegKind::IperfSingle(_) | LegKind::IperfGroup { .. } | LegKind::CtsTraffic(_) => {
+                    outcomes.push(preflight_block_outcome(&leg.tag, block));
+                }
+                LegKind::Ping(_) => {}
+            }
+        }
+        if outcomes.is_empty() {
+            outcomes.push(preflight_block_outcome("", block));
+        }
+        outcomes
+    }
+
     fn run_all_internal(
         &self,
         units: &[Unit],
@@ -1467,7 +1513,9 @@ impl Ctx {
             let outcomes = execute_unit_safely(
                 || {
                     if let Some(block) = blocked {
-                        preflight_block_outcomes(unit, block)
+                        self.preflight_block_outcomes_with_cts_args(
+                            useq, unit, block, &owner_id, lease_secs,
+                        )
                     } else if let Some(plans) = self.udp_leg_plans(unit) {
                         self.run_udp_unit(useq, unit, &plans, &owner_id, lease_secs)
                     } else if unit.legs.len() <= 1 {
@@ -2190,13 +2238,8 @@ impl Ctx {
                     .map(|error| format!("ctsTraffic server 停止未确认: {error}"))
                     .unwrap_or_default()
             });
-        let server_unexpected_failure = server_stop.as_ref().ok().is_some_and(|output| {
-            output.was_done
-                && output
-                    .result
-                    .as_ref()
-                    .is_some_and(|result| !result.ok || result.timed_out || result.cancelled)
-        });
+        let (server_cancelled_before_stop, server_unexpected_failure) =
+            cts_server_pre_stop_failures(&server_stop);
         let combined_output = format!("{}\n{}", client_run.client.output, server_output);
         let parsed = ctstraffic::parse_output(&combined_output, protocol);
         let traffic_established = parsed.has_measurement(protocol);
@@ -2215,17 +2258,23 @@ impl Ctx {
             ))
         } else if client_run.setup_error.is_some() {
             client_run.setup_error
-        } else if server_unexpected_failure {
+        } else if server_cancelled_before_stop {
             Some((
-                "CTSTRAFFIC_SERVER_FAILED".into(),
+                "CTSTRAFFIC_SERVER_CANCELLED".into(),
                 server_stop
                     .as_ref()
                     .ok()
                     .and_then(|output| output.result.as_ref())
                     .and_then(|result| result.output.lines().last())
-                    .unwrap_or("ctsTraffic server 在停止请求前异常退出")
+                    .unwrap_or("ctsTraffic server 在本次显式停止前已被取消")
                     .to_string(),
             ))
+        } else if let Some(error) = cts_server_unexpected_setup_error(
+            server_unexpected_failure,
+            traffic_established,
+            &server_output,
+        ) {
+            Some(error)
         } else if !server_process_started_confirmed {
             Some((
                 "CTSTRAFFIC_SERVER_PROCESS_NOT_STARTED".into(),
@@ -2292,6 +2341,18 @@ impl Ctx {
         lifecycle: LifecycleLease<'_>,
     ) -> LegOutcome {
         let time = now_full();
+        if let Some(error) = &task.setup_error {
+            return self.push_cts_setup_error_row(
+                useq,
+                unit,
+                lidx,
+                tag,
+                task,
+                time,
+                "CTSTRAFFIC_ARGS_INVALID",
+                error.clone(),
+            );
+        }
         logln(&format!(
             "  [ctsTraffic{}] {} {} -> {} 端口{} {}s...",
             fmt_tag(tag),
@@ -2518,20 +2579,13 @@ impl Ctx {
                     })
             })
             .or_else(|| {
-                attempts
-                    .iter()
-                    .find(|attempt| attempt.server_unexpected_failure)
-                    .map(|attempt| {
-                        (
-                            "CTSTRAFFIC_SERVER_FAILED".to_string(),
-                            attempt
-                                .server_output
-                                .lines()
-                                .last()
-                                .unwrap_or("ctsTraffic server 在停止请求前异常退出")
-                                .to_string(),
-                        )
-                    })
+                attempts.iter().find_map(|attempt| {
+                    cts_server_unexpected_setup_error(
+                        attempt.server_unexpected_failure,
+                        attempt.traffic_established,
+                        &attempt.server_output,
+                    )
+                })
             });
         let (verdict, reason_code, reason_detail) = if let Some((code, detail)) = setup_error {
             (Verdict::SetupError, code, detail)
@@ -2567,14 +2621,10 @@ impl Ctx {
                     .unwrap_or("没有吞吐测量")
                     .to_string(),
             )
-        } else if let Some(detail) =
-            cts_runtime_failure_detail(&selected.client, runtime_errors, client_expected_completion)
+        } else if let Some(runtime_failure) =
+            cts_runtime_failure_verdict(selected, runtime_errors, client_expected_completion)
         {
-            (
-                Verdict::RateFail,
-                "CTSTRAFFIC_RUNTIME_ERRORS".to_string(),
-                detail,
-            )
+            runtime_failure
         } else if required_streams > requested_streams {
             (
                 Verdict::NotEvaluated,
@@ -4511,6 +4561,14 @@ fn aggregate_unit_verdict(outcomes: &[LegOutcome]) -> Verdict {
 }
 
 fn outcome_matching_verdict(outcomes: &[LegOutcome], verdict: Verdict) -> Option<&LegOutcome> {
+    if verdict == Verdict::SetupError {
+        if let Some(outcome) = outcomes
+            .iter()
+            .find(|outcome| outcome.reason_code == "CTSTRAFFIC_ARGS_INVALID")
+        {
+            return Some(outcome);
+        }
+    }
     if verdict == Verdict::RateFail {
         if let Some(outcome) = outcomes
             .iter()
@@ -4593,6 +4651,23 @@ fn cts_stop_process_evidence(stop: &Result<CtsTrafficStopOut, String>) -> (bool,
     )
 }
 
+/// 区分本轮 controller 发出的正常 stop 与 server 自身失败。
+/// 返回 `(pre_stop_cancelled, server_runtime_failure)`：只有 stop 快照前已经完成且
+/// 明确带 cancelled 才视为外部显式取消；任何未带 cancelled 的异常退出/timeout
+/// 都是 server runtime failure，包括快照与 cancel 生效之间的窄竞争窗口。
+fn cts_server_pre_stop_failures(stop: &Result<CtsTrafficStopOut, String>) -> (bool, bool) {
+    let Some(output) = stop.as_ref().ok() else {
+        return (false, false);
+    };
+    let Some(result) = output.result.as_ref() else {
+        return (false, false);
+    };
+    (
+        output.was_done && result.cancelled,
+        !result.cancelled && (!result.ok || result.timed_out),
+    )
+}
+
 fn cts_attempt_is_safe_full(attempt: &CtsAttemptRun) -> bool {
     attempt.full_attempt
         && attempt.client.process_started == Some(true)
@@ -4648,39 +4723,72 @@ fn cts_single_udp_exhausted(
             .all(|attempt| cts_attempt_is_safe_full(attempt) && !attempt.traffic_established)
 }
 
-fn cts_runtime_failure_detail(
-    client: &IperfClientOut,
+fn cts_server_unexpected_setup_error(
+    server_unexpected_failure: bool,
+    traffic_established: bool,
+    server_output: &str,
+) -> Option<(String, String)> {
+    (server_unexpected_failure && !traffic_established).then(|| {
+        (
+            "CTSTRAFFIC_SERVER_FAILED".into(),
+            server_output
+                .lines()
+                .last()
+                .filter(|line| !line.trim().is_empty())
+                .unwrap_or("ctsTraffic server 在停止请求前异常退出")
+                .to_string(),
+        )
+    })
+}
+
+fn cts_runtime_failure_verdict(
+    attempt: &CtsAttemptRun,
     runtime_errors: u64,
     client_expected_completion: bool,
-) -> Option<String> {
-    if runtime_errors > 0 {
-        return Some(format!(
-            "ctsTraffic 记录到 {runtime_errors} 个网络/协议/数据错误"
-        ));
+) -> Option<(Verdict, String, String)> {
+    if !attempt.traffic_established {
+        return None;
     }
-    if client.timed_out {
-        return Some(
-            client
-                .output
-                .lines()
-                .last()
-                .filter(|line| !line.trim().is_empty())
-                .map(|line| format!("ctsTraffic 已产生工具测量，但 client 超时: {line}"))
-                .unwrap_or_else(|| "ctsTraffic 已产生工具测量，但 client 超时".into()),
-        );
-    }
-    if !client_expected_completion {
-        return Some(
-            client
-                .output
-                .lines()
-                .last()
-                .filter(|line| !line.trim().is_empty())
-                .map(|line| format!("ctsTraffic 已产生工具测量，但 client 未正常完成: {line}"))
-                .unwrap_or_else(|| "ctsTraffic 已产生工具测量，但 client 未正常完成".into()),
-        );
-    }
-    None
+    let detail = if attempt.server_unexpected_failure {
+        attempt
+            .server_output
+            .lines()
+            .last()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| {
+                format!("ctsTraffic 已产生工具测量，但 server 在显式停止前异常退出或超时: {line}")
+            })
+            .unwrap_or_else(|| {
+                "ctsTraffic 已产生工具测量，但 server 在显式停止前异常退出或超时".into()
+            })
+    } else if runtime_errors > 0 {
+        format!("ctsTraffic 记录到 {runtime_errors} 个网络/协议/数据错误")
+    } else if attempt.client.timed_out {
+        attempt
+            .client
+            .output
+            .lines()
+            .last()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| format!("ctsTraffic 已产生工具测量，但 client 超时: {line}"))
+            .unwrap_or_else(|| "ctsTraffic 已产生工具测量，但 client 超时".into())
+    } else if !client_expected_completion {
+        attempt
+            .client
+            .output
+            .lines()
+            .last()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| format!("ctsTraffic 已产生工具测量，但 client 未正常完成: {line}"))
+            .unwrap_or_else(|| "ctsTraffic 已产生工具测量，但 client 未正常完成".into())
+    } else {
+        return None;
+    };
+    Some((
+        Verdict::RateFail,
+        "CTSTRAFFIC_RUNTIME_ERRORS".into(),
+        detail,
+    ))
 }
 
 fn zero_udp_stream_verdict(requested: usize, attempts_exhausted: bool) -> Verdict {
@@ -5661,6 +5769,7 @@ mod tests {
             rate_mode: RateMode::Observe,
             rx_target_mbps: None,
             offered_mbps: udp.then_some(1_500.0),
+            setup_error: None,
         }
     }
 
@@ -5888,6 +5997,55 @@ mod tests {
     }
 
     #[test]
+    fn ctstraffic_builder_setup_error_returns_before_agent_or_cts_start() {
+        let (ctx, db_path) = isolated_ctx(0);
+        let mut task = ctstraffic_task(true);
+        // UDP server 在 src 端；放到 Agent 且使用不可连接的 agent_port=0。
+        // 若没有在 run_ctstraffic_leg 最前置返回，就会进入
+        // /ctstraffic/start 并丢失 builder 给出的精确错误。
+        task.src = endpoint(Side::Agent, "agent0", "192.168.1.3");
+        task.dst = endpoint(Side::Master, "master0", "192.168.1.2");
+        let builder_error = "CTS UDP socket buffer synthetic-invalid 无法解析";
+        task.setup_error = Some(builder_error.into());
+        let unit = Unit {
+            id: "cts-builder-setup-error".into(),
+            title: "CTS builder setup error".into(),
+            bidir: false,
+            legs: Vec::new(),
+            est_secs: 1,
+        };
+
+        let outcome = ctx.run_ctstraffic_leg(
+            0,
+            &unit,
+            0,
+            "ab",
+            &task,
+            LifecycleLease {
+                owner_id: "cts-builder-setup-owner",
+                lease_secs: 1,
+            },
+        );
+
+        assert_eq!(outcome.verdict, Verdict::SetupError);
+        assert_eq!(outcome.reason_code, "CTSTRAFFIC_ARGS_INVALID");
+        assert_eq!(outcome.reason_detail, builder_error);
+        assert_eq!(outcome.main_rows, vec![0]);
+        let rows = ctx.rows.lock().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].verdict, Verdict::SetupError);
+        assert_eq!(rows[0].execution_status, ExecutionStatus::Error);
+        assert_eq!(rows[0].reason_code, "CTSTRAFFIC_ARGS_INVALID");
+        assert_eq!(rows[0].reason_detail, builder_error);
+        assert_eq!(
+            rows[0].raws,
+            vec![("ctsTraffic 启动错误".into(), builder_error.into())]
+        );
+        drop(rows);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
     fn test_required_udp_stream_quorum() {
         let cfg = RateCheckCfg::default();
         assert_eq!(required_udp_streams(1, &cfg, None, Some(500.0)), 1);
@@ -5982,28 +6140,92 @@ mod tests {
 
     #[test]
     fn ctstraffic_measured_timeout_or_abnormal_exit_is_a_runtime_failure() {
-        let timed_out = IperfClientOut {
+        let mut timed_out = ctstraffic_attempt(0, true);
+        timed_out.client = IperfClientOut {
             timed_out: true,
             output: "manager timeout; process reaped".into(),
             process_started: Some(true),
             cleanup_confirmed: Some(true),
             ..Default::default()
         };
-        let timeout_detail = cts_runtime_failure_detail(&timed_out, 0, false).unwrap();
+        let (timeout_verdict, timeout_code, timeout_detail) =
+            cts_runtime_failure_verdict(&timed_out, 0, false).unwrap();
+        assert_eq!(timeout_verdict, Verdict::RateFail);
+        assert_eq!(timeout_code, "CTSTRAFFIC_RUNTIME_ERRORS");
         assert!(timeout_detail.contains("client 超时"));
 
-        let abnormal_exit = IperfClientOut {
+        let mut abnormal_exit = ctstraffic_attempt(0, true);
+        abnormal_exit.client = IperfClientOut {
             output: "ctsTraffic exited with code 7".into(),
             process_started: Some(true),
             cleanup_confirmed: Some(true),
             ..Default::default()
         };
-        let exit_detail = cts_runtime_failure_detail(&abnormal_exit, 0, false).unwrap();
+        let (_, exit_code, exit_detail) =
+            cts_runtime_failure_verdict(&abnormal_exit, 0, false).unwrap();
+        assert_eq!(exit_code, "CTSTRAFFIC_RUNTIME_ERRORS");
         assert!(exit_detail.contains("未正常完成"));
 
-        let counted_error = cts_runtime_failure_detail(&abnormal_exit, 3, false).unwrap();
+        let (_, counted_code, counted_error) =
+            cts_runtime_failure_verdict(&abnormal_exit, 3, false).unwrap();
+        assert_eq!(counted_code, "CTSTRAFFIC_RUNTIME_ERRORS");
         assert!(counted_error.contains("3 个网络/协议/数据错误"));
-        assert!(cts_runtime_failure_detail(&IperfClientOut::default(), 0, true).is_none());
+
+        let normal = ctstraffic_attempt(0, true);
+        assert!(cts_runtime_failure_verdict(&normal, 0, true).is_none());
+    }
+
+    #[test]
+    fn ctstraffic_measured_server_failure_is_runtime_but_unmeasured_is_setup() {
+        let mut measured = ctstraffic_attempt(0, true);
+        measured.server_unexpected_failure = true;
+        measured.server_output = "server statistics: 500 Mbps\nserver timed out".into();
+
+        assert!(cts_server_unexpected_setup_error(
+            measured.server_unexpected_failure,
+            measured.traffic_established,
+            &measured.server_output,
+        )
+        .is_none());
+        let (verdict, code, detail) = cts_runtime_failure_verdict(&measured, 0, true).unwrap();
+        assert_eq!(verdict, Verdict::RateFail);
+        assert_eq!(code, "CTSTRAFFIC_RUNTIME_ERRORS");
+        assert!(detail.contains("server 在显式停止前异常退出或超时"));
+        assert!(!cts_should_retry_after_last(
+            std::slice::from_ref(&measured),
+            3,
+            true
+        ));
+        assert!(!cts_single_udp_exhausted(
+            std::slice::from_ref(&measured),
+            1,
+            true
+        ));
+
+        let mut unmeasured = ctstraffic_attempt(0, false);
+        unmeasured.server_unexpected_failure = true;
+        unmeasured.server_output = "server exited with code 7".into();
+        let (setup_code, setup_detail) = cts_server_unexpected_setup_error(
+            unmeasured.server_unexpected_failure,
+            unmeasured.traffic_established,
+            &unmeasured.server_output,
+        )
+        .unwrap();
+        assert_eq!(setup_code, "CTSTRAFFIC_SERVER_FAILED");
+        assert_eq!(setup_detail, "server exited with code 7");
+        assert!(cts_runtime_failure_verdict(&unmeasured, 0, false).is_none());
+        assert!(!cts_should_retry_after_last(
+            std::slice::from_ref(&unmeasured),
+            3,
+            true
+        ));
+
+        let all_safe_misses = vec![
+            ctstraffic_attempt(0, false),
+            ctstraffic_attempt(1, false),
+            ctstraffic_attempt(2, false),
+        ];
+        assert!(cts_single_udp_exhausted(&all_safe_misses, 3, true));
     }
 
     #[test]
@@ -6039,6 +6261,108 @@ mod tests {
         assert_eq!(
             cts_stop_process_evidence(&Err("stop failed".into())),
             (false, false)
+        );
+    }
+
+    #[test]
+    fn ctstraffic_server_pre_stop_state_distinguishes_runtime_failure_and_cancel() {
+        let timed_out_before_stop = Ok(CtsTrafficStopOut {
+            was_done: true,
+            terminated: true,
+            result: Some(IperfClientOut {
+                timed_out: true,
+                process_started: Some(true),
+                cleanup_confirmed: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert_eq!(
+            cts_server_pre_stop_failures(&timed_out_before_stop),
+            (false, true)
+        );
+
+        let abnormal_exit_before_stop = Ok(CtsTrafficStopOut {
+            was_done: true,
+            terminated: true,
+            result: Some(IperfClientOut {
+                output: "server exited with code 7".into(),
+                process_started: Some(true),
+                cleanup_confirmed: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert_eq!(
+            cts_server_pre_stop_failures(&abnormal_exit_before_stop),
+            (false, true)
+        );
+
+        let cancelled_before_stop = Ok(CtsTrafficStopOut {
+            was_done: true,
+            terminated: true,
+            result: Some(IperfClientOut {
+                cancelled: true,
+                process_started: Some(true),
+                cleanup_confirmed: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert_eq!(
+            cts_server_pre_stop_failures(&cancelled_before_stop),
+            (true, false)
+        );
+
+        let cancelled_by_this_stop = Ok(CtsTrafficStopOut {
+            was_done: false,
+            terminated: true,
+            result: Some(IperfClientOut {
+                cancelled: true,
+                process_started: Some(true),
+                cleanup_confirmed: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert_eq!(
+            cts_server_pre_stop_failures(&cancelled_by_this_stop),
+            (false, false),
+            "controller 本轮发出的正常 server stop 不是异常"
+        );
+
+        let timed_out_between_snapshot_and_cancel = Ok(CtsTrafficStopOut {
+            was_done: false,
+            terminated: true,
+            result: Some(IperfClientOut {
+                timed_out: true,
+                process_started: Some(true),
+                cleanup_confirmed: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert_eq!(
+            cts_server_pre_stop_failures(&timed_out_between_snapshot_and_cancel),
+            (false, true),
+            "快照后自行 timeout 且未确认 cancelled 仍是 runtime failure"
+        );
+
+        let failed_between_snapshot_and_cancel = Ok(CtsTrafficStopOut {
+            was_done: false,
+            terminated: true,
+            result: Some(IperfClientOut {
+                output: "server exited with code 7".into(),
+                process_started: Some(true),
+                cleanup_confirmed: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert_eq!(
+            cts_server_pre_stop_failures(&failed_between_snapshot_and_cancel),
+            (false, true),
+            "快照后自行异常退出且未确认 cancelled 仍是 runtime failure"
         );
     }
 
@@ -6936,6 +7260,142 @@ mod tests {
             .expect("blocked CTS unit summary row");
         assert_eq!(summary_row.verdict, Verdict::SetupError);
         assert_eq!(summary_row.reason_code, "CTSTRAFFIC_PREFLIGHT_FAILED");
+        drop(rows);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn ctstraffic_args_error_takes_priority_over_preflight_without_starting_agent() {
+        let mut unit = ctstraffic_unit("cts-args-before-preflight", true);
+        let LegKind::CtsTraffic(task) = &mut unit.legs[0].kind else {
+            panic!("expect CTS task");
+        };
+        task.src = endpoint(Side::Agent, "agent0", "192.168.1.3");
+        task.dst = endpoint(Side::Master, "master0", "192.168.1.2");
+        task.setup_error = Some("builder rejected duration=0".into());
+
+        let block = IperfPreflightBlock {
+            reason_code: "CTSTRAFFIC_PREFLIGHT_FAILED".into(),
+            reason_detail: "当前平台缺少 ctsTraffic".into(),
+        };
+        let (ctx, db_path) = isolated_ctx(0);
+        let mut blocks = HashMap::new();
+        blocks.insert(unit.id.clone(), block);
+        let summary = ctx.run_all_with_preflight_blocks(&[unit], &blocks);
+        assert_eq!(summary.setup_error, 1);
+
+        let rows = ctx.rows.lock().unwrap();
+        let detail_rows: Vec<_> = rows.iter().filter(|row| !row.is_unit_summary).collect();
+        assert_eq!(detail_rows.len(), 1);
+        assert_eq!(detail_rows[0].reason_code, "CTSTRAFFIC_ARGS_INVALID");
+        assert_eq!(detail_rows[0].reason_detail, "builder rejected duration=0");
+        let summary_row = rows.iter().find(|row| row.is_unit_summary).unwrap();
+        assert_eq!(summary_row.reason_code, "CTSTRAFFIC_ARGS_INVALID");
+        assert!(summary_row
+            .reason_detail
+            .contains("CTSTRAFFIC_ARGS_INVALID"));
+        drop(rows);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn ctstraffic_preflight_remains_per_leg_when_only_one_direction_has_args_error() {
+        let mut invalid = ctstraffic_task(true);
+        invalid.src = endpoint(Side::Agent, "agent0", "192.168.1.3");
+        invalid.dst = endpoint(Side::Master, "master0", "192.168.1.2");
+        invalid.setup_error = Some("invalid ab socket buffer".into());
+        let mut normal = invalid.clone();
+        normal.port += 1;
+        normal.setup_error = None;
+        let unit = Unit {
+            id: "cts-mixed-args-preflight".into(),
+            title: "CTS mixed args/preflight".into(),
+            bidir: true,
+            legs: vec![
+                Leg {
+                    tag: "ab".into(),
+                    kind: LegKind::CtsTraffic(invalid),
+                },
+                Leg {
+                    tag: "ba".into(),
+                    kind: LegKind::CtsTraffic(normal),
+                },
+            ],
+            est_secs: 1,
+        };
+        let block = IperfPreflightBlock {
+            reason_code: "CTSTRAFFIC_PREFLIGHT_FAILED".into(),
+            reason_detail: "当前平台缺少 ctsTraffic".into(),
+        };
+        let (ctx, db_path) = isolated_ctx(0);
+        let mut blocks = HashMap::new();
+        blocks.insert(unit.id.clone(), block);
+        let summary = ctx.run_all_with_preflight_blocks(&[unit], &blocks);
+        assert_eq!(summary.setup_error, 1);
+
+        let rows = ctx.rows.lock().unwrap();
+        let detail_rows: Vec<_> = rows.iter().filter(|row| !row.is_unit_summary).collect();
+        assert_eq!(
+            detail_rows.len(),
+            1,
+            "正常方向必须停在 preflight，不能启动 CTS"
+        );
+        assert_eq!(detail_rows[0].reason_code, "CTSTRAFFIC_ARGS_INVALID");
+        let summary_row = rows.iter().find(|row| row.is_unit_summary).unwrap();
+        assert_eq!(summary_row.reason_code, "CTSTRAFFIC_ARGS_INVALID");
+        assert!(summary_row
+            .reason_detail
+            .contains("ab:CTSTRAFFIC_ARGS_INVALID"));
+        assert!(summary_row
+            .reason_detail
+            .contains("ba:CTSTRAFFIC_PREFLIGHT_FAILED"));
+        drop(rows);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn ctstraffic_two_invalid_directions_keep_two_detail_rows_under_preflight() {
+        let mut ab = ctstraffic_task(true);
+        ab.setup_error = Some("invalid ab".into());
+        let mut ba = ab.clone();
+        ba.port += 1;
+        ba.setup_error = Some("invalid ba".into());
+        let unit = Unit {
+            id: "cts-two-invalid-preflight".into(),
+            title: "CTS two invalid directions".into(),
+            bidir: true,
+            legs: vec![
+                Leg {
+                    tag: "ab".into(),
+                    kind: LegKind::CtsTraffic(ab),
+                },
+                Leg {
+                    tag: "ba".into(),
+                    kind: LegKind::CtsTraffic(ba),
+                },
+            ],
+            est_secs: 1,
+        };
+        let block = IperfPreflightBlock {
+            reason_code: "CTSTRAFFIC_PREFLIGHT_FAILED".into(),
+            reason_detail: "当前平台缺少 ctsTraffic".into(),
+        };
+        let (ctx, db_path) = isolated_ctx(0);
+        let mut blocks = HashMap::new();
+        blocks.insert(unit.id.clone(), block);
+        let summary = ctx.run_all_with_preflight_blocks(&[unit], &blocks);
+        assert_eq!(summary.setup_error, 1);
+
+        let rows = ctx.rows.lock().unwrap();
+        let detail_rows: Vec<_> = rows.iter().filter(|row| !row.is_unit_summary).collect();
+        assert_eq!(detail_rows.len(), 2);
+        assert!(detail_rows
+            .iter()
+            .all(|row| row.reason_code == "CTSTRAFFIC_ARGS_INVALID"));
+        let summary_row = rows.iter().find(|row| row.is_unit_summary).unwrap();
+        assert_eq!(summary_row.reason_code, "CTSTRAFFIC_ARGS_INVALID");
+        assert!(summary_row.reason_detail.contains("invalid ab"));
+        assert!(summary_row.reason_detail.contains("invalid ba"));
         drop(rows);
         let _ = std::fs::remove_file(db_path);
     }
