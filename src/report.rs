@@ -289,8 +289,8 @@ summary { cursor: pointer; font-weight: bold; }
         "有效/要求秒",
         "采样覆盖率",
         "对向接收 Mbps",
-        "iperf 发送 Mbps",
-        "iperf 接收 Mbps",
+        "后端发送 Mbps",
+        "后端接收 Mbps",
         "UDP 丢包率 %",
         "Ping 丢包率 %",
         "Ping 平均 ms",
@@ -452,6 +452,9 @@ mod tests {
         assert!(html.contains("&lt;output&gt;"));
         assert!(html.contains("./iperf_outputs/iperf_tcp.log"));
         assert!(html.contains("独立原始记录"));
+        assert!(html.contains("后端发送 Mbps"));
+        assert!(html.contains("后端接收 Mbps"));
+        assert!(!html.contains("iperf 发送 Mbps"));
         let _ = std::fs::remove_file(&p);
         let _ = std::fs::remove_dir(&dir);
     }

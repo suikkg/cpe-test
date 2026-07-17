@@ -340,7 +340,48 @@ en0  1500  <Link#14>  aa:bb:cc:dd:ee:ff  ...  9083840014  ...  749169011  0
 /sys/class/net/<iface>/statistics/tx_bytes
 ```
 
-### UDP 稳态统计如何使用样本
+### ctsTraffic 如何复用同一套 NIC 采样
+
+Windows 10+ 的 ctsTraffic 后端不会另造一套吞吐口径。主控仍在配置所表示的
+`src → dst` 接收端启动 `MonitorMgr`，只统计 CTS client 实际运行窗口，排除 server
+预热和停止清理时间；正式 RX 仍来自 `GetIfTable2.InOctets`。
+
+ctsTraffic 的原生角色需要特别区分：TCP Push 是 `src` client 发送、`dst` server 接收；
+UDP MediaStream 是 `src` server 发送、`dst` client 接收。执行器会按协议反转 UDP 的
+client/server 角色，但 NIC monitor 始终跟随用户配置的数据接收端 `dst`，因此报告方向不变。
+`streams` 映射成一个 CTS 进程里的 `Connections:N`，而不是 N 个独立监控器。
+
+CTS status/summary 提供连接、字节、速率、frame 和错误诊断。这里必须区分两层证据：
+
+- **是否灌通**只能由 CTS 自身的 rate、bytes、successful frames 等输出确认；NIC RX 有
+  背景流量不能证明 CTS 连接已经建立。
+- **已建立流是否达到目标吞吐**仍以 client 实际窗口内的 NIC RX、覆盖率和错误/丢帧条件
+  判定，CTS 自报速率不会替代 NIC 作为正式吞吐口径。
+
+CTS UDP `Connections:1` 是每方向独立的硬连通门槛，总尝试数为
+`max(flow_retries + 1, 3)`。双向 AB、BA 各自拥有完整预算并行执行；每轮必须完整启动
+server/client，并确认停止、进程和输出线程均已回收后才能复用端口。全部安全尝试仍没有
+CTS 自身测量时记录 `RATE_FAIL / CTSTRAFFIC_SINGLE_UDP_STREAM_FAILED`；平台、工具、
+非法参数、生命周期或清理异常仍是 `SETUP_ERROR`。一旦某轮已有工具测量，就按该轮真实
+运行错误、UDP 丢帧和目标速率判定，不再通过重试掩盖结果。
+
+原始输出保存为 `iperf_outputs/ctstraffic_raw_*.log`，包含各 attempt 的 client/server
+输出和生命周期信息；目录名为兼容旧版本保留。
+
+### UDP 单流为何不能只看 NIC
+
+iperf3 UDP 单流和 CTS UDP `Connections:1` 使用相同的硬连通原则：单向 1 流或双向每方向
+各 1 流时，每个方向总尝试数均为 `max(flow_retries + 1, 3)`，AB/BA 独立并行。每轮完整
+server/client 生命周期和清理都确认后，仍没有所选工具自身的 rate、bytes、frame/datagram
+证据，iperf3 返回 `RATE_FAIL / SINGLE_UDP_STREAM_FAILED`，CTS 返回
+`RATE_FAIL / CTSTRAFFIC_SINGLE_UDP_STREAM_FAILED`。
+
+NIC 计数器会包含同接口的其他业务和背景流量，所以只能回答“接口实际收发了多少”，不能
+单独回答“本轮工具流是否建立”。反过来，工具已证明流建立后，正式产品目标仍看 NIC，而
+不是用工具自报速率代替操作系统口径。工具/平台/参数错误、显式取消、server/client 启停
+或清理未确认都属于 `SETUP_ERROR`，不能伪装成单流性能失败。
+
+### iperf3 UDP 稳态统计如何使用样本
 
 1. 起流前默认采 3 秒背景流量，以 RX/TX 中位数作为 baseline。
 2. 根据最后一次 Retry 后的事件重建活跃区间。优先解析 iperf interval 行内的 `a-b sec`，按 `b-a` 从 Ended 时刻反推真实起点，避免 stdout 块缓冲把 180 秒误缩成几毫秒；解析不到可信区间时才回退到 `Traffic` / `Connected` / `Started`。

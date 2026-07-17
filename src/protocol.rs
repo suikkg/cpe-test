@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 /// 表示 agent 支持 request-id 幂等、同步 stop、owner 批量清理和动态租约。
 pub const RELIABLE_LIFECYCLE_CAPABILITY: &str = "reliable_lifecycle_v1";
 pub const LIVE_NIC_PROGRESS_CAPABILITY: &str = "live_nic_progress_v1";
+/// agent 支持 ctsTraffic 异步生命周期与简化参数映射。
+pub const CTS_TRAFFIC_CAPABILITY: &str = "ctstraffic_v1";
 
 /// 一张网卡的信息（两端通用）
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -192,6 +194,12 @@ pub struct IperfClientOut {
     pub timed_out: bool,
     #[serde(default)]
     pub cancelled: bool,
+    /// Some(true) 表示底层 client 进程确实成功 spawn；None 为旧版 agent 未上报。
+    #[serde(default)]
+    pub process_started: Option<bool>,
+    /// Some(true) 表示底层 client 已完成 wait/reap；None 为旧版 agent 未上报。
+    #[serde(default)]
+    pub cleanup_confirmed: Option<bool>,
     pub cmd: String,
     pub output: String,
 }
@@ -277,7 +285,92 @@ pub struct IperfClientStopOut {
     /// true 表示 worker 与 client 子进程已确认结束，或目标原本就不存在。
     #[serde(default)]
     pub terminated: bool,
+    /// 停止前已完成或经同步取消后得到的最终输出。旧 agent 不返回此字段时为 None。
+    /// ctsTraffic server 依靠它回传另一端的状态/错误摘要，避免只审计 client 输出。
+    #[serde(default)]
+    pub result: Option<IperfClientOut>,
 }
+
+// ---------- /ctstraffic ----------
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum CtsTrafficRole {
+    #[default]
+    Client,
+    Server,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum CtsTrafficProtocol {
+    #[default]
+    Tcp,
+    Udp,
+}
+
+/// ctsTraffic 的简化参数。上层仍以 src -> dst 表示数据方向；执行器负责把
+/// TCP 映射为 src=client/dst=server，把 UDP 映射为 src=server/dst=client。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CtsTrafficReq {
+    pub role: CtsTrafficRole,
+    pub protocol: CtsTrafficProtocol,
+    /// server 的 -Listen，或 client 的 -Bind。
+    pub bind_ip: String,
+    /// 仅 client 使用，对应 -Target。
+    #[serde(default)]
+    pub target_ip: String,
+    pub port: u16,
+    /// 自动化测试必须有界：TCP 映射 -TimeLimit，UDP 映射 -StreamLength。
+    pub duration_secs: u64,
+    /// client 的并发连接/UDP stream 数，对应 -Connections。
+    pub streams: u32,
+    /// iperf 风格的单一 window 经过上层换算为字节，同时映射 SO_RCVBUF/SO_SNDBUF。
+    #[serde(default)]
+    pub window_bytes: Option<u32>,
+    /// UDP 每条 stream 的目标 bit/s。
+    #[serde(default)]
+    pub bits_per_second: Option<u64>,
+    #[serde(default)]
+    pub datagram_bytes: Option<u32>,
+    #[serde(default = "default_cts_frame_rate")]
+    pub frame_rate: u32,
+    #[serde(default = "default_cts_buffer_depth")]
+    pub buffer_depth_secs: u32,
+    #[serde(default = "default_cts_status_update")]
+    pub status_update_ms: u32,
+}
+
+fn default_cts_frame_rate() -> u32 {
+    100
+}
+
+fn default_cts_buffer_depth() -> u32 {
+    1
+}
+
+fn default_cts_status_update() -> u32 {
+    1_000
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CtsTrafficStartReq {
+    pub request: CtsTrafficReq,
+    #[serde(default)]
+    pub request_id: String,
+    #[serde(default)]
+    pub owner_id: String,
+    #[serde(default)]
+    pub lease_secs: u64,
+}
+
+/// ctsTraffic 作业复用现有可靠异步作业的状态/停止结构，保持轮询、幂等和
+/// owner 批量清理语义一致。
+pub type CtsTrafficStartOut = IperfClientStartOut;
+pub type CtsTrafficStatusReq = IperfClientStatusReq;
+pub type CtsTrafficStatusOut = IperfClientStatusOut;
+pub type CtsTrafficStopReq = IperfClientStopReq;
+pub type CtsTrafficStopOut = IperfClientStopOut;
 
 // ---------- /resources/cleanup ----------
 /// 按 owner 清理一次自动化运行遗留的所有远端资源。
@@ -398,6 +491,9 @@ pub struct HealthOut {
     pub version: String,
     /// iperf3 版本信息，None 表示未找到
     pub iperf3: Option<String>,
+    /// ctsTraffic 可用性说明；该工具仅支持 Windows 10+。
+    #[serde(default)]
+    pub ctstraffic: Option<String>,
     /// 可选协议能力；旧 agent 缺少该字段时按空列表处理。
     #[serde(default)]
     pub capabilities: Vec<String>,
@@ -445,11 +541,73 @@ mod tests {
         assert!(monitor.owner_id.is_empty());
         assert_eq!(monitor.lease_secs, 0);
 
+        let stop: IperfClientStopOut =
+            serde_json::from_str(r#"{"existed":true,"was_done":true,"terminated":true}"#).unwrap();
+        assert!(stop.result.is_none());
+
+        let client_out: IperfClientOut = serde_json::from_str(
+            r#"{"ok":true,"timed_out":false,"cancelled":false,"cmd":"iperf3","output":"ok"}"#,
+        )
+        .unwrap();
+        assert_eq!(client_out.process_started, None);
+        assert_eq!(client_out.cleanup_confirmed, None);
+
         let health: HealthOut = serde_json::from_str(
             r#"{"hostname":"old-agent","os":"windows","version":"3.0.0","iperf3":null}"#,
         )
         .unwrap();
+        assert_eq!(health.ctstraffic, None);
         assert!(health.capabilities.is_empty());
+    }
+
+    #[test]
+    fn ctstraffic_request_json_defaults_media_stream_tuning_and_lifecycle_fields() {
+        let start: CtsTrafficStartReq = serde_json::from_str(
+            r#"{
+                "request": {
+                    "role": "client",
+                    "protocol": "udp",
+                    "bind_ip": "192.0.2.10",
+                    "target_ip": "192.0.2.20",
+                    "port": 56000,
+                    "duration_secs": 10,
+                    "streams": 3,
+                    "bits_per_second": 500000000
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(start.request.role, CtsTrafficRole::Client);
+        assert_eq!(start.request.protocol, CtsTrafficProtocol::Udp);
+        assert_eq!(start.request.frame_rate, 100);
+        assert_eq!(start.request.buffer_depth_secs, 1);
+        assert_eq!(start.request.status_update_ms, 1_000);
+        assert_eq!(start.request.window_bytes, None);
+        assert_eq!(start.request.datagram_bytes, None);
+        assert!(start.request_id.is_empty());
+        assert!(start.owner_id.is_empty());
+        assert_eq!(start.lease_secs, 0);
+    }
+
+    #[test]
+    fn health_json_roundtrip_preserves_ctstraffic_version_and_capability() {
+        let health = HealthOut {
+            hostname: "agent".into(),
+            os: "windows".into(),
+            version: "4.2.0".into(),
+            iperf3: Some("iperf 3.19".into()),
+            ctstraffic: Some("ctsTraffic 2.0.4.0".into()),
+            capabilities: vec![CTS_TRAFFIC_CAPABILITY.into()],
+        };
+        let json = serde_json::to_string(&health).unwrap();
+        let decoded: HealthOut = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(decoded.ctstraffic.as_deref(), Some("ctsTraffic 2.0.4.0"));
+        assert!(decoded
+            .capabilities
+            .iter()
+            .any(|capability| capability == CTS_TRAFFIC_CAPABILITY));
     }
 
     #[test]
@@ -484,5 +642,22 @@ mod tests {
         .unwrap();
         let legacy_client: LegacyClientStartReq = serde_json::from_str(&client_json).unwrap();
         assert_eq!(legacy_client.request.port, 56_000);
+    }
+
+    #[test]
+    fn client_output_roundtrip_preserves_process_lifecycle_evidence() {
+        let output = IperfClientOut {
+            ok: false,
+            timed_out: true,
+            process_started: Some(true),
+            cleanup_confirmed: Some(true),
+            cmd: "iperf3 -c 192.0.2.1".into(),
+            output: "timed out and reaped".into(),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&output).unwrap();
+        let decoded: IperfClientOut = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.process_started, Some(true));
+        assert_eq!(decoded.cleanup_confirmed, Some(true));
     }
 }

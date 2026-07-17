@@ -960,6 +960,8 @@ where
             ok: false,
             timed_out: false,
             cancelled: false,
+            process_started: Some(false),
+            cleanup_confirmed: Some(true),
             cmd: cmd_str,
             output: format!("iperf3 client duration={} 秒过大，无法执行", req.duration),
         };
@@ -976,6 +978,8 @@ where
         ok: false,
         timed_out: false,
         cancelled: false,
+        process_started: Some(false),
+        cleanup_confirmed: Some(true),
         cmd: cmd_str.clone(),
         output: String::new(),
     };
@@ -993,10 +997,12 @@ where
             ok: out.ok,
             timed_out: out.timed_out,
             cancelled: out.cancelled,
+            process_started: Some(out.process_started()),
+            cleanup_confirmed: Some(out.cleanup_confirmed()),
             cmd: cmd_str.clone(),
             output: merged.clone(),
         };
-        if out.ok || out.timed_out || out.cancelled {
+        if out.ok || out.timed_out || out.cancelled || !out.cleanup_confirmed() {
             break;
         }
         if attempt < CLIENT_RETRIES && is_transient_error(&merged) {
@@ -1165,6 +1171,32 @@ impl IperfClientJobMgr {
                     },
                 )
             },
+        )
+    }
+
+    /// 为其他受控灌包后端复用同一套幂等异步作业、租约、stop/join 与 owner 清理。
+    /// runner 必须在 cancel=true 时终止并回收其子进程后再返回。
+    pub(crate) fn start_external_request<F>(
+        &self,
+        request_id: String,
+        owner_id: String,
+        lease_secs: u64,
+        fingerprint: String,
+        runner: F,
+    ) -> Result<String, String>
+    where
+        F: FnOnce(Arc<AtomicBool>, Arc<Mutex<Vec<IperfFlowEvent>>>) -> IperfClientOut
+            + Send
+            + 'static,
+    {
+        validate_lifecycle_id("request_id", &request_id)?;
+        validate_lifecycle_id("owner_id", &owner_id)?;
+        self.start_job_managed(
+            request_id,
+            owner_id,
+            lease_secs,
+            format!("external|{fingerprint}"),
+            runner,
         )
     }
 
@@ -1399,6 +1431,7 @@ impl IperfClientJobMgr {
                     existed: false,
                     was_done: false,
                     terminated: true,
+                    result: None,
                 };
                 registry.tombstones.insert(
                     id.to_string(),
@@ -1419,11 +1452,13 @@ impl IperfClientJobMgr {
             .ok_or_else(|| format!("client stop 等待时间 {} 秒过大", wait.as_secs()))?;
         wait_for_client_result(&entry, Some(deadline), id)?;
         join_client_thread(&entry, Some(deadline), id)?;
+        let result = lock_recover(&entry.completion.result).clone();
 
         let out = IperfClientStopOut {
             existed: true,
             was_done,
             terminated: true,
+            result,
         };
         let mut registry = lock_recover(&self.inner);
         if registry
@@ -1479,6 +1514,35 @@ impl IperfClientJobMgr {
                 Ok(out) if out.existed && out.terminated => result.stopped += 1,
                 Ok(_) => {}
                 Err(e) => result.errors.push(format!("client job {id} 清理失败: {e}")),
+            }
+        }
+        result
+    }
+
+    /// 主控退出前的最后兜底：同时取消仍登记的全部异步 client/外部作业，
+    /// 再在同一总截止时间内逐项确认 worker 与子进程均已回收。
+    pub fn stop_all(&self, wait: Duration) -> LifecycleCleanupResult {
+        let mut result = LifecycleCleanupResult::default();
+        let targets: Vec<(String, Arc<ClientJobEntry>)> = {
+            let registry = lock_recover(&self.inner);
+            registry
+                .jobs
+                .iter()
+                .map(|(id, entry)| (id.clone(), Arc::clone(entry)))
+                .collect()
+        };
+        for (_, entry) in &targets {
+            entry.cancel.store(true, Ordering::SeqCst);
+        }
+        let deadline = Instant::now().checked_add(wait);
+        for (id, _) in targets {
+            let remaining = remaining_until(deadline).unwrap_or(Duration::ZERO);
+            match self.stop_checked(&id, remaining) {
+                Ok(out) if out.existed && out.terminated => result.stopped += 1,
+                Ok(_) => {}
+                Err(error) => result
+                    .errors
+                    .push(format!("client job {id} 最终清理失败: {error}")),
             }
         }
         result
@@ -2124,11 +2188,62 @@ iperf Done.
         let stopped = mgr.stop_checked(&id, Duration::from_secs(2)).unwrap();
         assert!(stopped.existed);
         assert!(stopped.terminated);
+        let result = stopped.result.as_ref().expect("stop 应回传最终输出");
+        assert!(result.cancelled);
+        assert_eq!(result.output, "cancelled and reaped");
         assert_eq!(active.load(Ordering::SeqCst), 0);
 
         let replay = mgr.stop_checked(&id, Duration::from_secs(2)).unwrap();
         assert_eq!(replay.existed, stopped.existed);
         assert!(replay.terminated);
+        assert_eq!(
+            replay.result.as_ref().map(|result| result.output.as_str()),
+            Some("cancelled and reaped")
+        );
+    }
+
+    #[test]
+    fn client_stop_all_reaps_every_registered_external_job() {
+        let mgr = IperfClientJobMgr::new();
+        let active = Arc::new(AtomicUsize::new(0));
+        let mut ids = Vec::new();
+        for index in 0..2 {
+            let active_runner = Arc::clone(&active);
+            ids.push(
+                mgr.start_job_managed(
+                    format!("client-stop-all-{index}"),
+                    format!("owner-stop-all-{index}"),
+                    60,
+                    format!("fingerprint-{index}"),
+                    move |cancel, _events| {
+                        active_runner.fetch_add(1, Ordering::SeqCst);
+                        while !cancel.load(Ordering::SeqCst) {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        active_runner.fetch_sub(1, Ordering::SeqCst);
+                        IperfClientOut {
+                            cancelled: true,
+                            output: format!("stopped-{index}"),
+                            ..Default::default()
+                        }
+                    },
+                )
+                .unwrap(),
+            );
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while active.load(Ordering::SeqCst) < 2 {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let stopped = mgr.stop_all(Duration::from_secs(2));
+        assert_eq!(stopped.stopped, 2);
+        assert!(stopped.errors.is_empty());
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        for id in ids {
+            assert!(mgr.status(&id, 0).is_err());
+        }
     }
 
     #[test]

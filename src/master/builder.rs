@@ -3,7 +3,10 @@
 //! 配置写 "master:SGMII2.5G" 这类角色引用，运行时解析成实际网卡/IP。
 //! 换电脑不用改配置：角色识别对了，IP 自动跟着变。
 
-use crate::config::{Config, RateCheckCfg, RateMode, RateTargets, TestSpec, UdpProfile};
+use crate::cmd::ctstraffic::parse_size_bytes;
+use crate::config::{
+    Config, CtsTrafficCfg, RateCheckCfg, RateMode, RateTargets, TestSpec, UdpProfile,
+};
 use crate::protocol::{HostInfo, NicInfo};
 use crate::rate;
 use crate::util::{md5_hex, same_slash24};
@@ -12,6 +15,12 @@ use std::collections::{BTreeMap, HashSet};
 pub const PORT_BASE: u16 = 56000;
 pub const DIAGNOSTIC_PING_COUNT: u32 = 3;
 pub const DIAGNOSTIC_SUBNET_PAYLOAD: u32 = 32;
+/// 单流 UDP 是基础连通性硬门槛：初次尝试加至少两次重试。
+pub const SINGLE_UDP_MIN_ATTEMPTS: u64 = 3;
+/// iperf3 每轮的 client 进程超时、回收、server 重建与轮间等待预算。
+const IPERF_SINGLE_UDP_ATTEMPT_GRACE_SECS: u64 = 130;
+/// ctsTraffic manager 每轮最多等待 duration+60 秒，再留少量停止/轮间预算。
+const CTS_SINGLE_UDP_ATTEMPT_GRACE_SECS: u64 = 65;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Side {
@@ -52,7 +61,7 @@ pub struct SpecNorm {
     pub dst: Endpoint,
     /// ab / ba / bidir
     pub directions: Vec<String>,
-    /// iperf / ping
+    /// iperf / ctstraffic / ping
     pub kinds: Vec<String>,
     /// tcp / udp
     pub transports: Vec<String>,
@@ -68,6 +77,7 @@ pub struct SpecNorm {
     pub rate_mode: RateMode,
     pub rate_targets: RateTargets,
     pub rate_check: RateCheckCfg,
+    pub ctstraffic: CtsTrafficCfg,
 }
 
 #[derive(Clone, Debug)]
@@ -88,6 +98,29 @@ pub struct IperfTask {
 }
 
 #[derive(Clone, Debug)]
+pub struct CtsTrafficTask {
+    pub v6: bool,
+    pub udp: bool,
+    pub profile_name: String,
+    pub profile_label: String,
+    /// 数据方向始终是 src -> dst；UDP 的进程角色会在执行器中反转。
+    pub src: Endpoint,
+    pub dst: Endpoint,
+    pub port: u16,
+    pub duration: u64,
+    pub streams: u32,
+    pub window_bytes: Option<u32>,
+    pub bits_per_second: Option<u64>,
+    pub datagram_bytes: Option<u32>,
+    pub frame_rate: u32,
+    pub buffer_depth_secs: u32,
+    pub status_update_ms: u32,
+    pub rate_mode: RateMode,
+    pub rx_target_mbps: Option<f64>,
+    pub offered_mbps: Option<f64>,
+}
+
+#[derive(Clone, Debug)]
 pub struct PingTask {
     pub v6: bool,
     pub src: Endpoint,
@@ -101,7 +134,7 @@ pub struct PingTask {
 pub enum PingPurpose {
     /// 配置/交互菜单明确选择的常规子网连通性测试。
     SubnetTest,
-    /// 所有 iperf 均无有效测量时自动追加的子网诊断。
+    /// 所有吞吐后端均无有效测量时自动追加的子网诊断。
     SubnetDiagnostic,
     /// 异常网卡绑定源地址到该接口 IPv4 网关的载体诊断。
     GatewayDiagnostic,
@@ -114,6 +147,7 @@ pub enum LegKind {
         name: String,
         streams: Vec<IperfTask>,
     },
+    CtsTraffic(CtsTrafficTask),
     Ping(PingTask),
 }
 
@@ -137,22 +171,31 @@ fn subnet_ping_key(src: &Endpoint, dst: &Endpoint, payload: u32) -> String {
     format!("{}|{}|{payload}", src.key(), dst.key())
 }
 
-/// 当本轮所有 iperf 都没有产生有效测量时，按失败任务涉及的方向和网卡
+/// 当本轮所有吞吐后端都没有产生有效测量时，按失败任务涉及的方向和网卡
 /// 构造一组短时、去重的诊断任务：
 ///
 /// - 每个唯一 IPv4 方向固定使用 32 字节短 Ping；
 /// - 每块涉及网卡绑定自己的 IPv4 源地址 Ping 自己的 IPv4 网关；
 /// - 已经在本轮选择中的同方向 32 字节常规 Ping 不重复执行；
 /// - 网关为空也保留诊断单元，由执行器报告 GATEWAY_NOT_FOUND，而不是伪装成丢包。
-pub fn build_iperf_failure_diagnostics(selected_units: &[Unit]) -> Vec<Unit> {
-    let mut iperf_tasks = Vec::new();
+pub fn build_traffic_failure_diagnostics(selected_units: &[Unit]) -> Vec<Unit> {
+    let mut traffic_pairs: Vec<(Endpoint, Endpoint)> = Vec::new();
     let mut existing_subnet_pings = HashSet::new();
     for unit in selected_units {
         for leg in &unit.legs {
             match &leg.kind {
-                LegKind::IperfSingle(task) => iperf_tasks.push(task.clone()),
+                LegKind::IperfSingle(task) => {
+                    traffic_pairs.push((task.src.clone(), task.dst.clone()))
+                }
                 LegKind::IperfGroup { streams, .. } => {
-                    iperf_tasks.extend(streams.iter().cloned());
+                    traffic_pairs.extend(
+                        streams
+                            .iter()
+                            .map(|task| (task.src.clone(), task.dst.clone())),
+                    );
+                }
+                LegKind::CtsTraffic(task) => {
+                    traffic_pairs.push((task.src.clone(), task.dst.clone()))
                 }
                 LegKind::Ping(task)
                     if !task.v6 && task.purpose != PingPurpose::GatewayDiagnostic =>
@@ -167,20 +210,20 @@ pub fn build_iperf_failure_diagnostics(selected_units: &[Unit]) -> Vec<Unit> {
             }
         }
     }
-    if iperf_tasks.is_empty() {
+    if traffic_pairs.is_empty() {
         return Vec::new();
     }
 
     let mut directions: BTreeMap<String, (Endpoint, Endpoint)> = BTreeMap::new();
     let mut endpoints: BTreeMap<String, Endpoint> = BTreeMap::new();
-    for task in iperf_tasks {
-        if !task.src.nic.ipv4.is_empty() && !task.dst.nic.ipv4.is_empty() {
-            let direction_key = format!("{}|{}", task.src.key(), task.dst.key());
+    for (src, dst) in traffic_pairs {
+        if !src.nic.ipv4.is_empty() && !dst.nic.ipv4.is_empty() {
+            let direction_key = format!("{}|{}", src.key(), dst.key());
             directions
                 .entry(direction_key)
-                .or_insert_with(|| (task.src.clone(), task.dst.clone()));
+                .or_insert_with(|| (src.clone(), dst.clone()));
         }
-        for endpoint in [&task.src, &task.dst] {
+        for endpoint in [&src, &dst] {
             if !endpoint.nic.ipv4.is_empty() {
                 endpoints
                     .entry(endpoint.key())
@@ -275,6 +318,12 @@ pub fn build_iperf_failure_diagnostics(selected_units: &[Unit]) -> Vec<Unit> {
     }
 
     diagnostics
+}
+
+/// 兼容旧测试/调用名称；诊断范围现已覆盖 iperf3 与 ctsTraffic。
+#[cfg(test)]
+pub fn build_iperf_failure_diagnostics(selected_units: &[Unit]) -> Vec<Unit> {
+    build_traffic_failure_diagnostics(selected_units)
 }
 
 /// v6 地址三元组（client 绑定 / client 目标 / server 绑定），link-local 自动带 zone
@@ -418,6 +467,7 @@ pub fn spec_from_config(
         rate_mode: t.rate_mode.unwrap_or(cfg.iperf.rate_check.mode),
         rate_targets: t.rate_targets_mbps.clone().unwrap_or_default(),
         rate_check: cfg.iperf.rate_check.clone(),
+        ctstraffic: cfg.ctstraffic.clone(),
     })
 }
 
@@ -450,6 +500,7 @@ fn allowed_udp_streams(
 fn udp_estimated_secs(
     duration: u64,
     total_streams: u64,
+    has_single_stream_leg: bool,
     mode: RateMode,
     rate_cfg: &RateCheckCfg,
 ) -> u64 {
@@ -463,12 +514,42 @@ fn udp_estimated_secs(
     } else {
         0
     };
-    duration
+    let base = duration
         .saturating_add(rate_cfg.background_secs.min(30))
         .saturating_add(rate_cfg.startup_timeout_secs)
         .saturating_add(rate_cfg.settle_secs)
         .saturating_add(5)
-        .saturating_add(stagger_ms.saturating_add(discovery_ms).div_ceil(1_000))
+        .saturating_add(stagger_ms.saturating_add(discovery_ms).div_ceil(1_000));
+    if !has_single_stream_leg {
+        return base;
+    }
+    let attempts = single_udp_attempts(rate_cfg);
+    let per_retry = duration
+        .saturating_add(rate_cfg.startup_timeout_secs)
+        .saturating_add(rate_cfg.settle_secs)
+        .saturating_add(5)
+        .saturating_add(IPERF_SINGLE_UDP_ATTEMPT_GRACE_SECS);
+    base.saturating_add(per_retry.saturating_mul(attempts.saturating_sub(1)))
+}
+
+fn single_udp_attempts(rate_cfg: &RateCheckCfg) -> u64 {
+    (rate_cfg.flow_retries as u64)
+        .saturating_add(1)
+        .max(SINGLE_UDP_MIN_ATTEMPTS)
+}
+
+fn ctstraffic_udp_estimated_secs(
+    duration: u64,
+    has_single_stream_leg: bool,
+    rate_cfg: &RateCheckCfg,
+) -> u64 {
+    if !has_single_stream_leg {
+        return duration.saturating_add(15);
+    }
+    duration
+        .saturating_add(CTS_SINGLE_UDP_ATTEMPT_GRACE_SECS)
+        .saturating_mul(single_udp_attempts(rate_cfg))
+        .saturating_add(5)
 }
 
 fn dir_pairs<'a>(spec: &'a SpecNorm, dir: &str) -> Vec<(&'a Endpoint, &'a Endpoint, &'static str)> {
@@ -654,16 +735,16 @@ fn push_iperf_task_identity(identity: &mut String, prefix: &str, task: &IperfTas
     // `port` 是构建顺序决定的临时资源，不属于测试/验收语义，不能写入 resume ID。
 }
 
-/// UDP resume ID schema v2：覆盖实际 offered load、裁剪后的流数、方向目标、模式和
-/// 全部验收阈值。v1 历史 PASS 因 schema 前缀变化不会再被错误复用。
-fn udp_resume_unit_id_v2(
+fn udp_resume_unit_id_with_schema(
+    schema: &str,
+    include_profile_window: bool,
     spec: &SpecNorm,
     ip_tag: &str,
     direction: &str,
     profile: &UdpProfile,
     legs: &[Leg],
 ) -> String {
-    let mut identity = "iperf_v2".to_string();
+    let mut identity = schema.to_string();
     push_resume_field(&mut identity, "transport", "udp");
     push_resume_field(&mut identity, "ip", ip_tag);
     push_resume_field(&mut identity, "direction", direction);
@@ -684,6 +765,13 @@ fn udp_resume_unit_id_v2(
         "profile.length",
         &option_str_identity(profile.length.as_deref()),
     );
+    if include_profile_window {
+        push_resume_field(
+            &mut identity,
+            "profile.window",
+            &option_str_identity(profile.window.as_deref()),
+        );
+    }
     push_resume_field(
         &mut identity,
         "configured_rate_mode",
@@ -719,6 +807,9 @@ fn udp_resume_unit_id_v2(
                     );
                 }
             }
+            LegKind::CtsTraffic(_) => {
+                push_resume_field(&mut identity, &format!("{prefix}.kind"), "cts-invalid");
+            }
             LegKind::Ping(_) => {
                 // 本函数仅由 UDP 构建分支调用；保留类型标记可防未来误用时发生碰撞。
                 push_resume_field(&mut identity, &format!("{prefix}.kind"), "ping-invalid");
@@ -726,6 +817,121 @@ fn udp_resume_unit_id_v2(
         }
     }
 
+    md5_hex(&identity)
+}
+
+/// UDP resume ID schema v3：覆盖实际 offered load、裁剪后的流数、方向目标、模式、
+/// socket buffer 和全部验收阈值。v1/v2 历史 PASS 因 schema 前缀变化不会再被错误复用。
+fn udp_resume_unit_id_v3(
+    spec: &SpecNorm,
+    ip_tag: &str,
+    direction: &str,
+    profile: &UdpProfile,
+    legs: &[Leg],
+) -> String {
+    udp_resume_unit_id_with_schema("iperf_v3", true, spec, ip_tag, direction, profile, legs)
+}
+
+fn cts_window_bytes(value: &str) -> Result<Option<u32>, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("auto")
+        || trimmed.eq_ignore_ascii_case("default")
+    {
+        Ok(None)
+    } else {
+        parse_size_bytes(trimmed).map(Some)
+    }
+}
+
+fn cts_bits_per_second(profile: &UdpProfile) -> Result<u64, String> {
+    let mbps = profile
+        .bandwidth_mbps()
+        .ok_or_else(|| format!("无法解析 UDP 带宽 {}", profile.bandwidth))?;
+    let bps = mbps * 1_000_000.0;
+    if !bps.is_finite() || bps < 1.0 || bps > u64::MAX as f64 {
+        return Err(format!(
+            "UDP 带宽超出 ctsTraffic 范围: {}",
+            profile.bandwidth
+        ));
+    }
+    Ok(bps.round() as u64)
+}
+
+fn cts_datagram_bytes(profile: &UdpProfile) -> Result<Option<u32>, String> {
+    profile
+        .length
+        .as_deref()
+        .map(parse_size_bytes)
+        .transpose()
+        .and_then(|value| {
+            if value.is_some_and(|size| size > 65_507) {
+                Err("ctsTraffic UDP datagram 必须不大于 65507 字节".into())
+            } else {
+                Ok(value)
+            }
+        })
+}
+
+fn cts_task_identity(identity: &mut String, prefix: &str, task: &CtsTrafficTask) {
+    for (name, value) in [
+        ("v6", if task.v6 { "true" } else { "false" }.to_string()),
+        ("udp", if task.udp { "true" } else { "false" }.to_string()),
+        ("profile", task.profile_name.clone()),
+        ("duration", task.duration.to_string()),
+        ("streams", task.streams.to_string()),
+        (
+            "window_bytes",
+            task.window_bytes
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".into()),
+        ),
+        (
+            "bits_per_second",
+            task.bits_per_second
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".into()),
+        ),
+        (
+            "datagram_bytes",
+            task.datagram_bytes
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "none".into()),
+        ),
+        ("frame_rate", task.frame_rate.to_string()),
+        ("buffer_depth_secs", task.buffer_depth_secs.to_string()),
+        ("status_update_ms", task.status_update_ms.to_string()),
+        ("rate_mode", rate_mode_identity(task.rate_mode).to_string()),
+        ("rx_target_mbps", option_f64_identity(task.rx_target_mbps)),
+        ("offered_mbps", option_f64_identity(task.offered_mbps)),
+    ] {
+        push_resume_field(identity, &format!("{prefix}.{name}"), &value);
+    }
+    push_endpoint_identity(identity, &format!("{prefix}.src"), &task.src);
+    push_endpoint_identity(identity, &format!("{prefix}.dst"), &task.dst);
+    // port 是临时资源，故意不进入 resume ID。
+}
+
+fn cts_resume_unit_id(spec: &SpecNorm, ip_tag: &str, direction: &str, legs: &[Leg]) -> String {
+    let mut identity = "ctstraffic_v1".to_string();
+    push_resume_field(&mut identity, "ip", ip_tag);
+    push_resume_field(&mut identity, "direction", direction);
+    push_resume_field(
+        &mut identity,
+        "configured_rate_mode",
+        rate_mode_identity(spec.rate_mode),
+    );
+    push_rate_targets_identity(&mut identity, "scenario_targets", &spec.rate_targets);
+    push_rate_check_identity(&mut identity, &spec.rate_check);
+    push_resume_field(&mut identity, "leg_count", &legs.len().to_string());
+    for (index, leg) in legs.iter().enumerate() {
+        let prefix = format!("leg.{index}");
+        push_resume_field(&mut identity, &format!("{prefix}.tag"), &leg.tag);
+        match &leg.kind {
+            LegKind::CtsTraffic(task) => cts_task_identity(&mut identity, &prefix, task),
+            _ => push_resume_field(&mut identity, &format!("{prefix}.kind"), "invalid"),
+        }
+    }
     md5_hex(&identity)
 }
 
@@ -868,6 +1074,10 @@ pub fn build_units(
                                             extra.push("-l".into());
                                             extra.push(l.clone());
                                         }
+                                        if let Some(w) = &prof.window {
+                                            extra.push("-w".into());
+                                            extra.push(w.clone());
+                                        }
                                         let flow_direction =
                                             if bidir { tag.to_string() } else { dir.clone() };
                                         let target = rate::resolve_target_mbps(
@@ -925,9 +1135,10 @@ pub fn build_units(
                                         stream_note,
                                         route_str
                                     );
-                                    let id = udp_resume_unit_id_v2(spec, ip_tag, dir, prof, &legs);
+                                    let id = udp_resume_unit_id_v3(spec, ip_tag, dir, prof, &legs);
                                     let total_streams =
                                         leg_streams.iter().map(|count| *count as u64).sum();
+                                    let has_single_stream_leg = leg_streams.contains(&1);
                                     units.push(Unit {
                                         id,
                                         title,
@@ -936,7 +1147,233 @@ pub fn build_units(
                                         est_secs: udp_estimated_secs(
                                             spec.duration,
                                             total_streams,
+                                            has_single_stream_leg,
                                             spec.rate_mode,
+                                            &spec.rate_check,
+                                        ),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ---------- Microsoft ctsTraffic（Windows 10+ 专用） ----------
+                if spec
+                    .kinds
+                    .iter()
+                    .any(|kind| kind == "ctstraffic" || kind == "cts")
+                {
+                    let cross = spec.src.side != spec.dst.side;
+                    let same24_ok = !cross
+                        || !require_same_subnet
+                        || same_slash24(&spec.src.nic.ipv4, &spec.dst.nic.ipv4);
+                    if !v6 && !same24_ok {
+                        notices.push(format!(
+                            "跳过 {} 的 ctsTraffic：两端 IPv4 不同 /24 ({} vs {})，无法直连灌包",
+                            spec.name, spec.src.nic.ipv4, spec.dst.nic.ipv4
+                        ));
+                    } else {
+                        for transport in &spec.transports {
+                            if transport == "tcp" {
+                                for window in &spec.tcp_windows {
+                                    let window_bytes = match cts_window_bytes(window) {
+                                        Ok(value) => value,
+                                        Err(error) => {
+                                            notices.push(format!(
+                                                "跳过 {} CTS TCP window={window}: {error}",
+                                                spec.name
+                                            ));
+                                            continue;
+                                        }
+                                    };
+                                    let window_label = window_bytes
+                                        .map(|bytes| format!("socket-buffer {window} ({bytes}B)"))
+                                        .unwrap_or_else(|| "socket-buffer 自动".into());
+                                    let profile_name = format!(
+                                        "cts_tcp_w{}_c{}",
+                                        if window.trim().is_empty() {
+                                            "auto"
+                                        } else {
+                                            window
+                                        },
+                                        spec.streams
+                                    );
+                                    let profile_label =
+                                        format!("CTS TCP {window_label} ×{}连接", spec.streams);
+                                    let mut legs = Vec::new();
+                                    for (src, dst, tag) in &pairs {
+                                        legs.push(Leg {
+                                            tag: tag.to_string(),
+                                            kind: LegKind::CtsTraffic(CtsTrafficTask {
+                                                v6,
+                                                udp: false,
+                                                profile_name: profile_name.clone(),
+                                                profile_label: profile_label.clone(),
+                                                src: (*src).clone(),
+                                                dst: (*dst).clone(),
+                                                port: alloc_port(next_port),
+                                                duration: spec.duration,
+                                                streams: spec.streams,
+                                                window_bytes,
+                                                bits_per_second: None,
+                                                datagram_bytes: None,
+                                                frame_rate: spec.ctstraffic.udp_frame_rate,
+                                                buffer_depth_secs: spec
+                                                    .ctstraffic
+                                                    .udp_buffer_depth_secs,
+                                                status_update_ms: spec.ctstraffic.status_update_ms,
+                                                rate_mode: spec.rate_mode,
+                                                rx_target_mbps: None,
+                                                offered_mbps: None,
+                                            }),
+                                        });
+                                    }
+                                    let title = format!(
+                                        "{}CTS TRAFFIC {} {} | {}",
+                                        if bidir { "★★双向 " } else { "" },
+                                        ip_tag,
+                                        profile_label,
+                                        route_str
+                                    );
+                                    units.push(Unit {
+                                        id: cts_resume_unit_id(spec, ip_tag, dir, &legs),
+                                        title,
+                                        bidir,
+                                        legs,
+                                        est_secs: spec.duration.saturating_add(15),
+                                    });
+                                }
+                            } else if transport == "udp" {
+                                for profile in &spec.udp_profiles {
+                                    let window_bytes = match profile
+                                        .window
+                                        .as_deref()
+                                        .map(cts_window_bytes)
+                                        .transpose()
+                                    {
+                                        Ok(value) => value.flatten(),
+                                        Err(error) => {
+                                            notices.push(format!(
+                                                "跳过 {} CTS UDP {}: {error}",
+                                                spec.name,
+                                                profile.label()
+                                            ));
+                                            continue;
+                                        }
+                                    };
+                                    let bits_per_second = match cts_bits_per_second(profile) {
+                                        Ok(value) => value,
+                                        Err(error) => {
+                                            notices.push(format!(
+                                                "跳过 {} CTS UDP: {error}",
+                                                spec.name
+                                            ));
+                                            continue;
+                                        }
+                                    };
+                                    let datagram_bytes = match cts_datagram_bytes(profile) {
+                                        Ok(value) => value,
+                                        Err(error) => {
+                                            notices.push(format!(
+                                                "跳过 {} CTS UDP: {error}",
+                                                spec.name
+                                            ));
+                                            continue;
+                                        }
+                                    };
+                                    let mut legs = Vec::new();
+                                    let mut max_streams = 1u32;
+                                    let mut has_single_stream_leg = false;
+                                    for (src, dst, tag) in &pairs {
+                                        let streams = allowed_udp_streams(
+                                            src,
+                                            dst,
+                                            profile,
+                                            spec.streams,
+                                            spec.udp_limit,
+                                            &spec.rate_check,
+                                        );
+                                        if streams == 0 {
+                                            notices.push(format!(
+                                                "跳过 {} CTS UDP {}：路径上限不足以承载单流",
+                                                spec.name,
+                                                profile.label()
+                                            ));
+                                            legs.clear();
+                                            break;
+                                        }
+                                        max_streams = max_streams.max(streams);
+                                        has_single_stream_leg |= streams == 1;
+                                        let flow_direction =
+                                            if bidir { tag.to_string() } else { dir.clone() };
+                                        let target = rate::resolve_target_mbps(
+                                            spec.rate_mode,
+                                            &spec.rate_targets,
+                                            &flow_direction,
+                                            &src.nic,
+                                            &dst.nic,
+                                            &spec.rate_check,
+                                        );
+                                        let effective_mode =
+                                            rate::effective_mode(spec.rate_mode, target);
+                                        let offered_mbps = profile
+                                            .bandwidth_mbps()
+                                            .map(|value| value * streams as f64);
+                                        let profile_label = format!(
+                                            "CTS UDP {} ×{}流 (每流)",
+                                            profile.label().trim_start_matches("UDP "),
+                                            streams
+                                        );
+                                        legs.push(Leg {
+                                            tag: tag.to_string(),
+                                            kind: LegKind::CtsTraffic(CtsTrafficTask {
+                                                v6,
+                                                udp: true,
+                                                profile_name: format!(
+                                                    "cts_{}_c{}",
+                                                    profile.name(),
+                                                    streams
+                                                ),
+                                                profile_label,
+                                                src: (*src).clone(),
+                                                dst: (*dst).clone(),
+                                                port: alloc_port(next_port),
+                                                duration: spec.duration,
+                                                streams,
+                                                window_bytes,
+                                                bits_per_second: Some(bits_per_second),
+                                                datagram_bytes,
+                                                frame_rate: spec.ctstraffic.udp_frame_rate,
+                                                buffer_depth_secs: spec
+                                                    .ctstraffic
+                                                    .udp_buffer_depth_secs,
+                                                status_update_ms: spec.ctstraffic.status_update_ms,
+                                                rate_mode: effective_mode,
+                                                rx_target_mbps: target,
+                                                offered_mbps,
+                                            }),
+                                        });
+                                    }
+                                    if legs.is_empty() {
+                                        continue;
+                                    }
+                                    let title = format!(
+                                        "{}CTS TRAFFIC {} UDP {} ×{}流 | {}",
+                                        if bidir { "★★双向 " } else { "" },
+                                        ip_tag,
+                                        profile.label().trim_start_matches("UDP "),
+                                        max_streams,
+                                        route_str
+                                    );
+                                    units.push(Unit {
+                                        id: cts_resume_unit_id(spec, ip_tag, dir, &legs),
+                                        title,
+                                        bidir,
+                                        legs,
+                                        est_secs: ctstraffic_udp_estimated_secs(
+                                            spec.duration,
+                                            has_single_stream_leg,
                                             &spec.rate_check,
                                         ),
                                     });
@@ -1045,7 +1482,24 @@ mod tests {
             rate_mode: RateMode::Auto,
             rate_targets: RateTargets::default(),
             rate_check: RateCheckCfg::default(),
+            ctstraffic: CtsTrafficCfg::default(),
         }
+    }
+
+    fn cts_spec(transport: &str) -> SpecNorm {
+        let mut spec = base_spec();
+        spec.kinds = vec!["ctstraffic".into()];
+        spec.transports = vec![transport.into()];
+        spec.streams = 3;
+        spec
+    }
+
+    fn build_single_cts_id(spec: SpecNorm, first_port: u16) -> String {
+        let mut port = first_port;
+        let (units, notices) = build_units(&[spec], true, &mut port);
+        assert!(notices.is_empty());
+        assert_eq!(units.len(), 1);
+        units[0].id.clone()
     }
 
     #[test]
@@ -1062,6 +1516,152 @@ mod tests {
             }
             _ => panic!("wrong kind"),
         }
+    }
+
+    #[test]
+    fn ctstraffic_tcp_keeps_connections_in_one_task() {
+        let spec = cts_spec("tcp");
+        let mut port = PORT_BASE;
+        let (units, notices) = build_units(&[spec], true, &mut port);
+
+        assert!(notices.is_empty());
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].legs.len(), 1);
+        assert_eq!(port, PORT_BASE + 1, "CTS 的 3 条连接只占用一个进程端口");
+        let LegKind::CtsTraffic(task) = &units[0].legs[0].kind else {
+            panic!("expect ctsTraffic task");
+        };
+        assert!(!task.udp);
+        assert_eq!(task.streams, 3);
+        assert_eq!(task.window_bytes, Some(64 * 1024));
+        assert_eq!(task.port, PORT_BASE);
+        assert_eq!(task.src.side, Side::Master);
+        assert_eq!(task.dst.side, Side::Agent);
+        assert!(units[0].title.contains("×3连接"));
+    }
+
+    #[test]
+    fn ctstraffic_udp_keeps_streams_in_one_task_and_preserves_data_direction() {
+        let mut spec = cts_spec("udp");
+        spec.udp_profiles = vec![UdpProfile {
+            bandwidth: "500m".into(),
+            length: Some("1200".into()),
+            window: Some("4m".into()),
+        }];
+        let mut port = PORT_BASE;
+        let (units, notices) = build_units(&[spec], true, &mut port);
+
+        assert!(notices.is_empty());
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].legs.len(), 1);
+        assert_eq!(port, PORT_BASE + 1, "CTS UDP 流不应展开成多个进程");
+        let LegKind::CtsTraffic(task) = &units[0].legs[0].kind else {
+            panic!("expect ctsTraffic task");
+        };
+        assert!(task.udp);
+        assert_eq!(task.streams, 3);
+        assert_eq!(task.bits_per_second, Some(500_000_000));
+        assert_eq!(task.datagram_bytes, Some(1200));
+        assert_eq!(task.window_bytes, Some(4 * 1024 * 1024));
+        assert_eq!(task.src.side, Side::Master, "src 始终表示实际发送端");
+        assert_eq!(task.dst.side, Side::Agent, "dst 始终表示实际接收端");
+        assert_eq!(task.src.nic.ipv4, "192.168.1.2");
+        assert_eq!(task.dst.nic.ipv4, "192.168.1.3");
+    }
+
+    #[test]
+    fn ctstraffic_bidir_builds_two_legs_with_distinct_ports() {
+        let mut spec = cts_spec("tcp");
+        spec.directions = vec!["bidir".into()];
+        let mut port = PORT_BASE;
+        let (units, notices) = build_units(&[spec], true, &mut port);
+
+        assert!(notices.is_empty());
+        assert_eq!(units.len(), 1);
+        assert!(units[0].bidir);
+        assert_eq!(units[0].legs.len(), 2);
+        assert_eq!(port, PORT_BASE + 2);
+
+        let LegKind::CtsTraffic(ab) = &units[0].legs[0].kind else {
+            panic!("expect ab ctsTraffic task");
+        };
+        let LegKind::CtsTraffic(ba) = &units[0].legs[1].kind else {
+            panic!("expect ba ctsTraffic task");
+        };
+        assert_eq!(units[0].legs[0].tag, "ab");
+        assert_eq!(units[0].legs[1].tag, "ba");
+        assert_eq!((ab.port, ba.port), (PORT_BASE, PORT_BASE + 1));
+        assert_eq!(ab.src.side, Side::Master);
+        assert_eq!(ab.dst.side, Side::Agent);
+        assert_eq!(ba.src.side, Side::Agent);
+        assert_eq!(ba.dst.side, Side::Master);
+        assert_eq!(ab.streams, 3);
+        assert_eq!(ba.streams, 3);
+    }
+
+    #[test]
+    fn ctstraffic_resume_id_ignores_port_and_tracks_udp_execution_semantics() {
+        let mut base = cts_spec("udp");
+        base.udp_profiles[0].window = Some("1m".into());
+        let base_id = build_single_cts_id(base.clone(), PORT_BASE);
+        assert_eq!(
+            base_id,
+            build_single_cts_id(base.clone(), PORT_BASE + 1000),
+            "临时端口变化不应破坏 CTS resume"
+        );
+
+        let assert_id_changed = |name: &str, change: fn(&mut SpecNorm)| {
+            let mut changed = base.clone();
+            change(&mut changed);
+            assert_ne!(
+                base_id,
+                build_single_cts_id(changed, PORT_BASE),
+                "{name} 必须使旧 PASS 失效"
+            );
+        };
+        assert_id_changed("socket buffer", |spec| {
+            spec.udp_profiles[0].window = Some("2m".into())
+        });
+        assert_id_changed("frame rate", |spec| spec.ctstraffic.udp_frame_rate = 200);
+        assert_id_changed("buffer depth", |spec| {
+            spec.ctstraffic.udp_buffer_depth_secs = 2
+        });
+        assert_id_changed("status interval", |spec| {
+            spec.ctstraffic.status_update_ms = 500
+        });
+    }
+
+    #[test]
+    fn ctstraffic_and_iperf_resume_ids_do_not_collide() {
+        let mut spec = base_spec();
+        spec.kinds = vec!["iperf".into(), "ctstraffic".into()];
+        let mut port = PORT_BASE;
+        let (units, notices) = build_units(&[spec], true, &mut port);
+
+        assert!(notices.is_empty());
+        assert_eq!(units.len(), 2);
+        let iperf_id = units
+            .iter()
+            .find(|unit| {
+                unit.legs.iter().any(|leg| {
+                    matches!(
+                        &leg.kind,
+                        LegKind::IperfSingle(_) | LegKind::IperfGroup { .. }
+                    )
+                })
+            })
+            .map(|unit| unit.id.as_str())
+            .expect("iperf unit");
+        let cts_id = units
+            .iter()
+            .find(|unit| {
+                unit.legs
+                    .iter()
+                    .any(|leg| matches!(&leg.kind, LegKind::CtsTraffic(_)))
+            })
+            .map(|unit| unit.id.as_str())
+            .expect("ctsTraffic unit");
+        assert_ne!(iperf_id, cts_id);
     }
 
     #[test]
@@ -1085,6 +1685,30 @@ mod tests {
         }
         // 端口不重复
         assert_eq!(port, PORT_BASE + 6);
+    }
+
+    #[test]
+    fn test_udp_window_is_forwarded_to_iperf_and_report_identity() {
+        let mut spec = base_spec();
+        spec.transports = vec!["udp".into()];
+        spec.udp_profiles = vec![UdpProfile {
+            bandwidth: "1000m".into(),
+            length: Some("64".into()),
+            window: Some("4m".into()),
+        }];
+
+        let mut port = PORT_BASE;
+        let (units, notices) = build_units(&[spec], true, &mut port);
+        assert!(notices.is_empty());
+        assert_eq!(units.len(), 1);
+        assert!(units[0].title.contains("UDP -b 1000m -l 64 -w 4m"));
+
+        let LegKind::IperfSingle(task) = &units[0].legs[0].kind else {
+            panic!("expect single UDP task");
+        };
+        assert_eq!(task.extra, vec!["-b", "1000m", "-l", "64", "-w", "4m"]);
+        assert_eq!(task.profile_name, "udp_b1000m_l64_w4m");
+        assert_eq!(task.profile_label, "UDP -b 1000m -l 64 -w 4m");
     }
 
     #[test]
@@ -1129,6 +1753,63 @@ mod tests {
             LegKind::IperfGroup { streams, .. } => assert_eq!(streams.len(), 5),
             _ => panic!("expect group"),
         }
+    }
+
+    #[test]
+    fn single_udp_estimate_covers_three_attempts_per_direction_without_double_counting_bidir() {
+        let mut oneway = base_spec();
+        oneway.transports = vec!["udp".into()];
+        oneway.streams = 1;
+        let mut port = PORT_BASE;
+        let (oneway_units, notices) = build_units(&[oneway.clone()], true, &mut port);
+        assert!(notices.is_empty());
+        assert_eq!(oneway_units.len(), 1);
+        let oneway_estimate = oneway_units[0].est_secs;
+        assert_eq!(oneway_estimate, 368);
+
+        oneway.directions = vec!["bidir".into()];
+        let mut port = PORT_BASE;
+        let (bidir_units, notices) = build_units(&[oneway], true, &mut port);
+        assert!(notices.is_empty());
+        assert_eq!(bidir_units.len(), 1);
+        assert_eq!(bidir_units[0].legs.len(), 2);
+        assert_eq!(
+            bidir_units[0].est_secs,
+            oneway_estimate + 1,
+            "AB/BA 并行只增加一次毫秒级错峰取整，不应按六轮墙钟时间重复累计"
+        );
+    }
+
+    #[test]
+    fn single_udp_estimate_honors_retry_budget_above_minimum() {
+        let mut spec = base_spec();
+        spec.transports = vec!["udp".into()];
+        spec.streams = 1;
+        spec.rate_check.flow_retries = 4;
+        let mut port = PORT_BASE;
+        let (units, notices) = build_units(&[spec], true, &mut port);
+        assert!(notices.is_empty());
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].est_secs, 698);
+    }
+
+    #[test]
+    fn ctstraffic_single_udp_estimate_covers_three_attempts_and_bidir_is_parallel() {
+        let mut spec = cts_spec("udp");
+        spec.streams = 1;
+        let mut port = PORT_BASE;
+        let (oneway_units, notices) = build_units(&[spec.clone()], true, &mut port);
+        assert!(notices.is_empty());
+        assert_eq!(oneway_units.len(), 1);
+        assert_eq!(oneway_units[0].est_secs, 230);
+
+        spec.directions = vec!["bidir".into()];
+        let mut port = PORT_BASE;
+        let (bidir_units, notices) = build_units(&[spec], true, &mut port);
+        assert!(notices.is_empty());
+        assert_eq!(bidir_units.len(), 1);
+        assert_eq!(bidir_units[0].legs.len(), 2);
+        assert_eq!(bidir_units[0].est_secs, oneway_units[0].est_secs);
     }
 
     #[test]
@@ -1177,9 +1858,26 @@ mod tests {
     }
 
     #[test]
-    fn test_udp_resume_v2_ignores_runtime_port_but_tracks_verdict_semantics() {
+    fn test_udp_resume_v3_ignores_runtime_port_but_tracks_verdict_semantics() {
         let base = evb_udp_spec();
         let base_id = build_single_udp_id(base.clone(), PORT_BASE);
+        let mut legacy_port = PORT_BASE;
+        let (legacy_units, legacy_notices) =
+            build_units(std::slice::from_ref(&base), true, &mut legacy_port);
+        assert!(legacy_notices.is_empty());
+        let legacy_v2_id = udp_resume_unit_id_with_schema(
+            "iperf_v2",
+            false,
+            &base,
+            "V4",
+            "ab",
+            &base.udp_profiles[0],
+            &legacy_units[0].legs,
+        );
+        assert_ne!(
+            base_id, legacy_v2_id,
+            "v3 必须让 v2 schema 下缓存的 PASS 无条件失效"
+        );
         let legacy_v1_id = md5_hex(&format!(
             "iperf_v1|V4|udp|{}|{}|{}|{}|{}|ab",
             base.udp_profiles[0].name(),
@@ -1190,7 +1888,7 @@ mod tests {
         ));
         assert_ne!(
             base_id, legacy_v1_id,
-            "v2 必须让旧 schema 下缓存的 PASS 无条件失效"
+            "v3 必须让 v1 schema 下缓存的 PASS 无条件失效"
         );
         assert_eq!(
             base_id,
@@ -1218,6 +1916,9 @@ mod tests {
         });
         assert_id_changed("offered load", |spec| {
             spec.udp_profiles = vec![UdpProfile::bw("400m")]
+        });
+        assert_id_changed("UDP socket buffer", |spec| {
+            spec.udp_profiles[0].window = Some("4m".into())
         });
         assert_id_changed("sample interval", |spec| {
             spec.rate_check.sample_interval_ms = 500
@@ -1257,7 +1958,7 @@ mod tests {
     }
 
     #[test]
-    fn test_udp_resume_v2_tracks_effective_leg_shape() {
+    fn test_udp_resume_v3_tracks_effective_leg_shape() {
         let mut base = evb_udp_spec();
         base.src = ep(Side::Master, "rndis", "RNDIS", "192.168.1.2", 3700);
         base.rate_mode = RateMode::Observe;
@@ -1338,6 +2039,40 @@ mod tests {
         assert_eq!(subnet_payloads, vec![DIAGNOSTIC_SUBNET_PAYLOAD]);
         assert!(gateways.contains(&("192.168.1.2".into(), "192.168.1.1".into())));
         assert!(gateways.contains(&("192.168.1.3".into(), "192.168.1.254".into())));
+    }
+
+    #[test]
+    fn ctstraffic_failure_diagnostics_collects_data_endpoints_and_gateways() {
+        let mut spec = cts_spec("udp");
+        spec.src.nic.gateway_v4 = "192.168.1.1".into();
+        spec.dst.nic.gateway_v4 = "192.168.1.254".into();
+        let mut port = PORT_BASE;
+        let (units, notices) = build_units(&[spec], true, &mut port);
+        assert!(notices.is_empty());
+
+        let diagnostics = build_traffic_failure_diagnostics(&units);
+        assert_eq!(diagnostics.len(), 3, "CTS 失败也要诊断数据路径与两端网关");
+        let subnet = diagnostics
+            .iter()
+            .find_map(|unit| match &unit.legs[0].kind {
+                LegKind::Ping(task) if task.purpose == PingPurpose::SubnetDiagnostic => Some(task),
+                _ => None,
+            })
+            .expect("CTS src->dst subnet diagnostic");
+        assert_eq!(subnet.src.nic.ipv4, "192.168.1.2");
+        assert_eq!(subnet.dst.nic.ipv4, "192.168.1.3");
+
+        let gateway_targets: Vec<&str> = diagnostics
+            .iter()
+            .filter_map(|unit| match &unit.legs[0].kind {
+                LegKind::Ping(task) if task.purpose == PingPurpose::GatewayDiagnostic => {
+                    Some(task.dst.nic.ipv4.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(gateway_targets.contains(&"192.168.1.1"));
+        assert!(gateway_targets.contains(&"192.168.1.254"));
     }
 
     #[test]

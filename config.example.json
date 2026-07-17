@@ -15,7 +15,7 @@
       { "bandwidth": "1m" },
       { "bandwidth": "100m" },
       { "bandwidth": "500m" },
-      { "bandwidth": "1000m", "length": "64" },
+      { "bandwidth": "1000m", "length": "64", "window": "1m" },
       { "bandwidth": "2500m" }
     ],
     "rate_check": {
@@ -42,6 +42,12 @@
     }
   },
 
+  "ctstraffic": {
+    "udp_frame_rate": 100,
+    "udp_buffer_depth_secs": 1,
+    "status_update_ms": 1000
+  },
+
   "ping": {
     "count": 100,
     "payload_sizes": [32, 1600, 65500]
@@ -55,7 +61,7 @@
 
   "universal_params": {
     "directions": ["A->B", "B->A", "bidir"],
-    "kinds": ["iperf", "ping"],
+    "kinds": ["iperf", "ctstraffic", "ping"],
     "transports": ["tcp", "udp"],
     "ip": ["v4", "v6"],
     "streams": 5,

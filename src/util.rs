@@ -38,6 +38,18 @@ impl CmdOut {
             format!("{}\n{}", self.stdout, self.stderr)
         }
     }
+
+    /// 命令是否已经成功 spawn。deadline 无法表示或 Command::spawn 失败时为 false。
+    pub fn process_started(&self) -> bool {
+        !self.stderr.contains("命令超时时间过大，无法执行")
+            && !self.stderr.contains("启动命令失败:")
+    }
+
+    /// 返回前是否确认完成 wait/reap。kill 本身报错可能只是进程恰好已退出；
+    /// 只有最终回收失败才表示禁止复用同一端口开始下一轮。
+    pub fn cleanup_confirmed(&self) -> bool {
+        !self.stderr.contains("回收子进程失败")
+    }
 }
 
 fn terminate_and_reap(child: &mut Child) -> Vec<String> {
@@ -445,7 +457,7 @@ pub fn os_name() -> String {
     }
 }
 
-// ---------------- iperf3 定位 ----------------
+// ---------------- 外部灌包工具定位 ----------------
 
 static IPERF3: OnceLock<Option<String>> = OnceLock::new();
 
@@ -486,6 +498,40 @@ pub fn iperf3_version() -> Option<String> {
     let bin = find_iperf3()?;
     let out = run_cmd(&bin, &["--version"], Duration::from_secs(8));
     out.merged().lines().next().map(|s| s.trim().to_string())
+}
+
+static CTS_TRAFFIC: OnceLock<Option<String>> = OnceLock::new();
+
+/// 找 ctsTraffic：仅 Windows 支持；优先程序同目录，其次 PATH。
+pub fn find_ctstraffic() -> Option<String> {
+    CTS_TRAFFIC
+        .get_or_init(|| {
+            if !cfg!(windows) {
+                return None;
+            }
+            if let Ok(exe) = std::env::current_exe() {
+                if let Some(dir) = exe.parent() {
+                    let p = dir.join("ctsTraffic.exe");
+                    if p.exists() {
+                        return Some(p.to_string_lossy().into_owned());
+                    }
+                }
+            }
+            // ctsTraffic 的 -Help 会打印帮助后返回非零，因此不能按退出码探测；
+            // 只要进程确实启动且输出了官方帮助标识，即可确认 PATH 中可用。
+            let probe = run_cmd("ctsTraffic.exe", &["-Help"], Duration::from_secs(8));
+            let text = probe.merged().to_ascii_lowercase();
+            (!text.contains("启动命令失败") && text.contains("ctstraffic"))
+                .then(|| "ctsTraffic.exe".into())
+        })
+        .clone()
+}
+
+pub fn ctstraffic_version() -> Option<String> {
+    let bin = find_ctstraffic()?;
+    // 官方 CLI 当前没有独立 --version；健康检查报告可执行文件位置和可用性，
+    // 精确文件版本可在 Windows 文件属性中查看。
+    Some(format!("ctsTraffic 可用 ({bin})"))
 }
 
 // ---------------- 交互输入 ----------------
@@ -648,6 +694,25 @@ mod tests {
         assert!(!out.ok);
         assert!(out.stderr.contains("超时时间过大"));
         assert!(!out.stderr.contains("启动命令失败"));
+        assert!(!out.process_started());
+        assert!(out.cleanup_confirmed());
+    }
+
+    #[test]
+    fn command_lifecycle_helpers_distinguish_spawn_and_reap_failures() {
+        let spawn_failed = CmdOut {
+            stderr: "启动命令失败: ctsTraffic.exe (not found)".into(),
+            ..Default::default()
+        };
+        assert!(!spawn_failed.process_started());
+        assert!(spawn_failed.cleanup_confirmed());
+
+        let reap_failed = CmdOut {
+            stderr: "超时后回收子进程失败: synthetic".into(),
+            ..Default::default()
+        };
+        assert!(reap_failed.process_started());
+        assert!(!reap_failed.cleanup_confirmed());
     }
 
     #[test]

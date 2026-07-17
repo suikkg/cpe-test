@@ -4,4 +4,5 @@
 iperf3.exe 以及其同目录全部 DLL，一起复制到本文件所在目录（即 cpe_test.exe 同目录）。
 
 常见发行版依赖 cygwin1.dll；只复制 iperf3.exe 可能无法启动。
-只运行 ping 测试时不需要 iperf3。
+只运行 Ping 或 ctsTraffic 测试时不需要 iperf3；ctsTraffic 的准备方式见
+ctsTraffic-请放到这里.txt。

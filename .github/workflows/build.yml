@@ -6,16 +6,109 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CTSTRAFFIC_VERSION: "2.0.4.0"
+  CTSTRAFFIC_COMMIT: "4468b8085b6ac58c531596216f10e812287174ea"
+  CTSTRAFFIC_SHA256: "9ac0f6a19da355343133f658c6e5d0dc40919f9a13020f86621194c31ce20b12"
 
 jobs:
   quality:
+    name: Quality (Linux)
     runs-on: ubuntu-latest
+    outputs:
+      crate_version: ${{ steps.metadata.outputs.crate_version }}
     steps:
       - uses: actions/checkout@v4
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+
+      - name: Resolve Cargo version
+        id: metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          crate_version="$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json, sys; data = json.load(sys.stdin); print(next(p["version"] for p in data["packages"] if p["name"] == "cpe_test"))')"
+          echo "crate_version=${crate_version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Verify release tag matches Cargo version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          set -euo pipefail
+          crate_version="${{ steps.metadata.outputs.crate_version }}"
+          expected_tag="v${crate_version}"
+          if [[ "${GITHUB_REF_NAME}" != "${expected_tag}" ]]; then
+            echo "release tag ${GITHUB_REF_NAME} does not match Cargo version ${crate_version}" >&2
+            exit 1
+          fi
+
+      - name: Validate JSON configuration files
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -c 'import glob, json; files = ["config.example.json", *sorted(glob.glob("dist/configs/*.json"))]; [json.load(open(path, encoding="utf-8")) for path in files]; print(f"validated {len(files)} JSON files")'
+
+      - name: Validate tracked Windows configuration and documentation bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from hashlib import sha256
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          bundle = Path("dist/cpe_test-v4.2.0-windows-config-docs.zip")
+          checksum = Path(f"{bundle}.sha256")
+          expected_hash = checksum.read_text(encoding="utf-8").split()[0]
+          actual_hash = sha256(bundle.read_bytes()).hexdigest()
+          if actual_hash != expected_hash:
+              raise SystemExit(f"bundle SHA-256 mismatch: {actual_hash}")
+
+          prefix = "cpe_test-v4.2.0-windows-config-docs"
+          source_for = {
+              "Windows配置与文档包说明.md": Path("dist/Windows配置与文档包说明.md"),
+              "README.md": Path("README.md"),
+              "README-Windows-快速开始.md": Path("dist/README-Windows-快速开始.md"),
+              "使用说明.md": Path("使用说明.md"),
+              "NIC_README.md": Path("NIC_README.md"),
+              "UDP并发灌包验收场景.md": Path("UDP并发灌包验收场景.md"),
+              "config.example.json": Path("config.example.json"),
+              "configs/config-sgmii.json": Path("dist/configs/config-sgmii.json"),
+              "configs/config-wifi5g.json": Path("dist/configs/config-wifi5g.json"),
+              "configs/config-10gusb.json": Path("dist/configs/config-10gusb.json"),
+              "configs/config-all-common.json": Path("dist/configs/config-all-common.json"),
+              "start_agent.bat": Path("dist/start_agent.bat"),
+              "start_master.bat": Path("dist/start_master.bat"),
+              "start_master_select_config.bat": Path("dist/start_master_select_config.bat"),
+              "iperf3-请放到这里.txt": Path("dist/iperf3-请放到这里.txt"),
+              "ctsTraffic-请放到这里.txt": Path("dist/ctsTraffic-请放到这里.txt"),
+              "LICENSE-cpe_test-MIT.txt": Path("LICENSE"),
+              "THIRD_PARTY_NOTICES.md": Path("THIRD_PARTY_NOTICES.md"),
+          }
+          expected_names = {f"{prefix}/{relative}" for relative in source_for}
+          with ZipFile(bundle) as archive:
+              archive.testzip()
+              actual_names = {info.filename for info in archive.infolist() if not info.is_dir()}
+              if actual_names != expected_names:
+                  missing = sorted(expected_names - actual_names)
+                  extra = sorted(actual_names - expected_names)
+                  raise SystemExit(f"bundle entries mismatch; missing={missing}, extra={extra}")
+              for relative, source in source_for.items():
+                  info = archive.getinfo(f"{prefix}/{relative}")
+                  if not info.filename.isascii() and not info.flag_bits & 0x800:
+                      raise SystemExit(f"ZIP entry is not marked UTF-8: {info.filename}")
+                  if archive.read(info) != source.read_bytes():
+                      raise SystemExit(f"bundle entry is stale: {relative}")
+          print(f"validated {len(source_for)} Windows config/document bundle files")
+          PY
 
       - name: Format
         run: cargo fmt --check
@@ -29,47 +122,411 @@ jobs:
   build:
     needs: quality
     strategy:
+      fail-fast: false
       matrix:
         include:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
+            platform: windows-x86_64
             ext: .exe
+            archive: zip
           - os: macos-latest
             target: aarch64-apple-darwin
+            platform: macos-aarch64
             ext: ""
+            archive: tar.gz
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
+            platform: linux-x86_64
             ext: ""
+            archive: tar.gz
 
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
+      - name: Resolve package name
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          crate_version="${{ needs.quality.outputs.crate_version }}"
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            release_version="${GITHUB_REF_NAME}"
+          else
+            release_version="v${crate_version}"
+          fi
+          if [[ "${release_version}" != "v${crate_version}" ]]; then
+            echo "release version ${release_version} does not match Cargo version ${crate_version}" >&2
+            exit 1
+          fi
+          asset_base="cpe_test-${release_version}-${{ matrix.platform }}"
+          echo "version=${release_version}" >> "${GITHUB_OUTPUT}"
+          echo "asset_base=${asset_base}" >> "${GITHUB_OUTPUT}"
+
+      - name: Validate JSON configuration files on Windows
+        if: matrix.platform == 'windows-x86_64'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $files = @((Resolve-Path 'config.example.json').Path)
+          $files += (Get-ChildItem 'dist/configs/*.json').FullName
+          foreach ($file in $files) {
+            Get-Content -LiteralPath $file -Raw -Encoding UTF8 | ConvertFrom-Json | Out-Null
+            Write-Host "validated $file"
+          }
+
+      - name: Test on Windows
+        if: matrix.platform == 'windows-x86_64'
+        run: cargo test --locked --target ${{ matrix.target }}
+
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
 
-      - name: Upload
+      - name: Native help smoke test
+        if: matrix.platform != 'macos-aarch64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="target/${{ matrix.target }}/release/cpe_test${{ matrix.ext }}"
+          help_output="$("${binary}" --help 2>&1)"
+          printf '%s\n' "${help_output}"
+          grep -F "v${{ needs.quality.outputs.crate_version }}" <<<"${help_output}"
+
+      - name: Verify macOS binary architecture
+        if: matrix.platform == 'macos-aarch64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          file "target/${{ matrix.target }}/release/cpe_test" | grep -F 'arm64'
+
+      - name: Verify Linux binary architecture
+        if: matrix.platform == 'linux-x86_64'
+        shell: bash
+        run: file "target/${{ matrix.target }}/release/cpe_test" | grep -F 'x86-64'
+
+      - name: Download and verify pinned ctsTraffic
+        id: ctstraffic
+        if: matrix.platform == 'windows-x86_64'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          function Get-PinnedFile {
+            param(
+              [Parameter(Mandatory = $true)][string]$Uri,
+              [Parameter(Mandatory = $true)][string]$OutFile
+            )
+            for ($attempt = 1; $attempt -le 3; $attempt++) {
+              try {
+                Invoke-WebRequest -Uri $Uri -OutFile $OutFile -UseBasicParsing
+                return
+              } catch {
+                if ($attempt -eq 3) { throw }
+                Write-Warning "download attempt $attempt failed: $($_.Exception.Message)"
+                Start-Sleep -Seconds (2 * $attempt)
+              }
+            }
+          }
+
+          $downloadDir = Join-Path $env:RUNNER_TEMP 'ctstraffic-pinned'
+          New-Item -ItemType Directory -Path $downloadDir -Force | Out-Null
+          $binary = Join-Path $downloadDir 'ctsTraffic.exe'
+          $license = Join-Path $downloadDir 'LICENSE-ctsTraffic-Apache-2.0.txt'
+          $baseUrl = "https://raw.githubusercontent.com/microsoft/ctsTraffic/$env:CTSTRAFFIC_COMMIT"
+
+          Get-PinnedFile -Uri "$baseUrl/Releases/$env:CTSTRAFFIC_VERSION/x64/ctsTraffic.exe" -OutFile $binary
+          Get-PinnedFile -Uri "$baseUrl/LICENSE" -OutFile $license
+
+          $actualHash = (Get-FileHash -LiteralPath $binary -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualHash -ne $env:CTSTRAFFIC_SHA256) {
+            throw "ctsTraffic SHA-256 mismatch: expected $env:CTSTRAFFIC_SHA256, got $actualHash"
+          }
+          $licenseText = Get-Content -LiteralPath $license -Raw -Encoding UTF8
+          if ($licenseText -notmatch 'Apache License\s+Version 2\.0') {
+            throw 'downloaded ctsTraffic license is not the expected Apache-2.0 text'
+          }
+
+          "binary=$binary" >> $env:GITHUB_OUTPUT
+          "license=$license" >> $env:GITHUB_OUTPUT
+          Write-Host "verified ctsTraffic $env:CTSTRAFFIC_VERSION ($actualHash)"
+
+      - name: ctsTraffic help smoke test
+        if: matrix.platform == 'windows-x86_64'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $binary = '${{ steps.ctstraffic.outputs.binary }}'
+          $stdout = Join-Path $env:RUNNER_TEMP 'ctstraffic-help.stdout.txt'
+          $stderr = Join-Path $env:RUNNER_TEMP 'ctstraffic-help.stderr.txt'
+          $process = Start-Process -FilePath $binary -ArgumentList '-Help' -NoNewWindow -Wait -PassThru -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+          $helpText = (Get-Content -LiteralPath $stdout -Raw -ErrorAction SilentlyContinue) + (Get-Content -LiteralPath $stderr -Raw -ErrorAction SilentlyContinue)
+          if (@(0, 13) -notcontains $process.ExitCode) {
+            throw "ctsTraffic -Help returned unexpected exit code $($process.ExitCode)"
+          }
+          if ($helpText -notmatch 'ctsTraffic') {
+            throw 'ctsTraffic -Help output did not identify ctsTraffic'
+          }
+          Write-Host "ctsTraffic -Help smoke test passed with expected exit code $($process.ExitCode)"
+
+      - name: Package Windows release
+        if: matrix.platform == 'windows-x86_64'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $assetBase = '${{ steps.package.outputs.asset_base }}'
+          $outDir = Join-Path $PWD 'release-packages'
+          $stage = Join-Path $env:RUNNER_TEMP $assetBase
+          New-Item -ItemType Directory -Path $outDir -Force | Out-Null
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+
+          Copy-Item 'target/${{ matrix.target }}/release/cpe_test.exe' (Join-Path $stage 'cpe_test.exe')
+          Copy-Item 'dist/README-Windows-快速开始.md' $stage
+          Copy-Item 'dist/start_agent.bat' $stage
+          Copy-Item 'dist/start_master.bat' $stage
+          Copy-Item 'dist/start_master_select_config.bat' $stage
+          Copy-Item 'dist/iperf3-请放到这里.txt' $stage
+          Copy-Item 'dist/ctsTraffic-请放到这里.txt' $stage
+          Copy-Item 'dist/configs' (Join-Path $stage 'configs') -Recurse
+          Copy-Item 'LICENSE' (Join-Path $stage 'LICENSE-cpe_test-MIT.txt')
+          Copy-Item 'THIRD_PARTY_NOTICES.md' $stage
+          Copy-Item 'third_party/WIL-LICENSE-MIT.txt' (Join-Path $stage 'LICENSE-WIL-MIT.txt')
+          Copy-Item '${{ steps.ctstraffic.outputs.binary }}' (Join-Path $stage 'ctsTraffic.exe')
+          Copy-Item '${{ steps.ctstraffic.outputs.license }}' $stage
+
+          $required = @(
+            'cpe_test.exe',
+            'ctsTraffic.exe',
+            'README-Windows-快速开始.md',
+            'start_agent.bat',
+            'start_master.bat',
+            'start_master_select_config.bat',
+            'iperf3-请放到这里.txt',
+            'ctsTraffic-请放到这里.txt',
+            'configs/config-sgmii.json',
+            'configs/config-wifi5g.json',
+            'configs/config-10gusb.json',
+            'configs/config-all-common.json',
+            'LICENSE-cpe_test-MIT.txt',
+            'LICENSE-ctsTraffic-Apache-2.0.txt',
+            'LICENSE-WIL-MIT.txt',
+            'THIRD_PARTY_NOTICES.md'
+          )
+          foreach ($relativePath in $required) {
+            $path = Join-Path $stage $relativePath
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+              throw "Windows package is missing required file: $relativePath"
+            }
+          }
+
+          $packagedCtsHash = (Get-FileHash -LiteralPath (Join-Path $stage 'ctsTraffic.exe') -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($packagedCtsHash -ne $env:CTSTRAFFIC_SHA256) {
+            throw "packaged ctsTraffic SHA-256 mismatch: $packagedCtsHash"
+          }
+
+          function Assert-PeX64 {
+            param([Parameter(Mandatory = $true)][string]$Path)
+            $bytes = [System.IO.File]::ReadAllBytes($Path)
+            if ($bytes.Length -lt 64) { throw "PE file is too small: $Path" }
+            $peOffset = [BitConverter]::ToInt32($bytes, 0x3c)
+            if ($peOffset -lt 0 -or $peOffset + 6 -gt $bytes.Length) {
+              throw "invalid PE header offset: $Path"
+            }
+            $signature = [Text.Encoding]::ASCII.GetString($bytes, $peOffset, 4)
+            $machine = [BitConverter]::ToUInt16($bytes, $peOffset + 4)
+            if ($signature -ne "PE`0`0" -or $machine -ne 0x8664) {
+              throw ('expected PE32+ x86-64: {0}; signature={1}; machine=0x{2:x4}' -f $Path, $signature, $machine)
+            }
+          }
+          Assert-PeX64 (Join-Path $stage 'cpe_test.exe')
+          Assert-PeX64 (Join-Path $stage 'ctsTraffic.exe')
+
+          $archive = Join-Path $outDir "$assetBase.zip"
+          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $archive -CompressionLevel Optimal
+          Write-Host "created $archive"
+
+      - name: Package Unix release
+        if: matrix.platform != 'windows-x86_64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset_base="${{ steps.package.outputs.asset_base }}"
+          out_dir="${PWD}/release-packages"
+          stage="${RUNNER_TEMP}/${asset_base}"
+          mkdir -p "${out_dir}" "${stage}"
+          install -m 0755 "target/${{ matrix.target }}/release/cpe_test" "${stage}/cpe_test"
+          install -m 0644 README.md "${stage}/README.md"
+          install -m 0644 LICENSE "${stage}/LICENSE"
+          install -m 0644 THIRD_PARTY_NOTICES.md "${stage}/THIRD_PARTY_NOTICES.md"
+          tar -czf "${out_dir}/${asset_base}.tar.gz" -C "${stage}" .
+          tar -tzf "${out_dir}/${asset_base}.tar.gz" | grep -Fx './cpe_test'
+
+      - name: Upload packaged release asset
         uses: actions/upload-artifact@v4
         with:
-          name: cpe_test-${{ matrix.os }}
-          path: target/${{ matrix.target }}/release/cpe_test${{ matrix.ext }}
+          name: ${{ steps.package.outputs.asset_base }}
+          path: release-packages/${{ steps.package.outputs.asset_base }}.${{ matrix.archive }}
+          if-no-files-found: error
+          retention-days: 7
 
   release:
     needs: build
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
     steps:
       - uses: actions/download-artifact@v4
         with:
-          path: artifacts
+          path: release-assets
+          merge-multiple: true
 
-      - name: Release
+      - name: Verify archives and create SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME}"
+          windows="cpe_test-${version}-windows-x86_64.zip"
+          macos="cpe_test-${version}-macos-aarch64.tar.gz"
+          linux="cpe_test-${version}-linux-x86_64.tar.gz"
+          expected=("${windows}" "${macos}" "${linux}")
+
+          mapfile -t actual < <(find release-assets -maxdepth 1 -type f -printf '%f\n' | sort)
+          if [[ "${#actual[@]}" -ne 3 ]]; then
+            printf 'expected exactly 3 packaged assets, found %s:\n' "${#actual[@]}" >&2
+            printf '  %s\n' "${actual[@]}" >&2
+            exit 1
+          fi
+          for asset in "${expected[@]}"; do
+            if [[ ! -f "release-assets/${asset}" ]]; then
+              echo "missing packaged asset: ${asset}" >&2
+              exit 1
+            fi
+          done
+
+          required_windows_files=(
+            cpe_test.exe
+            ctsTraffic.exe
+            README-Windows-快速开始.md
+            start_agent.bat
+            start_master.bat
+            start_master_select_config.bat
+            iperf3-请放到这里.txt
+            ctsTraffic-请放到这里.txt
+            configs/config-sgmii.json
+            configs/config-wifi5g.json
+            configs/config-10gusb.json
+            configs/config-all-common.json
+            LICENSE-cpe_test-MIT.txt
+            LICENSE-ctsTraffic-Apache-2.0.txt
+            LICENSE-WIL-MIT.txt
+            THIRD_PARTY_NOTICES.md
+          )
+          mapfile -t windows_entries < <(unzip -Z1 "release-assets/${windows}")
+          for required in "${required_windows_files[@]}"; do
+            if ! printf '%s\n' "${windows_entries[@]}" | grep -Fx -- "${required}" >/dev/null; then
+              echo "Windows archive is missing required file: ${required}" >&2
+              exit 1
+            fi
+          done
+
+          packaged_cts_hash="$(unzip -p "release-assets/${windows}" ctsTraffic.exe | sha256sum | awk '{print $1}')"
+          if [[ "${packaged_cts_hash}" != "${CTSTRAFFIC_SHA256}" ]]; then
+            echo "published Windows archive contains unexpected ctsTraffic hash: ${packaged_cts_hash}" >&2
+            exit 1
+          fi
+          verify_dir="$(mktemp -d)"
+          unzip -p "release-assets/${windows}" cpe_test.exe > "${verify_dir}/cpe_test.exe"
+          unzip -p "release-assets/${windows}" ctsTraffic.exe > "${verify_dir}/ctsTraffic.exe"
+          tar -xOzf "release-assets/${macos}" ./cpe_test > "${verify_dir}/cpe_test-macos"
+          tar -xOzf "release-assets/${linux}" ./cpe_test > "${verify_dir}/cpe_test-linux"
+          file "${verify_dir}/cpe_test.exe" | grep -E 'PE32\+.*x86-64'
+          file "${verify_dir}/ctsTraffic.exe" | grep -E 'PE32\+.*x86-64'
+          file "${verify_dir}/cpe_test-macos" | grep -E 'Mach-O.*arm64'
+          file "${verify_dir}/cpe_test-linux" | grep -E 'ELF 64-bit.*x86-64'
+          for archive in "${macos}" "${linux}"; do
+            if ! tar -tzf "release-assets/${archive}" | grep -Fx './cpe_test' >/dev/null; then
+              echo "Unix archive is missing cpe_test: ${archive}" >&2
+              exit 1
+            fi
+            if ! tar -tvzf "release-assets/${archive}" | grep -E '^-rwx[^ ]* .*\./cpe_test$' >/dev/null; then
+              echo "Unix archive does not preserve the cpe_test executable bit: ${archive}" >&2
+              exit 1
+            fi
+          done
+
+          (
+            cd release-assets
+            sha256sum "${expected[@]}" > SHA256SUMS
+            sha256sum -c SHA256SUMS
+          )
+
+      - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+          make_latest: true
+          body: |
+            cpe_test ${{ github.ref_name }} 的已验证跨平台发布包。
+
+            本版新增 iperf3 UDP `-w <socket buffer>` 配置与 Windows 10+ 专用 Microsoft ctsTraffic 后端。Windows 包已包含固定并校验过的 ctsTraffic 2.0.4.0 x64；iperf3 仍需按包内说明自行放置。
+
+            UDP 单流是每个方向独立的硬连通门槛：总尝试数为 `max(flow_retries + 1, 3)`；双向 AB、BA 各自拥有独立预算并并行执行。安全耗尽且仍无工具自身吞吐证据时，iperf3 返回 `RATE_FAIL / SINGLE_UDP_STREAM_FAILED`，ctsTraffic 返回 `RATE_FAIL / CTSTRAFFIC_SINGLE_UDP_STREAM_FAILED`。缺工具、平台不支持、非法参数或资源清理未确认仍属于 `SETUP_ERROR`；一旦已有工具测量，则按真实运行错误、丢包/丢帧和目标速率判定，不继续连通重试。
+
+            所有归档的 SHA-256 请见 `SHA256SUMS`。
           files: |
-            artifacts/cpe_test-windows-latest/cpe_test.exe
-            artifacts/cpe_test-macos-latest/cpe_test
-            artifacts/cpe_test-ubuntu-latest/cpe_test
+            release-assets/cpe_test-${{ github.ref_name }}-windows-x86_64.zip
+            release-assets/cpe_test-${{ github.ref_name }}-macos-aarch64.tar.gz
+            release-assets/cpe_test-${{ github.ref_name }}-linux-x86_64.tar.gz
+            release-assets/SHA256SUMS
+
+      - name: Assert published Release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          expected=(
+            "SHA256SUMS"
+            "cpe_test-${tag}-linux-x86_64.tar.gz"
+            "cpe_test-${tag}-macos-aarch64.tar.gz"
+            "cpe_test-${tag}-windows-x86_64.zip"
+          )
+          mapfile -t remote < <(gh release view "${tag}" --json assets --jq '.assets[].name' | sort)
+          if [[ "${#remote[@]}" -ne "${#expected[@]}" ]]; then
+            printf 'published asset count mismatch; expected %s, got %s:\n' "${#expected[@]}" "${#remote[@]}" >&2
+            printf '  %s\n' "${remote[@]}" >&2
+            exit 1
+          fi
+          for asset in "${expected[@]}"; do
+            if ! printf '%s\n' "${remote[@]}" | grep -Fx -- "${asset}" >/dev/null; then
+              echo "published Release is missing expected asset: ${asset}" >&2
+              exit 1
+            fi
+          done
+
+          body="$(gh release view "${tag}" --json body --jq '.body')"
+          if [[ -z "${body//[[:space:]]/}" ]]; then
+            echo "published Release notes are empty" >&2
+            exit 1
+          fi
+
+          mkdir -p published-assets
+          gh release download "${tag}" --dir published-assets
+          mapfile -t downloaded < <(find published-assets -maxdepth 1 -type f -printf '%f\n' | sort)
+          if [[ "${#downloaded[@]}" -ne "${#expected[@]}" ]]; then
+            echo "downloaded published asset count mismatch" >&2
+            exit 1
+          fi
+          cmp release-assets/SHA256SUMS published-assets/SHA256SUMS
+          (
+            cd published-assets
+            sha256sum -c SHA256SUMS
+          )

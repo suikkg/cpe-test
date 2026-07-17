@@ -11,17 +11,19 @@ pub struct Config {
     pub agent_port: u16,
     /// 测试子网 IPv4 前缀过滤
     pub ipv4_prefixes: Vec<String>,
-    /// 跨机 iperf 要求两端同 /24（ping 不受限）
+    /// 跨机 iperf3/ctsTraffic 要求两端同 /24（历史字段名保持兼容；ping 不受限）
     pub require_same_subnet_for_iperf: bool,
     /// UDP 按整条路径的可信负载上限裁剪档位/流数。
     pub limit_udp_by_link_speed: bool,
-    /// 每个 iperf 任务结束后在接收端截图
+    /// 每个吞吐任务结束后在涉及端截图
     pub screenshot: bool,
     /// 24 小时内已 PASS 的任务跳过
     pub resume: bool,
     /// 测试完自动打开 HTML 报告
     pub open_report: bool,
     pub iperf: IperfCfg,
+    /// Windows 专用 ctsTraffic 后端的简化默认参数。
+    pub ctstraffic: CtsTrafficCfg,
     pub ping: PingCfg,
     /// 自动配对生成测试：字符串 "all" 或具体角色对列表
     #[serde(default)]
@@ -60,6 +62,7 @@ pub struct UniversalParams {
     pub ip: Vec<String>,
     #[serde(default = "default_streams")]
     pub streams: u32,
+    /// 历史字段名；当前供 iperf3 与 ctsTraffic 共用。
     #[serde(default)]
     pub iperf_duration: Option<u64>,
     #[serde(default)]
@@ -90,6 +93,7 @@ impl Default for Config {
             resume: false,
             open_report: true,
             iperf: IperfCfg::default(),
+            ctstraffic: CtsTrafficCfg::default(),
             ping: PingCfg::default(),
             pairs: None,
             universal_params: None,
@@ -100,8 +104,29 @@ impl Default for Config {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+pub struct CtsTrafficCfg {
+    /// ctsTraffic UDP MediaStream 每秒媒体帧数；每帧再拆成 datagram。
+    pub udp_frame_rate: u32,
+    /// UDP client 应用层缓冲深度（秒），不是 socket buffer。
+    pub udp_buffer_depth_secs: u32,
+    /// 控制台聚合状态输出周期（毫秒）。
+    pub status_update_ms: u32,
+}
+
+impl Default for CtsTrafficCfg {
+    fn default() -> Self {
+        Self {
+            udp_frame_rate: 100,
+            udp_buffer_depth_secs: 1,
+            status_update_ms: 1_000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct IperfCfg {
-    /// 全局默认灌包秒数
+    /// 两种吞吐后端共用的全局默认灌包秒数（历史上位于 iperf 节点）
     pub duration: u64,
     /// TCP window 档位
     pub tcp_windows: Vec<String>,
@@ -122,6 +147,7 @@ impl Default for IperfCfg {
                 UdpProfile {
                     bandwidth: "1000m".into(),
                     length: Some("64".into()),
+                    window: None,
                 },
                 UdpProfile::bw("2500m"),
             ],
@@ -172,6 +198,7 @@ pub struct RateCheckCfg {
     pub min_concurrent_streams: u32,
     pub min_active_ratio: f64,
     pub offered_headroom_pct: f64,
+    /// UDP 完整 server/client 额外尝试预算；单流/单连接每方向总尝试数至少为 3。
     pub flow_retries: u32,
     pub discovery_step_secs: u64,
     /// EVB 10GUSB/NCM -> 10GETH 的已知接收目标。
@@ -215,6 +242,9 @@ pub struct UdpProfile {
     pub bandwidth: String,
     #[serde(default)]
     pub length: Option<String>,
+    /// iperf3 UDP socket buffer（`-w`）；省略时保持旧配置行为。
+    #[serde(default)]
+    pub window: Option<String>,
 }
 
 impl UdpProfile {
@@ -222,6 +252,7 @@ impl UdpProfile {
         UdpProfile {
             bandwidth: b.into(),
             length: None,
+            window: None,
         }
     }
 
@@ -244,17 +275,25 @@ impl UdpProfile {
     }
 
     pub fn name(&self) -> String {
-        match &self.length {
-            Some(l) => format!("udp_b{}_l{}", self.bandwidth, l),
-            None => format!("udp_b{}", self.bandwidth),
+        let mut name = format!("udp_b{}", self.bandwidth);
+        if let Some(length) = &self.length {
+            name.push_str(&format!("_l{length}"));
         }
+        if let Some(window) = &self.window {
+            name.push_str(&format!("_w{window}"));
+        }
+        name
     }
 
     pub fn label(&self) -> String {
-        match &self.length {
-            Some(l) => format!("UDP -b {} -l {}", self.bandwidth, l),
-            None => format!("UDP -b {}", self.bandwidth),
+        let mut label = format!("UDP -b {}", self.bandwidth);
+        if let Some(length) = &self.length {
+            label.push_str(&format!(" -l {length}"));
         }
+        if let Some(window) = &self.window {
+            label.push_str(&format!(" -w {window}"));
+        }
+        label
     }
 }
 
@@ -285,7 +324,7 @@ pub struct TestSpec {
     /// "A->B" / "B->A" / "bidir" / "both"(旧值,展开为前两个)；可以是字符串或数组
     #[serde(default = "default_direction")]
     pub direction: OneOrMany,
-    /// ["iperf","ping"]
+    /// ["iperf","ctstraffic","ping"]，可任选或组合
     #[serde(default = "default_kinds")]
     pub kinds: Vec<String>,
     /// ["tcp","udp"]
@@ -296,6 +335,7 @@ pub struct TestSpec {
     pub ip: Vec<String>,
     #[serde(default = "default_streams")]
     pub streams: u32,
+    /// 历史字段名；当前供 iperf3 与 ctsTraffic 共用。
     #[serde(default)]
     pub iperf_duration: Option<u64>,
     #[serde(default)]
@@ -428,6 +468,7 @@ mod tests {
         assert_eq!(c.iperf.duration, 180);
         assert_eq!(c.iperf.tcp_windows, vec!["64k", "1m", "4m"]);
         assert_eq!(c.iperf.udp_profiles.len(), 5);
+        assert!(c.iperf.udp_profiles.iter().all(|p| p.window.is_none()));
         assert_eq!(c.ping.count, 100);
         assert_eq!(c.ping.payload_sizes, vec![32, 1600, 65500]);
         assert_eq!(c.iperf.rate_check.mode, RateMode::Auto);
@@ -476,8 +517,25 @@ mod tests {
         let p = UdpProfile {
             bandwidth: "1000m".into(),
             length: Some("64".into()),
+            window: Some("4m".into()),
         };
-        assert_eq!(p.label(), "UDP -b 1000m -l 64");
+        assert_eq!(p.name(), "udp_b1000m_l64_w4m");
+        assert_eq!(p.label(), "UDP -b 1000m -l 64 -w 4m");
+    }
+
+    #[test]
+    fn test_udp_profile_window_parse_is_backward_compatible() {
+        let legacy: UdpProfile = serde_json::from_str(r#"{"bandwidth":"500m"}"#).unwrap();
+        assert_eq!(legacy.bandwidth, "500m");
+        assert_eq!(legacy.length, None);
+        assert_eq!(legacy.window, None);
+
+        let configured: UdpProfile =
+            serde_json::from_str(r#"{"bandwidth":"1000m","length":"64","window":"4m"}"#).unwrap();
+        assert_eq!(configured.length.as_deref(), Some("64"));
+        assert_eq!(configured.window.as_deref(), Some("4m"));
+        assert_eq!(configured.name(), "udp_b1000m_l64_w4m");
+        assert_eq!(configured.label(), "UDP -b 1000m -l 64 -w 4m");
     }
 
     #[test]

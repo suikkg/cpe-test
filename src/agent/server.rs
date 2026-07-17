@@ -3,15 +3,19 @@
 //! 端点（全部 POST JSON，另有 GET /health）：
 //!   /info /ping /iperf/server/start /iperf/server/stop
 //!   /iperf/client/run（兼容） /iperf/client/start /status /stop
+//!   /ctstraffic/start /status /stop
 //!   /monitor/start /monitor/status /monitor/stop /resources/cleanup /screenshot /health
 //! 响应统一 {"ok":bool,"error":...,"data":{...}}，HTTP 状态恒 200。
 
+use crate::cmd::ctstraffic;
 use crate::cmd::iperf::{IperfClientJobMgr, IperfServerMgr};
 use crate::config::Config;
 use crate::nic::monitor::MonitorMgr;
 use crate::nic::scan_host;
 use crate::protocol::*;
-use crate::util::{find_iperf3, iperf3_version, now_hms, os_name};
+use crate::util::{
+    ctstraffic_version, find_ctstraffic, find_iperf3, iperf3_version, now_hms, os_name,
+};
 use crate::{ping, screenshot};
 use base64::Engine;
 use std::collections::hash_map::DefaultHasher;
@@ -136,6 +140,13 @@ pub fn run(port: u16, cfg: &Config) {
             "!! 警告: 未找到 iperf3。ping 可用，但灌包测试会失败。\n!!       请把 iperf3 可执行文件放到本程序同目录。"
         ),
     }
+    match ctstraffic_version() {
+        Some(version) => println!("ctsTraffic: {version}"),
+        None if cfg!(windows) => println!(
+            "!! 提示: 未找到 ctsTraffic.exe；iperf3/ping 仍可用，CTS 测试会被前置检查拦截。"
+        ),
+        None => println!("ctsTraffic: 当前平台不支持（仅 Windows 10+）"),
+    }
 
     // 展示本机所有网卡详情，方便小白抄给主控
     let all = scan_host(&[]);
@@ -235,16 +246,23 @@ fn handle(mut rq: Request, st: &Arc<AgentState>) {
 fn route(method: &Method, url: &str, body: &str, st: &Arc<AgentState>) -> String {
     let path = url.split('?').next().unwrap_or(url);
     match (method, path) {
-        (Method::Get, "/health") | (Method::Post, "/health") => ok_json(HealthOut {
-            hostname: crate::util::hostname(),
-            os: os_name(),
-            version: env!("CARGO_PKG_VERSION").into(),
-            iperf3: iperf3_version(),
-            capabilities: vec![
+        (Method::Get, "/health") | (Method::Post, "/health") => {
+            let mut capabilities = vec![
                 RELIABLE_LIFECYCLE_CAPABILITY.into(),
                 LIVE_NIC_PROGRESS_CAPABILITY.into(),
-            ],
-        }),
+            ];
+            if cfg!(windows) {
+                capabilities.push(CTS_TRAFFIC_CAPABILITY.into());
+            }
+            ok_json(HealthOut {
+                hostname: crate::util::hostname(),
+                os: os_name(),
+                version: env!("CARGO_PKG_VERSION").into(),
+                iperf3: iperf3_version(),
+                ctstraffic: ctstraffic_version(),
+                capabilities,
+            })
+        }
         (Method::Post, "/info") => {
             let req: InfoReq = match parse(body) {
                 Ok(r) => r,
@@ -363,8 +381,69 @@ fn route(method: &Method, url: &str, body: &str, st: &Arc<AgentState>) -> String
                 Duration::from_secs(req.wait_secs)
             };
             match st.clients.stop_checked(&req.id, wait) {
-                Ok(out) if out.terminated => ok_json(out),
+                Ok(mut out) if out.terminated => {
+                    // 常规 iperf client 已通过 status 取过完整结果；stop 响应不再
+                    // 重复传输可能很大的 interval 输出，但保留进程是否启动/回收
+                    // 等紧凑生命周期证据，供单流安全重试决定是否允许复用端口。
+                    // CTS server 的 stop 路由仍保留完整 result，用来审计另一端摘要。
+                    if let Some(result) = out.result.as_mut() {
+                        result.cmd.clear();
+                        result.output.clear();
+                    }
+                    ok_json(out)
+                }
                 Ok(_) => err_json("iperf3 client 停止后未确认退出"),
+                Err(e) => err_json(&e),
+            }
+        }
+        (Method::Post, "/ctstraffic/start") => {
+            let req: CtsTrafficStartReq = match parse(body) {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
+            if !cfg!(windows) {
+                return err_json("ctsTraffic 仅支持 Windows 10+，当前 agent 平台不支持");
+            }
+            let Some(bin) = find_ctstraffic() else {
+                return err_json(
+                    "辅测机未找到 ctsTraffic.exe，请把官方 x64 版本放到 agent 程序同目录或 PATH",
+                );
+            };
+            let owner_id = req.owner_id.clone();
+            match st.owner_lifecycle.with_start(&owner_id, || {
+                ctstraffic::start_managed_job(&st.clients, bin, req)
+            }) {
+                Ok(id) => {
+                    println!("    ctsTraffic 异步作业已创建/复用: {id}");
+                    let elapsed_ms = st.clients.elapsed_ms(&id).unwrap_or(0);
+                    ok_json(CtsTrafficStartOut { id, elapsed_ms })
+                }
+                Err(e) => err_json(&e),
+            }
+        }
+        (Method::Post, "/ctstraffic/status") => {
+            let req: CtsTrafficStatusReq = match parse(body) {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
+            match st.clients.status(&req.id, req.cursor) {
+                Ok(out) => ok_json(out),
+                Err(e) => err_json(&e),
+            }
+        }
+        (Method::Post, "/ctstraffic/stop") => {
+            let req: CtsTrafficStopReq = match parse(body) {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
+            let wait = if req.wait_secs == 0 {
+                Duration::from_secs(10)
+            } else {
+                Duration::from_secs(req.wait_secs)
+            };
+            match st.clients.stop_checked(&req.id, wait) {
+                Ok(out) if out.terminated => ok_json(out),
+                Ok(_) => err_json("ctsTraffic 作业停止后未确认退出"),
                 Err(e) => err_json(&e),
             }
         }
@@ -514,13 +593,24 @@ mod tests {
         let response = route(&Method::Get, "/health", "", &state);
         let health: Resp<HealthOut> = serde_json::from_str(&response).unwrap();
         assert!(health.ok);
-        let capabilities = health.data.unwrap().capabilities;
+        let health = health.data.unwrap();
+        let capabilities = &health.capabilities;
         assert!(capabilities
             .iter()
             .any(|capability| capability == RELIABLE_LIFECYCLE_CAPABILITY));
         assert!(capabilities
             .iter()
             .any(|capability| capability == LIVE_NIC_PROGRESS_CAPABILITY));
+        assert_eq!(
+            capabilities
+                .iter()
+                .any(|capability| capability == CTS_TRAFFIC_CAPABILITY),
+            cfg!(windows),
+            "CTS capability 只能由 Windows agent 声明"
+        );
+        if !cfg!(windows) {
+            assert_eq!(health.ctstraffic, None);
+        }
 
         let response = route(
             &Method::Post,
@@ -530,6 +620,20 @@ mod tests {
         );
         let parsed: Resp<MonitorStatusOut> = serde_json::from_str(&response).unwrap();
         assert!(!parsed.ok);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn ctstraffic_start_route_explicitly_rejects_non_windows_agents() {
+        let state = empty_state();
+        let body = serde_json::to_string(&CtsTrafficStartReq::default()).unwrap();
+        let response = route(&Method::Post, "/ctstraffic/start", &body, &state);
+        let parsed: Resp<CtsTrafficStartOut> = serde_json::from_str(&response).unwrap();
+
+        assert!(!parsed.ok);
+        let error = parsed.error.unwrap_or_default();
+        assert!(error.contains("仅支持 Windows 10+"));
+        assert!(error.contains("当前 agent 平台不支持"));
     }
 
     #[test]

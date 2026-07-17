@@ -1,6 +1,6 @@
-# UDP 并发灌包重构验收场景
+# UDP 单流与并发灌包重构验收场景
 
-本文用于验收 UDP 单流、多流和双向灌包重构。验收重点不是“命令能结束”，而是确认并发流真实建立、失败流正确重试、网卡 RX/TX 使用共同稳态窗口统计，以及环境异常不会被误判成 CPE 性能失败。
+本文用于验收 iperf3 与 ctsTraffic 的 UDP 单流、多流和双向灌包重构。验收重点不是“命令能结束”，而是确认工具流确实建立、单流硬门槛和失败重试符合规则、网卡 RX/TX 使用正确窗口统计，以及环境异常不会被误判成 CPE 性能失败。
 
 ## 一、验收前准备
 
@@ -8,6 +8,7 @@
 
 - 当前版本 `cpe_test`。
 - 兼容现网的 iperf3；Windows 旧版 3.1.x 也在支持范围内。
+- 验收 CTS 时，两台电脑均为 Windows 10+，并准备发布包固定版本的 `ctsTraffic.exe`。
 - 放通管理端口 28801 和测试端口 56000 起的端口段。
 - 主控与 agent 的系统时间不要求严格同步；时间线使用各自单调时钟和主控 offset。
 - 测试时保留 `master_日期时间.log`、HTML 报告和 `iperf_outputs/`。
@@ -39,28 +40,117 @@
 }
 ```
 
+`flow_retries` 虽位于历史兼容路径 `iperf.rate_check`，但本节所述 UDP 单流硬门槛同时适用于
+iperf3 和 CTS；两种后端每方向总尝试数都按 `max(flow_retries + 1, 3)` 计算。
+
 ## 二、结果口径
 
 | 结果 | 验收含义 |
 |------|----------|
 | `PASS` | 明确目标存在，发送负载、共同窗口、采样覆盖、RX 平均/P10和可选丢包均满足 |
-| `RATE_FAIL` | 测试搭建有效，但 RX 平均低于目标或 UDP 丢包超过限制 |
+| `RATE_FAIL` | 测试搭建有效，但 RX 低于目标、UDP 丢包/丢帧超限，或单流安全耗尽全部尝试后仍未灌通 |
 | `UNSTABLE` | RX 平均达到目标，但 5 秒滚动 P10 低于目标 |
 | `MEASURED` | 目标未知，完整测量实际能力，不作合格/不合格承诺 |
 | `NOT_EVALUATED` | 流数、offered load、有效窗口或采样覆盖不足，不能评价 CPE 性能 |
-| `SETUP_ERROR` | 没有流成功、server/client/地址/环境搭建失败 |
+| `SETUP_ERROR` | 平台、工具、参数、server/client 启停或状态查询、地址、显式取消、资源清理等环境搭建失败 |
 
 验收时必须同时检查：
 
 - HTML 的测试单元汇总行。
 - 每个方向的组合计行。
 - 流明细行及“流事件”原始输出。
-- 主控日志中的 `[灌包进度][UDP]`、`[UDP流重试]`、有效窗口和截图日志。
-- `iperf_outputs/iperf_raw_*.log` 的全部 client/server 重试原文，以及 `nic_samples_*.csv` 的 OS 网卡逐样本记录。
+- 主控日志中的 UDP 灌包进度、各方向 attempt/retry、有效窗口和截图日志。
+- `iperf_outputs/iperf_raw_*.log`、`ctstraffic_raw_*.log` 的全部 client/server attempt 原文，以及 `nic_samples_*.csv` 的 OS 网卡逐样本记录。
 
 报告通过率只按测试单元汇总行统计。20 条流明细加 1 个组合测试仍只能算 1 个测试单元，不能算 21 个。
 
+还必须区分两层证据：工具自身的 rate、bytes、frame/datagram 等输出负责证明“本轮流确实
+建立”，NIC 计数器负责验证“已建立流的接口实际吞吐是否达到目标”。背景 NIC 流量不能
+把没有工具测量的单流尝试变成成功，工具自报速率也不能替代 NIC 作为正式目标口径。
+
 ## 三、并发与失败流容错
+
+### U00A：iperf3 单向 1 流前两轮失败、第三轮灌通
+
+步骤：
+
+1. 配置单向 iperf3 UDP、`streams=1`，分别用 `flow_retries=0`、`1` 和大于 2 的值运行测试桩。
+2. 让前两轮完整 server/client 生命周期结束但没有 iperf3 rate/bytes/datagram 测量，第三轮返回有效工具测量。
+
+预期：
+
+- 每方向总尝试数严格为 `max(flow_retries + 1, 3)`；`0` 和 `1` 都至少执行 3 次，较大的配置值不得被压回 3 次。
+- 每轮使用新的 request ID，完整启动 server/client；上一轮停止、进程 `wait`、输出 reader 和端口清理均确认后才开始下一轮。
+- 前两轮原文不会被覆盖，第三轮灌通后停止继续重试；`retry_count=2`。
+- 最终判定只使用成功轮的测量和真实错误，不能把前两轮的无测量或错误文本合并后污染第三轮。
+
+### U00B：CTS UDP `Connections:1` 前两轮失败、第三轮灌通
+
+步骤：在 Windows 10+ 双机或确定性测试桩中配置单向 CTS UDP、`streams=1`，让前两轮无
+CTS rate/bytes/successful frames，第三轮产生有效 CTS 测量。
+
+预期：
+
+- 总尝试数同样是 `max(flow_retries + 1, 3)`，而不是只执行一次 CTS 进程。
+- 每轮完整启动 CTS server/client，并在清理确认后复用端口；各轮使用不同 request ID。
+- `ctstraffic_raw_*.log` 按 attempt 保留三轮命令、client/server 输出、事件和清理状态。
+- 只解析并使用最终灌通轮做 verdict，`retry_count=2`；前两轮错误不能污染成功轮。
+
+### U00C：单流三轮安全耗尽后硬失败
+
+步骤：分别对 iperf3 UDP 单流和 CTS UDP `Connections:1`，让所有预算内尝试都完整执行、
+清理确认，但始终没有所选工具自身的 rate、bytes、frame/datagram 证据。
+
+预期：
+
+- iperf3 返回 `RATE_FAIL / SINGLE_UDP_STREAM_FAILED`。
+- CTS 返回 `RATE_FAIL / CTSTRAFFIC_SINGLE_UDP_STREAM_FAILED`。
+- 两者都不能降级为 `NOT_EVALUATED / ACTIVE_STREAMS_LOW`，也不能因为“0 流”笼统改成 `SETUP_ERROR`。
+- 原因详情列出完整尝试数和最后一轮工具输出；该轮不写入 RESUME PASS。
+
+### U00D：双向每方向 1 流各自独立并行
+
+步骤：使用默认 `flow_retries=1` 配置 bidir，AB 与 BA 都只有 1 流；让 AB 第三轮成功，BA 三轮均无工具测量。
+
+预期：
+
+- AB、BA 各自拥有 `max(flow_retries + 1, 3)` 的完整预算，不能两方向合计只有三次。
+- 两腿并行执行，可在时间线上看到 AB/BA attempt 重叠；不能先把 AB 三轮全跑完才开始 BA。
+- AB 使用成功轮按真实性能判定；BA 为对应后端的单流硬失败。
+- 测试单元汇总不得被另一方向的普通 `NOT_EVALUATED` 掩盖硬失败；每方向 raw log 和 retry count 独立。
+
+### U00E：确定性环境或清理问题仍是 SetupError
+
+分别制造：平台不支持、缺少工具、非法参数、server/client 启动或状态查询失败、显式取消，
+以及 server/client stop、进程 `wait` 或输出 reader 清理无法确认。
+
+预期：
+
+- 均返回明确的 `SETUP_ERROR` 原因码，不得伪装为 `SINGLE_UDP_STREAM_FAILED` 或 `CTSTRAFFIC_SINGLE_UDP_STREAM_FAILED`。
+- 清理未确认时立即停止该方向后续尝试，不得猜测端口已释放，也不得在同端口启动新 request。
+- 已安全完成的 attempt 原文仍保留，单元末尾 owner cleanup 可继续补偿，但不能把未确认状态改写成性能失败。
+
+### U00F：背景 NIC 流量不能证明单流灌通
+
+步骤：在被测接收网卡上制造明显背景 RX，同时让 iperf3/CTS 单流三轮都没有任何工具自身
+rate、bytes、frame/datagram 测量。
+
+预期：
+
+- 即使 `nic-rx` 高于最低有效速率或目标，active stream 也不能凭 NIC 被补成 1。
+- 安全耗尽后仍分别产生两个后端的单流硬失败原因码。
+- NIC 样本完整保留用于排障，但原因详情应明确“背景网卡流量不能证明工具流建立”。
+
+### U00G：已有工具测量后按真实结果判定
+
+步骤：让第一轮已经产生有效工具测量，同时分别制造运行时错误、UDP 丢包/丢帧超限、RX
+低于目标三种结果。
+
+预期：
+
+- 不再为了争取更好结果继续单流连通重试。
+- 分别保留真实的 runtime error、loss high 或 RX below target verdict/reason。
+- 不得把已有测量的真实性能问题改写为“未灌通”，也不得用后续重试掩盖失败。
 
 ### U01：双向 5 流/2 流全部成功
 
@@ -268,9 +358,11 @@
 
 ### W04：背景流量扣除
 
-步骤：起流前制造稳定且可控的背景 RX/TX，开始 UDP 后保持背景流量不变。
+步骤：起流前制造稳定且可控的背景 RX/TX，开始 UDP 后保持背景流量不变；另做一次只有
+背景 NIC 流量、工具没有测量的单流对照。
 
-预期：报告统计扣除背景中位数；原始网卡总流量与报告业务流量差值接近背景值。背景变化剧烈时应通过 P10/覆盖率和原始样本排查。
+预期：已由工具证明起流时，报告统计扣除背景中位数；原始网卡总流量与报告业务流量差值
+接近背景值。只有背景流量时不得证明单流灌通。背景变化剧烈时应通过 P10/覆盖率和原始样本排查。
 
 ### W05：计数器回退或采样失败
 
@@ -289,7 +381,7 @@
 预期：
 
 - 活跃时长优先取 iperf 行内 `结束秒 - 开始秒`，示例按 175 秒而不是 180 秒，更不能按日志集中到达的几毫秒计算。
-- 该时间只用于裁剪网卡样本；正式 RX 平均/P10 仍来自接收网卡计数器，iperf3 自报速率只保留为诊断列。
+- 该时间只用于裁剪网卡样本；正式 RX 平均/P10 仍来自接收网卡计数器。iperf3 的 rate/bytes/datagram 输出可证明流已建立并保留为诊断列，但不替代 NIC 正式口径。
 - 无法解析可信 interval 时才回退到 Traffic/Connected/Started 事件；短测量不能被扩成完整 180 秒。
 
 ### W08：恢复样本不能伪造稳定窗口
@@ -300,24 +392,25 @@
 
 ### W09：失败重试前同步释放端口
 
-步骤：让某流首轮 client 或 server 启动失败，观察组级重试；再制造一次 server kill/wait 无法确认的测试桩结果。
+步骤：让某单流首轮完整执行但没有工具测量且能够安全清理，观察下一轮；再制造一次 server/client stop、kill/wait 或 reader 回收无法确认的测试桩结果。
 
 预期：
 
-- 正常失败路径先停止 client，再按本轮 request ID 精确停止 server；确认进程退出、wait 回收和 reader 结束后，才使用新 request ID 在同端口重试。
-- stop 未确认时禁止同端口继续重试，并在单元结果中出现资源清理错误；不能靠等待固定毫秒数猜测端口已经释放。
+- iperf3 与 CTS 的正常无测量路径都先停止 client，再按本轮 request ID 精确停止 server；确认进程退出、wait 回收和 reader 结束后，才使用新 request ID 在同端口重试。
+- stop 未确认时禁止同端口继续重试，并以 `SETUP_ERROR` 报告资源清理错误；不能靠等待固定毫秒数猜测端口已经释放，也不能计入“安全耗尽”。
 - 迟到的旧 request stop 不会杀死同端口的新 request。
 
 ### W10：响应丢失、owner 清理与旧 agent 门禁
 
-步骤：分别丢弃一次 server/client start 响应、重复发送同一请求；让测试单元 panic；再用不声明 `reliable_lifecycle_v1` 的旧 agent 运行包含 iperf 的任务。
+步骤：分别丢弃一次 server/client start 响应、重复发送同一请求；让测试单元 panic；再分别
+使用不声明 `reliable_lifecycle_v1` 或 `ctstraffic_v1` 的旧 agent 运行对应后端任务。
 
 预期：
 
 - 同一 request ID、相同参数只复用已有进程/作业并续租，不创建第二份；stop-before-start tombstone 阻止迟到 start 复活。
 - 单元正常结束、错误和 panic 后均按唯一 owner ID 清理 client → server → monitor；重复 cleanup 幂等，owner A 不影响 owner B。
 - 清理未确认产生 `RESOURCE_CLEANUP_FAILED`；单元 panic 产生 `UNIT_PANIC`，随后单元继续执行。
-- 旧 agent 在任何 iperf 进程启动前被主控明确拦截并提示升级；ping-only 任务仍可执行。
+- 旧 agent 在任何对应工具进程启动前被主控明确拦截并提示升级；仅阻断缺能力的后端，另一吞吐后端和 ping-only 任务仍可执行。
 
 ## 六、正式判定边界
 
@@ -371,7 +464,8 @@
 
 ### L02：失败流可回溯
 
-预期：每条流明细包含命令、client 输出、server 输出、结构化事件、重试次数和最终错误；组合行包含请求/活跃/要求流及原因码。
+预期：每条 iperf3 流和每个 CTS attempt 都包含命令、client 输出、server 输出、结构化事件、
+重试次数和最终错误；组合行包含请求/活跃/要求流及原因码。单流三轮不能覆盖前两轮原文。
 
 ### L03：截图成功
 
@@ -402,6 +496,13 @@ git diff --check
 
 自动化单元测试至少覆盖：
 
+- `flow_retries=0/1` 时两种后端单流仍有 3 次总尝试，较大配置按 `flow_retries+1` 扩展。
+- iperf3 单流和 CTS `Connections:1` 前两轮无测量、第三轮成功；parser/verdict 只使用成功轮。
+- 两种后端三轮安全无测量分别产生 `SINGLE_UDP_STREAM_FAILED` 和 `CTSTRAFFIC_SINGLE_UDP_STREAM_FAILED`。
+- 双向每方向 1 流各自拥有独立三轮预算并行执行，硬失败优先于另一腿普通 `NOT_EVALUATED`。
+- 平台、工具、非法参数、start/status、显式取消和清理未确认均保持 `SETUP_ERROR`，cleanup 不确定时禁止复用端口。
+- 背景 NIC 流量不能充当工具 rate/bytes/frame/datagram 证据；已有工具测量后按真实错误、丢包和目标判定，不继续重试掩盖结果。
+- CTS raw log 保留全部 attempt、最终 `retry_count=完整尝试数-1`，单流三轮的 estimate/lease 覆盖完整墙钟预算。
 - 2 条要求 2 条、5 条要求 4 条、20 条 EVB 目标要求 18 条。
 - 2 流失败的组级重试边界。
 - 5 流/2 流双向中，小方向只有 1 条时不能形成共同窗口。

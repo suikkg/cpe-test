@@ -1,4 +1,4 @@
-//! CPE 子网测试工具 — 单文件双模式（主控 / 辅测 agent）
+//! CPE 子网测试工具 — 主控 / 辅测 agent 双机自动化 Ping 与吞吐测试
 //!
 //! 用法:
 //!   cpe_test                     交互选择模式（小白直接双击）
@@ -167,7 +167,8 @@ fn real_main(args: Vec<String>) -> i32 {
             // 无参数：交互选择
             println!("==============================================");
             println!("  CPE 子网测试工具 v{}", env!("CARGO_PKG_VERSION"));
-            println!("  两台电脑之间自动化 ping / iperf3 灌包测试");
+            println!("  两台电脑之间自动化 Ping / iperf3 / ctsTraffic 测试");
+            println!("  ctsTraffic 仅支持 Windows 10+");
             println!("==============================================");
             println!("\n这台电脑是哪个角色?");
             println!("  [1] 主控（带键盘操作、发起测试的这台） *");
@@ -201,6 +202,10 @@ fn print_help() {
     println!(
         r#"CPE 子网测试工具 v{}
 
+吞吐后端:
+  iperf3                     跨平台通用测试
+  ctsTraffic                 仅 Windows 10+；两端需同版本程序和 ctsTraffic.exe
+
 用法:
   cpe_test                    交互模式（双击运行就是这个）
   cpe_test agent              辅测机启动常驻服务 (默认端口 28801)
@@ -225,7 +230,7 @@ fn print_help() {
   config.json                 配置文件（可选，同目录）
   report_*.html               测试报告
   task_results.json           结果库（RESUME 用）
-  iperf_outputs/              iperf 原文、NIC 逐样本 CSV、截图等附件
+  iperf_outputs/              iperf3/ctsTraffic 原文、NIC 逐样本 CSV、截图等附件
 "#,
         env!("CARGO_PKG_VERSION")
     );

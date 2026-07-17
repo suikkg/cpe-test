@@ -1,0 +1,18 @@
+官方 cpe_test v4.2.0 Windows Release ZIP 已自动捆绑 ctsTraffic.exe，普通用户不需要手工下载。
+
+本源码仓库不提交第三方二进制。如果你自行编译或手工组装 Windows 包，并要使用
+"kinds": ["ctstraffic"]，请把 64 位 ctsTraffic.exe 放到 cpe_test.exe 同目录。
+主控机和辅测机都需要同一份文件，并且都必须运行 Windows 10 或更高版本。
+
+固定上游版本：Microsoft ctsTraffic 2.0.4.0 x64
+固定上游 commit：4468b8085b6ac58c531596216f10e812287174ea
+上游仓库：https://github.com/microsoft/ctsTraffic
+文件路径：Releases/2.0.4.0/x64/ctsTraffic.exe
+SHA-256：9ac0f6a19da355343133f658c6e5d0dc40919f9a13020f86621194c31ce20b12
+许可证：Apache License 2.0（请同时保留发布包中的第三方许可和归属文件）
+
+Windows 可用下面命令核对：
+
+  certutil -hashfile ctsTraffic.exe SHA256
+
+哈希不一致时不要运行，也不要用来源不明的同名文件替换。

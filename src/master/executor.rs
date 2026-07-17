@@ -1,16 +1,18 @@
 //! 任务执行器：调度本地/远端的 ping、iperf、监控、截图，产出报告行
 
-use crate::cmd::iperf::{self, IperfServerMgr};
+use crate::cmd::ctstraffic;
+use crate::cmd::iperf::{self, IperfClientJobMgr, IperfServerMgr};
 use crate::config::{Config, RateCheckCfg, RateMode};
 use crate::http_client;
 use crate::master::builder::{
-    v6_addrs, IperfTask, Leg, LegKind, PingPurpose, PingTask, Side, Unit,
+    v6_addrs, CtsTrafficTask, IperfTask, Leg, LegKind, PingPurpose, PingTask, Side, Unit,
+    SINGLE_UDP_MIN_ATTEMPTS,
 };
 use crate::nic::monitor::{MonitorMgr, MIN_VALID_RX_MBPS};
 use crate::ping;
 use crate::protocol::*;
 use crate::report::{ExecutionStatus, Row, Verdict};
-use crate::util::{find_iperf3, logln, md5_hex, now_compact, now_full, sanitize};
+use crate::util::{find_ctstraffic, find_iperf3, logln, md5_hex, now_compact, now_full, sanitize};
 use base64::Engine;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -38,6 +40,7 @@ pub struct Ctx {
     pub cfg: Config,
     pub outdir: PathBuf,
     pub local_servers: IperfServerMgr,
+    pub local_cts_jobs: IperfClientJobMgr,
     pub local_monitors: MonitorMgr,
     pub rows: Mutex<Vec<Row>>,
     pub db: Mutex<ResultDb>,
@@ -113,12 +116,23 @@ fn unit_has_iperf(unit: &Unit) -> bool {
     })
 }
 
+fn unit_has_ctstraffic(unit: &Unit) -> bool {
+    unit.legs
+        .iter()
+        .any(|leg| matches!(&leg.kind, LegKind::CtsTraffic(_)))
+}
+
+fn unit_has_traffic(unit: &Unit) -> bool {
+    unit_has_iperf(unit) || unit_has_ctstraffic(unit)
+}
+
 fn unit_uses_agent_resources(unit: &Unit) -> bool {
     unit.legs.iter().any(|leg| match &leg.kind {
         LegKind::IperfSingle(task) => task.src.side == Side::Agent || task.dst.side == Side::Agent,
         LegKind::IperfGroup { streams, .. } => streams
             .iter()
             .any(|task| task.src.side == Side::Agent || task.dst.side == Side::Agent),
+        LegKind::CtsTraffic(task) => task.src.side == Side::Agent || task.dst.side == Side::Agent,
         LegKind::Ping(_) => false,
     })
 }
@@ -160,12 +174,12 @@ pub struct RunSummary {
     pub setup_error: usize,
     pub unstable: usize,
     pub skip: usize,
-    /// 本轮选择并处理的 iperf 测试单元数（包括被前置检查拦截的单元）。
-    pub iperf_units: usize,
-    /// 至少产生一项有效 iperf/NIC 速率测量的 iperf 单元数。
-    pub iperf_usable_units: usize,
-    /// 最终判为 SETUP_ERROR 的 iperf 单元数。
-    pub iperf_setup_errors: usize,
+    /// 本轮选择并处理的灌包单元数（iperf3 + ctsTraffic，包括前置拦截）。
+    pub traffic_units: usize,
+    /// 至少产生一项有效工具/NIC 速率测量的灌包单元数。
+    pub traffic_usable_units: usize,
+    /// 最终判为 SETUP_ERROR 的灌包单元数。
+    pub traffic_setup_errors: usize,
 }
 
 impl RunSummary {
@@ -177,15 +191,15 @@ impl RunSummary {
         self.setup_error += other.setup_error;
         self.unstable += other.unstable;
         self.skip += other.skip;
-        self.iperf_units += other.iperf_units;
-        self.iperf_usable_units += other.iperf_usable_units;
-        self.iperf_setup_errors += other.iperf_setup_errors;
+        self.traffic_units += other.traffic_units;
+        self.traffic_usable_units += other.traffic_usable_units;
+        self.traffic_setup_errors += other.traffic_setup_errors;
     }
 
-    /// 只要本轮确实选择了 iperf，但一项有效速率测量都没有，就需要追加
-    /// 子网 Ping 与网卡到网关 Ping，区分网络/载体异常和 iperf 搭建异常。
-    pub fn needs_iperf_failure_diagnostics(&self) -> bool {
-        self.iperf_units > 0 && self.iperf_usable_units == 0
+    /// 只要本轮确实选择了流量测试，但一项有效速率测量都没有，就需要追加
+    /// 子网 Ping 与网卡到网关 Ping，区分网络/载体异常和后端搭建异常。
+    pub fn needs_traffic_failure_diagnostics(&self) -> bool {
+        self.traffic_units > 0 && self.traffic_usable_units == 0
     }
 }
 
@@ -209,14 +223,16 @@ fn preflight_block_outcomes(unit: &Unit, block: &IperfPreflightBlock) -> Vec<Leg
         .legs
         .iter()
         .filter_map(|leg| match &leg.kind {
-            LegKind::IperfSingle(_) | LegKind::IperfGroup { .. } => Some(LegOutcome {
-                verdict: Verdict::SetupError,
-                reason_code: block.reason_code.clone(),
-                reason_detail: block.reason_detail.clone(),
-                rx_avg: None,
-                main_rows: Vec::new(),
-                tag: leg.tag.clone(),
-            }),
+            LegKind::IperfSingle(_) | LegKind::IperfGroup { .. } | LegKind::CtsTraffic(_) => {
+                Some(LegOutcome {
+                    verdict: Verdict::SetupError,
+                    reason_code: block.reason_code.clone(),
+                    reason_detail: block.reason_detail.clone(),
+                    rx_avg: None,
+                    main_rows: Vec::new(),
+                    tag: leg.tag.clone(),
+                })
+            }
             LegKind::Ping(_) => None,
         })
         .collect();
@@ -290,18 +306,26 @@ struct PreparedUdpFlow {
     client_req: Option<IperfClientReq>,
     server_error: String,
     launch_delay_ms: u64,
+    strict_single_stream: bool,
 }
 
 struct UdpFlowRun {
     leg_pos: usize,
     stream_pos: usize,
     task: IperfTask,
+    /// 本轮选中 attempt 是否有 iperf3 client/server 自身吞吐证据。
     raw_ok: bool,
+    /// 已有工具测量，但 client 非正常完成/超时；不能再伪装成“无测量”。
+    runtime_failed: bool,
     parsed: iperf::IperfParsed,
     client: IperfClientOut,
     server_output: String,
     events: Vec<IperfFlowEvent>,
     retries: usize,
+    /// 实际启动 client 的完整外层尝试次数（不含 iperf3 内部瞬态重试）。
+    full_attempts: usize,
+    /// 单流方向已在每次资源清理均确认的前提下耗尽强制尝试预算。
+    single_stream_exhausted: bool,
     error: String,
 }
 
@@ -328,6 +352,27 @@ struct EffectiveWindow {
     available_secs: f64,
     required_secs: u64,
     complete: bool,
+}
+
+struct CtsAttemptRun {
+    attempt: usize,
+    client: IperfClientOut,
+    server_output: String,
+    server_unexpected_failure: bool,
+    traffic_window: EffectiveWindow,
+    events: Vec<IperfFlowEvent>,
+    parsed: ctstraffic::CtsTrafficParsed,
+    traffic_established: bool,
+    full_attempt: bool,
+    cleanup_confirmed: bool,
+    setup_error: Option<(String, String)>,
+}
+
+struct CtsClientRun {
+    client: IperfClientOut,
+    started: bool,
+    cleanup_confirmed: bool,
+    setup_error: Option<(String, String)>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -468,6 +513,10 @@ impl Ctx {
                 errors.push(format!("主控 monitor {id} 清理失败: {e}"));
             }
         }
+        let cts_jobs = self
+            .local_cts_jobs
+            .stop_owner(owner_id, Duration::from_secs(RESOURCE_CLEANUP_WAIT_SECS));
+        errors.extend(cts_jobs.errors);
 
         if errors.is_empty() {
             Ok(())
@@ -584,6 +633,8 @@ impl Ctx {
                     return IperfClientOut {
                         ok: false,
                         timed_out: false,
+                        process_started: Some(false),
+                        cleanup_confirmed: Some(true),
                         cmd: String::new(),
                         output: "主控机未找到 iperf3，请把 iperf3 放到程序同目录".into(),
                         ..Default::default()
@@ -617,8 +668,11 @@ impl Ctx {
                     Ok(v) => v,
                     Err(e) => {
                         let cleanup = self.client_stop_confirmed(request_id);
+                        let cleanup_confirmed = cleanup.is_ok();
                         return IperfClientOut {
-                            cancelled: cleanup.is_err(),
+                            cancelled: !cleanup_confirmed,
+                            process_started: Some(false),
+                            cleanup_confirmed: Some(cleanup_confirmed),
                             output: format!(
                                 "(远端异步作业启动失败: {e}; 补偿清理: {})",
                                 cleanup
@@ -630,13 +684,22 @@ impl Ctx {
                     }
                 };
                 if !request_id.is_empty() && started.id != request_id {
-                    let _ = self.client_stop_confirmed(&started.id);
-                    let _ = self.client_stop_confirmed(request_id);
+                    let actual_cleanup = self.client_stop_confirmed(&started.id);
+                    let expected_cleanup = self.client_stop_confirmed(request_id);
+                    let cleanup_confirmed = actual_cleanup.is_ok() && expected_cleanup.is_ok();
                     return IperfClientOut {
                         cancelled: true,
+                        process_started: Some(false),
+                        cleanup_confirmed: Some(cleanup_confirmed),
                         output: format!(
-                            "远端 client 返回了非预期 job id：期望 {request_id}，实际 {}",
-                            started.id
+                            "远端 client 返回了非预期 job id：期望 {request_id}，实际 {}；实际 ID 清理={}；期望 ID 清理={}",
+                            started.id,
+                            actual_cleanup
+                                .map(|_| "已确认".to_string())
+                                .unwrap_or_else(|error| error),
+                            expected_cleanup
+                                .map(|_| "已确认".to_string())
+                                .unwrap_or_else(|error| error)
                         ),
                         ..Default::default()
                     };
@@ -652,8 +715,10 @@ impl Ctx {
                     std::time::Instant::now().checked_add(Duration::from_secs(max_remote_secs))
                 else {
                     let cleanup = self.client_stop_confirmed(&started.id);
+                    let cleanup_confirmed = cleanup.is_ok();
                     return IperfClientOut {
-                        cancelled: cleanup.is_err(),
+                        cancelled: !cleanup_confirmed,
+                        cleanup_confirmed: Some(cleanup_confirmed),
                         output: format!(
                             "远端 client duration={} 秒过大，无法建立等待截止时间；停止确认: {}",
                             req.duration,
@@ -666,16 +731,31 @@ impl Ctx {
                 loop {
                     if std::time::Instant::now() >= deadline {
                         let cleanup = self.client_stop_confirmed(&started.id);
-                        return IperfClientOut {
-                            timed_out: true,
-                            output: format!(
-                                "(远端异步作业 {} 超过 {} 秒仍未结束；停止确认: {})",
-                                started.id,
-                                max_remote_secs,
-                                cleanup.map(|_| "成功".to_string()).unwrap_or_else(|e| e)
-                            ),
-                            ..Default::default()
-                        };
+                        let cleanup_confirmed = cleanup.is_ok();
+                        let mut result = cleanup
+                            .as_ref()
+                            .ok()
+                            .and_then(|output| output.result.clone())
+                            .unwrap_or_default();
+                        let detail = format!(
+                            "(远端异步作业 {} 超过 {} 秒仍未结束；停止确认: {})",
+                            started.id,
+                            max_remote_secs,
+                            cleanup
+                                .as_ref()
+                                .map(|_| "成功".to_string())
+                                .unwrap_or_else(|error| error.clone())
+                        );
+                        result.ok = false;
+                        result.timed_out = true;
+                        result.cancelled = !cleanup_confirmed;
+                        result.cleanup_confirmed =
+                            Some(cleanup_confirmed && result.cleanup_confirmed == Some(true));
+                        if !result.output.is_empty() && !result.output.ends_with('\n') {
+                            result.output.push('\n');
+                        }
+                        result.output.push_str(&detail);
+                        return result;
                     }
                     let status: IperfClientStatusOut = match self.agent_post_reliable(
                         "/iperf/client/status",
@@ -688,16 +768,24 @@ impl Ctx {
                         Ok(v) => v,
                         Err(e) => {
                             let cleanup = self.client_stop_confirmed(&started.id);
-                            return IperfClientOut {
-                                cancelled: cleanup.is_err(),
-                                output: format!(
-                                    "(远端异步作业查询失败: {e}; 停止确认: {})",
-                                    cleanup
-                                        .map(|_| "成功".to_string())
-                                        .unwrap_or_else(|cleanup_error| cleanup_error)
-                                ),
-                                ..Default::default()
-                            };
+                            let cleanup_confirmed = cleanup.is_ok();
+                            let mut result = cleanup
+                                .as_ref()
+                                .ok()
+                                .and_then(|output| output.result.clone())
+                                .unwrap_or_default();
+                            result.ok = false;
+                            result.cancelled = !cleanup_confirmed;
+                            result.cleanup_confirmed =
+                                Some(cleanup_confirmed && result.cleanup_confirmed == Some(true));
+                            result.output = format!(
+                                "(远端异步作业查询失败: {e}; 停止确认: {})",
+                                cleanup
+                                    .as_ref()
+                                    .map(|_| "成功".to_string())
+                                    .unwrap_or_else(|cleanup_error| cleanup_error.clone())
+                            );
+                            return result;
                         }
                     };
                     cursor = status.next_cursor;
@@ -709,25 +797,312 @@ impl Ctx {
                         on_event(event);
                     }
                     if status.done {
-                        let mut result = status.result.unwrap_or_else(|| IperfClientOut {
-                            output: format!("(远端异步作业 {} 已结束但缺少结果)", started.id),
-                            ..Default::default()
-                        });
-                        if let Err(e) = self.client_stop_confirmed(&started.id) {
+                        let result_missing = status.result.is_none();
+                        let stop = self.client_stop_confirmed(&started.id);
+                        let mut result = status
+                            .result
+                            .or_else(|| stop.as_ref().ok().and_then(|output| output.result.clone()))
+                            .unwrap_or_default();
+                        if result_missing {
+                            result.ok = false;
+                            result.output =
+                                format!("(远端异步作业 {} 已结束但缺少结果)", started.id);
+                        }
+                        if let Err(e) = stop {
                             result.ok = false;
                             result.cancelled = true;
+                            result.cleanup_confirmed = Some(false);
                             if !result.output.ends_with('\n') && !result.output.is_empty() {
                                 result.output.push('\n');
                             }
                             result
                                 .output
                                 .push_str(&format!("远端 client 结束后清理未确认: {e}"));
+                        } else {
+                            result.cleanup_confirmed = Some(result.cleanup_confirmed == Some(true));
                         }
                         return result;
                     }
                     std::thread::sleep(Duration::from_millis(250));
                 }
             }
+        }
+    }
+
+    fn cts_job_start(
+        &self,
+        side: Side,
+        start: CtsTrafficStartReq,
+    ) -> Result<CtsTrafficStartOut, String> {
+        match side {
+            Side::Master => {
+                let bin = find_ctstraffic().ok_or_else(|| {
+                    if cfg!(windows) {
+                        "主控机未找到 ctsTraffic.exe，请放到程序同目录或 PATH".to_string()
+                    } else {
+                        "ctsTraffic 仅支持 Windows 10+，当前主控平台不支持".to_string()
+                    }
+                })?;
+                let id = ctstraffic::start_managed_job(&self.local_cts_jobs, bin, start)?;
+                let elapsed_ms = self.local_cts_jobs.elapsed_ms(&id).unwrap_or(0);
+                Ok(CtsTrafficStartOut { id, elapsed_ms })
+            }
+            Side::Agent => {
+                self.agent_post_reliable("/ctstraffic/start", &start, Duration::from_secs(20))
+            }
+        }
+    }
+
+    fn cts_job_status(
+        &self,
+        side: Side,
+        id: &str,
+        cursor: usize,
+    ) -> Result<CtsTrafficStatusOut, String> {
+        match side {
+            Side::Master => self.local_cts_jobs.status(id, cursor),
+            Side::Agent => self.agent_post_reliable(
+                "/ctstraffic/status",
+                &CtsTrafficStatusReq {
+                    id: id.to_string(),
+                    cursor,
+                },
+                Duration::from_secs(10),
+            ),
+        }
+    }
+
+    fn cts_job_stop_confirmed(&self, side: Side, id: &str) -> Result<CtsTrafficStopOut, String> {
+        let out = match side {
+            Side::Master => self
+                .local_cts_jobs
+                .stop_checked(id, Duration::from_secs(RESOURCE_CLEANUP_WAIT_SECS)),
+            Side::Agent => self.agent_post_reliable(
+                "/ctstraffic/stop",
+                &CtsTrafficStopReq {
+                    id: id.to_string(),
+                    wait_secs: RESOURCE_CLEANUP_WAIT_SECS,
+                },
+                Duration::from_secs(20),
+            ),
+        }?;
+        if out.terminated {
+            Ok(out)
+        } else {
+            Err(format!("ctsTraffic 作业 {id} 停止未确认"))
+        }
+    }
+
+    fn cts_client_run_tracked<F>(
+        &self,
+        side: Side,
+        start: CtsTrafficStartReq,
+        mut on_event: F,
+    ) -> CtsClientRun
+    where
+        F: FnMut(IperfFlowEvent),
+    {
+        let expected_id = start.request_id.clone();
+        let duration = start.request.duration_secs;
+        let start_call = Instant::now();
+        let started = match self.cts_job_start(side, start) {
+            Ok(value) => value,
+            Err(error) => {
+                let cleanup = if expected_id.is_empty() {
+                    Ok(CtsTrafficStopOut::default())
+                } else {
+                    self.cts_job_stop_confirmed(side, &expected_id)
+                };
+                let cleanup_confirmed = cleanup.is_ok();
+                let detail = format!(
+                    "ctsTraffic client 启动失败: {error}；补偿清理: {}",
+                    cleanup
+                        .map(|_| "已确认".to_string())
+                        .unwrap_or_else(|cleanup_error| cleanup_error)
+                );
+                return CtsClientRun {
+                    client: IperfClientOut {
+                        cancelled: !cleanup_confirmed,
+                        output: detail.clone(),
+                        ..Default::default()
+                    },
+                    started: false,
+                    cleanup_confirmed,
+                    setup_error: Some(("CTSTRAFFIC_CLIENT_START_FAILED".into(), detail)),
+                };
+            }
+        };
+        if !expected_id.is_empty() && started.id != expected_id {
+            let actual_cleanup = self.cts_job_stop_confirmed(side, &started.id);
+            let expected_cleanup = self.cts_job_stop_confirmed(side, &expected_id);
+            let cleanup_confirmed = actual_cleanup.is_ok() && expected_cleanup.is_ok();
+            let detail = format!(
+                "ctsTraffic 返回非预期 job id：期望 {expected_id}，实际 {}；实际 ID 清理={}；期望 ID 清理={}",
+                started.id,
+                actual_cleanup
+                    .map(|_| "已确认".to_string())
+                    .unwrap_or_else(|error| error),
+                expected_cleanup
+                    .map(|_| "已确认".to_string())
+                    .unwrap_or_else(|error| error)
+            );
+            return CtsClientRun {
+                client: IperfClientOut {
+                    cancelled: true,
+                    output: detail.clone(),
+                    ..Default::default()
+                },
+                started: false,
+                cleanup_confirmed,
+                setup_error: Some(("CTSTRAFFIC_CLIENT_JOB_ID_MISMATCH".into(), detail)),
+            };
+        }
+        let response_elapsed_ms = start_call.elapsed().as_millis() as u64;
+        let origin_ms = if started.elapsed_ms > 0 {
+            response_elapsed_ms.saturating_sub(started.elapsed_ms)
+        } else {
+            response_elapsed_ms / 2
+        };
+        let max_wait = duration.saturating_add(60);
+        let Some(deadline) = Instant::now().checked_add(Duration::from_secs(max_wait)) else {
+            let cleanup = self.cts_job_stop_confirmed(side, &started.id);
+            let cleanup_confirmed = cleanup.is_ok();
+            let detail = format!(
+                "ctsTraffic duration 过大，无法建立等待截止时间；停止确认: {}",
+                cleanup
+                    .map(|_| "成功".to_string())
+                    .unwrap_or_else(|error| error)
+            );
+            return CtsClientRun {
+                client: IperfClientOut {
+                    cancelled: !cleanup_confirmed,
+                    output: detail.clone(),
+                    ..Default::default()
+                },
+                started: true,
+                cleanup_confirmed,
+                setup_error: Some(("CTSTRAFFIC_CLIENT_WAIT_INVALID".into(), detail)),
+            };
+        };
+        let mut cursor = 0usize;
+        loop {
+            if Instant::now() >= deadline {
+                let cleanup = self.cts_job_stop_confirmed(side, &started.id);
+                let mut client = cleanup
+                    .as_ref()
+                    .ok()
+                    .and_then(|output| output.result.clone())
+                    .unwrap_or_default();
+                let process_started_confirmed = client.process_started == Some(true);
+                let process_cleanup_confirmed = client.cleanup_confirmed == Some(true);
+                let cleanup_confirmed = cleanup.is_ok() && process_cleanup_confirmed;
+                let detail = format!(
+                    "ctsTraffic client 超过 {} 秒仍未结束；停止确认: {}",
+                    max_wait,
+                    cleanup
+                        .as_ref()
+                        .map(|_| "成功".to_string())
+                        .unwrap_or_else(|error| error.clone())
+                );
+                client.ok = false;
+                client.timed_out = true;
+                // 这里的 cancel 是 controller 为回收超时进程主动发出的。只要
+                // 底层进程 wait/reap 与 job stop 都已确认，就保留 timed_out
+                // 而不标成“显式取消”，从而允许单流安全进入下一轮。
+                client.cancelled = !cleanup_confirmed;
+                if !client.output.is_empty() && !client.output.ends_with('\n') {
+                    client.output.push('\n');
+                }
+                client.output.push_str(&detail);
+                let setup_error = if cleanup.is_err() {
+                    Some(("CTSTRAFFIC_CLIENT_STOP_FAILED".into(), detail))
+                } else if !process_started_confirmed {
+                    Some((
+                        "CTSTRAFFIC_CLIENT_PROCESS_NOT_STARTED".into(),
+                        "ctsTraffic client 超时回收时未确认底层进程曾成功启动".into(),
+                    ))
+                } else if !process_cleanup_confirmed {
+                    Some((
+                        "CTSTRAFFIC_CLIENT_PROCESS_CLEANUP_UNCONFIRMED".into(),
+                        "ctsTraffic client 超时后未确认底层进程已 wait/reap".into(),
+                    ))
+                } else {
+                    None
+                };
+                return CtsClientRun {
+                    client,
+                    started: true,
+                    cleanup_confirmed,
+                    setup_error,
+                };
+            }
+            let status = match self.cts_job_status(side, &started.id, cursor) {
+                Ok(value) => value,
+                Err(error) => {
+                    let cleanup = self.cts_job_stop_confirmed(side, &started.id);
+                    let cleanup_confirmed = cleanup.is_ok();
+                    let detail = format!(
+                        "ctsTraffic client 状态查询失败: {error}；停止确认: {}",
+                        cleanup
+                            .map(|_| "成功".to_string())
+                            .unwrap_or_else(|cleanup_error| cleanup_error)
+                    );
+                    return CtsClientRun {
+                        client: IperfClientOut {
+                            cancelled: !cleanup_confirmed,
+                            output: detail.clone(),
+                            ..Default::default()
+                        },
+                        started: true,
+                        cleanup_confirmed,
+                        setup_error: Some(("CTSTRAFFIC_CLIENT_STATUS_FAILED".into(), detail)),
+                    };
+                }
+            };
+            cursor = status.next_cursor;
+            for mut event in status.events {
+                event.elapsed_ms = event.elapsed_ms.saturating_add(origin_ms);
+                on_event(event);
+            }
+            if status.done {
+                let result_missing = status.result.is_none();
+                let mut result = status.result.unwrap_or_else(|| IperfClientOut {
+                    output: "ctsTraffic client 已结束但缺少结果".into(),
+                    ..Default::default()
+                });
+                let cleanup = self.cts_job_stop_confirmed(side, &started.id);
+                let cleanup_confirmed = cleanup.is_ok();
+                if let Err(error) = cleanup {
+                    result.ok = false;
+                    result.cancelled = true;
+                    if !result.output.is_empty() && !result.output.ends_with('\n') {
+                        result.output.push('\n');
+                    }
+                    result
+                        .output
+                        .push_str(&format!("ctsTraffic client 清理未确认: {error}"));
+                }
+                let setup_error = if !cleanup_confirmed {
+                    Some((
+                        "CTSTRAFFIC_CLIENT_STOP_FAILED".into(),
+                        result.output.clone(),
+                    ))
+                } else if result_missing {
+                    Some((
+                        "CTSTRAFFIC_CLIENT_RESULT_MISSING".into(),
+                        result.output.clone(),
+                    ))
+                } else {
+                    cts_process_setup_error(&result)
+                };
+                return CtsClientRun {
+                    client: result,
+                    started: true,
+                    cleanup_confirmed,
+                    setup_error,
+                };
+            }
+            std::thread::sleep(Duration::from_millis(250));
         }
     }
 
@@ -1010,38 +1385,56 @@ impl Ctx {
         self.run_all_internal(units, sequence_offset, None)
     }
 
+    #[cfg(test)]
     pub fn run_all_with_preflight(
         &self,
         units: &[Unit],
         block: Option<&IperfPreflightBlock>,
     ) -> RunSummary {
-        self.run_all_internal(units, 0, block)
+        let blocks: HashMap<String, IperfPreflightBlock> = block
+            .map(|block| {
+                units
+                    .iter()
+                    .filter(|unit| unit_has_iperf(unit))
+                    .map(|unit| (unit.id.clone(), block.clone()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.run_all_internal(units, 0, Some(&blocks))
+    }
+
+    pub fn run_all_with_preflight_blocks(
+        &self,
+        units: &[Unit],
+        blocks: &HashMap<String, IperfPreflightBlock>,
+    ) -> RunSummary {
+        self.run_all_internal(units, 0, Some(blocks))
     }
 
     fn run_all_internal(
         &self,
         units: &[Unit],
         sequence_offset: usize,
-        iperf_block: Option<&IperfPreflightBlock>,
+        preflight_blocks: Option<&HashMap<String, IperfPreflightBlock>>,
     ) -> RunSummary {
         let mut sum = RunSummary::default();
         let total = units.len();
         for (i, unit) in units.iter().enumerate() {
             let useq = sequence_offset + i;
-            let is_iperf_unit = unit_has_iperf(unit);
-            if is_iperf_unit {
-                sum.iperf_units += 1;
+            let is_traffic_unit = unit_has_traffic(unit);
+            if is_traffic_unit {
+                sum.traffic_units += 1;
             }
-            let blocked = is_iperf_unit.then_some(()).and(iperf_block);
+            let blocked = preflight_blocks.and_then(|blocks| blocks.get(&unit.id));
             logln(&format!("\n[{}/{}] {}", i + 1, total, unit.title));
             if self.cfg.resume && blocked.is_none() {
                 let fresh = { self.db.lock().unwrap().fresh_pass(&unit.id) };
                 if let Some(t) = fresh {
                     logln(&format!("  已PASS，上次时间: {t}，跳过 (RESUME)"));
                     sum.skip += 1;
-                    if is_iperf_unit {
+                    if is_traffic_unit {
                         // 24 小时内已有 PASS 结果时，不因本轮 resume 跳过而重复触发故障诊断。
-                        sum.iperf_usable_units += 1;
+                        sum.traffic_usable_units += 1;
                     }
                     self.push_row(Row {
                         sort_key: (useq, 0, 0, 0),
@@ -1061,14 +1454,14 @@ impl Ctx {
 
             if let Some(block) = blocked {
                 logln(&format!(
-                    "  [iperf 前置检查拦截] {}: {}",
+                    "  [流量后端前置检查拦截] {}: {}",
                     block.reason_code, block.reason_detail
                 ));
             }
 
             let owner_id = unit_resource_owner(unit, useq);
             let lease_secs = unit_resource_lease_secs(unit);
-            let mut resource_guard = (is_iperf_unit && blocked.is_none()).then(|| {
+            let mut resource_guard = (is_traffic_unit && blocked.is_none()).then(|| {
                 UnitResourceGuard::new(self, owner_id.clone(), unit_uses_agent_resources(unit))
             });
             let outcomes = execute_unit_safely(
@@ -1137,12 +1530,12 @@ impl Ctx {
             }
 
             let unit_verdict = aggregate_unit_verdict(&outcomes);
-            if is_iperf_unit {
-                if blocked.is_none() && self.outcomes_have_usable_iperf_measurement(&outcomes) {
-                    sum.iperf_usable_units += 1;
+            if is_traffic_unit {
+                if blocked.is_none() && self.outcomes_have_usable_traffic_measurement(&outcomes) {
+                    sum.traffic_usable_units += 1;
                 }
                 if unit_verdict == Verdict::SetupError {
-                    sum.iperf_setup_errors += 1;
+                    sum.traffic_setup_errors += 1;
                 }
             }
             let unit_reason = outcome_matching_verdict(&outcomes, unit_verdict);
@@ -1211,19 +1604,19 @@ impl Ctx {
                 db.set(&unit.id, unit_ok, &unit.title);
                 db.save();
             }
-            if blocked.is_none() && is_iperf_unit {
+            if blocked.is_none() && is_traffic_unit {
                 std::thread::sleep(Duration::from_secs(1));
             }
         }
         sum
     }
 
-    fn outcomes_have_usable_iperf_measurement(&self, outcomes: &[LegOutcome]) -> bool {
+    fn outcomes_have_usable_traffic_measurement(&self, outcomes: &[LegOutcome]) -> bool {
         let rows = self.rows.lock().unwrap();
         outcomes.iter().any(|outcome| {
             outcome.main_rows.iter().any(|index| {
                 rows.get(*index)
-                    .map(row_has_usable_iperf_measurement)
+                    .map(row_has_usable_traffic_measurement)
                     .unwrap_or(false)
             })
         })
@@ -1241,6 +1634,17 @@ impl Ctx {
         match &leg.kind {
             LegKind::Ping(t) => self.run_ping_leg(useq, unit, lidx, &leg.tag, t),
             LegKind::IperfSingle(t) => self.run_iperf_single(
+                useq,
+                unit,
+                lidx,
+                &leg.tag,
+                t,
+                LifecycleLease {
+                    owner_id,
+                    lease_secs,
+                },
+            ),
+            LegKind::CtsTraffic(t) => self.run_ctstraffic_leg(
                 useq,
                 unit,
                 lidx,
@@ -1458,6 +1862,947 @@ impl Ctx {
         LegOutcome {
             verdict,
             reason_code,
+            reason_detail,
+            rx_avg: None,
+            main_rows: vec![idx],
+            tag: tag.to_string(),
+        }
+    }
+
+    // ---------------- ctsTraffic ----------------
+
+    fn build_cts_requests(
+        &self,
+        task: &CtsTrafficTask,
+    ) -> Result<(CtsTrafficReq, CtsTrafficReq), String> {
+        let (client_endpoint, server_endpoint) = if task.udp {
+            // ctsTraffic UDP 固定 server 发、client 收；数据方向仍保持 src -> dst。
+            (&task.dst, &task.src)
+        } else {
+            // TCP Push 固定 client 发、server 收。
+            (&task.src, &task.dst)
+        };
+        let (client_bind, client_target, server_bind) = if task.v6 {
+            let addrs = v6_addrs(&client_endpoint.nic, &server_endpoint.nic)
+                .ok_or_else(|| "ctsTraffic 两端缺少可用 IPv6 地址".to_string())?;
+            (
+                add_zone(
+                    &addrs.client_bind,
+                    &client_endpoint.nic.zone,
+                    client_endpoint.side,
+                ),
+                add_zone(
+                    &addrs.client_target,
+                    &client_endpoint.nic.zone,
+                    client_endpoint.side,
+                ),
+                add_zone(
+                    &addrs.server_bind,
+                    &server_endpoint.nic.zone,
+                    server_endpoint.side,
+                ),
+            )
+        } else {
+            (
+                client_endpoint.nic.ipv4.clone(),
+                server_endpoint.nic.ipv4.clone(),
+                server_endpoint.nic.ipv4.clone(),
+            )
+        };
+        let protocol = if task.udp {
+            CtsTrafficProtocol::Udp
+        } else {
+            CtsTrafficProtocol::Tcp
+        };
+        let common = CtsTrafficReq {
+            protocol,
+            port: task.port,
+            duration_secs: task.duration,
+            streams: task.streams,
+            window_bytes: task.window_bytes,
+            bits_per_second: task.bits_per_second,
+            datagram_bytes: task.datagram_bytes,
+            frame_rate: task.frame_rate,
+            buffer_depth_secs: task.buffer_depth_secs,
+            status_update_ms: task.status_update_ms,
+            ..Default::default()
+        };
+        Ok((
+            CtsTrafficReq {
+                role: CtsTrafficRole::Server,
+                bind_ip: server_bind,
+                ..common.clone()
+            },
+            CtsTrafficReq {
+                role: CtsTrafficRole::Client,
+                bind_ip: client_bind,
+                target_ip: client_target,
+                ..common
+            },
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn save_ctstraffic_raw_record(
+        &self,
+        owner_id: &str,
+        lidx: usize,
+        tag: &str,
+        task: &CtsTrafficTask,
+        server_cmd: &str,
+        attempts: &[CtsAttemptRun],
+        error: &str,
+    ) -> String {
+        let filename = format!(
+            "ctstraffic_raw_{}_l{:02}_{}_{}_p{}.log",
+            sanitize(owner_id),
+            lidx,
+            if task.udp { "udp" } else { "tcp" },
+            sanitize(if tag.is_empty() { "oneway" } else { tag }),
+            task.port
+        );
+        let selected = attempts
+            .iter()
+            .find(|attempt| attempt.traffic_established)
+            .or_else(|| attempts.last());
+        let contents = format!(
+            "# CPE ctsTraffic raw record\n\
+# saved_at,{}\n\
+# transport,{}\n\
+# profile,{}\n\
+# source,{} / {} / {}\n\
+# destination,{} / {} / {}\n\
+# port,{}\n\
+# duration_secs,{}\n\
+# requested_connections,{}\n\
+# attempts,{}\n\
+# client_ok,{}\n\
+# client_timed_out,{}\n\
+# client_cancelled,{}\n\
+# error,{}\n\
+\n{}",
+            now_full(),
+            if task.udp {
+                "UDP MediaStream"
+            } else {
+                "TCP Push"
+            },
+            task.profile_label,
+            task.src.side.cn(),
+            task.src.nic.name,
+            task.src.nic.ipv4,
+            task.dst.side.cn(),
+            task.dst.nic.name,
+            task.dst.nic.ipv4,
+            task.port,
+            task.duration,
+            task.streams,
+            attempts.len(),
+            selected.map(|attempt| attempt.client.ok).unwrap_or(false),
+            selected
+                .map(|attempt| attempt.client.timed_out)
+                .unwrap_or(false),
+            selected
+                .map(|attempt| attempt.client.cancelled)
+                .unwrap_or(false),
+            error.replace(['\r', '\n'], " "),
+            format_ctstraffic_attempts(server_cmd, attempts, error),
+        );
+        self.write_output_artifact(&filename, &contents, "ctsTraffic 原始记录")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_ctstraffic_attempt(
+        &self,
+        task: &CtsTrafficTask,
+        server_req: &CtsTrafficReq,
+        client_req: &CtsTrafficReq,
+        server_side: Side,
+        client_side: Side,
+        lifecycle: LifecycleLease<'_>,
+        attempt: usize,
+        monitor_started_at: &Instant,
+    ) -> CtsAttemptRun {
+        let protocol = if task.udp {
+            CtsTrafficProtocol::Udp
+        } else {
+            CtsTrafficProtocol::Tcp
+        };
+        let setup_failure = |server_output: String,
+                             cleanup_confirmed: bool,
+                             code: &str,
+                             detail: String| CtsAttemptRun {
+            attempt,
+            client: IperfClientOut {
+                cancelled: !cleanup_confirmed,
+                output: detail.clone(),
+                ..Default::default()
+            },
+            server_output,
+            server_unexpected_failure: false,
+            traffic_window: EffectiveWindow {
+                required_secs: task.duration,
+                ..Default::default()
+            },
+            events: Vec::new(),
+            parsed: ctstraffic::CtsTrafficParsed::default(),
+            traffic_established: false,
+            full_attempt: false,
+            cleanup_confirmed,
+            setup_error: Some((code.to_string(), detail)),
+        };
+
+        let server_request_id =
+            lifecycle_request_id(lifecycle.owner_id, "cts-server", task.port, attempt);
+        let server_started = match self.cts_job_start(
+            server_side,
+            CtsTrafficStartReq {
+                request: server_req.clone(),
+                request_id: server_request_id.clone(),
+                owner_id: lifecycle.owner_id.to_string(),
+                lease_secs: lifecycle.lease_secs,
+            },
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                let cleanup = self.cts_job_stop_confirmed(server_side, &server_request_id);
+                let cleanup_confirmed = cleanup.is_ok();
+                let detail = format!(
+                    "ctsTraffic server 启动失败: {error}；补偿清理: {}",
+                    cleanup
+                        .map(|_| "已确认".to_string())
+                        .unwrap_or_else(|cleanup_error| cleanup_error)
+                );
+                return setup_failure(
+                    detail.clone(),
+                    cleanup_confirmed,
+                    "CTSTRAFFIC_SERVER_START_FAILED",
+                    detail,
+                );
+            }
+        };
+        if server_started.id != server_request_id {
+            let actual_cleanup = self.cts_job_stop_confirmed(server_side, &server_started.id);
+            let expected_cleanup = self.cts_job_stop_confirmed(server_side, &server_request_id);
+            let cleanup_confirmed = actual_cleanup.is_ok() && expected_cleanup.is_ok();
+            let detail = format!(
+                "ctsTraffic server 返回非预期 job id：期望 {server_request_id}，实际 {}；实际 ID 清理={}；期望 ID 清理={}",
+                server_started.id,
+                actual_cleanup
+                    .map(|_| "已确认".to_string())
+                    .unwrap_or_else(|error| error),
+                expected_cleanup
+                    .map(|_| "已确认".to_string())
+                    .unwrap_or_else(|error| error)
+            );
+            return setup_failure(
+                detail.clone(),
+                cleanup_confirmed,
+                "CTSTRAFFIC_SERVER_JOB_ID_MISMATCH",
+                detail,
+            );
+        }
+
+        std::thread::sleep(Duration::from_millis(750));
+        match self.cts_job_status(server_side, &server_started.id, 0) {
+            Ok(status) if status.done => {
+                let result = status.result.unwrap_or_default();
+                let cleanup = self.cts_job_stop_confirmed(server_side, &server_started.id);
+                let cleanup_confirmed = cleanup.is_ok();
+                let detail = format!(
+                    "ctsTraffic server 在 client 启动前退出；停止确认: {}；输出: {}",
+                    cleanup
+                        .map(|_| "成功".to_string())
+                        .unwrap_or_else(|error| error),
+                    result.output.lines().last().unwrap_or_default()
+                );
+                return setup_failure(
+                    result.output,
+                    cleanup_confirmed,
+                    if cleanup_confirmed {
+                        "CTSTRAFFIC_SERVER_EXITED_EARLY"
+                    } else {
+                        "CTSTRAFFIC_SERVER_STOP_FAILED"
+                    },
+                    detail,
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                let cleanup = self.cts_job_stop_confirmed(server_side, &server_started.id);
+                let cleanup_confirmed = cleanup.is_ok();
+                let detail = format!(
+                    "ctsTraffic server 启动后状态查询失败: {error}；停止确认: {}",
+                    cleanup
+                        .map(|_| "成功".to_string())
+                        .unwrap_or_else(|cleanup_error| cleanup_error)
+                );
+                return setup_failure(
+                    detail.clone(),
+                    cleanup_confirmed,
+                    if cleanup_confirmed {
+                        "CTSTRAFFIC_SERVER_STATUS_FAILED"
+                    } else {
+                        "CTSTRAFFIC_SERVER_STOP_FAILED"
+                    },
+                    detail,
+                );
+            }
+        }
+
+        let traffic_start_ms = monitor_started_at
+            .elapsed()
+            .as_millis()
+            .min(u64::MAX as u128) as u64;
+        let mut events = Vec::<IperfFlowEvent>::new();
+        let client_run = self.cts_client_run_tracked(
+            client_side,
+            CtsTrafficStartReq {
+                request: client_req.clone(),
+                request_id: lifecycle_request_id(
+                    lifecycle.owner_id,
+                    "cts-client",
+                    task.port,
+                    attempt,
+                ),
+                owner_id: lifecycle.owner_id.to_string(),
+                lease_secs: lifecycle.lease_secs,
+            },
+            |mut event| {
+                event.elapsed_ms = event.elapsed_ms.saturating_add(traffic_start_ms);
+                events.push(event);
+            },
+        );
+        let traffic_end_ms = monitor_started_at
+            .elapsed()
+            .as_millis()
+            .min(u64::MAX as u128) as u64;
+        let server_stop = self.cts_job_stop_confirmed(server_side, &server_started.id);
+        let server_output = server_stop
+            .as_ref()
+            .ok()
+            .and_then(|output| output.result.as_ref())
+            .map(|result| result.output.clone())
+            .unwrap_or_else(|| {
+                server_stop
+                    .as_ref()
+                    .err()
+                    .map(|error| format!("ctsTraffic server 停止未确认: {error}"))
+                    .unwrap_or_default()
+            });
+        let server_unexpected_failure = server_stop.as_ref().ok().is_some_and(|output| {
+            output.was_done
+                && output
+                    .result
+                    .as_ref()
+                    .is_some_and(|result| !result.ok || result.timed_out || result.cancelled)
+        });
+        let combined_output = format!("{}\n{}", client_run.client.output, server_output);
+        let parsed = ctstraffic::parse_output(&combined_output, protocol);
+        let traffic_established = parsed.has_measurement(protocol);
+        let process_started_confirmed = client_run.client.process_started == Some(true);
+        let process_cleanup_confirmed = client_run.client.cleanup_confirmed == Some(true);
+        let (server_process_started_confirmed, server_process_cleanup_confirmed) =
+            cts_stop_process_evidence(&server_stop);
+        let cleanup_confirmed = client_run.cleanup_confirmed
+            && process_cleanup_confirmed
+            && server_stop.is_ok()
+            && server_process_cleanup_confirmed;
+        let setup_error = if let Err(error) = &server_stop {
+            Some((
+                "CTSTRAFFIC_SERVER_STOP_FAILED".into(),
+                format!("ctsTraffic server 停止未确认，禁止复用端口: {error}"),
+            ))
+        } else if client_run.setup_error.is_some() {
+            client_run.setup_error
+        } else if server_unexpected_failure {
+            Some((
+                "CTSTRAFFIC_SERVER_FAILED".into(),
+                server_stop
+                    .as_ref()
+                    .ok()
+                    .and_then(|output| output.result.as_ref())
+                    .and_then(|result| result.output.lines().last())
+                    .unwrap_or("ctsTraffic server 在停止请求前异常退出")
+                    .to_string(),
+            ))
+        } else if !server_process_started_confirmed {
+            Some((
+                "CTSTRAFFIC_SERVER_PROCESS_NOT_STARTED".into(),
+                "ctsTraffic server 未明确证明底层进程已成功启动（process_started != true）".into(),
+            ))
+        } else if !server_process_cleanup_confirmed {
+            Some((
+                "CTSTRAFFIC_SERVER_PROCESS_CLEANUP_UNCONFIRMED".into(),
+                "ctsTraffic server 未明确证明底层进程已 wait/reap（cleanup_confirmed != true）"
+                    .into(),
+            ))
+        } else if !process_started_confirmed {
+            Some((
+                "CTSTRAFFIC_CLIENT_PROCESS_NOT_STARTED".into(),
+                "ctsTraffic client 未明确证明底层进程已成功启动（process_started != true）".into(),
+            ))
+        } else if !process_cleanup_confirmed {
+            Some((
+                "CTSTRAFFIC_CLIENT_PROCESS_CLEANUP_UNCONFIRMED".into(),
+                "ctsTraffic client 未明确证明底层进程已 wait/reap（cleanup_confirmed != true）"
+                    .into(),
+            ))
+        } else {
+            None
+        };
+        let full_attempt = client_run.started
+            && process_started_confirmed
+            && process_cleanup_confirmed
+            && server_process_started_confirmed
+            && server_process_cleanup_confirmed
+            && cleanup_confirmed
+            && setup_error.is_none()
+            && !client_run.client.cancelled;
+
+        CtsAttemptRun {
+            attempt,
+            client: client_run.client,
+            server_output,
+            server_unexpected_failure,
+            traffic_window: EffectiveWindow {
+                start_ms: traffic_start_ms,
+                end_ms: traffic_end_ms.max(traffic_start_ms.saturating_add(1)),
+                available_secs: traffic_end_ms.saturating_sub(traffic_start_ms) as f64 / 1_000.0,
+                required_secs: task.duration,
+                complete: traffic_end_ms.saturating_sub(traffic_start_ms)
+                    >= task.duration.saturating_mul(1_000),
+            },
+            events,
+            parsed,
+            traffic_established,
+            full_attempt,
+            cleanup_confirmed,
+            setup_error,
+        }
+    }
+
+    fn run_ctstraffic_leg(
+        &self,
+        useq: usize,
+        unit: &Unit,
+        lidx: usize,
+        tag: &str,
+        task: &CtsTrafficTask,
+        lifecycle: LifecycleLease<'_>,
+    ) -> LegOutcome {
+        let time = now_full();
+        logln(&format!(
+            "  [ctsTraffic{}] {} {} -> {} 端口{} {}s...",
+            fmt_tag(tag),
+            task.profile_label,
+            task.src.brief(),
+            task.dst.brief(),
+            task.port,
+            task.duration
+        ));
+        let (server_req, client_req) = match self.build_cts_requests(task) {
+            Ok(value) => value,
+            Err(error) => {
+                return self.push_cts_setup_error_row(
+                    useq,
+                    unit,
+                    lidx,
+                    tag,
+                    task,
+                    time,
+                    "CTSTRAFFIC_ARGS_INVALID",
+                    error,
+                );
+            }
+        };
+        let (server_side, client_side) = if task.udp {
+            (task.src.side, task.dst.side)
+        } else {
+            (task.dst.side, task.src.side)
+        };
+        let server_args = match ctstraffic::build_args(&server_req) {
+            Ok(args) => args,
+            Err(error) => {
+                return self.push_cts_setup_error_row(
+                    useq,
+                    unit,
+                    lidx,
+                    tag,
+                    task,
+                    time,
+                    "CTSTRAFFIC_ARGS_INVALID",
+                    error,
+                );
+            }
+        };
+        let server_cmd = ctstraffic::command_string("ctsTraffic.exe", &server_args);
+        let strict_single_udp = task.udp && task.streams == 1;
+        let max_attempts = cts_attempt_budget(
+            self.cfg.iperf.rate_check.flow_retries as usize,
+            strict_single_udp,
+        );
+
+        // 记录 monitor 的本地近似零点，最终只统计 client 实际运行窗口，排除
+        // server 预热、轮间等待和停止清理时间。所有轮次共享这一时间轴，
+        // 因此最终可用选中轮的 EffectiveWindow 精确裁剪。
+        let monitor_started_at = Instant::now();
+        let mon_id = self
+            .mon_start(
+                task.dst.side,
+                &task.dst.nic.name,
+                lifecycle.owner_id,
+                lifecycle.lease_secs,
+            )
+            .ok();
+
+        let mut attempts = Vec::with_capacity(max_attempts);
+        for attempt in 0..max_attempts {
+            let run = self.run_ctstraffic_attempt(
+                task,
+                &server_req,
+                &client_req,
+                server_side,
+                client_side,
+                lifecycle,
+                attempt,
+                &monitor_started_at,
+            );
+            attempts.push(run);
+
+            if !cts_should_retry_after_last(&attempts, max_attempts, strict_single_udp) {
+                break;
+            }
+
+            let retry_no = attempt + 1;
+            if let Some(previous) = attempts.last_mut() {
+                previous.events.push(IperfFlowEvent {
+                    kind: IperfEventKind::Retry,
+                    elapsed_ms: monitor_started_at
+                        .elapsed()
+                        .as_millis()
+                        .min(u64::MAX as u128) as u64,
+                    mbps: None,
+                    line: format!(
+                        "ctsTraffic single UDP retry {retry_no}/{retries}",
+                        retries = max_attempts.saturating_sub(1)
+                    ),
+                });
+            }
+            logln(&format!(
+                "    [CTS UDP 单流重试] 第 {} 次完整尝试无工具测量，双端清理已确认，将重启 server/client（{retry_no}/{}）",
+                attempt + 1,
+                max_attempts.saturating_sub(1)
+            ));
+            std::thread::sleep(Duration::from_millis(500));
+        }
+
+        let mon_out = match mon_id.as_deref() {
+            Some(id) => match self.mon_stop(task.dst.side, id) {
+                Ok(output) => Some(output),
+                Err(error) => {
+                    logln(&format!("    (CTS 网卡监控停止失败: {error})"));
+                    None
+                }
+            },
+            None => None,
+        };
+        let Some(selected_idx) = select_cts_attempt_index(&attempts) else {
+            return self.push_cts_setup_error_row(
+                useq,
+                unit,
+                lidx,
+                tag,
+                task,
+                time,
+                "CTSTRAFFIC_INTERNAL_NO_ATTEMPT",
+                "ctsTraffic 执行器未产生任何尝试记录".into(),
+            );
+        };
+        let selected = &attempts[selected_idx];
+        let first_traffic_start_ms = attempts
+            .iter()
+            .find(|attempt| attempt.full_attempt)
+            .map(|attempt| attempt.traffic_window.start_ms)
+            .unwrap_or(selected.traffic_window.start_ms);
+        let rx_stats = mon_out
+            .as_ref()
+            .map(|output| {
+                monitor_rate_stats(
+                    output,
+                    &selected.traffic_window,
+                    true,
+                    first_traffic_start_ms,
+                )
+            })
+            .unwrap_or_default();
+        let rx_avg = rx_stats.avg_mbps.or_else(|| {
+            mon_out
+                .as_ref()
+                .filter(|output| output.samples.is_empty() && attempts.len() == 1)
+                .map(|output| output.avg_mbps)
+        });
+        let nic_samples = mon_out
+            .as_ref()
+            .map(|output| {
+                self.save_monitor_samples(
+                    lifecycle.owner_id,
+                    task.dst.side,
+                    &task.dst.nic.name,
+                    &task.dst.key(),
+                    output,
+                )
+            })
+            .unwrap_or_default();
+        let parsed = &selected.parsed;
+        let measurement = selected.traffic_established;
+        let runtime_errors = if !task.udp && parsed.time_limit_reached {
+            parsed.status_network_errors + parsed.status_protocol_errors
+        } else {
+            parsed.error_count()
+        };
+        let requested_streams = task.streams as usize;
+        let summary_streams = parsed
+            .successful_connections
+            .unwrap_or(0)
+            .min(task.streams as u64) as usize;
+        let active_streams = parsed
+            .max_active_streams
+            .max(summary_streams)
+            .max(usize::from(measurement && requested_streams == 1));
+        let per_stream_mbps = task
+            .bits_per_second
+            .map(|bits_per_second| bits_per_second as f64 / 1_000_000.0);
+        let required_streams = required_udp_streams(
+            requested_streams,
+            &self.cfg.iperf.rate_check,
+            task.rx_target_mbps,
+            per_stream_mbps,
+        );
+        let loss = task.udp.then_some(parsed.udp_dropped_pct).flatten();
+        let loss_limit = self.cfg.iperf.rate_check.max_udp_loss_pct;
+        let client_expected_completion = selected.client.ok
+            || (!task.udp && parsed.time_limit_reached && !selected.client.timed_out);
+        let full_attempts = cts_full_attempts(&attempts);
+        let single_stream_exhausted =
+            cts_single_udp_exhausted(&attempts, max_attempts, strict_single_udp);
+        let setup_error = attempts
+            .iter()
+            .find_map(|attempt| attempt.setup_error.clone())
+            .or_else(|| {
+                attempts
+                    .iter()
+                    .find(|attempt| !attempt.cleanup_confirmed)
+                    .map(|_| {
+                        (
+                            "CTSTRAFFIC_CLEANUP_FAILED".to_string(),
+                            "ctsTraffic server/client 清理未全部确认，禁止复用端口".to_string(),
+                        )
+                    })
+            })
+            .or_else(|| {
+                attempts
+                    .iter()
+                    .find(|attempt| attempt.client.cancelled)
+                    .map(|attempt| {
+                        (
+                            "CTSTRAFFIC_CLIENT_CANCELLED".to_string(),
+                            attempt
+                                .client
+                                .output
+                                .lines()
+                                .last()
+                                .unwrap_or("ctsTraffic client 被取消")
+                                .to_string(),
+                        )
+                    })
+            })
+            .or_else(|| {
+                attempts
+                    .iter()
+                    .find(|attempt| attempt.server_unexpected_failure)
+                    .map(|attempt| {
+                        (
+                            "CTSTRAFFIC_SERVER_FAILED".to_string(),
+                            attempt
+                                .server_output
+                                .lines()
+                                .last()
+                                .unwrap_or("ctsTraffic server 在停止请求前异常退出")
+                                .to_string(),
+                        )
+                    })
+            });
+        let (verdict, reason_code, reason_detail) = if let Some((code, detail)) = setup_error {
+            (Verdict::SetupError, code, detail)
+        } else if single_stream_exhausted {
+            (
+                Verdict::RateFail,
+                "CTSTRAFFIC_SINGLE_UDP_STREAM_FAILED".to_string(),
+                format!(
+                    "CTS 单流 UDP 在 {full_attempts} 次完整 server/client 尝试且每轮双端清理均确认后，仍无 ctsTraffic 自身 rate/bytes/successful frames 测量；该方向必须灌通"
+                ),
+            )
+        } else if !measurement && (selected.client.timed_out || selected.client.cancelled) {
+            (
+                Verdict::SetupError,
+                "CTSTRAFFIC_CLIENT_ABORTED".to_string(),
+                selected
+                    .client
+                    .output
+                    .lines()
+                    .last()
+                    .unwrap_or_default()
+                    .to_string(),
+            )
+        } else if !measurement {
+            (
+                Verdict::SetupError,
+                "CTSTRAFFIC_NO_MEASUREMENT".to_string(),
+                selected
+                    .client
+                    .output
+                    .lines()
+                    .last()
+                    .unwrap_or("没有吞吐测量")
+                    .to_string(),
+            )
+        } else if let Some(detail) =
+            cts_runtime_failure_detail(&selected.client, runtime_errors, client_expected_completion)
+        {
+            (
+                Verdict::RateFail,
+                "CTSTRAFFIC_RUNTIME_ERRORS".to_string(),
+                detail,
+            )
+        } else if required_streams > requested_streams {
+            (
+                Verdict::NotEvaluated,
+                "CONFIGURED_LOAD_TOO_LOW".to_string(),
+                format!(
+                    "目标与余量要求至少 {required_streams} 条流，但只配置了 {requested_streams} 条"
+                ),
+            )
+        } else if active_streams < required_streams {
+            (
+                Verdict::NotEvaluated,
+                "ACTIVE_STREAMS_LOW".to_string(),
+                format!(
+                    "ctsTraffic 最多观测到 {active_streams}/{requested_streams} 条活跃连接，正式判定至少需要 {required_streams} 条"
+                ),
+            )
+        } else if task.udp && loss_limit.is_some() && loss.is_none() {
+            (
+                Verdict::NotEvaluated,
+                "CTSTRAFFIC_UDP_LOSS_DATA_MISSING".to_string(),
+                "已配置 UDP 丢帧门槛，但 ctsTraffic 输出缺少 dropped frames 数据".into(),
+            )
+        } else if task.udp
+            && loss_limit
+                .zip(loss)
+                .is_some_and(|(limit, actual)| actual > limit)
+        {
+            (
+                Verdict::RateFail,
+                "CTSTRAFFIC_UDP_LOSS_HIGH".to_string(),
+                format!(
+                    "CTS UDP 丢帧率 {:.3}% 超过限制 {:.3}%",
+                    loss.unwrap_or_default(),
+                    loss_limit.unwrap_or_default()
+                ),
+            )
+        } else if task.rx_target_mbps.is_none() && task.rate_mode == RateMode::Verify {
+            (
+                Verdict::NotEvaluated,
+                "TARGET_MISSING".to_string(),
+                "verify 模式必须配置 rate_targets_mbps，当前路径也没有自动目标".into(),
+            )
+        } else if task.rx_target_mbps.is_none() {
+            (
+                Verdict::Measured,
+                "TARGET_UNKNOWN".to_string(),
+                "ctsTraffic 已完成测量；未配置可信目标，因此不伪造 PASS/FAIL".into(),
+            )
+        } else if rx_stats.coverage < MIN_RATE_SAMPLE_COVERAGE {
+            (
+                Verdict::NotEvaluated,
+                "SAMPLE_COVERAGE_LOW".to_string(),
+                format!(
+                    "CTS client 实际运行窗口内的接收端网卡采样覆盖率 {:.1}%，低于 {:.1}%",
+                    rx_stats.coverage * 100.0,
+                    MIN_RATE_SAMPLE_COVERAGE * 100.0
+                ),
+            )
+        } else if rx_avg
+            .zip(task.rx_target_mbps)
+            .is_some_and(|(actual, target)| actual >= target)
+        {
+            (Verdict::Pass, String::new(), String::new())
+        } else if rx_avg.is_none() {
+            (
+                Verdict::NotEvaluated,
+                "NIC_RATE_MISSING".to_string(),
+                "缺少接收端 OS 网卡速率，不能验证目标".into(),
+            )
+        } else {
+            (
+                Verdict::RateFail,
+                "RX_BELOW_TARGET".to_string(),
+                format!(
+                    "RX平均 {} 低于目标 {}",
+                    fmt_opt(rx_avg),
+                    fmt_opt(task.rx_target_mbps)
+                ),
+            )
+        };
+        let raw_error = if reason_code.is_empty() {
+            String::new()
+        } else {
+            reason_detail.clone()
+        };
+        let raw_log = self.save_ctstraffic_raw_record(
+            lifecycle.owner_id,
+            lidx,
+            tag,
+            task,
+            &server_cmd,
+            &attempts,
+            &raw_error,
+        );
+        let (screenshot_master, screenshot_agent) = if self.cfg.screenshot {
+            self.take_screenshots(
+                &[task.dst.side, task.src.side],
+                &format!("{}_{}", unit.title, tag),
+            )
+        } else {
+            (String::new(), String::new())
+        };
+        logln(&format!(
+            "    结果: {} CTS自报发送={} 接收={} 网卡实测={} 活跃流={}/{}",
+            verdict.label(),
+            fmt_opt(parsed.send_mbps),
+            fmt_opt(parsed.recv_mbps),
+            fmt_opt(rx_avg),
+            active_streams,
+            task.streams
+        ));
+        let idx = self.push_row(Row {
+            sort_key: (useq, lidx, 0, 0),
+            time,
+            task_id: md5_hex(&format!("{}|{}|ctstraffic", unit.id, tag)),
+            parent_id: unit.id.clone(),
+            task: unit.title.clone(),
+            ip: if task.v6 { "V6".into() } else { "V4".into() },
+            transport: if task.udp {
+                "CTS/UDP".into()
+            } else {
+                "CTS/TCP".into()
+            },
+            param: task.profile_label.clone(),
+            src_pc: task.src.pc.clone(),
+            src_iface: task.src.nic.name.clone(),
+            src_ip: task.src.nic.ipv4.clone(),
+            dst_pc: task.dst.pc.clone(),
+            dst_iface: task.dst.nic.name.clone(),
+            dst_ip: task.dst.nic.ipv4.clone(),
+            verdict,
+            execution_status: if verdict == Verdict::SetupError {
+                if selected.client.cancelled {
+                    ExecutionStatus::Cancelled
+                } else if selected.client.timed_out {
+                    ExecutionStatus::TimedOut
+                } else {
+                    ExecutionStatus::Error
+                }
+            } else if verdict == Verdict::NotEvaluated {
+                ExecutionStatus::Partial
+            } else {
+                ExecutionStatus::Completed
+            },
+            reason_code: reason_code.clone(),
+            reason_detail: reason_detail.clone(),
+            kind_label: if unit.bidir {
+                format!("★★双向 CTS Traffic-{tag}")
+            } else {
+                "CTS Traffic 灌包".into()
+            },
+            rx_avg,
+            tx_mbps: parsed.send_mbps,
+            rx_mbps: parsed.recv_mbps,
+            udp_loss: loss,
+            command: selected.client.cmd.clone(),
+            raw_log,
+            nic_samples,
+            requested_streams,
+            active_streams,
+            required_streams,
+            retry_count: cts_retry_count(&attempts),
+            target_mbps: task.rx_target_mbps,
+            rx_p10: rx_stats.p10_mbps,
+            effective_seconds: Some(selected.traffic_window.available_secs),
+            required_seconds: Some(task.duration as f64),
+            sample_coverage: Some(rx_stats.coverage),
+            screenshot_master,
+            screenshot_agent,
+            raws: vec![(
+                format!("ctsTraffic{} 全部尝试输出", fmt_tag(tag)),
+                format_ctstraffic_attempts(&server_cmd, &attempts, &raw_error),
+            )],
+            ..Default::default()
+        });
+        LegOutcome {
+            verdict,
+            reason_code,
+            reason_detail,
+            rx_avg,
+            main_rows: vec![idx],
+            tag: tag.to_string(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_cts_setup_error_row(
+        &self,
+        useq: usize,
+        unit: &Unit,
+        lidx: usize,
+        tag: &str,
+        task: &CtsTrafficTask,
+        time: String,
+        reason_code: &str,
+        reason_detail: String,
+    ) -> LegOutcome {
+        let idx = self.push_row(Row {
+            sort_key: (useq, lidx, 0, 0),
+            time,
+            task_id: md5_hex(&format!("{}|{}|ctstraffic", unit.id, tag)),
+            parent_id: unit.id.clone(),
+            task: unit.title.clone(),
+            ip: if task.v6 { "V6".into() } else { "V4".into() },
+            transport: if task.udp {
+                "CTS/UDP".into()
+            } else {
+                "CTS/TCP".into()
+            },
+            param: task.profile_label.clone(),
+            src_pc: task.src.pc.clone(),
+            src_iface: task.src.nic.name.clone(),
+            src_ip: task.src.nic.ipv4.clone(),
+            dst_pc: task.dst.pc.clone(),
+            dst_iface: task.dst.nic.name.clone(),
+            dst_ip: task.dst.nic.ipv4.clone(),
+            verdict: Verdict::SetupError,
+            execution_status: ExecutionStatus::Error,
+            reason_code: reason_code.into(),
+            reason_detail: reason_detail.clone(),
+            kind_label: "CTS Traffic 灌包".into(),
+            requested_streams: task.streams as usize,
+            raws: vec![("ctsTraffic 启动错误".into(), reason_detail.clone())],
+            ..Default::default()
+        });
+        LegOutcome {
+            verdict: Verdict::SetupError,
+            reason_code: reason_code.into(),
             reason_detail,
             rx_avg: None,
             main_rows: vec![idx],
@@ -1827,9 +3172,10 @@ impl Ctx {
         &self,
         task: &IperfTask,
         base_req: &IperfServerStartReq,
+        max_retries: usize,
     ) -> Result<IperfServerStartReq, String> {
         let mut errors = Vec::new();
-        for attempt in 0..=UDP_SERVER_START_RETRIES {
+        for attempt in 0..=max_retries {
             let mut req = base_req.clone();
             if attempt > 0 {
                 req.request_id = format!("{}-start{attempt}", base_req.request_id);
@@ -1838,7 +3184,7 @@ impl Ctx {
                 Ok(_) => return Ok(req),
                 Err(e) => {
                     errors.push(format!("第{}次: {e}", attempt + 1));
-                    if attempt < UDP_SERVER_START_RETRIES {
+                    if attempt < max_retries {
                         // server_start 的各实现本身会做失败补偿；这里再用同一
                         // request_id 做一次幂等确认，作为“允许占用同端口的新
                         // request 开始”的硬门槛。无法确认退出时绝不盲目重试。
@@ -1883,6 +3229,7 @@ impl Ctx {
                 stream_pos: prepared.stream_pos,
                 task: prepared.task,
                 raw_ok: false,
+                runtime_failed: false,
                 parsed: iperf::IperfParsed::default(),
                 client: IperfClientOut {
                     output: prepared.server_error.clone(),
@@ -1891,6 +3238,8 @@ impl Ctx {
                 server_output: String::new(),
                 events: vec![],
                 retries: 0,
+                full_attempts: 0,
+                single_stream_exhausted: false,
                 error: prepared.server_error,
             };
         }
@@ -1904,10 +3253,17 @@ impl Ctx {
         let mut final_client = IperfClientOut::default();
         let mut final_parsed = iperf::IperfParsed::default();
         let mut final_ok = false;
+        let mut final_runtime_failed = false;
         let mut retries = 0usize;
+        let mut full_attempts = 0usize;
+        let mut cleanup_confirmed = false;
+        let mut setup_error_seen = false;
         let mut final_error = String::new();
 
-        let max_flow_retries = self.cfg.iperf.rate_check.flow_retries as usize;
+        let max_flow_retries = effective_udp_retries(
+            self.cfg.iperf.rate_check.flow_retries as usize,
+            prepared.strict_single_stream,
+        );
         let retry_cutoff =
             Duration::from_secs(self.cfg.iperf.rate_check.startup_timeout_secs.max(1));
         for attempt in 0..=max_flow_retries {
@@ -1937,18 +3293,12 @@ impl Ctx {
                     attempt_events.push(event);
                 },
             );
-            let parsed = iperf::parse_output(&client.output);
-            let raw_ok =
-                client.ok && !client.timed_out && !client.cancelled && parsed.has_measurement();
-
             all_events.extend(attempt_events);
             all_client_output.push(format!(
-                "=== group attempt {} ===\n{}",
+                "=== attempt {} ===\n{}",
                 attempt + 1,
                 client.output
             ));
-            final_client = client;
-            final_parsed = parsed;
             let stop = self.server_stop_confirmed(
                 prepared.task.dst.side,
                 prepared.task.port,
@@ -1959,13 +3309,58 @@ impl Ctx {
                 Ok(out) => (out.output, true),
                 Err(e) => (format!("server 停止未确认: {e}"), false),
             };
-            final_ok = raw_ok && stop_ok;
+            let parsed = iperf::parse_output(&format!("{}\n{}", client.output, server_out));
+            let tool_measurement = parsed.has_measurement();
+            let client_setup_error = iperf_client_setup_error(&client);
+            let process_started = client.process_started == Some(true);
+            let client_cleanup_confirmed = client.cleanup_confirmed == Some(true);
+            let safe_full_attempt = process_started
+                && client_cleanup_confirmed
+                && stop_ok
+                && client_setup_error.is_none()
+                && !client.cancelled;
+            if safe_full_attempt {
+                full_attempts += 1;
+            }
+            cleanup_confirmed = stop_ok && client_cleanup_confirmed;
+            final_ok = tool_measurement && safe_full_attempt;
+            final_runtime_failed = final_ok && (!client.ok || client.timed_out);
+            final_client = client;
+            final_parsed = parsed;
             all_server_output.push(format!("=== attempt {} ===\n{}", attempt + 1, server_out));
             if !stop_ok {
+                setup_error_seen = true;
                 final_error = "server 停止未确认，禁止在同端口继续重试".into();
                 break;
             }
-            if final_ok {
+            if let Some(error) = client_setup_error {
+                setup_error_seen = true;
+                final_error = error;
+                break;
+            }
+            if !process_started {
+                setup_error_seen = true;
+                final_error = "client 未明确证明底层进程已成功启动".into();
+                break;
+            }
+            if !client_cleanup_confirmed {
+                setup_error_seen = true;
+                final_error = "client 未明确证明底层进程已 wait/reap，禁止复用端口".into();
+                break;
+            }
+            // 只要本轮已有 iperf3 自身测量，就已经证明该方向灌通；后续由
+            // runtime/loss/目标判定真实结果，不能继续重试并声称“无测量”。
+            if tool_measurement {
+                final_error = if final_runtime_failed {
+                    final_client
+                        .output
+                        .lines()
+                        .find(|line| line.to_ascii_lowercase().contains("error"))
+                        .unwrap_or("iperf3 已有吞吐测量，但 client 未正常完成")
+                        .to_string()
+                } else {
+                    String::new()
+                };
                 break;
             }
 
@@ -1984,13 +3379,20 @@ impl Ctx {
                     .to_string()
             };
 
-            let retryable = should_retry_udp_flow(
-                attempt,
-                max_flow_retries,
-                attempt_started.elapsed(),
-                retry_cutoff,
-                &final_client,
-            );
+            let retryable = if prepared.strict_single_stream {
+                // 单流硬门槛必须完成至少三次安全尝试；不受普通 startup
+                // 截止或单次命令超时影响。显式取消/清理不确定时仍立即停下。
+                attempt < max_flow_retries && safe_full_attempt
+            } else {
+                safe_full_attempt
+                    && should_retry_udp_flow(
+                        attempt,
+                        max_flow_retries,
+                        attempt_started.elapsed(),
+                        retry_cutoff,
+                        &final_client,
+                    )
+            };
             if !retryable {
                 break;
             }
@@ -2006,7 +3408,7 @@ impl Ctx {
                 state.connected = false;
             }
             logln(&format!(
-                "    [UDP流重试] {}-#{} 首轮未跑通，重新启动 server/client（{}/{}）",
+                "    [UDP流重试] {}-#{} 本轮未跑通，重新启动 server/client（{}/{}）",
                 if prepared.task.stream_idx == 0 && prepared.stream_pos == 0 {
                     "流"
                 } else {
@@ -2029,7 +3431,10 @@ impl Ctx {
                 prepared.task.port,
                 attempt + 1,
             );
-            match self.start_udp_server_with_retry(&prepared.task, &next_server_req) {
+            let server_retries =
+                effective_udp_retries(UDP_SERVER_START_RETRIES, prepared.strict_single_stream);
+            match self.start_udp_server_with_retry(&prepared.task, &next_server_req, server_retries)
+            {
                 Ok(started_req) => current_server_req = started_req,
                 Err(e) => {
                     final_error = format!("重试时 server 启动失败: {e}");
@@ -2051,17 +3456,26 @@ impl Ctx {
             }
         }
 
-        let total_retries = count_retry_events(&all_events);
+        let single_stream_exhausted = prepared.strict_single_stream
+            && !final_ok
+            && !final_parsed.has_measurement()
+            && full_attempts == max_flow_retries.saturating_add(1)
+            && cleanup_confirmed
+            && !final_client.cancelled
+            && !setup_error_seen;
         UdpFlowRun {
             leg_pos: prepared.leg_pos,
             stream_pos: prepared.stream_pos,
             task: prepared.task,
             raw_ok: final_ok,
+            runtime_failed: final_runtime_failed,
             parsed: final_parsed,
             client: final_client,
             server_output: all_server_output.join("\n"),
             events: all_events,
-            retries: total_retries,
+            retries: full_attempts.saturating_sub(1),
+            full_attempts,
+            single_stream_exhausted,
             error: final_error,
         }
     }
@@ -2112,6 +3526,7 @@ impl Ctx {
         let mut prepared: Vec<PreparedUdpFlow> = Vec::new();
         for (leg_pos, plan) in plans.iter().enumerate() {
             for (stream_pos, task) in plan.streams.iter().enumerate() {
+                let strict_single_stream = plan.streams.len() == 1;
                 let launch_delay_ms = launch_delays
                     .get(&(leg_pos, stream_pos))
                     .copied()
@@ -2120,7 +3535,7 @@ impl Ctx {
                     .saturating_sub(launch_delay_ms)
                     .div_ceil(1000);
                 // duration 对用户表示有效测量时长。更早启动的流自动多跑，
-                // 让 discover 阶梯、错峰、settle 和一次快速重试后仍有共同窗口。
+                // 让 discover 阶梯、错峰、settle 和配置的快速重试后仍有共同窗口。
                 let process_duration = task
                     .duration
                     .saturating_add(rate_cfg.startup_timeout_secs)
@@ -2136,6 +3551,7 @@ impl Ctx {
                         client_req: Some(client_req),
                         server_error: String::new(),
                         launch_delay_ms,
+                        strict_single_stream,
                     }),
                     Err(e) => prepared.push(PreparedUdpFlow {
                         leg_pos,
@@ -2145,6 +3561,7 @@ impl Ctx {
                         client_req: None,
                         server_error: e,
                         launch_delay_ms: 0,
+                        strict_single_stream,
                     }),
                 }
             }
@@ -2156,8 +3573,12 @@ impl Ctx {
                 .map(|mut flow| {
                     scope.spawn(move || {
                         if let Some(req) = flow.server_req.clone() {
+                            let server_retries = effective_udp_retries(
+                                UDP_SERVER_START_RETRIES,
+                                flow.strict_single_stream,
+                            );
                             match catch_unwind(AssertUnwindSafe(|| {
-                                self.start_udp_server_with_retry(&flow.task, &req)
+                                self.start_udp_server_with_retry(&flow.task, &req, server_retries)
                             })) {
                                 Ok(Ok(started_req)) => flow.server_req = Some(started_req),
                                 Ok(Err(e)) => {
@@ -2264,6 +3685,7 @@ impl Ctx {
                                 stream_pos: fallback.1,
                                 task: fallback.2,
                                 raw_ok: false,
+                                runtime_failed: false,
                                 parsed: iperf::IperfParsed::default(),
                                 client: IperfClientOut {
                                     output: format!(
@@ -2275,6 +3697,8 @@ impl Ctx {
                                 server_output: String::new(),
                                 events: vec![],
                                 retries: 0,
+                                full_attempts: 0,
+                                single_stream_exhausted: false,
                                 error: "UDP 流线程 panic".into(),
                             }
                         })
@@ -2400,6 +3824,15 @@ impl Ctx {
                 results.iter().filter(|r| r.leg_pos == leg_pos).collect();
             let n = plan.streams.len();
             let success = leg_flows.iter().filter(|r| r.raw_ok).count();
+            let runtime_failures = leg_flows.iter().filter(|r| r.runtime_failed).count();
+            let single_stream_exhausted = n == 1
+                && leg_flows
+                    .first()
+                    .is_some_and(|flow| flow.single_stream_exhausted);
+            let single_attempts = leg_flows
+                .first()
+                .map(|flow| flow.full_attempts)
+                .unwrap_or(0);
             let first = &plan.streams[0];
             let required = required_udp_streams(
                 n,
@@ -2454,10 +3887,29 @@ impl Ctx {
                 .map(|limit| udp_loss.map(|value| value <= limit))
                 .unwrap_or(Some(true));
             let (verdict, reason_code, reason_detail) = if success == 0 {
+                let verdict = zero_udp_stream_verdict(n, single_stream_exhausted);
+                if verdict == Verdict::RateFail {
+                    (
+                        verdict,
+                        "SINGLE_UDP_STREAM_FAILED".to_string(),
+                        format!(
+                            "单流 UDP 在 {single_attempts} 次 client 尝试后仍未产生有效测量；该方向必须灌通"
+                        ),
+                    )
+                } else {
+                    (
+                        verdict,
+                        "NO_STREAM_STARTED".to_string(),
+                        format!("0/{n} 条流产生有效测量；执行环境未完成 client 尝试"),
+                    )
+                }
+            } else if runtime_failures > 0 {
                 (
-                    Verdict::SetupError,
-                    "NO_STREAM_STARTED".to_string(),
-                    format!("0/{n} 条流产生有效测量"),
+                    Verdict::RateFail,
+                    "IPERF_RUNTIME_ERRORS".to_string(),
+                    format!(
+                        "{runtime_failures} 条流已有 iperf3 自身吞吐测量，但 client 非正常完成或超时"
+                    ),
                 )
             } else if required > n {
                 (
@@ -2612,6 +4064,8 @@ impl Ctx {
                 verdict.label()
             ));
 
+            let strict_single_failed =
+                n == 1 && verdict == Verdict::RateFail && reason_code == "SINGLE_UDP_STREAM_FAILED";
             for flow in &leg_flows {
                 let raw_log = self.save_iperf_raw_record(IperfRawArtifact {
                     owner_id,
@@ -2652,22 +4106,30 @@ impl Ctx {
                     dst_pc: flow.task.dst.pc.clone(),
                     dst_iface: flow.task.dst.nic.name.clone(),
                     dst_ip: flow.task.dst.nic.ipv4.clone(),
-                    verdict: if flow.raw_ok {
+                    verdict: if flow.runtime_failed {
+                        Verdict::RateFail
+                    } else if flow.raw_ok {
                         Verdict::Pass
+                    } else if strict_single_failed {
+                        Verdict::RateFail
                     } else {
                         Verdict::SetupError
                     },
-                    execution_status: if flow.raw_ok {
-                        ExecutionStatus::Completed
-                    } else if flow.client.timed_out {
+                    execution_status: if flow.client.timed_out {
                         ExecutionStatus::TimedOut
                     } else if flow.client.cancelled {
                         ExecutionStatus::Cancelled
+                    } else if flow.raw_ok || strict_single_failed {
+                        ExecutionStatus::Completed
                     } else {
                         ExecutionStatus::Error
                     },
-                    reason_code: if flow.raw_ok {
+                    reason_code: if flow.runtime_failed {
+                        "IPERF_RUNTIME_ERRORS".into()
+                    } else if flow.raw_ok {
                         String::new()
+                    } else if strict_single_failed {
+                        "SINGLE_UDP_STREAM_FAILED".into()
                     } else {
                         "FLOW_FAILED".into()
                     },
@@ -2826,11 +4288,165 @@ fn fmt_opt(v: Option<f64>) -> String {
     }
 }
 
+fn iperf_client_setup_error(client: &IperfClientOut) -> Option<String> {
+    let detail = || {
+        client
+            .output
+            .lines()
+            .last()
+            .filter(|line| !line.trim().is_empty())
+            .unwrap_or("iperf3 client 执行环境错误")
+            .to_string()
+    };
+    if client.cancelled {
+        return Some(detail());
+    }
+    if client.process_started != Some(true) {
+        return Some(format!("client 进程未确认启动：{}", detail()));
+    }
+    if client.cleanup_confirmed != Some(true) {
+        return Some(format!("client 进程回收未确认：{}", detail()));
+    }
+    if client.timed_out {
+        // 已确认进程启动和回收的 timeout 是一次完整、安全的无测量尝试。
+        return None;
+    }
+
+    let lower = client.output.to_ascii_lowercase();
+    let setup_marker = [
+        "主控机未找到 iperf3",
+        "远端异步作业启动失败",
+        "远端异步作业查询失败",
+        "非预期 job id",
+        "已结束但缺少结果",
+        "duration=",
+        "启动命令失败",
+        "创建流式命令",
+        "等待子进程失败",
+        "回收子进程失败",
+        "parameter error",
+        "invalid argument",
+        "invalid option",
+        "unrecognized option",
+        "option requires an argument",
+        "unable to parse",
+        "cannot assign requested address",
+        "unable to bind",
+        "no such device",
+        "无法识别的选项",
+        "无法分配请求的地址",
+        "unable to set socket buffer",
+        "bad format",
+    ]
+    .iter()
+    .any(|marker| lower.contains(&marker.to_ascii_lowercase()));
+    setup_marker.then(detail)
+}
+
+fn cts_process_setup_error(client: &IperfClientOut) -> Option<(String, String)> {
+    if client.cancelled {
+        return Some((
+            "CTSTRAFFIC_CLIENT_CANCELLED".into(),
+            client
+                .output
+                .lines()
+                .last()
+                .unwrap_or("ctsTraffic client 被取消")
+                .to_string(),
+        ));
+    }
+    if client.timed_out {
+        // 超时但 stop/join 已确认时，属于一次可安全重试的完整尝试，
+        // 不能在这里预先降级成 setup error。
+        return None;
+    }
+
+    let lower = client.output.to_ascii_lowercase();
+    let code = if lower.contains("启动命令失败")
+        || lower.contains("failed to spawn")
+        || lower.contains("the system cannot find the file")
+        || lower.contains("找不到指定的文件")
+        || lower.contains("not recognized as an internal or external command")
+        || lower.contains("不是内部或外部命令")
+    {
+        "CTSTRAFFIC_PROCESS_START_FAILED"
+    } else if lower.contains("invalid argument")
+        || lower.contains("invalid option")
+        || lower.contains("无效参数")
+    {
+        "CTSTRAFFIC_ARGS_INVALID"
+    } else if lower.contains("命令超时时间过大")
+        || lower.contains("创建流式命令")
+        || lower.contains("等待子进程失败")
+        || lower.contains("回收子进程失败")
+    {
+        "CTSTRAFFIC_PROCESS_CONTROL_FAILED"
+    } else {
+        return None;
+    };
+    Some((
+        code.into(),
+        client
+            .output
+            .lines()
+            .last()
+            .unwrap_or("ctsTraffic 进程环境错误")
+            .to_string(),
+    ))
+}
+
+fn format_ctstraffic_attempts(
+    server_cmd: &str,
+    attempts: &[CtsAttemptRun],
+    final_error: &str,
+) -> String {
+    let mut out = String::new();
+    for attempt in attempts {
+        let attempt_error = attempt
+            .setup_error
+            .as_ref()
+            .map(|(_, detail)| detail.as_str())
+            .or_else(|| {
+                attempt
+                    .server_unexpected_failure
+                    .then_some("ctsTraffic server 在停止请求前异常退出")
+            })
+            .or_else(|| {
+                (!attempt.traffic_established).then_some("本轮未产生 ctsTraffic 自身吞吐测量")
+            })
+            .unwrap_or_default();
+        out.push_str(&format!(
+            "=== attempt {} ===\n\
+full_attempt={} cleanup_confirmed={} client_process_started={:?} client_process_cleanup={:?} tool_measurement={}\n\
+\n=== SERVER COMMAND ===\n$ {}\n\
+\n=== SERVER STDOUT+STDERR ===\n{}\n\
+\n=== CLIENT COMMAND ===\n$ {}\n\
+\n=== CLIENT STDOUT+STDERR ===\n{}\n\
+\n=== FLOW EVENTS ===\n{}\n",
+            attempt.attempt + 1,
+            attempt.full_attempt,
+            attempt.cleanup_confirmed,
+            attempt.client.process_started,
+            attempt.client.cleanup_confirmed,
+            attempt.traffic_established,
+            server_cmd,
+            attempt.server_output,
+            attempt.client.cmd,
+            attempt.client.output,
+            format_flow_events(&attempt.events, attempt_error),
+        ));
+    }
+    if !final_error.is_empty() {
+        out.push_str(&format!("\n=== FINAL ERROR ===\n{final_error}\n"));
+    }
+    out
+}
+
 fn text_preview(text: &str, max_chars: usize) -> String {
     text.chars().take(max_chars).collect()
 }
 
-fn row_has_usable_iperf_measurement(row: &Row) -> bool {
+fn row_has_usable_traffic_measurement(row: &Row) -> bool {
     if row.verdict == Verdict::SetupError
         || matches!(
             row.execution_status,
@@ -2839,21 +4455,42 @@ fn row_has_usable_iperf_measurement(row: &Row) -> bool {
     {
         return false;
     }
+    if matches!(
+        row.reason_code.as_str(),
+        "SINGLE_UDP_STREAM_FAILED" | "CTSTRAFFIC_SINGLE_UDP_STREAM_FAILED"
+    ) {
+        // 这两个专用硬失败的定义就是“工具自身没有任何吞吐证据”；即使
+        // 同网卡存在背景流量，也必须继续触发故障诊断。
+        return false;
+    }
     let usable_rate =
         |value: Option<f64>| value.is_some_and(|rate| rate.is_finite() && rate > MIN_VALID_RX_MBPS);
-    usable_rate(row.rx_avg)
-        || usable_rate(row.tx_mbps)
-        || usable_rate(row.rx_mbps)
-        || usable_rate(row.tx_avg)
-        || row.active_streams > 0
+    let tool_measurement =
+        usable_rate(row.tx_mbps) || usable_rate(row.rx_mbps) || row.active_streams > 0;
+    if row.transport.starts_with("CTS/") {
+        // CTS 是否起流只认工具自身 rate/bytes/frame 派生出的字段；NIC RX
+        // 只用于已起流后的产品目标验证，不能把背景流量补成 CTS 测量。
+        return tool_measurement;
+    }
+    usable_rate(row.rx_avg) || tool_measurement || usable_rate(row.tx_avg)
 }
 
 fn aggregate_unit_verdict(outcomes: &[LegOutcome]) -> Verdict {
     if outcomes.is_empty() {
         return Verdict::SetupError;
     }
+    if outcomes
+        .iter()
+        .any(|outcome| outcome.verdict == Verdict::SetupError)
+    {
+        return Verdict::SetupError;
+    }
+    // 单流 UDP 三次安全尝试仍无测量是用户指定的硬失败，不能被另一方向
+    // 的采样不足/目标缺失等普通 NOT_EVALUATED 覆盖。
+    if outcomes.iter().any(is_hard_single_udp_failure) {
+        return Verdict::RateFail;
+    }
     for verdict in [
-        Verdict::SetupError,
         Verdict::NotEvaluated,
         Verdict::RateFail,
         Verdict::Unstable,
@@ -2874,9 +4511,26 @@ fn aggregate_unit_verdict(outcomes: &[LegOutcome]) -> Verdict {
 }
 
 fn outcome_matching_verdict(outcomes: &[LegOutcome], verdict: Verdict) -> Option<&LegOutcome> {
+    if verdict == Verdict::RateFail {
+        if let Some(outcome) = outcomes
+            .iter()
+            .find(|outcome| is_hard_single_udp_failure(outcome))
+        {
+            return Some(outcome);
+        }
+    }
     outcomes.iter().find(|outcome| outcome.verdict == verdict)
 }
 
+fn is_hard_single_udp_failure(outcome: &LegOutcome) -> bool {
+    outcome.verdict == Verdict::RateFail
+        && matches!(
+            outcome.reason_code.as_str(),
+            "SINGLE_UDP_STREAM_FAILED" | "CTSTRAFFIC_SINGLE_UDP_STREAM_FAILED"
+        )
+}
+
+#[cfg(test)]
 fn count_retry_events(events: &[IperfFlowEvent]) -> usize {
     events
         .iter()
@@ -2913,6 +4567,128 @@ fn should_retry_udp_flow(
     client: &IperfClientOut,
 ) -> bool {
     attempt < max_retries && elapsed <= startup_timeout && !client.timed_out && !client.cancelled
+}
+
+fn effective_udp_retries(configured_retries: usize, strict_single_stream: bool) -> usize {
+    if strict_single_stream {
+        configured_retries.max(SINGLE_UDP_MIN_ATTEMPTS.saturating_sub(1) as usize)
+    } else {
+        configured_retries
+    }
+}
+
+fn cts_attempt_budget(configured_retries: usize, strict_single_udp: bool) -> usize {
+    if strict_single_udp {
+        effective_udp_retries(configured_retries, true).saturating_add(1)
+    } else {
+        1
+    }
+}
+
+fn cts_stop_process_evidence(stop: &Result<CtsTrafficStopOut, String>) -> (bool, bool) {
+    let result = stop.as_ref().ok().and_then(|output| output.result.as_ref());
+    (
+        result.and_then(|value| value.process_started) == Some(true),
+        result.and_then(|value| value.cleanup_confirmed) == Some(true),
+    )
+}
+
+fn cts_attempt_is_safe_full(attempt: &CtsAttemptRun) -> bool {
+    attempt.full_attempt
+        && attempt.client.process_started == Some(true)
+        && attempt.client.cleanup_confirmed == Some(true)
+        && attempt.cleanup_confirmed
+        && attempt.setup_error.is_none()
+        && !attempt.client.cancelled
+        && !attempt.server_unexpected_failure
+}
+
+fn cts_should_retry_after_last(
+    attempts: &[CtsAttemptRun],
+    max_attempts: usize,
+    strict_single_udp: bool,
+) -> bool {
+    let Some(last) = attempts.last() else {
+        return false;
+    };
+    strict_single_udp
+        && attempts.len() < max_attempts
+        && !last.traffic_established
+        && cts_attempt_is_safe_full(last)
+}
+
+fn select_cts_attempt_index(attempts: &[CtsAttemptRun]) -> Option<usize> {
+    attempts
+        .iter()
+        .position(|attempt| attempt.traffic_established)
+        .or_else(|| attempts.len().checked_sub(1))
+}
+
+fn cts_full_attempts(attempts: &[CtsAttemptRun]) -> usize {
+    attempts
+        .iter()
+        .filter(|attempt| cts_attempt_is_safe_full(attempt))
+        .count()
+}
+
+fn cts_retry_count(attempts: &[CtsAttemptRun]) -> usize {
+    cts_full_attempts(attempts).saturating_sub(1)
+}
+
+fn cts_single_udp_exhausted(
+    attempts: &[CtsAttemptRun],
+    max_attempts: usize,
+    strict_single_udp: bool,
+) -> bool {
+    strict_single_udp
+        && max_attempts > 0
+        && attempts.len() == max_attempts
+        && attempts
+            .iter()
+            .all(|attempt| cts_attempt_is_safe_full(attempt) && !attempt.traffic_established)
+}
+
+fn cts_runtime_failure_detail(
+    client: &IperfClientOut,
+    runtime_errors: u64,
+    client_expected_completion: bool,
+) -> Option<String> {
+    if runtime_errors > 0 {
+        return Some(format!(
+            "ctsTraffic 记录到 {runtime_errors} 个网络/协议/数据错误"
+        ));
+    }
+    if client.timed_out {
+        return Some(
+            client
+                .output
+                .lines()
+                .last()
+                .filter(|line| !line.trim().is_empty())
+                .map(|line| format!("ctsTraffic 已产生工具测量，但 client 超时: {line}"))
+                .unwrap_or_else(|| "ctsTraffic 已产生工具测量，但 client 超时".into()),
+        );
+    }
+    if !client_expected_completion {
+        return Some(
+            client
+                .output
+                .lines()
+                .last()
+                .filter(|line| !line.trim().is_empty())
+                .map(|line| format!("ctsTraffic 已产生工具测量，但 client 未正常完成: {line}"))
+                .unwrap_or_else(|| "ctsTraffic 已产生工具测量，但 client 未正常完成".into()),
+        );
+    }
+    None
+}
+
+fn zero_udp_stream_verdict(requested: usize, attempts_exhausted: bool) -> Verdict {
+    if requested == 1 && attempts_exhausted {
+        Verdict::RateFail
+    } else {
+        Verdict::SetupError
+    }
 }
 
 fn required_udp_streams(
@@ -3857,6 +5633,87 @@ mod tests {
         }
     }
 
+    fn ctstraffic_task(udp: bool) -> CtsTrafficTask {
+        CtsTrafficTask {
+            v6: false,
+            udp,
+            profile_name: if udp {
+                "cts_udp_b500m_c3".into()
+            } else {
+                "cts_tcp_w64k_c3".into()
+            },
+            profile_label: if udp {
+                "CTS UDP -b 500m ×3流 (每流)".into()
+            } else {
+                "CTS TCP socket-buffer 64k ×3连接".into()
+            },
+            src: endpoint(Side::Master, "master0", "192.168.1.2"),
+            dst: endpoint(Side::Agent, "agent0", "192.168.1.3"),
+            port: 56_000,
+            duration: 10,
+            streams: 3,
+            window_bytes: Some(64 * 1024),
+            bits_per_second: udp.then_some(500_000_000),
+            datagram_bytes: udp.then_some(1200),
+            frame_rate: 100,
+            buffer_depth_secs: 1,
+            status_update_ms: 1_000,
+            rate_mode: RateMode::Observe,
+            rx_target_mbps: None,
+            offered_mbps: udp.then_some(1_500.0),
+        }
+    }
+
+    fn ctstraffic_unit(id: &str, udp: bool) -> Unit {
+        Unit {
+            id: id.into(),
+            title: if udp {
+                "CTS UDP test".into()
+            } else {
+                "CTS TCP test".into()
+            },
+            bidir: false,
+            legs: vec![Leg {
+                tag: "ab".into(),
+                kind: LegKind::CtsTraffic(ctstraffic_task(udp)),
+            }],
+            est_secs: 25,
+        }
+    }
+
+    fn ctstraffic_attempt(attempt: usize, traffic_established: bool) -> CtsAttemptRun {
+        CtsAttemptRun {
+            attempt,
+            client: IperfClientOut {
+                ok: true,
+                process_started: Some(true),
+                cleanup_confirmed: Some(true),
+                cmd: format!("ctsTraffic client attempt {}", attempt + 1),
+                output: format!("CLIENT ATTEMPT {}", attempt + 1),
+                ..Default::default()
+            },
+            server_output: format!("SERVER ATTEMPT {}", attempt + 1),
+            server_unexpected_failure: false,
+            traffic_window: EffectiveWindow {
+                start_ms: attempt as u64 * 10_000 + 1_000,
+                end_ms: attempt as u64 * 10_000 + 11_000,
+                available_secs: 10.0,
+                required_secs: 10,
+                complete: true,
+            },
+            events: Vec::new(),
+            parsed: ctstraffic::CtsTrafficParsed {
+                recv_mbps: traffic_established.then_some(500.0),
+                udp_successful_frames: traffic_established.then_some(1_000),
+                ..Default::default()
+            },
+            traffic_established,
+            full_attempt: true,
+            cleanup_confirmed: true,
+            setup_error: None,
+        }
+    }
+
     fn isolated_ctx(agent_port: u16) -> (Ctx, PathBuf) {
         let db_path = std::env::temp_dir().join(format!(
             "cpe_test_executor_{}_{}.json",
@@ -3873,6 +5730,7 @@ mod tests {
             },
             outdir: std::env::temp_dir(),
             local_servers: IperfServerMgr::new(),
+            local_cts_jobs: IperfClientJobMgr::new(),
             local_monitors: MonitorMgr::new(),
             rows: Mutex::new(Vec::new()),
             db: Mutex::new(ResultDb::load(db_path.clone())),
@@ -3926,6 +5784,7 @@ mod tests {
             stream_pos,
             task: task.clone(),
             raw_ok,
+            runtime_failed: false,
             parsed: iperf::IperfParsed::default(),
             client: IperfClientOut::default(),
             server_output: String::new(),
@@ -3948,6 +5807,8 @@ mod tests {
                 vec![]
             },
             retries: 0,
+            full_attempts: usize::from(raw_ok),
+            single_stream_exhausted: false,
             error: String::new(),
         }
     }
@@ -3989,8 +5850,47 @@ mod tests {
     }
 
     #[test]
+    fn ctstraffic_tcp_requests_map_src_to_client_and_dst_to_server() {
+        let (ctx, db_path) = isolated_ctx(0);
+        let task = ctstraffic_task(false);
+        let (server, client) = ctx.build_cts_requests(&task).unwrap();
+
+        assert_eq!(server.role, CtsTrafficRole::Server);
+        assert_eq!(server.protocol, CtsTrafficProtocol::Tcp);
+        assert_eq!(server.bind_ip, task.dst.nic.ipv4);
+        assert!(server.target_ip.is_empty());
+        assert_eq!(client.role, CtsTrafficRole::Client);
+        assert_eq!(client.protocol, CtsTrafficProtocol::Tcp);
+        assert_eq!(client.bind_ip, task.src.nic.ipv4);
+        assert_eq!(client.target_ip, task.dst.nic.ipv4);
+        assert_eq!(client.streams, 3);
+        assert_eq!(client.window_bytes, Some(64 * 1024));
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn ctstraffic_udp_requests_reverse_process_roles_but_keep_src_to_dst_data_flow() {
+        let (ctx, db_path) = isolated_ctx(0);
+        let task = ctstraffic_task(true);
+        let (server, client) = ctx.build_cts_requests(&task).unwrap();
+
+        assert_eq!(server.role, CtsTrafficRole::Server);
+        assert_eq!(server.protocol, CtsTrafficProtocol::Udp);
+        assert_eq!(server.bind_ip, task.src.nic.ipv4, "UDP server 是实际发送端");
+        assert!(server.target_ip.is_empty());
+        assert_eq!(client.role, CtsTrafficRole::Client);
+        assert_eq!(client.protocol, CtsTrafficProtocol::Udp);
+        assert_eq!(client.bind_ip, task.dst.nic.ipv4, "UDP client 是实际接收端");
+        assert_eq!(client.target_ip, task.src.nic.ipv4);
+        assert_eq!(client.bits_per_second, Some(500_000_000));
+        assert_eq!(client.datagram_bytes, Some(1200));
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
     fn test_required_udp_stream_quorum() {
         let cfg = RateCheckCfg::default();
+        assert_eq!(required_udp_streams(1, &cfg, None, Some(500.0)), 1);
         assert_eq!(required_udp_streams(2, &cfg, None, Some(500.0)), 2);
         assert_eq!(required_udp_streams(5, &cfg, None, Some(500.0)), 4);
         assert_eq!(
@@ -4001,6 +5901,241 @@ mod tests {
             required_udp_streams(20, &cfg, Some(6400.0), Some(500.0)),
             18
         );
+    }
+
+    #[test]
+    fn single_udp_stream_gets_three_total_attempts_and_hard_failure_after_execution() {
+        assert_eq!(effective_udp_retries(0, true), 2);
+        assert_eq!(effective_udp_retries(1, true), 2);
+        assert_eq!(effective_udp_retries(4, true), 4);
+        assert_eq!(effective_udp_retries(1, false), 1);
+
+        assert_eq!(zero_udp_stream_verdict(1, true), Verdict::RateFail);
+        assert_eq!(zero_udp_stream_verdict(1, false), Verdict::SetupError);
+        assert_eq!(zero_udp_stream_verdict(2, true), Verdict::SetupError);
+    }
+
+    #[test]
+    fn iperf_single_udp_only_counts_started_and_reaped_processes_as_safe_attempts() {
+        let missing_tool = IperfClientOut {
+            output: "主控机未找到 iperf3".into(),
+            process_started: Some(false),
+            cleanup_confirmed: Some(true),
+            ..Default::default()
+        };
+        assert!(iperf_client_setup_error(&missing_tool).is_some());
+
+        let invalid_window = IperfClientOut {
+            output: "iperf3: error - unable to set socket buffer size: Invalid argument".into(),
+            process_started: Some(true),
+            cleanup_confirmed: Some(true),
+            ..Default::default()
+        };
+        assert!(iperf_client_setup_error(&invalid_window).is_some());
+
+        let timeout_reaped = IperfClientOut {
+            timed_out: true,
+            process_started: Some(true),
+            cleanup_confirmed: Some(true),
+            output: "timed out and reaped".into(),
+            ..Default::default()
+        };
+        assert_eq!(iperf_client_setup_error(&timeout_reaped), None);
+
+        let connection_refused = IperfClientOut {
+            process_started: Some(true),
+            cleanup_confirmed: Some(true),
+            output: "iperf3: error - unable to connect to server: Connection refused".into(),
+            ..Default::default()
+        };
+        assert_eq!(iperf_client_setup_error(&connection_refused), None);
+
+        let cleanup_unknown = IperfClientOut {
+            process_started: Some(true),
+            cleanup_confirmed: None,
+            ..Default::default()
+        };
+        assert!(iperf_client_setup_error(&cleanup_unknown).is_some());
+    }
+
+    #[test]
+    fn iperf_tool_measurement_can_come_from_server_output_without_merging_attempts() {
+        let client_output = "iperf3: error - control socket closed";
+        let server_output =
+            "[  5]   0.00-10.04 sec  119 MBytes  99.6 Mbits/sec  0.014 ms  312/86380 (0.36%) receiver";
+        let parsed = iperf::parse_output(&format!("{client_output}\n{server_output}"));
+        assert!(parsed.has_measurement());
+        assert_eq!(parsed.udp_loss_pct, Some(0.36));
+
+        let next_attempt = iperf::parse_output("iperf3: error - unable to connect to server");
+        assert!(!next_attempt.has_measurement());
+    }
+
+    #[test]
+    fn ctstraffic_single_udp_attempt_budget_has_a_three_attempt_floor() {
+        assert_eq!(cts_attempt_budget(0, true), 3);
+        assert_eq!(cts_attempt_budget(1, true), 3);
+        assert_eq!(cts_attempt_budget(2, true), 3);
+        assert_eq!(cts_attempt_budget(4, true), 5);
+        assert_eq!(cts_attempt_budget(4, false), 1);
+    }
+
+    #[test]
+    fn ctstraffic_measured_timeout_or_abnormal_exit_is_a_runtime_failure() {
+        let timed_out = IperfClientOut {
+            timed_out: true,
+            output: "manager timeout; process reaped".into(),
+            process_started: Some(true),
+            cleanup_confirmed: Some(true),
+            ..Default::default()
+        };
+        let timeout_detail = cts_runtime_failure_detail(&timed_out, 0, false).unwrap();
+        assert!(timeout_detail.contains("client 超时"));
+
+        let abnormal_exit = IperfClientOut {
+            output: "ctsTraffic exited with code 7".into(),
+            process_started: Some(true),
+            cleanup_confirmed: Some(true),
+            ..Default::default()
+        };
+        let exit_detail = cts_runtime_failure_detail(&abnormal_exit, 0, false).unwrap();
+        assert!(exit_detail.contains("未正常完成"));
+
+        let counted_error = cts_runtime_failure_detail(&abnormal_exit, 3, false).unwrap();
+        assert!(counted_error.contains("3 个网络/协议/数据错误"));
+        assert!(cts_runtime_failure_detail(&IperfClientOut::default(), 0, true).is_none());
+    }
+
+    #[test]
+    fn ctstraffic_server_requires_explicit_process_start_and_reap_evidence() {
+        let confirmed = Ok(CtsTrafficStopOut {
+            terminated: true,
+            result: Some(IperfClientOut {
+                process_started: Some(true),
+                cleanup_confirmed: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert_eq!(cts_stop_process_evidence(&confirmed), (true, true));
+
+        let legacy_unknown = Ok(CtsTrafficStopOut {
+            terminated: true,
+            result: Some(IperfClientOut::default()),
+            ..Default::default()
+        });
+        assert_eq!(cts_stop_process_evidence(&legacy_unknown), (false, false));
+
+        let reap_failed = Ok(CtsTrafficStopOut {
+            terminated: true,
+            result: Some(IperfClientOut {
+                process_started: Some(true),
+                cleanup_confirmed: Some(false),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert_eq!(cts_stop_process_evidence(&reap_failed), (true, false));
+        assert_eq!(
+            cts_stop_process_evidence(&Err("stop failed".into())),
+            (false, false)
+        );
+    }
+
+    #[test]
+    fn ctstraffic_selects_first_measured_attempt_and_only_exhausts_all_safe_misses() {
+        let mut first_two_miss_then_success = vec![
+            ctstraffic_attempt(0, false),
+            ctstraffic_attempt(1, false),
+            ctstraffic_attempt(2, true),
+        ];
+        first_two_miss_then_success[0].parsed.network_errors = Some(99);
+        assert!(cts_should_retry_after_last(
+            &first_two_miss_then_success[..1],
+            3,
+            true
+        ));
+        assert!(cts_should_retry_after_last(
+            &first_two_miss_then_success[..2],
+            3,
+            true
+        ));
+        assert!(!cts_should_retry_after_last(
+            &first_two_miss_then_success,
+            3,
+            true
+        ));
+        assert_eq!(
+            select_cts_attempt_index(&first_two_miss_then_success),
+            Some(2)
+        );
+        assert!(!cts_single_udp_exhausted(
+            &first_two_miss_then_success,
+            3,
+            true
+        ));
+        assert_eq!(cts_retry_count(&first_two_miss_then_success), 2);
+        let selected = select_cts_attempt_index(&first_two_miss_then_success).unwrap();
+        assert_eq!(selected, 2);
+        assert_eq!(
+            first_two_miss_then_success[selected].parsed.error_count(),
+            0,
+            "前两轮错误不能污染第三轮成功结果"
+        );
+        let raw = format_ctstraffic_attempts(
+            "ctsTraffic.exe -Listen:192.0.2.1",
+            &first_two_miss_then_success,
+            "",
+        );
+        assert!(raw.contains("=== attempt 1 ==="));
+        assert!(raw.contains("=== attempt 2 ==="));
+        assert!(raw.contains("=== attempt 3 ==="));
+        assert!(raw.contains("CLIENT ATTEMPT 1"));
+        assert!(raw.contains("CLIENT ATTEMPT 3"));
+
+        let all_miss = vec![
+            ctstraffic_attempt(0, false),
+            ctstraffic_attempt(1, false),
+            ctstraffic_attempt(2, false),
+        ];
+        assert_eq!(select_cts_attempt_index(&all_miss), Some(2));
+        assert!(cts_single_udp_exhausted(&all_miss, 3, true));
+        assert_eq!(cts_retry_count(&all_miss), 2);
+    }
+
+    #[test]
+    fn ctstraffic_setup_cancel_or_unconfirmed_cleanup_never_retries_or_exhausts() {
+        let mut setup = ctstraffic_attempt(0, false);
+        setup.setup_error = Some(("CTSTRAFFIC_SETUP".into(), "setup".into()));
+        setup.full_attempt = false;
+
+        let mut cancelled = ctstraffic_attempt(0, false);
+        cancelled.client.cancelled = true;
+        cancelled.full_attempt = false;
+
+        let mut cleanup_failed = ctstraffic_attempt(0, false);
+        cleanup_failed.cleanup_confirmed = false;
+        cleanup_failed.client.cleanup_confirmed = Some(false);
+        cleanup_failed.full_attempt = false;
+
+        let mut legacy_unknown = ctstraffic_attempt(0, false);
+        legacy_unknown.client.process_started = None;
+        legacy_unknown.client.cleanup_confirmed = None;
+        legacy_unknown.full_attempt = false;
+
+        for blocked in [setup, cancelled, cleanup_failed, legacy_unknown] {
+            assert!(!cts_should_retry_after_last(
+                std::slice::from_ref(&blocked),
+                3,
+                true
+            ));
+            let attempts = vec![
+                ctstraffic_attempt(0, false),
+                ctstraffic_attempt(1, false),
+                blocked,
+            ];
+            assert!(!cts_single_udp_exhausted(&attempts, 3, true));
+        }
     }
 
     #[test]
@@ -4675,6 +6810,63 @@ mod tests {
     }
 
     #[test]
+    fn hard_single_udp_failure_beats_other_direction_not_evaluated() {
+        let outcomes = vec![
+            LegOutcome {
+                verdict: Verdict::RateFail,
+                reason_code: "SINGLE_UDP_STREAM_FAILED".into(),
+                reason_detail: "AB exhausted three attempts".into(),
+                rx_avg: None,
+                main_rows: vec![],
+                tag: "ab".into(),
+            },
+            LegOutcome {
+                verdict: Verdict::NotEvaluated,
+                reason_code: "SAMPLE_COVERAGE_LOW".into(),
+                reason_detail: "BA monitor incomplete".into(),
+                rx_avg: Some(100.0),
+                main_rows: vec![],
+                tag: "ba".into(),
+            },
+        ];
+        let verdict = aggregate_unit_verdict(&outcomes);
+        assert_eq!(verdict, Verdict::RateFail);
+        assert_eq!(
+            outcome_matching_verdict(&outcomes, verdict)
+                .unwrap()
+                .reason_code,
+            "SINGLE_UDP_STREAM_FAILED"
+        );
+
+        let cts_outcomes = vec![
+            LegOutcome {
+                verdict: Verdict::RateFail,
+                reason_code: "CTSTRAFFIC_SINGLE_UDP_STREAM_FAILED".into(),
+                reason_detail: "AB exhausted three CTS attempts".into(),
+                rx_avg: Some(700.0),
+                main_rows: vec![],
+                tag: "ab".into(),
+            },
+            LegOutcome {
+                verdict: Verdict::NotEvaluated,
+                reason_code: "TARGET_MISSING".into(),
+                reason_detail: "BA measured independently".into(),
+                rx_avg: Some(700.0),
+                main_rows: vec![],
+                tag: "ba".into(),
+            },
+        ];
+        let verdict = aggregate_unit_verdict(&cts_outcomes);
+        assert_eq!(verdict, Verdict::RateFail);
+        assert_eq!(
+            outcome_matching_verdict(&cts_outcomes, verdict)
+                .unwrap()
+                .reason_code,
+            "CTSTRAFFIC_SINGLE_UDP_STREAM_FAILED"
+        );
+    }
+
+    #[test]
     fn preflight_block_marks_iperf_without_touching_ping_legs() {
         let master = endpoint(Side::Master, "master0", "192.168.1.2");
         let agent = endpoint(Side::Agent, "agent0", "192.168.1.3");
@@ -4713,6 +6905,66 @@ mod tests {
         assert_eq!(outcomes[0].reason_code, "IPERF_PREFLIGHT_FAILED");
         assert_eq!(outcomes[0].tag, "ab");
         assert!(outcomes[0].main_rows.is_empty());
+    }
+
+    #[test]
+    fn ctstraffic_preflight_block_becomes_setup_error_and_triggers_diagnostics() {
+        let unit = ctstraffic_unit("cts-blocked", true);
+        let block = IperfPreflightBlock {
+            reason_code: "CTSTRAFFIC_PREFLIGHT_FAILED".into(),
+            reason_detail: "当前平台缺少 ctsTraffic".into(),
+        };
+        let outcomes = preflight_block_outcomes(&unit, &block);
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].verdict, Verdict::SetupError);
+        assert_eq!(outcomes[0].reason_code, "CTSTRAFFIC_PREFLIGHT_FAILED");
+        assert_eq!(outcomes[0].tag, "ab");
+
+        let (ctx, db_path) = isolated_ctx(0);
+        let mut blocks = HashMap::new();
+        blocks.insert(unit.id.clone(), block);
+        let summary = ctx.run_all_with_preflight_blocks(&[unit], &blocks);
+        assert_eq!(summary.setup_error, 1);
+        assert_eq!(summary.traffic_units, 1);
+        assert_eq!(summary.traffic_setup_errors, 1);
+        assert_eq!(summary.traffic_usable_units, 0);
+        assert!(summary.needs_traffic_failure_diagnostics());
+        let rows = ctx.rows.lock().unwrap();
+        let summary_row = rows
+            .iter()
+            .find(|row| row.is_unit_summary)
+            .expect("blocked CTS unit summary row");
+        assert_eq!(summary_row.verdict, Verdict::SetupError);
+        assert_eq!(summary_row.reason_code, "CTSTRAFFIC_PREFLIGHT_FAILED");
+        drop(rows);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn resumed_ctstraffic_pass_counts_as_usable_traffic_measurement() {
+        let unit = ctstraffic_unit("cts-resume-pass", false);
+        let (mut ctx, db_path) = isolated_ctx(0);
+        ctx.cfg.resume = true;
+        {
+            let mut db = ctx.db.lock().unwrap();
+            db.set(&unit.id, true, &unit.title);
+            db.save();
+        }
+
+        let summary = ctx.run_all_with_preflight_blocks(&[unit], &HashMap::new());
+        assert_eq!(summary.skip, 1);
+        assert_eq!(summary.traffic_units, 1);
+        assert_eq!(summary.traffic_usable_units, 1);
+        assert_eq!(summary.traffic_setup_errors, 0);
+        assert!(!summary.needs_traffic_failure_diagnostics());
+        let rows = ctx.rows.lock().unwrap();
+        let skip = rows
+            .iter()
+            .find(|row| row.verdict == Verdict::Skip)
+            .expect("CTS resume skip row");
+        assert_eq!(skip.execution_status, ExecutionStatus::Skipped);
+        drop(rows);
+        let _ = std::fs::remove_file(db_path);
     }
 
     #[test]
@@ -4761,6 +7013,7 @@ mod tests {
             cfg,
             outdir: std::env::temp_dir(),
             local_servers: IperfServerMgr::new(),
+            local_cts_jobs: IperfClientJobMgr::new(),
             local_monitors: MonitorMgr::new(),
             rows: Mutex::new(Vec::new()),
             db: Mutex::new(ResultDb::load(db_path.clone())),
@@ -4772,9 +7025,9 @@ mod tests {
         let summary = ctx.run_all_with_preflight(&[unit], Some(&block));
         assert_eq!(summary.skip, 0);
         assert_eq!(summary.setup_error, 1);
-        assert_eq!(summary.iperf_units, 1);
-        assert_eq!(summary.iperf_usable_units, 0);
-        assert!(summary.needs_iperf_failure_diagnostics());
+        assert_eq!(summary.traffic_units, 1);
+        assert_eq!(summary.traffic_usable_units, 0);
+        assert!(summary.needs_traffic_failure_diagnostics());
         let _ = std::fs::remove_file(db_path);
     }
 
@@ -4915,7 +7168,7 @@ mod tests {
         let summary = ctx.run_all_with_preflight(&[iperf_unit, ping_unit], Some(&block));
         assert_eq!(summary.setup_error, 1);
         assert_eq!(summary.not_evaluated, 1);
-        assert_eq!(summary.iperf_units, 1);
+        assert_eq!(summary.traffic_units, 1);
         let rows = ctx.rows.lock().unwrap();
         assert!(rows
             .iter()
@@ -4928,52 +7181,100 @@ mod tests {
     }
 
     #[test]
-    fn diagnostics_trigger_only_when_every_iperf_unit_has_no_measurement() {
+    fn diagnostics_trigger_only_when_every_traffic_unit_has_no_measurement() {
         let mut summary = RunSummary {
-            iperf_units: 3,
-            iperf_setup_errors: 3,
+            traffic_units: 3,
+            traffic_setup_errors: 3,
             ..Default::default()
         };
-        assert!(summary.needs_iperf_failure_diagnostics());
+        assert!(summary.needs_traffic_failure_diagnostics());
 
-        summary.iperf_usable_units = 1;
-        assert!(!summary.needs_iperf_failure_diagnostics());
+        summary.traffic_usable_units = 1;
+        assert!(!summary.needs_traffic_failure_diagnostics());
 
         let ping_only = RunSummary::default();
-        assert!(!ping_only.needs_iperf_failure_diagnostics());
+        assert!(!ping_only.needs_traffic_failure_diagnostics());
     }
 
     #[test]
-    fn usable_iperf_measurement_requires_real_rate_or_active_stream() {
-        assert!(!row_has_usable_iperf_measurement(&Row::default()));
-        assert!(!row_has_usable_iperf_measurement(&Row {
+    fn usable_traffic_measurement_requires_real_rate_or_active_stream() {
+        assert!(!row_has_usable_traffic_measurement(&Row::default()));
+        assert!(!row_has_usable_traffic_measurement(&Row {
             rx_mbps: Some(0.0),
             ..Default::default()
         }));
-        assert!(!row_has_usable_iperf_measurement(&Row {
+        assert!(!row_has_usable_traffic_measurement(&Row {
             verdict: Verdict::SetupError,
             execution_status: ExecutionStatus::Error,
             rx_avg: Some(500.0),
             active_streams: 1,
             ..Default::default()
         }));
-        assert!(row_has_usable_iperf_measurement(&Row {
+        assert!(row_has_usable_traffic_measurement(&Row {
             rx_mbps: Some(100.0),
             ..Default::default()
         }));
-        assert!(row_has_usable_iperf_measurement(&Row {
+        assert!(row_has_usable_traffic_measurement(&Row {
             active_streams: 1,
+            ..Default::default()
+        }));
+        assert!(!row_has_usable_traffic_measurement(&Row {
+            transport: "CTS/UDP".into(),
+            verdict: Verdict::RateFail,
+            execution_status: ExecutionStatus::Completed,
+            rx_avg: Some(900.0),
+            reason_code: "CTSTRAFFIC_SINGLE_UDP_STREAM_FAILED".into(),
+            ..Default::default()
+        }));
+        assert!(!row_has_usable_traffic_measurement(&Row {
+            transport: "CTS/UDP".into(),
+            verdict: Verdict::NotEvaluated,
+            execution_status: ExecutionStatus::Partial,
+            rx_avg: Some(900.0),
+            ..Default::default()
+        }));
+        assert!(!row_has_usable_traffic_measurement(&Row {
+            transport: "UDP".into(),
+            verdict: Verdict::RateFail,
+            execution_status: ExecutionStatus::Completed,
+            rx_avg: Some(900.0),
+            reason_code: "SINGLE_UDP_STREAM_FAILED".into(),
             ..Default::default()
         }));
     }
 
     #[test]
-    fn run_summary_merge_keeps_iperf_diagnostic_counters() {
+    fn ctstraffic_row_is_counted_as_a_usable_traffic_measurement() {
+        let (ctx, db_path) = isolated_ctx(0);
+        let row_index = ctx.push_row(Row {
+            transport: "CTS/UDP".into(),
+            verdict: Verdict::Measured,
+            execution_status: ExecutionStatus::Completed,
+            rx_mbps: Some(1_420.0),
+            active_streams: 3,
+            requested_streams: 3,
+            ..Default::default()
+        });
+        let outcomes = vec![LegOutcome {
+            verdict: Verdict::Measured,
+            reason_code: "TARGET_UNKNOWN".into(),
+            reason_detail: String::new(),
+            rx_avg: None,
+            main_rows: vec![row_index],
+            tag: "ab".into(),
+        }];
+
+        assert!(ctx.outcomes_have_usable_traffic_measurement(&outcomes));
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn run_summary_merge_keeps_traffic_diagnostic_counters() {
         let mut left = RunSummary {
             pass: 1,
-            iperf_units: 2,
-            iperf_usable_units: 0,
-            iperf_setup_errors: 2,
+            traffic_units: 2,
+            traffic_usable_units: 0,
+            traffic_setup_errors: 2,
             ..Default::default()
         };
         left.merge(RunSummary {
@@ -4984,9 +7285,9 @@ mod tests {
         assert_eq!(left.pass, 1);
         assert_eq!(left.fail, 1);
         assert_eq!(left.not_evaluated, 1);
-        assert_eq!(left.iperf_units, 2);
-        assert_eq!(left.iperf_setup_errors, 2);
-        assert!(left.needs_iperf_failure_diagnostics());
+        assert_eq!(left.traffic_units, 2);
+        assert_eq!(left.traffic_setup_errors, 2);
+        assert!(left.needs_traffic_failure_diagnostics());
     }
 
     #[test]
@@ -5094,6 +7395,73 @@ mod tests {
         assert!(!filename.contains(':'));
         assert!(filename.contains("tcp"));
         assert!(filename.contains("p56000"));
+    }
+
+    #[test]
+    fn ctstraffic_raw_record_contains_server_client_events_and_error() {
+        let nonce = RESOURCE_OWNER_SEQ.fetch_add(1, Ordering::SeqCst);
+        let outdir =
+            std::env::temp_dir().join(format!("cpe_test_cts_raw_{}_{}", std::process::id(), nonce));
+        let (mut ctx, db_path) = isolated_ctx(0);
+        ctx.outdir = outdir.clone();
+        let task = ctstraffic_task(true);
+        let event = IperfFlowEvent {
+            kind: IperfEventKind::Traffic,
+            elapsed_ms: 1_000,
+            mbps: Some(1_500.0),
+            line: "EVENT RAW".into(),
+        };
+        let mut first = ctstraffic_attempt(0, false);
+        first.client.output = "CLIENT RAW 1".into();
+        first.server_output = "SERVER RAW 1".into();
+        first.events = vec![event.clone()];
+        first.setup_error = Some(("ATTEMPT_ONE".into(), "attempt-one-error".into()));
+        first.full_attempt = false;
+        let mut second = ctstraffic_attempt(1, false);
+        second.client.output = "CLIENT RAW 2".into();
+        second.server_output = "SERVER RAW 2".into();
+        let mut third = ctstraffic_attempt(2, true);
+        third.client.output = "CLIENT RAW 3".into();
+        third.server_output = "SERVER RAW 3".into();
+        third.events = vec![event];
+        let attempts = vec![first, second, third];
+        let link = ctx.save_ctstraffic_raw_record(
+            "cts:raw-owner",
+            0,
+            "ab",
+            &task,
+            "ctsTraffic.exe -Listen:192.168.1.2",
+            &attempts,
+            "sample error",
+        );
+        assert!(!link.is_empty());
+        let file = std::fs::read_dir(&outdir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| path.extension().is_some_and(|ext| ext == "log"))
+            .expect("CTS raw log");
+        let text = std::fs::read_to_string(file).unwrap();
+        assert!(text.contains("SERVER RAW 1"));
+        assert!(text.contains("SERVER RAW 2"));
+        assert!(text.contains("SERVER RAW 3"));
+        assert!(text.contains("CLIENT RAW 1"));
+        assert!(text.contains("CLIENT RAW 2"));
+        assert!(text.contains("CLIENT RAW 3"));
+        assert!(text.contains("EVENT RAW"));
+        assert!(text.contains("sample error"));
+        assert!(text.contains("UDP MediaStream"));
+        assert!(text.contains("=== attempt 1 ==="));
+        assert!(text.contains("=== attempt 2 ==="));
+        assert!(text.contains("=== attempt 3 ==="));
+        let attempt_1 = text.find("=== attempt 1 ===").unwrap();
+        let attempt_2 = text.find("=== attempt 2 ===").unwrap();
+        let attempt_3 = text.find("=== attempt 3 ===").unwrap();
+        assert!(attempt_1 < attempt_2 && attempt_2 < attempt_3);
+        assert!(text[attempt_1..attempt_2].contains("attempt-one-error"));
+        assert!(!text[attempt_2..attempt_3].contains("attempt-one-error"));
+
+        let _ = std::fs::remove_dir_all(outdir);
+        let _ = std::fs::remove_file(db_path);
     }
 
     #[test]
