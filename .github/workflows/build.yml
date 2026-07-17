@@ -411,40 +411,57 @@ jobs:
             fi
           done
 
-          required_windows_files=(
-            cpe_test.exe
-            ctsTraffic.exe
-            README-Windows-快速开始.md
-            start_agent.bat
-            start_master.bat
-            start_master_select_config.bat
-            iperf3-请放到这里.txt
-            ctsTraffic-请放到这里.txt
-            configs/config-sgmii.json
-            configs/config-wifi5g.json
-            configs/config-10gusb.json
-            configs/config-all-common.json
-            LICENSE-cpe_test-MIT.txt
-            LICENSE-ctsTraffic-Apache-2.0.txt
-            LICENSE-WIL-MIT.txt
-            THIRD_PARTY_NOTICES.md
-          )
-          mapfile -t windows_entries < <(unzip -Z1 "release-assets/${windows}")
-          for required in "${required_windows_files[@]}"; do
-            if ! printf '%s\n' "${windows_entries[@]}" | grep -Fx -- "${required}" >/dev/null; then
-              echo "Windows archive is missing required file: ${required}" >&2
-              exit 1
-            fi
-          done
-
-          packaged_cts_hash="$(unzip -p "release-assets/${windows}" ctsTraffic.exe | sha256sum | awk '{print $1}')"
-          if [[ "${packaged_cts_hash}" != "${CTSTRAFFIC_SHA256}" ]]; then
-            echo "published Windows archive contains unexpected ctsTraffic hash: ${packaged_cts_hash}" >&2
-            exit 1
-          fi
           verify_dir="$(mktemp -d)"
-          unzip -p "release-assets/${windows}" cpe_test.exe > "${verify_dir}/cpe_test.exe"
-          unzip -p "release-assets/${windows}" ctsTraffic.exe > "${verify_dir}/ctsTraffic.exe"
+          WINDOWS_ARCHIVE="release-assets/${windows}" VERIFY_DIR="${verify_dir}" python3 - <<'PY'
+          from hashlib import sha256
+          from os import environ
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          archive_path = Path(environ["WINDOWS_ARCHIVE"])
+          verify_dir = Path(environ["VERIFY_DIR"])
+          required = {
+              "cpe_test.exe",
+              "ctsTraffic.exe",
+              "README-Windows-快速开始.md",
+              "start_agent.bat",
+              "start_master.bat",
+              "start_master_select_config.bat",
+              "iperf3-请放到这里.txt",
+              "ctsTraffic-请放到这里.txt",
+              "configs/config-sgmii.json",
+              "configs/config-wifi5g.json",
+              "configs/config-10gusb.json",
+              "configs/config-all-common.json",
+              "LICENSE-cpe_test-MIT.txt",
+              "LICENSE-ctsTraffic-Apache-2.0.txt",
+              "LICENSE-WIL-MIT.txt",
+              "THIRD_PARTY_NOTICES.md",
+          }
+          with ZipFile(archive_path) as archive:
+              corrupt = archive.testzip()
+              if corrupt is not None:
+                  raise SystemExit(f"Windows archive contains a corrupt entry: {corrupt}")
+              entries = [info.filename for info in archive.infolist() if not info.is_dir()]
+              if len(entries) != len(set(entries)):
+                  raise SystemExit("Windows archive contains duplicate file entries")
+              missing = sorted(required - set(entries))
+              if missing:
+                  raise SystemExit(f"Windows archive is missing required files: {missing}")
+              for name in required:
+                  info = archive.getinfo(name)
+                  if not name.isascii() and not info.flag_bits & 0x800:
+                      raise SystemExit(f"Windows ZIP entry is not marked UTF-8: {name}")
+              cts = archive.read("ctsTraffic.exe")
+              actual_cts_hash = sha256(cts).hexdigest()
+              if actual_cts_hash != environ["CTSTRAFFIC_SHA256"]:
+                  raise SystemExit(
+                      "published Windows archive contains unexpected ctsTraffic hash: "
+                      f"{actual_cts_hash}"
+                  )
+              (verify_dir / "cpe_test.exe").write_bytes(archive.read("cpe_test.exe"))
+              (verify_dir / "ctsTraffic.exe").write_bytes(cts)
+          PY
           tar -xOzf "release-assets/${macos}" ./cpe_test > "${verify_dir}/cpe_test-macos"
           tar -xOzf "release-assets/${linux}" ./cpe_test > "${verify_dir}/cpe_test-linux"
           file "${verify_dir}/cpe_test.exe" | grep -E 'PE32\+.*x86-64'
