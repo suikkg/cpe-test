@@ -744,6 +744,14 @@ fn generate_specs_from_pairs(
             .map(|p| p.ip.clone())
             .unwrap_or_else(|| vec!["v4".into()]);
         let streams = default_params.as_ref().map(|p| p.streams).unwrap_or(1);
+        let tcp_streams = default_params
+            .as_ref()
+            .and_then(|p| p.tcp_streams)
+            .unwrap_or(0);
+        let udp_streams = default_params
+            .as_ref()
+            .and_then(|p| p.udp_streams)
+            .unwrap_or(0);
         let duration = default_params
             .as_ref()
             .and_then(|p| p.iperf_duration)
@@ -781,7 +789,11 @@ fn generate_specs_from_pairs(
             kinds,
             transports,
             ipvers,
-            streams: streams.clamp(1, 32),
+            // 保留配置原值供 CTS 生成精确的 SETUP_ERROR；builder 的
+            // effective_*_streams() 会为 iperf 执行安全归一化。
+            streams,
+            tcp_streams,
+            udp_streams,
             duration: duration.clamp(1, 86_400),
             ping_count,
             payload_sizes,
@@ -792,7 +804,7 @@ fn generate_specs_from_pairs(
             rate_targets,
             rate_check: cfg.iperf.rate_check.clone(),
             ctstraffic: cfg.ctstraffic.clone(),
-            ctstraffic_config_error: builder::ctstraffic_config_error(streams, duration),
+            ctstraffic_config_error: builder::ctstraffic_common_config_error(duration),
         });
     }
     out
@@ -803,7 +815,8 @@ struct UniversalParams {
     kinds: Vec<String>,
     transports: Vec<String>,
     ipvers: Vec<String>,
-    streams: u32,
+    tcp_streams: u32,
+    udp_streams: u32,
     duration: u64,
     ping_count: u32,
     payload_sizes: Vec<u32>,
@@ -913,11 +926,24 @@ fn ask_universal_params(cfg: &Config, mode: usize) -> UniversalParams {
     let has_traffic = kinds
         .iter()
         .any(|kind| kind == "iperf" || kind == "ctstraffic");
-    let streams = if has_traffic {
+    let has_tcp = has_traffic && transports.iter().any(|t| t == "tcp");
+    let has_udp = has_traffic && transports.iter().any(|t| t == "udp");
+    let tcp_streams = if has_tcp {
         ask_traffic_scalar(
-            "并发流数(iperf3 TCP=-P、UDP=多进程；CTS=-Connections，默认1): ",
+            "TCP 并发流数(iperf3 -P；CTS -Connections，默认1): ",
             1,
-            "并发流数",
+            "TCP并发流数",
+            1,
+            32,
+        ) as u32
+    } else {
+        1
+    };
+    let udp_streams = if has_udp {
+        ask_traffic_scalar(
+            "UDP 并发流数(iperf3 多进程；CTS -Connections，默认1): ",
+            1,
+            "UDP并发流数",
             1,
             32,
         ) as u32
@@ -963,7 +989,8 @@ fn ask_universal_params(cfg: &Config, mode: usize) -> UniversalParams {
         kinds,
         transports,
         ipvers,
-        streams,
+        tcp_streams,
+        udp_streams,
         duration,
         ping_count,
         payload_sizes,
@@ -986,7 +1013,12 @@ fn spec_from_params(
         kinds: p.kinds.clone(),
         transports: p.transports.clone(),
         ipvers: p.ipvers.clone(),
-        streams: p.streams.clamp(1, 32),
+        // 交互入口没有 legacy streams 输入；协议专用值已经逐项校验。
+        // 保留 1 仅作为未选协议的兼容 fallback，不能再把 TCP/UDP 取 max，
+        // 否则只改 TCP 流数会改变 UDP resume 身份。
+        streams: 1,
+        tcp_streams: p.tcp_streams,
+        udp_streams: p.udp_streams,
         duration: p.duration.clamp(1, 86_400),
         ping_count: p.ping_count,
         payload_sizes: p.payload_sizes.clone(),
@@ -997,7 +1029,7 @@ fn spec_from_params(
         rate_targets: cfg.iperf.rate_check.targets_mbps.clone(),
         rate_check: cfg.iperf.rate_check.clone(),
         ctstraffic: cfg.ctstraffic.clone(),
-        ctstraffic_config_error: builder::ctstraffic_config_error(p.streams, p.duration),
+        ctstraffic_config_error: builder::ctstraffic_common_config_error(p.duration),
     }
 }
 
@@ -1229,7 +1261,8 @@ mod tests {
             kinds: vec!["ctstraffic".into()],
             transports: vec!["udp".into()],
             ipvers: vec!["v4".into()],
-            streams: 0,
+            tcp_streams: 0,
+            udp_streams: 0,
             duration: 0,
             ping_count: 1,
             payload_sizes: vec![32],
@@ -1243,14 +1276,77 @@ mod tests {
             &params,
             &cfg,
         );
-        assert_eq!(spec.streams, 1, "iperf execution remains safely normalized");
+        assert_eq!(spec.streams, 1, "交互入口使用安全的 legacy fallback");
+        assert_eq!(spec.effective_tcp_streams(), 1);
+        assert_eq!(spec.effective_udp_streams(), 1);
         assert_eq!(
             spec.duration, 1,
             "iperf execution remains safely normalized"
         );
         let error = spec.ctstraffic_config_error.unwrap();
-        assert!(error.contains("streams 必须在 1..=32"));
         assert!(error.contains("duration 必须在 1..=86400"));
+    }
+
+    #[test]
+    fn pairs_config_preserves_raw_protocol_streams_until_builder_validation() {
+        let cfg: Config = serde_json::from_str(
+            r#"{
+                "pairs": [{"master":"M","agent":"A"}],
+                "universal_params": {
+                    "kinds": ["ctstraffic"],
+                    "transports": ["tcp", "udp"],
+                    "streams": 0,
+                    "tcp_streams": 4,
+                    "udp_streams": 33
+                }
+            }"#,
+        )
+        .unwrap();
+        let master = HostInfo {
+            hostname: "master".into(),
+            interfaces: vec![NicInfo {
+                name: "master0".into(),
+                role: "M".into(),
+                ipv4: "192.168.1.2".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let agent = HostInfo {
+            hostname: "agent".into(),
+            interfaces: vec![NicInfo {
+                name: "agent0".into(),
+                role: "A".into(),
+                ipv4: "192.168.1.3".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let specs = generate_specs_from_pairs(cfg.pairs.as_ref().unwrap(), &cfg, &master, &agent);
+        assert_eq!(specs.len(), 1);
+        let spec = &specs[0];
+        assert_eq!(spec.streams, 0, "legacy 原值不能在 UI 层提前截断");
+        assert_eq!(spec.tcp_streams, 4);
+        assert_eq!(spec.udp_streams, 33);
+        assert_eq!(spec.effective_tcp_streams(), 4);
+        assert_eq!(spec.effective_udp_streams(), 32);
+
+        let mut port = builder::PORT_BASE;
+        let (units, notices) = builder::build_units(&specs, true, &mut port);
+        assert!(notices
+            .iter()
+            .any(|notice| notice.contains("CTS UDP") && notice.contains("SETUP_ERROR")));
+        assert!(!notices
+            .iter()
+            .any(|notice| notice.contains("CTS TCP") && notice.contains("SETUP_ERROR")));
+        assert!(units.iter().flat_map(|unit| &unit.legs).any(|leg| {
+            matches!(
+                &leg.kind,
+                LegKind::CtsTraffic(task)
+                    if !task.udp && task.streams == 4 && task.setup_error.is_none()
+            )
+        }));
     }
 
     #[test]

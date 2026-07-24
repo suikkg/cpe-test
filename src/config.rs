@@ -62,6 +62,12 @@ pub struct UniversalParams {
     pub ip: Vec<String>,
     #[serde(default = "default_streams")]
     pub streams: u32,
+    /// 可选：覆盖 streams 的 TCP 并发流数（0/缺省时沿用 streams）。
+    #[serde(default)]
+    pub tcp_streams: Option<u32>,
+    /// 可选：覆盖 streams 的 UDP 并发流数（0/缺省时沿用 streams）。
+    #[serde(default)]
+    pub udp_streams: Option<u32>,
     /// 历史字段名；当前供 iperf3 与 ctsTraffic 共用。
     #[serde(default)]
     pub iperf_duration: Option<u64>,
@@ -247,6 +253,20 @@ pub struct UdpProfile {
     pub window: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ParsedBandwidth {
+    pub mbps: f64,
+    pub bits_per_second: u64,
+}
+
+impl ParsedBandwidth {
+    /// iperf3 的无后缀带宽值按 bit/s 解释。传精确整数可避免依赖其对
+    /// `Gbps` 等长后缀的非文档兼容行为。
+    pub fn iperf_arg(self) -> String {
+        self.bits_per_second.to_string()
+    }
+}
+
 impl UdpProfile {
     pub fn bw(b: &str) -> Self {
         UdpProfile {
@@ -256,22 +276,67 @@ impl UdpProfile {
         }
     }
 
-    /// 带宽数值 Mbps（"500m"->500, "1g"->1000；解析失败 None）
-    pub fn bandwidth_mbps(&self) -> Option<f64> {
-        let s = self.bandwidth.trim().to_lowercase().replace(',', ".");
-        let num: String = s
-            .chars()
-            .take_while(|c| c.is_ascii_digit() || *c == '.')
-            .collect();
-        let v: f64 = num.parse().ok()?;
-        if s.ends_with('g') {
-            Some(v * 1000.0)
-        } else if s.ends_with('k') {
-            Some(v / 1000.0)
-        } else {
-            // 默认按 m
-            Some(v)
+    /// 严格解析完整带宽字符串。支持十进制数值加 `k/m/g` 或
+    /// `kbps/mbps/gbps`（大小写不敏感），逗号也可作小数点；裸数为
+    /// 兼容旧配置仍按 Mbps 解释。
+    pub(crate) fn parsed_bandwidth(&self) -> Result<ParsedBandwidth, String> {
+        let raw = self.bandwidth.trim();
+        let lower = raw.to_ascii_lowercase();
+        let (number, bps_multiplier) = [
+            ("kbps", 1_000.0),
+            ("mbps", 1_000_000.0),
+            ("gbps", 1_000_000_000.0),
+            ("k", 1_000.0),
+            ("m", 1_000_000.0),
+            ("g", 1_000_000_000.0),
+        ]
+        .into_iter()
+        .find_map(|(suffix, multiplier)| {
+            lower
+                .strip_suffix(suffix)
+                .map(|number| (number, multiplier))
+        })
+        .unwrap_or((lower.as_str(), 1_000_000.0));
+
+        let mut separator_seen = false;
+        let mut digits_before_separator = 0usize;
+        let mut digits_after_separator = 0usize;
+        for byte in number.bytes() {
+            if byte.is_ascii_digit() {
+                if separator_seen {
+                    digits_after_separator += 1;
+                } else {
+                    digits_before_separator += 1;
+                }
+            } else if matches!(byte, b'.' | b',') && !separator_seen {
+                separator_seen = true;
+            } else {
+                return Err(format!("无法解析 UDP 带宽 {}", self.bandwidth));
+            }
         }
+        if digits_before_separator == 0 || (separator_seen && digits_after_separator == 0) {
+            return Err(format!("无法解析 UDP 带宽 {}", self.bandwidth));
+        }
+
+        let number = number.replace(',', ".");
+        let value = number
+            .parse::<f64>()
+            .map_err(|_| format!("无法解析 UDP 带宽 {}", self.bandwidth))?;
+        let bps = value * bps_multiplier;
+        let rounded_bps = bps.round();
+        // `u64::MAX as f64` 会舍入为 2^64；必须在转换前拒绝等于该
+        // 边界的值，否则 `as u64` 会饱和成一个并非用户所写的速率。
+        if !rounded_bps.is_finite() || rounded_bps < 1.0 || rounded_bps >= u64::MAX as f64 {
+            return Err(format!("UDP 带宽超出有效范围: {}", self.bandwidth));
+        }
+
+        let bits_per_second = rounded_bps as u64;
+        Ok(ParsedBandwidth {
+            // 规划流数、报告 offered rate 与命令参数都基于同一个整数 bps，
+            // 避免小数边界造成三者不一致。
+            mbps: bits_per_second as f64 / 1_000_000.0,
+            bits_per_second,
+        })
     }
 
     pub fn name(&self) -> String {
@@ -335,6 +400,12 @@ pub struct TestSpec {
     pub ip: Vec<String>,
     #[serde(default = "default_streams")]
     pub streams: u32,
+    /// 可选：覆盖 streams 的 TCP 并发流数（0/缺省时沿用 streams）。
+    #[serde(default)]
+    pub tcp_streams: Option<u32>,
+    /// 可选：覆盖 streams 的 UDP 并发流数（0/缺省时沿用 streams）。
+    #[serde(default)]
+    pub udp_streams: Option<u32>,
     /// 历史字段名；当前供 iperf3 与 ctsTraffic 共用。
     #[serde(default)]
     pub iperf_duration: Option<u64>,
@@ -486,7 +557,8 @@ mod tests {
             "tests": [
                 {"name":"t1","src":"master:SGMII2.5G","dst":"agent:SGMII2.5G",
                  "direction":"bidir","kinds":["iperf","ping"],"transports":["tcp","udp"],
-                 "ip":["v4","v6"],"streams":5,"iperf_duration":300},
+                 "ip":["v4","v6"],"streams":5,"tcp_streams":7,"udp_streams":3,
+                 "iperf_duration":300},
                 {"name":"t2","src":"master:SGMII1G","dst":"agent:SGMII1G",
                  "direction":["A->B","B->A"]}
             ]
@@ -499,8 +571,12 @@ mod tests {
         assert_eq!(c.tests.len(), 2);
         assert_eq!(c.tests[0].direction.directions(), vec!["bidir"]);
         assert_eq!(c.tests[0].iperf_duration, Some(300));
+        assert_eq!(c.tests[0].tcp_streams, Some(7));
+        assert_eq!(c.tests[0].udp_streams, Some(3));
         assert_eq!(c.tests[1].direction.directions(), vec!["ab", "ba"]);
         assert_eq!(c.tests[1].kinds, vec!["iperf"]);
+        assert_eq!(c.tests[1].tcp_streams, None);
+        assert_eq!(c.tests[1].udp_streams, None);
     }
 
     #[test]
@@ -511,8 +587,34 @@ mod tests {
 
     #[test]
     fn test_udp_profile() {
-        assert_eq!(UdpProfile::bw("500m").bandwidth_mbps(), Some(500.0));
-        assert_eq!(UdpProfile::bw("1g").bandwidth_mbps(), Some(1000.0));
+        let mbps = |bandwidth: &str| {
+            UdpProfile::bw(bandwidth)
+                .parsed_bandwidth()
+                .ok()
+                .map(|value| value.mbps)
+        };
+        assert_eq!(mbps("500m"), Some(500.0));
+        assert_eq!(mbps("1g"), Some(1000.0));
+        assert_eq!(mbps("2.8G"), Some(2800.0));
+        assert_eq!(mbps("2.8Gbps"), Some(2800.0));
+        assert_eq!(mbps("2,8gBpS"), Some(2800.0));
+        let parsed = UdpProfile::bw("2.8Gbps").parsed_bandwidth().unwrap();
+        assert_eq!(parsed.bits_per_second, 2_800_000_000);
+        assert_eq!(parsed.iperf_arg(), "2800000000");
+        for invalid in [
+            "",
+            "2.8oopsGbps",
+            "2.8Gbps trailing",
+            "2.8mbpsx",
+            "1e3m",
+            "1.2,3g",
+            "1.",
+            "+1m",
+            "0m",
+            "18446744073709.551616",
+        ] {
+            assert_eq!(mbps(invalid), None, "必须拒绝非完整带宽 value={invalid:?}");
+        }
         assert_eq!(UdpProfile::bw("2500m").name(), "udp_b2500m");
         let p = UdpProfile {
             bandwidth: "1000m".into(),

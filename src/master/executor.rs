@@ -28,6 +28,7 @@ const MIN_RATE_SAMPLE_COVERAGE: f64 = 0.95;
 const ROLLING_RATE_WINDOW_MS: u64 = 5_000;
 const ROLLING_COVERAGE_TOLERANCE_MS: u64 = 50;
 const FLOW_TIMELINE_TOLERANCE_MS: u64 = 2_000;
+const CTS_TIMELINE_TOLERANCE_MS: u64 = 100;
 const RESOURCE_LEASE_GRACE_SECS: u64 = 300;
 const RELIABLE_HTTP_ATTEMPTS: usize = 3;
 const RELIABLE_HTTP_RETRY_DELAY: Duration = Duration::from_millis(250);
@@ -370,6 +371,14 @@ struct CtsClientRun {
     started: bool,
     cleanup_confirmed: bool,
     setup_error: Option<(String, String)>,
+}
+
+#[derive(Debug, Clone)]
+struct CtsMonitorIssue {
+    code: String,
+    detail: String,
+    setup_error: bool,
+    affects_verdict: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -955,11 +964,7 @@ impl Ctx {
             };
         }
         let response_elapsed_ms = start_call.elapsed().as_millis() as u64;
-        let origin_ms = if started.elapsed_ms > 0 {
-            response_elapsed_ms.saturating_sub(started.elapsed_ms)
-        } else {
-            response_elapsed_ms / 2
-        };
+        let origin_ms = remote_job_origin_ms(response_elapsed_ms, started.elapsed_ms);
         let max_wait = duration.saturating_add(60);
         let Some(deadline) = Instant::now().checked_add(Duration::from_secs(max_wait)) else {
             let cleanup = self.cts_job_stop_confirmed(side, &started.id);
@@ -2069,7 +2074,7 @@ impl Ctx {
         client_side: Side,
         lifecycle: LifecycleLease<'_>,
         attempt: usize,
-        monitor_started_at: &Instant,
+        leg_epoch: &Instant,
     ) -> CtsAttemptRun {
         let protocol = if task.udp {
             CtsTrafficProtocol::Udp
@@ -2198,10 +2203,7 @@ impl Ctx {
             }
         }
 
-        let traffic_start_ms = monitor_started_at
-            .elapsed()
-            .as_millis()
-            .min(u64::MAX as u128) as u64;
+        let client_call_offset_ms = leg_epoch.elapsed().as_millis().min(u64::MAX as u128) as u64;
         let mut events = Vec::<IperfFlowEvent>::new();
         let client_run = self.cts_client_run_tracked(
             client_side,
@@ -2217,14 +2219,10 @@ impl Ctx {
                 lease_secs: lifecycle.lease_secs,
             },
             |mut event| {
-                event.elapsed_ms = event.elapsed_ms.saturating_add(traffic_start_ms);
+                event.elapsed_ms = event.elapsed_ms.saturating_add(client_call_offset_ms);
                 events.push(event);
             },
         );
-        let traffic_end_ms = monitor_started_at
-            .elapsed()
-            .as_millis()
-            .min(u64::MAX as u128) as u64;
         let server_stop = self.cts_job_stop_confirmed(server_side, &server_started.id);
         let server_output = server_stop
             .as_ref()
@@ -2243,6 +2241,8 @@ impl Ctx {
         let combined_output = format!("{}\n{}", client_run.client.output, server_output);
         let parsed = ctstraffic::parse_output(&combined_output, protocol);
         let traffic_established = parsed.has_measurement(protocol);
+        let traffic_window =
+            cts_effective_window(&events, task.duration, u64::from(task.status_update_ms));
         let process_started_confirmed = client_run.client.process_started == Some(true);
         let process_cleanup_confirmed = client_run.client.cleanup_confirmed == Some(true);
         let (server_process_started_confirmed, server_process_cleanup_confirmed) =
@@ -2314,14 +2314,7 @@ impl Ctx {
             client: client_run.client,
             server_output,
             server_unexpected_failure,
-            traffic_window: EffectiveWindow {
-                start_ms: traffic_start_ms,
-                end_ms: traffic_end_ms.max(traffic_start_ms.saturating_add(1)),
-                available_secs: traffic_end_ms.saturating_sub(traffic_start_ms) as f64 / 1_000.0,
-                required_secs: task.duration,
-                complete: traffic_end_ms.saturating_sub(traffic_start_ms)
-                    >= task.duration.saturating_mul(1_000),
-            },
+            traffic_window,
             events,
             parsed,
             traffic_established,
@@ -2404,18 +2397,33 @@ impl Ctx {
             strict_single_udp,
         );
 
-        // 记录 monitor 的本地近似零点，最终只统计 client 实际运行窗口，排除
-        // server 预热、轮间等待和停止清理时间。所有轮次共享这一时间轴，
-        // 因此最终可用选中轮的 EffectiveWindow 精确裁剪。
-        let monitor_started_at = Instant::now();
-        let mon_id = self
-            .mon_start(
-                task.dst.side,
-                &task.dst.nic.name,
-                lifecycle.owner_id,
-                lifecycle.lease_secs,
-            )
-            .ok();
+        // 所有 CTS 事件和网卡样本都对齐到同一个 leg epoch。远端 monitor
+        // 的真实启动落在 RPC 调用前后之间，用中点近似其零点。
+        let leg_epoch = Instant::now();
+        let monitor_start_before_ms = leg_epoch.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        let mut monitor_issue = None::<CtsMonitorIssue>;
+        let mon_id = match self.mon_start(
+            task.dst.side,
+            &task.dst.nic.name,
+            lifecycle.owner_id,
+            lifecycle.lease_secs,
+        ) {
+            Ok(id) => {
+                let after_ms = leg_epoch.elapsed().as_millis().min(u64::MAX as u128) as u64;
+                Some((id, midpoint_ms(monitor_start_before_ms, after_ms)))
+            }
+            Err(error) => {
+                let detail = format!("CTS 接收端网卡监控启动失败: {error}");
+                logln(&format!("    ({detail})"));
+                monitor_issue = Some(CtsMonitorIssue {
+                    code: "CTSTRAFFIC_MONITOR_START_FAILED".into(),
+                    detail,
+                    setup_error: true,
+                    affects_verdict: true,
+                });
+                None
+            }
+        };
 
         let mut attempts = Vec::with_capacity(max_attempts);
         for attempt in 0..max_attempts {
@@ -2427,7 +2435,7 @@ impl Ctx {
                 client_side,
                 lifecycle,
                 attempt,
-                &monitor_started_at,
+                &leg_epoch,
             );
             attempts.push(run);
 
@@ -2439,10 +2447,7 @@ impl Ctx {
             if let Some(previous) = attempts.last_mut() {
                 previous.events.push(IperfFlowEvent {
                     kind: IperfEventKind::Retry,
-                    elapsed_ms: monitor_started_at
-                        .elapsed()
-                        .as_millis()
-                        .min(u64::MAX as u128) as u64,
+                    elapsed_ms: leg_epoch.elapsed().as_millis().min(u64::MAX as u128) as u64,
                     mbps: None,
                     line: format!(
                         "ctsTraffic single UDP retry {retry_no}/{retries}",
@@ -2458,11 +2463,21 @@ impl Ctx {
             std::thread::sleep(Duration::from_millis(500));
         }
 
-        let mon_out = match mon_id.as_deref() {
-            Some(id) => match self.mon_stop(task.dst.side, id) {
-                Ok(output) => Some(output),
+        let mon_out = match mon_id {
+            Some((id, start_offset_ms)) => match self.mon_stop(task.dst.side, &id) {
+                Ok(mut output) => {
+                    align_monitor_samples(&mut output, start_offset_ms);
+                    Some(output)
+                }
                 Err(error) => {
-                    logln(&format!("    (CTS 网卡监控停止失败: {error})"));
+                    let detail = format!("CTS 接收端网卡监控停止失败: {error}");
+                    logln(&format!("    ({detail})"));
+                    monitor_issue = Some(CtsMonitorIssue {
+                        code: "CTSTRAFFIC_MONITOR_STOP_FAILED".into(),
+                        detail,
+                        setup_error: false,
+                        affects_verdict: true,
+                    });
                     None
                 }
             },
@@ -2481,28 +2496,19 @@ impl Ctx {
             );
         };
         let selected = &attempts[selected_idx];
-        let first_traffic_start_ms = attempts
-            .iter()
-            .find(|attempt| attempt.full_attempt)
-            .map(|attempt| attempt.traffic_window.start_ms)
-            .unwrap_or(selected.traffic_window.start_ms);
+        if monitor_issue.is_none() {
+            monitor_issue = mon_out
+                .as_ref()
+                .and_then(|output| cts_monitor_runtime_issue(output, &selected.traffic_window));
+        }
+        let baseline_cutoff_ms = cts_baseline_cutoff_ms(&attempts, selected);
         let rx_stats = mon_out
             .as_ref()
             .map(|output| {
-                monitor_rate_stats(
-                    output,
-                    &selected.traffic_window,
-                    true,
-                    first_traffic_start_ms,
-                )
+                monitor_rate_stats(output, &selected.traffic_window, true, baseline_cutoff_ms)
             })
             .unwrap_or_default();
-        let rx_avg = rx_stats.avg_mbps.or_else(|| {
-            mon_out
-                .as_ref()
-                .filter(|output| output.samples.is_empty() && attempts.len() == 1)
-                .map(|output| output.avg_mbps)
-        });
+        let rx_avg = rx_stats.avg_mbps;
         let nic_samples = mon_out
             .as_ref()
             .map(|output| {
@@ -2625,6 +2631,19 @@ impl Ctx {
             cts_runtime_failure_verdict(selected, runtime_errors, client_expected_completion)
         {
             runtime_failure
+        } else if let Some(monitor_verdict) =
+            monitor_issue.as_ref().and_then(cts_monitor_issue_verdict)
+        {
+            monitor_verdict
+        } else if !selected.traffic_window.complete {
+            (
+                Verdict::NotEvaluated,
+                "CTSTRAFFIC_EFFECTIVE_WINDOW_SHORT".to_string(),
+                format!(
+                    "CTS 真实流量事件窗口仅 {:.3}s，短于要求的 {}s；未把启动、握手、轮询或清理时间计入有效窗口",
+                    selected.traffic_window.available_secs, task.duration
+                ),
+            )
         } else if required_streams > requested_streams {
             (
                 Verdict::NotEvaluated,
@@ -2705,11 +2724,16 @@ impl Ctx {
                 ),
             )
         };
-        let raw_error = if reason_code.is_empty() {
-            String::new()
-        } else {
-            reason_detail.clone()
-        };
+        let mut raw_diagnostics = Vec::new();
+        if !reason_code.is_empty() {
+            raw_diagnostics.push(format!("[{reason_code}] {reason_detail}"));
+        }
+        if let Some(issue) = &monitor_issue {
+            if issue.code != reason_code {
+                raw_diagnostics.push(format!("[{}] {}", issue.code, issue.detail));
+            }
+        }
+        let raw_error = raw_diagnostics.join("；");
         let raw_log = self.save_ctstraffic_raw_record(
             lifecycle.owner_id,
             lidx,
@@ -2736,6 +2760,16 @@ impl Ctx {
             active_streams,
             task.streams
         ));
+        let mut raws = vec![(
+            format!("ctsTraffic{} 全部尝试输出", fmt_tag(tag)),
+            format_ctstraffic_attempts(&server_cmd, &attempts, &raw_error),
+        )];
+        if let Some(issue) = &monitor_issue {
+            raws.push((
+                "CTS 接收端网卡监控错误".into(),
+                format!("[{}] {}", issue.code, issue.detail),
+            ));
+        }
         let idx = self.push_row(Row {
             sort_key: (useq, lidx, 0, 0),
             time,
@@ -2794,10 +2828,7 @@ impl Ctx {
             sample_coverage: Some(rx_stats.coverage),
             screenshot_master,
             screenshot_agent,
-            raws: vec![(
-                format!("ctsTraffic{} 全部尝试输出", fmt_tag(tag)),
-                format_ctstraffic_attempts(&server_cmd, &attempts, &raw_error),
-            )],
+            raws,
             ..Default::default()
         });
         LegOutcome {
@@ -4643,6 +4674,216 @@ fn cts_attempt_budget(configured_retries: usize, strict_single_udp: bool) -> usi
     }
 }
 
+fn cts_baseline_cutoff_ms(attempts: &[CtsAttemptRun], selected: &CtsAttemptRun) -> u64 {
+    attempts
+        .iter()
+        .flat_map(|attempt| attempt.events.iter())
+        .filter(|event| event.kind == IperfEventKind::Started)
+        .map(|event| event.elapsed_ms)
+        .min()
+        .unwrap_or(selected.traffic_window.start_ms)
+}
+
+fn midpoint_ms(before_ms: u64, after_ms: u64) -> u64 {
+    before_ms.saturating_add(after_ms.saturating_sub(before_ms) / 2)
+}
+
+fn remote_job_origin_ms(response_elapsed_ms: u64, remote_elapsed_ms: u64) -> u64 {
+    let latest_start_ms = if remote_elapsed_ms > 0 {
+        response_elapsed_ms.saturating_sub(remote_elapsed_ms)
+    } else {
+        response_elapsed_ms
+    };
+    midpoint_ms(0, latest_start_ms)
+}
+
+fn align_monitor_samples(out: &mut MonitorStopOut, start_offset_ms: u64) {
+    for sample in &mut out.samples {
+        sample.elapsed_ms = sample.elapsed_ms.saturating_add(start_offset_ms);
+    }
+}
+
+fn cts_monitor_runtime_issue(
+    out: &MonitorStopOut,
+    window: &EffectiveWindow,
+) -> Option<CtsMonitorIssue> {
+    let mut details = Vec::<String>::new();
+    for error in &out.errors {
+        if !error.trim().is_empty() && !details.iter().any(|detail| detail == error) {
+            details.push(error.clone());
+        }
+    }
+    let mut window_details = Vec::<String>::new();
+    for sample in &out.samples {
+        if sample.valid {
+            continue;
+        }
+        let detail = if sample.error.trim().is_empty() {
+            format!("elapsed={}ms 的监控样本无效", sample.elapsed_ms)
+        } else {
+            sample.error.clone()
+        };
+        if !details.iter().any(|existing| existing == &detail) {
+            details.push(detail.clone());
+        }
+        let sample_start_ms = sample.elapsed_ms.saturating_sub(sample.interval_ms);
+        let overlaps_window = window.end_ms > window.start_ms
+            && sample.interval_ms > 0
+            && sample.elapsed_ms > window.start_ms
+            && sample_start_ms < window.end_ms;
+        if overlaps_window && !window_details.iter().any(|existing| existing == &detail) {
+            window_details.push(detail);
+        }
+    }
+    if out.samples.is_empty() {
+        let mut detail =
+            "CTS 接收端网卡监控未返回可裁剪的采样序列；全生命周期平均值不能用于 CTS 有效流量窗口"
+                .to_string();
+        if !details.is_empty() {
+            detail.push_str(&format!("；监控错误: {}", details.join("；")));
+        }
+        return Some(CtsMonitorIssue {
+            code: "CTSTRAFFIC_MONITOR_NO_SAMPLES".into(),
+            detail,
+            setup_error: false,
+            affects_verdict: true,
+        });
+    }
+    (!details.is_empty()).then(|| {
+        let affects_verdict = !window_details.is_empty();
+        let diagnostic_only_details: Vec<&str> = details
+            .iter()
+            .filter(|detail| !window_details.iter().any(|window| window == *detail))
+            .map(String::as_str)
+            .collect();
+        CtsMonitorIssue {
+            code: "CTSTRAFFIC_MONITOR_RUNTIME_ERROR".into(),
+            detail: if affects_verdict {
+                let mut detail = format!(
+                    "CTS 接收端网卡监控在有效流量窗口内运行异常: {}",
+                    window_details.join("；")
+                );
+                if !diagnostic_only_details.is_empty() {
+                    detail.push_str(&format!(
+                        "；窗口外或无法定位时间的监控异常（仅诊断）: {}",
+                        diagnostic_only_details.join("；")
+                    ));
+                }
+                detail
+            } else {
+                format!(
+                    "CTS 接收端网卡监控在有效流量窗口外记录到异常，不影响本轮主判定: {}",
+                    details.join("；")
+                )
+            },
+            setup_error: false,
+            affects_verdict,
+        }
+    })
+}
+
+fn cts_monitor_issue_verdict(issue: &CtsMonitorIssue) -> Option<(Verdict, String, String)> {
+    issue.affects_verdict.then(|| {
+        (
+            if issue.setup_error {
+                Verdict::SetupError
+            } else {
+                Verdict::NotEvaluated
+            },
+            issue.code.clone(),
+            issue.detail.clone(),
+        )
+    })
+}
+
+fn cts_effective_window(
+    events: &[IperfFlowEvent],
+    required_secs: u64,
+    status_update_ms: u64,
+) -> EffectiveWindow {
+    let required_ms = required_secs.saturating_mul(1_000);
+    let Some(end_ms) = events
+        .iter()
+        .filter(|event| event.kind == IperfEventKind::Ended)
+        .map(|event| event.elapsed_ms)
+        .max()
+    else {
+        return EffectiveWindow {
+            required_secs,
+            ..Default::default()
+        };
+    };
+    let started_ms = events
+        .iter()
+        .filter(|event| event.kind == IperfEventKind::Started && event.elapsed_ms < end_ms)
+        .map(|event| event.elapsed_ms)
+        .max();
+    let attempt_floor = started_ms.unwrap_or(0);
+    let first_traffic_ms = events
+        .iter()
+        .filter(|event| {
+            event.kind == IperfEventKind::Traffic
+                && event.elapsed_ms >= attempt_floor
+                && event.elapsed_ms < end_ms
+                && event.mbps.unwrap_or(0.0) > 0.0
+        })
+        .map(|event| event.elapsed_ms)
+        .min();
+    let connected_ms = events
+        .iter()
+        .filter(|event| {
+            event.kind == IperfEventKind::Connected
+                && event.elapsed_ms >= attempt_floor
+                && event.elapsed_ms < end_ms
+        })
+        .map(|event| event.elapsed_ms)
+        .max();
+    let status_inferred_ms = first_traffic_ms.map(|traffic_ms| {
+        traffic_ms
+            .saturating_sub(status_update_ms)
+            .max(attempt_floor)
+    });
+    let event_start_ms = match (connected_ms, status_inferred_ms) {
+        (Some(connected), Some(status)) => Some(connected.max(status)),
+        (connected, status) => connected.or(status),
+    };
+    let spans_required = |start_ms: u64| {
+        end_ms > start_ms
+            && end_ms
+                .saturating_sub(start_ms)
+                .saturating_add(CTS_TIMELINE_TOLERANCE_MS)
+                >= required_ms
+    };
+
+    // 首条状态行表示前一个 StatusUpdate 周期，通常比 Connection 更接近数据起点。
+    // Total Time、正常退出和疑似块缓冲都不能证明纯数据时长；事件证据不足时
+    // 保守返回短窗口，避免把启动或握手空窗计入 NIC 平均值。
+    let complete_start_ms = event_start_ms
+        .filter(|start_ms| spans_required(*start_ms))
+        .or_else(|| connected_ms.filter(|start_ms| spans_required(*start_ms)));
+    let start_ms = complete_start_ms.unwrap_or_else(|| {
+        first_traffic_ms
+            .or(connected_ms)
+            .or(started_ms)
+            .unwrap_or(end_ms)
+    });
+    let available_ms = end_ms.saturating_sub(start_ms);
+    let complete = complete_start_ms.is_some()
+        && available_ms.saturating_add(CTS_TIMELINE_TOLERANCE_MS) >= required_ms;
+    let scored_end_ms = if complete {
+        start_ms.saturating_add(required_ms).min(end_ms)
+    } else {
+        end_ms
+    };
+    EffectiveWindow {
+        start_ms,
+        end_ms: scored_end_ms,
+        available_secs: available_ms as f64 / 1_000.0,
+        required_secs,
+        complete,
+    }
+}
+
 fn cts_stop_process_evidence(stop: &Result<CtsTrafficStopOut, String>) -> (bool, bool) {
     let result = stop.as_ref().ok().and_then(|output| output.result.as_ref());
     (
@@ -5994,6 +6235,485 @@ mod tests {
         assert_eq!(client.bits_per_second, Some(500_000_000));
         assert_eq!(client.datagram_bytes, Some(1200));
         let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn cts_monitor_and_client_start_delays_share_one_leg_epoch() {
+        let monitor_offset_ms = midpoint_ms(200, 800);
+        assert_eq!(monitor_offset_ms, 500);
+        let client_call_offset_ms = 900;
+        let client_origin_ms = remote_job_origin_ms(900, 300);
+        assert_eq!(client_origin_ms, 300);
+        let client_job_offset_ms = client_call_offset_ms + client_origin_ms;
+        let actual_traffic_start_ms = 2_500;
+        let actual_traffic_end_ms = 12_500;
+        let events = vec![
+            IperfFlowEvent {
+                kind: IperfEventKind::Started,
+                elapsed_ms: client_job_offset_ms,
+                ..Default::default()
+            },
+            IperfFlowEvent {
+                kind: IperfEventKind::Connected,
+                elapsed_ms: client_job_offset_ms + 1_300,
+                ..Default::default()
+            },
+            IperfFlowEvent {
+                kind: IperfEventKind::Traffic,
+                elapsed_ms: client_job_offset_ms + 2_300,
+                mbps: Some(100.0),
+                line: "status".into(),
+            },
+            IperfFlowEvent {
+                kind: IperfEventKind::Ended,
+                elapsed_ms: client_job_offset_ms + 12_300,
+                ..Default::default()
+            },
+        ];
+        let window = cts_effective_window(&events, 10, 1_000);
+        assert_eq!(window.start_ms, 2_500);
+        assert_eq!(window.end_ms, 12_500);
+        assert_eq!(window.available_secs, 11.0);
+        assert!(window.complete);
+
+        let mut monitor = MonitorStopOut {
+            samples: (1..=14)
+                .map(|second| {
+                    let remote_end_ms = second * 1_000;
+                    let leg_end_ms = remote_end_ms + monitor_offset_ms;
+                    let leg_start_ms = leg_end_ms - 1_000;
+                    MonitorSample {
+                        elapsed_ms: remote_end_ms,
+                        interval_ms: 1_000,
+                        rx_mbps: if leg_start_ms >= actual_traffic_start_ms
+                            && leg_end_ms <= actual_traffic_end_ms
+                        {
+                            100.0
+                        } else {
+                            0.0
+                        },
+                        valid: true,
+                        ..Default::default()
+                    }
+                })
+                .collect(),
+            ..Default::default()
+        };
+        align_monitor_samples(&mut monitor, monitor_offset_ms);
+        let stats = monitor_rate_stats(&monitor, &window, true, window.start_ms);
+        assert_eq!(stats.avg_mbps, Some(100.0));
+        assert_eq!(stats.coverage, 1.0);
+    }
+
+    #[test]
+    fn cts_effective_window_does_not_guess_a_buffered_output_window() {
+        let events = vec![
+            IperfFlowEvent {
+                kind: IperfEventKind::Started,
+                elapsed_ms: 1_000,
+                ..Default::default()
+            },
+            // 模拟 stdout 在进程结束前才刷出 Connection/Status 行。
+            IperfFlowEvent {
+                kind: IperfEventKind::Connected,
+                elapsed_ms: 12_000,
+                ..Default::default()
+            },
+            IperfFlowEvent {
+                kind: IperfEventKind::Traffic,
+                elapsed_ms: 12_100,
+                mbps: Some(100.0),
+                ..Default::default()
+            },
+            IperfFlowEvent {
+                kind: IperfEventKind::Ended,
+                elapsed_ms: 12_500,
+                ..Default::default()
+            },
+        ];
+        let window = cts_effective_window(&events, 10, 1_000);
+        assert_eq!((window.start_ms, window.end_ms), (12_100, 12_500));
+        assert_eq!(window.available_secs, 0.4);
+        assert!(!window.complete);
+    }
+
+    #[test]
+    fn cts_effective_window_does_not_treat_a_long_handshake_as_buffered_output() {
+        let events = vec![
+            IperfFlowEvent {
+                kind: IperfEventKind::Started,
+                elapsed_ms: 1_000,
+                ..Default::default()
+            },
+            IperfFlowEvent {
+                kind: IperfEventKind::Connected,
+                elapsed_ms: 7_000,
+                ..Default::default()
+            },
+            IperfFlowEvent {
+                kind: IperfEventKind::Traffic,
+                elapsed_ms: 8_000,
+                mbps: Some(100.0),
+                ..Default::default()
+            },
+            IperfFlowEvent {
+                kind: IperfEventKind::Ended,
+                elapsed_ms: 13_000,
+                ..Default::default()
+            },
+        ];
+
+        // client 正常结束且有工具测量，也只能证明进程完整运行；Connection/Traffic
+        // 并未集中在退出前，不能用 Ended-duration 把前面的握手空窗扩成数据窗口。
+        let window = cts_effective_window(&events, 10, 1_000);
+        assert_eq!((window.start_ms, window.end_ms), (8_000, 13_000));
+        assert_eq!(window.available_secs, 5.0);
+        assert!(!window.complete);
+    }
+
+    #[test]
+    fn cts_effective_window_prefers_status_period_after_connection_handshake() {
+        let events = vec![
+            IperfFlowEvent {
+                kind: IperfEventKind::Started,
+                elapsed_ms: 1_000,
+                ..Default::default()
+            },
+            IperfFlowEvent {
+                kind: IperfEventKind::Connected,
+                elapsed_ms: 1_500,
+                ..Default::default()
+            },
+            IperfFlowEvent {
+                kind: IperfEventKind::Traffic,
+                elapsed_ms: 3_500,
+                mbps: Some(100.0),
+                ..Default::default()
+            },
+            IperfFlowEvent {
+                kind: IperfEventKind::Ended,
+                elapsed_ms: 12_500,
+                ..Default::default()
+            },
+        ];
+        let window = cts_effective_window(&events, 10, 1_000);
+        assert_eq!((window.start_ms, window.end_ms), (2_500, 12_500));
+        assert!(window.complete);
+    }
+
+    #[test]
+    fn cts_total_time_is_not_used_as_data_window_evidence() {
+        let client_output = "Total Time : 10000 ms.";
+        let server_output = "Total Time : 61273 ms.";
+        let client_duration =
+            ctstraffic::parse_output(client_output, CtsTrafficProtocol::Udp).total_time_ms;
+        let combined = ctstraffic::parse_output(
+            &format!("{client_output}\n{server_output}"),
+            CtsTrafficProtocol::Udp,
+        );
+        assert_eq!(client_duration, Some(10_000));
+        assert_eq!(combined.total_time_ms, Some(61_273));
+
+        let events = vec![
+            IperfFlowEvent {
+                kind: IperfEventKind::Started,
+                elapsed_ms: 1_000,
+                ..Default::default()
+            },
+            IperfFlowEvent {
+                kind: IperfEventKind::Connected,
+                elapsed_ms: 12_000,
+                ..Default::default()
+            },
+            IperfFlowEvent {
+                kind: IperfEventKind::Traffic,
+                elapsed_ms: 12_100,
+                mbps: Some(100.0),
+                ..Default::default()
+            },
+            IperfFlowEvent {
+                kind: IperfEventKind::Ended,
+                elapsed_ms: 12_500,
+                ..Default::default()
+            },
+        ];
+        // client 的 Total Time 与合并摘要中的 server 生命周期都不是纯数据时长，
+        // 不能用来补齐事件证据只有 0.4 秒的窗口。
+        let server_window = cts_effective_window(&events, 10, 1_000);
+        assert_eq!(
+            (server_window.start_ms, server_window.end_ms),
+            (12_100, 12_500)
+        );
+        assert!(!server_window.complete);
+    }
+
+    #[test]
+    fn cts_retry_traffic_is_never_used_as_monitor_baseline() {
+        let mut attempts = vec![
+            ctstraffic_attempt(0, false),
+            ctstraffic_attempt(1, false),
+            ctstraffic_attempt(2, true),
+        ];
+        attempts[0].events = vec![IperfFlowEvent {
+            kind: IperfEventKind::Started,
+            elapsed_ms: 1_000,
+            ..Default::default()
+        }];
+        attempts[0].traffic_window = EffectiveWindow {
+            start_ms: 11_000,
+            end_ms: 12_000,
+            available_secs: 1.0,
+            required_secs: 10,
+            complete: false,
+        };
+        attempts[1].events = vec![IperfFlowEvent {
+            kind: IperfEventKind::Started,
+            elapsed_ms: 13_000,
+            ..Default::default()
+        }];
+        attempts[2].events = vec![IperfFlowEvent {
+            kind: IperfEventKind::Started,
+            elapsed_ms: 22_000,
+            ..Default::default()
+        }];
+        attempts[2].traffic_window = EffectiveWindow {
+            start_ms: 23_000,
+            end_ms: 33_000,
+            available_secs: 10.0,
+            required_secs: 10,
+            complete: true,
+        };
+
+        let selected_idx = select_cts_attempt_index(&attempts).unwrap();
+        let selected = &attempts[selected_idx];
+        assert_eq!(selected_idx, 2);
+        let cutoff_ms = cts_baseline_cutoff_ms(&attempts, selected);
+        assert_eq!(cutoff_ms, 1_000);
+
+        let monitor = MonitorStopOut {
+            samples: (1..=33)
+                .map(|second| MonitorSample {
+                    elapsed_ms: second * 1_000,
+                    interval_ms: 1_000,
+                    rx_mbps: if (2..=11).contains(&second) || (24..=33).contains(&second) {
+                        100.0
+                    } else {
+                        0.0
+                    },
+                    valid: true,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        };
+
+        let stats = monitor_rate_stats(&monitor, &selected.traffic_window, true, cutoff_ms);
+        assert_eq!(stats.avg_mbps, Some(100.0));
+        assert_eq!(stats.coverage, 1.0);
+
+        let wrong_stats = monitor_rate_stats(
+            &monitor,
+            &selected.traffic_window,
+            true,
+            attempts[0].traffic_window.start_ms,
+        );
+        assert_eq!(
+            wrong_stats.avg_mbps,
+            Some(0.0),
+            "若把首轮流量窗口末端之前的样本当 baseline，后续结果会被固定扣低"
+        );
+    }
+
+    #[test]
+    fn cts_effective_window_tolerates_millisecond_rounding_only() {
+        let events = vec![
+            IperfFlowEvent {
+                kind: IperfEventKind::Started,
+                elapsed_ms: 1_000,
+                ..Default::default()
+            },
+            IperfFlowEvent {
+                kind: IperfEventKind::Connected,
+                elapsed_ms: 2_000,
+                ..Default::default()
+            },
+            IperfFlowEvent {
+                kind: IperfEventKind::Traffic,
+                elapsed_ms: 3_000,
+                mbps: Some(100.0),
+                ..Default::default()
+            },
+            IperfFlowEvent {
+                kind: IperfEventKind::Ended,
+                elapsed_ms: 11_999,
+                ..Default::default()
+            },
+        ];
+        let rounded = cts_effective_window(&events, 10, 1_000);
+        assert_eq!((rounded.start_ms, rounded.end_ms), (2_000, 11_999));
+        assert_eq!(rounded.available_secs, 9.999);
+        assert!(rounded.complete);
+
+        let clearly_short = cts_effective_window(
+            &[
+                events[0].clone(),
+                events[1].clone(),
+                events[2].clone(),
+                IperfFlowEvent {
+                    kind: IperfEventKind::Ended,
+                    elapsed_ms: 11_500,
+                    ..Default::default()
+                },
+            ],
+            10,
+            1_000,
+        );
+        assert!(!clearly_short.complete);
+    }
+
+    #[test]
+    fn cts_effective_window_does_not_expand_an_early_exit() {
+        let events = vec![
+            IperfFlowEvent {
+                kind: IperfEventKind::Started,
+                elapsed_ms: 1_000,
+                ..Default::default()
+            },
+            IperfFlowEvent {
+                kind: IperfEventKind::Connected,
+                elapsed_ms: 1_500,
+                ..Default::default()
+            },
+            IperfFlowEvent {
+                kind: IperfEventKind::Traffic,
+                elapsed_ms: 2_500,
+                mbps: Some(100.0),
+                ..Default::default()
+            },
+            IperfFlowEvent {
+                kind: IperfEventKind::Ended,
+                elapsed_ms: 8_000,
+                ..Default::default()
+            },
+        ];
+        let window = cts_effective_window(&events, 10, 1_000);
+        assert_eq!((window.start_ms, window.end_ms), (2_500, 8_000));
+        assert_eq!(window.available_secs, 5.5);
+        assert!(!window.complete);
+    }
+
+    #[test]
+    fn cts_monitor_failures_keep_specific_result_semantics() {
+        let window = EffectiveWindow {
+            start_ms: 0,
+            end_ms: 2_000,
+            available_secs: 2.0,
+            required_secs: 2,
+            complete: true,
+        };
+        let no_samples = MonitorStopOut {
+            avg_mbps: 2_800.0,
+            seconds: 12.0,
+            ..Default::default()
+        };
+        let issue = cts_monitor_runtime_issue(&no_samples, &window).expect("missing samples issue");
+        assert_eq!(issue.code, "CTSTRAFFIC_MONITOR_NO_SAMPLES");
+        assert!(issue.detail.contains("全生命周期平均值不能用于"));
+        assert_eq!(
+            cts_monitor_issue_verdict(&issue).unwrap().0,
+            Verdict::NotEvaluated
+        );
+
+        let runtime = MonitorStopOut {
+            samples: vec![MonitorSample {
+                elapsed_ms: 1_000,
+                interval_ms: 1_000,
+                valid: false,
+                error: "counter reset".into(),
+                ..Default::default()
+            }],
+            errors: vec!["counter reset".into()],
+            ..Default::default()
+        };
+        let issue = cts_monitor_runtime_issue(&runtime, &window).expect("runtime issue");
+        assert_eq!(issue.code, "CTSTRAFFIC_MONITOR_RUNTIME_ERROR");
+        assert!(issue.detail.contains("counter reset"));
+        assert_eq!(
+            cts_monitor_issue_verdict(&issue).unwrap().0,
+            Verdict::NotEvaluated
+        );
+
+        let startup = CtsMonitorIssue {
+            code: "CTSTRAFFIC_MONITOR_START_FAILED".into(),
+            detail: "interface not found".into(),
+            setup_error: true,
+            affects_verdict: true,
+        };
+        let (verdict, code, detail) = cts_monitor_issue_verdict(&startup).unwrap();
+        assert_eq!(verdict, Verdict::SetupError);
+        assert_eq!(code, "CTSTRAFFIC_MONITOR_START_FAILED");
+        assert_eq!(detail, "interface not found");
+    }
+
+    #[test]
+    fn cts_monitor_error_outside_effective_window_is_diagnostic_only() {
+        let window = EffectiveWindow {
+            start_ms: 2_000,
+            end_ms: 12_000,
+            available_secs: 10.0,
+            required_secs: 10,
+            complete: true,
+        };
+        let mut samples = vec![MonitorSample {
+            elapsed_ms: 1_000,
+            interval_ms: 1_000,
+            valid: false,
+            error: "startup read failed".into(),
+            ..Default::default()
+        }];
+        samples.extend((3..=12).map(|second| MonitorSample {
+            elapsed_ms: second * 1_000,
+            interval_ms: 1_000,
+            rx_mbps: 100.0,
+            valid: true,
+            ..Default::default()
+        }));
+        let output = MonitorStopOut {
+            samples,
+            errors: vec!["startup read failed".into()],
+            ..Default::default()
+        };
+
+        let issue = cts_monitor_runtime_issue(&output, &window).expect("diagnostic issue");
+        assert_eq!(issue.code, "CTSTRAFFIC_MONITOR_RUNTIME_ERROR");
+        assert!(issue.detail.contains("不影响本轮主判定"));
+        assert!(cts_monitor_issue_verdict(&issue).is_none());
+
+        let stats = monitor_rate_stats(&output, &window, true, window.start_ms);
+        assert_eq!(stats.avg_mbps, Some(100.0));
+        assert_eq!(stats.coverage, 1.0);
+
+        let errors_only = MonitorStopOut {
+            samples: (3..=12)
+                .map(|second| MonitorSample {
+                    elapsed_ms: second * 1_000,
+                    interval_ms: 1_000,
+                    rx_mbps: 100.0,
+                    valid: true,
+                    ..Default::default()
+                })
+                .collect(),
+            errors: vec!["sampling thread exited after the scored window".into()],
+            ..Default::default()
+        };
+        let issue =
+            cts_monitor_runtime_issue(&errors_only, &window).expect("unlocated diagnostic issue");
+        assert!(issue.detail.contains("不影响本轮主判定"));
+        assert!(cts_monitor_issue_verdict(&issue).is_none());
+        assert_eq!(
+            monitor_rate_stats(&errors_only, &window, true, window.start_ms).coverage,
+            1.0
+        );
     }
 
     #[test]

@@ -65,6 +65,8 @@
     "transports": ["tcp", "udp"],
     "ip": ["v4", "v6"],
     "streams": 5,
+    "tcp_streams": 5,
+    "udp_streams": 3,
     "iperf_duration": 180,
     "rate_mode": "auto",
     "rate_targets_mbps": {

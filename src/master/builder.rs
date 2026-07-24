@@ -5,7 +5,8 @@
 
 use crate::cmd::ctstraffic::parse_size_bytes;
 use crate::config::{
-    Config, CtsTrafficCfg, RateCheckCfg, RateMode, RateTargets, TestSpec, UdpProfile,
+    Config, CtsTrafficCfg, ParsedBandwidth, RateCheckCfg, RateMode, RateTargets, TestSpec,
+    UdpProfile,
 };
 use crate::protocol::{HostInfo, NicInfo};
 use crate::rate;
@@ -68,6 +69,8 @@ pub struct SpecNorm {
     /// v4 / v6
     pub ipvers: Vec<String>,
     pub streams: u32,
+    pub tcp_streams: u32,
+    pub udp_streams: u32,
     pub duration: u64,
     pub ping_count: u32,
     pub payload_sizes: Vec<u32>,
@@ -78,9 +81,58 @@ pub struct SpecNorm {
     pub rate_targets: RateTargets,
     pub rate_check: RateCheckCfg,
     pub ctstraffic: CtsTrafficCfg,
-    /// 配置层中只影响 ctsTraffic 的非法标量参数。保留正常化后的值供
-    /// iperf3/Ping 继续运行，同时让 CTS 生成明确的 SETUP_ERROR 行。
+    /// 配置层中 TCP/UDP 共用的非法 CTS 标量参数。协议流数错误由各自
+    /// 的任务分支根据原始值生成，避免一方错误污染另一方。
     pub ctstraffic_config_error: Option<String>,
+}
+
+impl SpecNorm {
+    fn stream_override(&self, udp: bool) -> u32 {
+        if udp {
+            self.udp_streams
+        } else {
+            self.tcp_streams
+        }
+    }
+
+    fn requested_streams(&self, udp: bool) -> u32 {
+        let protocol_streams = self.stream_override(udp);
+        if protocol_streams > 0 {
+            protocol_streams
+        } else {
+            self.streams
+        }
+    }
+
+    fn effective_streams(&self, udp: bool) -> u32 {
+        self.requested_streams(udp).clamp(1, 32)
+    }
+
+    pub fn effective_tcp_streams(&self) -> u32 {
+        self.effective_streams(false)
+    }
+
+    pub fn effective_udp_streams(&self) -> u32 {
+        self.effective_streams(true)
+    }
+
+    fn stream_config_error(&self, udp: bool) -> Option<String> {
+        let override_value = self.stream_override(udp);
+        let streams = self.requested_streams(udp);
+        (!(1..=32).contains(&streams)).then(|| {
+            let protocol = if udp { "UDP" } else { "TCP" };
+            let source = if override_value > 0 {
+                if udp {
+                    "udp_streams"
+                } else {
+                    "tcp_streams"
+                }
+            } else {
+                "streams"
+            };
+            format!("{protocol} streams 必须在 1..=32，当前为 {streams}（来源 {source}）")
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -427,14 +479,9 @@ pub fn resolve_endpoint(
     })
 }
 
-/// 配置文件 TestSpec -> SpecNorm
-pub(crate) fn ctstraffic_config_error(streams: u32, duration: u64) -> Option<String> {
+/// 返回 TCP/UDP 共用的 CTS 配置错误。协议流数由任务分支按原始值分别校验。
+pub(crate) fn ctstraffic_common_config_error(duration: u64) -> Option<String> {
     let mut errors = Vec::new();
-    if !(1..=32).contains(&streams) {
-        errors.push(format!(
-            "ctsTraffic streams 必须在 1..=32，当前为 {streams}"
-        ));
-    }
     if !(1..=86_400).contains(&duration) {
         errors.push(format!(
             "ctsTraffic 自动化 duration 必须在 1..=86400 秒，当前为 {duration}；无限测试请使用原生命令并手动停止"
@@ -443,6 +490,7 @@ pub(crate) fn ctstraffic_config_error(streams: u32, duration: u64) -> Option<Str
     (!errors.is_empty()).then(|| errors.join("；"))
 }
 
+/// 配置文件 TestSpec -> SpecNorm
 pub fn spec_from_config(
     t: &TestSpec,
     cfg: &Config,
@@ -468,7 +516,9 @@ pub fn spec_from_config(
         kinds: t.kinds.iter().map(|k| k.to_lowercase()).collect(),
         transports: t.transports.iter().map(|k| k.to_lowercase()).collect(),
         ipvers: t.ip.iter().map(|k| k.to_lowercase()).collect(),
-        streams: configured_streams.clamp(1, 32),
+        streams: configured_streams,
+        tcp_streams: t.tcp_streams.unwrap_or(0),
+        udp_streams: t.udp_streams.unwrap_or(0),
         duration: configured_duration.clamp(1, 86400),
         ping_count: t.ping_count.unwrap_or(cfg.ping.count).clamp(1, 100_000),
         payload_sizes: t
@@ -488,29 +538,12 @@ pub fn spec_from_config(
         rate_targets: t.rate_targets_mbps.clone().unwrap_or_default(),
         rate_check: cfg.iperf.rate_check.clone(),
         ctstraffic: cfg.ctstraffic.clone(),
-        ctstraffic_config_error: ctstraffic_config_error(configured_streams, configured_duration),
+        ctstraffic_config_error: ctstraffic_common_config_error(configured_duration),
     })
 }
 
 /// UDP 按整条路径的可信负载上限裁剪流数。
 /// RNDIS 3.7G 协商按约 2.5G，10GUSB 的 4.2G 已知显示 bug 不按 4.2G 裁剪。
-fn allowed_udp_streams(
-    sender: &Endpoint,
-    receiver: &Endpoint,
-    prof: &UdpProfile,
-    want: u32,
-    limit: bool,
-    rate_cfg: &RateCheckCfg,
-) -> u32 {
-    if !limit {
-        return want;
-    }
-    let Some(bw) = prof.bandwidth_mbps() else {
-        return want;
-    };
-    allowed_udp_streams_for_mbps(sender, receiver, bw, want, true, rate_cfg)
-}
-
 fn allowed_udp_streams_for_mbps(
     sender: &Endpoint,
     receiver: &Endpoint,
@@ -788,7 +821,7 @@ fn udp_resume_unit_id_with_schema(
     push_resume_field(
         &mut identity,
         "requested_streams",
-        &spec.streams.to_string(),
+        &spec.requested_streams(true).to_string(),
     );
     push_resume_field(
         &mut identity,
@@ -886,6 +919,9 @@ fn cts_task_config_errors(spec: &SpecNorm, udp: bool) -> Vec<String> {
         .iter()
         .cloned()
         .collect::<Vec<_>>();
+    if let Some(error) = spec.stream_config_error(udp) {
+        errors.push(error);
+    }
     if !(100..=60_000).contains(&spec.ctstraffic.status_update_ms) {
         errors.push(format!(
             "ctsTraffic status_update_ms 必须在 100..=60000，当前为 {}",
@@ -903,72 +939,8 @@ fn cts_task_config_errors(spec: &SpecNorm, udp: bool) -> Vec<String> {
     errors
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct CtsUdpBandwidth {
-    mbps: f64,
-    bits_per_second: u64,
-}
-
-/// ctsTraffic 的带宽格式必须完整匹配：十进制数值后只能跟可选的
-/// k/m/g 或 kbps/mbps/gbps。裸数按 Mbps 解释；逗号可作小数点。
-fn cts_udp_bandwidth(profile: &UdpProfile) -> Result<CtsUdpBandwidth, String> {
-    let raw = profile.bandwidth.trim();
-    let lower = raw.to_ascii_lowercase();
-    let (number, multiplier) = [
-        ("kbps", 0.001),
-        ("mbps", 1.0),
-        ("gbps", 1_000.0),
-        ("k", 0.001),
-        ("m", 1.0),
-        ("g", 1_000.0),
-    ]
-    .into_iter()
-    .find_map(|(suffix, multiplier)| {
-        lower
-            .strip_suffix(suffix)
-            .map(|number| (number, multiplier))
-    })
-    .unwrap_or((lower.as_str(), 1.0));
-
-    let mut separator_seen = false;
-    let mut digits_before_separator = 0usize;
-    let mut digits_after_separator = 0usize;
-    for byte in number.bytes() {
-        if byte.is_ascii_digit() {
-            if separator_seen {
-                digits_after_separator += 1;
-            } else {
-                digits_before_separator += 1;
-            }
-        } else if matches!(byte, b'.' | b',') && !separator_seen {
-            separator_seen = true;
-        } else {
-            return Err(format!("无法解析 UDP 带宽 {}", profile.bandwidth));
-        }
-    }
-    if digits_before_separator == 0 || (separator_seen && digits_after_separator == 0) {
-        return Err(format!("无法解析 UDP 带宽 {}", profile.bandwidth));
-    }
-
-    let normalized = number.replace(',', ".");
-    let value = normalized
-        .parse::<f64>()
-        .map_err(|_| format!("无法解析 UDP 带宽 {}", profile.bandwidth))?;
-    let requested_mbps = value * multiplier;
-    let bps = requested_mbps * 1_000_000.0;
-    if !bps.is_finite() || bps < 1.0 || bps > u64::MAX as f64 {
-        return Err(format!(
-            "UDP 带宽超出 ctsTraffic 范围: {}",
-            profile.bandwidth
-        ));
-    }
-    let bits_per_second = bps.round() as u64;
-    Ok(CtsUdpBandwidth {
-        // 后续的流数裁剪、offered rate 和实际命令必须使用同一个取整后的
-        // BitsPerSecond，避免小数边界让计划负载与真实 CTS 参数不一致。
-        mbps: bits_per_second as f64 / 1_000_000.0,
-        bits_per_second,
-    })
+fn cts_udp_bandwidth(profile: &UdpProfile) -> Result<ParsedBandwidth, String> {
+    profile.parsed_bandwidth()
 }
 
 fn cts_datagram_bytes(profile: &UdpProfile) -> Result<Option<u32>, String> {
@@ -1029,8 +1001,14 @@ fn cts_task_identity(identity: &mut String, prefix: &str, task: &CtsTrafficTask)
     // port 是临时资源，故意不进入 resume ID。
 }
 
-fn cts_resume_unit_id(spec: &SpecNorm, ip_tag: &str, direction: &str, legs: &[Leg]) -> String {
-    let mut identity = "ctstraffic_v1".to_string();
+fn cts_resume_unit_id_with_schema(
+    schema: &str,
+    spec: &SpecNorm,
+    ip_tag: &str,
+    direction: &str,
+    legs: &[Leg],
+) -> String {
+    let mut identity = schema.to_string();
     push_resume_field(&mut identity, "ip", ip_tag);
     push_resume_field(&mut identity, "direction", direction);
     push_resume_field(
@@ -1050,6 +1028,11 @@ fn cts_resume_unit_id(spec: &SpecNorm, ip_tag: &str, direction: &str, legs: &[Le
         }
     }
     md5_hex(&identity)
+}
+
+fn cts_resume_unit_id(spec: &SpecNorm, ip_tag: &str, direction: &str, legs: &[Leg]) -> String {
+    // v2 使时间轴对齐、真实流量窗口和 monitor 错误语义上线前的 PASS 失效。
+    cts_resume_unit_id_with_schema("ctstraffic_v2", spec, ip_tag, direction, legs)
 }
 
 /// 生成全部任务单元。返回 (units, 提示信息列表)
@@ -1096,9 +1079,17 @@ pub fn build_units(
                     } else {
                         for tr in &spec.transports {
                             if tr == "tcp" {
+                                if let Some(error) = spec.stream_config_error(false) {
+                                    notices.push(format!(
+                                        "{} 的 iperf TCP 流数配置非法，将按兼容范围使用 {} 流: {error}",
+                                        spec.name,
+                                        spec.effective_tcp_streams()
+                                    ));
+                                }
+                                let tcp_streams = spec.effective_tcp_streams();
                                 for w in &spec.tcp_windows {
-                                    let pname = format!("tcp_w{}_P{}", w, spec.streams);
-                                    let plabel = format!("TCP -w {} -P {}", w, spec.streams);
+                                    let pname = format!("tcp_w{}_P{}", w, tcp_streams);
+                                    let plabel = format!("TCP -w {} -P {}", w, tcp_streams);
                                     let mut legs = Vec::new();
                                     for (s, d, tag) in &pairs {
                                         let t = IperfTask {
@@ -1114,7 +1105,7 @@ pub fn build_units(
                                                 "-w".into(),
                                                 w.clone(),
                                                 "-P".into(),
-                                                spec.streams.to_string(),
+                                                tcp_streams.to_string(),
                                             ],
                                             stream_idx: 0,
                                             rate_mode: spec.rate_mode,
@@ -1151,16 +1142,36 @@ pub fn build_units(
                                     });
                                 }
                             } else if tr == "udp" {
+                                if let Some(error) = spec.stream_config_error(true) {
+                                    notices.push(format!(
+                                        "{} 的 iperf UDP 流数配置非法，将按兼容范围使用 {} 流: {error}",
+                                        spec.name,
+                                        spec.effective_udp_streams()
+                                    ));
+                                }
+                                let udp_streams = spec.effective_udp_streams();
                                 for prof in &spec.udp_profiles {
+                                    let parsed_bandwidth = match prof.parsed_bandwidth() {
+                                        Ok(value) => value,
+                                        Err(error) => {
+                                            notices.push(format!(
+                                                "跳过 {} 的 iperf UDP profile {}：{error}；带宽格式非法，未生成任务",
+                                                spec.name,
+                                                prof.label()
+                                            ));
+                                            continue;
+                                        }
+                                    };
+                                    let iperf_bandwidth = parsed_bandwidth.iperf_arg();
                                     // 每个方向腿按各自发送口限流
                                     let mut leg_streams: Vec<u32> = Vec::new();
                                     let mut blocked: Option<String> = None;
                                     for (s, _d, _tag) in &pairs {
-                                        let n = allowed_udp_streams(
+                                        let n = allowed_udp_streams_for_mbps(
                                             s,
                                             _d,
-                                            prof,
-                                            spec.streams,
+                                            parsed_bandwidth.mbps,
+                                            udp_streams,
                                             spec.udp_limit,
                                             &spec.rate_check,
                                         );
@@ -1186,7 +1197,7 @@ pub fn build_units(
                                         let n = *n;
                                         max_n = max_n.max(n);
                                         let mut extra: Vec<String> =
-                                            vec!["-b".into(), prof.bandwidth.clone()];
+                                            vec!["-b".into(), iperf_bandwidth.clone()];
                                         if let Some(l) = &prof.length {
                                             extra.push("-l".into());
                                             extra.push(l.clone());
@@ -1207,7 +1218,7 @@ pub fn build_units(
                                         );
                                         let effective_mode =
                                             rate::effective_mode(spec.rate_mode, target);
-                                        let offered_mbps = prof.bandwidth_mbps();
+                                        let offered_mbps = Some(parsed_bandwidth.mbps);
                                         let mk = |idx: usize, port: u16| IperfTask {
                                             v6,
                                             udp: true,
@@ -1289,6 +1300,7 @@ pub fn build_units(
                     let mut topology_notice_emitted = false;
                     for transport in &spec.transports {
                         if transport == "tcp" {
+                            let tcp_streams = spec.effective_tcp_streams();
                             for window in &spec.tcp_windows {
                                 let mut setup_errors = cts_task_config_errors(spec, false);
                                 let mut window_invalid = false;
@@ -1334,10 +1346,10 @@ pub fn build_units(
                                     } else {
                                         window
                                     },
-                                    spec.streams
+                                    tcp_streams
                                 );
                                 let profile_label =
-                                    format!("CTS TCP {window_label} ×{}连接", spec.streams);
+                                    format!("CTS TCP {window_label} ×{}连接", tcp_streams);
                                 let mut legs = Vec::new();
                                 for (src, dst, tag) in &pairs {
                                     legs.push(Leg {
@@ -1351,7 +1363,7 @@ pub fn build_units(
                                             dst: (*dst).clone(),
                                             port: alloc_port(next_port),
                                             duration: spec.duration,
-                                            streams: spec.streams,
+                                            streams: tcp_streams,
                                             window_bytes,
                                             bits_per_second: None,
                                             datagram_bytes: None,
@@ -1387,6 +1399,7 @@ pub fn build_units(
                                 });
                             }
                         } else if transport == "udp" {
+                            let udp_streams = spec.effective_udp_streams();
                             for profile in &spec.udp_profiles {
                                 let mut setup_errors = cts_task_config_errors(spec, true);
                                 let window_bytes = match profile
@@ -1442,7 +1455,7 @@ pub fn build_units(
                                 let mut has_single_stream_leg = false;
                                 for (src, dst, tag) in &pairs {
                                     let streams = if setup_error.is_some() {
-                                        spec.streams
+                                        udp_streams
                                     } else {
                                         allowed_udp_streams_for_mbps(
                                             src,
@@ -1450,7 +1463,7 @@ pub fn build_units(
                                             bandwidth
                                                 .expect("合法 CTS UDP 配置必须有严格带宽值")
                                                 .mbps,
-                                            spec.streams,
+                                            udp_streams,
                                             spec.udp_limit,
                                             &spec.rate_check,
                                         )
@@ -1628,6 +1641,14 @@ mod tests {
         }
     }
 
+    fn host(hostname: &str, name: &str, role: &str, ip: &str) -> HostInfo {
+        HostInfo {
+            hostname: hostname.into(),
+            os: "test".into(),
+            interfaces: vec![nic(name, role, ip, 2500)],
+        }
+    }
+
     fn base_spec() -> SpecNorm {
         SpecNorm {
             name: "t".into(),
@@ -1638,6 +1659,8 @@ mod tests {
             transports: vec!["tcp".into()],
             ipvers: vec!["v4".into()],
             streams: 1,
+            tcp_streams: 0,
+            udp_streams: 0,
             duration: 10,
             ping_count: 4,
             payload_sizes: vec![32],
@@ -1682,6 +1705,180 @@ mod tests {
             }
             _ => panic!("wrong kind"),
         }
+    }
+
+    #[test]
+    fn tests_config_maps_protocol_streams_and_builds_iperf_and_cts_independently() {
+        let test: TestSpec = serde_json::from_str(
+            r#"{
+                "name": "split-streams",
+                "src": "master:SGMII2.5G",
+                "dst": "agent:SGMII2.5G",
+                "kinds": ["iperf", "ctstraffic"],
+                "transports": ["tcp", "udp"],
+                "streams": 1,
+                "tcp_streams": 4,
+                "udp_streams": 2,
+                "tcp_windows": ["64k"],
+                "udp_profiles": [{"bandwidth": "500m"}]
+            }"#,
+        )
+        .unwrap();
+        let cfg = Config {
+            limit_udp_by_link_speed: false,
+            ..Config::default()
+        };
+        let spec = spec_from_config(
+            &test,
+            &cfg,
+            &host("master", "m0", "SGMII2.5G", "192.168.1.2"),
+            &host("agent", "a0", "SGMII2.5G", "192.168.1.3"),
+        )
+        .unwrap();
+
+        assert_eq!(spec.streams, 1);
+        assert_eq!(spec.tcp_streams, 4);
+        assert_eq!(spec.udp_streams, 2);
+        assert_eq!(spec.effective_tcp_streams(), 4);
+        assert_eq!(spec.effective_udp_streams(), 2);
+
+        let mut port = PORT_BASE;
+        let (units, notices) = build_units(&[spec], true, &mut port);
+        assert!(notices.is_empty());
+        assert_eq!(units.len(), 4);
+
+        let mut saw_iperf_tcp = false;
+        let mut saw_iperf_udp = false;
+        let mut saw_cts_tcp = false;
+        let mut saw_cts_udp = false;
+        for leg in units.iter().flat_map(|unit| &unit.legs) {
+            match &leg.kind {
+                LegKind::IperfSingle(task) if !task.udp => {
+                    assert_eq!(task.extra, vec!["-w", "64k", "-P", "4"]);
+                    saw_iperf_tcp = true;
+                }
+                LegKind::IperfGroup { streams, .. } => {
+                    assert_eq!(streams.len(), 2);
+                    assert!(streams.iter().all(|task| task.udp));
+                    saw_iperf_udp = true;
+                }
+                LegKind::CtsTraffic(task) if !task.udp => {
+                    assert_eq!(task.streams, 4);
+                    assert_eq!(task.setup_error, None);
+                    saw_cts_tcp = true;
+                }
+                LegKind::CtsTraffic(task) => {
+                    assert_eq!(task.streams, 2);
+                    assert_eq!(task.setup_error, None);
+                    saw_cts_udp = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_iperf_tcp && saw_iperf_udp && saw_cts_tcp && saw_cts_udp);
+    }
+
+    #[test]
+    fn tests_config_zero_or_missing_protocol_streams_fall_back_to_legacy_streams() {
+        let test: TestSpec = serde_json::from_str(
+            r#"{
+                "src": "master:SGMII2.5G",
+                "dst": "agent:SGMII2.5G",
+                "streams": 6,
+                "tcp_streams": 0,
+                "transports": ["tcp", "udp"]
+            }"#,
+        )
+        .unwrap();
+        let spec = spec_from_config(
+            &test,
+            &Config::default(),
+            &host("master", "m0", "SGMII2.5G", "192.168.1.2"),
+            &host("agent", "a0", "SGMII2.5G", "192.168.1.3"),
+        )
+        .unwrap();
+
+        assert_eq!(test.tcp_streams, Some(0));
+        assert_eq!(test.udp_streams, None);
+        assert_eq!(spec.effective_tcp_streams(), 6);
+        assert_eq!(spec.effective_udp_streams(), 6);
+        assert_eq!(spec.stream_config_error(false), None);
+        assert_eq!(spec.stream_config_error(true), None);
+    }
+
+    #[test]
+    fn protocol_stream_errors_are_selected_per_transport_for_cts() {
+        let mut spec = cts_spec("tcp");
+        spec.transports = vec!["tcp".into(), "udp".into()];
+        spec.tcp_streams = 33;
+        spec.udp_streams = 2;
+        spec.udp_limit = false;
+        let mut port = PORT_BASE;
+        let (units, notices) = build_units(&[spec], true, &mut port);
+
+        assert_eq!(units.len(), 2);
+        assert_eq!(
+            notices
+                .iter()
+                .filter(|notice| notice.contains("SETUP_ERROR"))
+                .count(),
+            1,
+            "TCP 的非法覆盖值不能污染 UDP"
+        );
+        let mut saw_tcp = false;
+        let mut saw_udp = false;
+        for leg in units.iter().flat_map(|unit| &unit.legs) {
+            let LegKind::CtsTraffic(task) = &leg.kind else {
+                continue;
+            };
+            if task.udp {
+                assert_eq!(task.streams, 2);
+                assert_eq!(task.setup_error, None);
+                saw_udp = true;
+            } else {
+                assert_eq!(task.streams, 32, "执行值仍需保持在 CTS 支持范围内");
+                let error = task.setup_error.as_deref().unwrap();
+                assert!(error.contains("TCP streams 必须在 1..=32"));
+                assert!(error.contains("当前为 33"));
+                assert!(error.contains("tcp_streams"));
+                saw_tcp = true;
+            }
+        }
+        assert!(saw_tcp && saw_udp);
+    }
+
+    #[test]
+    fn valid_protocol_override_ignores_invalid_legacy_streams_for_cts() {
+        let mut spec = cts_spec("tcp");
+        spec.streams = 0;
+        spec.tcp_streams = 4;
+        let mut port = PORT_BASE;
+        let (units, notices) = build_units(&[spec], true, &mut port);
+
+        assert!(notices.is_empty());
+        assert_eq!(units.len(), 1);
+        let LegKind::CtsTraffic(task) = &units[0].legs[0].kind else {
+            panic!("expect CTS TCP task");
+        };
+        assert_eq!(task.streams, 4);
+        assert_eq!(task.setup_error, None);
+    }
+
+    #[test]
+    fn invalid_iperf_streams_are_reported_and_normalized_for_execution() {
+        let mut spec = base_spec();
+        spec.tcp_streams = 33;
+        let mut port = PORT_BASE;
+        let (units, notices) = build_units(&[spec], true, &mut port);
+
+        assert_eq!(units.len(), 1);
+        assert!(notices.iter().any(|notice| {
+            notice.contains("iperf TCP 流数配置非法") && notice.contains("使用 32 流")
+        }));
+        let LegKind::IperfSingle(task) = &units[0].legs[0].kind else {
+            panic!("expect iperf TCP task");
+        };
+        assert_eq!(task.extra, vec!["-w", "64k", "-P", "32"]);
     }
 
     #[test]
@@ -1747,6 +1944,8 @@ mod tests {
             ("500Mbps", 500.0, 500_000_000),
             ("1,5g", 1_500.0, 1_500_000_000),
             ("1.5GbPs", 1_500.0, 1_500_000_000),
+            ("2.8G", 2_800.0, 2_800_000_000),
+            ("2.8Gbps", 2_800.0, 2_800_000_000),
         ] {
             let parsed = cts_udp_bandwidth(&UdpProfile::bw(value)).unwrap();
             assert_eq!(parsed.mbps, expected_mbps, "value={value}");
@@ -1757,6 +1956,7 @@ mod tests {
             "",
             "500mbps trailing",
             "500mbpsx",
+            "2.8oopsGbps",
             "1e3m",
             "1mkbps",
             "1gmbps",
@@ -1841,8 +2041,8 @@ mod tests {
             length: Some("70000".into()),
             window: Some("0".into()),
         }];
-        udp.ctstraffic_config_error = ctstraffic_config_error(0, 0);
-        udp.streams = 1;
+        udp.ctstraffic_config_error = ctstraffic_common_config_error(0);
+        udp.streams = 0;
         udp.duration = 1;
         let mut port = PORT_BASE;
         let (udp_units, udp_notices) = build_units(&[udp], true, &mut port);
@@ -1980,6 +2180,21 @@ mod tests {
         let mut base = cts_spec("udp");
         base.udp_profiles[0].window = Some("1m".into());
         let base_id = build_single_cts_id(base.clone(), PORT_BASE);
+        let mut legacy_port = PORT_BASE;
+        let (legacy_units, legacy_notices) =
+            build_units(std::slice::from_ref(&base), true, &mut legacy_port);
+        assert!(legacy_notices.is_empty());
+        let legacy_v1_id = cts_resume_unit_id_with_schema(
+            "ctstraffic_v1",
+            &base,
+            "V4",
+            "ab",
+            &legacy_units[0].legs,
+        );
+        assert_ne!(
+            base_id, legacy_v1_id,
+            "CTS 统计窗口语义变化后必须让 v1 PASS 无条件失效"
+        );
         assert_eq!(
             base_id,
             build_single_cts_id(base.clone(), PORT_BASE + 1000),
@@ -2082,9 +2297,91 @@ mod tests {
         let LegKind::IperfSingle(task) = &units[0].legs[0].kind else {
             panic!("expect single UDP task");
         };
-        assert_eq!(task.extra, vec!["-b", "1000m", "-l", "64", "-w", "4m"]);
+        assert_eq!(task.extra, vec!["-b", "1000000000", "-l", "64", "-w", "4m"]);
         assert_eq!(task.profile_name, "udp_b1000m_l64_w4m");
         assert_eq!(task.profile_label, "UDP -b 1000m -l 64 -w 4m");
+    }
+
+    #[test]
+    fn udp_length_14k_maps_to_iperf_and_cts_without_unit_drift() {
+        let mut spec = base_spec();
+        spec.kinds = vec!["iperf".into(), "ctstraffic".into()];
+        spec.transports = vec!["udp".into()];
+        spec.udp_limit = false;
+        spec.udp_profiles = vec![UdpProfile {
+            bandwidth: "500m".into(),
+            length: Some("14k".into()),
+            window: None,
+        }];
+
+        let mut port = PORT_BASE;
+        let (units, notices) = build_units(&[spec], true, &mut port);
+        assert!(notices.is_empty());
+        assert_eq!(units.len(), 2);
+
+        let iperf = units
+            .iter()
+            .flat_map(|unit| &unit.legs)
+            .find_map(|leg| match &leg.kind {
+                LegKind::IperfSingle(task) => Some(task),
+                _ => None,
+            })
+            .expect("iperf UDP task");
+        assert_eq!(iperf.extra, vec!["-b", "500000000", "-l", "14k"]);
+
+        let cts = units
+            .iter()
+            .flat_map(|unit| &unit.legs)
+            .find_map(|leg| match &leg.kind {
+                LegKind::CtsTraffic(task) => Some(task),
+                _ => None,
+            })
+            .expect("CTS UDP task");
+        assert_eq!(cts.datagram_bytes, Some(14 * 1024));
+        assert_eq!(cts.setup_error, None);
+    }
+
+    #[test]
+    fn iperf_udp_canonicalizes_gigabit_suffixes_to_exact_bps() {
+        for configured in ["2.8G", "2.8Gbps"] {
+            let mut spec = base_spec();
+            spec.transports = vec!["udp".into()];
+            spec.udp_limit = false;
+            spec.udp_profiles = vec![UdpProfile::bw(configured)];
+
+            let mut port = PORT_BASE;
+            let (units, notices) = build_units(&[spec], true, &mut port);
+            assert!(notices.is_empty());
+            let LegKind::IperfSingle(task) = &units[0].legs[0].kind else {
+                panic!("expect single UDP task");
+            };
+            assert_eq!(task.extra, vec!["-b", "2800000000"]);
+            assert_eq!(task.offered_mbps, Some(2800.0));
+            assert!(task.profile_name.contains(configured));
+            assert!(task.profile_label.contains(configured));
+        }
+    }
+
+    #[test]
+    fn invalid_iperf_udp_bandwidth_skips_profile_before_execution() {
+        for invalid in ["2.8oopsGbps", "2.8Gjunk"] {
+            let mut spec = base_spec();
+            spec.transports = vec!["udp".into()];
+            spec.streams = 4;
+            spec.udp_profiles = vec![UdpProfile::bw(invalid)];
+
+            let mut port = PORT_BASE;
+            let (units, notices) = build_units(&[spec], true, &mut port);
+            assert!(units.is_empty(), "非法带宽不能生成 iperf 任务");
+            assert_eq!(port, PORT_BASE, "跳过 profile 不应消耗端口");
+            assert!(notices.iter().any(|notice| {
+                notice.contains("跳过")
+                    && notice.contains("iperf UDP profile")
+                    && notice.contains(invalid)
+                    && notice.contains("带宽格式非法")
+                    && notice.contains("未生成任务")
+            }));
+        }
     }
 
     #[test]
@@ -2231,6 +2528,33 @@ mod tests {
         spec.streams = 20;
         spec.udp_profiles = vec![UdpProfile::bw("500m")];
         spec
+    }
+
+    #[test]
+    fn udp_resume_id_is_independent_of_tcp_stream_configuration() {
+        let mut base = evb_udp_spec();
+        base.streams = 20;
+        base.tcp_streams = 20;
+        base.udp_streams = 4;
+        let base_id = build_single_udp_id(base.clone(), PORT_BASE);
+
+        let mut tcp_changed = base.clone();
+        tcp_changed.tcp_streams = 7;
+        // 模拟交互路径中 legacy streams 曾取两种协议的最大值。
+        tcp_changed.streams = tcp_changed.tcp_streams.max(tcp_changed.udp_streams);
+        assert_eq!(
+            base_id,
+            build_single_udp_id(tcp_changed, PORT_BASE),
+            "只改变 TCP 流数不能让未变化的 UDP PASS 缓存失效"
+        );
+
+        let mut udp_changed = base;
+        udp_changed.udp_streams = 3;
+        assert_ne!(
+            base_id,
+            build_single_udp_id(udp_changed, PORT_BASE),
+            "UDP 请求流数变化必须进入 resume identity"
+        );
     }
 
     #[test]

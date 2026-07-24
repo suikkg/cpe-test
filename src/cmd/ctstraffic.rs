@@ -556,6 +556,7 @@ mod tests {
 
     #[test]
     fn parses_friendly_socket_buffer_sizes() {
+        assert_eq!(parse_size_bytes("14k").unwrap(), 14 * 1024);
         assert_eq!(parse_size_bytes("64k").unwrap(), 65_536);
         assert_eq!(parse_size_bytes("1m").unwrap(), 1_048_576);
         assert_eq!(parse_size_bytes("1.5m").unwrap(), 1_572_864);

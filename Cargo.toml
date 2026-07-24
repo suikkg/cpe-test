@@ -1,6 +1,6 @@
 [package]
 name = "cpe_test"
-version = "4.2.1"
+version = "4.2.2"
 edition = "2021"
 description = "CPE 子网测试工具：双机自动化 ping、iperf3 与 Windows ctsTraffic 吞吐测试"
 license = "MIT"

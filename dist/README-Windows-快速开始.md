@@ -1,8 +1,8 @@
 # CPE 测试工具 Windows 包
 
-> 如果你从 Git 仓库下载的是 `cpe_test-v4.2.1-windows-config-docs.zip`，那是一份只含
+> 如果你从 Git 仓库下载的是 `cpe_test-v4.2.2-windows-config-docs.zip`，那是一份只含
 > 配置、文档和启动脚本的资料包，不含 `cpe_test.exe`、`ctsTraffic.exe` 或 iperf3。
-> 开箱即用请下载 GitHub Release 的 `cpe_test-v4.2.1-windows-x86_64.zip`；也可以自行
+> 开箱即用请下载 GitHub Release 的 `cpe_test-v4.2.2-windows-x86_64.zip`；也可以自行
 > 编译程序后，把资料包内容与 exe 放到同一目录。
 
 将这个文件夹完整复制到**主控机**和**辅测机**。两台电脑必须使用同一个
@@ -11,7 +11,7 @@
 ## 包内文件与系统要求
 
 - `cpe_test.exe`：主控、agent、网卡扫描和监控共用的程序。
-- `ctsTraffic.exe`：Microsoft ctsTraffic 2.0.4.0 x64，随官方 v4.2.1 Windows 包固定捆绑并校验；仅支持 Windows 10 或更高版本。
+- `ctsTraffic.exe`：Microsoft ctsTraffic 2.0.4.0 x64，随官方 v4.2.2 Windows 包固定捆绑并校验；仅支持 Windows 10 或更高版本。
 - `start_*.bat`：双击启动脚本。
 - `configs\`：SGMII、Wi-Fi、10GUSB 等具名配置。
 - `THIRD_PARTY_NOTICES.md` 及 CTS/WIL 许可文件：第三方归属和许可说明。
@@ -69,12 +69,14 @@ JSON 标准不支持注释，不能在一个 JSON 内可靠地“取消注释”
 ### CTS 参数语义
 
 - 配置中的 `src → dst` 始终表示数据方向。TCP 是 `src` client 发送、`dst` server 接收；UDP MediaStream 是 `src` server 发送、`dst` client 接收。程序自动处理 UDP 角色反转，报告方向不变。
-- `streams` 映射为 `Connections:N`；一个 CTS 进程承载 N 条连接。CTS 自动化要求 `streams` 在 `1..=32`；配置文件超出范围会记录 `SETUP_ERROR / CTSTRAFFIC_ARGS_INVALID`，交互式输入则要求重输，不会静默修正。
+- TCP 使用 `tcp_streams`，UDP 使用 `udp_streams`，缺省或为 `0` 时分别回退旧字段 `streams`。有效流数映射为 `Connections:N`；一个 CTS 进程承载 N 条连接。CTS 自动化要求所选协议的有效流数在 `1..=32`；配置文件超出范围会记录 `SETUP_ERROR / CTSTRAFFIC_ARGS_INVALID`，交互式输入则要求重输，不会静默修正。
 - 历史字段 `iperf_duration` 供两个吞吐后端共用。CTS TCP 映射为 `TimeLimit:<毫秒>` 硬截止，CTS UDP 映射为 `StreamLength:<秒>`。CTS 自动化只接受 `1..=86400` 秒；配置文件中的 `duration=0` 不是无限，也不会被静默夹为 1 秒，而是记录 `SETUP_ERROR / CTSTRAFFIC_ARGS_INVALID`；交互式输入会要求重输。无限测试只能手工运行原生命令并手工停止。
 - `tcp_windows` 对 CTS 是 Winsock socket buffer；`udp_profiles[].window` 对 iperf3 生成 `-w`，对 CTS 映射为实际发送/接收方向的 `SendBufValue`/`RecvBufValue`。它们不是 TCP 拥塞窗口；非法尺寸会记录 `SETUP_ERROR / CTSTRAFFIC_ARGS_INVALID`。
-- CTS UDP 的 `bandwidth` 是**每条连接**的 `BitsPerSecond`，总提供速率约为“每流带宽 × streams”；`length` 映射为 `DatagramByteSize`，且不得大于 65507 字节。无法解析或越界的 `bandwidth`/`length` 会记录 `SETUP_ERROR / CTSTRAFFIC_ARGS_INVALID`。
+- UDP `bandwidth` 必须完整匹配十进制数值加可选 `k/m/g` 或 `kbps/mbps/gbps`；`2.8G` 与 `2.8Gbps` 都规范化为 `2800000000 bit/s`。尾随垃圾、科学计数和混合后缀不会再透传后端。CTS UDP 的速率按每条连接生效，总提供速率约为“每流带宽 × `udp_streams`”。
+- `length` 的 `k/m/g` 使用 1024 进制；`14k` 等于 14336 字节。iperf3 保留原生 `-l 14k`，CTS 映射为 `DatagramByteSize:14336` 且不得大于 65507 字节。14 KiB 超过常见 1500 字节 MTU，会产生 IP 分片。
 - 默认 `ctstraffic.udp_frame_rate=100`、`udp_buffer_depth_secs=1`。这是 MediaStream 模型，不等同于 iperf3 UDP flood；两种后端的数值不应当作完全相同语义的互换结果。
-- CTS 检查活跃连接、client 窗口内的 NIC RX 平均/覆盖率、运行时错误和可选 UDP 丢帧门槛。CTS 不使用 iperf3 的逐进程多流、5 秒 P10 与分阶段 `discover` 实现，但两者共享下面的 UDP 单流硬门槛和安全清理原则。
+- CTS 接收端 NIC 统计只计算 `Connected`、有效 `Traffic` 与 `Ended` 事件可以证明的数据窗口，不计 monitor RPC、进程启动、握手、状态轮询和清理。不会用 `Total Time`、正常退出或疑似缓冲输出补窗口，也不会在无样本时回退全生命周期平均值。证据不足时返回 `NOT_EVALUATED / CTSTRAFFIC_EFFECTIVE_WINDOW_SHORT`；monitor 启动、停止、无样本和窗口内采样错误分别使用 `CTSTRAFFIC_MONITOR_*` 原因码。
+- CTS 不使用 iperf3 的逐进程多流、5 秒 P10 与分阶段 `discover` 实现，但两者共享下面的 UDP 单流硬门槛和安全清理原则。
 
 UDP socket buffer 示例：
 

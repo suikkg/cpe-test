@@ -1,4 +1,4 @@
-官方 cpe_test v4.2.1 Windows Release ZIP 已自动捆绑 ctsTraffic.exe，普通用户不需要手工下载。
+官方 cpe_test v4.2.2 Windows Release ZIP 已自动捆绑 ctsTraffic.exe，普通用户不需要手工下载。
 
 本源码仓库不提交第三方二进制。如果你自行编译或手工组装 Windows 包，并要使用
 "kinds": ["ctstraffic"]，请把 64 位 ctsTraffic.exe 放到 cpe_test.exe 同目录。
