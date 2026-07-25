@@ -43,7 +43,7 @@ pub fn setup_cancel_handler() {
         }
 
         unsafe {
-            let _ = SetConsoleCtrlHandler(Some(handler));
+            let _ = SetConsoleCtrlHandler(Some(handler), true);
         }
     }
 
