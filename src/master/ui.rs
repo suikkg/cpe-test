@@ -319,6 +319,10 @@ pub fn run_master(opts: MasterOpts) -> i32 {
     let _ = std::fs::create_dir_all(&outdir);
     let started = now_full();
     let t0 = Instant::now();
+
+    // ---- 注册 Ctrl+C 处理器（Windows 上阻止 cmd.exe 弹出提示，非 Windows 用 ctrlc crate）
+    crate::cancel::setup_cancel_handler();
+
     let ctx = Ctx {
         agent_host: agent_host.clone(),
         agent_port: cfg.agent_port,

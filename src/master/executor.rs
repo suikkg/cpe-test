@@ -1471,6 +1471,10 @@ impl Ctx {
         let mut sum = RunSummary::default();
         let total = units.len();
         for (i, unit) in units.iter().enumerate() {
+            if crate::cancel::is_cancelled() {
+                logln("\n!! 用户中断 (Ctrl+C)，正在生成部分报告...");
+                break;
+            }
             let useq = sequence_offset + i;
             let is_traffic_unit = unit_has_traffic(unit);
             if is_traffic_unit {

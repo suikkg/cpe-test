@@ -7,6 +7,7 @@
 //!   cpe_test scan  [--prefix 192.168.,10.10.]   查看本机网卡识别结果
 
 mod agent;
+mod cancel;
 mod cmd;
 mod config;
 mod http_client;
