@@ -1,5 +1,8 @@
 //! 任务执行器：调度本地/远端的 ping、iperf、监控、截图，产出报告行
 
+use crate::clock::MonotonicClock;
+#[cfg(test)]
+use crate::clock::{ManualClock, SystemClock};
 use crate::cmd::ctstraffic;
 use crate::cmd::iperf::{self, IperfClientJobMgr, IperfServerMgr};
 use crate::config::{Config, RateCheckCfg, RateMode};
@@ -40,6 +43,10 @@ pub struct Ctx {
     pub agent_port: u16,
     pub cfg: Config,
     pub outdir: PathBuf,
+    /// Agent RPC transport. Production uses TCP; tests can inject a scripted
+    /// transport to model loss, delay, truncation, and reordering.
+    pub transport: Arc<dyn http_client::Transport>,
+    pub clock: Arc<dyn MonotonicClock>,
     pub local_servers: IperfServerMgr,
     pub local_cts_jobs: IperfClientJobMgr,
     pub local_monitors: MonitorMgr,
@@ -426,9 +433,21 @@ impl Ctx {
         timeout: Duration,
     ) -> Result<TOut, String> {
         let body = serde_json::to_string(req).map_err(|e| format!("序列化失败: {e}"))?;
-        let (status, text) =
-            http_client::post_json(&self.agent_host, self.agent_port, path, &body, timeout)
-                .map_err(|e| format!("辅测机 {path} 调用失败: {e}"))?;
+        let (status, text) = http_client::post_json_auth_with_transport(
+            self.transport.as_ref(),
+            &self.agent_host,
+            self.agent_port,
+            path,
+            &body,
+            &self.cfg.agent_token,
+            timeout,
+        )
+        .map_err(|e| format!("辅测机 {path} 调用失败: {e}"))?;
+        if status == 401 {
+            return Err(format!(
+                "辅测机 {path} 拒绝访问(401)：agent 已启用令牌认证，请在本机 config.json 配置相同 agent_token"
+            ));
+        }
         if status != 200 {
             return Err(format!("辅测机 {path} 返回 HTTP {status}: {text}"));
         }
@@ -449,14 +468,37 @@ impl Ctx {
         req: &TReq,
         timeout: Duration,
     ) -> Result<TOut, String> {
+        self.agent_post_reliable_timed(path, req, timeout)
+            .map(|(out, _)| out)
+    }
+
+    /// 与 `agent_post_reliable` 相同的重试语义，但额外返回成功那次调用
+    /// 自身消耗的耗时（不含前几次失败的重试等待）。
+    ///
+    /// 时间轴对齐必须使用“成功调用自身的耗时”：若把三次可靠调用前的
+    /// 起点到成功返回的总时长都算进去，首次连接超时、第二次成功时，
+    /// 前一次失败的重试延时会被整体混入远端 job 起点估计，
+    /// 真实流量窗口会整体偏移数秒。
+    fn agent_post_reliable_timed<TReq: Serialize, TOut: DeserializeOwned>(
+        &self,
+        path: &str,
+        req: &TReq,
+        timeout: Duration,
+    ) -> Result<(TOut, Duration), String> {
         let mut errors = Vec::new();
         for attempt in 1..=RELIABLE_HTTP_ATTEMPTS {
+            let attempt_started = self.clock.now();
             match self.agent_post(path, req, timeout) {
-                Ok(out) => return Ok(out),
+                Ok(out) => {
+                    return Ok((
+                        out,
+                        self.clock.now().saturating_duration_since(attempt_started),
+                    ))
+                }
                 Err(e) => {
                     errors.push(format!("第{attempt}次: {e}"));
                     if attempt < RELIABLE_HTTP_ATTEMPTS {
-                        std::thread::sleep(RELIABLE_HTTP_RETRY_DELAY);
+                        self.clock.sleep(RELIABLE_HTTP_RETRY_DELAY);
                     }
                 }
             }
@@ -649,7 +691,7 @@ impl Ctx {
                 iperf::run_client_controlled(
                     &bin,
                     req,
-                    None,
+                    Some(crate::cancel::cancel_flag()),
                     |line| {
                         if line.to_lowercase().contains("error") {
                             logln(&format!("      {line}"));
@@ -659,19 +701,19 @@ impl Ctx {
                 )
             }
             Side::Agent => {
-                let start_call = Instant::now();
                 let start_req = IperfClientStartReq {
                     request: req.clone(),
                     request_id: request_id.to_string(),
                     owner_id: owner_id.to_string(),
                     lease_secs,
                 };
-                let started: IperfClientStartOut = match self.agent_post_reliable(
-                    "/iperf/client/start",
-                    &start_req,
-                    Duration::from_secs(20),
-                ) {
-                    Ok(v) => v,
+                let (started, start_attempt_elapsed): (IperfClientStartOut, Duration) = match self
+                    .agent_post_reliable_timed(
+                        "/iperf/client/start",
+                        &start_req,
+                        Duration::from_secs(20),
+                    ) {
+                    Ok((v, attempt_elapsed)) => (v, attempt_elapsed),
                     Err(e) => {
                         let cleanup = self.client_stop_confirmed(request_id);
                         let cleanup_confirmed = cleanup.is_ok();
@@ -710,12 +752,11 @@ impl Ctx {
                         ..Default::default()
                     };
                 }
-                let response_elapsed_ms = start_call.elapsed().as_millis() as u64;
-                let remote_origin_ms = if started.elapsed_ms > 0 {
-                    response_elapsed_ms.saturating_sub(started.elapsed_ms)
-                } else {
-                    response_elapsed_ms / 2
-                };
+                // 只统计成功那次 start 调用自身的耗时：重试失败 + 等待
+                // 属于远端 job 开始之前的编排开销，不能混入 job 零点估计。
+                let response_elapsed_ms = start_attempt_elapsed.as_millis() as u64;
+                let remote_origin_ms =
+                    remote_job_origin_ms(response_elapsed_ms, started.elapsed_ms);
                 let max_remote_secs = req.duration.saturating_add(180);
                 let Some(deadline) =
                     std::time::Instant::now().checked_add(Duration::from_secs(max_remote_secs))
@@ -735,6 +776,30 @@ impl Ctx {
                 };
                 let mut cursor = 0usize;
                 loop {
+                    if crate::cancel::is_cancelled() {
+                        // 用户第一次 Ctrl+C：立即回收远端异步作业并返回，
+                        // 主循环随后生成部分报告，不必等整段 duration 跑完。
+                        let cleanup = self.client_stop_confirmed(&started.id);
+                        let cleanup_confirmed = cleanup.is_ok();
+                        let mut result = cleanup
+                            .as_ref()
+                            .ok()
+                            .and_then(|output| output.result.clone())
+                            .unwrap_or_default();
+                        result.ok = false;
+                        result.cancelled = !cleanup_confirmed;
+                        result.cleanup_confirmed =
+                            Some(cleanup_confirmed && result.cleanup_confirmed == Some(true));
+                        if !result.output.is_empty() && !result.output.ends_with('\n') {
+                            result.output.push('\n');
+                        }
+                        result.output.push_str(&format!(
+                            "(用户中断，远端异步作业 {} 已停止确认: {})",
+                            started.id,
+                            cleanup.map(|_| "成功".to_string()).unwrap_or_else(|e| e)
+                        ));
+                        return result;
+                    }
                     if std::time::Instant::now() >= deadline {
                         let cleanup = self.client_stop_confirmed(&started.id);
                         let cleanup_confirmed = cleanup.is_ok();
@@ -840,6 +905,16 @@ impl Ctx {
         side: Side,
         start: CtsTrafficStartReq,
     ) -> Result<CtsTrafficStartOut, String> {
+        self.cts_job_start_timed(side, start).map(|(out, _)| out)
+    }
+
+    /// 与 `cts_job_start` 相同的语义，额外返回成功那次 start 调用自身耗时
+    /// （不含重试等待），用于把远端 job 零点对齐到真实启动时刻。
+    fn cts_job_start_timed(
+        &self,
+        side: Side,
+        start: CtsTrafficStartReq,
+    ) -> Result<(CtsTrafficStartOut, Duration), String> {
         match side {
             Side::Master => {
                 let bin = find_ctstraffic().ok_or_else(|| {
@@ -851,10 +926,10 @@ impl Ctx {
                 })?;
                 let id = ctstraffic::start_managed_job(&self.local_cts_jobs, bin, start)?;
                 let elapsed_ms = self.local_cts_jobs.elapsed_ms(&id).unwrap_or(0);
-                Ok(CtsTrafficStartOut { id, elapsed_ms })
+                Ok((CtsTrafficStartOut { id, elapsed_ms }, Duration::ZERO))
             }
             Side::Agent => {
-                self.agent_post_reliable("/ctstraffic/start", &start, Duration::from_secs(20))
+                self.agent_post_reliable_timed("/ctstraffic/start", &start, Duration::from_secs(20))
             }
         }
     }
@@ -910,9 +985,8 @@ impl Ctx {
     {
         let expected_id = start.request_id.clone();
         let duration = start.request.duration_secs;
-        let start_call = Instant::now();
-        let started = match self.cts_job_start(side, start) {
-            Ok(value) => value,
+        let (started, start_attempt_elapsed) = match self.cts_job_start_timed(side, start) {
+            Ok((value, attempt_elapsed)) => (value, attempt_elapsed),
             Err(error) => {
                 let cleanup = if expected_id.is_empty() {
                     Ok(CtsTrafficStopOut::default())
@@ -963,7 +1037,8 @@ impl Ctx {
                 setup_error: Some(("CTSTRAFFIC_CLIENT_JOB_ID_MISMATCH".into(), detail)),
             };
         }
-        let response_elapsed_ms = start_call.elapsed().as_millis() as u64;
+        // 只统计成功那次 start 调用自身的耗时，避免重试等待混入 CTS job 零点。
+        let response_elapsed_ms = start_attempt_elapsed.as_millis() as u64;
         let origin_ms = remote_job_origin_ms(response_elapsed_ms, started.elapsed_ms);
         let max_wait = duration.saturating_add(60);
         let Some(deadline) = Instant::now().checked_add(Duration::from_secs(max_wait)) else {
@@ -988,6 +1063,35 @@ impl Ctx {
         };
         let mut cursor = 0usize;
         loop {
+            if crate::cancel::is_cancelled() {
+                // 用户第一次 Ctrl+C：立即回收 CTS 异步作业并返回，
+                // 主循环随后生成部分报告，不必等整段 duration 跑完。
+                let cleanup = self.cts_job_stop_confirmed(side, &started.id);
+                let mut client = cleanup
+                    .as_ref()
+                    .ok()
+                    .and_then(|output| output.result.clone())
+                    .unwrap_or_default();
+                let process_cleanup_confirmed = client.cleanup_confirmed == Some(true);
+                let cleanup_confirmed = cleanup.is_ok() && process_cleanup_confirmed;
+                client.ok = false;
+                client.cancelled = !cleanup_confirmed;
+                if !client.output.is_empty() && !client.output.ends_with('\n') {
+                    client.output.push('\n');
+                }
+                client.output.push_str(&format!(
+                    "(用户中断，ctsTraffic 作业 {} 已停止确认: {})",
+                    started.id,
+                    cleanup.map(|_| "成功".to_string()).unwrap_or_else(|e| e)
+                ));
+                let cancel_detail = client.output.clone();
+                return CtsClientRun {
+                    client,
+                    started: true,
+                    cleanup_confirmed,
+                    setup_error: Some(("CTSTRAFFIC_CLIENT_USER_CANCELLED".into(), cancel_detail)),
+                };
+            }
             if Instant::now() >= deadline {
                 let cleanup = self.cts_job_stop_confirmed(side, &started.id);
                 let mut client = cleanup
@@ -1108,13 +1212,18 @@ impl Ctx {
         }
     }
 
+    /// 启动接收端网卡监控，返回 (id, 相对本次调用起点的零点偏移毫秒)。
+    ///
+    /// 远端 monitor 的零点用响应中的 `elapsed_ms` 和成功那次调用自身的
+    /// 耗时做有界估计（`remote_job_origin_ms`），不再用 RPC 往返中点猜测：
+    /// 非对称网络延迟会把空闲时间混入正式窗口。
     fn mon_start(
         &self,
         side: Side,
         iface: &str,
         owner_id: &str,
         lease_secs: u64,
-    ) -> Result<String, String> {
+    ) -> Result<(String, u64), String> {
         let interval_ms = self
             .cfg
             .iperf
@@ -1123,11 +1232,16 @@ impl Ctx {
             .clamp(200, 5_000);
         match side {
             Side::Master => {
-                self.local_monitors
-                    .start_owned(iface, interval_ms, owner_id, lease_secs)
+                let before = Instant::now();
+                let id =
+                    self.local_monitors
+                        .start_owned(iface, interval_ms, owner_id, lease_secs)?;
+                let call_elapsed_ms = before.elapsed().as_millis() as u64;
+                // 本地启动无网络往返，零点就是调用起点（本地开销可忽略）。
+                Ok((id, midpoint_ms(0, call_elapsed_ms)))
             }
-            Side::Agent => self
-                .agent_post::<_, MonitorStartOut>(
+            Side::Agent => {
+                let (out, attempt_elapsed) = self.agent_post_reliable_timed::<_, MonitorStartOut>(
                     "/monitor/start",
                     &MonitorStartReq {
                         iface: iface.to_string(),
@@ -1136,8 +1250,11 @@ impl Ctx {
                         lease_secs,
                     },
                     Duration::from_secs(20),
-                )
-                .map(|o| o.id),
+                )?;
+                let origin =
+                    remote_job_origin_ms(attempt_elapsed.as_millis() as u64, out.elapsed_ms);
+                Ok((out.id, origin))
+            }
         }
     }
 
@@ -1255,11 +1372,12 @@ impl Ctx {
                         }
                     };
                     let timeout = Duration::from_secs(180);
-                    let (status, text) = match crate::http_client::post_json(
+                    let (status, text) = match crate::http_client::post_json_auth(
                         &self.agent_host,
                         self.agent_port,
                         "/screenshot",
                         &body,
+                        &self.cfg.agent_token,
                         timeout,
                     ) {
                         Ok((s, t)) => {
@@ -1519,7 +1637,7 @@ impl Ctx {
             let mut resource_guard = (is_traffic_unit && blocked.is_none()).then(|| {
                 UnitResourceGuard::new(self, owner_id.clone(), unit_uses_agent_resources(unit))
             });
-            let outcomes = execute_unit_safely(
+            let mut outcomes = execute_unit_safely(
                 || {
                     if let Some(block) = blocked {
                         self.preflight_block_outcomes_with_cts_args(
@@ -1547,14 +1665,23 @@ impl Ctx {
                                 .collect();
                             handles
                                 .into_iter()
-                                .map(|h| {
-                                    h.join().unwrap_or(LegOutcome {
+                                .zip(unit.legs.iter())
+                                .map(|(handle, leg)| {
+                                    handle.join().unwrap_or_else(|payload| LegOutcome {
                                         verdict: Verdict::SetupError,
                                         reason_code: "LEG_THREAD_PANIC".into(),
-                                        reason_detail: "方向执行线程 panic".into(),
+                                        reason_detail: format!(
+                                            "{} 方向执行线程 panic: {}",
+                                            if leg.tag.is_empty() {
+                                                "单向"
+                                            } else {
+                                                leg.tag.as_str()
+                                            },
+                                            panic_text(payload.as_ref())
+                                        ),
                                         rx_avg: None,
                                         main_rows: vec![],
-                                        tag: String::new(),
+                                        tag: leg.tag.clone(),
                                     })
                                 })
                                 .collect()
@@ -1572,14 +1699,29 @@ impl Ctx {
             // 不把可能残留的端口/进程拖到报告生成和下一测试单元。
             drop(resource_guard);
 
+            // 执行线程 panic、前置拦截或内部调度异常都可能只返回
+            // LegOutcome 而没有写入方向明细。报告必须始终保留每个预期流量方向，
+            // 否则双向测试会出现只有 BA 而 AB 整行消失的误导性结果。
+            if is_traffic_unit {
+                self.ensure_traffic_outcome_rows(useq, unit, &mut outcomes);
+            }
+
             // 双向：互填「对向接收 Mbps」
-            if unit.bidir && outcomes.len() == 2 {
+            if unit.bidir {
+                let ab = outcomes
+                    .iter()
+                    .position(|outcome| outcome.tag.eq_ignore_ascii_case("ab"));
+                let ba = outcomes
+                    .iter()
+                    .position(|outcome| outcome.tag.eq_ignore_ascii_case("ba"));
                 let mut g = self.rows.lock().unwrap();
-                for (me, other) in [(0usize, 1usize), (1, 0)] {
-                    if let Some(rx) = outcomes[other].rx_avg {
-                        for ri in &outcomes[me].main_rows {
-                            if let Some(row) = g.get_mut(*ri) {
-                                row.peer_rx = format!("{:.3}({})", rx, outcomes[other].tag);
+                if let (Some(ab), Some(ba)) = (ab, ba) {
+                    for (me, other) in [(ab, ba), (ba, ab)] {
+                        if let Some(rx) = outcomes[other].rx_avg {
+                            for ri in &outcomes[me].main_rows {
+                                if let Some(row) = g.get_mut(*ri) {
+                                    row.peer_rx = format!("{:.3}({})", rx, outcomes[other].tag);
+                                }
                             }
                         }
                     }
@@ -1633,7 +1775,7 @@ impl Ctx {
                 .collect();
             logln(&format!("  ==> 单元结果: {}", unit_verdict.label()));
             self.push_row(Row {
-                sort_key: (useq, 0, 0, 0),
+                sort_key: (useq, usize::MAX, usize::MAX, u8::MAX),
                 time: now_full(),
                 task_id: unit.id.clone(),
                 parent_id: unit.id.clone(),
@@ -1677,6 +1819,263 @@ impl Ctx {
                     .unwrap_or(false)
             })
         })
+    }
+
+    fn ensure_traffic_outcome_rows(
+        &self,
+        useq: usize,
+        unit: &Unit,
+        outcomes: &mut Vec<LegOutcome>,
+    ) {
+        for (lidx, leg) in unit.legs.iter().enumerate() {
+            if matches!(&leg.kind, LegKind::Ping(_)) {
+                continue;
+            }
+            if outcomes
+                .iter()
+                .any(|outcome| outcome.tag == leg.tag && !outcome.main_rows.is_empty())
+            {
+                continue;
+            }
+
+            let matched = outcomes.iter().position(|outcome| outcome.tag == leg.tag);
+            let inherited = matched.or_else(|| {
+                outcomes
+                    .iter()
+                    .position(|outcome| outcome.tag.is_empty() && outcome.main_rows.is_empty())
+            });
+            let (verdict, reason_code, reason_detail) = inherited
+                .map(|index| {
+                    let outcome = &outcomes[index];
+                    (
+                        outcome.verdict,
+                        outcome.reason_code.clone(),
+                        outcome.reason_detail.clone(),
+                    )
+                })
+                .unwrap_or_else(|| {
+                    (
+                        Verdict::SetupError,
+                        "UNIT_DIRECTION_RESULT_MISSING".into(),
+                        format!(
+                            "{} 方向执行未产生结果，已补入错误明细以保持报表完整",
+                            if leg.tag.is_empty() {
+                                "单向"
+                            } else {
+                                leg.tag.as_str()
+                            }
+                        ),
+                    )
+                });
+            // push_row 先于 LegOutcome 返回；若随后外层 unit panic，outcomes 会被
+            // UNIT_PANIC 替换，但已写入的方向 Row 仍然有效。先按稳定排序键复用这些
+            // Row，避免再生成同方向占位而得到“原 AB + 补 AB + 补 BA”。
+            let (committed_rows, committed_rx_avg) = {
+                let rows = self.rows.lock().unwrap();
+                let indices: Vec<usize> = rows
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, row)| {
+                        !row.is_unit_summary
+                            && row.parent_id == unit.id
+                            && row.sort_key.0 == useq
+                            && row.sort_key.1 == lidx
+                    })
+                    .map(|(index, _)| index)
+                    .collect();
+                let rx_avg = indices.iter().find_map(|index| rows[*index].rx_avg);
+                (indices, rx_avg)
+            };
+            if !committed_rows.is_empty() {
+                if let Some(index) = matched {
+                    outcomes[index].main_rows.extend(committed_rows);
+                    if outcomes[index].rx_avg.is_none() {
+                        outcomes[index].rx_avg = committed_rx_avg;
+                    }
+                } else {
+                    outcomes.push(LegOutcome {
+                        verdict,
+                        reason_code,
+                        reason_detail,
+                        rx_avg: committed_rx_avg,
+                        main_rows: committed_rows,
+                        tag: leg.tag.clone(),
+                    });
+                }
+                continue;
+            }
+            let row = self.push_traffic_outcome_row(
+                useq,
+                unit,
+                lidx,
+                leg,
+                verdict,
+                &reason_code,
+                &reason_detail,
+            );
+            let Some(row) = row else {
+                continue;
+            };
+            if let Some(index) = matched {
+                outcomes[index].main_rows.push(row);
+            } else {
+                outcomes.push(LegOutcome {
+                    verdict,
+                    reason_code,
+                    reason_detail,
+                    rx_avg: None,
+                    main_rows: vec![row],
+                    tag: leg.tag.clone(),
+                });
+            }
+        }
+        // 整个单元 panic 时 execute_unit_safely 只能生成无 tag 结果。
+        // 已将同一错误分发到所有有 tag 的方向明细后，删掉这个
+        // 临时结果，避免汇总里同时出现“单向”与 AB/BA 重复原因。
+        if unit
+            .legs
+            .iter()
+            .filter(|leg| !matches!(&leg.kind, LegKind::Ping(_)))
+            .all(|leg| !leg.tag.is_empty())
+        {
+            outcomes.retain(|outcome| !(outcome.tag.is_empty() && outcome.main_rows.is_empty()));
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_traffic_outcome_row(
+        &self,
+        useq: usize,
+        unit: &Unit,
+        lidx: usize,
+        leg: &Leg,
+        verdict: Verdict,
+        reason_code: &str,
+        reason_detail: &str,
+    ) -> Option<usize> {
+        let (
+            backend,
+            ip,
+            transport,
+            param,
+            src_pc,
+            src_iface,
+            src_ip,
+            dst_pc,
+            dst_iface,
+            dst_ip,
+            requested_streams,
+        ) = match &leg.kind {
+            LegKind::IperfSingle(task) => (
+                "iperf",
+                if task.v6 { "V6" } else { "V4" }.to_string(),
+                if task.udp { "UDP" } else { "TCP" }.to_string(),
+                task.profile_label.clone(),
+                task.src.pc.clone(),
+                task.src.nic.name.clone(),
+                task.src.nic.ipv4.clone(),
+                task.dst.pc.clone(),
+                task.dst.nic.name.clone(),
+                task.dst.nic.ipv4.clone(),
+                if task.udp {
+                    1
+                } else {
+                    tcp_parallel_streams(&task.extra)
+                },
+            ),
+            LegKind::IperfGroup { name, streams } => {
+                if let Some(task) = streams.first() {
+                    (
+                        "iperf",
+                        if task.v6 { "V6" } else { "V4" }.to_string(),
+                        "UDP".into(),
+                        name.clone(),
+                        task.src.pc.clone(),
+                        task.src.nic.name.clone(),
+                        task.src.nic.ipv4.clone(),
+                        task.dst.pc.clone(),
+                        task.dst.nic.name.clone(),
+                        task.dst.nic.ipv4.clone(),
+                        streams.len(),
+                    )
+                } else {
+                    (
+                        "iperf",
+                        String::new(),
+                        "UDP".into(),
+                        name.clone(),
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                        0,
+                    )
+                }
+            }
+            LegKind::CtsTraffic(task) => (
+                "ctstraffic",
+                if task.v6 { "V6" } else { "V4" }.to_string(),
+                if task.udp { "CTS/UDP" } else { "CTS/TCP" }.to_string(),
+                task.profile_label.clone(),
+                task.src.pc.clone(),
+                task.src.nic.name.clone(),
+                task.src.nic.ipv4.clone(),
+                task.dst.pc.clone(),
+                task.dst.nic.name.clone(),
+                task.dst.nic.ipv4.clone(),
+                task.streams as usize,
+            ),
+            LegKind::Ping(_) => return None,
+        };
+        let tag = if leg.tag.is_empty() {
+            "单向"
+        } else {
+            leg.tag.as_str()
+        };
+        Some(self.push_row(Row {
+            sort_key: (useq, lidx, 0, 0),
+            time: now_full(),
+            task_id: md5_hex(&format!(
+                "{}|{}|{}|direction-result",
+                unit.id, leg.tag, backend
+            )),
+            parent_id: unit.id.clone(),
+            task: unit.title.clone(),
+            ip,
+            transport,
+            param,
+            src_pc,
+            src_iface,
+            src_ip,
+            dst_pc,
+            dst_iface,
+            dst_ip,
+            verdict,
+            execution_status: match verdict {
+                Verdict::SetupError => ExecutionStatus::Error,
+                Verdict::NotEvaluated => ExecutionStatus::Partial,
+                _ => ExecutionStatus::Completed,
+            },
+            reason_code: reason_code.into(),
+            reason_detail: reason_detail.into(),
+            kind_label: if unit.bidir && backend == "ctstraffic" {
+                format!("★★双向 CTS Traffic-{tag}")
+            } else if unit.bidir {
+                format!("★★双向灌包-{tag}")
+            } else if backend == "ctstraffic" {
+                "CTS Traffic 灌包".into()
+            } else {
+                "灌包".into()
+            },
+            requested_streams,
+            raws: vec![(
+                format!("{tag} 方向执行诊断"),
+                format!("[{reason_code}] {reason_detail}"),
+            )],
+            ..Default::default()
+        }))
     }
 
     fn run_leg(
@@ -2402,7 +2801,8 @@ impl Ctx {
         );
 
         // 所有 CTS 事件和网卡样本都对齐到同一个 leg epoch。远端 monitor
-        // 的真实启动落在 RPC 调用前后之间，用中点近似其零点。
+        // 的真实启动由响应中的 elapsed_ms 与成功调用自身耗时做有界估计，
+        // 不再用 RPC 往返中点猜测零点。
         let leg_epoch = Instant::now();
         let monitor_start_before_ms = leg_epoch.elapsed().as_millis().min(u64::MAX as u128) as u64;
         let mut monitor_issue = None::<CtsMonitorIssue>;
@@ -2412,10 +2812,7 @@ impl Ctx {
             lifecycle.owner_id,
             lifecycle.lease_secs,
         ) {
-            Ok(id) => {
-                let after_ms = leg_epoch.elapsed().as_millis().min(u64::MAX as u128) as u64;
-                Some((id, midpoint_ms(monitor_start_before_ms, after_ms)))
-            }
+            Ok((id, call_origin_ms)) => Some((id, monitor_start_before_ms + call_origin_ms)),
             Err(error) => {
                 let detail = format!("CTS 接收端网卡监控启动失败: {error}");
                 logln(&format!("    ({detail})"));
@@ -2880,7 +3277,11 @@ impl Ctx {
             execution_status: ExecutionStatus::Error,
             reason_code: reason_code.into(),
             reason_detail: reason_detail.clone(),
-            kind_label: "CTS Traffic 灌包".into(),
+            kind_label: if unit.bidir {
+                format!("★★双向 CTS Traffic-{tag}")
+            } else {
+                "CTS Traffic 灌包".into()
+            },
             requested_streams: task.streams as usize,
             raws: vec![("ctsTraffic 启动错误".into(), reason_detail.clone())],
             ..Default::default()
@@ -2947,7 +3348,8 @@ impl Ctx {
         t: &IperfTask,
         owner_id: &str,
         lease_secs: u64,
-        on_event: F,
+        epoch: &Instant,
+        mut on_event: F,
     ) -> (bool, iperf::IperfParsed, IperfClientOut, String)
     where
         F: FnMut(IperfFlowEvent),
@@ -2974,13 +3376,31 @@ impl Ctx {
             };
             return (false, iperf::IperfParsed::default(), out, String::new());
         }
+        let client_call_offset_ms = epoch.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        let mut local_event_origin_ms = None::<u64>;
         let client = self.client_run_tracked(
             t.src.side,
             &creq,
             owner_id,
             &lifecycle_request_id(owner_id, "client", t.port, 0),
             lease_secs,
-            on_event,
+            |mut event| {
+                if t.src.side == Side::Master {
+                    // 本机首轮可能在 Started 事件前先执行
+                    // `iperf3 --help` 能力探测。以首个回调的当前时刻
+                    // 反推 job 零点，不把这段一次性等待计入数据窗口。
+                    iperf::align_event_to_epoch(
+                        &mut event,
+                        epoch.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                        &mut local_event_origin_ms,
+                    );
+                } else {
+                    // 远端事件已在 client_run_tracked 中按 start RPC
+                    // 与 job elapsed 对齐到本次调用零点。
+                    event.elapsed_ms = event.elapsed_ms.saturating_add(client_call_offset_ms);
+                }
+                on_event(event);
+            },
         );
         let stop = self.server_stop_confirmed(t.dst.side, t.port, &sreq.request_id, Duration::ZERO);
         let (server_out, stop_ok) = match stop {
@@ -3011,13 +3431,18 @@ impl Ctx {
             t.port,
             t.duration
         ));
+        // monitor 和 iperf client 事件必须对齐到同一个 leg epoch，
+        // 否则 server 启动、RPC 延迟和停止清理都会混入 TCP 平均速率。
+        // 远端 monitor 零点由响应 elapsed_ms 有界估计，不再用 RPC 中点猜测。
+        let leg_epoch = Instant::now();
+        let monitor_start_before_ms = leg_epoch.elapsed().as_millis().min(u64::MAX as u128) as u64;
         let mon_id = match self.mon_start(
             t.dst.side,
             &t.dst.nic.name,
             lifecycle.owner_id,
             lifecycle.lease_secs,
         ) {
-            Ok(id) => Some(id),
+            Ok((id, call_origin_ms)) => Some((id, monitor_start_before_ms + call_origin_ms)),
             Err(e) => {
                 logln(&format!("    (接收端网卡监控启动失败: {e})"));
                 None
@@ -3030,7 +3455,7 @@ impl Ctx {
         } else {
             tcp_parallel_streams(&t.extra)
         };
-        let mon_id_for_progress = mon_id.clone();
+        let mon_id_for_progress = mon_id.as_ref().map(|(id, _)| id.clone());
         let live_for_progress = Arc::clone(&live);
         let progress_tag = tag.to_string();
         let progress_protocol = if t.udp { "UDP" } else { "TCP" };
@@ -3095,8 +3520,12 @@ impl Ctx {
                     }));
                 }
             });
-            let result =
-                self.exec_iperf_core(t, lifecycle.owner_id, lifecycle.lease_secs, |event| {
+            let result = self.exec_iperf_core(
+                t,
+                lifecycle.owner_id,
+                lifecycle.lease_secs,
+                &leg_epoch,
+                |event| {
                     {
                         let mut state =
                             live.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -3107,15 +3536,34 @@ impl Ctx {
                         }
                     }
                     events.push(event);
-                });
+                },
+            );
             let _ = done_tx.send(());
             let _ = progress.join();
             result
         });
-        let mon_out = mon_id
-            .as_deref()
-            .and_then(|id| self.mon_stop(t.dst.side, id).ok());
-        let rx_avg = mon_out.as_ref().map(|m| m.avg_mbps);
+        let mon_out =
+            mon_id.and_then(
+                |(id, start_offset_ms)| match self.mon_stop(t.dst.side, &id) {
+                    Ok(mut output) => {
+                        align_monitor_samples(&mut output, start_offset_ms);
+                        Some(output)
+                    }
+                    Err(error) => {
+                        logln(&format!("    (接收端网卡监控停止失败: {error})"));
+                        None
+                    }
+                },
+            );
+        let effective_window =
+            iperf_effective_window(&events, t.duration, parsed.has_measurement());
+        let rx_stats = mon_out
+            .as_ref()
+            .map(|output| {
+                monitor_rate_stats(output, &effective_window, true, effective_window.start_ms)
+            })
+            .unwrap_or_default();
+        let rx_avg = rx_stats.avg_mbps;
         let nic_samples = mon_out
             .as_ref()
             .map(|out| {
@@ -3129,22 +3577,46 @@ impl Ctx {
             })
             .unwrap_or_default();
 
-        let meas_ok =
-            parsed.has_measurement() || rx_avg.map(|v| v > MIN_VALID_RX_MBPS).unwrap_or(false);
-        let ok = raw_ok && meas_ok;
-        let verdict = if ok {
-            Verdict::Pass
-        } else if !raw_ok {
-            Verdict::SetupError
+        let measurement = parsed.has_measurement();
+        let (verdict, reason_code, reason_detail) = if !raw_ok {
+            (
+                Verdict::SetupError,
+                "IPERF_EXEC_FAILED".to_string(),
+                client.output.lines().last().unwrap_or_default().to_string(),
+            )
+        } else if !measurement {
+            (
+                Verdict::RateFail,
+                "NO_VALID_MEASUREMENT".to_string(),
+                "iperf3 已结束，但没有 rate/bytes 吞吐测量".into(),
+            )
+        } else if !effective_window.complete {
+            (
+                Verdict::NotEvaluated,
+                "IPERF_EFFECTIVE_WINDOW_SHORT".to_string(),
+                format!(
+                    "iperf3 真实流量事件窗口仅 {:.3}s，短于要求的 {}s；未把 server 启动、连接或清理时间计入平均速率",
+                    effective_window.available_secs, t.duration
+                ),
+            )
+        } else if rx_avg.is_none() {
+            (
+                Verdict::NotEvaluated,
+                "IPERF_NIC_RATE_MISSING".to_string(),
+                "有效流量窗口内没有可用的接收端 OS 网卡速率样本".into(),
+            )
+        } else if rx_stats.coverage < MIN_RATE_SAMPLE_COVERAGE {
+            (
+                Verdict::NotEvaluated,
+                "IPERF_SAMPLE_COVERAGE_LOW".to_string(),
+                format!(
+                    "iperf3 有效流量窗口内的接收端网卡采样覆盖率 {:.1}%，低于 {:.1}%",
+                    rx_stats.coverage * 100.0,
+                    MIN_RATE_SAMPLE_COVERAGE * 100.0
+                ),
+            )
         } else {
-            Verdict::RateFail
-        };
-        let reason_code = if ok {
-            String::new()
-        } else if !raw_ok {
-            "IPERF_EXEC_FAILED".into()
-        } else {
-            "NO_VALID_MEASUREMENT".into()
+            (Verdict::Pass, String::new(), String::new())
         };
         let raw_error = if raw_ok {
             String::new()
@@ -3165,7 +3637,7 @@ impl Ctx {
 
         logln(&format!(
             "    结果: {} 发送={} 接收={} 网卡实测={}",
-            if ok { "PASS" } else { "FAIL" },
+            verdict.label(),
             fmt_opt(parsed.best_sender()),
             fmt_opt(parsed.best_receiver()),
             fmt_opt(rx_avg)
@@ -3201,19 +3673,19 @@ impl Ctx {
             dst_iface: t.dst.nic.name.clone(),
             dst_ip: t.dst.nic.ipv4.clone(),
             verdict,
-            execution_status: if raw_ok {
-                ExecutionStatus::Completed
-            } else if client.timed_out {
+            execution_status: if client.timed_out {
                 ExecutionStatus::TimedOut
-            } else {
+            } else if client.cancelled {
+                ExecutionStatus::Cancelled
+            } else if !raw_ok {
                 ExecutionStatus::Error
+            } else if verdict == Verdict::NotEvaluated {
+                ExecutionStatus::Partial
+            } else {
+                ExecutionStatus::Completed
             },
             reason_code: reason_code.clone(),
-            reason_detail: if ok {
-                String::new()
-            } else {
-                client.output.lines().last().unwrap_or_default().to_string()
-            },
+            reason_detail: reason_detail.clone(),
             kind_label,
             rx_avg,
             tx_mbps: parsed.best_sender(),
@@ -3224,6 +3696,21 @@ impl Ctx {
             command: client.cmd.clone(),
             raw_log,
             nic_samples,
+            requested_streams: parallel_streams,
+            active_streams: if parsed.has_measurement() {
+                parallel_streams
+            } else {
+                0
+            },
+            required_streams: parallel_streams,
+            rx_p10: rx_stats.p10_mbps,
+            rx_median: rx_stats.median_mbps,
+            rx_p95: rx_stats.p95_mbps,
+            rx_min: rx_stats.min_mbps,
+            rx_max: rx_stats.max_mbps,
+            effective_seconds: Some(effective_window.available_secs),
+            required_seconds: Some(t.duration as f64),
+            sample_coverage: Some(rx_stats.coverage),
             raws: vec![
                 (
                     format!("iperf3 client{} 输出", fmt_tag(tag)),
@@ -3240,11 +3727,7 @@ impl Ctx {
         LegOutcome {
             verdict,
             reason_code,
-            reason_detail: if ok {
-                String::new()
-            } else {
-                client.output.lines().last().unwrap_or_default().to_string()
-            },
+            reason_detail,
             rx_avg,
             main_rows: vec![idx],
             tag: tag.to_string(),
@@ -3712,14 +4195,13 @@ impl Ctx {
                     }
                     let before_ms = epoch.elapsed().as_millis() as u64;
                     match self.mon_start(endpoint.side, &endpoint.nic.name, owner_id, lease_secs) {
-                        Ok(id) => {
-                            let after_ms = epoch.elapsed().as_millis() as u64;
+                        Ok((id, call_origin_ms)) => {
                             monitor_ids.insert(
                                 key,
                                 (
                                     endpoint.side,
                                     id,
-                                    before_ms + (after_ms - before_ms) / 2,
+                                    before_ms + call_origin_ms,
                                     endpoint.nic.name.clone(),
                                 ),
                             );
@@ -5262,9 +5744,9 @@ fn build_monitor_samples_csv(endpoint: &str, iface: &str, out: &MonitorStopOut) 
         "# CPE OS NIC counter samples\n\
 # endpoint,{}\n\
 # interface,{}\n\
-# seconds,{:.6}\n\
-# average_rx_mbps,{:.6}\n\
-# average_tx_mbps,{:.6}\n\
+# full_lifecycle_seconds,{:.6}\n\
+# full_lifecycle_average_rx_mbps,{:.6}\n\
+# full_lifecycle_average_tx_mbps,{:.6}\n\
 elapsed_ms,interval_ms,rx_bytes,tx_bytes,rx_delta_bytes,tx_delta_bytes,rx_mbps,tx_mbps,valid,error\n",
         csv_field(endpoint),
         csv_field(iface),
@@ -5332,27 +5814,21 @@ fn flow_duration_is_plausible(start_ms: u64, end_ms: u64, expected_ms: u64) -> b
             >= expected_ms
 }
 
-fn flow_active_interval(flow: &UdpFlowRun) -> Option<(u64, u64)> {
-    if !flow.raw_ok {
-        return None;
-    }
-    let latest_retry_ms = flow
-        .events
+fn iperf_active_interval(events: &[IperfFlowEvent], required_secs: u64) -> Option<(u64, u64)> {
+    let latest_retry_ms = events
         .iter()
         .filter(|event| event.kind == IperfEventKind::Retry)
         .map(|event| event.elapsed_ms)
         .max();
     let retry_cutoff = latest_retry_ms.unwrap_or(0);
-    let end = flow
-        .events
+    let end = events
         .iter()
         .rev()
         .find(|event| event.kind == IperfEventKind::Ended && event.elapsed_ms >= retry_cutoff)
         .map(|event| event.elapsed_ms)?;
-    let expected_ms = flow.task.duration.saturating_mul(1_000);
+    let expected_ms = required_secs.saturating_mul(1_000);
 
-    let started = flow
-        .events
+    let started = events
         .iter()
         .rev()
         .find(|event| {
@@ -5362,8 +5838,7 @@ fn flow_active_interval(flow: &UdpFlowRun) -> Option<(u64, u64)> {
         })
         .map(|event| event.elapsed_ms);
     let attempt_floor = started.unwrap_or(retry_cutoff);
-    let connected = flow
-        .events
+    let connected = events
         .iter()
         .find(|event| {
             event.kind == IperfEventKind::Connected
@@ -5371,8 +5846,7 @@ fn flow_active_interval(flow: &UdpFlowRun) -> Option<(u64, u64)> {
                 && event.elapsed_ms < end
         })
         .map(|event| event.elapsed_ms);
-    let traffic_events: Vec<&IperfFlowEvent> = flow
-        .events
+    let traffic_events: Vec<&IperfFlowEvent> = events
         .iter()
         .filter(|event| {
             event.kind == IperfEventKind::Traffic
@@ -5386,17 +5860,23 @@ fn flow_active_interval(flow: &UdpFlowRun) -> Option<(u64, u64)> {
     // interval 行内的时间是 iperf 进程自己的测量时间，不受 stdout 块缓冲影响。
     // 优先用最终汇总区间反推起流时刻；只有区间覆盖了用户要求的有效时长才采用，
     // 避免把一次过早结束的短测量误扩成完整测试。
-    let reported_duration_ms = traffic_events
+    let reported_interval = traffic_events
         .iter()
-        .filter_map(|event| iperf_interval_ms(&event.line))
-        .map(|(start_ms, end_ms)| end_ms - start_ms)
-        .max();
-    if let Some(duration_ms) = reported_duration_ms
-        .filter(|duration_ms| duration_ms.saturating_add(FLOW_TIMELINE_TOLERANCE_MS) >= expected_ms)
-    {
-        let start = end.saturating_sub(duration_ms).max(attempt_floor);
-        if flow_duration_is_plausible(start, end, expected_ms) {
-            return Some((start, end));
+        .filter_map(|event| {
+            iperf_interval_ms(&event.line)
+                .map(|(start_ms, end_ms)| (end_ms.saturating_sub(start_ms), event.elapsed_ms))
+        })
+        .filter(|(duration_ms, _)| {
+            duration_ms.saturating_add(FLOW_TIMELINE_TOLERANCE_MS) >= expected_ms
+        })
+        .max_by_key(|(duration_ms, event_elapsed_ms)| (*event_elapsed_ms, *duration_ms));
+    if let Some((duration_ms, event_elapsed_ms)) = reported_interval {
+        // 最终汇总行已经证明吞吐测量结束；它之后到 Ended 之间只剩
+        // child wait、stdout reader join 等退出收尾，不能纳入网卡平均。
+        let measured_end = event_elapsed_ms.min(end);
+        let start = measured_end.saturating_sub(duration_ms).max(attempt_floor);
+        if flow_duration_is_plausible(start, measured_end, expected_ms) {
+            return Some((start, measured_end));
         }
     }
 
@@ -5426,6 +5906,46 @@ fn flow_active_interval(flow: &UdpFlowRun) -> Option<(u64, u64)> {
     // 测试确实提前结束时保留最保守的可观察起点，使有效窗口保持不足。
     let start = first_traffic.or(connected).or(started)?;
     (end > start).then_some((start, end))
+}
+
+fn iperf_effective_window(
+    events: &[IperfFlowEvent],
+    required_secs: u64,
+    has_measurement: bool,
+) -> EffectiveWindow {
+    if !has_measurement {
+        return EffectiveWindow {
+            required_secs,
+            ..Default::default()
+        };
+    }
+    let Some((start_ms, end_ms)) = iperf_active_interval(events, required_secs) else {
+        return EffectiveWindow {
+            required_secs,
+            ..Default::default()
+        };
+    };
+    let available_ms = end_ms.saturating_sub(start_ms);
+    let required_ms = required_secs.saturating_mul(1_000);
+    let complete = available_ms.saturating_add(CTS_TIMELINE_TOLERANCE_MS) >= required_ms;
+    EffectiveWindow {
+        start_ms,
+        end_ms: if complete {
+            start_ms.saturating_add(required_ms).min(end_ms)
+        } else {
+            end_ms
+        },
+        available_secs: available_ms as f64 / 1_000.0,
+        required_secs,
+        complete,
+    }
+}
+
+fn flow_active_interval(flow: &UdpFlowRun) -> Option<(u64, u64)> {
+    if !flow.raw_ok {
+        return None;
+    }
+    iperf_active_interval(&flow.events, flow.task.duration)
 }
 
 fn nearest_valid_sample(
@@ -5939,6 +6459,7 @@ mod tests {
     use super::*;
     use crate::master::builder::{Endpoint, PingPurpose, PingTask};
     use crate::protocol::NicInfo;
+    use std::sync::atomic::AtomicUsize;
 
     #[test]
     fn unit_panic_is_converted_cleanup_runs_and_next_unit_can_continue() {
@@ -6083,6 +6604,8 @@ mod tests {
                 ..Default::default()
             },
             outdir: std::env::temp_dir(),
+            transport: Arc::new(http_client::TcpTransport),
+            clock: Arc::new(SystemClock),
             local_servers: IperfServerMgr::new(),
             local_cts_jobs: IperfClientJobMgr::new(),
             local_monitors: MonitorMgr::new(),
@@ -6092,6 +6615,576 @@ mod tests {
         (ctx, db_path)
     }
 
+    #[test]
+    fn reliable_retry_elapsed_excludes_failed_attempts() {
+        // 回归：start 时间轴只统计成功那次调用的耗时。
+        // 若把三次可靠调用（含失败重试与 250ms 等待）的总时长都算进
+        // response_elapsed，远端 job 零点会被整体偏移数秒。
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_worker = Arc::clone(&attempts);
+        std::thread::spawn(move || {
+            for rq in server.incoming_requests() {
+                let n = attempts_worker.fetch_add(1, Ordering::SeqCst);
+                let body = if n == 0 {
+                    // 第一次调用模拟失败（连接被拒/超时由客户端侧体现）；
+                    // 这里直接返回 500，让 agent_post 走 Err 分支进入重试。
+                    "boom".to_string()
+                } else {
+                    ok_json(MonitorStartOut {
+                        id: "mon-retry".into(),
+                        elapsed_ms: 5,
+                    })
+                };
+                let status_code = if n == 0 { 500 } else { 200 };
+                let resp = tiny_http::Response::from_string(body).with_status_code(status_code);
+                let _ = rq.respond(resp);
+            }
+        });
+
+        let (ctx, db_path) = isolated_ctx(port);
+        let t0 = Instant::now();
+        let (out, attempt_elapsed) = ctx
+            .agent_post_reliable_timed::<_, MonitorStartOut>(
+                "/monitor/start",
+                &MonitorStartReq {
+                    iface: "retry-iface".into(),
+                    interval_ms: 1000,
+                    owner_id: "owner-retry".into(),
+                    lease_secs: 0,
+                },
+                Duration::from_secs(5),
+            )
+            .expect("第二次调用应成功");
+        let total_elapsed = t0.elapsed();
+        assert_eq!(out.id, "mon-retry");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2, "必须真的发生过一次重试");
+        // 成功那次调用自身耗时必须远小于含重试等待的总时长。
+        assert!(
+            attempt_elapsed < total_elapsed - RELIABLE_HTTP_RETRY_DELAY,
+            "成功调用耗时 {attempt_elapsed:?} 不应包含 {RELIABLE_HTTP_RETRY_DELAY:?} 的重试等待（总耗时 {total_elapsed:?}）"
+        );
+        // 且成功调用自身耗时应是亚秒级（第二次立刻成功）。
+        assert!(attempt_elapsed < Duration::from_millis(200));
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn scripted_transport_retries_dropped_and_truncated_responses_with_fake_time() {
+        let transport = Arc::new(http_client::ScriptedTransport::new());
+        transport.push_for_path(
+            "/monitor/start",
+            http_client::ScriptedExchange::drop_response(),
+        );
+        transport.push_for_path(
+            "/monitor/start",
+            http_client::ScriptedExchange::truncated(200, r#"{"ok":true"#, 64),
+        );
+        transport.push_for_path(
+            "/monitor/start",
+            http_client::ScriptedExchange::response(
+                200,
+                ok_json(MonitorStartOut {
+                    id: "mon-scripted".into(),
+                    elapsed_ms: 37,
+                }),
+            ),
+        );
+        let clock = Arc::new(ManualClock::new());
+        let (mut ctx, db_path) = isolated_ctx(1);
+        ctx.transport = transport.clone();
+        ctx.clock = clock.clone();
+
+        let (out, successful_attempt_elapsed) = ctx
+            .agent_post_reliable_timed::<_, MonitorStartOut>(
+                "/monitor/start",
+                &MonitorStartReq {
+                    iface: "fake0".into(),
+                    interval_ms: 1_000,
+                    owner_id: "owner-scripted".into(),
+                    lease_secs: 60,
+                },
+                Duration::from_secs(5),
+            )
+            .unwrap();
+
+        assert_eq!(out.id, "mon-scripted");
+        assert_eq!(successful_attempt_elapsed, Duration::ZERO);
+        assert_eq!(clock.elapsed(), Duration::from_millis(500));
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 3);
+        assert!(requests.windows(2).all(|pair| pair[0].body == pair[1].body));
+        assert_eq!(transport.remaining(), 0);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    // ---------------- P1 step 2：服务端副作用 + 丢响应幂等验收 ----------------
+
+    /// 假 agent：按 request_id 幂等的 client job 注册表，镜像真实
+    /// [`IperfClientJobMgr::start_request`] 的契约：
+    /// 相同 request_id + 相同参数 → 复用同一 job（不重复创建）；
+    /// 相同 request_id + 不同参数 → 拒绝；stop 幂等。
+    /// 同时记录服务端副作用计数：spawned 是“实际创建 job 的次数”，
+    /// 丢响应场景下响应被丢弃但副作用必须已经发生。
+    #[derive(Default)]
+    struct FakeClientAgent {
+        spawned: AtomicUsize,
+        start_attempts: AtomicUsize,
+        statuses: AtomicUsize,
+        stops: AtomicUsize,
+        jobs: Mutex<HashMap<String, String>>,
+    }
+
+    impl FakeClientAgent {
+        fn handle(
+            &self,
+            request: &http_client::HttpRequest,
+        ) -> Result<http_client::HttpResponse, String> {
+            let respond = |body: String| http_client::HttpResponse::new(200, body);
+            match request.path.as_str() {
+                "/iperf/client/start" => {
+                    self.start_attempts.fetch_add(1, Ordering::SeqCst);
+                    let start: IperfClientStartReq = serde_json::from_str(&request.body)
+                        .map_err(|e| format!("start 请求解析失败: {e}"))?;
+                    let fingerprint = format!(
+                        "{}|{}",
+                        start.owner_id,
+                        serde_json::to_string(&start.request).map_err(|e| e.to_string())?
+                    );
+                    let mut jobs = self
+                        .jobs
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    if let Some(existing) = jobs.get(&start.request_id) {
+                        if existing != &fingerprint {
+                            return Ok(respond(err_json(&format!(
+                                "iperf client request_id {} 的重复 start 参数不一致",
+                                start.request_id
+                            ))));
+                        }
+                        // 相同参数重复 start：复用，不创建新 job。
+                        return Ok(respond(ok_json(IperfClientStartOut {
+                            id: start.request_id.clone(),
+                            elapsed_ms: 5,
+                        })));
+                    }
+                    self.spawned.fetch_add(1, Ordering::SeqCst);
+                    jobs.insert(start.request_id.clone(), fingerprint);
+                    Ok(respond(ok_json(IperfClientStartOut {
+                        id: start.request_id.clone(),
+                        elapsed_ms: 5,
+                    })))
+                }
+                "/iperf/client/status" => {
+                    self.statuses.fetch_add(1, Ordering::SeqCst);
+                    let req: IperfClientStatusReq = serde_json::from_str(&request.body)
+                        .map_err(|e| format!("status 请求解析失败: {e}"))?;
+                    Ok(respond(ok_json(IperfClientStatusOut {
+                        id: req.id,
+                        done: true,
+                        next_cursor: 0,
+                        events: vec![IperfFlowEvent {
+                            kind: IperfEventKind::Ended,
+                            elapsed_ms: 10_000,
+                            ..Default::default()
+                        }],
+                        result: Some(IperfClientOut {
+                            ok: true,
+                            cleanup_confirmed: Some(true),
+                            cmd: "fake client".into(),
+                            output: "fake client ok".into(),
+                            ..Default::default()
+                        }),
+                    })))
+                }
+                "/iperf/client/stop" => {
+                    self.stops.fetch_add(1, Ordering::SeqCst);
+                    let _req: IperfClientStopReq = serde_json::from_str(&request.body)
+                        .map_err(|e| format!("stop 请求解析失败: {e}"))?;
+                    Ok(respond(ok_json(IperfClientStopOut {
+                        existed: true,
+                        was_done: false,
+                        terminated: true,
+                        result: Some(IperfClientOut {
+                            ok: true,
+                            cleanup_confirmed: Some(true),
+                            cmd: "fake client".into(),
+                            output: "fake stop ok".into(),
+                            ..Default::default()
+                        }),
+                    })))
+                }
+                _ => Err(format!("fake agent 未知路径 {}", request.path)),
+            }
+        }
+    }
+
+    /// 构造与测试共享虚拟时钟的脚本 transport，handler 即假 agent。
+    fn fake_client_agent_transport(
+        clock: &Arc<ManualClock>,
+        agent: &Arc<FakeClientAgent>,
+    ) -> http_client::ScriptedTransport {
+        let agent = Arc::clone(agent);
+        http_client::ScriptedTransport::with_handler(clock.clone(), move |request| {
+            agent.handle(request)
+        })
+    }
+
+    fn acc_start_req(request_id: &str, port: u16) -> IperfClientStartReq {
+        IperfClientStartReq {
+            request: IperfClientReq {
+                dst: "10.0.0.2".into(),
+                bind_ip: "10.0.0.1".into(),
+                port,
+                duration: 10,
+                ..Default::default()
+            },
+            request_id: request_id.to_string(),
+            owner_id: "owner-acc".into(),
+            lease_secs: 0,
+        }
+    }
+
+    /// P1 第一条验收测试：丢 start 响应不能重复创建 job。
+    ///
+    /// 同时验证三个契约：
+    /// 1. Transport —— 响应在返回路径丢失，但请求已送达并产生服务端副作用；
+    /// 2. 重试幂等 —— 相同 request_id 的可靠重试必须复用同一个 job，spawn 次数=1；
+    /// 3. 资源清理 —— stop 可回收；重复 stop 幂等；不同参数的重复 start 必须拒绝。
+    #[test]
+    fn dropped_start_response_retries_idempotently_and_stop_reclaims() {
+        let clock = Arc::new(ManualClock::new());
+        let agent = Arc::new(FakeClientAgent::default());
+        let transport = fake_client_agent_transport(&clock, &agent);
+        // 第一次 start 响应在返回路径丢失（请求已送达，副作用已发生）；
+        // 之后三次调用都直接交付 handler 的结果。
+        transport.push_for_path(
+            "/iperf/client/start",
+            http_client::ScriptedExchange::drop_response(),
+        );
+        transport.push_for_path(
+            "/iperf/client/start",
+            http_client::ScriptedExchange::handler_response(),
+        );
+        transport.push_for_path(
+            "/iperf/client/start",
+            http_client::ScriptedExchange::handler_response(),
+        );
+        transport.push_for_path(
+            "/iperf/client/start",
+            http_client::ScriptedExchange::handler_response(),
+        );
+
+        // 两次 stop 各需一次脚本。
+        transport.push_for_path(
+            "/iperf/client/stop",
+            http_client::ScriptedExchange::handler_response(),
+        );
+        transport.push_for_path(
+            "/iperf/client/stop",
+            http_client::ScriptedExchange::handler_response(),
+        );
+        let (mut ctx, db_path) = isolated_ctx(1);
+        ctx.transport = Arc::new(transport.clone());
+        ctx.clock = clock.clone();
+
+        let start_req = acc_start_req("acc-start-1", 5201);
+        let (out, attempt_elapsed) = ctx
+            .agent_post_reliable_timed::<_, IperfClientStartOut>(
+                "/iperf/client/start",
+                &start_req,
+                Duration::from_secs(5),
+            )
+            .expect("响应丢失后重试必须成功");
+        assert_eq!(out.id, "acc-start-1", "重试必须返回同一个 job ID");
+        assert_eq!(
+            agent.spawned.load(Ordering::SeqCst),
+            1,
+            "spawn 次数必须是 1，不是 2"
+        );
+        assert_eq!(
+            agent.start_attempts.load(Ordering::SeqCst),
+            2,
+            "第一次响应丢失后必须真的重试"
+        );
+        assert_eq!(
+            attempt_elapsed,
+            Duration::ZERO,
+            "成功那次调用自身耗时不能计入失败等待"
+        );
+        // 丢响应耗尽 5s 虚拟超时 + 一次 250ms 重试等待，全程零真实 sleep。
+        assert_eq!(
+            clock.elapsed(),
+            Duration::from_secs(5) + RELIABLE_HTTP_RETRY_DELAY
+        );
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests.windows(2).all(|pair| pair[0].body == pair[1].body),
+            "重试必须携带相同 request_id/body"
+        );
+
+        // 相同参数重复 start 是复用：直接返回同一 job，不再创建。
+        let again = ctx
+            .agent_post::<_, IperfClientStartOut>(
+                "/iperf/client/start",
+                &start_req,
+                Duration::from_secs(5),
+            )
+            .unwrap();
+        assert_eq!(again.id, "acc-start-1");
+        assert_eq!(agent.spawned.load(Ordering::SeqCst), 1);
+
+        // 不同参数必须拒绝。
+        let mut conflict = start_req.clone();
+        conflict.request.port = 5202;
+        let conflict_err = ctx
+            .agent_post::<_, IperfClientStartOut>(
+                "/iperf/client/start",
+                &conflict,
+                Duration::from_secs(5),
+            )
+            .unwrap_err();
+        assert!(
+            conflict_err.contains("重复 start 参数不一致"),
+            "不同参数的重复 start 必须拒绝: {conflict_err}"
+        );
+
+        // stop 回收资源。
+        let stop = ctx
+            .client_stop_confirmed("acc-start-1")
+            .expect("stop 必须被确认");
+        assert!(stop.terminated);
+        assert_eq!(agent.stops.load(Ordering::SeqCst), 1);
+
+        // 再次 stop 幂等：不产生新的资源错误。
+        let stop_again = ctx
+            .client_stop_confirmed("acc-start-1")
+            .expect("重复 stop 必须仍然成功");
+        assert!(stop_again.terminated);
+        assert_eq!(agent.stops.load(Ordering::SeqCst), 2);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    /// 全部 start 响应都丢失：主控必须明确失败（不能假成功），
+    /// 幂等 agent 只创建一个 job，补偿清理仍能按 request_id 回收。
+    #[test]
+    fn all_start_responses_dropped_fails_explicitly_without_false_pass() {
+        let clock = Arc::new(ManualClock::new());
+        let agent = Arc::new(FakeClientAgent::default());
+        let transport = fake_client_agent_transport(&clock, &agent);
+        for _ in 0..RELIABLE_HTTP_ATTEMPTS {
+            transport.push_for_path(
+                "/iperf/client/start",
+                http_client::ScriptedExchange::drop_response(),
+            );
+        }
+        transport.push_for_path(
+            "/iperf/client/stop",
+            http_client::ScriptedExchange::handler_response(),
+        );
+
+        let (mut ctx, db_path) = isolated_ctx(1);
+        ctx.transport = Arc::new(transport.clone());
+        ctx.clock = clock.clone();
+
+        let start_req = acc_start_req("acc-start-2", 5203);
+        let err = ctx
+            .agent_post_reliable_timed::<_, IperfClientStartOut>(
+                "/iperf/client/start",
+                &start_req,
+                Duration::from_secs(5),
+            )
+            .expect_err("全部响应丢失必须明确失败，不能产生假成功");
+        assert!(
+            err.contains("第1次") && err.contains("第3次"),
+            "错误必须列出每次重试: {err}"
+        );
+        assert_eq!(
+            agent.spawned.load(Ordering::SeqCst),
+            1,
+            "三次丢响应也只创建一个 job（request_id 幂等）"
+        );
+        assert_eq!(
+            agent.start_attempts.load(Ordering::SeqCst),
+            RELIABLE_HTTP_ATTEMPTS
+        );
+        assert_eq!(
+            clock.elapsed(),
+            Duration::from_secs(5) * 3 + RELIABLE_HTTP_RETRY_DELAY * 2,
+            "三次尝试之间有两次重试等待，全程虚拟"
+        );
+
+        // 主控补偿清理：按 request_id 直接 stop 依然能回收资源。
+        let stop = ctx
+            .client_stop_confirmed("acc-start-2")
+            .expect("补偿清理 stop 必须被确认");
+        assert!(stop.terminated);
+        assert_eq!(agent.stops.load(Ordering::SeqCst), 1);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    /// 丢请求：请求根本没送达 agent，因此不产生任何服务端副作用；
+    /// 主控可靠重试后成功，spawn 恰好一次。
+    #[test]
+    fn dropped_start_request_leaves_no_side_effect_and_retry_succeeds() {
+        let clock = Arc::new(ManualClock::new());
+        let agent = Arc::new(FakeClientAgent::default());
+        let transport = fake_client_agent_transport(&clock, &agent);
+        transport.push_for_path(
+            "/iperf/client/start",
+            http_client::ScriptedExchange::drop_request(),
+        );
+        transport.push_for_path(
+            "/iperf/client/start",
+            http_client::ScriptedExchange::handler_response(),
+        );
+
+        let (mut ctx, db_path) = isolated_ctx(1);
+        ctx.transport = Arc::new(transport.clone());
+        ctx.clock = clock.clone();
+
+        let start_req = acc_start_req("acc-start-3", 5204);
+        let (out, _) = ctx
+            .agent_post_reliable_timed::<_, IperfClientStartOut>(
+                "/iperf/client/start",
+                &start_req,
+                Duration::from_secs(5),
+            )
+            .expect("丢请求重试后必须成功");
+        assert_eq!(out.id, "acc-start-3");
+        assert_eq!(
+            agent.spawned.load(Ordering::SeqCst),
+            1,
+            "只有成功那次才创建 job"
+        );
+        assert_eq!(
+            agent.start_attempts.load(Ordering::SeqCst),
+            1,
+            "丢请求时 handler 不应被调用（请求未送达）"
+        );
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    /// 非对称延迟：请求 20ms、响应 900ms。时间轴必须用 agent 上报的 elapsed_ms
+    /// 反推 job 起点，而不是用 RTT 中点（460ms）当作起点。
+    #[test]
+    fn asymmetric_delay_origin_uses_agent_elapsed_not_rtt_midpoint() {
+        let clock = Arc::new(ManualClock::new());
+        let transport = http_client::ScriptedTransport::with_clock(clock.clone());
+        transport.push_for_path(
+            "/monitor/start",
+            http_client::ScriptedExchange::with_delays(
+                Duration::from_millis(20),
+                Duration::from_millis(900),
+                http_client::ScriptedOutcome::Response(http_client::HttpResponse::new(
+                    200,
+                    ok_json(MonitorStartOut {
+                        id: "mon-asym".into(),
+                        elapsed_ms: 900,
+                    }),
+                )),
+            ),
+        );
+
+        let (mut ctx, db_path) = isolated_ctx(1);
+        ctx.transport = Arc::new(transport);
+        ctx.clock = clock.clone();
+
+        let (out, attempt_elapsed) = ctx
+            .agent_post_reliable_timed::<_, MonitorStartOut>(
+                "/monitor/start",
+                &MonitorStartReq {
+                    iface: "fake0".into(),
+                    interval_ms: 1_000,
+                    owner_id: "owner-asym".into(),
+                    lease_secs: 0,
+                },
+                Duration::from_secs(5),
+            )
+            .unwrap();
+        assert_eq!(attempt_elapsed, Duration::from_millis(920));
+        let origin = remote_job_origin_ms(attempt_elapsed.as_millis() as u64, out.elapsed_ms);
+        assert_eq!(
+            origin, 10,
+            "job 起点应接近请求到达时刻(20ms)，而不是 RTT 中点 460ms"
+        );
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    /// 完整主控 client 流程：start（首次丢响应 → 幂等重试）→ status(done)
+    /// → stop。最终报告必须为 ok（资源真实创建且清理确认），spawn 恰一次，
+    /// 事件不因丢响应而丢失。
+    #[test]
+    fn full_scripted_client_flow_reports_ok_and_reclaims() {
+        let clock = Arc::new(ManualClock::new());
+        let agent = Arc::new(FakeClientAgent::default());
+        let transport = fake_client_agent_transport(&clock, &agent);
+        transport.push_for_path(
+            "/iperf/client/start",
+            http_client::ScriptedExchange::drop_response(),
+        );
+        transport.push_for_path(
+            "/iperf/client/start",
+            http_client::ScriptedExchange::handler_response(),
+        );
+        transport.push_for_path(
+            "/iperf/client/status",
+            http_client::ScriptedExchange::handler_response(),
+        );
+        transport.push_for_path(
+            "/iperf/client/stop",
+            http_client::ScriptedExchange::handler_response(),
+        );
+
+        let (mut ctx, db_path) = isolated_ctx(1);
+        ctx.transport = Arc::new(transport.clone());
+        ctx.clock = clock.clone();
+
+        let events = Arc::new(Mutex::new(Vec::<IperfFlowEvent>::new()));
+        let events_sink = Arc::clone(&events);
+        let out = ctx.client_run_tracked(
+            Side::Agent,
+            &IperfClientReq {
+                dst: "10.0.0.2".into(),
+                bind_ip: "10.0.0.1".into(),
+                port: 5205,
+                duration: 10,
+                ..Default::default()
+            },
+            "owner-full",
+            "full-1",
+            0,
+            move |event| {
+                events_sink
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(event);
+            },
+        );
+
+        assert!(out.ok, "资源真实创建并确认，报告必须为 PASS");
+        assert_eq!(out.cleanup_confirmed, Some(true));
+        assert_eq!(
+            agent.spawned.load(Ordering::SeqCst),
+            1,
+            "start 首次丢响应后重试不能重复创建 job"
+        );
+        assert_eq!(agent.stops.load(Ordering::SeqCst), 1);
+        assert_eq!(agent.statuses.load(Ordering::SeqCst), 1);
+        let delivered = events
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(delivered.len(), 1, "done 时尾部事件必须全部可见");
+        assert_eq!(delivered[0].kind, IperfEventKind::Ended);
+        assert_eq!(
+            clock.elapsed(),
+            Duration::from_secs(20) + RELIABLE_HTTP_RETRY_DELAY,
+            "只有 start 丢响应那次耗尽虚拟超时(client_run 使用 20s 超时)"
+        );
+        let _ = std::fs::remove_file(db_path);
+    }
     fn udp_plan(
         lidx: usize,
         tag: &str,
@@ -6122,6 +7215,24 @@ mod tests {
             tag: tag.into(),
             name: "udp_b500m".into(),
             streams,
+        }
+    }
+
+    fn tcp_task(src: &Endpoint, dst: &Endpoint, port: u16) -> IperfTask {
+        IperfTask {
+            v6: false,
+            udp: false,
+            profile_name: "tcp_w64k_P2".into(),
+            profile_label: "TCP -w 64k -P 2".into(),
+            src: src.clone(),
+            dst: dst.clone(),
+            port,
+            duration: 10,
+            extra: vec!["-w".into(), "64k".into(), "-P".into(), "2".into()],
+            stream_idx: 0,
+            rate_mode: RateMode::Observe,
+            rx_target_mbps: None,
+            offered_mbps: None,
         }
     }
 
@@ -6307,6 +7418,45 @@ mod tests {
         let stats = monitor_rate_stats(&monitor, &window, true, window.start_ms);
         assert_eq!(stats.avg_mbps, Some(100.0));
         assert_eq!(stats.coverage, 1.0);
+    }
+
+    #[test]
+    fn tcp_remote_job_origin_uses_rpc_midpoint_not_the_latest_bound() {
+        let response_elapsed_ms = 900;
+        let remote_job_age_ms = 300;
+        let latest_possible_origin_ms = response_elapsed_ms - remote_job_age_ms;
+
+        assert_eq!(latest_possible_origin_ms, 600);
+        assert_eq!(
+            remote_job_origin_ms(response_elapsed_ms, remote_job_age_ms),
+            300
+        );
+    }
+
+    #[test]
+    fn remote_monitor_origin_uses_agent_elapsed_not_rpc_midpoint() {
+        // 回归：远端 monitor 零点必须由 start 响应里的 elapsed_ms 与
+        // 成功调用自身耗时做有界估计；若退化为“请求前后中点”，
+        // 非对称网络延迟会把空闲时间混入正式窗口，覆盖率仍可能 100%。
+        // 模拟：RPC 总耗时 900ms（含 retry 等待），远端 monitor 已运行 300ms，
+        // 与 iperf client start 走完全相同的 remote_job_origin_ms 路径。
+        let attempt_elapsed_ms = 900;
+        let monitor_elapsed_ms = 300;
+        let origin = remote_job_origin_ms(attempt_elapsed_ms, monitor_elapsed_ms);
+        assert_eq!(origin, 300);
+        // 零点必须落进 [0, 成功调用耗时] 的可证明区间，不能是调用前中点。
+        assert!(origin <= attempt_elapsed_ms);
+
+        // 与旧实现对比：旧实现用调用前后中点（例如 before=200, after=1100
+        // → midpoint 650），把 350ms 空闲时间混入窗口。
+        let legacy_rpc_midpoint = midpoint_ms(200, 1_100);
+        assert_eq!(legacy_rpc_midpoint, 650);
+        assert!(origin < legacy_rpc_midpoint, "零点估计必须优于 RPC 中点");
+
+        // 本地 monitor 无网络往返：起点就是调用起点（偏移≈0）。
+        let local_origin = midpoint_ms(0, 2);
+        assert_eq!(local_origin, 1);
+        assert!(local_origin <= 2);
     }
 
     #[test]
@@ -7807,6 +8957,97 @@ mod tests {
     }
 
     #[test]
+    fn tcp_rate_uses_only_the_event_proven_effective_window() {
+        let events = vec![
+            IperfFlowEvent {
+                kind: IperfEventKind::Started,
+                elapsed_ms: 500,
+                line: "started".into(),
+                ..Default::default()
+            },
+            IperfFlowEvent {
+                kind: IperfEventKind::Connected,
+                elapsed_ms: 2_000,
+                line: "connected".into(),
+                ..Default::default()
+            },
+            // 模拟旧版 iperf3 到结束时才刷出汇总行；行内区间仍能
+            // 证明真实的 10 秒数据窗口为 [2s, 12s)。
+            IperfFlowEvent {
+                kind: IperfEventKind::Traffic,
+                elapsed_ms: 12_000,
+                mbps: Some(100.0),
+                line: "[SUM] 0.00-10.00 sec 125 MBytes 100 Mbits/sec receiver".into(),
+            },
+            IperfFlowEvent {
+                kind: IperfEventKind::Ended,
+                elapsed_ms: 12_500,
+                line: "ended".into(),
+                ..Default::default()
+            },
+        ];
+        let window = iperf_effective_window(&events, 10, true);
+        assert_eq!(window.start_ms, 2_000);
+        assert_eq!(window.end_ms, 12_000);
+        assert_eq!(window.available_secs, 10.0);
+        assert!(window.complete);
+
+        let mut samples = vec![
+            MonitorSample {
+                elapsed_ms: 1_000,
+                interval_ms: 1_000,
+                rx_mbps: 10.0,
+                valid: true,
+                ..Default::default()
+            },
+            MonitorSample {
+                elapsed_ms: 2_000,
+                interval_ms: 1_000,
+                rx_mbps: 10.0,
+                valid: true,
+                ..Default::default()
+            },
+        ];
+        samples.extend((3..=12).map(|second| MonitorSample {
+            elapsed_ms: second * 1_000,
+            interval_ms: 1_000,
+            rx_mbps: 110.0,
+            valid: true,
+            ..Default::default()
+        }));
+        // 最终汇总行回调之后的 client wait/reader join 样本必须被裁掉。
+        samples.push(MonitorSample {
+            elapsed_ms: 12_500,
+            interval_ms: 500,
+            rx_mbps: 10.0,
+            valid: true,
+            ..Default::default()
+        });
+        // 这个 stop/清理阶段样本必须被窗口裁掉。
+        samples.push(MonitorSample {
+            elapsed_ms: 13_500,
+            interval_ms: 1_000,
+            rx_mbps: 10.0,
+            valid: true,
+            ..Default::default()
+        });
+        let output = MonitorStopOut {
+            avg_mbps: 42.0,
+            samples,
+            ..Default::default()
+        };
+        let stats = monitor_rate_stats(&output, &window, true, window.start_ms);
+        assert_eq!(stats.avg_mbps, Some(100.0));
+        assert_eq!(stats.coverage, 1.0);
+        assert_eq!(stats.p10_mbps, Some(100.0));
+        assert_ne!(stats.avg_mbps, Some(output.avg_mbps));
+
+        let missing = iperf_effective_window(&events, 10, false);
+        assert_eq!(missing.available_secs, 0.0);
+        assert!(!missing.complete);
+    }
+
+    #[test]
     fn test_retry_count_includes_client_and_group_retry_events() {
         let events = vec![
             IperfFlowEvent {
@@ -7956,6 +9197,236 @@ mod tests {
     }
 
     #[test]
+    fn missing_ab_row_is_restored_without_duplicating_existing_ba_row() {
+        let master = endpoint(Side::Master, "master0", "192.168.1.2");
+        let agent = endpoint(Side::Agent, "agent0", "192.168.1.3");
+        let unit = Unit {
+            id: "partial-bidir-tcp".into(),
+            title: "partial bidirectional TCP".into(),
+            bidir: true,
+            legs: vec![
+                Leg {
+                    tag: "ab".into(),
+                    kind: LegKind::IperfSingle(tcp_task(&master, &agent, 56_000)),
+                },
+                Leg {
+                    tag: "ba".into(),
+                    kind: LegKind::IperfSingle(tcp_task(&agent, &master, 56_001)),
+                },
+            ],
+            est_secs: 20,
+        };
+        let (ctx, db_path) = isolated_ctx(0);
+        let ba_row = ctx.push_row(Row {
+            sort_key: (0, 1, 0, 0),
+            task: unit.title.clone(),
+            transport: "TCP".into(),
+            kind_label: "★★双向灌包-ba".into(),
+            verdict: Verdict::Pass,
+            rx_avg: Some(500.0),
+            ..Default::default()
+        });
+        let mut outcomes = vec![
+            LegOutcome {
+                verdict: Verdict::SetupError,
+                reason_code: "LEG_THREAD_PANIC".into(),
+                reason_detail: "ab 方向执行线程 panic: synthetic".into(),
+                rx_avg: None,
+                main_rows: vec![],
+                tag: "ab".into(),
+            },
+            LegOutcome {
+                verdict: Verdict::Pass,
+                reason_code: String::new(),
+                reason_detail: String::new(),
+                rx_avg: Some(500.0),
+                main_rows: vec![ba_row],
+                tag: "ba".into(),
+            },
+        ];
+
+        ctx.ensure_traffic_outcome_rows(0, &unit, &mut outcomes);
+        assert_eq!(outcomes.len(), 2);
+        assert_eq!(outcomes[0].main_rows.len(), 1);
+        assert_eq!(outcomes[1].main_rows, vec![ba_row]);
+        let rows = ctx.rows.lock().unwrap();
+        assert_eq!(rows.len(), 2);
+        let ab = rows
+            .iter()
+            .find(|row| row.kind_label.ends_with("-ab"))
+            .expect("restored AB detail row");
+        assert_eq!(ab.reason_code, "LEG_THREAD_PANIC");
+        assert_eq!(ab.src_ip, "192.168.1.2");
+        assert_eq!(ab.dst_ip, "192.168.1.3");
+        drop(rows);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn unit_panic_is_expanded_to_both_direction_rows_without_generic_duplicate() {
+        let master = endpoint(Side::Master, "master0", "192.168.1.2");
+        let agent = endpoint(Side::Agent, "agent0", "192.168.1.3");
+        let unit = Unit {
+            id: "panic-bidir-tcp".into(),
+            title: "panic bidirectional TCP".into(),
+            bidir: true,
+            legs: vec![
+                Leg {
+                    tag: "ab".into(),
+                    kind: LegKind::IperfSingle(tcp_task(&master, &agent, 56_000)),
+                },
+                Leg {
+                    tag: "ba".into(),
+                    kind: LegKind::IperfSingle(tcp_task(&agent, &master, 56_001)),
+                },
+            ],
+            est_secs: 20,
+        };
+        let (ctx, db_path) = isolated_ctx(0);
+        let mut outcomes = vec![LegOutcome {
+            verdict: Verdict::SetupError,
+            reason_code: "UNIT_PANIC".into(),
+            reason_detail: "synthetic unit panic".into(),
+            rx_avg: None,
+            main_rows: vec![],
+            tag: String::new(),
+        }];
+
+        ctx.ensure_traffic_outcome_rows(0, &unit, &mut outcomes);
+        assert_eq!(outcomes.len(), 2);
+        assert!(outcomes.iter().any(|outcome| outcome.tag == "ab"));
+        assert!(outcomes.iter().any(|outcome| outcome.tag == "ba"));
+        assert!(outcomes
+            .iter()
+            .all(|outcome| outcome.reason_code == "UNIT_PANIC" && outcome.main_rows.len() == 1));
+        let rows = ctx.rows.lock().unwrap();
+        assert_eq!(rows.len(), 2);
+        drop(rows);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn unit_panic_reuses_a_committed_ab_row_and_only_fills_missing_ba() {
+        let master = endpoint(Side::Master, "master0", "192.168.1.2");
+        let agent = endpoint(Side::Agent, "agent0", "192.168.1.3");
+        let unit = Unit {
+            id: "partial-row-then-panic".into(),
+            title: "partial row then unit panic".into(),
+            bidir: true,
+            legs: vec![
+                Leg {
+                    tag: "ab".into(),
+                    kind: LegKind::IperfSingle(tcp_task(&master, &agent, 56_000)),
+                },
+                Leg {
+                    tag: "ba".into(),
+                    kind: LegKind::IperfSingle(tcp_task(&agent, &master, 56_001)),
+                },
+            ],
+            est_secs: 20,
+        };
+        let (ctx, db_path) = isolated_ctx(0);
+        let ab_row = ctx.push_row(Row {
+            sort_key: (0, 0, 0, 0),
+            parent_id: unit.id.clone(),
+            task: unit.title.clone(),
+            transport: "TCP".into(),
+            kind_label: "★★双向灌包-ab".into(),
+            verdict: Verdict::Pass,
+            rx_avg: Some(420.0),
+            ..Default::default()
+        });
+        let mut outcomes = vec![LegOutcome {
+            verdict: Verdict::SetupError,
+            reason_code: "UNIT_PANIC".into(),
+            reason_detail: "panic after AB row commit".into(),
+            rx_avg: None,
+            main_rows: vec![],
+            tag: String::new(),
+        }];
+
+        ctx.ensure_traffic_outcome_rows(0, &unit, &mut outcomes);
+
+        assert_eq!(outcomes.len(), 2);
+        let ab = outcomes.iter().find(|outcome| outcome.tag == "ab").unwrap();
+        let ba = outcomes.iter().find(|outcome| outcome.tag == "ba").unwrap();
+        assert_eq!(ab.main_rows, vec![ab_row]);
+        assert_eq!(ab.rx_avg, Some(420.0));
+        assert_eq!(ba.main_rows.len(), 1);
+        assert_eq!(ba.reason_code, "UNIT_PANIC");
+        let rows = ctx.rows.lock().unwrap();
+        assert_eq!(rows.len(), 2, "已有 AB 不能再被补成重复方向行");
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.kind_label.ends_with("-ab"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.kind_label.ends_with("-ba"))
+                .count(),
+            1
+        );
+        drop(rows);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn bidirectional_preflight_keeps_both_ab_and_ba_detail_rows() {
+        let master = endpoint(Side::Master, "master0", "192.168.1.2");
+        let agent = endpoint(Side::Agent, "agent0", "192.168.1.3");
+        let unit = Unit {
+            id: "blocked-bidir-tcp".into(),
+            title: "blocked bidirectional TCP".into(),
+            bidir: true,
+            legs: vec![
+                Leg {
+                    tag: "ab".into(),
+                    kind: LegKind::IperfSingle(tcp_task(&master, &agent, 56_000)),
+                },
+                Leg {
+                    tag: "ba".into(),
+                    kind: LegKind::IperfSingle(tcp_task(&agent, &master, 56_001)),
+                },
+            ],
+            est_secs: 20,
+        };
+        let block = IperfPreflightBlock {
+            reason_code: "IPERF_PREFLIGHT_FAILED".into(),
+            reason_detail: "两端缺少 iperf3".into(),
+        };
+        let (ctx, db_path) = isolated_ctx(0);
+        let summary = ctx.run_all_with_preflight(&[unit], Some(&block));
+        assert_eq!(summary.setup_error, 1);
+
+        let rows = ctx.rows.lock().unwrap();
+        let detail_rows: Vec<_> = rows.iter().filter(|row| !row.is_unit_summary).collect();
+        assert_eq!(detail_rows.len(), 2);
+        assert!(detail_rows
+            .iter()
+            .all(|row| row.reason_code == "IPERF_PREFLIGHT_FAILED"));
+        assert!(detail_rows
+            .iter()
+            .any(|row| row.src_ip == "192.168.1.2" && row.dst_ip == "192.168.1.3"));
+        assert!(detail_rows
+            .iter()
+            .any(|row| row.src_ip == "192.168.1.3" && row.dst_ip == "192.168.1.2"));
+        assert!(detail_rows
+            .iter()
+            .any(|row| row.kind_label.ends_with("-ab")));
+        assert!(detail_rows
+            .iter()
+            .any(|row| row.kind_label.ends_with("-ba")));
+        let unit_summary = rows.iter().find(|row| row.is_unit_summary).unwrap();
+        assert!(detail_rows
+            .iter()
+            .all(|row| row.sort_key < unit_summary.sort_key));
+        drop(rows);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
     fn ctstraffic_preflight_block_becomes_setup_error_and_triggers_diagnostics() {
         let unit = ctstraffic_unit("cts-blocked", true);
         let block = IperfPreflightBlock {
@@ -8061,10 +9532,20 @@ mod tests {
         let detail_rows: Vec<_> = rows.iter().filter(|row| !row.is_unit_summary).collect();
         assert_eq!(
             detail_rows.len(),
-            1,
-            "正常方向必须停在 preflight，不能启动 CTS"
+            2,
+            "两个方向都必须保留明细，且正常方向仍必须停在 preflight"
         );
-        assert_eq!(detail_rows[0].reason_code, "CTSTRAFFIC_ARGS_INVALID");
+        assert!(detail_rows
+            .iter()
+            .any(|row| row.reason_code == "CTSTRAFFIC_ARGS_INVALID"
+                && row.kind_label.ends_with("-ab")));
+        assert!(detail_rows
+            .iter()
+            .any(|row| row.reason_code == "CTSTRAFFIC_PREFLIGHT_FAILED"
+                && row.kind_label.ends_with("-ba")));
+        assert!(detail_rows
+            .iter()
+            .all(|row| row.kind_label.contains("CTS Traffic")));
         let summary_row = rows.iter().find(|row| row.is_unit_summary).unwrap();
         assert_eq!(summary_row.reason_code, "CTSTRAFFIC_ARGS_INVALID");
         assert!(summary_row
@@ -8196,6 +9677,8 @@ mod tests {
             agent_port: 1,
             cfg,
             outdir: std::env::temp_dir(),
+            transport: Arc::new(http_client::TcpTransport),
+            clock: Arc::new(SystemClock),
             local_servers: IperfServerMgr::new(),
             local_cts_jobs: IperfClientJobMgr::new(),
             local_monitors: MonitorMgr::new(),
@@ -8582,6 +10065,29 @@ mod tests {
     }
 
     #[test]
+    fn nested_run_artifact_keeps_report_relative_link() {
+        let nonce = RESOURCE_OWNER_SEQ.fetch_add(1, Ordering::SeqCst);
+        let run_dir = std::env::temp_dir().join(format!(
+            "cpe_run_artifact_test_{}_{}",
+            std::process::id(),
+            nonce
+        ));
+        let outdir = run_dir.join("iperf_outputs");
+        let (mut ctx, db_path) = isolated_ctx(0);
+        ctx.outdir = outdir.clone();
+
+        let link = ctx.write_output_artifact("artifact.log", "artifact", "测试附件");
+
+        assert_eq!(link, "./iperf_outputs/artifact.log");
+        assert_eq!(
+            std::fs::read_to_string(outdir.join("artifact.log")).unwrap(),
+            "artifact"
+        );
+        let _ = std::fs::remove_dir_all(run_dir);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
     fn ctstraffic_raw_record_contains_server_client_events_and_error() {
         let nonce = RESOURCE_OWNER_SEQ.fetch_add(1, Ordering::SeqCst);
         let outdir =
@@ -8675,5 +10181,9 @@ mod tests {
         assert!(csv.contains("1000,1000,1012500000,2011250000,12500000,11250000,100.000000,90.000000,false,counter reset"));
         assert!(csv.contains("# endpoint,agent"));
         assert!(csv.contains("# interface,Ethernet 2"));
+        assert!(csv.contains("# full_lifecycle_seconds,1.000000"));
+        assert!(csv.contains("# full_lifecycle_average_rx_mbps,100.000000"));
+        assert!(csv.contains("# full_lifecycle_average_tx_mbps,90.000000"));
+        assert!(!csv.contains("\n# average_rx_mbps,"));
     }
 }

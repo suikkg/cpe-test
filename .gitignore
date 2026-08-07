@@ -1,4 +1,5 @@
 /target
+/runs/
 report_*.html
 master_*.log
 task_results.json

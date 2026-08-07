@@ -11,7 +11,7 @@
 - 验收 CTS 时，两台电脑均为 Windows 10+，并准备发布包固定版本的 `ctsTraffic.exe`。
 - 放通管理端口 28801 和测试端口 56000 起的端口段。
 - 主控与 agent 的系统时间不要求严格同步；时间线使用各自单调时钟和主控 offset。
-- 测试时保留 `master_日期时间.log`、HTML 报告和 `iperf_outputs/`。
+- 测试时保留同一个 `runs/run_日期时间_进程号/`，其中包含 `master.log`、`report.html` 和 `iperf_outputs/`。
 
 建议基础配置：
 
@@ -59,8 +59,8 @@ iperf3 和 CTS；两种后端每方向总尝试数都按 `max(flow_retries + 1, 
 - HTML 的测试单元汇总行。
 - 每个方向的组合计行。
 - 流明细行及“流事件”原始输出。
-- 主控日志中的 UDP 灌包进度、各方向 attempt/retry、有效窗口和截图日志。
-- `iperf_outputs/iperf_raw_*.log`、`ctstraffic_raw_*.log` 的全部 client/server attempt 原文，以及 `nic_samples_*.csv` 的 OS 网卡逐样本记录。
+- 当前 run 的 `master.log` 中的 UDP 灌包进度、各方向 attempt/retry、有效窗口和截图日志。
+- 当前 run 的 `iperf_outputs/iperf_raw_*.log`、`ctstraffic_raw_*.log` 的全部 client/server attempt 原文，以及 `nic_samples_*.csv` 的 OS 网卡逐样本记录。
 
 报告通过率只按测试单元汇总行统计。20 条流明细加 1 个组合测试仍只能算 1 个测试单元，不能算 21 个。
 
@@ -480,7 +480,7 @@ rate、bytes、frame/datagram 测量。
 - agent 返回错误 JSON、缺少 data 或非法 Base64。
 - 输出目录不可写。
 
-预期：`master_日期时间.log` 写出对应的具体失败环节和错误信息；吞吐 verdict 不因截图失败而改变。
+预期：当前 run 的 `master.log` 写出对应的具体失败环节和错误信息；吞吐 verdict 不因截图失败而改变。
 
 ## 八、自动化回归
 

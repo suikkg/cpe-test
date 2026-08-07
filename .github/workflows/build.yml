@@ -2,7 +2,9 @@ name: Build Release
 
 on:
   push:
+    branches: ["**"]
     tags: ["v*"]
+  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -65,14 +67,14 @@ jobs:
           from pathlib import Path
           from zipfile import ZipFile
 
-          bundle = Path("dist/cpe_test-v4.2.2-windows-config-docs.zip")
+          bundle = Path("dist/cpe_test-v4.2.4-windows-config-docs.zip")
           checksum = Path(f"{bundle}.sha256")
           expected_hash = checksum.read_text(encoding="utf-8").split()[0]
           actual_hash = sha256(bundle.read_bytes()).hexdigest()
           if actual_hash != expected_hash:
               raise SystemExit(f"bundle SHA-256 mismatch: {actual_hash}")
 
-          prefix = "cpe_test-v4.2.2-windows-config-docs"
+          prefix = "cpe_test-v4.2.4-windows-config-docs"
           source_for = {
               "Windows配置与文档包说明.md": Path("dist/Windows配置与文档包说明.md"),
               "README.md": Path("README.md"),
@@ -494,7 +496,16 @@ jobs:
           body: |
             cpe_test ${{ github.ref_name }} 的已验证跨平台发布包。
 
-            ## v4.2.2 核心修复
+            ## v4.2.4 时间轴、安全与报告归档修复
+
+            - 修复 iperf client `status()` 的 done=true 快照竞态：先复制事件、再读完成状态的合法并发交错会让主控停止轮询时永久漏掉尾部 `Traffic/Ended` 事件。现在先读完成状态再复制事件，任何已完成 job 的快照都包含全部事件。
+            - 修复 start RPC 重试污染远端时间轴：只统计成功那次调用自身的耗时，首次连接超时、重试成功后，远端 job 零点不再被前几次失败的重试等待整体偏移。
+            - 远端 monitor 零点改用 start 响应回传的 `elapsed_ms` 做有界估计，不再用 RPC 往返中点猜测；非对称网络延迟不会再把空闲时间混入正式窗口。
+            - agent 控制平面加固：支持 `--token` / `agent_token` 共享令牌认证（未认证请求返回 401 且不创建任何资源）和 `--bind` 监听地址收紧；主控在 config.json 配置相同令牌即可连接。
+            - 报告、主控日志和全部运行附件按 run 目录归档，报告截图缩略图保留到原图的链接。
+            - CI 质量作业（fmt / test / clippy / 配置与文档包校验）扩展到每个 PR 与分支推送，不再只等 tag 或手工触发。
+
+            ## v4.2.2 核心修复（历史）
 
             - TCP 与 UDP 并发流数可分别通过 `tcp_streams`、`udp_streams` 控制；字段缺省或为 `0` 时分别回退旧字段 `streams`。交互菜单只询问已选协议的流数；iperf3 和 CTS 都使用对应协议的有效流数。
             - UDP 带宽使用完整、严格且大小写不敏感的格式解析。`2.8G` 与 `2.8Gbps` 都规范化为精确的 `2800000000 bit/s`；尾随垃圾、科学计数和混合后缀不再透传给后端。
@@ -505,7 +516,7 @@ jobs:
 
             ## 文档与部署
 
-            本版补充 Microsoft ctsTraffic 2.0.4.0 x64 的 TCP Push/Pull/Duplex、UDP 单向/双向原生双机手工命令。Windows 包继续捆绑固定并校验过的 ctsTraffic 2.0.4.0 x64；iperf3 仍需按包内说明自行放置。主控和 agent 应完整使用同一个 v4.2.2 Release 包。
+            本版补充 Microsoft ctsTraffic 2.0.4.0 x64 的 TCP Push/Pull/Duplex、UDP 单向/双向原生双机手工命令。Windows 包继续捆绑固定并校验过的 ctsTraffic 2.0.4.0 x64；iperf3 仍需按包内说明自行放置。主控和 agent 应完整使用同一个 ${{ github.ref_name }} Release 包。
 
             自动测试和 Windows 交叉编译不能代替真实网卡、驱动、防火墙及 CPE 环境。发布后仍建议在两台真实 Windows 10+ 设备上完成一次 CTS TCP/UDP 双机数据流验收，重点核对 CTS 自报速率、`sample_coverage`、`effective_seconds`、`nic_samples_*.csv` 和 `CTSTRAFFIC_*` 诊断。
 

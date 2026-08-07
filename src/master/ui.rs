@@ -1,6 +1,7 @@
 //! 主控交互流程：连接辅测 -> 扫描 -> 菜单选任务 -> 执行 -> 报告
 //! 设计目标：小白一路回车就能跑起来。
 
+use crate::clock::SystemClock;
 use crate::cmd::iperf::IperfServerMgr;
 use crate::config::{load_config, Config};
 use crate::http_client;
@@ -17,8 +18,9 @@ use crate::util::{
     iperf3_version, log_to_file, logln, now_compact, now_full, open_path, parse_selection,
 };
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::Mutex;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Default, Clone)]
@@ -27,6 +29,7 @@ pub struct MasterOpts {
     pub agent_port: Option<u16>,
     pub config_path: Option<String>,
     pub prefixes: Option<Vec<String>>,
+    pub agent_token: Option<String>,
     pub auto: bool,
     pub resume: bool,
     pub no_open: bool,
@@ -36,6 +39,52 @@ pub struct MasterOpts {
 const LAST_AGENT_FILE: &str = ".cpe_last_agent";
 const IPERF_PREFLIGHT_FAILED: &str = "IPERF_PREFLIGHT_FAILED";
 const CTS_PREFLIGHT_FAILED: &str = "CTSTRAFFIC_PREFLIGHT_FAILED";
+const RUNS_DIR: &str = "runs";
+
+#[derive(Debug, Clone)]
+struct RunPaths {
+    dir: PathBuf,
+    log: PathBuf,
+    report: PathBuf,
+    outdir: PathBuf,
+}
+
+/// 创建一次运行的独立输出目录。
+///
+/// `task_results.json` 不在这里：它是跨运行共享的 RESUME 状态库，必须保持稳定路径。
+fn create_run_paths(root: &Path) -> io::Result<RunPaths> {
+    let runs_dir = root.join(RUNS_DIR);
+    std::fs::create_dir_all(&runs_dir)?;
+    let base = format!("run_{}_{}", now_compact(), std::process::id());
+
+    for attempt in 0..1000u32 {
+        let name = if attempt == 0 {
+            base.clone()
+        } else {
+            format!("{base}_{attempt}")
+        };
+        let dir = runs_dir.join(name);
+        match std::fs::create_dir(&dir) {
+            Ok(()) => {
+                let outdir = dir.join("iperf_outputs");
+                std::fs::create_dir(&outdir)?;
+                return Ok(RunPaths {
+                    log: dir.join("master.log"),
+                    report: dir.join("report.html"),
+                    outdir,
+                    dir,
+                });
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "无法创建唯一的运行目录",
+    ))
+}
 
 pub fn run_master(opts: MasterOpts) -> i32 {
     let (mut cfg, cfg_path) = load_config(opts.config_path.as_deref());
@@ -44,6 +93,9 @@ pub fn run_master(opts: MasterOpts) -> i32 {
     }
     if let Some(p) = opts.agent_port {
         cfg.agent_port = p;
+    }
+    if let Some(token) = &opts.agent_token {
+        cfg.agent_token = token.clone();
     }
     if let Some(p) = &opts.prefixes {
         cfg.ipv4_prefixes = p.clone();
@@ -58,8 +110,14 @@ pub fn run_master(opts: MasterOpts) -> i32 {
         cfg.open_report = false;
     }
 
-    let ts = now_compact();
-    log_to_file(&PathBuf::from(format!("master_{ts}.log")));
+    let run_paths = match create_run_paths(Path::new(".")) {
+        Ok(paths) => paths,
+        Err(error) => {
+            eprintln!("!! 无法创建本次运行目录：{error}");
+            return 2;
+        }
+    };
+    log_to_file(&run_paths.log);
 
     logln("==============================================");
     logln(&format!(
@@ -67,6 +125,7 @@ pub fn run_master(opts: MasterOpts) -> i32 {
         env!("CARGO_PKG_VERSION")
     ));
     logln("==============================================");
+    logln(&format!("本次运行目录: {}", run_paths.dir.display()));
     if let Some(p) = &cfg_path {
         logln(&format!("已加载配置文件: {}", p.display()));
     } else {
@@ -99,7 +158,7 @@ pub fn run_master(opts: MasterOpts) -> i32 {
             "正在连接辅测机 {}:{} ...",
             agent_host, cfg.agent_port
         ));
-        match agent_health(&agent_host, cfg.agent_port) {
+        match agent_health(&agent_host, cfg.agent_port, &cfg.agent_token) {
             Ok(h) => break h,
             Err(e) => {
                 logln(&format!("!! 连接失败: {e}"));
@@ -138,7 +197,12 @@ pub fn run_master(opts: MasterOpts) -> i32 {
     logln("正在扫描本机网卡...");
     let master_info = scan_host(&cfg.ipv4_prefixes);
     logln("正在获取辅测机网卡...");
-    let agent_info = match agent_info(&agent_host, cfg.agent_port, &cfg.ipv4_prefixes) {
+    let agent_info = match agent_info(
+        &agent_host,
+        cfg.agent_port,
+        &cfg.ipv4_prefixes,
+        &cfg.agent_token,
+    ) {
         Ok(i) => i,
         Err(e) => {
             logln(&format!("!! 获取辅测机网卡失败: {e}"));
@@ -315,8 +379,6 @@ pub fn run_master(opts: MasterOpts) -> i32 {
     }
 
     // ---- 执行 ----
-    let outdir = PathBuf::from("iperf_outputs");
-    let _ = std::fs::create_dir_all(&outdir);
     let started = now_full();
     let t0 = Instant::now();
 
@@ -327,7 +389,9 @@ pub fn run_master(opts: MasterOpts) -> i32 {
         agent_host: agent_host.clone(),
         agent_port: cfg.agent_port,
         cfg: cfg.clone(),
-        outdir,
+        outdir: run_paths.outdir.clone(),
+        transport: Arc::new(http_client::TcpTransport),
+        clock: Arc::new(SystemClock),
         local_servers: IperfServerMgr::new(),
         local_cts_jobs: crate::cmd::iperf::IperfClientJobMgr::new(),
         local_monitors: MonitorMgr::new(),
@@ -355,7 +419,7 @@ pub fn run_master(opts: MasterOpts) -> i32 {
             sum.merge(diagnostic_summary);
         }
     }
-    let mut final_cleanup_errors = ctx.local_servers.stop_all();
+    let mut final_cleanup_errors = ctx.local_servers.stop_all().errors;
     final_cleanup_errors.extend(ctx.local_cts_jobs.stop_all(Duration::from_secs(10)).errors);
     for error in &final_cleanup_errors {
         logln(&format!("!! 主控最终资源清理未确认: {error}"));
@@ -377,11 +441,10 @@ pub fn run_master(opts: MasterOpts) -> i32 {
         finished: now_full(),
         elapsed: elapsed.clone(),
     };
-    let report_path = PathBuf::from(format!("report_{}.html", now_compact()));
     {
         let mut rows = ctx.rows.lock().unwrap();
-        match write_report(&report_path, &mut rows, &meta) {
-            Ok(_) => logln(&format!("\n报告已生成: {}", report_path.display())),
+        match write_report(&run_paths.report, &mut rows, &meta) {
+            Ok(_) => logln(&format!("\n报告已生成: {}", run_paths.report.display())),
             Err(e) => logln(&format!("!! 报告写入失败: {e}")),
         }
     }
@@ -399,8 +462,8 @@ pub fn run_master(opts: MasterOpts) -> i32 {
         final_cleanup_errors.len(),
         elapsed
     ));
-    if cfg.open_report && report_path.exists() {
-        open_path(&report_path);
+    if cfg.open_report && run_paths.report.exists() {
+        open_path(&run_paths.report);
     }
     if sum.fail > 0 || !final_cleanup_errors.is_empty() {
         1
@@ -521,9 +584,14 @@ fn ctstraffic_preflight_block(
 
 // ---------------- agent 通讯（连接阶段） ----------------
 
-fn agent_health(host: &str, port: u16) -> Result<HealthOut, String> {
-    let (st, body) = http_client::get(host, port, "/health", Duration::from_secs(10))?;
+fn agent_health(host: &str, port: u16, token: &str) -> Result<HealthOut, String> {
+    let (st, body) = http_client::get_auth(host, port, "/health", token, Duration::from_secs(10))?;
     if st != 200 {
+        if st == 401 {
+            return Err(
+                "agent 返回 401：已启用令牌认证，请在本机 config.json 配置相同 agent_token".into(),
+            );
+        }
         return Err(format!("HTTP {st}"));
     }
     let r: Resp<HealthOut> =
@@ -531,13 +599,19 @@ fn agent_health(host: &str, port: u16) -> Result<HealthOut, String> {
     r.data.ok_or_else(|| "响应缺 data".into())
 }
 
-fn agent_info(host: &str, port: u16, prefixes: &[String]) -> Result<HostInfo, String> {
+fn agent_info(host: &str, port: u16, prefixes: &[String], token: &str) -> Result<HostInfo, String> {
     let req = InfoReq {
         ipv4_prefixes: prefixes.to_vec(),
     };
     let body = serde_json::to_string(&req).unwrap_or_default();
-    let (st, text) = http_client::post_json(host, port, "/info", &body, Duration::from_secs(60))?;
+    let (st, text) =
+        http_client::post_json_auth(host, port, "/info", &body, token, Duration::from_secs(60))?;
     if st != 200 {
+        if st == 401 {
+            return Err(
+                "agent 返回 401：已启用令牌认证，请在本机 config.json 配置相同 agent_token".into(),
+            );
+        }
         return Err(format!("HTTP {st}"));
     }
     let r: Resp<HostInfo> =
@@ -1133,6 +1207,28 @@ mod tests {
     use crate::config::RateMode;
     use crate::master::builder::{CtsTrafficTask, IperfTask, Leg, PingPurpose, PingTask};
     use crate::protocol::NicInfo;
+
+    #[test]
+    fn run_paths_keep_report_log_and_artifacts_in_one_unique_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "cpe_run_paths_test_{}_{}",
+            std::process::id(),
+            now_compact()
+        ));
+        let first = create_run_paths(&root).expect("first run directory");
+        let second = create_run_paths(&root).expect("second run directory");
+
+        assert_ne!(first.dir, second.dir);
+        assert!(first.dir.starts_with(root.join(RUNS_DIR)));
+        assert_eq!(first.log, first.dir.join("master.log"));
+        assert_eq!(first.report, first.dir.join("report.html"));
+        assert_eq!(first.outdir, first.dir.join("iperf_outputs"));
+        assert!(first.outdir.is_dir());
+        assert!(first.log.parent() == Some(first.dir.as_path()));
+        assert!(first.report.parent() == Some(first.dir.as_path()));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     fn endpoint(side: Side, name: &str) -> Endpoint {
         Endpoint {

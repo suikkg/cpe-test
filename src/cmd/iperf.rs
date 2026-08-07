@@ -8,7 +8,10 @@ use crate::protocol::{
     IperfClientOut, IperfClientReq, IperfClientStartReq, IperfClientStatusOut, IperfClientStopOut,
     IperfEventKind, IperfFlowEvent, IperfServerStartReq, IperfServerStopOut,
 };
-use crate::util::{decode_bytes, run_cmd, run_streaming_controlled};
+use crate::util::{
+    decode_bytes, run_cmd_with_executor, run_streaming_controlled_timed_with, ProcessExecutor,
+    SystemProcessExecutor,
+};
 use regex::Regex;
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
@@ -124,11 +127,13 @@ fn cmdline(bin: &str, args: &[String]) -> String {
 
 fn supports_forceflush(bin: &str) -> bool {
     static SUPPORTED: OnceLock<bool> = OnceLock::new();
-    *SUPPORTED.get_or_init(|| {
-        run_cmd(bin, &["--help"], Duration::from_secs(8))
-            .merged()
-            .contains("--forceflush")
-    })
+    *SUPPORTED.get_or_init(|| supports_forceflush_with(&SystemProcessExecutor, bin))
+}
+
+fn supports_forceflush_with<E: ProcessExecutor + ?Sized>(executor: &E, bin: &str) -> bool {
+    run_cmd_with_executor(executor, bin, &["--help"], Duration::from_secs(8))
+        .merged()
+        .contains("--forceflush")
 }
 
 // ---------------- 输出解析 ----------------
@@ -681,6 +686,24 @@ impl IperfServerMgr {
         errors
     }
 
+    /// 返回指定 owner 当前登记的 server request ID，供统一资源清单快照使用。
+    pub fn resource_ids_for_owner(&self, owner_id: &str) -> Vec<String> {
+        let entries = lock_recover(&self.inner);
+        let mut ids: Vec<String> = entries
+            .iter()
+            .filter(|(_, entry)| entry.owner_id == owner_id)
+            .map(|(port, entry)| {
+                if entry.request_id.is_empty() {
+                    format!("server-port-{port}")
+                } else {
+                    entry.request_id.clone()
+                }
+            })
+            .collect();
+        ids.sort();
+        ids
+    }
+
     pub fn stop_owner(&self, owner_id: &str, wait: Duration) -> LifecycleCleanupResult {
         let mut result = LifecycleCleanupResult::default();
         if owner_id.is_empty() {
@@ -735,20 +758,24 @@ impl IperfServerMgr {
         result
     }
 
-    pub fn stop_all(&self) -> Vec<String> {
+    pub fn stop_all(&self) -> LifecycleCleanupResult {
+        let mut result = LifecycleCleanupResult::default();
         let targets: Vec<(u16, String)> = {
             let g = lock_recover(&self.inner);
             g.iter()
                 .map(|(port, entry)| (*port, entry.request_id.clone()))
                 .collect()
         };
-        let mut errors = Vec::new();
         for (port, request_id) in targets {
-            if let Err(e) = self.stop_checked(port, &request_id, Duration::ZERO) {
-                errors.push(format!("server 端口 {port} 清理失败: {e}"));
+            match self.stop_checked(port, &request_id, Duration::ZERO) {
+                Ok(out) if out.existed && out.terminated => result.stopped += 1,
+                Ok(_) => {}
+                Err(e) => result
+                    .errors
+                    .push(format!("server 端口 {port} 清理失败: {e}")),
             }
         }
-        errors
+        result
     }
 }
 
@@ -914,6 +941,19 @@ fn classify_live_line(line: &str, elapsed_ms: u64) -> Option<IperfFlowEvent> {
     None
 }
 
+/// 将 runner 内部的事件 elapsed 对齐到外层 job/call epoch。
+/// 首个回调反推固定 origin，后续事件必须复用该值，
+/// 避免把轮询或 stdout 缓冲延迟反复加入时间轴。
+pub(crate) fn align_event_to_epoch(
+    event: &mut IperfFlowEvent,
+    callback_elapsed_ms: u64,
+    origin_ms: &mut Option<u64>,
+) {
+    let origin =
+        *origin_ms.get_or_insert_with(|| callback_elapsed_ms.saturating_sub(event.elapsed_ms));
+    event.elapsed_ms = event.elapsed_ms.saturating_add(origin);
+}
+
 fn wait_cancelable(duration: Duration, cancel: Option<&AtomicBool>) -> bool {
     let Some(deadline) = Instant::now().checked_add(duration) else {
         return false;
@@ -935,7 +975,9 @@ fn wait_cancelable(duration: Duration, cancel: Option<&AtomicBool>) -> bool {
 
 /// 执行 iperf3 client，逐行回调并上报结构化事件。
 /// cancel 用于异步 job 主动终止，瞬态连接错误仍保留原有自动重试。
-pub fn run_client_controlled<F, E>(
+fn run_client_controlled_inner<P, F, E>(
+    executor: &P,
+    forceflush_supported: bool,
     bin: &str,
     req: &IperfClientReq,
     cancel: Option<&AtomicBool>,
@@ -943,6 +985,7 @@ pub fn run_client_controlled<F, E>(
     mut on_event: E,
 ) -> IperfClientOut
 where
+    P: ProcessExecutor + ?Sized,
     F: FnMut(&str),
     E: FnMut(IperfFlowEvent),
 {
@@ -950,7 +993,7 @@ where
     // stdout 接到 pipe 后部分 iperf3 会块缓冲，几十秒后才吐 interval，
     // 事件时间线会被整体推迟。只在当前二进制明确支持时开启逐 interval flush，
     // 保持对更老 Windows 版本的兼容。
-    if supports_forceflush(bin) {
+    if forceflush_supported {
         args.push("--forceflush".into());
     }
     let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
@@ -985,12 +1028,23 @@ where
     };
     let mut attempt_history = Vec::new();
     for attempt in 1..=CLIENT_RETRIES {
-        let out = run_streaming_controlled(bin, &args_ref, timeout, cancel, |line| {
-            on_line(line);
-            if let Some(event) = classify_live_line(line, started.elapsed().as_millis() as u64) {
-                on_event(event);
-            }
-        });
+        let out = run_streaming_controlled_timed_with(
+            executor,
+            bin,
+            &args_ref,
+            timeout,
+            cancel,
+            |line, observed_at| {
+                on_line(line);
+                let elapsed_ms = observed_at
+                    .saturating_duration_since(started)
+                    .as_millis()
+                    .min(u64::MAX as u128) as u64;
+                if let Some(event) = classify_live_line(line, elapsed_ms) {
+                    on_event(event);
+                }
+            },
+        );
         let merged = out.merged();
         append_attempt_output(&mut attempt_history, attempt, &merged);
         last = IperfClientOut {
@@ -1042,6 +1096,56 @@ where
         },
     });
     last
+}
+
+/// 可注入进程执行器的 iperf client 入口。测试可在不启动 iperf3 的情况下
+/// 驱动完整参数、事件解析、取消与 cleanup evidence 路径。
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn run_client_controlled_with_executor<P, F, E>(
+    executor: &P,
+    bin: &str,
+    req: &IperfClientReq,
+    cancel: Option<&AtomicBool>,
+    on_line: F,
+    on_event: E,
+) -> IperfClientOut
+where
+    P: ProcessExecutor + ?Sized,
+    F: FnMut(&str),
+    E: FnMut(IperfFlowEvent),
+{
+    let forceflush_supported = supports_forceflush_with(executor, bin);
+    run_client_controlled_inner(
+        executor,
+        forceflush_supported,
+        bin,
+        req,
+        cancel,
+        on_line,
+        on_event,
+    )
+}
+
+pub fn run_client_controlled<F, E>(
+    bin: &str,
+    req: &IperfClientReq,
+    cancel: Option<&AtomicBool>,
+    on_line: F,
+    on_event: E,
+) -> IperfClientOut
+where
+    F: FnMut(&str),
+    E: FnMut(IperfFlowEvent),
+{
+    run_client_controlled_inner(
+        &SystemProcessExecutor,
+        supports_forceflush(bin),
+        bin,
+        req,
+        cancel,
+        on_line,
+        on_event,
+    )
 }
 
 /// 兼容旧调用点：同步运行，无取消信号，仅保留逐行回调。
@@ -1157,14 +1261,20 @@ impl IperfClientJobMgr {
             owner_id,
             lease_secs,
             fingerprint,
-            move |cancel, events| {
+            move |cancel, events, job_epoch| {
                 let event_sink = Arc::clone(&events);
+                let mut event_origin_ms = None;
                 run_client_controlled(
                     &bin,
                     &req,
                     Some(cancel.as_ref()),
                     |_| {},
-                    move |event| {
+                    move |mut event| {
+                        align_event_to_epoch(
+                            &mut event,
+                            job_epoch.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                            &mut event_origin_ms,
+                        );
                         if let Ok(mut g) = event_sink.lock() {
                             g.push(event);
                         }
@@ -1185,7 +1295,7 @@ impl IperfClientJobMgr {
         runner: F,
     ) -> Result<String, String>
     where
-        F: FnOnce(Arc<AtomicBool>, Arc<Mutex<Vec<IperfFlowEvent>>>) -> IperfClientOut
+        F: FnOnce(Arc<AtomicBool>, Arc<Mutex<Vec<IperfFlowEvent>>>, Instant) -> IperfClientOut
             + Send
             + 'static,
     {
@@ -1207,8 +1317,14 @@ impl IperfClientJobMgr {
             + Send
             + 'static,
     {
-        self.start_job_managed(String::new(), String::new(), 0, String::new(), runner)
-            .expect("legacy client job id generation must not conflict")
+        self.start_job_managed(
+            String::new(),
+            String::new(),
+            0,
+            String::new(),
+            move |cancel, events, _job_epoch| runner(cancel, events),
+        )
+        .expect("legacy client job id generation must not conflict")
     }
 
     fn next_job_id(&self) -> String {
@@ -1247,7 +1363,7 @@ impl IperfClientJobMgr {
         runner: F,
     ) -> Result<String, String>
     where
-        F: FnOnce(Arc<AtomicBool>, Arc<Mutex<Vec<IperfFlowEvent>>>) -> IperfClientOut
+        F: FnOnce(Arc<AtomicBool>, Arc<Mutex<Vec<IperfFlowEvent>>>, Instant) -> IperfClientOut
             + Send
             + 'static,
     {
@@ -1286,11 +1402,12 @@ impl IperfClientJobMgr {
             cv: Condvar::new(),
         });
         let cancel = Arc::new(AtomicBool::new(false));
+        let job_epoch = Instant::now();
         let entry = Arc::new(ClientJobEntry {
             events: Arc::clone(&events),
             completion: Arc::clone(&completion),
             cancel: Arc::clone(&cancel),
-            started: Instant::now(),
+            started: job_epoch,
             expires_at: Mutex::new(requested_deadline),
             dynamic_lease: AtomicBool::new(lease_secs > 0),
             owner_id,
@@ -1325,8 +1442,8 @@ impl IperfClientJobMgr {
         let handle = match std::thread::Builder::new()
             .name(format!("iperf-client-{id}"))
             .spawn(move || {
-                let out = catch_unwind(AssertUnwindSafe(|| runner(cancel, events))).unwrap_or_else(
-                    |panic_value| IperfClientOut {
+                let out = catch_unwind(AssertUnwindSafe(|| runner(cancel, events, job_epoch)))
+                    .unwrap_or_else(|panic_value| IperfClientOut {
                         ok: false,
                         cancelled: false,
                         output: format!(
@@ -1334,8 +1451,7 @@ impl IperfClientJobMgr {
                             panic_message(panic_value.as_ref())
                         ),
                         ..Default::default()
-                    },
-                );
+                    });
                 *lock_recover(&completion.result) = Some(out);
                 completion.cv.notify_all();
             }) {
@@ -1383,12 +1499,15 @@ impl IperfClientJobMgr {
             .get(id)
             .cloned()
             .ok_or_else(|| format!("iperf client job 不存在: {id}"))?;
+        // 先读完成状态、再复制事件：worker 总是先推送全部事件、再写 completion。
+        // 若先复制事件，合法的并发交错会让调用方看到 done=true 却缺少
+        // 尾部 Traffic/Ended 事件；主控看到 done 后立即停止轮询，尾事件永久丢失。
+        let result = lock_recover(&entry.completion.result).clone();
         let events_guard = lock_recover(&entry.events);
         let from = cursor.min(events_guard.len());
         let events = events_guard[from..].to_vec();
         let next_cursor = events_guard.len();
         drop(events_guard);
-        let result = lock_recover(&entry.completion.result).clone();
         Ok(IperfClientStatusOut {
             id: id.to_string(),
             done: result.is_some(),
@@ -1548,6 +1667,19 @@ impl IperfClientJobMgr {
         result
     }
 
+    /// 返回指定 owner 当前登记的 client/job ID，供统一资源清单快照使用。
+    pub fn resource_ids_for_owner(&self, owner_id: &str) -> Vec<String> {
+        let registry = lock_recover(&self.inner);
+        let mut ids: Vec<String> = registry
+            .jobs
+            .iter()
+            .filter(|(_, entry)| entry.owner_id == owner_id)
+            .map(|(id, _)| id.clone())
+            .collect();
+        ids.sort();
+        ids
+    }
+
     pub fn sweep(&self, max_age: Duration) -> Vec<String> {
         self.prune_client_tombstones();
         let expired: Vec<String> = {
@@ -1663,8 +1795,53 @@ fn join_client_thread(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::util::{CmdOut, ProcessSpec};
     use std::sync::atomic::AtomicUsize;
     use std::sync::{mpsc, Condvar};
+
+    struct FakeProcessExecutor {
+        forceflush: bool,
+        lines: Vec<String>,
+        stream_out: Mutex<Option<CmdOut>>,
+    }
+
+    impl FakeProcessExecutor {
+        fn new(forceflush: bool, lines: Vec<String>, stream_out: CmdOut) -> Self {
+            Self {
+                forceflush,
+                lines,
+                stream_out: Mutex::new(Some(stream_out)),
+            }
+        }
+    }
+
+    impl ProcessExecutor for FakeProcessExecutor {
+        fn run(&self, _spec: &ProcessSpec, _timeout: Duration) -> CmdOut {
+            CmdOut {
+                ok: true,
+                stdout: if self.forceflush { "--forceflush" } else { "" }.into(),
+                ..Default::default()
+            }
+        }
+
+        fn run_streaming(
+            &self,
+            _spec: &ProcessSpec,
+            _timeout: Duration,
+            _cancel: Option<&AtomicBool>,
+            on_line: &mut dyn FnMut(&str, Instant),
+        ) -> CmdOut {
+            let started = Instant::now();
+            for (index, line) in self.lines.iter().enumerate() {
+                on_line(line, started + Duration::from_millis(index as u64));
+            }
+            self.stream_out
+                .lock()
+                .unwrap()
+                .take()
+                .expect("fake stream result already consumed")
+        }
+    }
 
     const TCP_SAMPLE: &str = r#"
 Connecting to host 192.168.1.3, port 56000
@@ -1679,6 +1856,30 @@ Connecting to host 192.168.1.3, port 56000
 
 iperf Done.
 "#;
+
+    #[test]
+    fn event_epoch_alignment_applies_runner_start_delay_only_once() {
+        let mut origin_ms = None;
+        let mut started = IperfFlowEvent {
+            kind: IperfEventKind::Started,
+            elapsed_ms: 0,
+            ..Default::default()
+        };
+        align_event_to_epoch(&mut started, 5_000, &mut origin_ms);
+        assert_eq!(origin_ms, Some(5_000));
+        assert_eq!(started.elapsed_ms, 5_000);
+
+        // 第二个回调即使因轮询/缓冲在 16s 才被读到，仍只能
+        // 加入首次确定的 5s runner 启动偏移，不能重新用 16s 对齐。
+        let mut traffic = IperfFlowEvent {
+            kind: IperfEventKind::Traffic,
+            elapsed_ms: 10_000,
+            mbps: Some(100.0),
+            ..Default::default()
+        };
+        align_event_to_epoch(&mut traffic, 16_000, &mut origin_ms);
+        assert_eq!(traffic.elapsed_ms, 15_000);
+    }
 
     #[test]
     fn test_parse_tcp() {
@@ -1767,6 +1968,78 @@ iperf Done.
         };
         let sa = server_args(&sreq);
         assert_eq!(sa.join(" "), "-s -B fe80::1%12 -p 56001 -i 1 -f m -6");
+    }
+
+    #[test]
+    fn injected_process_executor_drives_client_events_without_iperf_binary() {
+        let lines = vec![
+            "[  5] local 192.0.2.1 port 50000 connected to 192.0.2.2 port 56000".into(),
+            "[  5]   0.00-1.00 sec  100 MBytes  800 Mbits/sec".into(),
+        ];
+        let fake = FakeProcessExecutor::new(
+            true,
+            lines.clone(),
+            CmdOut {
+                ok: true,
+                stdout: lines.join("\n"),
+                ..Default::default()
+            },
+        );
+        let req = IperfClientReq {
+            dst: "192.0.2.2".into(),
+            bind_ip: "192.0.2.1".into(),
+            port: 56_000,
+            duration: 1,
+            ..Default::default()
+        };
+        let mut events = Vec::new();
+        let out = run_client_controlled_with_executor(
+            &fake,
+            "iperf3-not-installed",
+            &req,
+            None,
+            |_line| {},
+            |event| events.push(event),
+        );
+        assert!(out.ok);
+        assert!(out.cmd.contains("--forceflush"));
+        assert!(events
+            .iter()
+            .any(|event| event.kind == IperfEventKind::Connected));
+        assert!(events
+            .iter()
+            .any(|event| event.kind == IperfEventKind::Traffic));
+    }
+
+    #[test]
+    fn injected_refused_reap_stops_retry_and_preserves_cleanup_evidence() {
+        let fake = FakeProcessExecutor::new(
+            false,
+            Vec::new(),
+            CmdOut {
+                cancelled: true,
+                stderr: "回收子进程失败: fake refuses exit".into(),
+                ..Default::default()
+            },
+        );
+        let req = IperfClientReq {
+            dst: "192.0.2.2".into(),
+            bind_ip: "192.0.2.1".into(),
+            port: 56_000,
+            duration: 1,
+            ..Default::default()
+        };
+        let out = run_client_controlled_with_executor(
+            &fake,
+            "iperf3-not-installed",
+            &req,
+            None,
+            |_line| {},
+            |_event| {},
+        );
+        assert!(out.cancelled);
+        assert_eq!(out.cleanup_confirmed, Some(false));
+        assert!(out.output.contains("回收子进程失败"));
     }
 
     #[test]
@@ -2163,7 +2436,7 @@ iperf Done.
                 "owner-client-test".into(),
                 60,
                 "fingerprint".into(),
-                move |cancel, _events| {
+                move |cancel, _events, _job_epoch| {
                     active_runner.store(1, Ordering::SeqCst);
                     while !cancel.load(Ordering::SeqCst) {
                         std::thread::sleep(Duration::from_millis(5));
@@ -2203,6 +2476,115 @@ iperf Done.
     }
 
     #[test]
+    fn status_done_snapshot_includes_events_pushed_before_completion_set() {
+        // 回归：status() 必须先读完成状态、再复制事件。
+        // 若先复制事件，合法的并发交错（worker 在两次读取之间推送尾事件
+        // 并写 completion）会让调用方看到 done=true 却缺少 Traffic/Ended。
+        let mgr = IperfClientJobMgr::new();
+        let (pushed_tx, pushed_rx) = mpsc::channel::<()>();
+        let (entered_tx, entered_rx) = mpsc::channel::<()>();
+        let id = mgr
+            .start_job_managed(
+                "status-tail-race".into(),
+                "owner-status-tail".into(),
+                60,
+                "fingerprint".into(),
+                move |cancel, events, _job_epoch| {
+                    // worker 先推送 Started，再阻塞，等待测试释放。
+                    events.lock().unwrap().push(IperfFlowEvent {
+                        kind: IperfEventKind::Started,
+                        elapsed_ms: 0,
+                        ..Default::default()
+                    });
+                    pushed_tx.send(()).unwrap();
+                    while !cancel.load(Ordering::SeqCst) {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    IperfClientOut {
+                        cancelled: true,
+                        output: "status-tail-race".into(),
+                        ..Default::default()
+                    }
+                },
+            )
+            .unwrap();
+        pushed_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        // 通过内部 registry 拿到同一个 entry，模拟 worker 在
+        // status() 的“复制事件→读完成”之间完成收尾。
+        let entry = lock_recover(&mgr.inner)
+            .jobs
+            .get(&id)
+            .cloned()
+            .expect("job registered");
+
+        // 测试线程先持有 completion 锁：
+        //  - 旧实现先复制事件（此时只有 Started），再阻塞在 completion 锁；
+        //  - 新实现先读 completion，会阻塞在 completion 锁且尚未复制事件。
+        let mut completion_guard = lock_recover(&entry.completion.result);
+        let (status_tx, status_rx) = mpsc::channel::<IperfClientStatusOut>();
+        let mgr_for_thread = &mgr;
+        let id_for_thread = id.clone();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                entered_tx.send(()).unwrap();
+                let out = mgr_for_thread.status(&id_for_thread, 0).unwrap();
+                status_tx.send(out).unwrap();
+            });
+            // 等 status 线程进入并阻塞在 completion 锁。
+            entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            std::thread::sleep(Duration::from_millis(100));
+
+            // 在 status() 卡在 completion 锁期间，worker 补推尾事件
+            // 并写完成状态——即报告描述的合法并发交错。
+            {
+                let mut guard = lock_recover(&entry.events);
+                guard.push(IperfFlowEvent {
+                    kind: IperfEventKind::Traffic,
+                    elapsed_ms: 10,
+                    mbps: Some(100.0),
+                    ..Default::default()
+                });
+                guard.push(IperfFlowEvent {
+                    kind: IperfEventKind::Ended,
+                    elapsed_ms: 20,
+                    ..Default::default()
+                });
+            }
+            *completion_guard = Some(IperfClientOut {
+                ok: true,
+                output: "completed".into(),
+                ..Default::default()
+            });
+            drop(completion_guard);
+
+            let status = status_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("status() 应返回");
+            assert!(status.done, "完成状态必须可见");
+            // 尾事件不能因为 done=true 快照截断而丢失：
+            // 一旦 done=true，快照必须包含 completion 写入前推送的全部事件。
+            let kinds: Vec<_> = status
+                .events
+                .iter()
+                .map(|event| event.kind.clone())
+                .collect();
+            assert_eq!(
+                kinds,
+                vec![
+                    IperfEventKind::Started,
+                    IperfEventKind::Traffic,
+                    IperfEventKind::Ended,
+                ]
+            );
+        });
+
+        // 触发 worker 退出并回收线程，避免泄漏。
+        entry.cancel.store(true, Ordering::SeqCst);
+        let _ = mgr.stop_checked(&id, Duration::from_secs(2));
+    }
+
+    #[test]
     fn client_stop_all_reaps_every_registered_external_job() {
         let mgr = IperfClientJobMgr::new();
         let active = Arc::new(AtomicUsize::new(0));
@@ -2215,7 +2597,7 @@ iperf Done.
                     format!("owner-stop-all-{index}"),
                     60,
                     format!("fingerprint-{index}"),
-                    move |cancel, _events| {
+                    move |cancel, _events, _job_epoch| {
                         active_runner.fetch_add(1, Ordering::SeqCst);
                         while !cancel.load(Ordering::SeqCst) {
                             std::thread::sleep(Duration::from_millis(5));
@@ -2260,7 +2642,7 @@ iperf Done.
                 "owner-idempotent".into(),
                 60,
                 "same-fingerprint".into(),
-                move |_cancel, _events| {
+                move |_cancel, _events, _job_epoch| {
                     runs_first.fetch_add(1, Ordering::SeqCst);
                     let (lock, cv) = &*gate_first;
                     let mut released = lock_recover(lock);
@@ -2279,7 +2661,7 @@ iperf Done.
                 "owner-idempotent".into(),
                 60,
                 "same-fingerprint".into(),
-                move |_cancel, _events| {
+                move |_cancel, _events, _job_epoch| {
                     panic!("幂等 start 不应启动第二个 runner");
                 },
             )
@@ -2309,7 +2691,7 @@ iperf Done.
             "owner-idempotent".into(),
             60,
             "late-fingerprint".into(),
-            move |_cancel, _events| IperfClientOut::default(),
+            move |_cancel, _events, _job_epoch| IperfClientOut::default(),
         );
         assert!(
             late_start.is_err(),
@@ -2326,7 +2708,7 @@ iperf Done.
                 "owner-lease-renew".into(),
                 1,
                 "lease-fingerprint".into(),
-                move |cancel, _events| {
+                move |cancel, _events, _job_epoch| {
                     while !cancel.load(Ordering::SeqCst) {
                         std::thread::sleep(Duration::from_millis(5));
                     }
@@ -2346,7 +2728,7 @@ iperf Done.
                 "owner-lease-renew".into(),
                 60,
                 "lease-fingerprint".into(),
-                move |_cancel, _events| panic!("幂等续租不应启动第二个 worker"),
+                move |_cancel, _events, _job_epoch| panic!("幂等续租不应启动第二个 worker"),
             )
             .unwrap();
         let after = {
@@ -2368,7 +2750,7 @@ iperf Done.
                 owner.into(),
                 60,
                 format!("fingerprint-{id}"),
-                move |cancel, _events| {
+                move |cancel, _events, _job_epoch| {
                     while !cancel.load(Ordering::SeqCst) {
                         std::thread::sleep(Duration::from_millis(5));
                     }
@@ -2411,7 +2793,7 @@ iperf Done.
                 "owner-timeout".into(),
                 60,
                 "timeout-fingerprint".into(),
-                move |_cancel, _events| {
+                move |_cancel, _events, _job_epoch| {
                     while !release_runner.load(Ordering::SeqCst) {
                         std::thread::sleep(Duration::from_millis(5));
                     }
@@ -2436,7 +2818,7 @@ iperf Done.
                 "owner-panic".into(),
                 60,
                 "panic-fingerprint".into(),
-                move |_cancel, _events| panic!("synthetic runner panic"),
+                move |_cancel, _events, _job_epoch| panic!("synthetic runner panic"),
             )
             .unwrap();
         let stopped = mgr.stop_checked(&id, Duration::from_secs(2)).unwrap();

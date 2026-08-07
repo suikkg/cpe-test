@@ -365,8 +365,8 @@ CTS 自身测量时记录 `RATE_FAIL / CTSTRAFFIC_SINGLE_UDP_STREAM_FAILED`；�
 非法参数、生命周期或清理异常仍是 `SETUP_ERROR`。一旦某轮已有工具测量，就按该轮真实
 运行错误、UDP 丢帧和目标速率判定，不再通过重试掩盖结果。
 
-原始输出保存为 `iperf_outputs/ctstraffic_raw_*.log`，包含各 attempt 的 client/server
-输出和生命周期信息；目录名为兼容旧版本保留。
+原始输出保存为当前 run 目录下的 `iperf_outputs/ctstraffic_raw_*.log`，包含各 attempt 的
+client/server 输出和生命周期信息；`iperf_outputs` 目录名为兼容旧版本保留。
 
 ### UDP 单流为何不能只看 NIC
 

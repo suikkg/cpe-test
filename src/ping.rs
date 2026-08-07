@@ -58,6 +58,20 @@ pub fn build(req: &PingReq) -> (String, Vec<String>) {
         ];
         a.push(if req.v6 { "-6".into() } else { "-4".into() });
         ("ping".into(), a)
+    } else if cfg!(target_os = "linux") {
+        // Linux (iputils)：-I 源地址（-S 是 macOS 专用），-c 计数，-s 负载
+        let prog = "ping";
+        let mut a = vec![
+            "-c".into(),
+            count,
+            "-I".into(),
+            req.src.clone(),
+            "-s".into(),
+            payload,
+        ];
+        a.push(if req.v6 { "-6".into() } else { "-4".into() });
+        a.push(req.dst.clone());
+        (prog.into(), a)
     } else {
         // macOS：v4 用 ping，v6 用 ping6（-c 计数，-s 负载，-S 源绑定）
         let prog = if req.v6 { "ping6" } else { "ping" };

@@ -9,7 +9,7 @@ use crate::protocol::{
     CtsTrafficProtocol, CtsTrafficReq, CtsTrafficRole, CtsTrafficStartReq, IperfClientOut,
     IperfEventKind, IperfFlowEvent,
 };
-use crate::util::run_streaming_controlled;
+use crate::util::run_streaming_controlled_timed;
 use regex::Regex;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -451,13 +451,17 @@ where
         req.duration_secs.saturating_add(PROCESS_GRACE_SECS)
     };
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let out = run_streaming_controlled(
+    let out = run_streaming_controlled_timed(
         bin,
         &arg_refs,
         Duration::from_secs(timeout_secs),
         cancel,
-        |line| {
-            if let Some(event) = classify_line(line, req, started.elapsed().as_millis() as u64) {
+        |line, observed_at| {
+            let elapsed_ms = observed_at
+                .saturating_duration_since(started)
+                .as_millis()
+                .min(u64::MAX as u128) as u64;
+            if let Some(event) = classify_line(line, req, elapsed_ms) {
                 on_event(event);
             }
         },
@@ -521,9 +525,17 @@ pub fn start_managed_job(
         start.owner_id,
         start.lease_secs,
         format!("ctstraffic|{fingerprint}"),
-        move |cancel: Arc<AtomicBool>, events: Arc<Mutex<Vec<IperfFlowEvent>>>| {
+        move |cancel: Arc<AtomicBool>,
+              events: Arc<Mutex<Vec<IperfFlowEvent>>>,
+              job_epoch: Instant| {
             let sink = Arc::clone(&events);
-            run_controlled(&bin, &request, Some(cancel.as_ref()), move |event| {
+            let mut event_origin_ms = None;
+            run_controlled(&bin, &request, Some(cancel.as_ref()), move |mut event| {
+                crate::cmd::iperf::align_event_to_epoch(
+                    &mut event,
+                    job_epoch.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                    &mut event_origin_ms,
+                );
                 if let Ok(mut guard) = sink.lock() {
                     guard.push(event);
                 }

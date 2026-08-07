@@ -413,6 +413,11 @@ fn default_monitor_interval_ms() -> u64 {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MonitorStartOut {
     pub id: String,
+    /// monitor 自启动起的单调时钟毫秒数（响应构建时刻）。
+    /// 主控用它把远端 monitor 零点对齐到 leg epoch，不再用 RPC 往返中点猜测：
+    /// 非对称网络延迟会把空闲时间混入正式窗口。
+    #[serde(default)]
+    pub elapsed_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

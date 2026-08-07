@@ -1,13 +1,13 @@
-# cpe_test v4.2.2 Windows 配置与文档包
+# cpe_test v4.2.4 Windows 配置与文档包
 
-仓库中的 `cpe_test-v4.2.2-windows-config-docs.zip` 是便于从 Git 直接下载的
+仓库中的 `cpe_test-v4.2.4-windows-config-docs.zip` 是便于从 Git 直接下载的
 Windows 配置、说明文档和启动脚本资料包。包内文件由仓库当前版本生成，并由 CI
 逐文件与源码副本比对，避免配置或文档过期。
 
 这个资料包**不包含可执行程序或吞吐工具**：
 
 - 不包含 `cpe_test.exe`；请从 GitHub Release 下载正式
-  `cpe_test-v4.2.2-windows-x86_64.zip`，或自行编译。
+  `cpe_test-v4.2.4-windows-x86_64.zip`，或自行编译。
 - 不包含 `ctsTraffic.exe`；正式 Windows Release ZIP 会捆绑固定并校验过的
   Microsoft ctsTraffic 2.0.4.0 x64。
 - 不包含 `iperf3.exe` 及其 DLL；需要 iperf3 测试时，请放入完整的 Windows
@@ -20,7 +20,7 @@ Windows 配置、说明文档和启动脚本资料包。包内文件由仓库当
 - `start_agent.bat`、`start_master.bat`、`start_master_select_config.bat`。
 - iperf3/ctsTraffic 放置说明、MIT 许可证和第三方声明。
 
-## v4.2.2 行为要点
+## v4.2.4 行为要点
 
 - TCP 与 UDP 并发流数可分别通过 `tcp_streams`、`udp_streams` 控制；缺省或为 `0` 时分别回退旧字段 `streams`，交互菜单按已选协议分别询问。
 - `2.8G` 与 `2.8Gbps` 均严格规范化为 `2800000000 bit/s`；非法尾随内容不再交给 iperf3/CTS 宽松解释。`14k` 按 1024 进制等于 14336 字节，超过常见 MTU 时会产生 IP 分片。

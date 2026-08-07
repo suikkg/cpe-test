@@ -18,10 +18,6 @@ pub const DIAGNOSTIC_PING_COUNT: u32 = 3;
 pub const DIAGNOSTIC_SUBNET_PAYLOAD: u32 = 32;
 /// 单流 UDP 是基础连通性硬门槛：初次尝试加至少两次重试。
 pub const SINGLE_UDP_MIN_ATTEMPTS: u64 = 3;
-/// iperf3 每轮的 client 进程超时、回收、server 重建与轮间等待预算。
-const IPERF_SINGLE_UDP_ATTEMPT_GRACE_SECS: u64 = 130;
-/// ctsTraffic manager 每轮最多等待 duration+60 秒，再留少量停止/轮间预算。
-const CTS_SINGLE_UDP_ATTEMPT_GRACE_SECS: u64 = 65;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Side {
@@ -566,14 +562,23 @@ fn allowed_udp_streams_for_mbps(
     max_n.min(want)
 }
 
+/// iperf UDP 单元的“预计总耗时”（秒），按典型成功路径估算：
+/// 第一次完整尝试的时长 + 启动/收尾/错峰开销。
+///
+/// 单流 UDP 的重试只在“当次尝试没有产生任何有效测量”时发生，属于异常路径；
+/// 若按最坏情况（最多 3 次完整尝试 × 每次再附加 130s 宽限）累加，
+/// 180s 的单流 UDP 项会被估成 14+ 分钟，开始前的总耗时规划会严重偏大。
+/// 因此这里统一按一次尝试估算，与多流 UDP / TCP 口径一致。
+///
+/// 错峰只按单腿最大流数计算：双向 AB/BA 腿是并行执行的，
+/// 不能把两条腿的流数相加，否则双向会凭空多出毫秒级错峰取整。
 fn udp_estimated_secs(
     duration: u64,
-    total_streams: u64,
-    has_single_stream_leg: bool,
+    max_leg_streams: u64,
     mode: RateMode,
     rate_cfg: &RateCheckCfg,
 ) -> u64 {
-    let stagger_ms = total_streams
+    let stagger_ms = max_leg_streams
         .saturating_sub(1)
         .saturating_mul(rate_cfg.launch_interval_ms.clamp(0, 1_000));
     let discovery_ms = if mode == RateMode::Discover {
@@ -583,42 +588,12 @@ fn udp_estimated_secs(
     } else {
         0
     };
-    let base = duration
+    duration
         .saturating_add(rate_cfg.background_secs.min(30))
         .saturating_add(rate_cfg.startup_timeout_secs)
         .saturating_add(rate_cfg.settle_secs)
         .saturating_add(5)
-        .saturating_add(stagger_ms.saturating_add(discovery_ms).div_ceil(1_000));
-    if !has_single_stream_leg {
-        return base;
-    }
-    let attempts = single_udp_attempts(rate_cfg);
-    let per_retry = duration
-        .saturating_add(rate_cfg.startup_timeout_secs)
-        .saturating_add(rate_cfg.settle_secs)
-        .saturating_add(5)
-        .saturating_add(IPERF_SINGLE_UDP_ATTEMPT_GRACE_SECS);
-    base.saturating_add(per_retry.saturating_mul(attempts.saturating_sub(1)))
-}
-
-fn single_udp_attempts(rate_cfg: &RateCheckCfg) -> u64 {
-    (rate_cfg.flow_retries as u64)
-        .saturating_add(1)
-        .max(SINGLE_UDP_MIN_ATTEMPTS)
-}
-
-fn ctstraffic_udp_estimated_secs(
-    duration: u64,
-    has_single_stream_leg: bool,
-    rate_cfg: &RateCheckCfg,
-) -> u64 {
-    if !has_single_stream_leg {
-        return duration.saturating_add(15);
-    }
-    duration
-        .saturating_add(CTS_SINGLE_UDP_ATTEMPT_GRACE_SECS)
-        .saturating_mul(single_udp_attempts(rate_cfg))
-        .saturating_add(5)
+        .saturating_add(stagger_ms.saturating_add(discovery_ms).div_ceil(1_000))
 }
 
 fn dir_pairs<'a>(spec: &'a SpecNorm, dir: &str) -> Vec<(&'a Endpoint, &'a Endpoint, &'static str)> {
@@ -1264,9 +1239,8 @@ pub fn build_units(
                                         route_str
                                     );
                                     let id = udp_resume_unit_id_v3(spec, ip_tag, dir, prof, &legs);
-                                    let total_streams =
-                                        leg_streams.iter().map(|count| *count as u64).sum();
-                                    let has_single_stream_leg = leg_streams.contains(&1);
+                                    // 错峰按单腿最大流数估算：双向双腿并行，不能把
+                                    // 两条腿的流数相加。
                                     units.push(Unit {
                                         id,
                                         title,
@@ -1274,8 +1248,7 @@ pub fn build_units(
                                         legs,
                                         est_secs: udp_estimated_secs(
                                             spec.duration,
-                                            total_streams,
-                                            has_single_stream_leg,
+                                            max_n as u64,
                                             spec.rate_mode,
                                             &spec.rate_check,
                                         ),
@@ -1452,7 +1425,6 @@ pub fn build_units(
                                 }
                                 let mut legs = Vec::new();
                                 let mut max_streams = 1u32;
-                                let mut has_single_stream_leg = false;
                                 for (src, dst, tag) in &pairs {
                                     let streams = if setup_error.is_some() {
                                         udp_streams
@@ -1478,7 +1450,6 @@ pub fn build_units(
                                         break;
                                     }
                                     max_streams = max_streams.max(streams);
-                                    has_single_stream_leg |= streams == 1;
                                     let flow_direction =
                                         if bidir { tag.to_string() } else { dir.clone() };
                                     let target = rate::resolve_target_mbps(
@@ -1549,11 +1520,7 @@ pub fn build_units(
                                     est_secs: if setup_error.is_some() {
                                         1
                                     } else {
-                                        ctstraffic_udp_estimated_secs(
-                                            spec.duration,
-                                            has_single_stream_leg,
-                                            &spec.rate_check,
-                                        )
+                                        spec.duration.saturating_add(15)
                                     },
                                 });
                             }
@@ -2429,7 +2396,9 @@ mod tests {
     }
 
     #[test]
-    fn single_udp_estimate_covers_three_attempts_per_direction_without_double_counting_bidir() {
+    fn single_udp_estimate_matches_one_attempt_and_bidir_is_parallel() {
+        // 预计总耗时按典型成功路径估算：单流 UDP 第一次尝试通常就能测出速率，
+        // 不再按最坏 3 次尝试累加（旧行为会把 10s 项估成 368s）。
         let mut oneway = base_spec();
         oneway.transports = vec!["udp".into()];
         oneway.streams = 1;
@@ -2438,7 +2407,7 @@ mod tests {
         assert!(notices.is_empty());
         assert_eq!(oneway_units.len(), 1);
         let oneway_estimate = oneway_units[0].est_secs;
-        assert_eq!(oneway_estimate, 368);
+        assert_eq!(oneway_estimate, 38);
 
         oneway.directions = vec!["bidir".into()];
         let mut port = PORT_BASE;
@@ -2447,14 +2416,15 @@ mod tests {
         assert_eq!(bidir_units.len(), 1);
         assert_eq!(bidir_units[0].legs.len(), 2);
         assert_eq!(
-            bidir_units[0].est_secs,
-            oneway_estimate + 1,
-            "AB/BA 并行只增加一次毫秒级错峰取整，不应按六轮墙钟时间重复累计"
+            bidir_units[0].est_secs, oneway_estimate,
+            "AB/BA 双腿并行，估算不得按两条腿重复累计"
         );
     }
 
     #[test]
-    fn single_udp_estimate_honors_retry_budget_above_minimum() {
+    fn single_udp_estimate_ignores_retry_budget_since_retries_are_failure_path() {
+        // 重试只在当次尝试无有效测量时发生，是异常路径；预计总耗时按一次尝试估算，
+        // flow_retries 配置不应把开始前的规划时间放大到 698s。
         let mut spec = base_spec();
         spec.transports = vec!["udp".into()];
         spec.streams = 1;
@@ -2463,18 +2433,18 @@ mod tests {
         let (units, notices) = build_units(&[spec], true, &mut port);
         assert!(notices.is_empty());
         assert_eq!(units.len(), 1);
-        assert_eq!(units[0].est_secs, 698);
+        assert_eq!(units[0].est_secs, 38);
     }
 
     #[test]
-    fn ctstraffic_single_udp_estimate_covers_three_attempts_and_bidir_is_parallel() {
+    fn ctstraffic_single_udp_estimate_matches_one_attempt_and_bidir_is_parallel() {
         let mut spec = cts_spec("udp");
         spec.streams = 1;
         let mut port = PORT_BASE;
         let (oneway_units, notices) = build_units(&[spec.clone()], true, &mut port);
         assert!(notices.is_empty());
         assert_eq!(oneway_units.len(), 1);
-        assert_eq!(oneway_units[0].est_secs, 230);
+        assert_eq!(oneway_units[0].est_secs, 25);
 
         spec.directions = vec!["bidir".into()];
         let mut port = PORT_BASE;

@@ -2,6 +2,15 @@
 
 > 两台电脑间自动化 ping + iperf3 / Microsoft ctsTraffic 灌包测试，零 Python/零 PowerShell
 
+## v4.2.4
+
+- [P1] 修复 `status()` 先复制事件、再读完成状态的竞态：done=true 的快照现在保证包含 completion 写入前推送的全部事件，主控不会因停止轮询而永久漏掉尾部 Traffic/Ended。
+- [P1] start RPC 时间轴只统计成功那次调用的耗时：首次连接超时、重试成功后，远端 job 零点不再被前几次失败的重试等待整体偏移。
+- [P2] 远端 monitor 零点由 start 响应的 `elapsed_ms` 做有界估计，不再用 RPC 往返中点猜测，非对称网络延迟不会再把空闲时间混入正式窗口。
+- agent 控制平面加固：支持 `--token`/`agent_token` 共享令牌认证（未认证请求返回 401 且不创建任何资源）与 `--bind` 监听地址收紧；主控在 config.json 配置相同令牌即可连接。
+- 报告、主控日志和 iperf3/ctsTraffic/NIC/截图附件按每次运行归档到独立的 `runs/run_<时间>_<进程号>/` 目录，报告中的缩略图仍可点击打开原图。
+- CI 质量作业扩展到每个 PR/分支推送，不再只等 tag 或手工触发；文档、配置与受跟踪资料包版本统一为 4.2.4。
+
 ## v4.2.2
 
 - TCP 与 UDP 并发流数可分别通过 `tcp_streams`、`udp_streams` 控制；缺省或为 `0` 时分别回退旧字段 `streams`，已有配置保持兼容。交互菜单会按已选协议分别询问流数。
@@ -65,7 +74,7 @@ CPE（Customer Premises Equipment）子网测试工具用于在**两台电脑之
 ```
 cpe_test.exe          ← 本工具（单文件）
 iperf3.exe            ← 从 iperf.fr 下载（只测 Ping/ctsTraffic 可不放）
-ctsTraffic.exe        ← v4.2.2 Windows Release 已捆绑（仅 Windows 10+）
+ctsTraffic.exe        ← v4.2.4 Windows Release 已捆绑（仅 Windows 10+）
 start_agent.bat       ← 辅测机双击
 start_master.bat      ← 主控机双击
 start_master_select_config.bat ← 主控机选择网口配置后双击
@@ -108,12 +117,16 @@ agent 已启动，监听 0.0.0.0:28801
 
 ```
 cpe_test                    交互选择模式（双击运行就是这个）
+  菜单: [1] 子网测试(主控)  [2] 辅测 agent  [3] 只看网卡  [4] 独立网卡速率监控
 cpe_test agent              辅测机启动常驻服务
     --port N                指定监听端口（默认 28801）
+    --token SECRET          共享访问令牌（与主控一致才可连接）
+    --bind IP               监听地址（默认 0.0.0.0）
 
 cpe_test master             主控发起测试
     --agent-host IP         辅测机 IP
     --agent-port N          辅测机端口（默认 28801）
+    --token SECRET          与 agent 相同的共享访问令牌
     --config FILE           指定配置文件（默认找 ./config.json）
     --auto                  免交互：按配置文件 tests 全部执行
     --resume                24 小时内已 PASS 的任务跳过
@@ -641,13 +654,26 @@ UNKNOWN          以上都不匹配
 
 ## 原始记录、截图与报告
 
-每个灌包单元完成并回收进程后，会在历史兼容目录 `iperf_outputs/` 保存：
+每次主控运行都会先创建独立目录 `runs/run_日期时间_进程号/`。报告、主控日志和全部附件都归档在这个 run 目录下：
+
+```text
+runs/run_日期时间_进程号/
+├── report.html
+├── master.log
+└── iperf_outputs/
+    ├── iperf_raw_*.log
+    ├── ctstraffic_raw_*.log
+    ├── nic_samples_*.csv
+    └── screenshot_*.png
+```
+
+每个灌包单元完成并回收进程后，会在该 run 目录的 `iperf_outputs/` 保存：
 
 - `iperf_raw_*.log`：client 命令、client stdout/stderr、server stdout/stderr、结构化流事件及所有重试 attempt。
 - `ctstraffic_raw_*.log`：CTS 每轮 client/server 命令、stdout/stderr、解析摘要、生命周期和全部重试 attempt。
 - `nic_samples_*.csv`：OS 网卡累计 RX/TX 字节、周期增量、当期 RX/TX Mbps、有效性和读取错误。
 
-HTML 报告底部的“原始输出”仍内嵌便于查看的内容，并提供“独立原始记录”和“网卡逐样本 CSV”链接。`master_*.log` 只保存运行进度、摘要、错误和这些文件的路径，不重复塞入大体积的工具原文。复制报告给别人时，应连同整个 `iperf_outputs/` 一起复制。
+HTML 报告底部的“原始输出”仍内嵌便于查看的内容，并提供“独立原始记录”和“网卡逐样本 CSV”链接。`master.log` 只保存运行进度、摘要、错误和这些文件的路径，不重复塞入大体积的工具原文。复制报告给别人时，应连同整个 run 目录一起复制。`task_results.json` 仍放在外层作为跨运行的 RESUME 状态库。
 
 ### 截图流程
 
@@ -658,14 +684,14 @@ HTML 报告底部的“原始输出”仍内嵌便于查看的内容，并提供
        └── 若接收端是辅测 → POST /screenshot → base64 PNG
                │
                ├── 两端各自尝试截图
-               └── 任一成功 → 保存到 iperf_outputs/
+               └── 任一成功 → 保存到当前 run 的 iperf_outputs/
                                 命名: screenshot_{label}_{主控/辅测}_{时间戳}.png
                                 报告链接: ./iperf_outputs/screenshot_xxx.png
 ```
 
 - 两端都尝试截图，全部成功则报告中出现多个 `查看截图` 链接
 - 辅测机不存盘，传完即丢（无磁盘残留）
-- 请求失败、HTTP 状态异常、JSON/Base64 解析失败、截图 API 报错和本地写文件失败，都会把具体原因写入 `master_日期时间.log`
+- 请求失败、HTTP 状态异常、JSON/Base64 解析失败、截图 API 报错和本地写文件失败，都会把具体原因写入当前 run 目录的 `master.log`
 
 ### 报告列
 
@@ -773,7 +799,7 @@ cargo build --release --locked
 
 自行编译后，把 `cpe_test.exe`、启动脚本和所需吞吐工具放到两台 Windows 电脑同一目录：
 iperf3 测试需要完整的 iperf3 Windows 发行包；ctsTraffic 测试需要 `ctsTraffic.exe`。
-官方 v4.2.2 Windows Release ZIP 已捆绑固定且校验过的 ctsTraffic 2.0.4.0，但由于发行包差异不内置 iperf3。
+官方 v4.2.4 Windows Release ZIP 已捆绑固定且校验过的 ctsTraffic 2.0.4.0，但由于发行包差异不内置 iperf3。
 
 ### GitHub Actions CI
 
@@ -796,7 +822,7 @@ Windows ZIP 包含启动脚本、四份配置、固定 CTS 二进制和第三方
 `tar.gz` 保留 `cpe_test` 可执行位。发布作业会再次核对资产名称、数量、内部结构和哈希。
 
 仓库同时跟踪一份不含可执行程序的
-[`cpe_test-v4.2.2-windows-config-docs.zip`](dist/cpe_test-v4.2.2-windows-config-docs.zip)，
+[`cpe_test-v4.2.4-windows-config-docs.zip`](dist/cpe_test-v4.2.4-windows-config-docs.zip)，
 便于直接从 Git 下载 Windows 配置、文档和启动脚本。其 SHA-256 位于同目录的
 `.zip.sha256` 文件；CI 会逐文件确认压缩包内容与仓库源文件一致。需要开箱即用的程序、
 固定版 ctsTraffic 和许可证全集时，仍应下载上面的正式 Windows Release ZIP。
@@ -830,8 +856,14 @@ Windows ZIP 包含启动脚本、四份配置、固定 CTS 二进制和第三方
 - 默认只认 `192.168.` 开头的 IP，改 `config.json` 的 `ipv4_prefixes`
 - 断开的网卡不显示
 
-### 灌包全 FAIL 但 ping 通
+### 测试中途 Ctrl+C 能出报告吗？批处理和直接运行有区别吗？
 
+- 第一次 Ctrl+C：安全停止当前单元后的流程并照常生成 HTML 报告与 CSV（部分结果在内）；第二次 Ctrl+C 才是强制退出。
+- 直接运行 `cpe_test.exe` 或在 cmd/PowerShell 里运行，第一次 Ctrl+C 即优雅停止并出报告。
+- 从 `start_master.bat` / `start_agent.bat` 启动时，cmd.exe 收到 Ctrl+C 可能额外弹出
+  "Terminate batch job (Y/N)?"，**请按 N**（不要按 Y），批处理会等待工具优雅退出并写出报告。
+
+### 灌包全 FAIL 但 ping 通
 - 两端都准备了所选后端吗（iperf3 或 ctsTraffic）？
 - 防火墙拦了 56000+ 端口？
 - 两端 IP 不同网段？关掉 `require_same_subnet_for_iperf`
@@ -854,7 +886,7 @@ iperf3 UDP 单流和 CTS UDP `Connections:1` 都是每方向独立的硬连通�
 
 ### 灌包原始记录在哪里
 
-HTML 报告底部仍有“原始输出”。此外，iperf3 会在 `iperf_outputs/` 生成 `iperf_raw_*.log`，ctsTraffic 会生成 `ctstraffic_raw_*.log`，网卡监控会生成 `nic_samples_*.csv`；重试不会覆盖前一次原文。目录名为兼容旧版本仍保留 `iperf_outputs`。`master_*.log` 不重复写全部原始行，只记录进度和文件路径。
+HTML 报告底部仍有“原始输出”。此外，iperf3 会在当前 run 的 `iperf_outputs/` 生成 `iperf_raw_*.log`，ctsTraffic 会生成 `ctstraffic_raw_*.log`，网卡监控会生成 `nic_samples_*.csv`；重试不会覆盖前一次原文。`master.log` 不重复写全部原始行，只记录进度和文件路径。报告、日志和附件位于同一个 run 目录中。
 
 ### 报告的 RX/P10 是 iperf3 内部速率还是网卡实际速率
 
@@ -868,4 +900,4 @@ HTML 报告底部仍有“原始输出”。此外，iperf3 会在 `iperf_output
 
 - Windows agent 需要 GDI 授权（通常首次跑会自动弹窗）
 - macOS 终端需要系统设置 → 隐私 → 屏幕录制 授权
-- 截图失败不改变吞吐判定；具体 API/HTTP/解析/写盘原因会记录在 `master_日期时间.log`
+- 截图失败不改变吞吐判定；具体 API/HTTP/解析/写盘原因会记录在当前 run 目录的 `master.log`

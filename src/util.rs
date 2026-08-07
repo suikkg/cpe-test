@@ -1,10 +1,14 @@
 //! 公共工具：子进程执行(带超时/GBK解码)、日志、时间、iperf3 定位等
 
+#[cfg(test)]
+use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read, Write};
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Mutex, OnceLock};
@@ -52,6 +56,83 @@ impl CmdOut {
     }
 }
 
+/// 可执行命令的描述。业务层只需要描述命令，不必直接持有 `std::process::Child`。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProcessSpec {
+    pub program: String,
+    pub args: Vec<String>,
+}
+
+impl ProcessSpec {
+    pub fn new(program: impl Into<String>, args: &[&str]) -> Self {
+        Self {
+            program: program.into(),
+            args: args.iter().map(|arg| (*arg).to_string()).collect(),
+        }
+    }
+}
+
+/// 子进程执行边界。
+///
+/// 生产环境使用 `SystemProcessExecutor`，测试可以注入脚本化实现来制造
+/// 输出截断、取消、超时和拒绝回收，而不需要启动 iperf3/ctsTraffic。
+pub trait ProcessExecutor: Send + Sync {
+    fn run(&self, spec: &ProcessSpec, timeout: Duration) -> CmdOut;
+
+    fn run_streaming(
+        &self,
+        spec: &ProcessSpec,
+        timeout: Duration,
+        cancel: Option<&AtomicBool>,
+        on_line: &mut dyn FnMut(&str, Instant),
+    ) -> CmdOut;
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SystemProcessExecutor;
+
+impl ProcessExecutor for SystemProcessExecutor {
+    fn run(&self, spec: &ProcessSpec, timeout: Duration) -> CmdOut {
+        let args: Vec<&str> = spec.args.iter().map(String::as_str).collect();
+        run_cmd_system(&spec.program, &args, timeout)
+    }
+
+    fn run_streaming(
+        &self,
+        spec: &ProcessSpec,
+        timeout: Duration,
+        cancel: Option<&AtomicBool>,
+        on_line: &mut dyn FnMut(&str, Instant),
+    ) -> CmdOut {
+        let args: Vec<&str> = spec.args.iter().map(String::as_str).collect();
+        run_streaming_system(&spec.program, &args, timeout, cancel, on_line)
+    }
+}
+
+static SYSTEM_PROCESS_EXECUTOR: SystemProcessExecutor = SystemProcessExecutor;
+
+/// 通过指定执行器运行一次命令；正式代码通常使用 `run_cmd` 兼容包装。
+pub fn run_cmd_with_executor<E: ProcessExecutor + ?Sized>(
+    executor: &E,
+    prog: &str,
+    args: &[&str],
+    timeout: Duration,
+) -> CmdOut {
+    executor.run(&ProcessSpec::new(prog, args), timeout)
+}
+
+/// 通过指定执行器运行流式命令；便于 manager/解析器测试注入 fake。
+pub fn run_streaming_controlled_timed_with<E: ProcessExecutor + ?Sized, F: FnMut(&str, Instant)>(
+    executor: &E,
+    prog: &str,
+    args: &[&str],
+    timeout: Duration,
+    cancel: Option<&AtomicBool>,
+    mut on_line: F,
+) -> CmdOut {
+    executor.run_streaming(&ProcessSpec::new(prog, args), timeout, cancel, &mut on_line)
+}
+
 fn terminate_and_reap(child: &mut Child) -> Vec<String> {
     let mut errors = Vec::new();
     if let Err(error) = child.kill() {
@@ -75,7 +156,7 @@ fn append_errors(mut stderr: String, errors: &[String]) -> String {
 }
 
 /// 执行命令，等待结束（超时强杀），返回解码后的输出
-pub fn run_cmd(prog: &str, args: &[&str], timeout: Duration) -> CmdOut {
+fn run_cmd_system(prog: &str, args: &[&str], timeout: Duration) -> CmdOut {
     let mut c = Command::new(prog);
     c.args(args)
         .stdin(Stdio::null())
@@ -169,10 +250,31 @@ pub fn run_cmd(prog: &str, args: &[&str], timeout: Duration) -> CmdOut {
     }
 }
 
+/// 使用生产系统执行器的兼容入口。
+pub fn run_cmd(prog: &str, args: &[&str], timeout: Duration) -> CmdOut {
+    run_cmd_with_executor(&SYSTEM_PROCESS_EXECUTOR, prog, args, timeout)
+}
+
 /// 执行命令并逐行回调；cancel=true 时主动终止子进程。
 /// 异步 agent job 和主控本地 job 共用这一实现，避免 HTTP handler
 /// 被长时间 iperf3 进程占住。
+#[cfg(test)]
 pub fn run_streaming_controlled<F: FnMut(&str)>(
+    prog: &str,
+    args: &[&str],
+    timeout: Duration,
+    cancel: Option<&AtomicBool>,
+    mut on_line: F,
+) -> CmdOut {
+    run_streaming_controlled_timed(prog, args, timeout, cancel, move |line, _observed_at| {
+        on_line(line)
+    })
+}
+
+/// 执行命令并逐行回调，同时提供 stdout reader 真正读到该行的单调时钟时间。
+/// 即使主线程在 child wait 或 reader join 后才消费 channel，调用方也不会
+/// 把这段排队时间误认为输出产生时间。
+fn run_streaming_system<F: FnMut(&str, Instant)>(
     prog: &str,
     args: &[&str],
     timeout: Duration,
@@ -207,7 +309,7 @@ pub fn run_streaming_controlled<F: FnMut(&str)>(
     };
     let so = child.stdout.take().expect("stdout piped");
     let se = child.stderr.take().expect("stderr piped");
-    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    let (tx, rx) = mpsc::channel::<(Vec<u8>, Instant)>();
     let th_o = match std::thread::Builder::new()
         .name("streaming-command-stdout".into())
         .spawn(move || {
@@ -217,7 +319,8 @@ pub fn run_streaming_controlled<F: FnMut(&str)>(
                 match std::io::BufRead::read_until(&mut r, b'\n', &mut line) {
                     Ok(0) | Err(_) => break,
                     Ok(_) => {
-                        if tx.send(line).is_err() {
+                        let observed_at = Instant::now();
+                        if tx.send((line, observed_at)).is_err() {
                             break;
                         }
                     }
@@ -252,7 +355,7 @@ pub fn run_streaming_controlled<F: FnMut(&str)>(
             let cleanup_errors = terminate_and_reap(&mut child);
             let _ = th_o.join();
             let mut stdout = String::new();
-            while let Ok(bytes) = rx.try_recv() {
+            while let Ok((bytes, _observed_at)) = rx.try_recv() {
                 stdout.push_str(&decode_bytes(&bytes));
             }
             return CmdOut {
@@ -307,10 +410,12 @@ pub fn run_streaming_controlled<F: FnMut(&str)>(
         // 控制轮询保持在 100ms 内，使同步 stop 不必额外等半秒才开始 kill。
         let wait = std::cmp::min(deadline - now, Duration::from_millis(100));
         match rx.recv_timeout(wait) {
-            Ok(bytes) => {
+            Ok((bytes, observed_at)) => {
                 let s = decode_bytes(&bytes);
                 collected.push_str(&s);
-                if let Err(payload) = catch_unwind(AssertUnwindSafe(|| on_line(s.trim_end()))) {
+                if let Err(payload) =
+                    catch_unwind(AssertUnwindSafe(|| on_line(s.trim_end(), observed_at)))
+                {
                     callback_panic = Some(payload);
                     // 先走完整 kill/wait/join，再把 panic 交回上层隔离器。
                     cancelled = true;
@@ -372,11 +477,13 @@ pub fn run_streaming_controlled<F: FnMut(&str)>(
     // 子进程退出后 pipe 已关闭；join stdout reader，确保没有后台读取线程和尾部输出残留。
     let _ = th_o.join();
     // reader 退出后 channel 不再产生新数据，此时排空才不会漏掉最后几行。
-    while let Ok(bytes) = rx.try_recv() {
+    while let Ok((bytes, observed_at)) = rx.try_recv() {
         let s = decode_bytes(&bytes);
         collected.push_str(&s);
         if callback_panic.is_none() {
-            if let Err(payload) = catch_unwind(AssertUnwindSafe(|| on_line(s.trim_end()))) {
+            if let Err(payload) =
+                catch_unwind(AssertUnwindSafe(|| on_line(s.trim_end(), observed_at)))
+            {
                 callback_panic = Some(payload);
             }
         }
@@ -398,6 +505,24 @@ pub fn run_streaming_controlled<F: FnMut(&str)>(
         stdout: collected,
         stderr,
     }
+}
+
+/// 使用生产系统执行器的兼容入口。
+pub fn run_streaming_controlled_timed<F: FnMut(&str, Instant)>(
+    prog: &str,
+    args: &[&str],
+    timeout: Duration,
+    cancel: Option<&AtomicBool>,
+    on_line: F,
+) -> CmdOut {
+    run_streaming_controlled_timed_with(
+        &SYSTEM_PROCESS_EXECUTOR,
+        prog,
+        args,
+        timeout,
+        cancel,
+        on_line,
+    )
 }
 
 // ---------------- 日志 ----------------
@@ -760,6 +885,108 @@ pub fn same_slash24(a: &str, b: &str) -> bool {
 mod tests {
     use super::*;
 
+    enum ScriptedAction {
+        Emit {
+            lines: Vec<String>,
+            ok: bool,
+            stderr: String,
+        },
+        Truncated {
+            output: String,
+        },
+        RefuseReap,
+    }
+
+    struct ScriptedExecutor {
+        actions: Mutex<VecDeque<ScriptedAction>>,
+        kill_count: AtomicUsize,
+        reap_count: AtomicUsize,
+    }
+
+    impl ScriptedExecutor {
+        fn new(actions: Vec<ScriptedAction>) -> Self {
+            Self {
+                actions: Mutex::new(actions.into()),
+                kill_count: AtomicUsize::new(0),
+                reap_count: AtomicUsize::new(0),
+            }
+        }
+
+        fn next(&self) -> ScriptedAction {
+            self.actions
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("scripted process action exhausted")
+        }
+    }
+
+    impl ProcessExecutor for ScriptedExecutor {
+        fn run(&self, _spec: &ProcessSpec, _timeout: Duration) -> CmdOut {
+            match self.next() {
+                ScriptedAction::Emit { lines, ok, stderr } => CmdOut {
+                    ok,
+                    stdout: lines.join("\n"),
+                    stderr,
+                    ..Default::default()
+                },
+                ScriptedAction::Truncated { output } => CmdOut {
+                    stdout: output,
+                    stderr: "输出被截断".into(),
+                    ..Default::default()
+                },
+                ScriptedAction::RefuseReap => CmdOut {
+                    stderr: "回收子进程失败: fake process refuses exit".into(),
+                    ..Default::default()
+                },
+            }
+        }
+
+        fn run_streaming(
+            &self,
+            _spec: &ProcessSpec,
+            _timeout: Duration,
+            cancel: Option<&AtomicBool>,
+            on_line: &mut dyn FnMut(&str, Instant),
+        ) -> CmdOut {
+            let base = Instant::now();
+            match self.next() {
+                ScriptedAction::Emit { lines, ok, stderr } => {
+                    let mut stdout = String::new();
+                    for (index, line) in lines.iter().enumerate() {
+                        if index > 0 {
+                            stdout.push('\n');
+                        }
+                        stdout.push_str(line);
+                        on_line(line, base + Duration::from_millis(index as u64 * 10));
+                    }
+                    CmdOut {
+                        ok,
+                        stdout,
+                        stderr,
+                        ..Default::default()
+                    }
+                }
+                ScriptedAction::Truncated { output } => CmdOut {
+                    stdout: output,
+                    stderr: "输出被截断".into(),
+                    ..Default::default()
+                },
+                ScriptedAction::RefuseReap => {
+                    if cancel.is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+                        self.kill_count.fetch_add(1, Ordering::SeqCst);
+                        self.reap_count.fetch_add(1, Ordering::SeqCst);
+                    }
+                    CmdOut {
+                        cancelled: cancel.is_some_and(|flag| flag.load(Ordering::SeqCst)),
+                        stderr: "回收子进程失败: fake process refuses exit".into(),
+                        ..Default::default()
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_parse_selection() {
         assert_eq!(parse_selection("", 5).unwrap(), vec![1, 2, 3, 4, 5]);
@@ -794,6 +1021,65 @@ mod tests {
         );
         assert!(out.ok);
         assert!(out.stdout.contains("hi"));
+    }
+
+    #[test]
+    fn process_executor_keeps_system_wrapper_and_scripted_boundary_separate() {
+        let spec = ProcessSpec::new("echo", &["hello"]);
+        assert_eq!(spec.program, "echo");
+        assert_eq!(spec.args, vec!["hello"]);
+
+        let fake = ScriptedExecutor::new(vec![ScriptedAction::Emit {
+            lines: vec!["first event".into(), "second event".into()],
+            ok: true,
+            stderr: String::new(),
+        }]);
+        let mut observed = Vec::new();
+        let out = run_streaming_controlled_timed_with(
+            &fake,
+            "fake-tool",
+            &[],
+            Duration::from_secs(30),
+            None,
+            |line, at| observed.push((line.to_string(), at)),
+        );
+        assert!(out.ok);
+        assert_eq!(observed.len(), 2);
+        assert_eq!(observed[0].0, "first event");
+        assert!(observed[1].1 >= observed[0].1);
+    }
+
+    #[test]
+    fn scripted_process_can_model_truncation_and_refused_reap_without_a_child() {
+        let truncated = ScriptedExecutor::new(vec![ScriptedAction::Truncated {
+            output: "partial summary".into(),
+        }]);
+        let out = run_streaming_controlled_timed_with(
+            &truncated,
+            "fake-tool",
+            &[],
+            Duration::from_secs(1),
+            None,
+            |_line, _at| {},
+        );
+        assert!(!out.ok);
+        assert!(out.stdout.contains("partial summary"));
+        assert!(out.cleanup_confirmed(), "截断输出本身不等于回收失败");
+
+        let cancel = AtomicBool::new(true);
+        let refusing = ScriptedExecutor::new(vec![ScriptedAction::RefuseReap]);
+        let out = run_streaming_controlled_timed_with(
+            &refusing,
+            "fake-tool",
+            &[],
+            Duration::from_secs(1),
+            Some(&cancel),
+            |_line, _at| {},
+        );
+        assert!(out.cancelled);
+        assert!(!out.cleanup_confirmed());
+        assert_eq!(refusing.kill_count.load(Ordering::SeqCst), 1);
+        assert_eq!(refusing.reap_count.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -966,6 +1252,53 @@ mod tests {
         assert!(!out.cancelled, "stop/cancel 不能覆盖已经发生的自然异常退出");
         assert!(out.process_started());
         assert!(out.cleanup_confirmed());
+    }
+
+    #[test]
+    fn streaming_timed_callback_preserves_reader_time_for_queued_tail_lines() {
+        let (program, args): (&str, Vec<&str>) = if cfg!(windows) {
+            (
+                "cmd",
+                vec![
+                    "/C",
+                    "(for /L %i in (1,1,256) do @echo line%i) & echo marker",
+                ],
+            )
+        } else {
+            (
+                "sh",
+                vec![
+                    "-c",
+                    "i=1; while [ $i -le 256 ]; do printf 'line%s\\n' \"$i\"; i=$((i+1)); done; printf 'marker\\n'",
+                ],
+            )
+        };
+        let mut line_count = 0usize;
+        let mut marker_queue_time = None;
+        let out = run_streaming_controlled_timed(
+            program,
+            &args,
+            Duration::from_secs(10),
+            None,
+            |line, observed_at| {
+                if line.starts_with("line") {
+                    line_count += 1;
+                    if line_count == 1 {
+                        // reader 继续把尾部行送入无界 channel，控制线程则停在回调中。
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
+                } else if line == "marker" {
+                    marker_queue_time = Some(Instant::now().saturating_duration_since(observed_at));
+                }
+            },
+        );
+
+        assert!(out.ok, "helper command failed: {}", out.stderr);
+        assert_eq!(line_count, 256);
+        assert!(
+            marker_queue_time.is_some_and(|delay| delay >= Duration::from_millis(100)),
+            "marker 必须保留 reader 入队时间，而不是晚到的 drain 回调时间: {marker_queue_time:?}"
+        );
     }
 
     #[test]

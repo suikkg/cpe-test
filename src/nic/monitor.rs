@@ -4,6 +4,8 @@
 //! 独立连续监控模式：`run_continuous` 按可配置间隔采样，Ctrl+C 时输出
 //! 平均/峰值并写 CSV（不依赖 agent/master 子网测试流程）。
 
+use super::counter::{NicCounterReader, SystemNicCounterReader};
+use crate::clock::{MonotonicClock, SystemClock};
 use crate::protocol::{MonitorSample, MonitorStatusOut, MonitorStopOut};
 use std::collections::HashMap;
 use std::io::Write;
@@ -50,7 +52,9 @@ pub fn read_counters(iface: &str) -> Result<(u64, u64), String> {
 }
 
 pub fn read_rx_bytes(iface: &str) -> Result<u64, String> {
-    read_counters(iface).map(|(rx, _)| rx)
+    SystemNicCounterReader
+        .read_counters(iface)
+        .map(|(rx, _)| rx)
 }
 
 #[cfg(target_os = "macos")]
@@ -223,6 +227,7 @@ fn run_monitor_loop<F>(
     start_tx: u64,
     t0: Instant,
     interval: Duration,
+    clock: &dyn MonotonicClock,
     mut reader: F,
 ) where
     F: FnMut() -> Result<(u64, u64), String>,
@@ -238,7 +243,7 @@ fn run_monitor_loop<F>(
         let stop_on_wake = context.stop.wait_timeout(interval);
         // 停止唤醒也进行一次读取，结算尚未满一个周期的最后部分区间。
         let result = reader();
-        let observed_at = Instant::now();
+        let observed_at = clock.now();
         let stop_after_read = stop_on_wake.or_else(|| context.stop.requested_at());
         // 终采样以 stop 请求时刻为截止，读取计数器和 join 的开销不进入样本时长。
         let sample_at = stop_after_read
@@ -282,6 +287,8 @@ struct MonEntry {
 pub struct MonitorMgr {
     inner: Mutex<HashMap<String, MonEntry>>,
     seq: AtomicU64,
+    clock: Arc<dyn MonotonicClock>,
+    reader: Arc<dyn NicCounterReader>,
 }
 
 impl Default for MonitorMgr {
@@ -292,9 +299,23 @@ impl Default for MonitorMgr {
 
 impl MonitorMgr {
     pub fn new() -> Self {
+        Self::with_dependencies(Arc::new(SystemClock), Arc::new(SystemNicCounterReader))
+    }
+
+    /// Construct a monitor registry with injectable time and counter sources.
+    ///
+    /// The default [`Self::new`] constructor remains the production path; this
+    /// constructor is intentionally small so tests can model clock movement
+    /// and interface failures without sleeping or touching an OS interface.
+    pub fn with_dependencies(
+        clock: Arc<dyn MonotonicClock>,
+        reader: Arc<dyn NicCounterReader>,
+    ) -> Self {
         MonitorMgr {
             inner: Mutex::new(HashMap::new()),
             seq: AtomicU64::new(1),
+            clock,
+            reader,
         }
     }
 
@@ -316,7 +337,9 @@ impl MonitorMgr {
         lease_secs: u64,
     ) -> Result<String, String> {
         if lease_secs > 0
-            && Instant::now()
+            && self
+                .clock
+                .now()
                 .checked_add(Duration::from_secs(lease_secs))
                 .is_none()
         {
@@ -324,7 +347,7 @@ impl MonitorMgr {
                 "monitor lease_secs={lease_secs} 过大，无法表示截止时间"
             ));
         }
-        let (start_rx, start_tx) = read_counters(iface)?;
+        let (start_rx, start_tx) = self.reader.read_counters(iface)?;
         let interval_ms = interval_ms.clamp(200, 5_000);
         let id = format!("mon{}", self.seq.fetch_add(1, Ordering::SeqCst));
         let stop = Arc::new(StopSignal::new());
@@ -334,7 +357,9 @@ impl MonitorMgr {
         let samples_thread = Arc::clone(&samples);
         let errors_thread = Arc::clone(&errors);
         let iface_thread = iface.to_string();
-        let t0 = Instant::now();
+        let t0 = self.clock.now();
+        let clock_thread = Arc::clone(&self.clock);
+        let reader_thread = Arc::clone(&self.reader);
         let handle = std::thread::spawn(move || {
             run_monitor_loop(
                 MonitorLoopContext {
@@ -346,7 +371,8 @@ impl MonitorMgr {
                 start_tx,
                 t0,
                 Duration::from_millis(interval_ms),
-                || read_counters(&iface_thread),
+                clock_thread.as_ref(),
+                || reader_thread.read_counters(&iface_thread),
             );
         });
         self.inner.lock().unwrap().insert(
@@ -388,6 +414,35 @@ impl MonitorMgr {
         })
     }
 
+    /// Return the monitor IDs currently registered to an owner.
+    pub fn resource_ids_for_owner(&self, owner_id: &str) -> Vec<String> {
+        let entries = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ids: Vec<String> = entries
+            .iter()
+            .filter(|(_, entry)| entry.owner_id == owner_id)
+            .map(|(id, _)| id.clone())
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    /// 返回 monitor 自启动起的单调时钟毫秒数。
+    /// 供 `/monitor/start` 响应回传，让主控把远端 monitor 零点
+    /// 对齐到 leg epoch，避免用 RPC 往返中点猜测引入空闲时间。
+    pub fn elapsed_ms(&self, id: &str) -> Option<u64> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(id)
+            .map(|entry| {
+                self.clock
+                    .now()
+                    .saturating_duration_since(entry.t0)
+                    .as_millis()
+                    .min(u64::MAX as u128) as u64
+            })
+    }
+
     pub fn stop(&self, id: &str) -> Result<MonitorStopOut, String> {
         let mut e = self
             .inner
@@ -396,7 +451,7 @@ impl MonitorMgr {
             .remove(id)
             .ok_or_else(|| format!("监控 ID 不存在: {id}"))?;
         // 以调用 stop 的时刻作为报告截止点，终采样读取和 join 的开销不计入时长。
-        let stopped_at = e.stop.request_stop(Instant::now());
+        let stopped_at = e.stop.request_stop(self.clock.now());
         let thread_panicked = e.handle.take().is_some_and(|handle| handle.join().is_err());
         let secs = stopped_at.duration_since(e.t0).as_secs_f64().max(0.001);
         let samples = e.samples.lock().unwrap().clone();
@@ -416,7 +471,7 @@ impl MonitorMgr {
             .sum();
         // 正常路径由线程终采样结算；仅在线程未产出任何样本时兜底直读。
         if samples.is_empty() {
-            match read_counters(&e.iface) {
+            match self.reader.read_counters(&e.iface) {
                 Ok((rx, tx)) => {
                     rx_delta = rx.saturating_sub(e.start_rx);
                     tx_delta = tx.saturating_sub(e.start_tx);
@@ -450,7 +505,29 @@ impl MonitorMgr {
                 .collect()
         };
         targets.sort_by(|(left, _), (right, _)| left.cmp(right));
-        let stopped_at = Instant::now();
+        let stopped_at = self.clock.now();
+        for (_, stop) in &targets {
+            stop.request_stop(stopped_at);
+        }
+        targets
+            .into_iter()
+            .map(|(id, _)| id)
+            .map(|id| {
+                let result = self.stop(&id);
+                (id, result)
+            })
+            .collect()
+    }
+    /// 停止全部监控（Agent 退出清理用）。
+    pub fn stop_all(&self) -> Vec<(String, Result<MonitorStopOut, String>)> {
+        let mut targets: Vec<(String, Arc<StopSignal>)> = {
+            let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            g.iter()
+                .map(|(id, entry)| (id.clone(), Arc::clone(&entry.stop)))
+                .collect()
+        };
+        targets.sort_by(|(left, _), (right, _)| left.cmp(right));
+        let stopped_at = self.clock.now();
         for (_, stop) in &targets {
             stop.request_stop(stopped_at);
         }
@@ -469,6 +546,7 @@ impl MonitorMgr {
     /// 新 entry 使用自身 `lease_secs`；旧调用点以 0 表示未设置租约，继续使用
     /// 调用方传入的 `legacy_max_age`，避免固定短 TTL 误杀合法的长时间测试。
     pub fn sweep(&self, legacy_max_age: std::time::Duration) {
+        let now = self.clock.now();
         let expired: Vec<String> = {
             let g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             g.iter()
@@ -478,7 +556,7 @@ impl MonitorMgr {
                     } else {
                         Duration::from_secs(e.lease_secs)
                     };
-                    e.t0.elapsed() >= max_age
+                    now.saturating_duration_since(e.t0) >= max_age
                 })
                 .map(|(id, _)| id.clone())
                 .collect()
@@ -506,7 +584,8 @@ pub fn run_continuous(opts: &ContinuousOpts) -> Result<(), String> {
     })
     .map_err(|e| format!("设置 Ctrl+C 处理器失败: {e}"))?;
 
-    let t_start = Instant::now();
+    let clock = SystemClock;
+    let t_start = clock.now();
     let mut old_bytes = read_rx_bytes(opts.iface)?;
     let mut old_time = t_start;
     let wait = Duration::from_secs(opts.interval_secs);
@@ -529,7 +608,9 @@ pub fn run_continuous(opts: &ContinuousOpts) -> Result<(), String> {
     loop {
         std::thread::sleep(wait);
 
-        if opts.duration_secs > 0 && t_start.elapsed().as_secs() >= opts.duration_secs {
+        if opts.duration_secs > 0
+            && clock.now().saturating_duration_since(t_start).as_secs() >= opts.duration_secs
+        {
             running.store(false, Ordering::SeqCst);
         }
         if !running.load(Ordering::SeqCst) {
@@ -538,7 +619,7 @@ pub fn run_continuous(opts: &ContinuousOpts) -> Result<(), String> {
 
         match read_rx_bytes(opts.iface) {
             Ok(new_bytes) => {
-                let now = Instant::now();
+                let now = clock.now();
                 let dt = (now - old_time).as_secs_f64().max(0.001);
                 let delta = new_bytes.saturating_sub(old_bytes);
                 let mbps = delta as f64 * 8.0 / dt / 1_000_000.0;
@@ -571,7 +652,7 @@ pub fn run_continuous(opts: &ContinuousOpts) -> Result<(), String> {
     let avg = speeds.iter().sum::<f64>() / speeds.len() as f64;
     let max = speeds.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
     let min = speeds.iter().fold(f64::INFINITY, |a, &b| a.min(b));
-    let elapsed = t_start.elapsed().as_secs();
+    let elapsed = clock.now().saturating_duration_since(t_start).as_secs();
 
     println!("\n{}", "=".repeat(50));
     println!("网卡: {}", opts.iface);
@@ -713,6 +794,7 @@ en0        1500  192.168.8     192.168.8.100     9219567     - 9083840014  52962
             2_000,
             t0,
             Duration::from_secs(30),
+            &SystemClock,
             || {
                 reader_calls += 1;
                 Ok((1_250, 2_500))
@@ -775,6 +857,139 @@ en0        1500  192.168.8     192.168.8.100     9219567     - 9083840014  52962
     }
 
     #[test]
+    fn injected_reader_and_manual_clock_cover_failure_recovery_and_reset() {
+        use crate::clock::{ManualClock, MonotonicClock};
+        use crate::nic::counter::FnNicCounterReader;
+        use std::collections::VecDeque;
+
+        let clock = Arc::new(ManualClock::new());
+        let stop = Arc::new(StopSignal::new());
+        let samples = Arc::new(Mutex::new(Vec::new()));
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let outcomes = Arc::new(Mutex::new(VecDeque::from([
+            Err("temporary read failure".to_string()),
+            Ok((1_200, 2_200)),
+            Ok((900, 2_100)),
+        ])));
+        let calls = Arc::new(AtomicU64::new(0));
+        let reader = FnNicCounterReader::new({
+            let clock = Arc::clone(&clock);
+            let stop = Arc::clone(&stop);
+            let outcomes = Arc::clone(&outcomes);
+            let calls = Arc::clone(&calls);
+            move |_iface: &str| {
+                clock.advance(Duration::from_secs(1));
+                let result = outcomes
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("scripted reader called too many times");
+                if calls.fetch_add(1, Ordering::SeqCst) == 2 {
+                    stop.request_stop(clock.now());
+                }
+                result
+            }
+        });
+        let t0 = clock.now();
+
+        run_monitor_loop(
+            MonitorLoopContext {
+                stop: Arc::clone(&stop),
+                samples: Arc::clone(&samples),
+                errors: Arc::clone(&errors),
+            },
+            1_000,
+            2_000,
+            t0,
+            Duration::ZERO,
+            clock.as_ref(),
+            || reader.read_counters("fake0"),
+        );
+
+        let samples = samples.lock().unwrap();
+        assert_eq!(samples.len(), 3);
+        assert!(!samples[0].valid);
+        assert_eq!(samples[0].interval_ms, 1_000);
+        assert_eq!(samples[0].error, "temporary read failure");
+        assert!(samples[1].valid);
+        assert_eq!(samples[1].interval_ms, 2_000);
+        assert_eq!(samples[1].rx_delta_bytes, 200);
+        assert_eq!(samples[1].tx_delta_bytes, 200);
+        assert!(!samples[2].valid, "counter reset must not become traffic");
+        assert_eq!(samples[2].rx_delta_bytes, 0);
+        assert_eq!(samples[2].tx_delta_bytes, 0);
+        assert!(samples[2].error.contains("回退/reset"));
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+        let errors = errors.lock().unwrap();
+        assert_eq!(errors.len(), 2);
+        assert!(errors[0].contains("temporary read failure"));
+        assert!(errors[1].contains("回退/reset"));
+    }
+
+    #[test]
+    fn monitor_manager_uses_injected_clock_and_reader() {
+        use crate::clock::{ManualClock, MonotonicClock};
+        use crate::nic::counter::FnNicCounterReader;
+        use std::collections::VecDeque;
+
+        let clock = Arc::new(ManualClock::new());
+        let reads = Arc::new(Mutex::new(VecDeque::from([
+            Ok((10_000, 20_000)),
+            Ok((10_500, 20_750)),
+        ])));
+        let reader = Arc::new(FnNicCounterReader::new({
+            let reads = Arc::clone(&reads);
+            move |iface: &str| {
+                assert_eq!(iface, "fake0");
+                reads
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("scripted reader called too many times")
+            }
+        }));
+        let manager =
+            MonitorMgr::with_dependencies(Arc::clone(&clock) as Arc<dyn MonotonicClock>, reader);
+
+        let id = manager.start_owned("fake0", 5_000, "owner", 60).unwrap();
+        clock.advance(Duration::from_secs(2));
+        assert_eq!(manager.elapsed_ms(&id), Some(2_000));
+
+        let output = manager.stop(&id).unwrap();
+        assert!((output.seconds - 2.0).abs() < f64::EPSILON);
+        assert_eq!(output.bytes, 500);
+        assert_eq!(output.tx_bytes, 750);
+        assert_eq!(output.samples.len(), 1);
+        assert!(output.samples[0].valid);
+        assert_eq!(output.samples[0].interval_ms, 2_000);
+        assert!(reads.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn sweep_uses_manual_clock_without_sleeping() {
+        use crate::clock::{ManualClock, MonotonicClock};
+        use crate::nic::counter::FnNicCounterReader;
+
+        let clock = Arc::new(ManualClock::new());
+        let reader = Arc::new(FnNicCounterReader::new(|iface: &str| {
+            assert_eq!(iface, "fake0");
+            Ok((1_000, 2_000))
+        }));
+        let manager =
+            MonitorMgr::with_dependencies(Arc::clone(&clock) as Arc<dyn MonotonicClock>, reader);
+        let id = manager.start_owned("fake0", 5_000, "owner", 2).unwrap();
+
+        clock.advance(Duration::from_millis(1_999));
+        manager.sweep(Duration::from_secs(60));
+        assert!(manager.status(&id).is_ok());
+
+        clock.advance(Duration::from_millis(1));
+        manager.sweep(Duration::from_secs(60));
+        assert!(manager.status(&id).is_err());
+    }
+
+    #[test]
     fn stop_owner_stops_only_matching_entries_and_returns_each_result() {
         let mgr = MonitorMgr::new();
         {
@@ -793,7 +1008,13 @@ en0        1500  192.168.8     192.168.8.100     9219567     - 9083840014  52962
             );
         }
 
+        assert_eq!(
+            mgr.resource_ids_for_owner("owner-a"),
+            vec!["mon-owner-a-1", "mon-owner-a-2"]
+        );
         let stopped = mgr.stop_owner("owner-a");
+        assert!(mgr.resource_ids_for_owner("owner-a").is_empty());
+        assert_eq!(mgr.resource_ids_for_owner("owner-b"), vec!["mon-owner-b"]);
         assert_eq!(
             stopped
                 .iter()

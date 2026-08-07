@@ -9,6 +9,14 @@ pub struct Config {
     /// 辅测机管理口 IP（留空则交互询问）
     pub agent_host: String,
     pub agent_port: u16,
+    /// 与辅测 agent 之间的共享访问令牌。空表示不启用认证（仅建议隔离测试网使用）；
+    /// 非空时 agent 要求所有请求携带 `Authorization: Bearer <token>`，
+    /// 未认证请求返回 401 且不会创建任何资源。
+    #[serde(default)]
+    pub agent_token: String,
+    /// agent 监听地址；默认 0.0.0.0。可设为 127.0.0.1 或测试网卡 IP 收紧暴露面。
+    #[serde(default = "default_agent_bind")]
+    pub agent_bind: String,
     /// 测试子网 IPv4 前缀过滤
     pub ipv4_prefixes: Vec<String>,
     /// 跨机 iperf3/ctsTraffic 要求两端同 /24（历史字段名保持兼容；ping 不受限）
@@ -87,11 +95,17 @@ pub struct UniversalParams {
     pub rate_targets_mbps: Option<RateTargets>,
 }
 
+fn default_agent_bind() -> String {
+    "0.0.0.0".into()
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
             agent_host: String::new(),
             agent_port: 28801,
+            agent_token: String::new(),
+            agent_bind: default_agent_bind(),
             ipv4_prefixes: vec!["192.168.".into()],
             require_same_subnet_for_iperf: true,
             limit_udp_by_link_speed: true,

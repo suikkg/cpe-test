@@ -13,6 +13,7 @@ use crate::config::Config;
 use crate::nic::monitor::MonitorMgr;
 use crate::nic::scan_host;
 use crate::protocol::*;
+use crate::resource::{AgentResourceInventory, ResourceInventory};
 use crate::util::{
     ctstraffic_platform_supported, ctstraffic_version, find_ctstraffic, find_iperf3,
     iperf3_version, now_hms, os_name,
@@ -30,8 +31,9 @@ use tiny_http::{Header, Method, Request, Response, Server};
 
 const WORKERS: usize = 16;
 const MAX_BODY: u64 = 100 * 1024 * 1024;
-/// 每 30 秒清理一次过期状态（见 PROJECT_PLAN）
-const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+/// 每 200ms 轮询取消标志（P0: Ctrl+C 到资源归零 ≤5 秒）；租约清扫每 30 秒一次
+const SWEEP_INTERVAL: Duration = Duration::from_millis(200);
+const SWEEP_EVERY_TICKS: u64 = 150; // 200ms × 150 = 30s
 const SERVER_MAX_AGE: Duration = Duration::from_secs(90_000);
 const CLIENT_JOB_MAX_AGE: Duration = Duration::from_secs(90_000);
 const MONITOR_MAX_AGE: Duration = Duration::from_secs(90_000);
@@ -124,10 +126,14 @@ pub struct AgentState {
     pub monitors: MonitorMgr,
     pub default_prefixes: Vec<String>,
     owner_lifecycle: OwnerLifecycle,
+    /// 共享访问令牌；空表示不启用认证。
+    token: String,
 }
 
 /// 启动 agent（阻塞不返回）
 pub fn run(port: u16, cfg: &Config) {
+    // P0: agent 也必须安装 Ctrl+C 处理器，否则无法优雅退出/清理。
+    crate::cancel::setup_cancel_handler();
     println!("==============================================");
     println!(
         "  CPE 子网测试工具 v{} — 辅测 agent",
@@ -175,15 +181,33 @@ pub fn run(port: u16, cfg: &Config) {
         println!("    {} = {}  [{}]", n.name, info, n.role);
     }
 
-    let server = match Server::http(("0.0.0.0", port)) {
+    let bind_addr = if cfg.agent_bind.trim().is_empty() {
+        "0.0.0.0".to_string()
+    } else {
+        cfg.agent_bind.trim().to_string()
+    };
+    let server = match Server::http((bind_addr.as_str(), port)) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("\n!! 启动失败: 端口 {port} 无法监听 ({e})");
+            eprintln!("\n!! 启动失败: {bind_addr}:{port} 无法监听 ({e})");
             eprintln!("!! 可能已有一个 agent 在运行，或端口被占用。");
             std::process::exit(1);
         }
     };
-    println!("\nagent 已启动，监听 0.0.0.0:{port}");
+    let auth = if cfg.agent_token.trim().is_empty() {
+        None
+    } else {
+        Some(cfg.agent_token.trim().to_string())
+    };
+    println!("\nagent 已启动，监听 {bind_addr}:{port}");
+    match &auth {
+        Some(_) => println!(
+            "已启用共享令牌认证：主控需在 config.json 配置相同 agent_token 才能连接。"
+        ),
+        None => println!(
+            "!! 未配置 agent_token：任何能访问该端口的主机都能控制本 agent。\n!! 生产/非隔离网络请用 --token 或 config.json 的 agent_token 开启认证。"
+        ),
+    }
     println!("等待主控连接...（保持本窗口开着，不要关闭；首次运行请允许防火墙放行）\n");
 
     let server = Arc::new(server);
@@ -193,6 +217,7 @@ pub fn run(port: u16, cfg: &Config) {
         monitors: MonitorMgr::new(),
         default_prefixes: cfg.ipv4_prefixes.clone(),
         owner_lifecycle: OwnerLifecycle::new(),
+        token: auth.unwrap_or_default(),
     });
 
     for _ in 0..WORKERS {
@@ -209,12 +234,37 @@ pub fn run(port: u16, cfg: &Config) {
         });
     }
 
-    // 主线程做定期清理
+    // 主线程做定期清理；第一次 Ctrl+C 时优雅退出（与主控一致）。
+    // P0: Ctrl+C 到资源归零 ≤5 秒 —— 200ms 轮询取消标志，退出前停止全部资源。
+    let mut tick: u64 = 0;
     loop {
+        if crate::cancel::is_cancelled() {
+            println!("\n辅测 agent 收到 Ctrl+C，正在退出...");
+            let started = std::time::Instant::now();
+            let inv = AgentResourceInventory::new(&state.clients, &state.servers, &state.monitors);
+            let out = inv.cleanup_all(Duration::from_secs(5));
+            for e in &out.errors {
+                eprintln!("[agent] 退出清理错误: {e}");
+            }
+            println!(
+                "[agent] 退出清理完成：servers={} clients={} monitors={} errors={} 耗时 {:.2}s",
+                out.servers,
+                out.clients,
+                out.monitors,
+                out.errors.len(),
+                started.elapsed().as_secs_f64()
+            );
+            break;
+        }
         std::thread::sleep(SWEEP_INTERVAL);
-        state.servers.sweep(SERVER_MAX_AGE);
-        state.clients.sweep(CLIENT_JOB_MAX_AGE);
-        state.monitors.sweep(MONITOR_MAX_AGE);
+        tick += 1;
+        // Keep the modulo form for the documented Rust 1.82 MSRV.
+        #[allow(clippy::manual_is_multiple_of)]
+        if tick % SWEEP_EVERY_TICKS == 0 {
+            state.servers.sweep(SERVER_MAX_AGE);
+            state.clients.sweep(CLIENT_JOB_MAX_AGE);
+            state.monitors.sweep(MONITOR_MAX_AGE);
+        }
     }
 }
 
@@ -234,6 +284,22 @@ fn handle(mut rq: Request, st: &Arc<AgentState>) {
     };
     println!("[{}] {} {} 来自 {}", now_hms(), method, url, peer);
 
+    // 认证在路由之前完成：未认证请求必须返回 401 且不创建任何资源。
+    if !st.token.is_empty() && !request_authorized(&rq, &st.token) {
+        let header = Header::from_bytes(
+            &b"Content-Type"[..],
+            &b"application/json; charset=utf-8"[..],
+        )
+        .expect("header");
+        let resp = Response::from_data(
+            err_json("未认证：缺少或错误的 Authorization: Bearer <token>").into_bytes(),
+        )
+        .with_status_code(401)
+        .with_header(header);
+        let _ = rq.respond(resp);
+        return;
+    }
+
     // handler panic 不能弄崩 server
     let resp_body = std::panic::catch_unwind(AssertUnwindSafe(|| route(&method, &url, &body, st)))
         .unwrap_or_else(|_| err_json("agent 内部错误(panic)，其余功能不受影响"));
@@ -245,6 +311,37 @@ fn handle(mut rq: Request, st: &Arc<AgentState>) {
     .expect("header");
     let resp = Response::from_data(resp_body.into_bytes()).with_header(header);
     let _ = rq.respond(resp);
+}
+
+/// 校验请求的 `Authorization: Bearer <token>` 头。
+/// 用恒定时间比较避免令牌侧信道；token 为空时视为未启用认证。
+fn request_authorized(rq: &Request, expected: &str) -> bool {
+    let header_value = rq
+        .headers()
+        .iter()
+        .find(|h| h.field.equiv("Authorization"))
+        .map(|h| h.value.as_str());
+    bearer_token_ok(header_value, expected)
+}
+
+/// 纯函数：校验 Authorization 头的 Bearer 令牌。
+pub(crate) fn bearer_token_ok(header_value: Option<&str>, expected: &str) -> bool {
+    if expected.is_empty() {
+        return true;
+    }
+    let Some(provided) = header_value.and_then(|v| v.strip_prefix("Bearer ")) else {
+        return false;
+    };
+    let provided = provided.trim();
+    if provided.len() != expected.len() {
+        return false;
+    }
+    // 恒定时间比较。
+    provided
+        .bytes()
+        .zip(expected.bytes())
+        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+        == 0
 }
 
 fn route(method: &Method, url: &str, body: &str, st: &Arc<AgentState>) -> String {
@@ -462,7 +559,10 @@ fn route(method: &Method, url: &str, body: &str, st: &Arc<AgentState>) -> String
                 st.monitors
                     .start_owned(&req.iface, req.interval_ms, &req.owner_id, req.lease_secs)
             }) {
-                Ok(id) => ok_json(MonitorStartOut { id }),
+                Ok(id) => {
+                    let elapsed_ms = st.monitors.elapsed_ms(&id).unwrap_or(0);
+                    ok_json(MonitorStartOut { id, elapsed_ms })
+                }
                 Err(e) => err_json(&e),
             }
         }
@@ -504,27 +604,8 @@ fn route(method: &Method, url: &str, body: &str, st: &Arc<AgentState>) -> String
             };
 
             let out = st.owner_lifecycle.with_cleanup(&req.owner_id, || {
-                // 先同时取消发送端 client，再关闭 listener，最后结算 monitor；这样旧
-                // client 不会在 server 重建窗口中误连，同时 monitor 能记录完整尾部样本。
-                let clients = st.clients.stop_owner(&req.owner_id, client_wait);
-                let servers = st.servers.stop_owner(&req.owner_id, Duration::ZERO);
-                let monitors = st.monitors.stop_owner(&req.owner_id);
-                let mut errors = Vec::new();
-                errors.extend(clients.errors);
-                errors.extend(servers.errors);
-                let mut stopped_monitors = 0usize;
-                for (id, result) in monitors {
-                    match result {
-                        Ok(_) => stopped_monitors += 1,
-                        Err(e) => errors.push(format!("monitor {id} 清理失败: {e}")),
-                    }
-                }
-                ResourceCleanupOut {
-                    servers: servers.stopped,
-                    clients: clients.stopped,
-                    monitors: stopped_monitors,
-                    errors,
-                }
+                AgentResourceInventory::new(&st.clients, &st.servers, &st.monitors)
+                    .cleanup_owner(&req.owner_id, client_wait)
             });
             ok_json(out)
         }
@@ -561,7 +642,90 @@ mod tests {
             monitors: MonitorMgr::new(),
             default_prefixes: Vec::new(),
             owner_lifecycle: OwnerLifecycle::new(),
+            token: String::new(),
         })
+    }
+    #[test]
+    fn bearer_token_auth_rejects_missing_wrong_and_accepts_matching() {
+        // 未启用认证：任何头都放行。
+        assert!(bearer_token_ok(None, ""));
+        assert!(bearer_token_ok(Some("Bearer anything"), ""));
+        // 启用认证：缺失头被拒。
+        assert!(!bearer_token_ok(None, "secret"));
+        // 非 Bearer 前缀被拒。
+        assert!(!bearer_token_ok(Some("Basic abc"), "secret"));
+        // 错误令牌被拒。
+        assert!(!bearer_token_ok(Some("Bearer wrong"), "secret"));
+        // 长度不同直接被拒（不进入常量时间比较）。
+        assert!(!bearer_token_ok(Some("Bearer secret-extralong"), "secret"));
+        // 正确令牌放行（含前后空白容忍）。
+        assert!(bearer_token_ok(Some("Bearer secret"), "secret"));
+        assert!(bearer_token_ok(Some("Bearer  secret  "), "secret"));
+    }
+
+    #[test]
+    fn unauthenticated_request_returns_401_without_creating_resources() {
+        // 启用令牌的 agent：未认证请求必须 401 且不得创建任何资源。
+        // 这里用真实 tiny_http + handle() 验证 401 状态码与资源零创建。
+        let state = Arc::new(AgentState {
+            servers: IperfServerMgr::new(),
+            clients: IperfClientJobMgr::new(),
+            monitors: MonitorMgr::new(),
+            default_prefixes: Vec::new(),
+            owner_lifecycle: OwnerLifecycle::new(),
+            token: "unit-secret".into(),
+        });
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let st = Arc::clone(&state);
+        std::thread::spawn(move || {
+            for rq in server.incoming_requests() {
+                handle(rq, &st);
+            }
+        });
+
+        // 未带令牌 → 401，且不创建任何资源。
+        let (status, _body) = crate::http_client::post_json_auth(
+            "127.0.0.1",
+            port,
+            "/monitor/start",
+            r#"{"iface":"unreachable-iface","interval_ms":1000}"#,
+            "",
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(status, 401);
+        assert!(
+            state.monitors.status("mon1").is_err(),
+            "未认证请求不得创建 monitor"
+        );
+
+        // 错误令牌 → 401。
+        let (status, _body) = crate::http_client::post_json_auth(
+            "127.0.0.1",
+            port,
+            "/health",
+            "{}",
+            "wrong-token",
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(status, 401);
+
+        // 正确令牌 → 200。
+        let body = serde_json::json!({}).to_string();
+        let (status, text) = crate::http_client::post_json_auth(
+            "127.0.0.1",
+            port,
+            "/health",
+            &body,
+            "unit-secret",
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(status, 200);
+        let resp: Resp<HealthOut> = serde_json::from_str(&text).unwrap();
+        assert!(resp.ok);
     }
 
     #[test]

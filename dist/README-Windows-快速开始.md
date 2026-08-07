@@ -1,8 +1,8 @@
 # CPE 测试工具 Windows 包
 
-> 如果你从 Git 仓库下载的是 `cpe_test-v4.2.2-windows-config-docs.zip`，那是一份只含
+> 如果你从 Git 仓库下载的是 `cpe_test-v4.2.4-windows-config-docs.zip`，那是一份只含
 > 配置、文档和启动脚本的资料包，不含 `cpe_test.exe`、`ctsTraffic.exe` 或 iperf3。
-> 开箱即用请下载 GitHub Release 的 `cpe_test-v4.2.2-windows-x86_64.zip`；也可以自行
+> 开箱即用请下载 GitHub Release 的 `cpe_test-v4.2.4-windows-x86_64.zip`；也可以自行
 > 编译程序后，把资料包内容与 exe 放到同一目录。
 
 将这个文件夹完整复制到**主控机**和**辅测机**。两台电脑必须使用同一个
@@ -11,7 +11,7 @@
 ## 包内文件与系统要求
 
 - `cpe_test.exe`：主控、agent、网卡扫描和监控共用的程序。
-- `ctsTraffic.exe`：Microsoft ctsTraffic 2.0.4.0 x64，随官方 v4.2.2 Windows 包固定捆绑并校验；仅支持 Windows 10 或更高版本。
+- `ctsTraffic.exe`：Microsoft ctsTraffic 2.0.4.0 x64，随官方 v4.2.4 Windows 包固定捆绑并校验；仅支持 Windows 10 或更高版本。
 - `start_*.bat`：双击启动脚本。
 - `configs\`：SGMII、Wi-Fi、10GUSB 等具名配置。
 - `THIRD_PARTY_NOTICES.md` 及 CTS/WIL 许可文件：第三方归属和许可说明。
@@ -29,7 +29,7 @@ Windows 7/8/8.1、版本无法确认以及 macOS/Linux 都不支持 CTS，但不
 1. 辅测机双击 `start_agent.bat`，首次防火墙提示请选择“允许访问”。保持窗口打开，记下显示的可达 IP。
 2. 主控机双击 `start_master_select_config.bat`，选择对应网口配置，再输入辅测机 IP。
 3. 交互菜单中选择 iperf3、ctsTraffic、两者对比、Ping 或全部；确认任务清单后开始。
-4. 测试结束后，HTML 报告、主控日志和 `iperf_outputs` 附件目录保存在主控机当前目录。
+4. 测试结束后，HTML 报告、主控日志和全部附件会保存在主控机当前目录下同一个 `runs/run_<时间>_<进程号>/` 目录中。
 
 也可直接运行 `start_master.bat configs\config-sgmii.json`，把文件名替换为
 `config-wifi5g.json`、`config-10gusb.json` 或 `config-all-common.json`。

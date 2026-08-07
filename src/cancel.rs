@@ -1,8 +1,12 @@
 //! 平台无关的取消信号处理。
 //!
 //! Windows：使用 `SetConsoleCtrlHandler` 原生 API；
-//! - 第一次 Ctrl+C：设置取消标志并返回 TRUE（阻止 cmd.exe "Terminate batch job?" 提示）
+//! - 第一次 Ctrl+C：设置取消标志并返回 TRUE（本进程存活，主循环检测后优雅收尾）
 //! - 第二次 Ctrl+C：返回 FALSE 交由默认处理器强退
+//!
+//! 注意：返回 TRUE 只让**本进程**不被默认处理器终止。若经 cmd.exe 批处理
+//! （start_*.bat）启动，cmd.exe 是独立进程，会另行弹出 "Terminate batch job (Y/N)?"，
+//! 此时请按 N 让批处理等待本进程优雅退出；直接运行 exe 则无此提示。
 //!
 //! 非 Windows：使用 `ctrlc` crate。
 
@@ -13,6 +17,11 @@ static CANCELLED: AtomicBool = AtomicBool::new(false);
 /// 是否收到了取消信号（Ctrl+C）
 pub fn is_cancelled() -> bool {
     CANCELLED.load(Ordering::SeqCst)
+}
+
+/// 返回取消标志的原子引用，供底层受控命令轮询（与全局标志同源）。
+pub fn cancel_flag() -> &'static AtomicBool {
+    &CANCELLED
 }
 
 /// 注册 Ctrl+C 处理器。
