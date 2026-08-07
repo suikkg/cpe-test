@@ -12,7 +12,7 @@ pub mod scan_macos;
 pub mod scan_windows;
 
 use crate::protocol::HostInfo;
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 use crate::protocol::NicInfo;
 use crate::util::{hostname, os_name};
 
