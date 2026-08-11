@@ -1,9 +1,9 @@
 //! 解析 `ipconfig /all` 输出（Windows，中英文兼容，GBK 已在 run_cmd 解码）
 
-#![cfg_attr(not(windows), allow(dead_code))]
-
+#[cfg(windows)]
 use crate::util::run_cmd;
 use regex::Regex;
+#[cfg(windows)]
 use std::time::Duration;
 
 #[derive(Debug, Clone, Default)]
@@ -18,6 +18,7 @@ pub struct IpcfgAdapter {
     pub disconnected: bool,
 }
 
+#[cfg(windows)]
 pub fn scan() -> Vec<IpcfgAdapter> {
     let out = run_cmd("ipconfig", &["/all"], Duration::from_secs(20));
     parse(&out.merged())

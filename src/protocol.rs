@@ -2,6 +2,12 @@
 
 use serde::{Deserialize, Serialize};
 
+/// 表示 agent 支持 request-id 幂等、同步 stop、owner 批量清理和动态租约。
+pub const RELIABLE_LIFECYCLE_CAPABILITY: &str = "reliable_lifecycle_v1";
+pub const LIVE_NIC_PROGRESS_CAPABILITY: &str = "live_nic_progress_v1";
+/// agent 支持 ctsTraffic 异步生命周期与简化参数映射。
+pub const CTS_TRAFFIC_CAPABILITY: &str = "ctstraffic_v1";
+
 /// 一张网卡的信息（两端通用）
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct NicInfo {
@@ -14,6 +20,9 @@ pub struct NicInfo {
     pub role: String,
     /// IPv4 地址（必有，扫描时按前缀过滤）
     pub ipv4: String,
+    /// 该 IPv4 接口的默认网关；无默认路由或旧版 agent 未提供时为空。
+    #[serde(default)]
+    pub gateway_v4: String,
     /// IPv6 link-local（fe80::，不带 %zone）
     #[serde(default)]
     pub ipv6_ll: String,
@@ -125,6 +134,15 @@ pub struct IperfServerStartReq {
     pub port: u16,
     #[serde(default)]
     pub v6: bool,
+    /// 单次 server 生命周期的幂等键。空值保留旧版按端口管理语义。
+    #[serde(default)]
+    pub request_id: String,
+    /// 一次自动化运行的资源所有者，用于异常路径批量清理。
+    #[serde(default)]
+    pub owner_id: String,
+    /// server 租约秒数；超时后 agent 可自动清理。0 表示使用兼容默认值。
+    #[serde(default)]
+    pub lease_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -138,11 +156,17 @@ pub struct IperfServerStopReq {
     /// 停止前最多等 server 自然退出秒数
     #[serde(default)]
     pub wait_secs: u64,
+    /// 精确停止对应 start 的 server。空值保留旧版按端口停止语义。
+    #[serde(default)]
+    pub request_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct IperfServerStopOut {
     pub existed: bool,
+    /// true 表示目标进程已确认退出并完成 wait 回收，或目标原本就不存在。
+    #[serde(default)]
+    pub terminated: bool,
     pub output: String,
 }
 
@@ -168,19 +192,251 @@ pub struct IperfClientReq {
 pub struct IperfClientOut {
     pub ok: bool,
     pub timed_out: bool,
+    #[serde(default)]
+    pub cancelled: bool,
+    /// Some(true) 表示底层 client 进程确实成功 spawn；None 为旧版 agent 未上报。
+    #[serde(default)]
+    pub process_started: Option<bool>,
+    /// Some(true) 表示底层 client 已完成 wait/reap；None 为旧版 agent 未上报。
+    #[serde(default)]
+    pub cleanup_confirmed: Option<bool>,
     pub cmd: String,
     pub output: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum IperfEventKind {
+    #[default]
+    Started,
+    Connected,
+    Traffic,
+    Retry,
+    Error,
+    Ended,
+}
+
+/// iperf3 实时事件。elapsed_ms 以单个 client job 启动为零点，
+/// 主控可叠加本地 launch offset，避免直接比较两台机器的系统时钟。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct IperfFlowEvent {
+    pub kind: IperfEventKind,
+    pub elapsed_ms: u64,
+    #[serde(default)]
+    pub mbps: Option<f64>,
+    #[serde(default)]
+    pub line: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct IperfClientStartReq {
+    pub request: IperfClientReq,
+    /// 幂等 job ID；非空时 agent 使用该值作为实际 job ID。
+    #[serde(default)]
+    pub request_id: String,
+    /// 一次自动化运行的资源所有者，用于异常路径批量清理。
+    #[serde(default)]
+    pub owner_id: String,
+    /// client job 租约秒数；0 表示使用兼容的 agent 旧作业上限。
+    #[serde(default)]
+    pub lease_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct IperfClientStartOut {
+    pub id: String,
+    /// agent 返回响应时，该 job 自创建起已经经过的毫秒数；用于主控对齐时间轴。
+    #[serde(default)]
+    pub elapsed_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct IperfClientStatusReq {
+    pub id: String,
+    /// 从该事件下标开始返回，避免长测试反复传输全部 interval。
+    #[serde(default)]
+    pub cursor: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct IperfClientStatusOut {
+    pub id: String,
+    pub done: bool,
+    pub next_cursor: usize,
+    #[serde(default)]
+    pub events: Vec<IperfFlowEvent>,
+    /// 仅 done=true 时返回最终结果。
+    #[serde(default)]
+    pub result: Option<IperfClientOut>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct IperfClientStopReq {
+    pub id: String,
+    /// 最多等待 client 子进程确认退出的秒数；0 表示使用 agent 默认值。
+    #[serde(default)]
+    pub wait_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct IperfClientStopOut {
+    pub existed: bool,
+    pub was_done: bool,
+    /// true 表示 worker 与 client 子进程已确认结束，或目标原本就不存在。
+    #[serde(default)]
+    pub terminated: bool,
+    /// 停止前已完成或经同步取消后得到的最终输出。旧 agent 不返回此字段时为 None。
+    /// ctsTraffic server 依靠它回传另一端的状态/错误摘要，避免只审计 client 输出。
+    #[serde(default)]
+    pub result: Option<IperfClientOut>,
+}
+
+// ---------- /ctstraffic ----------
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum CtsTrafficRole {
+    #[default]
+    Client,
+    Server,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum CtsTrafficProtocol {
+    #[default]
+    Tcp,
+    Udp,
+}
+
+/// ctsTraffic 的简化参数。上层仍以 src -> dst 表示数据方向；执行器负责把
+/// TCP 映射为 src=client/dst=server，把 UDP 映射为 src=server/dst=client。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CtsTrafficReq {
+    pub role: CtsTrafficRole,
+    pub protocol: CtsTrafficProtocol,
+    /// server 的 -Listen，或 client 的 -Bind。
+    pub bind_ip: String,
+    /// 仅 client 使用，对应 -Target。
+    #[serde(default)]
+    pub target_ip: String,
+    pub port: u16,
+    /// 自动化测试必须有界：TCP 映射 -TimeLimit，UDP 映射 -StreamLength。
+    pub duration_secs: u64,
+    /// client 的并发连接/UDP stream 数，对应 -Connections。
+    pub streams: u32,
+    /// iperf 风格的单一 window 经过上层换算为字节，同时映射 SO_RCVBUF/SO_SNDBUF。
+    #[serde(default)]
+    pub window_bytes: Option<u32>,
+    /// UDP 每条 stream 的目标 bit/s。
+    #[serde(default)]
+    pub bits_per_second: Option<u64>,
+    #[serde(default)]
+    pub datagram_bytes: Option<u32>,
+    #[serde(default = "default_cts_frame_rate")]
+    pub frame_rate: u32,
+    #[serde(default = "default_cts_buffer_depth")]
+    pub buffer_depth_secs: u32,
+    #[serde(default = "default_cts_status_update")]
+    pub status_update_ms: u32,
+}
+
+fn default_cts_frame_rate() -> u32 {
+    100
+}
+
+fn default_cts_buffer_depth() -> u32 {
+    1
+}
+
+fn default_cts_status_update() -> u32 {
+    1_000
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CtsTrafficStartReq {
+    pub request: CtsTrafficReq,
+    #[serde(default)]
+    pub request_id: String,
+    #[serde(default)]
+    pub owner_id: String,
+    #[serde(default)]
+    pub lease_secs: u64,
+}
+
+/// ctsTraffic 作业复用现有可靠异步作业的状态/停止结构，保持轮询、幂等和
+/// owner 批量清理语义一致。
+pub type CtsTrafficStartOut = IperfClientStartOut;
+pub type CtsTrafficStatusReq = IperfClientStatusReq;
+pub type CtsTrafficStatusOut = IperfClientStatusOut;
+pub type CtsTrafficStopReq = IperfClientStopReq;
+pub type CtsTrafficStopOut = IperfClientStopOut;
+
+// ---------- /resources/cleanup ----------
+/// 按 owner 清理一次自动化运行遗留的所有远端资源。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ResourceCleanupReq {
+    pub owner_id: String,
+    /// client 批量取消与回收的总等待预算；0 表示使用 agent 默认值。
+    #[serde(default)]
+    pub wait_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ResourceCleanupOut {
+    pub servers: usize,
+    pub clients: usize,
+    pub monitors: usize,
+    #[serde(default)]
+    pub errors: Vec<String>,
 }
 
 // ---------- /monitor ----------
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MonitorStartReq {
     pub iface: String,
+    /// 连续采样周期。默认 1000ms，Windows 可按需降低到 500ms。
+    #[serde(default = "default_monitor_interval_ms")]
+    pub interval_ms: u64,
+    /// 一次自动化运行的资源所有者，用于异常路径批量清理。
+    #[serde(default)]
+    pub owner_id: String,
+    /// monitor 租约秒数；0 表示使用兼容的 agent 默认上限。
+    #[serde(default)]
+    pub lease_secs: u64,
+}
+
+fn default_monitor_interval_ms() -> u64 {
+    1000
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MonitorStartOut {
     pub id: String,
+    /// monitor 自启动起的单调时钟毫秒数（响应构建时刻）。
+    /// 主控用它把远端 monitor 零点对齐到 leg epoch，不再用 RPC 往返中点猜测：
+    /// 非对称网络延迟会把空闲时间混入正式窗口。
+    #[serde(default)]
+    pub elapsed_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MonitorStatusReq {
+    pub id: String,
+}
+
+/// 运行中的网卡监控快照。读取该接口不会停止 monitor；主控用它按秒打印
+/// OS 网卡计数器口径的实际 RX/TX，最终判定仍使用 stop 返回的完整样本序列。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MonitorStatusOut {
+    pub id: String,
+    pub iface: String,
+    pub sample_count: usize,
+    #[serde(default)]
+    pub latest_sample: Option<MonitorSample>,
+    pub error_count: usize,
+    #[serde(default)]
+    pub latest_error: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -191,8 +447,32 @@ pub struct MonitorStopReq {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct MonitorStopOut {
     pub avg_mbps: f64,
+    #[serde(default)]
+    pub tx_avg_mbps: f64,
     pub seconds: f64,
     pub bytes: u64,
+    #[serde(default)]
+    pub tx_bytes: u64,
+    #[serde(default)]
+    pub samples: Vec<MonitorSample>,
+    #[serde(default)]
+    pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct MonitorSample {
+    /// 以 monitor start 为零点，避免依赖两台机器系统时钟同步。
+    pub elapsed_ms: u64,
+    pub interval_ms: u64,
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+    pub rx_delta_bytes: u64,
+    pub tx_delta_bytes: u64,
+    pub rx_mbps: f64,
+    pub tx_mbps: f64,
+    pub valid: bool,
+    #[serde(default)]
+    pub error: String,
 }
 
 // ---------- /screenshot ----------
@@ -216,4 +496,173 @@ pub struct HealthOut {
     pub version: String,
     /// iperf3 版本信息，None 表示未找到
     pub iperf3: Option<String>,
+    /// ctsTraffic 可用性说明；该工具仅支持 Windows 10+。
+    #[serde(default)]
+    pub ctstraffic: Option<String>,
+    /// 可选协议能力；旧 agent 缺少该字段时按空列表处理。
+    #[serde(default)]
+    pub capabilities: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug, Deserialize)]
+    struct LegacyServerStartReq {
+        bind_ip: String,
+        port: u16,
+        v6: bool,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct LegacyClientStartReq {
+        request: IperfClientReq,
+    }
+
+    #[test]
+    fn legacy_json_defaults_new_lifecycle_fields() {
+        let nic: NicInfo =
+            serde_json::from_str(r#"{"name":"Ethernet","role":"UNKNOWN","ipv4":"192.0.2.10"}"#)
+                .unwrap();
+        assert!(nic.gateway_v4.is_empty());
+
+        let server: IperfServerStartReq =
+            serde_json::from_str(r#"{"bind_ip":"127.0.0.1","port":56000,"v6":false}"#).unwrap();
+        assert!(server.request_id.is_empty());
+        assert!(server.owner_id.is_empty());
+        assert_eq!(server.lease_secs, 0);
+
+        let client: IperfClientStartReq = serde_json::from_str(
+            r#"{"request":{"dst":"127.0.0.1","bind_ip":"127.0.0.1","port":56000,"duration":1,"udp":true,"v6":false,"extra":[]}}"#,
+        )
+        .unwrap();
+        assert!(client.request_id.is_empty());
+        assert!(client.owner_id.is_empty());
+        assert_eq!(client.lease_secs, 0);
+
+        let monitor: MonitorStartReq =
+            serde_json::from_str(r#"{"iface":"Ethernet","interval_ms":1000}"#).unwrap();
+        assert!(monitor.owner_id.is_empty());
+        assert_eq!(monitor.lease_secs, 0);
+
+        let stop: IperfClientStopOut =
+            serde_json::from_str(r#"{"existed":true,"was_done":true,"terminated":true}"#).unwrap();
+        assert!(stop.result.is_none());
+
+        let client_out: IperfClientOut = serde_json::from_str(
+            r#"{"ok":true,"timed_out":false,"cancelled":false,"cmd":"iperf3","output":"ok"}"#,
+        )
+        .unwrap();
+        assert_eq!(client_out.process_started, None);
+        assert_eq!(client_out.cleanup_confirmed, None);
+
+        let health: HealthOut = serde_json::from_str(
+            r#"{"hostname":"old-agent","os":"windows","version":"3.0.0","iperf3":null}"#,
+        )
+        .unwrap();
+        assert_eq!(health.ctstraffic, None);
+        assert!(health.capabilities.is_empty());
+    }
+
+    #[test]
+    fn ctstraffic_request_json_defaults_media_stream_tuning_and_lifecycle_fields() {
+        let start: CtsTrafficStartReq = serde_json::from_str(
+            r#"{
+                "request": {
+                    "role": "client",
+                    "protocol": "udp",
+                    "bind_ip": "192.0.2.10",
+                    "target_ip": "192.0.2.20",
+                    "port": 56000,
+                    "duration_secs": 10,
+                    "streams": 3,
+                    "bits_per_second": 500000000
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(start.request.role, CtsTrafficRole::Client);
+        assert_eq!(start.request.protocol, CtsTrafficProtocol::Udp);
+        assert_eq!(start.request.frame_rate, 100);
+        assert_eq!(start.request.buffer_depth_secs, 1);
+        assert_eq!(start.request.status_update_ms, 1_000);
+        assert_eq!(start.request.window_bytes, None);
+        assert_eq!(start.request.datagram_bytes, None);
+        assert!(start.request_id.is_empty());
+        assert!(start.owner_id.is_empty());
+        assert_eq!(start.lease_secs, 0);
+    }
+
+    #[test]
+    fn health_json_roundtrip_preserves_ctstraffic_version_and_capability() {
+        let health = HealthOut {
+            hostname: "agent".into(),
+            os: "windows".into(),
+            version: "4.2.0".into(),
+            iperf3: Some("iperf 3.19".into()),
+            ctstraffic: Some("ctsTraffic 2.0.4.0".into()),
+            capabilities: vec![CTS_TRAFFIC_CAPABILITY.into()],
+        };
+        let json = serde_json::to_string(&health).unwrap();
+        let decoded: HealthOut = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(decoded.ctstraffic.as_deref(), Some("ctsTraffic 2.0.4.0"));
+        assert!(decoded
+            .capabilities
+            .iter()
+            .any(|capability| capability == CTS_TRAFFIC_CAPABILITY));
+    }
+
+    #[test]
+    fn legacy_structs_ignore_new_lifecycle_fields() {
+        let server_json = serde_json::to_string(&IperfServerStartReq {
+            bind_ip: "127.0.0.1".into(),
+            port: 56_000,
+            v6: false,
+            request_id: "server-1".into(),
+            owner_id: "unit-1".into(),
+            lease_secs: 300,
+        })
+        .unwrap();
+        let legacy_server: LegacyServerStartReq = serde_json::from_str(&server_json).unwrap();
+        assert_eq!(legacy_server.bind_ip, "127.0.0.1");
+        assert_eq!(legacy_server.port, 56_000);
+        assert!(!legacy_server.v6);
+
+        let client_json = serde_json::to_string(&IperfClientStartReq {
+            request: IperfClientReq {
+                dst: "127.0.0.1".into(),
+                bind_ip: "127.0.0.1".into(),
+                port: 56_000,
+                duration: 1,
+                udp: true,
+                ..Default::default()
+            },
+            request_id: "client-1".into(),
+            owner_id: "unit-1".into(),
+            lease_secs: 300,
+        })
+        .unwrap();
+        let legacy_client: LegacyClientStartReq = serde_json::from_str(&client_json).unwrap();
+        assert_eq!(legacy_client.request.port, 56_000);
+    }
+
+    #[test]
+    fn client_output_roundtrip_preserves_process_lifecycle_evidence() {
+        let output = IperfClientOut {
+            ok: false,
+            timed_out: true,
+            process_started: Some(true),
+            cleanup_confirmed: Some(true),
+            cmd: "iperf3 -c 192.0.2.1".into(),
+            output: "timed out and reaped".into(),
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&output).unwrap();
+        let decoded: IperfClientOut = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.process_started, Some(true));
+        assert_eq!(decoded.cleanup_confirmed, Some(true));
+    }
 }

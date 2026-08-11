@@ -1,21 +1,26 @@
 //! 主控交互流程：连接辅测 -> 扫描 -> 菜单选任务 -> 执行 -> 报告
 //! 设计目标：小白一路回车就能跑起来。
 
+use crate::clock::SystemClock;
 use crate::cmd::iperf::IperfServerMgr;
 use crate::config::{load_config, Config};
 use crate::http_client;
-use crate::master::builder::{self, build_units, Endpoint, Side, SpecNorm};
-use crate::master::executor::{Ctx, ResultDb};
+use crate::master::builder::{self, build_units, Endpoint, LegKind, Side, SpecNorm, Unit};
+use crate::master::executor::{Ctx, IperfPreflightBlock, ResultDb};
 use crate::nic::monitor::MonitorMgr;
 use crate::nic::{format_nic_table, scan_host};
-use crate::protocol::{HealthOut, HostInfo, InfoReq, Resp};
+use crate::protocol::{
+    HealthOut, HostInfo, InfoReq, Resp, CTS_TRAFFIC_CAPABILITY, RELIABLE_LIFECYCLE_CAPABILITY,
+};
 use crate::report::{write_report, ReportMeta};
 use crate::util::{
-    ask, find_iperf3, iperf3_version, log_to_file, logln, now_compact, now_full, open_path,
-    parse_selection,
+    ask, ctstraffic_platform_supported, ctstraffic_version, find_ctstraffic, find_iperf3,
+    iperf3_version, log_to_file, logln, now_compact, now_full, open_path, parse_selection,
 };
-use std::path::PathBuf;
-use std::sync::Mutex;
+use std::collections::HashMap;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Default, Clone)]
@@ -24,6 +29,7 @@ pub struct MasterOpts {
     pub agent_port: Option<u16>,
     pub config_path: Option<String>,
     pub prefixes: Option<Vec<String>>,
+    pub agent_token: Option<String>,
     pub auto: bool,
     pub resume: bool,
     pub no_open: bool,
@@ -31,6 +37,54 @@ pub struct MasterOpts {
 }
 
 const LAST_AGENT_FILE: &str = ".cpe_last_agent";
+const IPERF_PREFLIGHT_FAILED: &str = "IPERF_PREFLIGHT_FAILED";
+const CTS_PREFLIGHT_FAILED: &str = "CTSTRAFFIC_PREFLIGHT_FAILED";
+const RUNS_DIR: &str = "runs";
+
+#[derive(Debug, Clone)]
+struct RunPaths {
+    dir: PathBuf,
+    log: PathBuf,
+    report: PathBuf,
+    outdir: PathBuf,
+}
+
+/// 创建一次运行的独立输出目录。
+///
+/// `task_results.json` 不在这里：它是跨运行共享的 RESUME 状态库，必须保持稳定路径。
+fn create_run_paths(root: &Path) -> io::Result<RunPaths> {
+    let runs_dir = root.join(RUNS_DIR);
+    std::fs::create_dir_all(&runs_dir)?;
+    let base = format!("run_{}_{}", now_compact(), std::process::id());
+
+    for attempt in 0..1000u32 {
+        let name = if attempt == 0 {
+            base.clone()
+        } else {
+            format!("{base}_{attempt}")
+        };
+        let dir = runs_dir.join(name);
+        match std::fs::create_dir(&dir) {
+            Ok(()) => {
+                let outdir = dir.join("iperf_outputs");
+                std::fs::create_dir(&outdir)?;
+                return Ok(RunPaths {
+                    log: dir.join("master.log"),
+                    report: dir.join("report.html"),
+                    outdir,
+                    dir,
+                });
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "无法创建唯一的运行目录",
+    ))
+}
 
 pub fn run_master(opts: MasterOpts) -> i32 {
     let (mut cfg, cfg_path) = load_config(opts.config_path.as_deref());
@@ -39,6 +93,9 @@ pub fn run_master(opts: MasterOpts) -> i32 {
     }
     if let Some(p) = opts.agent_port {
         cfg.agent_port = p;
+    }
+    if let Some(token) = &opts.agent_token {
+        cfg.agent_token = token.clone();
     }
     if let Some(p) = &opts.prefixes {
         cfg.ipv4_prefixes = p.clone();
@@ -53,8 +110,14 @@ pub fn run_master(opts: MasterOpts) -> i32 {
         cfg.open_report = false;
     }
 
-    let ts = now_compact();
-    log_to_file(&PathBuf::from(format!("master_{ts}.log")));
+    let run_paths = match create_run_paths(Path::new(".")) {
+        Ok(paths) => paths,
+        Err(error) => {
+            eprintln!("!! 无法创建本次运行目录：{error}");
+            return 2;
+        }
+    };
+    log_to_file(&run_paths.log);
 
     logln("==============================================");
     logln(&format!(
@@ -62,6 +125,7 @@ pub fn run_master(opts: MasterOpts) -> i32 {
         env!("CARGO_PKG_VERSION")
     ));
     logln("==============================================");
+    logln(&format!("本次运行目录: {}", run_paths.dir.display()));
     if let Some(p) = &cfg_path {
         logln(&format!("已加载配置文件: {}", p.display()));
     } else {
@@ -94,7 +158,7 @@ pub fn run_master(opts: MasterOpts) -> i32 {
             "正在连接辅测机 {}:{} ...",
             agent_host, cfg.agent_port
         ));
-        match agent_health(&agent_host, cfg.agent_port) {
+        match agent_health(&agent_host, cfg.agent_port, &cfg.agent_token) {
             Ok(h) => break h,
             Err(e) => {
                 logln(&format!("!! 连接失败: {e}"));
@@ -110,18 +174,35 @@ pub fn run_master(opts: MasterOpts) -> i32 {
         }
     };
     logln(&format!(
-        "辅测机已连接: {} ({}) agent v{} iperf3: {}",
+        "辅测机已连接: {} ({}) agent v{} iperf3: {} ctsTraffic: {}",
         health.hostname,
         health.os,
         health.version,
-        health.iperf3.clone().unwrap_or_else(|| "未找到!".into())
+        health.iperf3.clone().unwrap_or_else(|| "未找到!".into()),
+        health
+            .ctstraffic
+            .clone()
+            .unwrap_or_else(|| "未找到/不支持".into())
+    ));
+    logln(&format!(
+        "辅测机协议能力: {}",
+        if health.capabilities.is_empty() {
+            "未声明（旧版 agent）".into()
+        } else {
+            health.capabilities.join(", ")
+        }
     ));
 
     // ---- 双端扫描 ----
     logln("正在扫描本机网卡...");
     let master_info = scan_host(&cfg.ipv4_prefixes);
     logln("正在获取辅测机网卡...");
-    let agent_info = match agent_info(&agent_host, cfg.agent_port, &cfg.ipv4_prefixes) {
+    let agent_info = match agent_info(
+        &agent_host,
+        cfg.agent_port,
+        &cfg.ipv4_prefixes,
+        &cfg.agent_token,
+    ) {
         Ok(i) => i,
         Err(e) => {
             logln(&format!("!! 获取辅测机网卡失败: {e}"));
@@ -153,6 +234,18 @@ pub fn run_master(opts: MasterOpts) -> i32 {
     if health.iperf3.is_none() {
         logln("!! 辅测机未找到 iperf3：ping 可测，灌包会失败。");
     }
+    let local_cts_platform_supported = ctstraffic_platform_supported();
+    let local_cts = find_ctstraffic();
+    if !local_cts_platform_supported {
+        logln("主控 ctsTraffic: 当前平台或系统版本不支持（仅 Windows 10+）");
+    } else {
+        match ctstraffic_version() {
+            Some(version) => logln(&format!("主控 ctsTraffic: {version}")),
+            None => {
+                logln("!! 主控未找到 ctsTraffic.exe：CTS 单元会失败；iperf3 和 ping 不受影响。")
+            }
+        }
+    }
 
     // ---- 生成测试规格 ----
     let specs: Vec<SpecNorm> = if !cfg.tests.is_empty() {
@@ -161,7 +254,7 @@ pub fn run_master(opts: MasterOpts) -> i32 {
         } else {
             let c = choose_single(
                 "检测到配置文件里有 tests，选择配置方式:",
-                &["按配置文件执行(推荐)", "交互式选择"],
+                &["按配置文件执行(推荐)".into(), "交互式选择".into()],
                 0,
             );
             c == 0
@@ -220,6 +313,54 @@ pub fn run_master(opts: MasterOpts) -> i32 {
                 Err(e) => logln(&format!("!! {e}")),
             }
         }
+    } else {
+        logln(&format!("\n[auto] 共 {} 个任务，直接开始执行", units.len()));
+        for (i, u) in units.iter().enumerate() {
+            logln(&format!("  [{}] {}", i + 1, u.title));
+        }
+    }
+
+    // 按后端独立前置检查：缺 ctsTraffic 只拦 CTS，不能连带拦截可用的 iperf/ping。
+    let iperf_preflight = iperf_preflight_block(&units, &health, local_iperf.is_some());
+    let cts_preflight = ctstraffic_preflight_block(
+        &units,
+        &health,
+        local_cts.is_some(),
+        local_cts_platform_supported,
+    );
+    let mut preflight_blocks: HashMap<String, IperfPreflightBlock> = HashMap::new();
+    if let Some(block) = &iperf_preflight {
+        let blocked_units: Vec<&Unit> = units.iter().filter(|unit| unit_has_iperf(unit)).collect();
+        for unit in &blocked_units {
+            preflight_blocks.insert(unit.id.clone(), block.clone());
+        }
+        logln(&format!(
+            "!! iperf3 前置检查未通过：{}: {}",
+            block.reason_code, block.reason_detail
+        ));
+        logln(&format!(
+            "!! {} 个 iperf3 单元将标记为 SETUP_ERROR，且不会启动进程。",
+            blocked_units.len()
+        ));
+    }
+    if let Some(block) = &cts_preflight {
+        let blocked_units: Vec<&Unit> = units
+            .iter()
+            .filter(|unit| unit_has_ctstraffic(unit))
+            .collect();
+        for unit in &blocked_units {
+            preflight_blocks.insert(unit.id.clone(), block.clone());
+        }
+        logln(&format!(
+            "!! ctsTraffic 前置检查未通过：{}: {}",
+            block.reason_code, block.reason_detail
+        ));
+        logln(&format!(
+            "!! {} 个 CTS 单元将标记为 SETUP_ERROR；可用的 iperf3/Ping 单元继续执行。",
+            blocked_units.len()
+        ));
+    }
+    if !opts.auto {
         let c = ask(&format!(
             "已选 {} 个任务，确认执行? (回车=开始, n=取消): ",
             units.len()
@@ -228,30 +369,54 @@ pub fn run_master(opts: MasterOpts) -> i32 {
             logln("已取消。");
             return 1;
         }
-    } else {
-        logln(&format!("\n[auto] 共 {} 个任务，直接开始执行", units.len()));
-        for (i, u) in units.iter().enumerate() {
-            logln(&format!("  [{}] {}", i + 1, u.title));
-        }
     }
 
     // ---- 执行 ----
-    let outdir = PathBuf::from("iperf_outputs");
-    let _ = std::fs::create_dir_all(&outdir);
     let started = now_full();
     let t0 = Instant::now();
+
+    // ---- 注册 Ctrl+C 处理器（Windows 上阻止 cmd.exe 弹出提示，非 Windows 用 ctrlc crate）
+    crate::cancel::setup_cancel_handler();
+
     let ctx = Ctx {
         agent_host: agent_host.clone(),
         agent_port: cfg.agent_port,
         cfg: cfg.clone(),
-        outdir,
+        outdir: run_paths.outdir.clone(),
+        transport: Arc::new(http_client::TcpTransport),
+        clock: Arc::new(SystemClock),
         local_servers: IperfServerMgr::new(),
+        local_cts_jobs: crate::cmd::iperf::IperfClientJobMgr::new(),
         local_monitors: MonitorMgr::new(),
         rows: Mutex::new(Vec::new()),
         db: Mutex::new(ResultDb::load(PathBuf::from("task_results.json"))),
     };
-    let sum = ctx.run_all(&units);
-    ctx.local_servers.stop_all();
+    let mut sum = ctx.run_all_with_preflight_blocks(&units, &preflight_blocks);
+    if sum.needs_traffic_failure_diagnostics() {
+        let diagnostics = builder::build_traffic_failure_diagnostics(&units);
+        logln(&format!(
+            "\n!! 本轮 {} 个灌包单元没有产生任何有效速率测量（其中 SETUP_ERROR={}）。",
+            sum.traffic_units, sum.traffic_setup_errors
+        ));
+        if diagnostics.is_empty() {
+            logln("!! 无法从所选灌包任务提取可用 IPv4 端点，未生成自动 Ping 诊断。");
+        } else {
+            logln(&format!(
+                "开始追加 {} 个故障诊断：每个唯一 IPv4 方向使用 32 字节短 Ping，并对涉及网卡绑定源地址 Ping IPv4 网关。",
+                diagnostics.len()
+            ));
+            for (index, unit) in diagnostics.iter().enumerate() {
+                logln(&format!("  [诊断 {}] {}", index + 1, unit.title));
+            }
+            let diagnostic_summary = ctx.run_all_from(&diagnostics, units.len());
+            sum.merge(diagnostic_summary);
+        }
+    }
+    let mut final_cleanup_errors = ctx.local_servers.stop_all().errors;
+    final_cleanup_errors.extend(ctx.local_cts_jobs.stop_all(Duration::from_secs(10)).errors);
+    for error in &final_cleanup_errors {
+        logln(&format!("!! 主控最终资源清理未确认: {error}"));
+    }
 
     // ---- 报告 ----
     let elapsed_s = t0.elapsed().as_secs();
@@ -269,38 +434,157 @@ pub fn run_master(opts: MasterOpts) -> i32 {
         finished: now_full(),
         elapsed: elapsed.clone(),
     };
-    let report_path = PathBuf::from(format!("report_{}.html", now_compact()));
     {
         let mut rows = ctx.rows.lock().unwrap();
-        match write_report(&report_path, &mut rows, &meta) {
-            Ok(_) => logln(&format!("\n报告已生成: {}", report_path.display())),
+        match write_report(&run_paths.report, &mut rows, &meta) {
+            Ok(_) => logln(&format!("\n报告已生成: {}", run_paths.report.display())),
             Err(e) => logln(&format!("!! 报告写入失败: {e}")),
         }
     }
 
     logln(&format!(
-        "\n========== 全部完成 ==========\n单元总数: {}  PASS: {}  FAIL: {}  跳过: {}  耗时: {}",
-        sum.pass + sum.fail + sum.skip,
+        "\n========== 全部完成 ==========\n单元总数: {}  PASS: {}  FAIL: {}  UNSTABLE: {}  MEASURED: {}  NOT_EVALUATED: {}  SETUP_ERROR: {}  跳过: {}  最终清理错误: {}  耗时: {}",
+        sum.pass + sum.fail + sum.measured + sum.skip,
         sum.pass,
         sum.fail,
+        sum.unstable,
+        sum.measured,
+        sum.not_evaluated,
+        sum.setup_error,
         sum.skip,
+        final_cleanup_errors.len(),
         elapsed
     ));
-    if cfg.open_report && report_path.exists() {
-        open_path(&report_path);
+    if cfg.open_report && run_paths.report.exists() {
+        open_path(&run_paths.report);
     }
-    if sum.fail > 0 {
+    if sum.fail > 0 || !final_cleanup_errors.is_empty() {
         1
     } else {
         0
     }
 }
 
+fn unit_has_iperf(unit: &Unit) -> bool {
+    unit.legs.iter().any(|leg| {
+        matches!(
+            &leg.kind,
+            LegKind::IperfSingle(_) | LegKind::IperfGroup { .. }
+        )
+    })
+}
+
+fn unit_has_ctstraffic(unit: &Unit) -> bool {
+    unit.legs
+        .iter()
+        .any(|leg| matches!(&leg.kind, LegKind::CtsTraffic(_)))
+}
+
+fn units_have_iperf(units: &[Unit]) -> bool {
+    units.iter().any(unit_has_iperf)
+}
+
+fn iperf_preflight_block(
+    units: &[Unit],
+    health: &HealthOut,
+    local_iperf_available: bool,
+) -> Option<IperfPreflightBlock> {
+    if !units_have_iperf(units) {
+        return None;
+    }
+
+    let mut reasons = Vec::new();
+    if !agent_supports_reliable_lifecycle(health) {
+        let version = if health.version.trim().is_empty() {
+            "未知版本"
+        } else {
+            health.version.as_str()
+        };
+        reasons.push(format!(
+            "辅测机 agent {version} 缺少可靠灌包生命周期能力 {RELIABLE_LIFECYCLE_CAPABILITY}，请替换为与主控配套的新版 agent"
+        ));
+    }
+    if !local_iperf_available {
+        reasons.push("主控机未找到 iperf3，请安装或将 iperf3 放到主控程序同目录".into());
+    }
+    if health.iperf3.is_none() {
+        reasons
+            .push("辅测机未找到 iperf3，请安装或将 iperf3.exe 及配套 DLL 放到 agent 同目录".into());
+    }
+
+    (!reasons.is_empty()).then(|| IperfPreflightBlock {
+        reason_code: IPERF_PREFLIGHT_FAILED.into(),
+        reason_detail: reasons.join("；"),
+    })
+}
+
+fn agent_supports_reliable_lifecycle(health: &HealthOut) -> bool {
+    health
+        .capabilities
+        .iter()
+        .any(|capability| capability == RELIABLE_LIFECYCLE_CAPABILITY)
+}
+
+fn agent_supports_ctstraffic(health: &HealthOut) -> bool {
+    health
+        .capabilities
+        .iter()
+        .any(|capability| capability == CTS_TRAFFIC_CAPABILITY)
+}
+
+fn ctstraffic_preflight_block(
+    units: &[Unit],
+    health: &HealthOut,
+    local_cts_available: bool,
+    local_platform_supported: bool,
+) -> Option<IperfPreflightBlock> {
+    if !units.iter().any(unit_has_ctstraffic) {
+        return None;
+    }
+    let mut reasons = Vec::new();
+    if !local_platform_supported {
+        reasons.push(
+            "主控平台不是 Windows 10+ 或系统版本无法确认；ctsTraffic 不支持旧版 Windows/macOS/Linux"
+                .into(),
+        );
+    }
+    if !health.os.eq_ignore_ascii_case("windows") {
+        reasons.push(format!(
+            "辅测机平台为 {}；ctsTraffic 仅支持 Windows 10+",
+            if health.os.trim().is_empty() {
+                "未知"
+            } else {
+                &health.os
+            }
+        ));
+    }
+    if !agent_supports_ctstraffic(health) {
+        reasons.push(format!(
+            "辅测机 agent 未声明 CTS 生命周期能力 {CTS_TRAFFIC_CAPABILITY}；请确认辅测机为 Windows 10+，并将两端同时升级"
+        ));
+    }
+    if local_platform_supported && !local_cts_available {
+        reasons.push("主控机未找到 ctsTraffic.exe，请放到 cpe_test.exe 同目录或 PATH".into());
+    }
+    if agent_supports_ctstraffic(health) && health.ctstraffic.is_none() {
+        reasons.push("辅测机未找到 ctsTraffic.exe，请放到 agent 同目录或 PATH".into());
+    }
+    (!reasons.is_empty()).then(|| IperfPreflightBlock {
+        reason_code: CTS_PREFLIGHT_FAILED.into(),
+        reason_detail: reasons.join("；"),
+    })
+}
+
 // ---------------- agent 通讯（连接阶段） ----------------
 
-fn agent_health(host: &str, port: u16) -> Result<HealthOut, String> {
-    let (st, body) = http_client::get(host, port, "/health", Duration::from_secs(10))?;
+fn agent_health(host: &str, port: u16, token: &str) -> Result<HealthOut, String> {
+    let (st, body) = http_client::get_auth(host, port, "/health", token, Duration::from_secs(10))?;
     if st != 200 {
+        if st == 401 {
+            return Err(
+                "agent 返回 401：已启用令牌认证，请在本机 config.json 配置相同 agent_token".into(),
+            );
+        }
         return Err(format!("HTTP {st}"));
     }
     let r: Resp<HealthOut> =
@@ -308,13 +592,19 @@ fn agent_health(host: &str, port: u16) -> Result<HealthOut, String> {
     r.data.ok_or_else(|| "响应缺 data".into())
 }
 
-fn agent_info(host: &str, port: u16, prefixes: &[String]) -> Result<HostInfo, String> {
+fn agent_info(host: &str, port: u16, prefixes: &[String], token: &str) -> Result<HostInfo, String> {
     let req = InfoReq {
         ipv4_prefixes: prefixes.to_vec(),
     };
     let body = serde_json::to_string(&req).unwrap_or_default();
-    let (st, text) = http_client::post_json(host, port, "/info", &body, Duration::from_secs(60))?;
+    let (st, text) =
+        http_client::post_json_auth(host, port, "/info", &body, token, Duration::from_secs(60))?;
     if st != 200 {
+        if st == 401 {
+            return Err(
+                "agent 返回 401：已启用令牌认证，请在本机 config.json 配置相同 agent_token".into(),
+            );
+        }
         return Err(format!("HTTP {st}"));
     }
     let r: Resp<HostInfo> =
@@ -428,8 +718,20 @@ fn enumerate_pairs(master: &HostInfo, agent: &HostInfo) -> Vec<(Endpoint, Endpoi
             out.push((mep(m), aep(a), format!("跨机 {}<->{}", m.role, a.role)));
         }
     }
-    push_local_pairs(&mut out, master, Side::Master, "主控");
-    push_local_pairs(&mut out, agent, Side::Agent, "辅测");
+    // 主控同机
+    for i in 0..master.interfaces.len() {
+        for j in (i + 1)..master.interfaces.len() {
+            let (a, b) = (&master.interfaces[i], &master.interfaces[j]);
+            out.push((mep(a), mep(b), format!("主控同机 {}<->{}", a.role, b.role)));
+        }
+    }
+    // 辅测同机
+    for i in 0..agent.interfaces.len() {
+        for j in (i + 1)..agent.interfaces.len() {
+            let (a, b) = (&agent.interfaces[i], &agent.interfaces[j]);
+            out.push((aep(a), aep(b), format!("辅测同机 {}<->{}", a.role, b.role)));
+        }
+    }
     out
 }
 
@@ -460,16 +762,170 @@ fn push_local_pairs(
 }
 
 /// 从 config.json 的 pairs 字段自动生成测试规格
+fn generate_specs_from_pairs(
+    pairs: &crate::config::Pairs,
+    cfg: &Config,
+    master: &HostInfo,
+    agent: &HostInfo,
+) -> Vec<SpecNorm> {
+    use crate::config::PairSpec as Ps;
+    let pair_list: Vec<Ps> = match pairs {
+        crate::config::Pairs::All(_) => {
+            // 枚举全部跨机配对
+            let mut v = Vec::new();
+            for m in &master.interfaces {
+                for a in &agent.interfaces {
+                    if m.role == "UNKNOWN" && a.role == "UNKNOWN" {
+                        continue;
+                    }
+                    v.push(Ps {
+                        master: format!("NAME={}", m.name),
+                        agent: format!("NAME={}", a.name),
+                    });
+                }
+            }
+            v
+        }
+        crate::config::Pairs::List(list) => list.clone(),
+    };
+
+    let default_params = cfg.universal_params.clone();
+    let mut out = Vec::new();
+    for p in &pair_list {
+        let src = match builder::resolve_endpoint(&format!("master:{}", p.master), master, agent) {
+            Ok(e) => e,
+            Err(e) => {
+                logln(&format!("!! 跳过配对 master:{}: {e}", p.master));
+                continue;
+            }
+        };
+        let dst = match builder::resolve_endpoint(&format!("agent:{}", p.agent), master, agent) {
+            Ok(e) => e,
+            Err(e) => {
+                logln(&format!("!! 跳过配对 agent:{}: {e}", p.agent));
+                continue;
+            }
+        };
+        let directions = default_params
+            .as_ref()
+            .map(|p| p.directions.directions())
+            .unwrap_or_else(|| vec!["ab".into()]);
+        let kinds = default_params
+            .as_ref()
+            .map(|p| p.kinds.clone())
+            .unwrap_or_else(|| vec!["iperf".into()]);
+        let transports = default_params
+            .as_ref()
+            .and_then(|p| {
+                if !p.transports.is_empty() {
+                    Some(p.transports.clone())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| vec!["tcp".into()]);
+        let ipvers = default_params
+            .as_ref()
+            .map(|p| p.ip.clone())
+            .unwrap_or_else(|| vec!["v4".into()]);
+        let streams = default_params.as_ref().map(|p| p.streams).unwrap_or(1);
+        let tcp_streams = default_params
+            .as_ref()
+            .and_then(|p| p.tcp_streams)
+            .unwrap_or(0);
+        let udp_streams = default_params
+            .as_ref()
+            .and_then(|p| p.udp_streams)
+            .unwrap_or(0);
+        let duration = default_params
+            .as_ref()
+            .and_then(|p| p.iperf_duration)
+            .unwrap_or(cfg.iperf.duration);
+        let ping_count = default_params
+            .as_ref()
+            .and_then(|p| p.ping_count)
+            .unwrap_or(cfg.ping.count);
+        let payload_sizes = default_params
+            .as_ref()
+            .and_then(|p| p.ping_payload_sizes.clone())
+            .unwrap_or_else(|| cfg.ping.payload_sizes.clone());
+        let tcp_windows = default_params
+            .as_ref()
+            .and_then(|p| p.tcp_windows.clone())
+            .unwrap_or_else(|| cfg.iperf.tcp_windows.clone());
+        let udp_profiles = default_params
+            .as_ref()
+            .and_then(|p| p.udp_profiles.clone())
+            .unwrap_or_else(|| cfg.iperf.udp_profiles.clone());
+        let rate_mode = default_params
+            .as_ref()
+            .and_then(|p| p.rate_mode)
+            .unwrap_or(cfg.iperf.rate_check.mode);
+        let rate_targets = default_params
+            .as_ref()
+            .and_then(|p| p.rate_targets_mbps.clone())
+            .unwrap_or_default();
+
+        out.push(SpecNorm {
+            name: format!("{}<->{}", p.master, p.agent),
+            src,
+            dst,
+            directions,
+            kinds,
+            transports,
+            ipvers,
+            // 保留配置原值供 CTS 生成精确的 SETUP_ERROR；builder 的
+            // effective_*_streams() 会为 iperf 执行安全归一化。
+            streams,
+            tcp_streams,
+            udp_streams,
+            duration: duration.clamp(1, 86_400),
+            ping_count,
+            payload_sizes,
+            tcp_windows,
+            udp_profiles,
+            udp_limit: cfg.limit_udp_by_link_speed,
+            rate_mode,
+            rate_targets,
+            rate_check: cfg.iperf.rate_check.clone(),
+            ctstraffic: cfg.ctstraffic.clone(),
+            ctstraffic_config_error: builder::ctstraffic_common_config_error(duration),
+        });
+    }
+    out
+}
+
 struct UniversalParams {
     directions: Vec<String>,
     kinds: Vec<String>,
     transports: Vec<String>,
     ipvers: Vec<String>,
-    streams: u32,
+    tcp_streams: u32,
+    udp_streams: u32,
     duration: u64,
     ping_count: u32,
     payload_sizes: Vec<u32>,
     udp_limit: bool,
+}
+
+fn validate_traffic_scalar(label: &str, value: u64, min: u64, max: u64) -> Result<u64, String> {
+    if (min..=max).contains(&value) {
+        Ok(value)
+    } else {
+        Err(format!("{label} 必须在 {min}..={max}，当前为 {value}"))
+    }
+}
+
+fn ask_traffic_scalar(prompt: &str, default: u64, label: &str, min: u64, max: u64) -> u64 {
+    loop {
+        let value = ask_int(prompt, default);
+        match validate_traffic_scalar(label, value, min, max) {
+            Ok(value) => return value,
+            Err(error) => logln(&format!(
+                "!! {error}，请重新输入；CTS 自动化不会静默修正该值。"
+            )),
+        }
+    }
 }
 
 fn ask_universal_params(cfg: &Config, mode: usize) -> UniversalParams {
@@ -492,15 +948,34 @@ fn ask_universal_params(cfg: &Config, mode: usize) -> UniversalParams {
         })
         .collect();
 
-    let kind_sel = choose_single("测试类型:", &["灌包 iperf3", "ping 连通", "灌包+ping"], 0);
+    let kind_sel = choose_single(
+        "测试类型:",
+        &[
+            "灌包 iperf3（跨平台）".into(),
+            "灌包 ctsTraffic（仅 Windows 10+）".into(),
+            "iperf3 + ctsTraffic 对比".into(),
+            "ping 连通".into(),
+            "iperf3 + ctsTraffic + ping".into(),
+        ],
+        0,
+    );
     let kinds: Vec<String> = match kind_sel {
         0 => vec!["iperf".into()],
-        1 => vec!["ping".into()],
-        _ => vec!["iperf".into(), "ping".into()],
+        1 => vec!["ctstraffic".into()],
+        2 => vec!["iperf".into(), "ctstraffic".into()],
+        3 => vec!["ping".into()],
+        _ => vec!["iperf".into(), "ctstraffic".into(), "ping".into()],
     };
 
-    let transports: Vec<String> = if kinds.iter().any(|k| k == "iperf") {
-        match choose_single("传输协议:", &["TCP+UDP", "仅TCP", "仅UDP"], 0) {
+    let transports: Vec<String> = if kinds
+        .iter()
+        .any(|kind| kind == "iperf" || kind == "ctstraffic")
+    {
+        match choose_single(
+            "传输协议:",
+            &["TCP+UDP".into(), "仅TCP".into(), "仅UDP".into()],
+            0,
+        ) {
             1 => vec!["tcp".into()],
             2 => vec!["udp".into()],
             _ => vec!["tcp".into(), "udp".into()],
@@ -526,17 +1001,41 @@ fn ask_universal_params(cfg: &Config, mode: usize) -> UniversalParams {
         cfg.limit_udp_by_link_speed
     };
 
-    let streams = if kinds.iter().any(|k| k == "iperf") {
-        ask_int("并发流数(TCP用-P, UDP为多进程并发, 默认1): ", 1).clamp(1, 32) as u32
+    let has_traffic = kinds
+        .iter()
+        .any(|kind| kind == "iperf" || kind == "ctstraffic");
+    let has_tcp = has_traffic && transports.iter().any(|t| t == "tcp");
+    let has_udp = has_traffic && transports.iter().any(|t| t == "udp");
+    let tcp_streams = if has_tcp {
+        ask_traffic_scalar(
+            "TCP 并发流数(iperf3 -P；CTS -Connections，默认1): ",
+            1,
+            "TCP并发流数",
+            1,
+            32,
+        ) as u32
     } else {
         1
     };
-    let duration = if kinds.iter().any(|k| k == "iperf") {
-        ask_int(
+    let udp_streams = if has_udp {
+        ask_traffic_scalar(
+            "UDP 并发流数(iperf3 多进程；CTS -Connections，默认1): ",
+            1,
+            "UDP并发流数",
+            1,
+            32,
+        ) as u32
+    } else {
+        1
+    };
+    let duration = if has_traffic {
+        ask_traffic_scalar(
             &format!("灌包时长秒(默认{}): ", cfg.iperf.duration),
             cfg.iperf.duration,
+            "灌包时长",
+            1,
+            86_400,
         )
-        .clamp(1, 86400)
     } else {
         cfg.iperf.duration
     };
@@ -568,7 +1067,8 @@ fn ask_universal_params(cfg: &Config, mode: usize) -> UniversalParams {
         kinds,
         transports,
         ipvers,
-        streams,
+        tcp_streams,
+        udp_streams,
         duration,
         ping_count,
         payload_sizes,
@@ -591,13 +1091,23 @@ fn spec_from_params(
         kinds: p.kinds.clone(),
         transports: p.transports.clone(),
         ipvers: p.ipvers.clone(),
-        streams: p.streams,
-        duration: p.duration,
+        // 交互入口没有 legacy streams 输入；协议专用值已经逐项校验。
+        // 保留 1 仅作为未选协议的兼容 fallback，不能再把 TCP/UDP 取 max，
+        // 否则只改 TCP 流数会改变 UDP resume 身份。
+        streams: 1,
+        tcp_streams: p.tcp_streams,
+        udp_streams: p.udp_streams,
+        duration: p.duration.clamp(1, 86_400),
         ping_count: p.ping_count,
         payload_sizes: p.payload_sizes.clone(),
         tcp_windows: cfg.iperf.tcp_windows.clone(),
         udp_profiles: cfg.iperf.udp_profiles.clone(),
         udp_limit: p.udp_limit,
+        rate_mode: cfg.iperf.rate_check.mode,
+        rate_targets: cfg.iperf.rate_check.targets_mbps.clone(),
+        rate_check: cfg.iperf.rate_check.clone(),
+        ctstraffic: cfg.ctstraffic.clone(),
+        ctstraffic_config_error: builder::ctstraffic_common_config_error(p.duration),
     }
 }
 
@@ -686,7 +1196,7 @@ fn ask_ints_csv(prompt: &str, default: &[u32]) -> Vec<u32> {
         let parsed: Result<Vec<u32>, _> = inp.split(',').map(|s| s.trim().parse::<u32>()).collect();
         match parsed {
             Ok(v) if !v.is_empty() => return v,
-            _ => logln("!! 请输入逗号分隔的数字，如 32,1400"),
+            _ => logln("!! 请输入逗号分隔的数字，如 32,1600,65500"),
         }
     }
 }
@@ -694,41 +1204,391 @@ fn ask_ints_csv(prompt: &str, default: &[u32]) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::RateMode;
+    use crate::master::builder::{CtsTrafficTask, IperfTask, Leg, PingPurpose, PingTask};
     use crate::protocol::NicInfo;
 
-    fn host(name: &str, roles: &[&str]) -> HostInfo {
-        HostInfo {
-            hostname: name.into(),
-            interfaces: roles
-                .iter()
-                .enumerate()
-                .map(|(i, role)| NicInfo {
-                    name: format!("nic{i}"),
-                    role: (*role).into(),
-                    ipv4: format!("192.168.1.{}", i + 1),
-                    ..Default::default()
-                })
-                .collect(),
+    #[test]
+    fn run_paths_keep_report_log_and_artifacts_in_one_unique_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "cpe_run_paths_test_{}_{}",
+            std::process::id(),
+            now_compact()
+        ));
+        let first = create_run_paths(&root).expect("first run directory");
+        let second = create_run_paths(&root).expect("second run directory");
+
+        assert_ne!(first.dir, second.dir);
+        assert!(first.dir.starts_with(root.join(RUNS_DIR)));
+        assert_eq!(first.log, first.dir.join("master.log"));
+        assert_eq!(first.report, first.dir.join("report.html"));
+        assert_eq!(first.outdir, first.dir.join("iperf_outputs"));
+        assert!(first.outdir.is_dir());
+        assert!(first.log.parent() == Some(first.dir.as_path()));
+        assert!(first.report.parent() == Some(first.dir.as_path()));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn endpoint(side: Side, name: &str) -> Endpoint {
+        Endpoint {
+            side,
+            pc: side.cn().into(),
+            nic: NicInfo {
+                name: name.into(),
+                ipv4: "127.0.0.1".into(),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn ping_unit() -> Unit {
+        let master = endpoint(Side::Master, "master0");
+        let agent = endpoint(Side::Agent, "agent0");
+        Unit {
+            id: "ping-only".into(),
+            title: "ping-only".into(),
+            bidir: false,
+            est_secs: 1,
+            legs: vec![Leg {
+                tag: String::new(),
+                kind: LegKind::Ping(PingTask {
+                    v6: false,
+                    src: master.clone(),
+                    dst: agent.clone(),
+                    count: 1,
+                    payload: 32,
+                    purpose: PingPurpose::SubnetTest,
+                }),
+            }],
+        }
+    }
+
+    fn iperf_unit() -> Unit {
+        let master = endpoint(Side::Master, "master0");
+        let agent = endpoint(Side::Agent, "agent0");
+        Unit {
+            id: "iperf".into(),
+            title: "iperf".into(),
+            bidir: false,
+            est_secs: 1,
+            legs: vec![Leg {
+                tag: String::new(),
+                kind: LegKind::IperfSingle(IperfTask {
+                    v6: false,
+                    udp: true,
+                    profile_name: "udp".into(),
+                    profile_label: "UDP".into(),
+                    src: master,
+                    dst: agent,
+                    port: 56_000,
+                    duration: 1,
+                    extra: Vec::new(),
+                    stream_idx: 0,
+                    rate_mode: RateMode::Auto,
+                    rx_target_mbps: None,
+                    offered_mbps: None,
+                }),
+            }],
+        }
+    }
+
+    fn ctstraffic_unit() -> Unit {
+        let master = endpoint(Side::Master, "master0");
+        let agent = endpoint(Side::Agent, "agent0");
+        Unit {
+            id: "ctstraffic".into(),
+            title: "ctstraffic".into(),
+            bidir: false,
+            est_secs: 1,
+            legs: vec![Leg {
+                tag: "ab".into(),
+                kind: LegKind::CtsTraffic(CtsTrafficTask {
+                    v6: false,
+                    udp: true,
+                    profile_name: "cts_udp_b500m_c3".into(),
+                    profile_label: "CTS UDP -b 500m ×3流 (每流)".into(),
+                    src: master,
+                    dst: agent,
+                    port: 56_001,
+                    duration: 10,
+                    streams: 3,
+                    window_bytes: Some(1024 * 1024),
+                    bits_per_second: Some(500_000_000),
+                    datagram_bytes: Some(1200),
+                    frame_rate: 100,
+                    buffer_depth_secs: 1,
+                    status_update_ms: 1_000,
+                    rate_mode: RateMode::Observe,
+                    rx_target_mbps: None,
+                    offered_mbps: Some(1_500.0),
+                    setup_error: None,
+                }),
+            }],
+        }
+    }
+
+    fn ready_health() -> HealthOut {
+        HealthOut {
+            version: "4.0.0".into(),
+            iperf3: Some("iperf 3.x".into()),
+            capabilities: vec![RELIABLE_LIFECYCLE_CAPABILITY.into()],
+            ..Default::default()
+        }
+    }
+
+    fn ready_ctstraffic_health() -> HealthOut {
+        HealthOut {
+            os: "windows".into(),
+            version: "4.2.0".into(),
+            ctstraffic: Some("ctsTraffic 2.0.4.0".into()),
+            capabilities: vec![CTS_TRAFFIC_CAPABILITY.into()],
             ..Default::default()
         }
     }
 
     #[test]
-    fn pair_enumeration_keeps_cross_then_local_order() {
-        let pairs = enumerate_pairs(
-            &host("master", &["UNKNOWN", "SGMII1G"]),
-            &host("agent", &["UNKNOWN", "WIFI5G"]),
+    fn interactive_traffic_scalars_are_rejected_instead_of_silently_clamped() {
+        assert_eq!(validate_traffic_scalar("streams", 1, 1, 32), Ok(1));
+        assert_eq!(validate_traffic_scalar("streams", 32, 1, 32), Ok(32));
+        assert!(validate_traffic_scalar("streams", 0, 1, 32).is_err());
+        assert!(validate_traffic_scalar("streams", 33, 1, 32).is_err());
+        assert!(validate_traffic_scalar("duration", 0, 1, 86_400).is_err());
+        assert!(validate_traffic_scalar("duration", 86_401, 1, 86_400).is_err());
+
+        let params = UniversalParams {
+            directions: vec!["ab".into()],
+            kinds: vec!["ctstraffic".into()],
+            transports: vec!["udp".into()],
+            ipvers: vec!["v4".into()],
+            tcp_streams: 0,
+            udp_streams: 0,
+            duration: 0,
+            ping_count: 1,
+            payload_sizes: vec![32],
+            udp_limit: true,
+        };
+        let cfg = Config::default();
+        let spec = spec_from_params(
+            "interactive-invalid",
+            endpoint(Side::Master, "master0"),
+            endpoint(Side::Agent, "agent0"),
+            &params,
+            &cfg,
         );
-        let descriptions: Vec<_> = pairs.iter().map(|p| p.2.as_str()).collect();
+        assert_eq!(spec.streams, 1, "交互入口使用安全的 legacy fallback");
+        assert_eq!(spec.effective_tcp_streams(), 1);
+        assert_eq!(spec.effective_udp_streams(), 1);
         assert_eq!(
-            descriptions,
-            [
-                "跨机 UNKNOWN<->WIFI5G",
-                "跨机 SGMII1G<->UNKNOWN",
-                "跨机 SGMII1G<->WIFI5G",
-                "主控同机 UNKNOWN<->SGMII1G",
-                "辅测同机 UNKNOWN<->WIFI5G",
-            ]
+            spec.duration, 1,
+            "iperf execution remains safely normalized"
         );
+        let error = spec.ctstraffic_config_error.unwrap();
+        assert!(error.contains("duration 必须在 1..=86400"));
+    }
+
+    #[test]
+    fn pairs_config_preserves_raw_protocol_streams_until_builder_validation() {
+        let cfg: Config = serde_json::from_str(
+            r#"{
+                "pairs": [{"master":"M","agent":"A"}],
+                "universal_params": {
+                    "kinds": ["ctstraffic"],
+                    "transports": ["tcp", "udp"],
+                    "streams": 0,
+                    "tcp_streams": 4,
+                    "udp_streams": 33
+                }
+            }"#,
+        )
+        .unwrap();
+        let master = HostInfo {
+            hostname: "master".into(),
+            interfaces: vec![NicInfo {
+                name: "master0".into(),
+                role: "M".into(),
+                ipv4: "192.168.1.2".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let agent = HostInfo {
+            hostname: "agent".into(),
+            interfaces: vec![NicInfo {
+                name: "agent0".into(),
+                role: "A".into(),
+                ipv4: "192.168.1.3".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let specs = generate_specs_from_pairs(cfg.pairs.as_ref().unwrap(), &cfg, &master, &agent);
+        assert_eq!(specs.len(), 1);
+        let spec = &specs[0];
+        assert_eq!(spec.streams, 0, "legacy 原值不能在 UI 层提前截断");
+        assert_eq!(spec.tcp_streams, 4);
+        assert_eq!(spec.udp_streams, 33);
+        assert_eq!(spec.effective_tcp_streams(), 4);
+        assert_eq!(spec.effective_udp_streams(), 32);
+
+        let mut port = builder::PORT_BASE;
+        let (units, notices) = builder::build_units(&specs, true, &mut port);
+        assert!(notices
+            .iter()
+            .any(|notice| notice.contains("CTS UDP") && notice.contains("SETUP_ERROR")));
+        assert!(!notices
+            .iter()
+            .any(|notice| notice.contains("CTS TCP") && notice.contains("SETUP_ERROR")));
+        assert!(units.iter().flat_map(|unit| &unit.legs).any(|leg| {
+            matches!(
+                &leg.kind,
+                LegKind::CtsTraffic(task)
+                    if !task.udp && task.streams == 4 && task.setup_error.is_none()
+            )
+        }));
+    }
+
+    #[test]
+    fn iperf_capability_gate_distinguishes_ping_only_and_old_agents() {
+        let ping_only = ping_unit();
+        let iperf = iperf_unit();
+        assert!(!units_have_iperf(std::slice::from_ref(&ping_only)));
+        assert!(units_have_iperf(&[ping_only, iperf]));
+
+        let old_agent = HealthOut::default();
+        assert!(!agent_supports_reliable_lifecycle(&old_agent));
+        let current_agent = ready_health();
+        assert!(agent_supports_reliable_lifecycle(&current_agent));
+    }
+
+    #[test]
+    fn ping_only_is_never_blocked_by_iperf_preflight() {
+        let decision = iperf_preflight_block(&[ping_unit()], &HealthOut::default(), false);
+        assert_eq!(decision, None);
+        let cts_decision =
+            ctstraffic_preflight_block(&[ping_unit()], &HealthOut::default(), false, false);
+        assert_eq!(cts_decision, None);
+    }
+
+    #[test]
+    fn mixed_selection_collects_all_iperf_preflight_failures() {
+        let health = HealthOut {
+            version: "3.0.0".into(),
+            ..Default::default()
+        };
+        let decision = iperf_preflight_block(&[ping_unit(), iperf_unit()], &health, false)
+            .expect("混合任务中的 iperf 应被前置阻断");
+
+        assert_eq!(decision.reason_code, IPERF_PREFLIGHT_FAILED);
+        assert!(decision
+            .reason_detail
+            .contains(RELIABLE_LIFECYCLE_CAPABILITY));
+        assert!(decision.reason_detail.contains("主控机未找到 iperf3"));
+        assert!(decision.reason_detail.contains("辅测机未找到 iperf3"));
+    }
+
+    #[test]
+    fn pure_iperf_preflight_failure_produces_an_explicit_block() {
+        let decision = iperf_preflight_block(&[iperf_unit()], &HealthOut::default(), false)
+            .expect("纯 iperf 也必须产生明确失败，不能被当成成功批次");
+        assert_eq!(decision.reason_code, IPERF_PREFLIGHT_FAILED);
+        assert!(!decision.reason_detail.is_empty());
+    }
+
+    #[test]
+    fn ready_iperf_selection_has_no_preflight_block() {
+        let decision = iperf_preflight_block(&[iperf_unit()], &ready_health(), true);
+        assert_eq!(decision, None);
+    }
+
+    #[test]
+    fn ready_ctstraffic_selection_has_no_preflight_block() {
+        let decision = ctstraffic_preflight_block(
+            &[ctstraffic_unit()],
+            &ready_ctstraffic_health(),
+            true,
+            true,
+        );
+        assert_eq!(decision, None);
+    }
+
+    #[test]
+    fn ctstraffic_preflight_rejects_old_agent_without_capability() {
+        let mut health = ready_ctstraffic_health();
+        health.version = "4.1.0".into();
+        health.capabilities.clear();
+        let decision = ctstraffic_preflight_block(&[ctstraffic_unit()], &health, true, true)
+            .expect("旧 agent 必须被明确阻断");
+
+        assert_eq!(decision.reason_code, CTS_PREFLIGHT_FAILED);
+        assert!(decision.reason_detail.contains(CTS_TRAFFIC_CAPABILITY));
+        assert!(decision.reason_detail.contains("两端同时升级"));
+    }
+
+    #[test]
+    fn ctstraffic_preflight_rejects_non_windows_master_and_agent() {
+        let health = HealthOut {
+            os: "linux".into(),
+            version: "4.2.0".into(),
+            ctstraffic: Some("unexpected".into()),
+            capabilities: vec![CTS_TRAFFIC_CAPABILITY.into()],
+            ..Default::default()
+        };
+        let decision = ctstraffic_preflight_block(&[ctstraffic_unit()], &health, true, false)
+            .expect("非 Windows 两端必须被明确阻断");
+
+        assert_eq!(decision.reason_code, CTS_PREFLIGHT_FAILED);
+        assert!(decision.reason_detail.contains("主控平台不是 Windows 10+"));
+        assert!(decision.reason_detail.contains("辅测机平台为 linux"));
+    }
+
+    #[test]
+    fn ctstraffic_preflight_reports_each_missing_binary_location() {
+        let health = ready_ctstraffic_health();
+        let local_missing =
+            ctstraffic_preflight_block(&[ctstraffic_unit()], &health, false, true).unwrap();
+        assert!(local_missing
+            .reason_detail
+            .contains("主控机未找到 ctsTraffic.exe"));
+        assert!(!local_missing
+            .reason_detail
+            .contains("辅测机未找到 ctsTraffic.exe"));
+
+        let mut agent_missing_health = health;
+        agent_missing_health.ctstraffic = None;
+        let agent_missing =
+            ctstraffic_preflight_block(&[ctstraffic_unit()], &agent_missing_health, true, true)
+                .unwrap();
+        assert!(!agent_missing
+            .reason_detail
+            .contains("主控机未找到 ctsTraffic.exe"));
+        assert!(agent_missing
+            .reason_detail
+            .contains("辅测机未找到 ctsTraffic.exe"));
+    }
+
+    #[test]
+    fn mixed_backend_preflight_blocks_only_the_unavailable_ctstraffic_unit() {
+        let units = vec![iperf_unit(), ctstraffic_unit(), ping_unit()];
+        assert_eq!(
+            iperf_preflight_block(&units, &ready_health(), true),
+            None,
+            "可用的 iperf3 后端不应被 CTS 状态连带阻断"
+        );
+        let cts_block = ctstraffic_preflight_block(&units, &ready_ctstraffic_health(), false, true)
+            .expect("缺少主控 CTS binary 时只应阻断 CTS");
+        assert_eq!(cts_block.reason_code, CTS_PREFLIGHT_FAILED);
+
+        let blocked_ids: Vec<&str> = units
+            .iter()
+            .filter(|unit| unit_has_ctstraffic(unit))
+            .map(|unit| unit.id.as_str())
+            .collect();
+        assert_eq!(blocked_ids, vec!["ctstraffic"]);
+        assert!(unit_has_iperf(&units[0]));
+        assert!(!unit_has_ctstraffic(&units[0]));
+        assert!(!unit_has_iperf(&units[2]));
+        assert!(!unit_has_ctstraffic(&units[2]));
     }
 }

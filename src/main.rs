@@ -1,4 +1,4 @@
-//! CPE 子网测试工具 — 单文件双模式（主控 / 辅测 agent）
+//! CPE 子网测试工具 — 主控 / 辅测 agent 双机自动化 Ping 与吞吐测试
 //!
 //! 用法:
 //!   cpe_test                     交互选择模式（小白直接双击）
@@ -7,14 +7,20 @@
 //!   cpe_test scan  [--prefix 192.168.,10.10.]   查看本机网卡识别结果
 
 mod agent;
+mod cancel;
+pub mod clock;
 mod cmd;
 mod config;
 mod http_client;
 mod master;
 mod nic;
+#[cfg(test)]
+mod parser_properties;
 mod ping;
 mod protocol;
+mod rate;
 mod report;
+mod resource;
 mod screenshot;
 mod util;
 
@@ -40,11 +46,17 @@ fn real_main(args: Vec<String>) -> i32 {
     match mode {
         "agent" => {
             let f = parse_flags(&args[1..]);
-            let (cfg, _) = config::load_config(f.get("config").map(|s| s.as_str()));
+            let (mut cfg, _) = config::load_config(f.get("config").map(|s| s.as_str()));
             let port = f
                 .get("port")
                 .and_then(|p| p.parse().ok())
                 .unwrap_or(cfg.agent_port);
+            if let Some(token) = f.get("token") {
+                cfg.agent_token = token.clone();
+            }
+            if let Some(bind) = f.get("bind") {
+                cfg.agent_bind = bind.clone();
+            }
             agent::run(port, &cfg); // 不返回
             0
         }
@@ -55,6 +67,7 @@ fn real_main(args: Vec<String>) -> i32 {
                 agent_port: f.get("agent-port").and_then(|p| p.parse().ok()),
                 config_path: f.get("config").cloned(),
                 prefixes: f.get("prefix").map(|p| split_csv(p)),
+                agent_token: f.get("token").cloned(),
                 auto: f.contains_key("auto"),
                 resume: f.contains_key("resume"),
                 no_open: f.contains_key("no-open"),
@@ -77,88 +90,16 @@ fn real_main(args: Vec<String>) -> i32 {
         "monitor" => {
             let f = parse_flags(&args[1..]);
             let (cfg, _) = config::load_config(f.get("config").map(|s| s.as_str()));
-            let number =
-                |key: &str, default| f.get(key).and_then(|s| s.parse().ok()).unwrap_or(default);
-            let interval: u64 = number("interval", 1);
-            let duration: u64 = number("duration", 0);
+            let interval: u64 = f.get("interval").and_then(|s| s.parse().ok()).unwrap_or(1);
+            let duration: u64 = f.get("duration").and_then(|s| s.parse().ok()).unwrap_or(0);
             let csv_path = f.get("csv").map(|s| s.as_str());
-
-            let iface: String = if let Some(name) = f.get("iface") {
-                let _ = std::fs::write(".cpe_monitor_iface", name);
-                name.to_string()
-            } else {
-                let info = nic::scan_host(&cfg.ipv4_prefixes);
-                let ifs = &info.interfaces;
-                if ifs.is_empty() {
-                    eprintln!(
-                        "未发现可用网卡（匹配前缀 {:?}），请检查网线/WiFi 连接。",
-                        cfg.ipv4_prefixes
-                    );
-                    return 1;
-                }
-                let saved = std::fs::read_to_string(".cpe_monitor_iface")
-                    .ok()
-                    .map(|s| s.trim().to_string());
-                let saved_idx = saved
-                    .as_ref()
-                    .and_then(|s| ifs.iter().position(|n| n.name.eq_ignore_ascii_case(s)));
-                // 始终展示网卡列表
-                println!("{}", nic::format_nic_table("【本机】", &info));
-                for (i, n) in ifs.iter().enumerate() {
-                    let mut extra = String::new();
-                    if n.speed_mbps > 0 {
-                        extra.push_str(&format!("  {}Mbps", n.speed_mbps));
-                    }
-                    if !n.wifi_band.is_empty() {
-                        extra.push_str(&format!("  {}", n.wifi_band));
-                    }
-                    println!(
-                        " [{}] {}  {:<12}  {:<16}  {}",
-                        i + 1,
-                        n.role,
-                        n.name,
-                        n.ipv4,
-                        extra
-                    );
-                }
-                let (name, prompt) = if let Some(idx) = saved_idx {
-                    (
-                        &ifs[idx].name,
-                        format!("回车使用上次网卡 [{}], 或输入序号切换: ", ifs[idx].name),
-                    )
-                } else {
-                    (&ifs[0].name, "选择网卡序号(回车=1): ".to_string())
-                };
-                let choice = ask(&prompt);
-                let final_name = if choice.is_empty() {
-                    name.clone()
-                } else if let Ok(n) = choice.parse::<usize>() {
-                    if n >= 1 && n <= ifs.len() {
-                        let picked = ifs[n - 1].name.clone();
-                        let _ = std::fs::write(".cpe_monitor_iface", &picked);
-                        picked
-                    } else {
-                        name.clone()
-                    }
-                } else {
-                    name.clone()
-                };
-                if saved_idx.is_none() {
-                    let _ = std::fs::write(".cpe_monitor_iface", &final_name);
-                }
-                final_name
-            };
-
-            if let Err(e) = nic::monitor::run_continuous(&nic::monitor::ContinuousOpts {
-                iface: &iface,
-                interval_secs: interval,
-                duration_secs: duration,
+            run_monitor_mode(
+                &cfg,
+                f.get("iface").map(|s| s.as_str()),
+                interval,
+                duration,
                 csv_path,
-            }) {
-                eprintln!("监控错误: {e}");
-                return 1;
-            }
-            0
+            )
         }
         "-h" | "--help" | "help" => {
             print_help();
@@ -168,12 +109,14 @@ fn real_main(args: Vec<String>) -> i32 {
             // 无参数：交互选择
             println!("==============================================");
             println!("  CPE 子网测试工具 v{}", env!("CARGO_PKG_VERSION"));
-            println!("  两台电脑之间自动化 ping / iperf3 灌包测试");
+            println!("  两台电脑之间自动化 Ping / iperf3 / ctsTraffic 测试");
+            println!("  ctsTraffic 仅支持 Windows 10+");
             println!("==============================================");
-            println!("\n这台电脑是哪个角色?");
-            println!("  [1] 主控（带键盘操作、发起测试的这台） *");
+            println!("\n请选择模式:");
+            println!("  [1] 子网测试（主控，发起 ping/iperf3/CTS 双向测试） *");
             println!("  [2] 辅测 agent（被控端，先在那台上启动）");
             println!("  [3] 只看本机网卡识别结果");
+            println!("  [4] 独立网卡速率监控（单机观察链路速率，按 Ctrl+C 停止）");
             let c = ask("选择(回车=默认1): ");
             match c.trim() {
                 "2" => {
@@ -187,6 +130,10 @@ fn real_main(args: Vec<String>) -> i32 {
                     println!("{}", nic::format_nic_table("【本机】", &info));
                     0
                 }
+                "4" => {
+                    let (cfg, _) = config::load_config(None);
+                    run_monitor_mode(&cfg, None, 1, 0, None)
+                }
                 _ => run_master(MasterOpts::default()),
             }
         }
@@ -198,16 +145,110 @@ fn real_main(args: Vec<String>) -> i32 {
     }
 }
 
+/// 独立网卡速率监控：交互选择网卡（或指定 iface）后连续采样，Ctrl+C 停止。
+fn run_monitor_mode(
+    cfg: &config::Config,
+    iface_override: Option<&str>,
+    interval: u64,
+    duration: u64,
+    csv_path: Option<&str>,
+) -> i32 {
+    let iface: String = if let Some(name) = iface_override {
+        let _ = std::fs::write(".cpe_monitor_iface", name);
+        name.to_string()
+    } else {
+        let info = nic::scan_host(&cfg.ipv4_prefixes);
+        let ifs = &info.interfaces;
+        if ifs.is_empty() {
+            eprintln!(
+                "未发现可用网卡（匹配前缀 {:?}），请检查网线/WiFi 连接。",
+                cfg.ipv4_prefixes
+            );
+            return 1;
+        }
+        let saved = std::fs::read_to_string(".cpe_monitor_iface")
+            .ok()
+            .map(|s| s.trim().to_string());
+        let saved_idx = saved
+            .as_ref()
+            .and_then(|s| ifs.iter().position(|n| n.name.eq_ignore_ascii_case(s)));
+        // 始终展示网卡列表
+        println!("{}", nic::format_nic_table("【本机】", &info));
+        for (i, n) in ifs.iter().enumerate() {
+            let mut extra = String::new();
+            if n.speed_mbps > 0 {
+                extra.push_str(&format!("  {}Mbps", n.speed_mbps));
+            }
+            if !n.wifi_band.is_empty() {
+                extra.push_str(&format!("  {}", n.wifi_band));
+            }
+            println!(
+                " [{}] {}  {:<12}  {:<16}  {}",
+                i + 1,
+                n.role,
+                n.name,
+                n.ipv4,
+                extra
+            );
+        }
+        let (name, prompt) = if let Some(idx) = saved_idx {
+            (
+                &ifs[idx].name,
+                format!("回车使用上次网卡 [{}], 或输入序号切换: ", ifs[idx].name),
+            )
+        } else {
+            (&ifs[0].name, "选择网卡序号(回车=1): ".to_string())
+        };
+        let choice = ask(&prompt);
+        let final_name = if choice.is_empty() {
+            name.clone()
+        } else if let Ok(n) = choice.parse::<usize>() {
+            if n >= 1 && n <= ifs.len() {
+                let picked = ifs[n - 1].name.clone();
+                let _ = std::fs::write(".cpe_monitor_iface", &picked);
+                picked
+            } else {
+                name.clone()
+            }
+        } else {
+            name.clone()
+        };
+        if saved_idx.is_none() {
+            let _ = std::fs::write(".cpe_monitor_iface", &final_name);
+        }
+        final_name
+    };
+
+    if let Err(e) = nic::monitor::run_continuous(&nic::monitor::ContinuousOpts {
+        iface: &iface,
+        interval_secs: interval,
+        duration_secs: duration,
+        csv_path,
+    }) {
+        eprintln!("监控错误: {e}");
+        return 1;
+    }
+    0
+}
+
 fn print_help() {
     println!(
         r#"CPE 子网测试工具 v{}
+
+吞吐后端:
+  iperf3                     跨平台通用测试
+  ctsTraffic                 仅 Windows 10+；两端需同版本程序和 ctsTraffic.exe
 
 用法:
   cpe_test                    交互模式（双击运行就是这个）
   cpe_test agent              辅测机启动常驻服务 (默认端口 28801)
       --port N                指定监听端口
+      --token SECRET          共享访问令牌（agent 与主控必须一致；不配置则不启用认证）
+      --bind IP               监听地址 (默认 0.0.0.0；可设 127.0.0.1 或测试网卡 IP)
   cpe_test master             主控发起测试
       --agent-host IP         辅测机 IP
+      --agent-port N          辅测机端口 (默认 28801)
+      --token SECRET          与 agent 相同的共享访问令牌
       --agent-port N          辅测机端口 (默认 28801)
       --config FILE           指定配置文件 (默认找 ./config.json)
       --auto                  免交互：按配置文件 tests 全部执行
@@ -224,9 +265,11 @@ fn print_help() {
 
 文件:
   config.json                 配置文件（可选，同目录）
-  report_*.html               测试报告
-  task_results.json           结果库（RESUME 用）
-  iperf_outputs/              截图等输出
+  runs/run_<时间>_<进程号>/    每次运行的报告、主控日志和全部附件
+    report.html               测试报告
+    master.log                主控运行进度、摘要和错误
+    iperf_outputs/            iperf3/ctsTraffic 原文、NIC CSV、截图
+  task_results.json           跨运行结果库（RESUME 用）
 "#,
         env!("CARGO_PKG_VERSION")
     );

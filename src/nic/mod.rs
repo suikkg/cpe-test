@@ -1,15 +1,18 @@
 //! 网卡扫描（分平台实现）+ 角色分类 + RX 监控
 
 pub mod classify;
+pub mod counter;
 pub mod monitor;
 
+#[cfg(target_os = "linux")]
+pub mod scan_linux;
 #[cfg(target_os = "macos")]
 pub mod scan_macos;
 #[cfg(windows)]
 pub mod scan_windows;
 
 use crate::protocol::HostInfo;
-#[cfg(not(any(windows, target_os = "macos")))]
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
 use crate::protocol::NicInfo;
 use crate::util::{hostname, os_name};
 
@@ -19,7 +22,9 @@ pub fn scan_host(ipv4_prefixes: &[String]) -> HostInfo {
     let mut ifs = scan_windows::scan_all(ipv4_prefixes);
     #[cfg(target_os = "macos")]
     let mut ifs = scan_macos::scan_all(ipv4_prefixes);
-    #[cfg(not(any(windows, target_os = "macos")))]
+    #[cfg(target_os = "linux")]
+    let mut ifs = scan_linux::scan_all(ipv4_prefixes);
+    #[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
     let mut ifs: Vec<NicInfo> = {
         let _ = ipv4_prefixes;
         Vec::new()
@@ -38,6 +43,7 @@ pub fn scan_host(ipv4_prefixes: &[String]) -> HostInfo {
 }
 
 /// IPv4 是否匹配任一前缀（前缀列表为空 = 全放行）
+#[cfg(any(windows, target_os = "macos", target_os = "linux"))]
 pub fn ipv4_match(ip: &str, prefixes: &[String]) -> bool {
     if prefixes.is_empty() {
         return true;
@@ -59,6 +65,9 @@ pub fn format_nic_table(side: &str, host: &HostInfo) -> String {
         }
         if !n.wifi_band.is_empty() {
             extra.push(n.wifi_band.clone());
+        }
+        if !n.gateway_v4.is_empty() {
+            extra.push(format!("gw:{}", n.gateway_v4));
         }
         if !n.ipv6_ll.is_empty() {
             extra.push(format!("v6:{}", n.ipv6_ll));
