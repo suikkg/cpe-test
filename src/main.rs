@@ -77,14 +77,10 @@ fn real_main(args: Vec<String>) -> i32 {
         "monitor" => {
             let f = parse_flags(&args[1..]);
             let (cfg, _) = config::load_config(f.get("config").map(|s| s.as_str()));
-            let interval: u64 = f
-                .get("interval")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(1);
-            let duration: u64 = f
-                .get("duration")
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
+            let number =
+                |key: &str, default| f.get(key).and_then(|s| s.parse().ok()).unwrap_or(default);
+            let interval: u64 = number("interval", 1);
+            let duration: u64 = number("duration", 0);
             let csv_path = f.get("csv").map(|s| s.as_str());
 
             let iface: String = if let Some(name) = f.get("iface") {
@@ -94,15 +90,18 @@ fn real_main(args: Vec<String>) -> i32 {
                 let info = nic::scan_host(&cfg.ipv4_prefixes);
                 let ifs = &info.interfaces;
                 if ifs.is_empty() {
-                    eprintln!("未发现可用网卡（匹配前缀 {:?}），请检查网线/WiFi 连接。", cfg.ipv4_prefixes);
+                    eprintln!(
+                        "未发现可用网卡（匹配前缀 {:?}），请检查网线/WiFi 连接。",
+                        cfg.ipv4_prefixes
+                    );
                     return 1;
                 }
                 let saved = std::fs::read_to_string(".cpe_monitor_iface")
                     .ok()
                     .map(|s| s.trim().to_string());
-                let saved_idx = saved.as_ref().and_then(|s| {
-                    ifs.iter().position(|n| n.name.eq_ignore_ascii_case(s))
-                });
+                let saved_idx = saved
+                    .as_ref()
+                    .and_then(|s| ifs.iter().position(|n| n.name.eq_ignore_ascii_case(s)));
                 // 始终展示网卡列表
                 println!("{}", nic::format_nic_table("【本机】", &info));
                 for (i, n) in ifs.iter().enumerate() {
@@ -113,12 +112,22 @@ fn real_main(args: Vec<String>) -> i32 {
                     if !n.wifi_band.is_empty() {
                         extra.push_str(&format!("  {}", n.wifi_band));
                     }
-                    println!(" [{}] {}  {:<12}  {:<16}  {}", i + 1, n.role, n.name, n.ipv4, extra);
+                    println!(
+                        " [{}] {}  {:<12}  {:<16}  {}",
+                        i + 1,
+                        n.role,
+                        n.name,
+                        n.ipv4,
+                        extra
+                    );
                 }
                 let (name, prompt) = if let Some(idx) = saved_idx {
-                    (&ifs[idx].name, format!("回车使用上次网卡 [{}], 或输入序号切换: ", ifs[idx].name))
+                    (
+                        &ifs[idx].name,
+                        format!("回车使用上次网卡 [{}], 或输入序号切换: ", ifs[idx].name),
+                    )
                 } else {
-                    (&ifs[0].name, format!("选择网卡序号(回车=1): "))
+                    (&ifs[0].name, "选择网卡序号(回车=1): ".to_string())
                 };
                 let choice = ask(&prompt);
                 let final_name = if choice.is_empty() {
@@ -144,7 +153,7 @@ fn real_main(args: Vec<String>) -> i32 {
                 iface: &iface,
                 interval_secs: interval,
                 duration_secs: duration,
-                csv_path: csv_path,
+                csv_path,
             }) {
                 eprintln!("监控错误: {e}");
                 return 1;
@@ -234,36 +243,28 @@ fn parse_flags(args: &[String]) -> std::collections::HashMap<String, String> {
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
-        if let Some(key) = a.strip_prefix("--") {
-            let next_is_val = args
-                .get(i + 1)
-                .map(|n| !n.starts_with("--"))
-                .unwrap_or(false);
-            if next_is_val {
-                map.insert(key.to_string(), args[i + 1].clone());
-                i += 2;
-            } else {
-                map.insert(key.to_string(), String::new());
-                i += 1;
-            }
+        let key_and_prefix = if let Some(key) = a.strip_prefix("--") {
+            Some((key, "--"))
         } else if a.starts_with('-') && a.len() == 2 {
             let ch = &a[1..2];
-            if let Some(&(_, long)) = short_map.iter().find(|&&(s, _)| s == ch) {
-                let next_is_val = args
-                    .get(i + 1)
-                    .map(|n| !n.starts_with('-'))
-                    .unwrap_or(false);
-                if next_is_val {
-                    map.insert(long.to_string(), args[i + 1].clone());
-                    i += 2;
-                } else {
-                    map.insert(long.to_string(), String::new());
-                    i += 1;
-                }
-            } else {
-                i += 1;
-            }
+            short_map
+                .iter()
+                .find_map(|&(short, long)| (short == ch).then_some((long, "-")))
         } else {
+            None
+        };
+        let Some((key, option_prefix)) = key_and_prefix else {
+            i += 1;
+            continue;
+        };
+        if let Some(value) = args
+            .get(i + 1)
+            .filter(|value| !value.starts_with(option_prefix))
+        {
+            map.insert(key.to_string(), value.clone());
+            i += 2;
+        } else {
+            map.insert(key.to_string(), String::new());
             i += 1;
         }
     }
@@ -285,5 +286,24 @@ fn setup_console() {
         let _ = SetConsoleOutputCP(65001);
         let _ = SetConsoleCP(65001);
         let _ = windows::Win32::UI::WindowsAndMessaging::SetProcessDPIAware();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flags_preserve_long_and_short_value_rules() {
+        let args = ["--auto", "--prefix", "192.168.,10.", "-i", "5", "-x"].map(str::to_string);
+        let flags = parse_flags(&args);
+        assert_eq!(flags.get("auto").map(String::as_str), Some(""));
+        assert_eq!(
+            flags.get("prefix").map(String::as_str),
+            Some("192.168.,10.")
+        );
+        assert_eq!(flags.get("interval").map(String::as_str), Some("5"));
+        assert!(!flags.contains_key("x"));
+        assert_eq!(split_csv(" a, ,b "), ["a", "b"]);
     }
 }

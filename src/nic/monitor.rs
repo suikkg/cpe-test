@@ -15,28 +15,19 @@ use std::time::{Duration, Instant};
 pub const MIN_VALID_RX_MBPS: f64 = 0.01;
 
 /// 读某接口 RX 累计字节
-pub fn read_rx_bytes(iface: &str) -> Result<u64, String> {
-    #[cfg(windows)]
-    {
-        super::scan_windows::rx_bytes(iface)
-    }
-    #[cfg(target_os = "macos")]
-    {
-        rx_bytes_macos(iface)
-    }
-    #[cfg(not(any(windows, target_os = "macos")))]
-    {
-        let _ = iface;
-        Err("平台不支持".into())
-    }
-}
+#[cfg(windows)]
+pub use super::scan_windows::rx_bytes as read_rx_bytes;
 
 #[cfg(target_os = "macos")]
-fn rx_bytes_macos(iface: &str) -> Result<u64, String> {
+pub fn read_rx_bytes(iface: &str) -> Result<u64, String> {
     use crate::util::run_cmd;
-    use std::time::Duration;
     let out = run_cmd("netstat", &["-ibn"], Duration::from_secs(10));
     parse_netstat_ib(&out.stdout, iface)
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+pub fn read_rx_bytes(_iface: &str) -> Result<u64, String> {
+    Err("平台不支持".into())
 }
 
 /// netstat -ibn 的 <Link#N> 行含全接口计数；
@@ -70,12 +61,6 @@ struct MonEntry {
 pub struct MonitorMgr {
     inner: Mutex<HashMap<String, MonEntry>>,
     seq: AtomicU64,
-}
-
-impl Default for MonitorMgr {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 impl MonitorMgr {
@@ -118,7 +103,7 @@ impl MonitorMgr {
     }
 
     /// 清理超龄监控
-    pub fn sweep(&self, max_age: std::time::Duration) {
+    pub fn sweep(&self, max_age: Duration) {
         let mut g = self.inner.lock().unwrap();
         g.retain(|_, e| e.t0.elapsed() <= max_age);
     }
@@ -187,8 +172,7 @@ pub fn run_continuous(opts: &ContinuousOpts) -> Result<(), String> {
                         .append(true)
                         .open(p)
                         .map_err(|e| format!("打开CSV失败: {e}"))?;
-                    writeln!(f, "{},{:.2}", t, mbps)
-                        .map_err(|e| format!("写入CSV失败: {e}"))?;
+                    writeln!(f, "{},{:.2}", t, mbps).map_err(|e| format!("写入CSV失败: {e}"))?;
                 }
 
                 old_bytes = new_bytes;
@@ -205,12 +189,8 @@ pub fn run_continuous(opts: &ContinuousOpts) -> Result<(), String> {
 
     let speeds: Vec<f64> = records.iter().map(|r| r.1).collect();
     let avg = speeds.iter().sum::<f64>() / speeds.len() as f64;
-    let max = speeds
-        .iter()
-        .fold(f64::NEG_INFINITY, |a, &b| a.max(b));
-    let min = speeds
-        .iter()
-        .fold(f64::INFINITY, |a, &b| a.min(b));
+    let max = speeds.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b));
+    let min = speeds.iter().fold(f64::INFINITY, |a, &b| a.min(b));
     let elapsed = t_start.elapsed().as_secs();
 
     println!("\n{}", "=".repeat(50));
@@ -245,8 +225,7 @@ fn rewrite_csv_with_header(
     max: f64,
     records: &[(String, f64)],
 ) -> Result<(), String> {
-    let mut f =
-        std::fs::File::create(path).map_err(|e| format!("重写CSV失败: {e}"))?;
+    let mut f = std::fs::File::create(path).map_err(|e| format!("重写CSV失败: {e}"))?;
     writeln!(f, "\u{FEFF}# === CPE NIC Monitor Report ===").map_err(|e| format!("{e}"))?;
     writeln!(f, "# Interface,{}", iface).map_err(|e| format!("{e}"))?;
     writeln!(f, "# Interval,{}s", interval).map_err(|e| format!("{e}"))?;

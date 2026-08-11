@@ -37,36 +37,35 @@ impl CmdOut {
     }
 }
 
-/// 执行命令，等待结束（超时强杀），返回解码后的输出
-pub fn run_cmd(prog: &str, args: &[&str], timeout: Duration) -> CmdOut {
-    let mut c = Command::new(prog);
-    c.args(args)
+fn spawn_piped(prog: &str, args: &[&str]) -> Result<std::process::Child, CmdOut> {
+    let mut command = Command::new(prog);
+    command
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = match c.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            return CmdOut {
-                ok: false,
-                timed_out: false,
-                stdout: String::new(),
-                stderr: format!("启动命令失败: {prog} ({e})"),
-            }
-        }
+    command.spawn().map_err(|e| CmdOut {
+        stderr: format!("启动命令失败: {prog} ({e})"),
+        ..Default::default()
+    })
+}
+
+fn read_all<R: Read + Send + 'static>(mut reader: R) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = reader.read_to_end(&mut bytes);
+        bytes
+    })
+}
+
+/// 执行命令，等待结束（超时强杀），返回解码后的输出
+pub fn run_cmd(prog: &str, args: &[&str], timeout: Duration) -> CmdOut {
+    let mut child = match spawn_piped(prog, args) {
+        Ok(child) => child,
+        Err(out) => return out,
     };
-    let mut so = child.stdout.take().expect("stdout piped");
-    let mut se = child.stderr.take().expect("stderr piped");
-    let th_o = std::thread::spawn(move || {
-        let mut v = Vec::new();
-        let _ = so.read_to_end(&mut v);
-        v
-    });
-    let th_e = std::thread::spawn(move || {
-        let mut v = Vec::new();
-        let _ = se.read_to_end(&mut v);
-        v
-    });
+    let th_o = read_all(child.stdout.take().expect("stdout piped"));
+    let th_e = read_all(child.stderr.take().expect("stderr piped"));
     let (ok, timed_out) = match child.wait_timeout(timeout) {
         Ok(Some(st)) => (st.success(), false),
         Ok(None) => {
@@ -93,24 +92,12 @@ pub fn run_streaming<F: FnMut(&str)>(
     timeout: Duration,
     mut on_line: F,
 ) -> CmdOut {
-    let mut c = Command::new(prog);
-    c.args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = match c.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            return CmdOut {
-                ok: false,
-                timed_out: false,
-                stdout: String::new(),
-                stderr: format!("启动命令失败: {prog} ({e})"),
-            }
-        }
+    let mut child = match spawn_piped(prog, args) {
+        Ok(child) => child,
+        Err(out) => return out,
     };
     let so = child.stdout.take().expect("stdout piped");
-    let mut se = child.stderr.take().expect("stderr piped");
+    let th_e = read_all(child.stderr.take().expect("stderr piped"));
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
     std::thread::spawn(move || {
         let mut r = BufReader::new(so);
@@ -125,11 +112,6 @@ pub fn run_streaming<F: FnMut(&str)>(
                 }
             }
         }
-    });
-    let th_e = std::thread::spawn(move || {
-        let mut v = Vec::new();
-        let _ = se.read_to_end(&mut v);
-        v
     });
 
     let deadline = Instant::now() + timeout;
@@ -261,7 +243,11 @@ static IPERF3: OnceLock<Option<String>> = OnceLock::new();
 pub fn find_iperf3() -> Option<String> {
     IPERF3
         .get_or_init(|| {
-            let fname = if cfg!(windows) { "iperf3.exe" } else { "iperf3" };
+            let fname = if cfg!(windows) {
+                "iperf3.exe"
+            } else {
+                "iperf3"
+            };
             if let Ok(exe) = std::env::current_exe() {
                 if let Some(dir) = exe.parent() {
                     let p = dir.join(fname);
@@ -286,60 +272,16 @@ pub fn iperf3_version() -> Option<String> {
     out.merged().lines().next().map(|s| s.trim().to_string())
 }
 
-// ---------------- 端口监听检测 ----------------
-
-/// 检查本机某 TCP 端口是否处于 LISTEN（iperf3 server 就绪探测；
-/// iperf3 即使 UDP 测试，控制通道也是 TCP LISTEN）
-pub fn port_listening(port: u16) -> bool {
-    let args: &[&str] = if cfg!(windows) {
-        &["-an", "-p", "TCP"]
-    } else {
-        &["-an", "-p", "tcp"]
-    };
-    let out = run_cmd("netstat", args, Duration::from_secs(10));
-    let colon = format!(":{port} ");
-    let dot = format!(".{port} ");
-    for line in out.stdout.lines() {
-        let up = line.to_uppercase();
-        if !up.contains("LISTEN") {
-            continue;
-        }
-        let padded = format!("{line} ");
-        if padded.contains(&colon) || padded.contains(&dot) {
-            return true;
-        }
-    }
-    false
-}
-
-/// 轮询等待端口 LISTEN
-pub fn wait_port_listen(port: u16, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if port_listening(port) {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    port_listening(port)
-}
-
 // ---------------- 交互输入 ----------------
-
-/// 读一行（EOF 返回 None，用于 --auto/管道场景不卡死）
-pub fn read_line_trim() -> Option<String> {
-    let mut s = String::new();
-    match std::io::stdin().read_line(&mut s) {
-        Ok(0) => None,
-        Ok(_) => Some(s.trim().to_string()),
-        Err(_) => None,
-    }
-}
 
 pub fn ask(prompt: &str) -> String {
     print!("{prompt}");
     let _ = std::io::stdout().flush();
-    read_line_trim().unwrap_or_default()
+    let mut input = String::new();
+    match std::io::stdin().read_line(&mut input) {
+        Ok(0) | Err(_) => String::new(),
+        Ok(_) => input.trim().to_string(),
+    }
 }
 
 // ---------------- 其它 ----------------
@@ -361,6 +303,7 @@ pub fn md5_hex(s: &str) -> String {
 }
 
 /// 临时目录里的文件路径
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn temp_file(name: &str) -> PathBuf {
     std::env::temp_dir().join(name)
 }
@@ -377,22 +320,19 @@ pub fn parse_selection(input: &str, max: usize) -> Result<Vec<usize>, String> {
         if p.is_empty() {
             continue;
         }
-        if let Some((a, b)) = p.split_once('-') {
-            let a: usize = a.trim().parse().map_err(|_| format!("无效序号: {p}"))?;
-            let b: usize = b.trim().parse().map_err(|_| format!("无效序号: {p}"))?;
-            if a == 0 || b == 0 || a > b || b > max {
-                return Err(format!("序号超出范围(1-{max}): {p}"));
-            }
-            for i in a..=b {
-                if !out.contains(&i) {
-                    out.push(i);
-                }
-            }
+        let (start, end) = if let Some((a, b)) = p.split_once('-') {
+            (
+                a.trim().parse().map_err(|_| format!("无效序号: {p}"))?,
+                b.trim().parse().map_err(|_| format!("无效序号: {p}"))?,
+            )
         } else {
             let i: usize = p.parse().map_err(|_| format!("无效序号: {p}"))?;
-            if i == 0 || i > max {
-                return Err(format!("序号超出范围(1-{max}): {p}"));
-            }
+            (i, i)
+        };
+        if start == 0 || start > end || end > max {
+            return Err(format!("序号超出范围(1-{max}): {p}"));
+        }
+        for i in start..=end {
             if !out.contains(&i) {
                 out.push(i);
             }
@@ -419,9 +359,11 @@ mod tests {
     fn test_parse_selection() {
         assert_eq!(parse_selection("", 5).unwrap(), vec![1, 2, 3, 4, 5]);
         assert_eq!(parse_selection("1-3,5", 5).unwrap(), vec![1, 2, 3, 5]);
+        assert_eq!(parse_selection(" 1,1-3,,2 ", 5).unwrap(), vec![1, 2, 3]);
         assert_eq!(parse_selection("2", 5).unwrap(), vec![2]);
         assert!(parse_selection("6", 5).is_err());
         assert!(parse_selection("0", 5).is_err());
+        assert!(parse_selection("3-2", 5).is_err());
         assert!(parse_selection("abc", 5).is_err());
     }
 
@@ -449,5 +391,33 @@ mod tests {
         );
         assert!(out.ok);
         assert!(out.stdout.contains("hi"));
+    }
+
+    #[test]
+    fn test_run_cmd_spawn_error() {
+        let out = run_cmd(
+            "cpe-test-command-that-does-not-exist",
+            &[],
+            Duration::from_secs(1),
+        );
+        assert!(!out.ok);
+        assert!(!out.timed_out);
+        assert!(out.stderr.starts_with("启动命令失败:"));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn test_streaming_keeps_unterminated_output_and_stderr() {
+        let mut lines = Vec::new();
+        let out = run_streaming(
+            "sh",
+            &["-c", "printf 'one\\ntwo'; printf 'err' >&2"],
+            Duration::from_secs(5),
+            |line| lines.push(line.to_string()),
+        );
+        assert!(out.ok);
+        assert_eq!(out.stdout, "one\ntwo");
+        assert_eq!(out.stderr, "err");
+        assert_eq!(lines, ["one", "two"]);
     }
 }

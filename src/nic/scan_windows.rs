@@ -20,7 +20,6 @@ pub struct IfRow {
     pub ifindex: u32,
     pub speed_mbps: u64,
     pub is_wifi: bool,
-    pub up: bool,
     pub in_octets: u64,
 }
 
@@ -49,14 +48,12 @@ pub fn if_rows() -> Vec<IfRow> {
             };
             // ifType 71 = IEEE 802.11 无线
             let is_wifi = r.Type == 71;
-            let up = r.OperStatus.0 == 1;
             out.push(IfRow {
                 alias,
                 desc,
                 ifindex: r.InterfaceIndex,
                 speed_mbps,
                 is_wifi,
-                up,
                 in_octets: r.InOctets,
             });
         }
@@ -96,14 +93,13 @@ pub fn scan_all(prefixes: &[String]) -> Vec<NicInfo> {
         if !ipv4_match(&ipv4, prefixes) {
             continue;
         }
-        let row = rows_by_alias.get(&a.name).copied().or_else(|| {
-            rows.iter()
-                .find(|r| r.alias.eq_ignore_ascii_case(&a.name))
-        });
+        let row = rows_by_alias
+            .get(&a.name)
+            .copied()
+            .or_else(|| rows.iter().find(|r| r.alias.eq_ignore_ascii_case(&a.name)));
         let wlan = wlans.iter().find(|w| w.name == a.name);
-        let is_wifi = row.map(|r| r.is_wifi).unwrap_or(false)
-            || is_wifi_name(&a.name)
-            || wlan.is_some();
+        let is_wifi =
+            row.map(|r| r.is_wifi).unwrap_or(false) || is_wifi_name(&a.name) || wlan.is_some();
         // WiFi 已断开的不要（有 IP 残留的情况）
         if is_wifi {
             if let Some(w) = wlan {

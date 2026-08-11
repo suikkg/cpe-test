@@ -67,7 +67,6 @@ pub struct SpecNorm {
 pub struct IperfTask {
     pub v6: bool,
     pub udp: bool,
-    pub profile_name: String,
     pub profile_label: String,
     pub src: Endpoint,
     pub dst: Endpoint,
@@ -89,7 +88,10 @@ pub struct PingTask {
 #[derive(Clone, Debug)]
 pub enum LegKind {
     IperfSingle(IperfTask),
-    IperfGroup { name: String, streams: Vec<IperfTask> },
+    IperfGroup {
+        name: String,
+        streams: Vec<IperfTask>,
+    },
     Ping(PingTask),
 }
 
@@ -120,21 +122,18 @@ pub struct V6Addrs {
 /// 选 v6 地址：两端都有 fe80 优先用 fe80（CPE 局域网标准场景），否则都有全局地址用全局
 /// v6 地址一律不带 %zone：Windows iperf3/ping 都不接受 %xx 语法
 pub fn v6_addrs(src: &NicInfo, dst: &NicInfo) -> Option<V6Addrs> {
-    if !src.ipv6_ll.is_empty() && !dst.ipv6_ll.is_empty() {
-        Some(V6Addrs {
-            client_bind: src.ipv6_ll.clone(),
-            client_target: dst.ipv6_ll.clone(),
-            server_bind: dst.ipv6_ll.clone(),
-        })
+    let (client_bind, client_target) = if !src.ipv6_ll.is_empty() && !dst.ipv6_ll.is_empty() {
+        (src.ipv6_ll.clone(), dst.ipv6_ll.clone())
     } else if !src.ipv6_global.is_empty() && !dst.ipv6_global.is_empty() {
-        Some(V6Addrs {
-            client_bind: src.ipv6_global.clone(),
-            client_target: dst.ipv6_global.clone(),
-            server_bind: dst.ipv6_global.clone(),
-        })
+        (src.ipv6_global.clone(), dst.ipv6_global.clone())
     } else {
-        None
-    }
+        return None;
+    };
+    Some(V6Addrs {
+        server_bind: client_target.clone(),
+        client_bind,
+        client_target,
+    })
 }
 
 /// 解析 "master:SGMII2.5G" / "agent:NAME=以太网 2" 为具体端点
@@ -152,7 +151,10 @@ pub fn resolve_endpoint(
         other => return Err(format!("端点侧别无效(master/agent): {other}")),
     };
     let rest = rest.trim();
-    let nic = if let Some(name) = rest.strip_prefix("NAME=").or_else(|| rest.strip_prefix("name=")) {
+    let nic = if let Some(name) = rest
+        .strip_prefix("NAME=")
+        .or_else(|| rest.strip_prefix("name="))
+    {
         let n = name.trim();
         host.interfaces
             .iter()
@@ -226,7 +228,10 @@ pub fn spec_from_config(
         transports: t.transports.iter().map(|k| k.to_lowercase()).collect(),
         ipvers: t.ip.iter().map(|k| k.to_lowercase()).collect(),
         streams: t.streams.clamp(1, 32),
-        duration: t.iperf_duration.unwrap_or(cfg.iperf.duration).clamp(1, 86400),
+        duration: t
+            .iperf_duration
+            .unwrap_or(cfg.iperf.duration)
+            .clamp(1, 86400),
         ping_count: t.ping_count.unwrap_or(cfg.ping.count).clamp(1, 100_000),
         payload_sizes: t
             .ping_payload_sizes
@@ -263,15 +268,35 @@ fn allowed_udp_streams(sender: &Endpoint, prof: &UdpProfile, want: u32, limit: b
     max_n.min(want)
 }
 
-fn dir_pairs<'a>(
-    spec: &'a SpecNorm,
-    dir: &str,
-) -> Vec<(&'a Endpoint, &'a Endpoint, &'static str)> {
+fn dir_pairs<'a>(spec: &'a SpecNorm, dir: &str) -> Vec<(&'a Endpoint, &'a Endpoint, &'static str)> {
     match dir {
         "ab" => vec![(&spec.src, &spec.dst, "")],
         "ba" => vec![(&spec.dst, &spec.src, "")],
         "bidir" => vec![(&spec.src, &spec.dst, "ab"), (&spec.dst, &spec.src, "ba")],
         _ => vec![],
+    }
+}
+
+fn map_legs<F>(pairs: &[(&Endpoint, &Endpoint, &'static str)], mut kind: F) -> Vec<Leg>
+where
+    F: FnMut(&Endpoint, &Endpoint) -> LegKind,
+{
+    pairs
+        .iter()
+        .map(|(src, dst, tag)| Leg {
+            tag: (*tag).into(),
+            kind: kind(src, dst),
+        })
+        .collect()
+}
+
+fn unit(id: String, title: String, bidir: bool, legs: Vec<Leg>, est_secs: u64) -> Unit {
+    Unit {
+        id,
+        title,
+        bidir,
+        legs,
+        est_secs,
     }
 }
 
@@ -296,16 +321,7 @@ pub fn build_units(
                 continue;
             }
             let arrow = if bidir { "<->" } else { "->" };
-            let route_str = format!(
-                "{} {} {}",
-                pairs[0].0.brief(),
-                arrow,
-                if bidir {
-                    pairs[0].1.brief()
-                } else {
-                    pairs[0].1.brief()
-                }
-            );
+            let route_str = format!("{} {} {}", pairs[0].0.brief(), arrow, pairs[0].1.brief());
 
             for ipver in &spec.ipvers {
                 let v6 = ipver == "v6";
@@ -334,17 +350,14 @@ pub fn build_units(
                             if tr == "tcp" {
                                 for w in &spec.tcp_windows {
                                     let pname = format!("tcp_w{}_P{}", w, spec.streams);
-                                    let plabel =
-                                        format!("TCP -w {} -P {}", w, spec.streams);
-                                    let mut legs = Vec::new();
-                                    for (s, d, tag) in &pairs {
-                                        let t = IperfTask {
+                                    let plabel = format!("TCP -w {} -P {}", w, spec.streams);
+                                    let legs = map_legs(&pairs, |src, dst| {
+                                        LegKind::IperfSingle(IperfTask {
                                             v6,
                                             udp: false,
-                                            profile_name: pname.clone(),
                                             profile_label: plabel.clone(),
-                                            src: (*s).clone(),
-                                            dst: (*d).clone(),
+                                            src: src.clone(),
+                                            dst: dst.clone(),
                                             port: alloc_port(next_port),
                                             duration: spec.duration,
                                             extra: vec![
@@ -354,12 +367,8 @@ pub fn build_units(
                                                 spec.streams.to_string(),
                                             ],
                                             stream_idx: 0,
-                                        };
-                                        legs.push(Leg {
-                                            tag: tag.to_string(),
-                                            kind: LegKind::IperfSingle(t),
-                                        });
-                                    }
+                                        })
+                                    });
                                     let title = format!(
                                         "{}IPERF {} {} | {}",
                                         if bidir { "★★双向 " } else { "" },
@@ -376,83 +385,78 @@ pub fn build_units(
                                         ep_id(&spec.dst),
                                         dir
                                     ));
-                                    units.push(Unit {
-                                        id,
-                                        title,
-                                        bidir,
-                                        legs,
-                                        est_secs: spec.duration + 10,
-                                    });
+                                    units.push(unit(id, title, bidir, legs, spec.duration + 10));
                                 }
                             } else if tr == "udp" {
                                 for prof in &spec.udp_profiles {
+                                    let pname = prof.name();
+                                    let plabel = prof.label();
                                     // 每个方向腿按各自发送口限流
-                                    let mut leg_streams: Vec<u32> = Vec::new();
-                                    let mut blocked: Option<String> = None;
-                                    for (s, _d, _tag) in &pairs {
-                                        let n = allowed_udp_streams(
-                                            s,
-                                            prof,
-                                            spec.streams,
-                                            spec.udp_limit,
-                                        );
-                                        if n == 0 {
-                                            blocked = Some(format!(
-                                                "跳过 {} {}：发送口 {} 速率 {}Mbps 不足以承载 {}",
-                                                spec.name,
-                                                prof.label(),
-                                                s.nic.name,
-                                                s.nic.speed_mbps,
-                                                prof.label()
-                                            ));
-                                        }
-                                        leg_streams.push(n);
-                                    }
-                                    if let Some(msg) = blocked {
-                                        notices.push(msg);
+                                    let leg_streams: Vec<_> = pairs
+                                        .iter()
+                                        .map(|(sender, _, _)| {
+                                            allowed_udp_streams(
+                                                sender,
+                                                prof,
+                                                spec.streams,
+                                                spec.udp_limit,
+                                            )
+                                        })
+                                        .collect();
+                                    if let Some(sender) = pairs
+                                        .iter()
+                                        .zip(&leg_streams)
+                                        .filter_map(|((sender, _, _), n)| {
+                                            (*n == 0).then_some(*sender)
+                                        })
+                                        .next_back()
+                                    {
+                                        notices.push(format!(
+                                            "跳过 {} {}：发送口 {} 速率 {}Mbps 不足以承载 {}",
+                                            spec.name,
+                                            plabel,
+                                            sender.nic.name,
+                                            sender.nic.speed_mbps,
+                                            plabel
+                                        ));
                                         continue;
                                     }
-                                    let mut legs = Vec::new();
-                                    let mut max_n = 1;
-                                    for ((s, d, tag), n) in
-                                        pairs.iter().zip(leg_streams.iter())
-                                    {
-                                        let n = *n;
-                                        max_n = max_n.max(n);
-                                        let mut extra: Vec<String> =
-                                            vec!["-b".into(), prof.bandwidth.clone()];
-                                        if let Some(l) = &prof.length {
-                                            extra.push("-l".into());
-                                            extra.push(l.clone());
-                                        }
-                                        let mk = |idx: usize, port: u16| IperfTask {
-                                            v6,
-                                            udp: true,
-                                            profile_name: prof.name(),
-                                            profile_label: prof.label(),
-                                            src: (*s).clone(),
-                                            dst: (*d).clone(),
-                                            port,
-                                            duration: spec.duration,
-                                            extra: extra.clone(),
-                                            stream_idx: idx,
-                                        };
-                                        let kind = if n <= 1 {
-                                            LegKind::IperfSingle(mk(0, alloc_port(next_port)))
-                                        } else {
-                                            let streams: Vec<IperfTask> = (0..n as usize)
-                                                .map(|i| mk(i, alloc_port(next_port)))
-                                                .collect();
-                                            LegKind::IperfGroup {
-                                                name: prof.name(),
-                                                streams,
-                                            }
-                                        };
-                                        legs.push(Leg {
-                                            tag: tag.to_string(),
-                                            kind,
-                                        });
+                                    let max_n = leg_streams.iter().copied().max().unwrap_or(1);
+                                    let mut extra = vec!["-b".into(), prof.bandwidth.clone()];
+                                    if let Some(length) = &prof.length {
+                                        extra.extend(["-l".into(), length.clone()]);
                                     }
+                                    let legs = pairs
+                                        .iter()
+                                        .zip(&leg_streams)
+                                        .map(|((src, dst, tag), &streams)| {
+                                            let task = |stream_idx, port| IperfTask {
+                                                v6,
+                                                udp: true,
+                                                profile_label: plabel.clone(),
+                                                src: (*src).clone(),
+                                                dst: (*dst).clone(),
+                                                port,
+                                                duration: spec.duration,
+                                                extra: extra.clone(),
+                                                stream_idx,
+                                            };
+                                            let kind = if streams <= 1 {
+                                                LegKind::IperfSingle(task(0, alloc_port(next_port)))
+                                            } else {
+                                                LegKind::IperfGroup {
+                                                    name: pname.clone(),
+                                                    streams: (0..streams as usize)
+                                                        .map(|i| task(i, alloc_port(next_port)))
+                                                        .collect(),
+                                                }
+                                            };
+                                            Leg {
+                                                tag: (*tag).into(),
+                                                kind,
+                                            }
+                                        })
+                                        .collect();
                                     let stream_note = if max_n > 1 {
                                         format!(" ×{max_n}流")
                                     } else {
@@ -462,27 +466,21 @@ pub fn build_units(
                                         "{}IPERF {} {}{} | {}",
                                         if bidir { "★★双向 " } else { "" },
                                         ip_tag,
-                                        prof.label(),
+                                        plabel,
                                         stream_note,
                                         route_str
                                     );
                                     let id = md5_hex(&format!(
                                         "iperf_v1|{}|udp|{}|{}|{}|{}|{}|{}",
                                         ip_tag,
-                                        prof.name(),
+                                        pname,
                                         spec.duration,
                                         spec.streams,
                                         ep_id(&spec.src),
                                         ep_id(&spec.dst),
                                         dir
                                     ));
-                                    units.push(Unit {
-                                        id,
-                                        title,
-                                        bidir,
-                                        legs,
-                                        est_secs: spec.duration + 10,
-                                    });
+                                    units.push(unit(id, title, bidir, legs, spec.duration + 10));
                                 }
                             }
                         }
@@ -492,19 +490,15 @@ pub fn build_units(
                 // ---------- ping ----------
                 if spec.kinds.iter().any(|k| k == "ping") {
                     for payload in &spec.payload_sizes {
-                        let mut legs = Vec::new();
-                        for (s, d, tag) in &pairs {
-                            legs.push(Leg {
-                                tag: tag.to_string(),
-                                kind: LegKind::Ping(PingTask {
-                                    v6,
-                                    src: (*s).clone(),
-                                    dst: (*d).clone(),
-                                    count: spec.ping_count,
-                                    payload: *payload,
-                                }),
-                            });
-                        }
+                        let legs = map_legs(&pairs, |src, dst| {
+                            LegKind::Ping(PingTask {
+                                v6,
+                                src: src.clone(),
+                                dst: dst.clone(),
+                                count: spec.ping_count,
+                                payload: *payload,
+                            })
+                        });
                         let title = format!(
                             "{}PING {} -l {} n={} | {}",
                             if bidir { "★双向 " } else { "" },
@@ -522,13 +516,7 @@ pub fn build_units(
                             ep_id(&spec.dst),
                             dir
                         ));
-                        units.push(Unit {
-                            id,
-                            title,
-                            bidir,
-                            legs,
-                            est_secs: spec.ping_count as u64 + 5,
-                        });
+                        units.push(unit(id, title, bidir, legs, spec.ping_count as u64 + 5));
                     }
                 }
             }
@@ -593,6 +581,7 @@ mod tests {
         let (units, notices) = build_units(&[base_spec()], true, &mut port);
         assert_eq!(units.len(), 1);
         assert!(notices.is_empty());
+        assert_eq!(units[0].id, "0851c19636f46ddd521a533a5541f7fd");
         assert_eq!(units[0].legs.len(), 1);
         match &units[0].legs[0].kind {
             LegKind::IperfSingle(t) => {
@@ -613,6 +602,7 @@ mod tests {
         let (units, _) = build_units(&[spec], true, &mut port);
         assert_eq!(units.len(), 1);
         assert!(units[0].bidir);
+        assert_eq!(units[0].id, "7c52d228bc00b7e34c3e2fac103bbf1d");
         assert_eq!(units[0].legs.len(), 2);
         // 2500/500 = 5 >= 3 允许 3 流
         for leg in &units[0].legs {

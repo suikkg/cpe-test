@@ -21,8 +21,6 @@ pub struct Ctx {
     pub agent_host: String,
     pub agent_port: u16,
     pub cfg: Config,
-    pub master_pc: String,
-    pub agent_pc: String,
     pub outdir: PathBuf,
     pub local_servers: IperfServerMgr,
     pub local_monitors: MonitorMgr,
@@ -37,6 +35,7 @@ pub struct RunSummary {
     pub skip: usize,
 }
 
+#[derive(Default)]
 struct LegOutcome {
     ok: bool,
     rx_avg: Option<f64>,
@@ -60,8 +59,8 @@ impl Ctx {
         if status != 200 {
             return Err(format!("辅测机 {path} 返回 HTTP {status}: {text}"));
         }
-        let resp: Resp<TOut> = serde_json::from_str(&text)
-            .map_err(|e| format!("辅测机 {path} 响应解析失败: {e}"))?;
+        let resp: Resp<TOut> =
+            serde_json::from_str(&text).map_err(|e| format!("辅测机 {path} 响应解析失败: {e}"))?;
         if !resp.ok {
             return Err(resp
                 .error
@@ -76,11 +75,9 @@ impl Ctx {
     fn ping_at(&self, side: Side, req: &PingReq) -> Result<PingOut, String> {
         match side {
             Side::Master => Ok(ping::run(req)),
-            Side::Agent => self.agent_post(
-                "/ping",
-                req,
-                Duration::from_secs(req.count as u64 * 5 + 60),
-            ),
+            Side::Agent => {
+                self.agent_post("/ping", req, Duration::from_secs(req.count as u64 * 5 + 60))
+            }
         }
     }
 
@@ -91,7 +88,11 @@ impl Ctx {
                 self.local_servers.start(&bin, req)
             }
             Side::Agent => self
-                .agent_post::<_, IperfServerStartOut>("/iperf/server/start", req, Duration::from_secs(40))
+                .agent_post::<_, IperfServerStartOut>(
+                    "/iperf/server/start",
+                    req,
+                    Duration::from_secs(40),
+                )
                 .map(|o| o.cmd),
         }
     }
@@ -102,10 +103,7 @@ impl Ctx {
             Side::Agent => self
                 .agent_post(
                     "/iperf/server/stop",
-                    &IperfServerStopReq {
-                        port,
-                        wait_secs: 3,
-                    },
+                    &IperfServerStopReq { port, wait_secs: 3 },
                     Duration::from_secs(30),
                 )
                 .unwrap_or_else(|e| IperfServerStopOut {
@@ -173,65 +171,85 @@ impl Ctx {
         }
     }
 
+    fn try_mon_start(&self, side: Side, iface: &str) -> Option<String> {
+        self.mon_start(side, iface)
+            .map_err(|e| logln(&format!("    (接收端网卡监控启动失败: {e})")))
+            .ok()
+    }
+
+    fn screenshot_at(&self, side: Side, label: &str) -> Result<Vec<u8>, String> {
+        match side {
+            Side::Master => crate::screenshot::capture_png().map_err(|_| String::new()),
+            Side::Agent => {
+                let body = serde_json::to_string(&ScreenshotReq {
+                    label: label.to_string(),
+                })
+                .unwrap_or_default();
+                let (status, text) = match http_client::post_json(
+                    &self.agent_host,
+                    self.agent_port,
+                    "/screenshot",
+                    &body,
+                    Duration::from_secs(180),
+                ) {
+                    Ok((status, text)) => {
+                        logln(&format!(
+                            "    [截图] 辅测响应: status={status}, len={}",
+                            text.len()
+                        ));
+                        (status, text)
+                    }
+                    Err(e) => return Err(format!("辅测请求失败: {e}")),
+                };
+                if status != 200 {
+                    return Err(format!("辅测 HTTP {status}: {}", byte_prefix(&text, 200)));
+                }
+                let resp: Resp<ScreenshotOut> = serde_json::from_str(&text).map_err(|e| {
+                    format!(
+                        "JSON解析失败: {e}, raw前100字节: {}",
+                        byte_prefix(&text, 100)
+                    )
+                })?;
+                if !resp.ok {
+                    return Err(format!("辅测截图错误: {}", resp.error.unwrap_or_default()));
+                }
+                let Some(data) = resp.data else {
+                    return Err("辅测响应缺data".into());
+                };
+                let b64_len = data.image_b64.len();
+                base64::engine::general_purpose::STANDARD
+                    .decode(data.image_b64)
+                    .map_err(|e| format!("辅测 base64 解码失败: {e}, len={b64_len}"))
+            }
+        }
+    }
+
     /// 两端都尝试截图，任一成功就保存。返回报告用相对路径（多个用分号隔开）
     fn take_screenshots(&self, sides: &[Side], label: &str) -> (String, String) {
+        if !self.cfg.screenshot {
+            return Default::default();
+        }
         let mut master = String::new();
         let mut agent = String::new();
-        for side in sides.iter() {
-            let png: Vec<u8> = match side {
-                Side::Master => match crate::screenshot::capture_png() {
-                    Ok(p) => p,
-                    Err(_) => continue,
-                },
-                Side::Agent => {
-                    let body = serde_json::to_string(&ScreenshotReq { label: label.to_string() }).unwrap_or_default();
-                    let timeout = Duration::from_secs(180);
-                    let (status, text) = match crate::http_client::post_json(
-                        &self.agent_host, self.agent_port, "/screenshot", &body, timeout,
-                    ) {
-                        Ok((s, t)) => {
-                            logln(&format!("    [截图] 辅测响应: status={s}, len={}", t.len()));
-                            (s, t)
-                        }
-                        Err(e) => {
-                            logln(&format!("    [截图] 辅测请求失败: {e}"));
-                            continue;
-                        }
-                    };
-                    if status != 200 {
-                        logln(&format!("    [截图] 辅测 HTTP {status}: {}", &text[..std::cmp::min(200, text.len())]));
-                        continue;
-                    }
-                    let resp: Resp<ScreenshotOut> = match serde_json::from_str(&text) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            logln(&format!("    [截图] JSON解析失败: {e}, raw前100字节: {}", &text[..std::cmp::min(100, text.len())]));
-                            continue;
-                        }
-                    };
-                    if !resp.ok {
-                        logln(&format!("    [截图] 辅测截图错误: {}", resp.error.unwrap_or_default()));
-                        continue;
-                    }
-                    let Some(data) = resp.data else {
-                        logln("    [截图] 辅测响应缺data");
-                        continue;
-                    };
-                    let b64_len = data.image_b64.len();
-                    match base64::engine::general_purpose::STANDARD.decode(data.image_b64) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            logln(&format!("    [截图] 辅测 base64 解码失败: {e}, len={b64_len}"));
-                            continue;
-                        }
-                    }
+        for &side in sides {
+            let png = match self.screenshot_at(side, label) {
+                Ok(png) => png,
+                Err(e) if !e.is_empty() => {
+                    logln(&format!("    [截图] {e}"));
+                    continue;
                 }
+                Err(_) => continue,
             };
             let (tag, ref mut out_path) = match side {
                 Side::Master => ("_master", &mut master),
                 Side::Agent => ("_agent", &mut agent),
             };
-            let fname = format!("screenshot_{}{}_{}.png", sanitize(label), tag, now_compact());
+            let fname = format!(
+                "screenshot_{}{}_{}.png",
+                sanitize(label),
+                tag,
+                now_compact()
+            );
             let full = self.outdir.join(&fname);
             if std::fs::write(&full, &png).is_err() {
                 continue;
@@ -287,16 +305,12 @@ impl Ctx {
                         .legs
                         .iter()
                         .enumerate()
-                        .map(|(li, leg)| {
-                            s.spawn(move || self.run_leg(i, unit, li, leg))
-                        })
+                        .map(|(li, leg)| s.spawn(move || self.run_leg(i, unit, li, leg)))
                         .collect();
-                    handles.into_iter().map(|h| h.join().unwrap_or(LegOutcome {
-                        ok: false,
-                        rx_avg: None,
-                        main_rows: vec![],
-                        tag: String::new(),
-                    })).collect()
+                    handles
+                        .into_iter()
+                        .map(|h| h.join().unwrap_or_default())
+                        .collect()
                 })
             };
 
@@ -358,8 +372,8 @@ impl Ctx {
         let (src_addr, dst_addr) = if t.v6 {
             match v6_addrs(&t.src.nic, &t.dst.nic) {
                 Some(v) => {
-                    let bind = add_zone(&v.client_bind, &t.src.nic.zone, t.src.side);
-                    let target = add_zone(&v.client_target, &t.src.nic.zone, t.src.side);
+                    let bind = add_zone(&v.client_bind, &t.src.nic.zone);
+                    let target = add_zone(&v.client_target, &t.src.nic.zone);
                     (bind, target)
                 }
                 None => (String::new(), String::new()),
@@ -400,7 +414,9 @@ impl Ctx {
             out.received,
             out.sent,
             out.loss_pct,
-            out.rtt_avg.map(|v| v.to_string()).unwrap_or_else(|| "-".into())
+            out.rtt_avg
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "-".into())
         ));
         let kind_label = if unit.bidir {
             format!("★双向-{tag}")
@@ -427,7 +443,10 @@ impl Ctx {
             ping_loss: Some(out.loss_pct),
             ping_avg: out.rtt_avg,
             command: out.cmd.clone(),
-            raws: vec![(format!("ping{} 输出", fmt_tag(tag)), format!("$ {}\n{}", out.cmd, out.raw))],
+            raws: vec![(
+                format!("ping{} 输出", fmt_tag(tag)),
+                format!("$ {}\n{}", out.cmd, out.raw),
+            )],
             ..Default::default()
         });
         LegOutcome {
@@ -445,9 +464,9 @@ impl Ctx {
         let (client_bind, client_target, server_bind) = if t.v6 {
             match v6_addrs(&t.src.nic, &t.dst.nic) {
                 Some(v) => {
-                    let bind = add_zone(&v.client_bind, &t.src.nic.zone, t.src.side);
-                    let target = add_zone(&v.client_target, &t.src.nic.zone, t.src.side);
-                    let srv = add_zone(&v.server_bind, &t.dst.nic.zone, t.dst.side);
+                    let bind = add_zone(&v.client_bind, &t.src.nic.zone);
+                    let target = add_zone(&v.client_target, &t.src.nic.zone);
+                    let srv = add_zone(&v.server_bind, &t.dst.nic.zone);
                     (bind, target, srv)
                 }
                 None => {
@@ -467,25 +486,23 @@ impl Ctx {
             )
         };
 
+        let creq = IperfClientReq {
+            dst: client_target,
+            bind_ip: client_bind,
+            port: t.port,
+            duration: t.duration,
+            udp: t.udp,
+            v6: t.v6,
+            extra: t.extra.clone(),
+        };
         let sreq = IperfServerStartReq {
             bind_ip: server_bind,
             port: t.port,
             v6: t.v6,
         };
         if let Err(e) = self.server_start(t.dst.side, &sreq) {
-            let srv_cmd = format!("iperf3 -s -B {} -p {} {}",
-                sreq.bind_ip, sreq.port, if sreq.v6 { "-6" } else { "-4" });
             // 同时构造 client 命令供查错
-            let creq = IperfClientReq {
-                dst: client_target.clone(),
-                bind_ip: client_bind.clone(),
-                port: t.port,
-                duration: t.duration,
-                udp: t.udp,
-                v6: t.v6,
-                extra: t.extra.clone(),
-            };
-            let cli_args = crate::cmd::iperf::client_args(&creq);
+            let cli_args = iperf::client_args(&creq);
             let cli_cmd = format!("iperf3 {}", cli_args.join(" "));
             let out = IperfClientOut {
                 ok: false,
@@ -496,15 +513,6 @@ impl Ctx {
             return (false, iperf::IperfParsed::default(), out, String::new());
         }
 
-        let creq = IperfClientReq {
-            dst: client_target,
-            bind_ip: client_bind,
-            port: t.port,
-            duration: t.duration,
-            udp: t.udp,
-            v6: t.v6,
-            extra: t.extra.clone(),
-        };
         let client = self.client_run(t.src.side, &creq);
         let server_out = self.server_stop(t.dst.side, t.port).output;
         let parsed = iperf::parse_output(&client.output);
@@ -530,19 +538,13 @@ impl Ctx {
             t.port,
             t.duration
         ));
-        let mon_id = match self.mon_start(t.dst.side, &t.dst.nic.name) {
-            Ok(id) => Some(id),
-            Err(e) => {
-                logln(&format!("    (接收端网卡监控启动失败: {e})"));
-                None
-            }
-        };
+        let mon_id = self.try_mon_start(t.dst.side, &t.dst.nic.name);
         let (raw_ok, parsed, client, server_out) = self.exec_iperf_core(t);
         let mon_out = mon_id.and_then(|id| self.mon_stop(t.dst.side, &id).ok());
         let rx_avg = mon_out.as_ref().map(|m| m.avg_mbps);
 
-        let meas_ok = parsed.has_measurement()
-            || rx_avg.map(|v| v > MIN_VALID_RX_MBPS).unwrap_or(false);
+        let meas_ok =
+            parsed.has_measurement() || rx_avg.map(|v| v > MIN_VALID_RX_MBPS).unwrap_or(false);
         let ok = raw_ok && meas_ok;
 
         logln(&format!(
@@ -553,11 +555,10 @@ impl Ctx {
             fmt_opt(rx_avg)
         ));
 
-        let (screenshot_master, screenshot_agent) = if self.cfg.screenshot {
-            self.take_screenshots(&[t.dst.side, t.src.side], &format!("{}_{}", unit.title, tag))
-        } else {
-            (String::new(), String::new())
-        };
+        let (screenshot_master, screenshot_agent) = self.take_screenshots(
+            &[t.dst.side, t.src.side],
+            &format!("{}_{}", unit.title, tag),
+        );
 
         let kind_label = if unit.bidir {
             format!("★★双向灌包-{tag}")
@@ -565,20 +566,6 @@ impl Ctx {
             "灌包".into()
         };
         let idx = self.push_row(Row {
-            sort_key: (useq, lidx, 0, 0),
-            time,
-            task_id: md5_hex(&format!("{}|{}|{}", unit.id, tag, t.stream_idx)),
-            parent_id: unit.id.clone(),
-            task: unit.title.clone(),
-            ip: if t.v6 { "V6".into() } else { "V4".into() },
-            transport: if t.udp { "UDP".into() } else { "TCP".into() },
-            param: t.profile_label.clone(),
-            src_pc: t.src.pc.clone(),
-            src_iface: t.src.nic.name.clone(),
-            src_ip: t.src.nic.ipv4.clone(),
-            dst_pc: t.dst.pc.clone(),
-            dst_iface: t.dst.nic.name.clone(),
-            dst_ip: t.dst.nic.ipv4.clone(),
             ok: Some(ok),
             kind_label,
             rx_avg,
@@ -595,7 +582,14 @@ impl Ctx {
                 ),
                 (format!("iperf3 server{} 输出", fmt_tag(tag)), server_out),
             ],
-            ..Default::default()
+            ..iperf_row(
+                (useq, lidx, 0, 0),
+                time,
+                md5_hex(&format!("{}|{}|{}", unit.id, tag, t.stream_idx)),
+                unit,
+                t,
+                t.profile_label.clone(),
+            )
         });
         LegOutcome {
             ok,
@@ -626,15 +620,9 @@ impl Ctx {
             first.src.brief(),
             first.dst.brief()
         ));
-        let mon_id = match self.mon_start(first.dst.side, &first.dst.nic.name) {
-            Ok(id) => Some(id),
-            Err(e) => {
-                logln(&format!("    (接收端网卡监控启动失败: {e})"));
-                None
-            }
-        };
+        let mon_id = self.try_mon_start(first.dst.side, &first.dst.nic.name);
 
-        let results: Vec<(bool, iperf::IperfParsed)> = std::thread::scope(|s| {
+        let results: Vec<bool> = std::thread::scope(|s| {
             let handles: Vec<_> = streams
                 .iter()
                 .enumerate()
@@ -651,20 +639,6 @@ impl Ctx {
                             "灌包(并发组共享网卡采样)".into()
                         };
                         self.push_row(Row {
-                            sort_key: (useq, lidx, si + 1, 0),
-                            time,
-                            task_id: md5_hex(&format!("{}|{}|{}", unit.id, tag, si)),
-                            parent_id: unit.id.clone(),
-                            task: unit.title.clone(),
-                            ip: if t.v6 { "V6".into() } else { "V4".into() },
-                            transport: "UDP".into(),
-                            param: format!("{} (#{})", t.profile_label, si + 1),
-                            src_pc: t.src.pc.clone(),
-                            src_iface: t.src.nic.name.clone(),
-                            src_ip: t.src.nic.ipv4.clone(),
-                            dst_pc: t.dst.pc.clone(),
-                            dst_iface: t.dst.nic.name.clone(),
-                            dst_ip: t.dst.nic.ipv4.clone(),
                             ok: Some(ok),
                             kind_label,
                             tx_mbps: parsed.best_sender(),
@@ -681,21 +655,28 @@ impl Ctx {
                                     server_out,
                                 ),
                             ],
-                            ..Default::default()
+                            ..iperf_row(
+                                (useq, lidx, si + 1, 0),
+                                time,
+                                md5_hex(&format!("{}|{}|{}", unit.id, tag, si)),
+                                unit,
+                                t,
+                                format!("{} (#{})", t.profile_label, si + 1),
+                            )
                         });
-                        (ok, parsed)
+                        ok
                     })
                 })
                 .collect();
             handles
                 .into_iter()
-                .map(|h| h.join().unwrap_or((false, iperf::IperfParsed::default())))
+                .map(|h| h.join().unwrap_or(false))
                 .collect()
         });
 
         let mon_out = mon_id.and_then(|id| self.mon_stop(first.dst.side, &id).ok());
         let rx_avg = mon_out.as_ref().map(|m| m.avg_mbps);
-        let all_ok = results.iter().all(|(ok, _)| *ok);
+        let all_ok = results.into_iter().all(|ok| ok);
         let group_ok = rx_avg.map(|v| v > MIN_VALID_RX_MBPS).unwrap_or(false);
         let ok = all_ok && group_ok;
 
@@ -706,27 +687,12 @@ impl Ctx {
             n
         ));
 
-        let (screenshot_master, screenshot_agent) = if self.cfg.screenshot {
-            self.take_screenshots(&[first.dst.side, first.src.side], &format!("{}_{}", unit.title, tag))
-        } else {
-            (String::new(), String::new())
-        };
+        let (screenshot_master, screenshot_agent) = self.take_screenshots(
+            &[first.dst.side, first.src.side],
+            &format!("{}_{}", unit.title, tag),
+        );
 
         let idx = self.push_row(Row {
-            sort_key: (useq, lidx, n + 1, 1),
-            time: now_full(),
-            task_id: md5_hex(&format!("{}|{}|grouptotal", unit.id, tag)),
-            parent_id: unit.id.clone(),
-            task: unit.title.clone(),
-            ip: if first.v6 { "V6".into() } else { "V4".into() },
-            transport: "UDP".into(),
-            param: format!("★组合计({} 共{}条流)", name, n),
-            src_pc: first.src.pc.clone(),
-            src_iface: first.src.nic.name.clone(),
-            src_ip: first.src.nic.ipv4.clone(),
-            dst_pc: first.dst.pc.clone(),
-            dst_iface: first.dst.nic.name.clone(),
-            dst_ip: first.dst.nic.ipv4.clone(),
             ok: Some(ok),
             kind_label: if unit.bidir {
                 format!("★组合计-{tag}")
@@ -737,7 +703,14 @@ impl Ctx {
             screenshot_master,
             screenshot_agent,
             is_grouptotal: true,
-            ..Default::default()
+            ..iperf_row(
+                (useq, lidx, n + 1, 1),
+                now_full(),
+                md5_hex(&format!("{}|{}|grouptotal", unit.id, tag)),
+                unit,
+                first,
+                format!("★组合计({} 共{}条流)", name, n),
+            )
         });
         LegOutcome {
             ok,
@@ -748,8 +721,43 @@ impl Ctx {
     }
 }
 
+fn byte_prefix(text: &str, len: usize) -> &str {
+    let mut end = len.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
+fn iperf_row(
+    sort_key: (usize, usize, usize, u8),
+    time: String,
+    task_id: String,
+    unit: &Unit,
+    task: &IperfTask,
+    param: String,
+) -> Row {
+    Row {
+        sort_key,
+        time,
+        task_id,
+        parent_id: unit.id.clone(),
+        task: unit.title.clone(),
+        ip: if task.v6 { "V6".into() } else { "V4".into() },
+        transport: if task.udp { "UDP".into() } else { "TCP".into() },
+        param,
+        src_pc: task.src.pc.clone(),
+        src_iface: task.src.nic.name.clone(),
+        src_ip: task.src.nic.ipv4.clone(),
+        dst_pc: task.dst.pc.clone(),
+        dst_iface: task.dst.nic.name.clone(),
+        dst_ip: task.dst.nic.ipv4.clone(),
+        ..Default::default()
+    }
+}
+
 /// v6 link-local 地址加 zone（仅 macOS 需要，Windows 不加）
-fn add_zone(addr: &str, zone: &str, _side: Side) -> String {
+fn add_zone(addr: &str, zone: &str) -> String {
     if cfg!(target_os = "macos") && !zone.is_empty() && addr.starts_with("fe80") {
         format!("{}%{}", addr, zone)
     } else {
@@ -827,10 +835,10 @@ impl ResultDb {
     /// 原子写（tmp + rename）
     pub fn save(&self) {
         let tmp = self.path.with_extension("tmp");
-        if let Ok(text) = serde_json::to_string_pretty(&self.map) {
-            if std::fs::write(&tmp, text).is_ok() {
-                let _ = std::fs::rename(&tmp, &self.path);
-            }
+        if serde_json::to_string_pretty(&self.map)
+            .is_ok_and(|text| std::fs::write(&tmp, text).is_ok())
+        {
+            let _ = std::fs::rename(&tmp, &self.path);
         }
     }
 }

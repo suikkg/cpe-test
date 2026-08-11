@@ -20,53 +20,43 @@ pub const ROLE_ORDER: [&str; 10] = [
 ///   1. WiFi 频段 → WIFI5G/2.4G/6G
 ///   2. 描述含 "10g" + "usb" → 10GUSB
 ///   3. 描述含 rndis/remote ndis → RNDIS
-///   4. 速率 9000-12000 + 描述含 usb → 10GUSB（兼容 4.2G 驱动 bug）
+///   4. 速率 4001-8999 + 描述含 usb → 10GUSB（兼容 4.2G 驱动 bug）
 ///   5. 速率 9000-12000 → 10GETH
 ///   6. 速率 2400-2600 → SGMII2.5G
 ///   7. 速率 900-1100 → SGMII1G
 ///   8. 速率 3400-4000 → RNDIS（RNDIS 协商 ~3.7G 兜底）
 ///   9. → UNKNOWN
 pub fn classify_role(description: &str, speed_mbps: u64, is_wifi: bool, band: &str) -> String {
-    if is_wifi {
-        return match band {
+    let desc_l = description.to_lowercase();
+    let is_usb = desc_l.contains("usb");
+    let role = if is_wifi {
+        match band {
             "5GHz" => "WIFI5G",
             "2.4GHz" => "WIFI2.4G",
             "6GHz" => "WIFI6G",
             _ => "WIFI",
         }
-        .to_string();
-    }
-    let desc_l = description.to_lowercase();
-    // EVB：10GUSB 优先匹配（描述含 10GbE + USB，或 10G USB 网卡）
-    if desc_l.contains("10g") && desc_l.contains("usb") {
-        return "10GUSB".to_string();
-    }
-    if desc_l.contains("rndis") || desc_l.contains("remote ndis") {
-        return "RNDIS".to_string();
-    }
-    match speed_mbps {
-        // EVB：10G 口（纯以太 10G 或 USB 10G 显示正确速率）
-        9_000..=12_000 => {
-            if desc_l.contains("usb") {
-                "10GUSB".to_string()
-            } else {
-                "10GETH".to_string()
-            }
+    } else if desc_l.contains("10g") && is_usb {
+        // EVB：描述含 10GbE + USB，或 10G USB 网卡
+        "10GUSB"
+    } else if desc_l.contains("rndis") || desc_l.contains("remote ndis") {
+        "RNDIS"
+    } else {
+        match speed_mbps {
+            // EVB：10G 口，以及驱动只显示 4.2G 的 10GUSB
+            4001..=12_000 => match (is_usb, speed_mbps >= 9_000) {
+                (true, _) => "10GUSB",
+                (false, true) => "10GETH",
+                _ => "UNKNOWN",
+            },
+            2400..=2600 => "SGMII2.5G",
+            900..=1100 => "SGMII1G",
+            // RNDIS 实测协商 ~3.7Gbps，描述没写 rndis 时按速率兜底
+            3400..=4000 => "RNDIS",
+            _ => "UNKNOWN",
         }
-        2400..=2600 => "SGMII2.5G".to_string(),
-        900..=1100 => "SGMII1G".to_string(),
-        // RNDIS 实测协商 ~3.7Gbps，描述没写 rndis 时按速率兜底
-        3400..=4000 => "RNDIS".to_string(),
-        // EVB：10GUSB 驱动显示 4.2G，描述含 USB 关键字
-        4001..=9000 => {
-            if desc_l.contains("usb") {
-                "10GUSB".to_string()
-            } else {
-                "UNKNOWN".to_string()
-            }
-        }
-        _ => "UNKNOWN".to_string(),
-    }
+    };
+    role.to_string()
 }
 
 pub fn role_rank(role: &str) -> usize {
@@ -77,6 +67,7 @@ pub fn role_rank(role: &str) -> usize {
 }
 
 /// 按名称关键字判断是否 WiFi 接口（兜底）
+#[cfg(any(windows, test))]
 pub fn is_wifi_name(name: &str) -> bool {
     let l = name.to_lowercase();
     ["wi-fi", "wifi", "wireless", "wlan", "802.11"]
@@ -89,28 +80,42 @@ pub fn is_wifi_name(name: &str) -> bool {
 mod tests {
     use super::*;
 
+    fn role(description: &str, speed: u64, wifi: bool, band: &str) -> String {
+        classify_role(description, speed, wifi, band)
+    }
+
     #[test]
     fn test_classify() {
         // WiFi
-        assert_eq!(classify_role("Intel AX201", 866, true, "5GHz"), "WIFI5G");
-        assert_eq!(classify_role("Intel AX201", 100, true, "2.4GHz"), "WIFI2.4G");
-        assert_eq!(classify_role("Intel AX201", 100, true, ""), "WIFI");
+        assert_eq!(role("Intel AX201", 866, true, "5GHz"), "WIFI5G");
+        assert_eq!(role("Intel AX201", 100, true, "2.4GHz"), "WIFI2.4G");
+        assert_eq!(role("Intel AX201", 100, true, ""), "WIFI");
         // RNDIS
-        assert_eq!(classify_role("Remote NDIS based Device", 0, false, ""), "RNDIS");
-        assert_eq!(classify_role("USB RNDIS Adapter", 3700, false, ""), "RNDIS");
-        assert_eq!(classify_role("Some USB NIC", 3700, false, ""), "RNDIS");
+        assert_eq!(role("Remote NDIS based Device", 0, false, ""), "RNDIS");
+        assert_eq!(role("USB RNDIS Adapter", 3700, false, ""), "RNDIS");
+        assert_eq!(role("Some USB NIC", 3700, false, ""), "RNDIS");
         // 10G
-        assert_eq!(classify_role("Realtek 10GbE USB Family Controller", 4200, false, ""), "10GUSB");
-        assert_eq!(classify_role("Realtek USB 10/100/1G/2.5G/5GbE/10GbE Family Controller", 4200, false, ""), "10GUSB");
-        assert_eq!(classify_role("Some USB NIC", 4200, false, ""), "10GUSB");
-        assert_eq!(classify_role("AQC113 10G Ethernet", 10000, false, ""), "10GETH");
-        assert_eq!(classify_role("Intel X710 10G SFP+", 10000, false, ""), "10GETH");
-        assert_eq!(classify_role("Realtek USB 10GbE", 10000, false, ""), "10GUSB");
+        assert_eq!(role("Realtek 10GbE USB", 100, false, ""), "10GUSB");
         // 标准口
-        assert_eq!(classify_role("Realtek GbE", 1000, false, ""), "SGMII1G");
-        assert_eq!(classify_role("Realtek 2.5GbE", 2500, false, ""), "SGMII2.5G");
+        assert_eq!(role("Realtek GbE", 1000, false, ""), "SGMII1G");
+        assert_eq!(role("Realtek 2.5GbE", 2500, false, ""), "SGMII2.5G");
         // unknown
-        assert_eq!(classify_role("Some NIC", 100, false, ""), "UNKNOWN");
+        assert_eq!(role("Some NIC", 100, false, ""), "UNKNOWN");
+    }
+
+    #[test]
+    fn test_10g_speed_boundaries() {
+        for (description, speed, expected) in [
+            ("USB NIC", 4000, "RNDIS"),
+            ("USB NIC", 4001, "10GUSB"),
+            ("USB NIC", 8999, "10GUSB"),
+            ("Ethernet", 8999, "UNKNOWN"),
+            ("Ethernet", 9000, "10GETH"),
+            ("USB NIC", 12_000, "10GUSB"),
+            ("Ethernet", 12_001, "UNKNOWN"),
+        ] {
+            assert_eq!(role(description, speed, false, ""), expected);
+        }
     }
 
     #[test]

@@ -15,11 +15,11 @@ pub fn post_json(
     body: &str,
     timeout: Duration,
 ) -> Result<(u16, String), String> {
-    request("POST", host, port, path, Some(body), timeout)
+    request("POST", host, port, path, body, timeout)
 }
 
 pub fn get(host: &str, port: u16, path: &str, timeout: Duration) -> Result<(u16, String), String> {
-    request("GET", host, port, path, None, timeout)
+    request("GET", host, port, path, "", timeout)
 }
 
 fn request(
@@ -27,31 +27,26 @@ fn request(
     host: &str,
     port: u16,
     path: &str,
-    body: Option<&str>,
+    body: &str,
     timeout: Duration,
 ) -> Result<(u16, String), String> {
     let addr_str = format!("{host}:{port}");
-    let addrs: Vec<_> = addr_str
+    let addr = addr_str
         .to_socket_addrs()
         .map_err(|e| format!("解析地址 {addr_str} 失败: {e}"))?
-        .collect();
-    let addr = addrs
-        .first()
+        .next()
         .ok_or_else(|| format!("地址 {addr_str} 无法解析"))?;
 
-    let mut stream = TcpStream::connect_timeout(addr, CONNECT_TIMEOUT)
+    let mut stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)
         .map_err(|e| format!("连接 {addr_str} 失败: {e}"))?;
     stream
         .set_read_timeout(Some(timeout))
-        .map_err(|e| e.to_string())?;
-    stream
-        .set_write_timeout(Some(Duration::from_secs(30)))
+        .and_then(|_| stream.set_write_timeout(Some(Duration::from_secs(30))))
         .map_err(|e| e.to_string())?;
 
-    let b = body.unwrap_or("");
     let req = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}",
-        b.len()
+        "{method} {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
     );
     stream
         .write_all(req.as_bytes())
@@ -59,36 +54,42 @@ fn request(
 
     // 读响应头
     let mut reader = BufReader::new(&mut stream);
-    let mut head_lines: Vec<String> = Vec::new();
+    let mut head = String::new();
     let mut line_buf = String::new();
     loop {
         line_buf.clear();
-        let n = reader.read_line(&mut line_buf).map_err(|e| format!("读头失败: {e}"))?;
-        if n == 0 {
+        if reader
+            .read_line(&mut line_buf)
+            .map_err(|e| format!("读头失败: {e}"))?
+            == 0
+        {
             return Err("连接意外关闭".into());
         }
-        let l = line_buf.trim_end().to_string();
-        if l.is_empty() {
+        if line_buf.trim_end().is_empty() {
             break; // 空行 = 头结束
         }
-        head_lines.push(l);
+        head.push_str(&line_buf);
     }
 
-    let head_text = head_lines.join("\r\n");
-    let status = parse_status(&head_lines.first().unwrap_or(&String::new()))?;
-    let is_chunked = head_text.to_lowercase().contains("transfer-encoding: chunked");
+    let status = parse_status(head.lines().next().unwrap_or(""))?;
+    let is_chunked = head
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked");
 
     // 读响应体
     let body_str = if is_chunked {
         read_chunked_body(&mut reader)?
     } else {
-        let cl = parse_content_length(&head_text);
         let mut buf = Vec::new();
-        if let Some(len) = cl {
+        if let Some(len) = parse_content_length(&head) {
             buf.resize(len, 0);
-            reader.read_exact(&mut buf).map_err(|e| format!("读响应体失败: {e}"))?;
+            reader
+                .read_exact(&mut buf)
+                .map_err(|e| format!("读响应体失败: {e}"))?;
         } else {
-            reader.read_to_end(&mut buf).map_err(|e| format!("读响应体失败: {e}"))?;
+            reader
+                .read_to_end(&mut buf)
+                .map_err(|e| format!("读响应体失败: {e}"))?;
         }
         String::from_utf8_lossy(&buf).into_owned()
     };
@@ -102,7 +103,9 @@ fn read_chunked_body<R: BufRead>(reader: &mut R) -> Result<String, String> {
     let mut size_buf = String::new();
     loop {
         size_buf.clear();
-        reader.read_line(&mut size_buf).map_err(|e| format!("读 chunk 大小失败: {e}"))?;
+        reader
+            .read_line(&mut size_buf)
+            .map_err(|e| format!("读 chunk 大小失败: {e}"))?;
         let size_str = size_buf.trim();
         // 可能有 chunk extension (;...)
         let size_str = size_str.split(';').next().unwrap_or(size_str);
@@ -113,9 +116,11 @@ fn read_chunked_body<R: BufRead>(reader: &mut R) -> Result<String, String> {
             let _ = reader.read_line(&mut String::new());
             break;
         }
-        let mut chunk_data = vec![0u8; size];
-        reader.read_exact(&mut chunk_data).map_err(|e| format!("读 chunk 数据失败: {e}"))?;
-        out.extend_from_slice(&chunk_data);
+        let start = out.len();
+        out.resize(start + size, 0);
+        reader
+            .read_exact(&mut out[start..])
+            .map_err(|e| format!("读 chunk 数据失败: {e}"))?;
         // 读掉 chunk 后的 \r\n
         let _ = reader.read_line(&mut String::new());
     }
@@ -123,20 +128,17 @@ fn read_chunked_body<R: BufRead>(reader: &mut R) -> Result<String, String> {
 }
 
 fn parse_content_length(head: &str) -> Option<usize> {
-    for line in head.lines() {
-        let l = line.to_lowercase();
-        if let Some(v) = l.strip_prefix("content-length:") {
-            return v.trim().parse().ok();
-        }
-    }
-    None
+    head.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("content-length")
+            .then(|| value.trim().parse().ok())
+            .flatten()
+    })
 }
 
 fn parse_status(line: &str) -> Result<u16, String> {
-    let mut parts = line.split_whitespace();
-    let _ver = parts.next();
-    parts
-        .next()
+    line.split_whitespace()
+        .nth(1)
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| format!("无法解析状态行: {line}"))
 }
@@ -152,6 +154,12 @@ mod tests {
             Some(12)
         );
         assert_eq!(parse_status("HTTP/1.1 200 OK").unwrap(), 200);
+        assert!(parse_status("broken").is_err());
+
+        let mut chunked = std::io::Cursor::new(b"4;foo=bar\r\ntest\r\n3\r\n123\r\n0\r\n\r\n");
+        assert_eq!(read_chunked_body(&mut chunked).unwrap(), "test123");
+        let mut invalid = std::io::Cursor::new(b"x\r\n");
+        assert!(read_chunked_body(&mut invalid).is_err());
     }
 
     #[test]

@@ -1,5 +1,7 @@
 //! 解析 `ipconfig /all` 输出（Windows，中英文兼容，GBK 已在 run_cmd 解码）
 
+#![cfg_attr(not(windows), allow(dead_code))]
+
 use crate::util::run_cmd;
 use regex::Regex;
 use std::time::Duration;
@@ -49,11 +51,11 @@ pub fn parse(text: &str) -> Vec<IpcfgAdapter> {
             continue;
         }
         let Some(a) = cur.as_mut() else { continue };
-        let Some(cap) = field_re.captures(line) else {
+        let Some((_, [key, val])) = field_re.captures(line).map(|cap| cap.extract()) else {
             continue;
         };
-        let key = cap.get(1).map(|m| m.as_str()).unwrap_or("").trim();
-        let val = cap.get(2).map(|m| m.as_str()).unwrap_or("").trim();
+        let key = key.trim();
+        let val = val.trim();
         if val.is_empty() {
             continue;
         }
@@ -80,10 +82,11 @@ pub fn parse(text: &str) -> Vec<IpcfgAdapter> {
                         a.ipv6_ll = Some(vl.clone());
                     }
                 }
-            } else if (vl.starts_with('2') || vl.starts_with('3')) && vl.contains(':') {
-                if a.ipv6_global.is_none() {
-                    a.ipv6_global = Some(vl.split('%').next().unwrap_or(&vl).to_string());
-                }
+            } else if (vl.starts_with('2') || vl.starts_with('3'))
+                && vl.contains(':')
+                && a.ipv6_global.is_none()
+            {
+                a.ipv6_global = Some(vl.split('%').next().unwrap_or(&vl).to_string());
             }
         } else if (key.contains("媒体状态") || key_l.contains("media state"))
             && (val.contains("已断开") || val.to_lowercase().contains("disconnected"))
@@ -99,22 +102,11 @@ pub fn parse(text: &str) -> Vec<IpcfgAdapter> {
 
 /// 从头部行提取适配器名
 fn adapter_name(head: &str) -> Option<String> {
-    if let Some(idx) = head.find("适配器 ") {
-        let name = &head[idx + "适配器 ".len()..];
-        let n = name.trim();
-        if !n.is_empty() {
-            return Some(n.to_string());
-        }
-    }
-    let low = head.to_lowercase();
-    if let Some(idx) = low.find(" adapter ") {
-        let name = &head[idx + " adapter ".len()..];
-        let n = name.trim();
-        if !n.is_empty() {
-            return Some(n.to_string());
-        }
-    }
-    None
+    let suffix = |haystack: &str, marker: &str| {
+        let name = head[haystack.find(marker)? + marker.len()..].trim();
+        (!name.is_empty()).then(|| name.to_string())
+    };
+    suffix(head, "适配器 ").or_else(|| suffix(&head.to_lowercase(), " adapter "))
 }
 
 fn strip_paren(v: &str) -> String {

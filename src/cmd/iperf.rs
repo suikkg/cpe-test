@@ -94,8 +94,7 @@ impl IperfParsed {
 /// 解析 iperf3 文本输出（-f m）
 pub fn parse_output(text: &str) -> IperfParsed {
     let ansi = Regex::new(r"\x1b\[[0-9;]*[A-Za-z]").expect("regex");
-    let rate_re =
-        Regex::new(r"(\d+(?:[.,]\d+)?)\s*([KMGT]?)(bits|Bytes)/sec").expect("regex");
+    let rate_re = Regex::new(r"(\d+(?:[.,]\d+)?)\s*([KMGT]?)(bits|Bytes)/sec").expect("regex");
     let loss_re = Regex::new(r"\((\d+(?:[.,]\d+)?)%\)").expect("regex");
 
     let mut p = IperfParsed::default();
@@ -128,10 +127,7 @@ pub fn parse_output(text: &str) -> IperfParsed {
             }
         }
     }
-    if let Some(cap) = loss_re
-        .captures_iter(text)
-        .last()
-    {
+    if let Some(cap) = loss_re.captures_iter(text).last() {
         p.udp_loss_pct = cap[1].replace(',', ".").parse().ok();
     }
     p
@@ -148,21 +144,14 @@ struct SrvEntry {
 }
 
 /// iperf3 server 注册表（agent 端与主控本地共用）
+#[derive(Default)]
 pub struct IperfServerMgr {
     inner: Mutex<HashMap<u16, SrvEntry>>,
 }
 
-impl Default for IperfServerMgr {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl IperfServerMgr {
     pub fn new() -> Self {
-        IperfServerMgr {
-            inner: Mutex::new(HashMap::new()),
-        }
+        Self::default()
     }
 
     /// 启动 server（不带 -1，运行后由调用方主动 stop），TCP connect 探测就绪
@@ -188,9 +177,12 @@ impl IperfServerMgr {
             std::thread::spawn(move || {
                 let reader = BufReader::new(stdout);
                 for line in reader.lines() {
-                    if let Ok(l) = line {
-                        let mut buf = output_clone.lock().unwrap();
-                        writeln!(buf, "{l}").ok();
+                    match line {
+                        Ok(line) => {
+                            let mut buf = output_clone.lock().unwrap();
+                            writeln!(buf, "{line}").ok();
+                        }
+                        Err(_) => continue,
                     }
                 }
             });
@@ -210,13 +202,11 @@ impl IperfServerMgr {
         }
 
         // 等待就绪：TCP connect 探测端口（兼容 IPv4/v6 / 跨平台）
-        wait_server_tcp_ready(req.bind_ip.clone(), req.port, req.v6, SERVER_READY_TIMEOUT)?;
+        wait_server_tcp_ready(&req.bind_ip, req.port, SERVER_READY_TIMEOUT)?;
 
         Ok(cmd_str)
     }
-}
 
-impl IperfServerMgr {
     pub fn stop(&self, port: u16, wait: Duration) -> IperfServerStopOut {
         let entry = {
             let mut g = self.inner.lock().unwrap();
@@ -271,40 +261,28 @@ impl IperfServerMgr {
     }
 }
 
-// ---------------- client 执行 ----------------
-
-use std::time::Duration as StdDuration;
-
 /// TCP connect 探测 iperf3 server 是否已就绪（兼容 IPv4 / IPv6，跨平台）
-fn wait_server_tcp_ready(bind_ip: String, port: u16, _v6: bool, timeout: StdDuration) -> Result<(), String> {
+fn wait_server_tcp_ready(bind_ip: &str, port: u16, timeout: Duration) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
     // probe 地址要去掉 zone（%en0 / %6），getaddrinfo 不支持带 zone 解析
-    let clean = if let Some(idx) = bind_ip.find('%') {
-        &bind_ip[..idx]
-    } else {
-        &bind_ip
-    };
+    let clean = bind_ip.split_once('%').map_or(bind_ip, |(ip, _)| ip);
     // IPv6 需要用 [addr]:port 格式
     let addr_str = if clean.contains(':') {
         format!("[{clean}]:{port}")
     } else {
         format!("{clean}:{port}")
     };
+    let addr = addr_str
+        .to_socket_addrs()
+        .map_err(|e| format!("解析地址失败 {addr_str}: {e}"))?
+        .last()
+        .ok_or_else(|| format!("无法解析地址 {addr_str}"))?;
     while Instant::now() < deadline {
-        let addrs = addr_str.to_socket_addrs()
-            .map_err(|e| format!("解析地址失败 {addr_str}: {e}"))?;
-        // 取第一个可用的地址
-        if let Some(sa) = addrs.last() {
-            match TcpStream::connect_timeout(&sa, StdDuration::from_secs(1)) {
-                Ok(_) => return Ok(()),
-                Err(_e) => {
-                    // ConnectionRefused 正常（server 还没好）
-                    std::thread::sleep(StdDuration::from_millis(200));
-                }
-            }
-        } else {
-            return Err(format!("无法解析地址 {addr_str}"));
+        if TcpStream::connect_timeout(&addr, Duration::from_secs(1)).is_ok() {
+            return Ok(());
         }
+        // ConnectionRefused 正常（server 还没好）
+        std::thread::sleep(Duration::from_millis(200));
     }
     Err(format!(
         "iperf3 server 端口 {} 在 {}.?{} 秒内未响应 TCP connect",
@@ -313,6 +291,8 @@ fn wait_server_tcp_ready(bind_ip: String, port: u16, _v6: bool, timeout: StdDura
         timeout.subsec_millis() / 100
     ))
 }
+
+// ---------------- client 执行 ----------------
 
 fn is_transient_error(out: &str) -> bool {
     let l = out.to_lowercase();

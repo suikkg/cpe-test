@@ -89,32 +89,26 @@ pub fn parse(text: &str, count: u32) -> PingOut {
     )
     .expect("regex");
 
-    let (sent, received, lost, loss_pct) = if let Some(c) = cn.captures(text) {
-        (
-            c[1].parse().unwrap_or(count),
-            c[2].parse().unwrap_or(0),
-            c[3].parse().unwrap_or(count),
-            c[4].parse().unwrap_or(100.0),
-        )
-    } else if let Some(c) = en.captures(text) {
-        (
-            c[1].parse().unwrap_or(count),
-            c[2].parse().unwrap_or(0),
-            c[3].parse().unwrap_or(count),
-            c[4].parse().unwrap_or(100.0),
-        )
-    } else if let Some(c) = bsd.captures(text) {
-        let sent: u32 = c[1].parse().unwrap_or(count);
-        let recv: u32 = c[2].parse().unwrap_or(0);
-        (
-            sent,
-            recv,
-            sent.saturating_sub(recv),
-            c[3].parse().unwrap_or(100.0),
-        )
-    } else {
-        (count, 0, count, 100.0)
-    };
+    let (sent, received, lost, loss_pct) =
+        if let Some(c) = cn.captures(text).or_else(|| en.captures(text)) {
+            (
+                c[1].parse().unwrap_or(count),
+                c[2].parse().unwrap_or(0),
+                c[3].parse().unwrap_or(count),
+                c[4].parse().unwrap_or(100.0),
+            )
+        } else if let Some(c) = bsd.captures(text) {
+            let sent: u32 = c[1].parse().unwrap_or(count);
+            let recv: u32 = c[2].parse().unwrap_or(0);
+            (
+                sent,
+                recv,
+                sent.saturating_sub(recv),
+                c[3].parse().unwrap_or(100.0),
+            )
+        } else {
+            (count, 0, count, 100.0)
+        };
 
     // 统计行本身会说谎：Windows/BSD 把"目标不可达""TTL 超时""需要分片"等
     // ICMP 错误应答也计入"已接收"，因为本机确实收到了一个回复包，只是
@@ -142,25 +136,19 @@ pub fn parse(text: &str, count: u32) -> PingOut {
         r"(?si)Minimum\s*=\s*(<?\d+)ms.*?Maximum\s*=\s*(<?\d+)ms.*?Average\s*=\s*(<?\d+)ms",
     )
     .expect("regex");
-    let rtt_bsd = Regex::new(
-        r"(?:round-trip|rtt)[^=]*=\s*(\d+(?:\.\d+)?)/(\d+(?:\.\d+)?)/(\d+(?:\.\d+)?)",
-    )
-    .expect("regex");
+    let rtt_bsd =
+        Regex::new(r"(?:round-trip|rtt)[^=]*=\s*(\d+(?:\.\d+)?)/(\d+(?:\.\d+)?)/(\d+(?:\.\d+)?)")
+            .expect("regex");
 
-    let (rtt_min, rtt_max, rtt_avg) = if let Some(c) = rtt_cn.captures(text) {
-        (parse_ms(&c[1]), parse_ms(&c[2]), parse_ms(&c[3]))
-    } else if let Some(c) = rtt_en.captures(text) {
-        (parse_ms(&c[1]), parse_ms(&c[2]), parse_ms(&c[3]))
-    } else if let Some(c) = rtt_bsd.captures(text) {
-        // BSD 顺序是 min/avg/max
-        (
-            c[1].parse().ok(),
-            c[3].parse().ok(),
-            c[2].parse().ok(),
-        )
-    } else {
-        (None, None, None)
-    };
+    let (rtt_min, rtt_max, rtt_avg) =
+        if let Some(c) = rtt_cn.captures(text).or_else(|| rtt_en.captures(text)) {
+            (parse_ms(&c[1]), parse_ms(&c[2]), parse_ms(&c[3]))
+        } else if let Some(c) = rtt_bsd.captures(text) {
+            // BSD 顺序是 min/avg/max
+            (c[1].parse().ok(), c[3].parse().ok(), c[2].parse().ok())
+        } else {
+            (None, None, None)
+        };
 
     let ok = received > 0 && loss_pct < 100.0;
     let (rtt_min, rtt_max, rtt_avg) = if ok {
@@ -185,11 +173,11 @@ pub fn parse(text: &str, count: u32) -> PingOut {
 /// "<1" -> 0
 fn parse_ms(s: &str) -> Option<f64> {
     let t = s.trim();
-    if let Some(stripped) = t.strip_prefix('<') {
-        let _ = stripped;
-        return Some(0.0);
+    if t.starts_with('<') {
+        Some(0.0)
+    } else {
+        t.parse().ok()
     }
-    t.parse().ok()
 }
 
 #[cfg(test)]

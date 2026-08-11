@@ -65,14 +65,19 @@ fn esc(s: &str) -> String {
 }
 
 fn fmt_f(v: Option<f64>, prec: usize) -> String {
-    match v {
-        Some(x) => format!("{x:.prec$}"),
-        None => String::new(),
+    v.map_or_else(String::new, |x| format!("{x:.prec$}"))
+}
+
+fn status(ok: Option<bool>) -> (&'static str, &'static str) {
+    match ok {
+        Some(true) => ("pass", "PASS"),
+        Some(false) => ("fail", "FAIL"),
+        None => ("skip", "SKIP"),
     }
 }
 
 pub fn write_report(path: &Path, rows: &mut [Row], meta: &ReportMeta) -> std::io::Result<()> {
-    rows.sort_by(|a, b| a.sort_key.cmp(&b.sort_key));
+    rows.sort_by_key(|row| row.sort_key);
     let total = rows.iter().filter(|r| !r.is_grouptotal).count();
     let pass = rows
         .iter()
@@ -131,10 +136,31 @@ summary { cursor: pointer; font-weight: bold; }
 
     h.push_str("<table>\n<tr>");
     for th in [
-        "时间", "Task ID", "Parent ID", "任务", "IP", "传输", "参数", "源 PC", "源接口",
-        "源 IP", "目标 PC", "目标接口", "目标 IP", "结果", "类型", "接收网卡平均 Mbps",
-        "对向接收 Mbps", "iperf 发送 Mbps", "iperf 接收 Mbps", "UDP 丢包率 %",
-        "Ping 丢包率 %", "Ping 平均 ms", "主控截图", "辅测截图", "执行命令",
+        "时间",
+        "Task ID",
+        "Parent ID",
+        "任务",
+        "IP",
+        "传输",
+        "参数",
+        "源 PC",
+        "源接口",
+        "源 IP",
+        "目标 PC",
+        "目标接口",
+        "目标 IP",
+        "结果",
+        "类型",
+        "接收网卡平均 Mbps",
+        "对向接收 Mbps",
+        "iperf 发送 Mbps",
+        "iperf 接收 Mbps",
+        "UDP 丢包率 %",
+        "Ping 丢包率 %",
+        "Ping 平均 ms",
+        "主控截图",
+        "辅测截图",
+        "执行命令",
     ] {
         h.push_str(&format!("<th>{th}</th>"));
     }
@@ -160,11 +186,8 @@ summary { cursor: pointer; font-weight: bold; }
         h.push_str(&format!("<td>{}</td>", esc(&r.dst_pc)));
         h.push_str(&format!("<td>{}</td>", esc(&r.dst_iface)));
         h.push_str(&format!("<td>{}</td>", esc(&r.dst_ip)));
-        match r.ok {
-            Some(true) => h.push_str("<td class=\"pass\">PASS</td>"),
-            Some(false) => h.push_str("<td class=\"fail\">FAIL</td>"),
-            None => h.push_str("<td class=\"skip\">SKIP</td>"),
-        }
+        let (status_class, status_text) = status(r.ok);
+        h.push_str(&format!("<td class=\"{status_class}\">{status_text}</td>"));
         h.push_str(&format!("<td>{}</td>", esc(&r.kind_label)));
         h.push_str(&format!(
             "<td class=\"num\"><b>{}</b></td>",
@@ -176,8 +199,14 @@ summary { cursor: pointer; font-weight: bold; }
         h.push_str(&format!("<td class=\"num\">{}</td>", fmt_f(r.udp_loss, 3)));
         h.push_str(&format!("<td class=\"num\">{}</td>", fmt_f(r.ping_loss, 3)));
         h.push_str(&format!("<td class=\"num\">{}</td>", fmt_f(r.ping_avg, 1)));
-        h.push_str(&format!("<td>{}</td>", screenshot_link(&r.screenshot_master)));
-        h.push_str(&format!("<td>{}</td>", screenshot_link(&r.screenshot_agent)));
+        h.push_str(&format!(
+            "<td>{}</td>",
+            screenshot_link(&r.screenshot_master)
+        ));
+        h.push_str(&format!(
+            "<td>{}</td>",
+            screenshot_link(&r.screenshot_agent)
+        ));
         h.push_str(&format!("<td>{}</td>", esc(&r.command)));
         h.push_str("</tr>\n");
     }
@@ -192,14 +221,14 @@ summary { cursor: pointer; font-weight: bold; }
             "<details><summary>{} — {} [{}]</summary>\n",
             esc(&r.time),
             esc(&r.task),
-            match r.ok {
-                Some(true) => "PASS",
-                Some(false) => "FAIL",
-                None => "SKIP",
-            }
+            status(r.ok).1,
         ));
         for (title, text) in &r.raws {
-            h.push_str(&format!("<h3>{}</h3><pre>{}</pre>\n", esc(title), esc(text)));
+            h.push_str(&format!(
+                "<h3>{}</h3><pre>{}</pre>\n",
+                esc(title),
+                esc(text)
+            ));
         }
         h.push_str("</details>\n");
     }
@@ -221,19 +250,34 @@ mod tests {
         let dir = std::env::temp_dir().join("cpe_report_test");
         let _ = std::fs::create_dir_all(&dir);
         let p = dir.join("r.html");
-        let mut rows = vec![Row {
-            time: "2026-07-04 12:00:00".into(),
-            task: "IPERF V4 TCP".into(),
-            ok: Some(true),
-            rx_avg: Some(2379.123456),
-            raws: vec![("client".into(), "<output>".into())],
-            ..Default::default()
-        }];
+        let mut rows = vec![
+            Row {
+                sort_key: (1, 0, 0, 0),
+                time: "2026-07-04 12:00:00".into(),
+                task: "IPERF V4 TCP".into(),
+                ok: Some(true),
+                rx_avg: Some(2379.123456),
+                raws: vec![("client".into(), "<output>".into())],
+                ..Default::default()
+            },
+            Row {
+                task: "first<&".into(),
+                ok: None,
+                screenshot_master: "a&b.png".into(),
+                is_grouptotal: true,
+                ..Default::default()
+            },
+        ];
         write_report(&p, &mut rows, &ReportMeta::default()).unwrap();
         let html = std::fs::read_to_string(&p).unwrap();
         assert!(html.contains("PASS"));
         assert!(html.contains("2379.123"));
         assert!(html.contains("&lt;output&gt;"));
+        assert!(html.contains("总计: 1"));
+        assert!(html.contains("class=\"grouptotal\""));
+        assert!(html.contains("class=\"skip\">SKIP"));
+        assert!(html.contains("href=\"a&amp;b.png\""));
+        assert!(html.find("first&lt;&amp;").unwrap() < html.find("IPERF V4 TCP").unwrap());
         let _ = std::fs::remove_file(&p);
     }
 }

@@ -159,12 +159,11 @@ pub fn scan_all(prefixes: &[String]) -> Vec<NicInfo> {
         })
         .collect();
 
-    let any_wifi = cands.iter().any(|b| {
-        ports
-            .get(&b.name)
-            .map(|p| p.contains("Wi-Fi") || p.contains("AirPort"))
-            .unwrap_or(false)
-    });
+    let is_wifi_port = |port: &str| port.contains("Wi-Fi") || port.contains("AirPort");
+    let any_wifi = cands
+        .iter()
+        .filter_map(|b| ports.get(&b.name))
+        .any(|port| is_wifi_port(port));
     let (wifi_band, wifi_rate) = if any_wifi {
         airport_info()
     } else {
@@ -174,13 +173,17 @@ pub fn scan_all(prefixes: &[String]) -> Vec<NicInfo> {
     let mut out = Vec::new();
     for b in cands {
         let port_name = ports.get(&b.name).cloned().unwrap_or_default();
-        let is_wifi = port_name.contains("Wi-Fi") || port_name.contains("AirPort");
+        let is_wifi = is_wifi_port(&port_name);
         let speed = if is_wifi {
             wifi_rate
         } else {
             probe_speed(&b.name)
         };
-        let band = if is_wifi { wifi_band.clone() } else { String::new() };
+        let band = if is_wifi {
+            wifi_band.clone()
+        } else {
+            String::new()
+        };
         let role = classify_role(&port_name, speed, is_wifi, &band);
         out.push(NicInfo {
             name: b.name.clone(),
