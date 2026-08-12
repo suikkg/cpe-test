@@ -52,6 +52,20 @@ jobs:
             exit 1
           fi
 
+      - name: Verify release tag points to main
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          main_sha="$(git rev-parse 'origin/main^{commit}')"
+          tag_sha="$(git rev-parse '${{ github.sha }}^{commit}')"
+          if [[ "${tag_sha}" != "${main_sha}" ]]; then
+            echo "release tag ${GITHUB_REF_NAME} points to ${tag_sha}, but origin/main points to ${main_sha}" >&2
+            echo "formal releases must be tagged from the current main branch HEAD" >&2
+            exit 1
+          fi
+
       - name: Validate JSON configuration files
         shell: bash
         run: |
