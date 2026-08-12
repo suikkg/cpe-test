@@ -67,14 +67,14 @@ jobs:
           from pathlib import Path
           from zipfile import ZipFile
 
-          bundle = Path("dist/cpe_test-v4.2.4-windows-config-docs.zip")
+          bundle = Path("dist/cpe_test-v4.2.5-windows-config-docs.zip")
           checksum = Path(f"{bundle}.sha256")
           expected_hash = checksum.read_text(encoding="utf-8").split()[0]
           actual_hash = sha256(bundle.read_bytes()).hexdigest()
           if actual_hash != expected_hash:
               raise SystemExit(f"bundle SHA-256 mismatch: {actual_hash}")
 
-          prefix = "cpe_test-v4.2.4-windows-config-docs"
+          prefix = "cpe_test-v4.2.5-windows-config-docs"
           source_for = {
               "Windows配置与文档包说明.md": Path("dist/Windows配置与文档包说明.md"),
               "README.md": Path("README.md"),
@@ -495,6 +495,14 @@ jobs:
           make_latest: true
           body: |
             cpe_test ${{ github.ref_name }} 的已验证跨平台发布包。
+
+            ## v4.2.5 报告可读性、双向汇总与 UDP 语义修复
+
+            - Ping 概览现在明确显示丢包率以及 RTT 最小/平均/最大值，并记录 `PING_OK`；resume 命中记录 `RESUME_FRESH_PASS`，SKIP 不再显示无意义的“不适用”原因。
+            - 逐行诊断恢复截图、实际灌包命令、raw log、NIC CSV 和内嵌原始输出入口；报告在桌面与移动端都保留这些附件，并显示真实资源是否加载。
+            - 双向单元按 AB/BA 分别展示接收端 RX 平均、RX-P10、目标和原因，另给出 AB + BA RX 平均合计；RX-P10 不相加，判定原因会依据当前展示指标复核。
+            - TCP 双向执行行明确为两个方向；UDP 双向区分独立流明细和方向组合计。Windows UDP client 使用 `-b`，并发由独立 client 实现，不使用 `-P`。
+            - UDP resume identity 升级为 `iperf_v4`，避免旧统计窗口语义的 PASS 被错误复用。
 
             ## v4.2.4 时间轴、安全与报告归档修复
 

@@ -33,6 +33,12 @@ pub struct Config {
     /// Windows 专用 ctsTraffic 后端的简化默认参数。
     pub ctstraffic: CtsTrafficCfg,
     pub ping: PingCfg,
+    /// 自动配对生成测试：字符串 "all" 或具体角色对列表
+    #[serde(default)]
+    pub pairs: Option<Pairs>,
+    /// pairs 模式下的统一测试参数
+    #[serde(default)]
+    pub universal_params: Option<UniversalParams>,
     pub tests: Vec<TestSpec>,
 }
 
@@ -109,6 +115,8 @@ impl Default for Config {
             iperf: IperfCfg::default(),
             ctstraffic: CtsTrafficCfg::default(),
             ping: PingCfg::default(),
+            pairs: None,
+            universal_params: None,
             tests: Vec::new(),
         }
     }

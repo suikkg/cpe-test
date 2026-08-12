@@ -135,6 +135,7 @@ impl SpecNorm {
 pub struct IperfTask {
     pub v6: bool,
     pub udp: bool,
+    pub profile_name: String,
     pub profile_label: String,
     pub src: Endpoint,
     pub dst: Endpoint,
@@ -390,18 +391,21 @@ pub struct V6Addrs {
 /// 选 v6 地址：两端都有 fe80 优先用 fe80（CPE 局域网标准场景），否则都有全局地址用全局
 /// v6 地址一律不带 %zone：Windows iperf3/ping 都不接受 %xx 语法
 pub fn v6_addrs(src: &NicInfo, dst: &NicInfo) -> Option<V6Addrs> {
-    let (client_bind, client_target) = if !src.ipv6_ll.is_empty() && !dst.ipv6_ll.is_empty() {
-        (src.ipv6_ll.clone(), dst.ipv6_ll.clone())
+    if !src.ipv6_ll.is_empty() && !dst.ipv6_ll.is_empty() {
+        Some(V6Addrs {
+            client_bind: src.ipv6_ll.clone(),
+            client_target: dst.ipv6_ll.clone(),
+            server_bind: dst.ipv6_ll.clone(),
+        })
     } else if !src.ipv6_global.is_empty() && !dst.ipv6_global.is_empty() {
-        (src.ipv6_global.clone(), dst.ipv6_global.clone())
+        Some(V6Addrs {
+            client_bind: src.ipv6_global.clone(),
+            client_target: dst.ipv6_global.clone(),
+            server_bind: dst.ipv6_global.clone(),
+        })
     } else {
-        return None;
-    };
-    Some(V6Addrs {
-        server_bind: client_target.clone(),
-        client_bind,
-        client_target,
-    })
+        None
+    }
 }
 
 /// 解析 "master:SGMII2.5G" / "agent:NAME=以太网 2" 为具体端点
@@ -598,29 +602,6 @@ fn dir_pairs<'a>(spec: &'a SpecNorm, dir: &str) -> Vec<(&'a Endpoint, &'a Endpoi
         "ba" => vec![(&spec.dst, &spec.src, "")],
         "bidir" => vec![(&spec.src, &spec.dst, "ab"), (&spec.dst, &spec.src, "ba")],
         _ => vec![],
-    }
-}
-
-fn map_legs<F>(pairs: &[(&Endpoint, &Endpoint, &'static str)], mut kind: F) -> Vec<Leg>
-where
-    F: FnMut(&Endpoint, &Endpoint) -> LegKind,
-{
-    pairs
-        .iter()
-        .map(|(src, dst, tag)| Leg {
-            tag: (*tag).into(),
-            kind: kind(src, dst),
-        })
-        .collect()
-}
-
-fn unit(id: String, title: String, bidir: bool, legs: Vec<Leg>, est_secs: u64) -> Unit {
-    Unit {
-        id,
-        title,
-        bidir,
-        legs,
-        est_secs,
     }
 }
 
@@ -883,16 +864,66 @@ fn udp_resume_unit_id_with_schema(
     md5_hex(&identity)
 }
 
-/// UDP resume ID schema v3：覆盖实际 offered load、裁剪后的流数、方向目标、模式、
-/// socket buffer 和全部验收阈值。v1/v2 历史 PASS 因 schema 前缀变化不会再被错误复用。
-fn udp_resume_unit_id_v3(
+/// UDP resume ID schema v4：除覆盖实际 offered load、裁剪后的流数、方向目标、模式、
+/// socket buffer 和全部验收阈值外，也隔离使用旧流量窗口作为背景截止点的 v3 结果。
+fn udp_resume_unit_id_v4(
     spec: &SpecNorm,
     ip_tag: &str,
     direction: &str,
     profile: &UdpProfile,
     legs: &[Leg],
 ) -> String {
-    udp_resume_unit_id_with_schema("iperf_v3", true, spec, ip_tag, direction, profile, legs)
+    udp_resume_unit_id_with_schema("iperf_v4", true, spec, ip_tag, direction, profile, legs)
+}
+
+/// TCP resume identity includes the resolved RX target and rate policy.  The
+/// v1 identity predates NIC-RX validation, so reusing it could silently skip
+/// a result produced under the old, tool-only PASS rule.
+fn tcp_resume_unit_id_v2(
+    spec: &SpecNorm,
+    ip_tag: &str,
+    direction: &str,
+    profile: &str,
+    legs: &[Leg],
+) -> String {
+    let mut identity = "iperf_tcp_v2".to_string();
+    push_resume_field(&mut identity, "transport", "tcp");
+    push_resume_field(&mut identity, "ip", ip_tag);
+    push_resume_field(&mut identity, "direction", direction);
+    push_resume_field(&mut identity, "duration", &spec.duration.to_string());
+    push_resume_field(&mut identity, "profile", profile);
+    push_resume_field(
+        &mut identity,
+        "configured_rate_mode",
+        rate_mode_identity(spec.rate_mode),
+    );
+    push_rate_targets_identity(&mut identity, "scenario_targets", &spec.rate_targets);
+    push_rate_check_identity(&mut identity, &spec.rate_check);
+    push_endpoint_identity(&mut identity, "spec.src", &spec.src);
+    push_endpoint_identity(&mut identity, "spec.dst", &spec.dst);
+    push_resume_field(&mut identity, "leg_count", &legs.len().to_string());
+    for (leg_idx, leg) in legs.iter().enumerate() {
+        let prefix = format!("leg.{leg_idx}");
+        push_resume_field(&mut identity, &format!("{prefix}.tag"), &leg.tag);
+        match &leg.kind {
+            LegKind::IperfSingle(task) => {
+                push_resume_field(&mut identity, &format!("{prefix}.kind"), "single");
+                push_iperf_task_identity(&mut identity, &format!("{prefix}.stream.0"), task);
+            }
+            LegKind::IperfGroup { streams, .. } => {
+                push_resume_field(&mut identity, &format!("{prefix}.kind"), "group");
+                for (stream_idx, task) in streams.iter().enumerate() {
+                    push_iperf_task_identity(
+                        &mut identity,
+                        &format!("{prefix}.stream.{stream_idx}"),
+                        task,
+                    );
+                }
+            }
+            _ => push_resume_field(&mut identity, &format!("{prefix}.kind"), "invalid"),
+        }
+    }
+    md5_hex(&identity)
 }
 
 fn cts_window_bytes(value: &str) -> Result<Option<u32>, String> {
@@ -1025,8 +1056,8 @@ fn cts_resume_unit_id_with_schema(
 }
 
 fn cts_resume_unit_id(spec: &SpecNorm, ip_tag: &str, direction: &str, legs: &[Leg]) -> String {
-    // v2 使时间轴对齐、真实流量窗口和 monitor 错误语义上线前的 PASS 失效。
-    cts_resume_unit_id_with_schema("ctstraffic_v2", spec, ip_tag, direction, legs)
+    // v3 吸收共享 RX-P10/rolling coverage 判定；v2 结果不能跨判定语义复用。
+    cts_resume_unit_id_with_schema("ctstraffic_v3", spec, ip_tag, direction, legs)
 }
 
 /// 生成全部任务单元。返回 (units, 提示信息列表)
@@ -1086,12 +1117,25 @@ pub fn build_units(
                                     let plabel = format!("TCP -w {} -P {}", w, tcp_streams);
                                     let mut legs = Vec::new();
                                     for (s, d, tag) in &pairs {
+                                        let flow_direction =
+                                            if bidir { tag.to_string() } else { dir.clone() };
+                                        let target = rate::resolve_target_mbps(
+                                            spec.rate_mode,
+                                            &spec.rate_targets,
+                                            &flow_direction,
+                                            &s.nic,
+                                            &d.nic,
+                                            &spec.rate_check,
+                                        );
+                                        let effective_mode =
+                                            rate::effective_mode(spec.rate_mode, target);
                                         let t = IperfTask {
                                             v6,
                                             udp: false,
+                                            profile_name: pname.clone(),
                                             profile_label: plabel.clone(),
-                                            src: src.clone(),
-                                            dst: dst.clone(),
+                                            src: (*s).clone(),
+                                            dst: (*d).clone(),
                                             port: alloc_port(next_port),
                                             duration: spec.duration,
                                             extra: vec![
@@ -1101,8 +1145,8 @@ pub fn build_units(
                                                 tcp_streams.to_string(),
                                             ],
                                             stream_idx: 0,
-                                            rate_mode: spec.rate_mode,
-                                            rx_target_mbps: None,
+                                            rate_mode: effective_mode,
+                                            rx_target_mbps: target,
                                             offered_mbps: None,
                                         };
                                         legs.push(Leg {
@@ -1117,16 +1161,15 @@ pub fn build_units(
                                         plabel,
                                         route_str
                                     );
-                                    let id = md5_hex(&format!(
-                                        "iperf_v1|{}|tcp|{}|{}|{}|{}|{}",
-                                        ip_tag,
-                                        pname,
-                                        spec.duration,
-                                        ep_id(&spec.src),
-                                        ep_id(&spec.dst),
-                                        dir
-                                    ));
-                                    units.push(unit(id, title, bidir, legs, spec.duration + 10));
+                                    let id =
+                                        tcp_resume_unit_id_v2(spec, ip_tag, dir, &pname, &legs);
+                                    units.push(Unit {
+                                        id,
+                                        title,
+                                        bidir,
+                                        legs,
+                                        est_secs: spec.duration + 10,
+                                    });
                                 }
                             } else if tr == "udp" {
                                 if let Some(error) = spec.stream_config_error(true) {
@@ -1237,37 +1280,6 @@ pub fn build_units(
                                             kind,
                                         });
                                     }
-                                    let legs = pairs
-                                        .iter()
-                                        .zip(&leg_streams)
-                                        .map(|((src, dst, tag), &streams)| {
-                                            let task = |stream_idx, port| IperfTask {
-                                                v6,
-                                                udp: true,
-                                                profile_label: plabel.clone(),
-                                                src: (*src).clone(),
-                                                dst: (*dst).clone(),
-                                                port,
-                                                duration: spec.duration,
-                                                extra: extra.clone(),
-                                                stream_idx,
-                                            };
-                                            let kind = if streams <= 1 {
-                                                LegKind::IperfSingle(task(0, alloc_port(next_port)))
-                                            } else {
-                                                LegKind::IperfGroup {
-                                                    name: pname.clone(),
-                                                    streams: (0..streams as usize)
-                                                        .map(|i| task(i, alloc_port(next_port)))
-                                                        .collect(),
-                                                }
-                                            };
-                                            Leg {
-                                                tag: (*tag).into(),
-                                                kind,
-                                            }
-                                        })
-                                        .collect();
                                     let stream_note = if max_n > 1 {
                                         format!(" ×{max_n}流")
                                     } else {
@@ -1277,11 +1289,11 @@ pub fn build_units(
                                         "{}IPERF {} {}{} | {}",
                                         if bidir { "★★双向 " } else { "" },
                                         ip_tag,
-                                        plabel,
+                                        prof.label(),
                                         stream_note,
                                         route_str
                                     );
-                                    let id = udp_resume_unit_id_v3(spec, ip_tag, dir, prof, &legs);
+                                    let id = udp_resume_unit_id_v4(spec, ip_tag, dir, prof, &legs);
                                     // 错峰按单腿最大流数估算：双向双腿并行，不能把
                                     // 两条腿的流数相加。
                                     units.push(Unit {
@@ -1368,6 +1380,18 @@ pub fn build_units(
                                     format!("CTS TCP {window_label} ×{}连接", tcp_streams);
                                 let mut legs = Vec::new();
                                 for (src, dst, tag) in &pairs {
+                                    let flow_direction =
+                                        if bidir { tag.to_string() } else { dir.clone() };
+                                    let target = rate::resolve_target_mbps(
+                                        spec.rate_mode,
+                                        &spec.rate_targets,
+                                        &flow_direction,
+                                        &src.nic,
+                                        &dst.nic,
+                                        &spec.rate_check,
+                                    );
+                                    let effective_mode =
+                                        rate::effective_mode(spec.rate_mode, target);
                                     legs.push(Leg {
                                         tag: tag.to_string(),
                                         kind: LegKind::CtsTraffic(CtsTrafficTask {
@@ -1388,8 +1412,8 @@ pub fn build_units(
                                                 .ctstraffic
                                                 .udp_buffer_depth_secs,
                                             status_update_ms: spec.ctstraffic.status_update_ms,
-                                            rate_mode: spec.rate_mode,
-                                            rx_target_mbps: None,
+                                            rate_mode: effective_mode,
+                                            rx_target_mbps: target,
                                             offered_mbps: None,
                                             setup_error: setup_error.clone(),
                                         }),
@@ -1605,7 +1629,13 @@ pub fn build_units(
                             ep_id(&spec.dst),
                             dir
                         ));
-                        units.push(unit(id, title, bidir, legs, spec.ping_count as u64 + 5));
+                        units.push(Unit {
+                            id,
+                            title,
+                            bidir,
+                            legs,
+                            est_secs: spec.ping_count as u64 + 5,
+                        });
                     }
                 }
             }
@@ -1695,13 +1725,63 @@ mod tests {
         units[0].id.clone()
     }
 
+    fn build_single_iperf_unit(spec: SpecNorm, first_port: u16) -> Unit {
+        let mut port = first_port;
+        let (units, notices) = build_units(&[spec], true, &mut port);
+        assert!(
+            notices.is_empty(),
+            "unexpected builder notices: {notices:?}"
+        );
+        assert_eq!(units.len(), 1);
+        units.into_iter().next().expect("iperf unit")
+    }
+
+    fn build_single_cts_unit(spec: SpecNorm, first_port: u16) -> Unit {
+        let mut port = first_port;
+        let (units, notices) = build_units(&[spec], true, &mut port);
+        assert!(
+            notices.is_empty(),
+            "unexpected builder notices: {notices:?}"
+        );
+        assert_eq!(units.len(), 1);
+        units.into_iter().next().expect("CTS unit")
+    }
+
+    fn build_single_iperf_id(spec: SpecNorm, first_port: u16) -> String {
+        build_single_iperf_unit(spec, first_port).id
+    }
+
+    fn iperf_single_task(unit: &Unit) -> &IperfTask {
+        let LegKind::IperfSingle(task) = &unit.legs[0].kind else {
+            panic!("expect single iperf task")
+        };
+        task
+    }
+
+    fn cts_task(unit: &Unit) -> &CtsTrafficTask {
+        let LegKind::CtsTraffic(task) = &unit.legs[0].kind else {
+            panic!("expect single ctsTraffic task")
+        };
+        task
+    }
+
+    fn set_evb_endpoints(spec: &mut SpecNorm) {
+        spec.src = ep(Side::Master, "usb", "10GUSB", "192.168.1.2", 4200);
+        spec.dst = ep(Side::Agent, "10g", "10GETH", "192.168.1.3", 10000);
+    }
+
+    fn evb_tcp_spec() -> SpecNorm {
+        let mut spec = base_spec();
+        set_evb_endpoints(&mut spec);
+        spec
+    }
+
     #[test]
     fn test_tcp_single() {
         let mut port = PORT_BASE;
         let (units, notices) = build_units(&[base_spec()], true, &mut port);
         assert_eq!(units.len(), 1);
         assert!(notices.is_empty());
-        assert_eq!(units[0].id, "0851c19636f46ddd521a533a5541f7fd");
         assert_eq!(units[0].legs.len(), 1);
         match &units[0].legs[0].kind {
             LegKind::IperfSingle(t) => {
@@ -1710,6 +1790,147 @@ mod tests {
             }
             _ => panic!("wrong kind"),
         }
+    }
+
+    #[test]
+    fn tcp_and_cts_rate_modes_resolve_targets_consistently() {
+        let cases = [
+            (RateMode::Auto, None, RateMode::Observe, None),
+            (RateMode::Auto, Some(4321.0), RateMode::Verify, Some(4321.0)),
+            (RateMode::Verify, None, RateMode::Verify, None),
+            (
+                RateMode::Verify,
+                Some(4321.0),
+                RateMode::Verify,
+                Some(4321.0),
+            ),
+            (RateMode::Observe, Some(4321.0), RateMode::Observe, None),
+            (RateMode::Discover, Some(4321.0), RateMode::Discover, None),
+        ];
+
+        for (configured_mode, configured_target, expected_mode, expected_target) in cases {
+            let mut iperf = base_spec();
+            iperf.rate_mode = configured_mode;
+            iperf.rate_targets.forward = configured_target;
+            let iperf_unit = build_single_iperf_unit(iperf, PORT_BASE);
+            let iperf_task = iperf_single_task(&iperf_unit);
+            assert_eq!(iperf_task.rate_mode, expected_mode);
+            assert_eq!(iperf_task.rx_target_mbps, expected_target);
+
+            let mut cts = cts_spec("tcp");
+            cts.rate_mode = configured_mode;
+            cts.rate_targets.forward = configured_target;
+            let cts_unit = build_single_cts_unit(cts, PORT_BASE);
+            let cts_task_ref = cts_task(&cts_unit);
+            assert_eq!(cts_task_ref.rate_mode, expected_mode);
+            assert_eq!(cts_task_ref.rx_target_mbps, expected_target);
+        }
+    }
+
+    #[test]
+    fn tcp_and_cts_tcp_resolve_evb_targets_per_bidir_direction() {
+        let mut iperf = base_spec();
+        set_evb_endpoints(&mut iperf);
+        iperf.directions = vec!["bidir".into()];
+        let iperf_unit = build_single_iperf_unit(iperf, PORT_BASE);
+        assert_eq!(iperf_unit.legs.len(), 2);
+        for leg in &iperf_unit.legs {
+            let LegKind::IperfSingle(task) = &leg.kind else {
+                panic!("expect TCP single leg")
+            };
+            let expected = if leg.tag == "ab" { 6400.0 } else { 8400.0 };
+            assert_eq!(task.rx_target_mbps, Some(expected), "{} target", leg.tag);
+            assert_eq!(task.rate_mode, RateMode::Verify, "{} mode", leg.tag);
+        }
+
+        let mut cts = cts_spec("tcp");
+        set_evb_endpoints(&mut cts);
+        cts.directions = vec!["bidir".into()];
+        let cts_unit = build_single_cts_unit(cts, PORT_BASE);
+        assert_eq!(cts_unit.legs.len(), 2);
+        for leg in &cts_unit.legs {
+            let LegKind::CtsTraffic(task) = &leg.kind else {
+                panic!("expect CTS TCP leg")
+            };
+            let expected = if leg.tag == "ab" { 6400.0 } else { 8400.0 };
+            assert_eq!(task.rx_target_mbps, Some(expected), "{} target", leg.tag);
+            assert_eq!(task.rate_mode, RateMode::Verify, "{} mode", leg.tag);
+        }
+    }
+
+    #[test]
+    fn tcp_and_cts_tcp_one_way_ba_uses_ba_target_over_forward() {
+        let mut iperf = base_spec();
+        iperf.directions = vec!["ba".into()];
+        iperf.rate_targets.forward = Some(1111.0);
+        iperf.rate_targets.ba = Some(2222.0);
+        let iperf_unit = build_single_iperf_unit(iperf, PORT_BASE);
+        let iperf_task = iperf_single_task(&iperf_unit);
+        assert_eq!(iperf_unit.legs[0].tag, "");
+        assert_eq!(iperf_task.rx_target_mbps, Some(2222.0));
+        assert_eq!(iperf_task.rate_mode, RateMode::Verify);
+
+        let mut cts = cts_spec("tcp");
+        cts.directions = vec!["ba".into()];
+        cts.rate_targets.forward = Some(1111.0);
+        cts.rate_targets.ba = Some(2222.0);
+        let cts_unit = build_single_cts_unit(cts, PORT_BASE);
+        let cts_task_ref = cts_task(&cts_unit);
+        assert_eq!(cts_unit.legs[0].tag, "");
+        assert_eq!(cts_task_ref.rx_target_mbps, Some(2222.0));
+        assert_eq!(cts_task_ref.rate_mode, RateMode::Verify);
+    }
+
+    #[test]
+    fn tcp_resume_v2_ignores_port_and_invalidates_legacy_and_verdict_semantics() {
+        let base = {
+            let mut spec = evb_tcp_spec();
+            spec.rate_mode = RateMode::Auto;
+            spec
+        };
+        let base_id = build_single_iperf_id(base.clone(), PORT_BASE);
+        let legacy_profile = format!(
+            "tcp_w{}_P{}",
+            base.tcp_windows[0],
+            base.effective_tcp_streams()
+        );
+        let legacy_v1_id = md5_hex(&format!(
+            "iperf_v1|V4|tcp|{}|{}|{}|{}|ab",
+            legacy_profile,
+            base.duration,
+            ep_id(&base.src),
+            ep_id(&base.dst),
+        ));
+        assert_ne!(
+            base_id, legacy_v1_id,
+            "TCP RX 目标判定上线后不能复用旧 iperf_v1 PASS"
+        );
+        assert_eq!(
+            base_id,
+            build_single_iperf_id(base.clone(), PORT_BASE + 1000),
+            "临时端口变化不应破坏 TCP resume"
+        );
+
+        let assert_id_changed = |name: &str, change: fn(&mut SpecNorm)| {
+            let mut changed = base.clone();
+            change(&mut changed);
+            assert_ne!(
+                base_id,
+                build_single_iperf_id(changed, PORT_BASE),
+                "{name} 必须使旧 TCP PASS 失效"
+            );
+        };
+        assert_id_changed("scenario target", |spec| {
+            spec.rate_targets.ab = Some(6200.0)
+        });
+        assert_id_changed("configured mode", |spec| spec.rate_mode = RateMode::Verify);
+        assert_id_changed("sample interval", |spec| {
+            spec.rate_check.sample_interval_ms = 500
+        });
+        assert_id_changed("EVB target", |spec| {
+            spec.rate_check.evb_usb_to_eth_target_mbps = 6300.0
+        });
+        assert_id_changed("TCP window", |spec| spec.tcp_windows = vec!["128k".into()]);
     }
 
     #[test]
@@ -2189,6 +2410,17 @@ mod tests {
         let (legacy_units, legacy_notices) =
             build_units(std::slice::from_ref(&base), true, &mut legacy_port);
         assert!(legacy_notices.is_empty());
+        let legacy_v2_id = cts_resume_unit_id_with_schema(
+            "ctstraffic_v2",
+            &base,
+            "V4",
+            "ab",
+            &legacy_units[0].legs,
+        );
+        assert_ne!(
+            base_id, legacy_v2_id,
+            "CTS P10/rolling coverage 判定上线后必须让 v2 PASS 无条件失效"
+        );
         let legacy_v1_id = cts_resume_unit_id_with_schema(
             "ctstraffic_v1",
             &base,
@@ -2270,13 +2502,21 @@ mod tests {
         let (units, _) = build_units(&[spec], true, &mut port);
         assert_eq!(units.len(), 1);
         assert!(units[0].bidir);
-        assert_eq!(units[0].id, "7c52d228bc00b7e34c3e2fac103bbf1d");
         assert_eq!(units[0].legs.len(), 2);
         assert_eq!(units[0].est_secs, 39);
         // 2500/500 = 5 >= 3 允许 3 流
         for leg in &units[0].legs {
             match &leg.kind {
-                LegKind::IperfGroup { streams, .. } => assert_eq!(streams.len(), 3),
+                LegKind::IperfGroup { streams, .. } => {
+                    assert_eq!(streams.len(), 3);
+                    for stream in streams {
+                        assert_eq!(stream.extra, vec!["-b", "500000000"]);
+                        assert!(
+                            !stream.extra.iter().any(|arg| arg == "-P"),
+                            "UDP 并发通过独立 client 实现，单个 client 不得使用 -P"
+                        );
+                    }
+                }
                 _ => panic!("expect group"),
             }
         }
@@ -2567,13 +2807,26 @@ mod tests {
     }
 
     #[test]
-    fn test_udp_resume_v3_ignores_runtime_port_but_tracks_verdict_semantics() {
+    fn test_udp_resume_v4_ignores_runtime_port_but_tracks_verdict_semantics() {
         let base = evb_udp_spec();
         let base_id = build_single_udp_id(base.clone(), PORT_BASE);
         let mut legacy_port = PORT_BASE;
         let (legacy_units, legacy_notices) =
             build_units(std::slice::from_ref(&base), true, &mut legacy_port);
         assert!(legacy_notices.is_empty());
+        let legacy_v3_id = udp_resume_unit_id_with_schema(
+            "iperf_v3",
+            true,
+            &base,
+            "V4",
+            "ab",
+            &base.udp_profiles[0],
+            &legacy_units[0].legs,
+        );
+        assert_ne!(
+            base_id, legacy_v3_id,
+            "Started 基线语义上线后，v4 必须让 v3 PASS 无条件失效"
+        );
         let legacy_v2_id = udp_resume_unit_id_with_schema(
             "iperf_v2",
             false,
@@ -2585,7 +2838,7 @@ mod tests {
         );
         assert_ne!(
             base_id, legacy_v2_id,
-            "v3 必须让 v2 schema 下缓存的 PASS 无条件失效"
+            "v4 必须让 v2 schema 下缓存的 PASS 无条件失效"
         );
         let legacy_v1_id = md5_hex(&format!(
             "iperf_v1|V4|udp|{}|{}|{}|{}|{}|ab",
@@ -2597,7 +2850,7 @@ mod tests {
         ));
         assert_ne!(
             base_id, legacy_v1_id,
-            "v3 必须让 v1 schema 下缓存的 PASS 无条件失效"
+            "v4 必须让 v1 schema 下缓存的 PASS 无条件失效"
         );
         assert_eq!(
             base_id,
@@ -2667,7 +2920,7 @@ mod tests {
     }
 
     #[test]
-    fn test_udp_resume_v3_tracks_effective_leg_shape() {
+    fn test_udp_resume_v4_tracks_effective_leg_shape() {
         let mut base = evb_udp_spec();
         base.src = ep(Side::Master, "rndis", "RNDIS", "192.168.1.2", 3700);
         base.rate_mode = RateMode::Observe;

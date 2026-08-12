@@ -52,11 +52,11 @@ pub fn parse(text: &str) -> Vec<IpcfgAdapter> {
             continue;
         }
         let Some(a) = cur.as_mut() else { continue };
-        let Some((_, [key, val])) = field_re.captures(line).map(|cap| cap.extract()) else {
+        let Some(cap) = field_re.captures(line) else {
             continue;
         };
-        let key = key.trim();
-        let val = val.trim();
+        let key = cap.get(1).map(|m| m.as_str()).unwrap_or("").trim();
+        let val = cap.get(2).map(|m| m.as_str()).unwrap_or("").trim();
         if val.is_empty() {
             continue;
         }
@@ -103,11 +103,22 @@ pub fn parse(text: &str) -> Vec<IpcfgAdapter> {
 
 /// 从头部行提取适配器名
 fn adapter_name(head: &str) -> Option<String> {
-    let suffix = |haystack: &str, marker: &str| {
-        let name = head[haystack.find(marker)? + marker.len()..].trim();
-        (!name.is_empty()).then(|| name.to_string())
-    };
-    suffix(head, "适配器 ").or_else(|| suffix(&head.to_lowercase(), " adapter "))
+    if let Some(idx) = head.find("适配器 ") {
+        let name = &head[idx + "适配器 ".len()..];
+        let n = name.trim();
+        if !n.is_empty() {
+            return Some(n.to_string());
+        }
+    }
+    let low = head.to_lowercase();
+    if let Some(idx) = low.find(" adapter ") {
+        let name = &head[idx + " adapter ".len()..];
+        let n = name.trim();
+        if !n.is_empty() {
+            return Some(n.to_string());
+        }
+    }
+    None
 }
 
 fn strip_paren(v: &str) -> String {

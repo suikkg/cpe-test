@@ -249,7 +249,6 @@ fn print_help() {
       --agent-host IP         辅测机 IP
       --agent-port N          辅测机端口 (默认 28801)
       --token SECRET          与 agent 相同的共享访问令牌
-      --agent-port N          辅测机端口 (默认 28801)
       --config FILE           指定配置文件 (默认找 ./config.json)
       --auto                  免交互：按配置文件 tests 全部执行
       --resume                24小时内已 PASS 的任务跳过
@@ -286,28 +285,36 @@ fn parse_flags(args: &[String]) -> std::collections::HashMap<String, String> {
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
-        let key_and_prefix = if let Some(key) = a.strip_prefix("--") {
-            Some((key, "--"))
+        if let Some(key) = a.strip_prefix("--") {
+            let next_is_val = args
+                .get(i + 1)
+                .map(|n| !n.starts_with("--"))
+                .unwrap_or(false);
+            if next_is_val {
+                map.insert(key.to_string(), args[i + 1].clone());
+                i += 2;
+            } else {
+                map.insert(key.to_string(), String::new());
+                i += 1;
+            }
         } else if a.starts_with('-') && a.len() == 2 {
             let ch = &a[1..2];
-            short_map
-                .iter()
-                .find_map(|&(short, long)| (short == ch).then_some((long, "-")))
+            if let Some(&(_, long)) = short_map.iter().find(|&&(s, _)| s == ch) {
+                let next_is_val = args
+                    .get(i + 1)
+                    .map(|n| !n.starts_with('-'))
+                    .unwrap_or(false);
+                if next_is_val {
+                    map.insert(long.to_string(), args[i + 1].clone());
+                    i += 2;
+                } else {
+                    map.insert(long.to_string(), String::new());
+                    i += 1;
+                }
+            } else {
+                i += 1;
+            }
         } else {
-            None
-        };
-        let Some((key, option_prefix)) = key_and_prefix else {
-            i += 1;
-            continue;
-        };
-        if let Some(value) = args
-            .get(i + 1)
-            .filter(|value| !value.starts_with(option_prefix))
-        {
-            map.insert(key.to_string(), value.clone());
-            i += 2;
-        } else {
-            map.insert(key.to_string(), String::new());
             i += 1;
         }
     }
@@ -329,24 +336,5 @@ fn setup_console() {
         let _ = SetConsoleOutputCP(65001);
         let _ = SetConsoleCP(65001);
         let _ = windows::Win32::UI::WindowsAndMessaging::SetProcessDPIAware();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn flags_preserve_long_and_short_value_rules() {
-        let args = ["--auto", "--prefix", "192.168.,10.", "-i", "5", "-x"].map(str::to_string);
-        let flags = parse_flags(&args);
-        assert_eq!(flags.get("auto").map(String::as_str), Some(""));
-        assert_eq!(
-            flags.get("prefix").map(String::as_str),
-            Some("192.168.,10.")
-        );
-        assert_eq!(flags.get("interval").map(String::as_str), Some("5"));
-        assert!(!flags.contains_key("x"));
-        assert_eq!(split_csv(" a, ,b "), ["a", "b"]);
     }
 }

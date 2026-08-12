@@ -1,6 +1,4 @@
-//! 解析 `netsh wlan show interfaces`（Windows WiFi 频段/状态，中英文兼容）
-
-#![cfg_attr(not(windows), allow(dead_code))]
+//! 解析 `netsh wlan show interfaces`（Windows WiFi 频段/SSID/状态，中英文兼容）
 
 #[cfg(windows)]
 use crate::util::run_cmd;
@@ -14,6 +12,7 @@ pub struct WlanInfo {
     pub name: String,
     /// 规范化频段："2.4GHz" / "5GHz" / "6GHz" / ""
     pub band: String,
+    pub ssid: String,
     pub connected: bool,
 }
 
@@ -32,11 +31,11 @@ pub fn parse(text: &str) -> Vec<WlanInfo> {
     let mut out: Vec<WlanInfo> = Vec::new();
     let mut cur: Option<WlanInfo> = None;
     for line in text.lines() {
-        let Some((_, [key, val])) = kv.captures(line).map(|cap| cap.extract()) else {
+        let Some(cap) = kv.captures(line) else {
             continue;
         };
-        let key = key.trim();
-        let val = val.trim();
+        let key = cap.get(1).map(|m| m.as_str()).unwrap_or("").trim();
+        let val = cap.get(2).map(|m| m.as_str()).unwrap_or("").trim();
         let key_l = key.to_lowercase();
         if key_l == "name" || key == "名称" {
             if let Some(w) = cur.take() {
@@ -120,6 +119,7 @@ mod tests {
         assert_eq!(v[0].name, "WLAN");
         assert!(v[0].connected);
         assert_eq!(v[0].band, "5GHz");
+        assert_eq!(v[0].ssid, "CPE_TEST_5G");
     }
 
     const SAMPLE_EN: &str = r#"

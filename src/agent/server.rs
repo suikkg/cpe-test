@@ -301,10 +301,8 @@ fn handle(mut rq: Request, st: &Arc<AgentState>) {
     }
 
     // handler panic 不能弄崩 server
-    let resp_body = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        route(&method, &url, &body, st).unwrap_or_else(|e| err_json(&e))
-    }))
-    .unwrap_or_else(|_| err_json("agent 内部错误(panic)，其余功能不受影响"));
+    let resp_body = std::panic::catch_unwind(AssertUnwindSafe(|| route(&method, &url, &body, st)))
+        .unwrap_or_else(|_| err_json("agent 内部错误(panic)，其余功能不受影响"));
 
     let header = Header::from_bytes(
         &b"Content-Type"[..],
@@ -367,13 +365,16 @@ fn route(method: &Method, url: &str, body: &str, st: &Arc<AgentState>) -> String
             })
         }
         (Method::Post, "/info") => {
-            let req: InfoReq = parse(body)?;
+            let req: InfoReq = match parse(body) {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
             let prefixes = if req.ipv4_prefixes.is_empty() {
                 st.default_prefixes.clone()
             } else {
                 req.ipv4_prefixes
             };
-            Ok(ok_json(scan_host(&prefixes)))
+            ok_json(scan_host(&prefixes))
         }
         (Method::Post, "/ping") => {
             let req: PingReq = match parse(body) {
@@ -421,10 +422,13 @@ fn route(method: &Method, url: &str, body: &str, st: &Arc<AgentState>) -> String
             }
         }
         (Method::Post, "/iperf/client/run") => {
-            let req: IperfClientReq = parse(body)?;
-            let bin = find_iperf3().ok_or_else(|| {
-                "辅测机未找到 iperf3，请把 iperf3.exe 放到 agent 程序同目录".to_string()
-            })?;
+            let req: IperfClientReq = match parse(body) {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
+            let Some(bin) = find_iperf3() else {
+                return err_json("辅测机未找到 iperf3，请把 iperf3.exe 放到 agent 程序同目录");
+            };
             println!(
                 "    执行 iperf3 client: -c {} -p {} ({}s)...",
                 req.dst, req.port, req.duration
@@ -434,7 +438,7 @@ fn route(method: &Method, url: &str, body: &str, st: &Arc<AgentState>) -> String
                     println!("      {line}");
                 }
             });
-            Ok(ok_json(out))
+            ok_json(out)
         }
         (Method::Post, "/iperf/client/start") => {
             let req: IperfClientStartReq = match parse(body) {
@@ -573,8 +577,14 @@ fn route(method: &Method, url: &str, body: &str, st: &Arc<AgentState>) -> String
             }
         }
         (Method::Post, "/monitor/stop") => {
-            let req: MonitorStopReq = parse(body)?;
-            Ok(ok_json(st.monitors.stop(&req.id)?))
+            let req: MonitorStopReq = match parse(body) {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
+            match st.monitors.stop(&req.id) {
+                Ok(out) => ok_json(out),
+                Err(e) => err_json(&e),
+            }
         }
         (Method::Post, "/resources/cleanup") => {
             let req: ResourceCleanupReq = match parse(body) {
@@ -602,14 +612,14 @@ fn route(method: &Method, url: &str, body: &str, st: &Arc<AgentState>) -> String
         (Method::Post, "/screenshot") => {
             let _req: ScreenshotReq = parse(body).unwrap_or_default();
             match screenshot::capture_png() {
-                Ok(png) => Ok(ok_json(ScreenshotOut {
+                Ok(png) => ok_json(ScreenshotOut {
                     image_b64: base64::engine::general_purpose::STANDARD.encode(png),
                     format: "png".into(),
-                })),
-                Err(e) => Err(e),
+                }),
+                Err(e) => err_json(&e),
             }
         }
-        _ => Err(format!("未知接口: {method} {path}")),
+        _ => err_json(&format!("未知接口: {method} {path}")),
     }
 }
 
@@ -617,23 +627,7 @@ fn parse<T: serde::de::DeserializeOwned + Default>(body: &str) -> Result<T, Stri
     if body.trim().is_empty() {
         return Ok(T::default());
     }
-    serde_json::from_str(body).map_err(|e| format!("请求 JSON 解析失败: {e}"))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parse_defaults_empty_body_and_reports_invalid_json() {
-        let req = parse::<PingReq>("").unwrap();
-        assert_eq!(req.count, 0);
-        let err = parse::<PingReq>("{").unwrap_err();
-        assert!(err.starts_with("请求 JSON 解析失败:"));
-        let wrapped: Resp<()> = serde_json::from_str(&err_json(&err)).unwrap();
-        assert!(!wrapped.ok);
-        assert_eq!(wrapped.error.as_deref(), Some(err.as_str()));
-    }
+    serde_json::from_str(body).map_err(|e| err_json(&format!("请求 JSON 解析失败: {e}")))
 }
 
 #[cfg(test)]

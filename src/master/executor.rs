@@ -14,7 +14,9 @@ use crate::master::builder::{
 use crate::nic::monitor::{MonitorMgr, MIN_VALID_RX_MBPS};
 use crate::ping;
 use crate::protocol::*;
-use crate::report::{ExecutionStatus, Row, Verdict};
+use crate::report::{
+    report_endpoint, report_reason, DirectionSummary, ExecutionStatus, Row, StreamCounts, Verdict,
+};
 use crate::util::{find_ctstraffic, find_iperf3, logln, md5_hex, now_compact, now_full, sanitize};
 use base64::Engine;
 use serde::de::DeserializeOwned;
@@ -217,7 +219,6 @@ pub struct IperfPreflightBlock {
     pub reason_detail: String,
 }
 
-#[derive(Default)]
 struct LegOutcome {
     verdict: Verdict,
     reason_code: String,
@@ -1351,9 +1352,6 @@ impl Ctx {
 
     /// 两端都尝试截图，任一成功就保存。返回报告用相对路径（多个用分号隔开）
     fn take_screenshots(&self, sides: &[Side], label: &str) -> (String, String) {
-        if !self.cfg.screenshot {
-            return Default::default();
-        }
         let mut master = String::new();
         let mut agent = String::new();
         for side in sides.iter() {
@@ -1432,7 +1430,6 @@ impl Ctx {
                         }
                     }
                 }
-                Err(_) => continue,
             };
             let (tag, ref mut out_path) = match side {
                 Side::Master => ("_master", &mut master),
@@ -1622,6 +1619,10 @@ impl Ctx {
                         task: unit.title.clone(),
                         verdict: Verdict::Skip,
                         execution_status: ExecutionStatus::Skipped,
+                        reason_code: "RESUME_FRESH_PASS".into(),
+                        reason_detail: format!(
+                            "复用 {t} 的正式 PASS；本轮启用 resume，且结果未超过 {RESUME_MAX_AGE_HOURS} 小时，因此跳过执行"
+                        ),
                         kind_label: format!("跳过(上次PASS: {t})"),
                         is_unit_summary: true,
                         ..Default::default()
@@ -1713,24 +1714,8 @@ impl Ctx {
 
             // 双向：互填「对向接收 Mbps」
             if unit.bidir {
-                let ab = outcomes
-                    .iter()
-                    .position(|outcome| outcome.tag.eq_ignore_ascii_case("ab"));
-                let ba = outcomes
-                    .iter()
-                    .position(|outcome| outcome.tag.eq_ignore_ascii_case("ba"));
                 let mut g = self.rows.lock().unwrap();
-                if let (Some(ab), Some(ba)) = (ab, ba) {
-                    for (me, other) in [(ab, ba), (ba, ab)] {
-                        if let Some(rx) = outcomes[other].rx_avg {
-                            for ri in &outcomes[me].main_rows {
-                                if let Some(row) = g.get_mut(*ri) {
-                                    row.peer_rx = format!("{:.3}({})", rx, outcomes[other].tag);
-                                }
-                            }
-                        }
-                    }
-                }
+                populate_peer_rx(&mut g, &outcomes);
             }
 
             let unit_verdict = aggregate_unit_verdict(&outcomes);
@@ -1764,7 +1749,11 @@ impl Ctx {
             }
             let reasons: Vec<String> = outcomes
                 .iter()
-                .filter(|outcome| outcome.verdict != Verdict::Pass)
+                .filter(|outcome| {
+                    outcome.verdict != Verdict::Pass
+                        || !outcome.reason_code.is_empty()
+                        || !outcome.reason_detail.is_empty()
+                })
                 .map(|outcome| {
                     format!(
                         "{}:{} {}",
@@ -1778,6 +1767,11 @@ impl Ctx {
                     )
                 })
                 .collect();
+            let direction_summaries = self.direction_summaries(&outcomes);
+            let single_direction = (direction_summaries.len() == 1)
+                .then(|| direction_summaries.first())
+                .flatten();
+            let stream_counts = aggregate_direction_streams(&direction_summaries);
             logln(&format!("  ==> 单元结果: {}", unit_verdict.label()));
             self.push_row(Row {
                 sort_key: (useq, usize::MAX, usize::MAX, u8::MAX),
@@ -1800,6 +1794,19 @@ impl Ctx {
                 } else {
                     "测试单元汇总".into()
                 },
+                requested_streams: stream_counts.map_or(0, |counts| counts.requested),
+                active_streams: stream_counts.map_or(0, |counts| counts.active),
+                required_streams: stream_counts.map_or(0, |counts| counts.required),
+                rx_avg: single_direction.and_then(|direction| direction.rx_avg),
+                rx_p10: single_direction.and_then(|direction| direction.rx_p10),
+                target_mbps: single_direction.and_then(|direction| direction.target_mbps),
+                sample_coverage: single_direction.and_then(|direction| direction.sample_coverage),
+                udp_loss: single_direction.and_then(|direction| direction.udp_loss),
+                ping_loss: single_direction.and_then(|direction| direction.ping_loss),
+                ping_min: single_direction.and_then(|direction| direction.ping_min),
+                ping_avg: single_direction.and_then(|direction| direction.ping_avg),
+                ping_max: single_direction.and_then(|direction| direction.ping_max),
+                direction_summaries,
                 is_unit_summary: true,
                 ..Default::default()
             });
@@ -1824,6 +1831,56 @@ impl Ctx {
                     .unwrap_or(false)
             })
         })
+    }
+
+    fn direction_summaries(&self, outcomes: &[LegOutcome]) -> Vec<DirectionSummary> {
+        let rows = self.rows.lock().unwrap();
+        outcomes
+            .iter()
+            .filter_map(|outcome| {
+                let row = outcome
+                    .main_rows
+                    .iter()
+                    .filter_map(|index| rows.get(*index))
+                    .max_by_key(|row| {
+                        u8::from(row.is_grouptotal) * 8
+                            + u8::from(row.rx_p10.is_some()) * 4
+                            + u8::from(row.rx_avg.is_some()) * 2
+                            + u8::from(row.sample_coverage.is_some())
+                    })?;
+                let streams = (row.requested_streams > 0
+                    || row.active_streams > 0
+                    || row.required_streams > 0)
+                    .then_some(StreamCounts {
+                        requested: row.requested_streams,
+                        active: row.active_streams,
+                        required: row.required_streams,
+                    });
+                Some(DirectionSummary {
+                    tag: if outcome.tag.is_empty() {
+                        "单向".into()
+                    } else {
+                        outcome.tag.to_ascii_uppercase()
+                    },
+                    src: report_endpoint(&row.src_pc, &row.src_iface, &row.src_ip),
+                    dst: report_endpoint(&row.dst_pc, &row.dst_iface, &row.dst_ip),
+                    verdict: outcome.verdict,
+                    reason_code: outcome.reason_code.clone(),
+                    reason_detail: outcome.reason_detail.clone(),
+                    reason: report_reason(&outcome.reason_code, &outcome.reason_detail),
+                    streams,
+                    rx_avg: row.rx_avg,
+                    rx_p10: row.rx_p10,
+                    target_mbps: row.target_mbps,
+                    sample_coverage: row.sample_coverage,
+                    udp_loss: row.udp_loss,
+                    ping_loss: row.ping_loss,
+                    ping_min: row.ping_min,
+                    ping_avg: row.ping_avg,
+                    ping_max: row.ping_max,
+                })
+            })
+            .collect()
     }
 
     fn ensure_traffic_outcome_rows(
@@ -2145,8 +2202,8 @@ impl Ctx {
         let (src_addr, dst_addr) = if t.v6 {
             match v6_addrs(&t.src.nic, &t.dst.nic) {
                 Some(v) => {
-                    let bind = add_zone(&v.client_bind, &t.src.nic.zone);
-                    let target = add_zone(&v.client_target, &t.src.nic.zone);
+                    let bind = add_zone(&v.client_bind, &t.src.nic.zone, t.src.side);
+                    let target = add_zone(&v.client_target, &t.src.nic.zone, t.src.side);
                     (bind, target)
                 }
                 None => (String::new(), String::new()),
@@ -2238,7 +2295,7 @@ impl Ctx {
         } else if exec_kind.is_some() {
             "PING_EXEC_ERROR"
         } else if out.ok {
-            ""
+            "PING_OK"
         } else {
             match t.purpose {
                 PingPurpose::SubnetTest => "PING_UNREACHABLE",
@@ -2255,7 +2312,15 @@ impl Ctx {
         } else if let Some(detail) = exec_detail {
             detail
         } else if out.ok {
-            String::new()
+            format!(
+                "Ping 连通：发送/接收={}/{}，丢包率 {:.1}%，RTT 最小/平均/最大={}/{}/{} ms",
+                out.sent,
+                out.received,
+                out.loss_pct,
+                format_ping_rtt(out.rtt_min),
+                format_ping_rtt(out.rtt_avg),
+                format_ping_rtt(out.rtt_max)
+            )
         } else {
             format!(
                 "Ping 命令正常完成，但未收到目标 Echo Reply（收/发={}/{}，丢包率 {:.1}%）",
@@ -2313,8 +2378,14 @@ impl Ctx {
             reason_detail: reason_detail.clone(),
             kind_label,
             ping_loss: (!gateway_missing && exec_kind.is_none()).then_some(out.loss_pct),
+            ping_min: (!gateway_missing && exec_kind.is_none())
+                .then_some(out.rtt_min)
+                .flatten(),
             ping_avg: (!gateway_missing && exec_kind.is_none())
                 .then_some(out.rtt_avg)
+                .flatten(),
+            ping_max: (!gateway_missing && exec_kind.is_none())
+                .then_some(out.rtt_max)
                 .flatten(),
             command: out.cmd.clone(),
             raws: vec![(format!("ping{} 输出", fmt_tag(tag)), raw_text)],
@@ -2907,7 +2978,7 @@ impl Ctx {
                 .as_ref()
                 .and_then(|output| cts_monitor_runtime_issue(output, &selected.traffic_window));
         }
-        let baseline_cutoff_ms = cts_baseline_cutoff_ms(&attempts, selected);
+        let baseline_cutoff_ms = cts_baseline_cutoff_ms(&attempts);
         let rx_stats = mon_out
             .as_ref()
             .map(|output| {
@@ -3086,49 +3157,8 @@ impl Ctx {
                     loss_limit.unwrap_or_default()
                 ),
             )
-        } else if task.rx_target_mbps.is_none() && task.rate_mode == RateMode::Verify {
-            (
-                Verdict::NotEvaluated,
-                "TARGET_MISSING".to_string(),
-                "verify 模式必须配置 rate_targets_mbps，当前路径也没有自动目标".into(),
-            )
-        } else if task.rx_target_mbps.is_none() {
-            (
-                Verdict::Measured,
-                "TARGET_UNKNOWN".to_string(),
-                "ctsTraffic 已完成测量；未配置可信目标，因此不伪造 PASS/FAIL".into(),
-            )
-        } else if rx_stats.coverage < MIN_RATE_SAMPLE_COVERAGE {
-            (
-                Verdict::NotEvaluated,
-                "SAMPLE_COVERAGE_LOW".to_string(),
-                format!(
-                    "CTS client 实际运行窗口内的接收端网卡采样覆盖率 {:.1}%，低于 {:.1}%",
-                    rx_stats.coverage * 100.0,
-                    MIN_RATE_SAMPLE_COVERAGE * 100.0
-                ),
-            )
-        } else if rx_avg
-            .zip(task.rx_target_mbps)
-            .is_some_and(|(actual, target)| actual >= target)
-        {
-            (Verdict::Pass, String::new(), String::new())
-        } else if rx_avg.is_none() {
-            (
-                Verdict::NotEvaluated,
-                "NIC_RATE_MISSING".to_string(),
-                "缺少接收端 OS 网卡速率，不能验证目标".into(),
-            )
         } else {
-            (
-                Verdict::RateFail,
-                "RX_BELOW_TARGET".to_string(),
-                format!(
-                    "RX平均 {} 低于目标 {}",
-                    fmt_opt(rx_avg),
-                    fmt_opt(task.rx_target_mbps)
-                ),
-            )
+            evaluate_nic_rx(task.rate_mode, task.rx_target_mbps, &rx_stats)
         };
         let mut raw_diagnostics = Vec::new();
         if !reason_code.is_empty() {
@@ -3562,11 +3592,10 @@ impl Ctx {
             );
         let effective_window =
             iperf_effective_window(&events, t.duration, parsed.has_measurement());
+        let baseline_cutoff_ms = iperf_baseline_cutoff_ms(&events);
         let rx_stats = mon_out
             .as_ref()
-            .map(|output| {
-                monitor_rate_stats(output, &effective_window, true, effective_window.start_ms)
-            })
+            .map(|output| monitor_rate_stats(output, &effective_window, true, baseline_cutoff_ms))
             .unwrap_or_default();
         let rx_avg = rx_stats.avg_mbps;
         let nic_samples = mon_out
@@ -3604,24 +3633,8 @@ impl Ctx {
                     effective_window.available_secs, t.duration
                 ),
             )
-        } else if rx_avg.is_none() {
-            (
-                Verdict::NotEvaluated,
-                "IPERF_NIC_RATE_MISSING".to_string(),
-                "有效流量窗口内没有可用的接收端 OS 网卡速率样本".into(),
-            )
-        } else if rx_stats.coverage < MIN_RATE_SAMPLE_COVERAGE {
-            (
-                Verdict::NotEvaluated,
-                "IPERF_SAMPLE_COVERAGE_LOW".to_string(),
-                format!(
-                    "iperf3 有效流量窗口内的接收端网卡采样覆盖率 {:.1}%，低于 {:.1}%",
-                    rx_stats.coverage * 100.0,
-                    MIN_RATE_SAMPLE_COVERAGE * 100.0
-                ),
-            )
         } else {
-            (Verdict::Pass, String::new(), String::new())
+            evaluate_nic_rx(t.rate_mode, t.rx_target_mbps, &rx_stats)
         };
         let raw_error = if raw_ok {
             String::new()
@@ -3708,6 +3721,7 @@ impl Ctx {
                 0
             },
             required_streams: parallel_streams,
+            target_mbps: t.rx_target_mbps,
             rx_p10: rx_stats.p10_mbps,
             rx_median: rx_stats.median_mbps,
             rx_p95: rx_stats.p95_mbps,
@@ -3727,14 +3741,7 @@ impl Ctx {
                     format_flow_events(&events, &raw_error),
                 ),
             ],
-            ..iperf_row(
-                (useq, lidx, 0, 0),
-                time,
-                md5_hex(&format!("{}|{}|{}", unit.id, tag, t.stream_idx)),
-                unit,
-                t,
-                t.profile_label.clone(),
-            )
+            ..Default::default()
         });
         LegOutcome {
             verdict,
@@ -4424,13 +4431,15 @@ impl Ctx {
                 .filter_map(|flow| flow_active_interval(flow).map(|v| v.0))
                 .min()
                 .unwrap_or(effective_window.start_ms);
+            let baseline_cutoff_ms =
+                iperf_baseline_cutoff_ms(leg_flows.iter().flat_map(|flow| flow.events.iter()));
             let rx_stats = monitor_outputs
                 .get(&first.dst.key())
-                .map(|out| monitor_rate_stats(out, &effective_window, true, first_active_ms))
+                .map(|out| monitor_rate_stats(out, &effective_window, true, baseline_cutoff_ms))
                 .unwrap_or_default();
             let tx_stats = monitor_outputs
                 .get(&first.src.key())
-                .map(|out| monitor_rate_stats(out, &effective_window, false, first_active_ms))
+                .map(|out| monitor_rate_stats(out, &effective_window, false, baseline_cutoff_ms))
                 .unwrap_or_default();
             let rx_avg = rx_stats.avg_mbps;
             let rate_present = rx_avg.map(|v| v > MIN_VALID_RX_MBPS).unwrap_or(false);
@@ -4646,6 +4655,8 @@ impl Ctx {
             let strict_single_failed =
                 n == 1 && verdict == Verdict::RateFail && reason_code == "SINGLE_UDP_STREAM_FAILED";
             for flow in &leg_flows {
+                let (flow_verdict, flow_reason_code, flow_reason_detail) =
+                    udp_flow_detail_outcome(flow, strict_single_failed);
                 let raw_log = self.save_iperf_raw_record(IperfRawArtifact {
                     owner_id,
                     lidx: plan.lidx,
@@ -4685,15 +4696,7 @@ impl Ctx {
                     dst_pc: flow.task.dst.pc.clone(),
                     dst_iface: flow.task.dst.nic.name.clone(),
                     dst_ip: flow.task.dst.nic.ipv4.clone(),
-                    verdict: if flow.runtime_failed {
-                        Verdict::RateFail
-                    } else if flow.raw_ok {
-                        Verdict::Pass
-                    } else if strict_single_failed {
-                        Verdict::RateFail
-                    } else {
-                        Verdict::SetupError
-                    },
+                    verdict: flow_verdict,
                     execution_status: if flow.client.timed_out {
                         ExecutionStatus::TimedOut
                     } else if flow.client.cancelled {
@@ -4703,16 +4706,8 @@ impl Ctx {
                     } else {
                         ExecutionStatus::Error
                     },
-                    reason_code: if flow.runtime_failed {
-                        "IPERF_RUNTIME_ERRORS".into()
-                    } else if flow.raw_ok {
-                        String::new()
-                    } else if strict_single_failed {
-                        "SINGLE_UDP_STREAM_FAILED".into()
-                    } else {
-                        "FLOW_FAILED".into()
-                    },
-                    reason_detail: flow.error.clone(),
+                    reason_code: flow_reason_code,
+                    reason_detail: flow_reason_detail,
                     kind_label: if unit.bidir {
                         format!("★★双向灌包-{}(流明细)", plan.tag)
                     } else {
@@ -4843,43 +4838,8 @@ impl Ctx {
     }
 }
 
-fn byte_prefix(text: &str, len: usize) -> &str {
-    let mut end = len.min(text.len());
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    &text[..end]
-}
-
-fn iperf_row(
-    sort_key: (usize, usize, usize, u8),
-    time: String,
-    task_id: String,
-    unit: &Unit,
-    task: &IperfTask,
-    param: String,
-) -> Row {
-    Row {
-        sort_key,
-        time,
-        task_id,
-        parent_id: unit.id.clone(),
-        task: unit.title.clone(),
-        ip: if task.v6 { "V6".into() } else { "V4".into() },
-        transport: if task.udp { "UDP".into() } else { "TCP".into() },
-        param,
-        src_pc: task.src.pc.clone(),
-        src_iface: task.src.nic.name.clone(),
-        src_ip: task.src.nic.ipv4.clone(),
-        dst_pc: task.dst.pc.clone(),
-        dst_iface: task.dst.nic.name.clone(),
-        dst_ip: task.dst.nic.ipv4.clone(),
-        ..Default::default()
-    }
-}
-
 /// v6 link-local 地址加 zone（仅 macOS 需要，Windows 不加）
-fn add_zone(addr: &str, zone: &str) -> String {
+fn add_zone(addr: &str, zone: &str, _side: Side) -> String {
     if cfg!(target_os = "macos") && !zone.is_empty() && addr.starts_with("fe80") {
         format!("{}%{}", addr, zone)
     } else {
@@ -4900,6 +4860,10 @@ fn fmt_opt(v: Option<f64>) -> String {
         Some(x) => format!("{x:.3}Mbps"),
         None => "-".into(),
     }
+}
+
+fn format_ping_rtt(v: Option<f64>) -> String {
+    v.map(|x| format!("{x:.3}")).unwrap_or_else(|| "-".into())
 }
 
 fn iperf_client_setup_error(client: &IperfClientOut) -> Option<String> {
@@ -5124,6 +5088,45 @@ fn aggregate_unit_verdict(outcomes: &[LegOutcome]) -> Verdict {
     }
 }
 
+fn aggregate_direction_streams(directions: &[DirectionSummary]) -> Option<StreamCounts> {
+    directions
+        .iter()
+        .filter_map(|direction| direction.streams)
+        .fold(None, |total: Option<StreamCounts>, counts| {
+            Some(match total {
+                Some(total) => StreamCounts {
+                    requested: total.requested.saturating_add(counts.requested),
+                    active: total.active.saturating_add(counts.active),
+                    required: total.required.saturating_add(counts.required),
+                },
+                None => counts,
+            })
+        })
+}
+
+fn populate_peer_rx(rows: &mut [Row], outcomes: &[LegOutcome]) {
+    let ab = outcomes
+        .iter()
+        .position(|outcome| outcome.tag.eq_ignore_ascii_case("ab"));
+    let ba = outcomes
+        .iter()
+        .position(|outcome| outcome.tag.eq_ignore_ascii_case("ba"));
+    if let (Some(ab), Some(ba)) = (ab, ba) {
+        for (me, other) in [(ab, ba), (ba, ab)] {
+            if let Some(rx) = outcomes[other].rx_avg {
+                for row_index in &outcomes[me].main_rows {
+                    if let Some(row) = rows.get_mut(*row_index) {
+                        row.peer_rx = format!(
+                            "{rx:.3} Mbps ({})",
+                            outcomes[other].tag.to_ascii_uppercase()
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn outcome_matching_verdict(outcomes: &[LegOutcome], verdict: Verdict) -> Option<&LegOutcome> {
     if verdict == Verdict::SetupError {
         if let Some(outcome) = outcomes
@@ -5150,6 +5153,89 @@ fn is_hard_single_udp_failure(outcome: &LegOutcome) -> bool {
             outcome.reason_code.as_str(),
             "SINGLE_UDP_STREAM_FAILED" | "CTSTRAFFIC_SINGLE_UDP_STREAM_FAILED"
         )
+}
+
+fn evaluate_nic_rx(
+    mode: RateMode,
+    target_mbps: Option<f64>,
+    stats: &RateStats,
+) -> (Verdict, String, String) {
+    let Some(rx_avg) = stats
+        .avg_mbps
+        .filter(|value| value.is_finite() && *value > MIN_VALID_RX_MBPS)
+    else {
+        return (
+            Verdict::NotEvaluated,
+            "NIC_RATE_MISSING".into(),
+            "有效流量窗口内没有可用的接收端 OS 网卡 RX 速率".into(),
+        );
+    };
+    if !stats.coverage.is_finite() || stats.coverage < MIN_RATE_SAMPLE_COVERAGE {
+        return (
+            Verdict::NotEvaluated,
+            "SAMPLE_COVERAGE_LOW".into(),
+            format!(
+                "接收端网卡 RX 采样覆盖率 {:.1}%，低于 {:.1}%",
+                stats.coverage * 100.0,
+                MIN_RATE_SAMPLE_COVERAGE * 100.0
+            ),
+        );
+    }
+    let target_mbps = if matches!(mode, RateMode::Observe | RateMode::Discover) {
+        None
+    } else {
+        target_mbps.filter(|value| value.is_finite() && *value > 0.0)
+    };
+    let Some(target) = target_mbps else {
+        return if mode == RateMode::Verify {
+            (
+                Verdict::NotEvaluated,
+                "TARGET_MISSING".into(),
+                "verify 模式必须配置可信的接收端网卡 RX 目标".into(),
+            )
+        } else {
+            (
+                Verdict::Measured,
+                "TARGET_UNKNOWN".into(),
+                format!("接收端网卡 RX 已测得 {rx_avg:.3}Mbps；未配置可信目标，因此不标记 PASS"),
+            )
+        };
+    };
+    if rx_avg < target {
+        return (
+            Verdict::RateFail,
+            "RX_BELOW_TARGET".into(),
+            format!("网卡 RX 平均 {rx_avg:.3}Mbps 低于目标 {target:.3}Mbps"),
+        );
+    }
+    let rx_p10 = stats
+        .p10_mbps
+        .filter(|value| value.is_finite() && *value >= 0.0);
+    if !stats.rolling_coverage.is_finite()
+        || stats.rolling_coverage < MIN_RATE_SAMPLE_COVERAGE
+        || rx_p10.is_none()
+    {
+        return (
+            Verdict::NotEvaluated,
+            "RATE_WINDOW_COVERAGE_LOW".into(),
+            format!(
+                "完整 5 秒 RX 稳定性窗口覆盖率 {:.1}%，低于 {:.1}%，无法计算可信 RX-P10",
+                stats.rolling_coverage * 100.0,
+                MIN_RATE_SAMPLE_COVERAGE * 100.0
+            ),
+        );
+    }
+    let rx_p10 = rx_p10.unwrap_or_default();
+    if rx_p10 < target {
+        return (
+            Verdict::Unstable,
+            "RX_UNSTABLE".into(),
+            format!(
+                "网卡 RX 平均 {rx_avg:.3}Mbps 已达标，但 RX-P10 {rx_p10:.3}Mbps 低于目标 {target:.3}Mbps"
+            ),
+        );
+    }
+    (Verdict::Pass, String::new(), String::new())
 }
 
 #[cfg(test)]
@@ -5207,14 +5293,14 @@ fn cts_attempt_budget(configured_retries: usize, strict_single_udp: bool) -> usi
     }
 }
 
-fn cts_baseline_cutoff_ms(attempts: &[CtsAttemptRun], selected: &CtsAttemptRun) -> u64 {
+fn cts_baseline_cutoff_ms(attempts: &[CtsAttemptRun]) -> u64 {
     attempts
         .iter()
         .flat_map(|attempt| attempt.events.iter())
         .filter(|event| event.kind == IperfEventKind::Started)
         .map(|event| event.elapsed_ms)
         .min()
-        .unwrap_or(selected.traffic_window.start_ms)
+        .unwrap_or(0)
 }
 
 fn midpoint_ms(before_ms: u64, after_ms: u64) -> u64 {
@@ -5861,6 +5947,20 @@ fn flow_duration_is_plausible(start_ms: u64, end_ms: u64, expected_ms: u64) -> b
             >= expected_ms
 }
 
+/// Return the earliest client-start boundary across the included attempts or
+/// flows. Only samples that ended before any client could send traffic are
+/// eligible as idle background. A retry boundary or an inferred traffic
+/// window can both occur after traffic has already flowed, so neither may be
+/// reused as the background cutoff.
+fn iperf_baseline_cutoff_ms<'a>(events: impl IntoIterator<Item = &'a IperfFlowEvent>) -> u64 {
+    events
+        .into_iter()
+        .filter(|event| event.kind == IperfEventKind::Started)
+        .map(|event| event.elapsed_ms)
+        .min()
+        .unwrap_or(0)
+}
+
 fn iperf_active_interval(events: &[IperfFlowEvent], required_secs: u64) -> Option<(u64, u64)> {
     let latest_retry_ms = events
         .iter()
@@ -5993,6 +6093,38 @@ fn flow_active_interval(flow: &UdpFlowRun) -> Option<(u64, u64)> {
         return None;
     }
     iperf_active_interval(&flow.events, flow.task.duration)
+}
+
+fn udp_flow_detail_outcome(
+    flow: &UdpFlowRun,
+    strict_single_failed: bool,
+) -> (Verdict, String, String) {
+    if flow.runtime_failed {
+        (
+            Verdict::RateFail,
+            "IPERF_RUNTIME_ERRORS".into(),
+            flow.error.clone(),
+        )
+    } else if flow.raw_ok {
+        (
+            Verdict::Measured,
+            "FLOW_MEASURED".into(),
+            "流量工具已产生吞吐测量；此行仅记录单流执行，单元验收以接收端 OS 网卡 RX 组合计为准"
+                .into(),
+        )
+    } else if strict_single_failed {
+        (
+            Verdict::RateFail,
+            "SINGLE_UDP_STREAM_FAILED".into(),
+            flow.error.clone(),
+        )
+    } else {
+        (
+            Verdict::SetupError,
+            "FLOW_FAILED".into(),
+            flow.error.clone(),
+        )
+    }
 }
 
 fn nearest_valid_sample(
@@ -6454,6 +6586,10 @@ pub struct ResultDb {
 
 pub const RESUME_MAX_AGE_HOURS: i64 = 24;
 
+fn resume_age_is_fresh(age: chrono::Duration) -> bool {
+    age >= chrono::Duration::seconds(-60) && age < chrono::Duration::hours(RESUME_MAX_AGE_HOURS)
+}
+
 impl ResultDb {
     pub fn load(path: PathBuf) -> Self {
         let map = std::fs::read_to_string(&path)
@@ -6472,7 +6608,7 @@ impl ResultDb {
         let t = chrono::NaiveDateTime::parse_from_str(&e.time, "%Y-%m-%d %H:%M:%S").ok()?;
         let now = chrono::Local::now().naive_local();
         let age = now.signed_duration_since(t);
-        if age.num_hours() <= RESUME_MAX_AGE_HOURS && age.num_seconds() >= -60 {
+        if resume_age_is_fresh(age) {
             Some(e.time.clone())
         } else {
             None
@@ -6493,10 +6629,10 @@ impl ResultDb {
     /// 原子写（tmp + rename）
     pub fn save(&self) {
         let tmp = self.path.with_extension("tmp");
-        if serde_json::to_string_pretty(&self.map)
-            .is_ok_and(|text| std::fs::write(&tmp, text).is_ok())
-        {
-            let _ = std::fs::rename(&tmp, &self.path);
+        if let Ok(text) = serde_json::to_string_pretty(&self.map) {
+            if std::fs::write(&tmp, text).is_ok() {
+                let _ = std::fs::rename(&tmp, &self.path);
+            }
         }
     }
 }
@@ -7342,6 +7478,135 @@ mod tests {
     }
 
     #[test]
+    fn successful_udp_flow_detail_is_measured_while_unit_owns_acceptance() {
+        let src = endpoint(Side::Master, "master0", "192.168.1.2");
+        let dst = endpoint(Side::Agent, "agent0", "192.168.1.3");
+        let task = udp_plan(0, "", 1, &src, &dst, 10)
+            .streams
+            .into_iter()
+            .next()
+            .unwrap();
+        let flow = udp_flow(0, 0, &task, 1_000, 11_000, true);
+
+        let (verdict, code, detail) = udp_flow_detail_outcome(&flow, false);
+        assert_eq!(verdict, Verdict::Measured);
+        assert_eq!(code, "FLOW_MEASURED");
+        assert!(detail.contains("单元验收"));
+        assert_ne!(verdict, Verdict::Pass);
+    }
+
+    #[test]
+    fn unit_summary_metrics_preserve_single_and_bidirectional_nic_rx() {
+        let (ctx, db_path) = isolated_ctx(0);
+        let ab_row = ctx.push_row(Row {
+            task_id: "ab-flow".into(),
+            parent_id: "bidir-unit".into(),
+            kind_label: "★★双向灌包-ab".into(),
+            src_pc: "master".into(),
+            src_iface: "eth0".into(),
+            src_ip: "192.168.1.2".into(),
+            dst_pc: "agent".into(),
+            dst_iface: "eth1".into(),
+            dst_ip: "192.168.1.3".into(),
+            verdict: Verdict::Pass,
+            requested_streams: 3,
+            active_streams: 3,
+            required_streams: 2,
+            rx_avg: Some(950.0),
+            rx_p10: Some(940.0),
+            target_mbps: Some(900.0),
+            sample_coverage: Some(0.99),
+            is_grouptotal: true,
+            ..Default::default()
+        });
+        let ba_row = ctx.push_row(Row {
+            task_id: "ba-flow".into(),
+            parent_id: "bidir-unit".into(),
+            kind_label: "★★双向灌包-ba".into(),
+            src_pc: "agent".into(),
+            src_iface: "eth1".into(),
+            src_ip: "192.168.1.3".into(),
+            dst_pc: "master".into(),
+            dst_iface: "eth0".into(),
+            dst_ip: "192.168.1.2".into(),
+            verdict: Verdict::RateFail,
+            requested_streams: 2,
+            active_streams: 2,
+            required_streams: 2,
+            rx_avg: Some(780.0),
+            rx_p10: Some(760.0),
+            target_mbps: Some(900.0),
+            sample_coverage: Some(0.98),
+            is_grouptotal: true,
+            ..Default::default()
+        });
+        let outcomes = vec![
+            LegOutcome {
+                verdict: Verdict::Pass,
+                reason_code: String::new(),
+                reason_detail: String::new(),
+                rx_avg: Some(950.0),
+                main_rows: vec![ab_row],
+                tag: "ab".into(),
+            },
+            LegOutcome {
+                verdict: Verdict::RateFail,
+                reason_code: "RX_BELOW_TARGET".into(),
+                reason_detail: "ba low".into(),
+                rx_avg: Some(780.0),
+                main_rows: vec![ba_row],
+                tag: "ba".into(),
+            },
+        ];
+        {
+            let mut rows = ctx.rows.lock().unwrap();
+            populate_peer_rx(&mut rows, &outcomes);
+            assert_eq!(rows[ab_row].peer_rx, "780.000 Mbps (BA)");
+            assert_eq!(rows[ba_row].peer_rx, "950.000 Mbps (AB)");
+        }
+        let directions = ctx.direction_summaries(&outcomes);
+        assert_eq!(directions.len(), 2);
+        assert_eq!(directions[0].tag, "AB");
+        assert_eq!(directions[0].rx_avg, Some(950.0));
+        assert_eq!(directions[1].tag, "BA");
+        assert_eq!(directions[1].rx_p10, Some(760.0));
+        let total = aggregate_direction_streams(&directions).unwrap();
+        assert_eq!(
+            (total.requested, total.active, total.required),
+            (5, 5, 4),
+            "双向单元的流数必须来自实际方向，而不是 Default::default() 的 0/0/0"
+        );
+
+        let ping_row = ctx.push_row(Row {
+            task_id: "ping-flow".into(),
+            parent_id: "ping-unit".into(),
+            task: "PING V4".into(),
+            kind_label: "PING".into(),
+            verdict: Verdict::Pass,
+            ping_loss: Some(0.0),
+            ping_min: Some(1.25),
+            ping_avg: Some(2.5),
+            ping_max: Some(3.75),
+            ..Default::default()
+        });
+        let ping_directions = ctx.direction_summaries(&[LegOutcome {
+            verdict: Verdict::Pass,
+            reason_code: String::new(),
+            reason_detail: String::new(),
+            rx_avg: None,
+            main_rows: vec![ping_row],
+            tag: String::new(),
+        }]);
+        assert_eq!(ping_directions.len(), 1);
+        assert_eq!(ping_directions[0].streams, None);
+        assert_eq!(ping_directions[0].ping_min, Some(1.25));
+        assert_eq!(ping_directions[0].ping_avg, Some(2.5));
+        assert_eq!(ping_directions[0].ping_max, Some(3.75));
+        assert_eq!(aggregate_direction_streams(&ping_directions), None);
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
     fn test_result_db() {
         let dir = std::env::temp_dir().join("cpe_db_test");
         let _ = std::fs::create_dir_all(&dir);
@@ -7359,6 +7624,19 @@ mod tests {
         let db4 = ResultDb::load(p.clone());
         assert!(db4.fresh_pass("abc").is_none());
         let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn resume_freshness_uses_exact_24_hour_boundary() {
+        assert!(resume_age_is_fresh(
+            chrono::Duration::hours(23) + chrono::Duration::minutes(59)
+        ));
+        assert!(!resume_age_is_fresh(chrono::Duration::hours(24)));
+        assert!(!resume_age_is_fresh(
+            chrono::Duration::hours(24) + chrono::Duration::minutes(1)
+        ));
+        assert!(resume_age_is_fresh(chrono::Duration::seconds(-60)));
+        assert!(!resume_age_is_fresh(chrono::Duration::seconds(-61)));
     }
 
     #[test]
@@ -7688,7 +7966,7 @@ mod tests {
         let selected_idx = select_cts_attempt_index(&attempts).unwrap();
         let selected = &attempts[selected_idx];
         assert_eq!(selected_idx, 2);
-        let cutoff_ms = cts_baseline_cutoff_ms(&attempts, selected);
+        let cutoff_ms = cts_baseline_cutoff_ms(&attempts);
         assert_eq!(cutoff_ms, 1_000);
 
         let monitor = MonitorStopOut {
@@ -7722,6 +8000,234 @@ mod tests {
             wrong_stats.avg_mbps,
             Some(0.0),
             "若把首轮流量窗口末端之前的样本当 baseline，后续结果会被固定扣低"
+        );
+    }
+
+    #[test]
+    fn cts_baseline_without_started_evidence_is_fail_safe() {
+        let mut attempt = ctstraffic_attempt(0, true);
+        attempt.events = vec![IperfFlowEvent {
+            kind: IperfEventKind::Connected,
+            elapsed_ms: 5_000,
+            ..Default::default()
+        }];
+        attempt.traffic_window.start_ms = 6_000;
+
+        assert_eq!(
+            cts_baseline_cutoff_ms(std::slice::from_ref(&attempt)),
+            0,
+            "缺失 Started 时不能把反推流量窗口之前的样本误当 idle baseline"
+        );
+    }
+
+    #[test]
+    fn artifact_tcp_rx_baseline_uses_client_start_not_inferred_window() {
+        // 复现 run_20260811_152635_20728 首个 TCP 的关键时间线：client 在
+        // 551ms 启动，最终 receiver 区间从 184678ms 反推正式窗口从 2898ms
+        // 开始。2898ms 前两个样本已经包含真实流量，绝不能作为背景基线。
+        let events = vec![
+            IperfFlowEvent {
+                kind: IperfEventKind::Started,
+                elapsed_ms: 551,
+                ..Default::default()
+            },
+            IperfFlowEvent {
+                kind: IperfEventKind::Connected,
+                elapsed_ms: 1_874,
+                ..Default::default()
+            },
+            IperfFlowEvent {
+                kind: IperfEventKind::Traffic,
+                elapsed_ms: 184_678,
+                mbps: Some(935.0),
+                line: "[SUM] 0.00-181.78 sec 19.8 GBytes 935 Mbits/sec receiver".into(),
+            },
+            IperfFlowEvent {
+                kind: IperfEventKind::Ended,
+                elapsed_ms: 184_707,
+                ..Default::default()
+            },
+        ];
+        let window = iperf_effective_window(&events, 180, true);
+        assert_eq!((window.start_ms, window.end_ms), (2_898, 182_898));
+        assert_eq!(iperf_baseline_cutoff_ms(&events), 551);
+
+        let mut samples = vec![
+            MonitorSample {
+                elapsed_ms: 1_014,
+                interval_ms: 1_011,
+                rx_mbps: 131.208_970,
+                valid: true,
+                ..Default::default()
+            },
+            MonitorSample {
+                elapsed_ms: 2_025,
+                interval_ms: 1_011,
+                rx_mbps: 956.586_137,
+                valid: true,
+                ..Default::default()
+            },
+        ];
+        for index in 3_u64..=184 {
+            samples.push(MonitorSample {
+                elapsed_ms: 2_025 + (index - 2) * 1_010,
+                interval_ms: 1_010,
+                // 代表原样本中约 952-957Mbps 的持续 RX；连续低段也确保
+                // 错误扣基线时 RX-P10 会退化为 0。
+                rx_mbps: if index % 20 < 7 { 952.0 } else { 956.875 },
+                valid: true,
+                ..Default::default()
+            });
+        }
+        let monitor = MonitorStopOut {
+            samples,
+            ..Default::default()
+        };
+
+        let fixed = monitor_rate_stats(&monitor, &window, true, iperf_baseline_cutoff_ms(&events));
+        assert!(fixed.avg_mbps.is_some_and(|value| value > 950.0));
+        assert!(fixed.p10_mbps.is_some_and(|value| value > 950.0));
+        assert_eq!(fixed.coverage, 1.0);
+
+        let contaminated = monitor_rate_stats(&monitor, &window, true, window.start_ms);
+        assert!(contaminated.avg_mbps.is_some_and(|value| value < 1.0));
+        assert_eq!(contaminated.p10_mbps, Some(0.0));
+
+        let retry_events = vec![
+            IperfFlowEvent {
+                kind: IperfEventKind::Started,
+                elapsed_ms: 551,
+                ..Default::default()
+            },
+            IperfFlowEvent {
+                kind: IperfEventKind::Retry,
+                elapsed_ms: 4_000,
+                ..Default::default()
+            },
+            IperfFlowEvent {
+                kind: IperfEventKind::Started,
+                elapsed_ms: 5_000,
+                ..Default::default()
+            },
+        ];
+        assert_eq!(
+            iperf_baseline_cutoff_ms(&retry_events),
+            551,
+            "重试不能把可能已含首轮流量的样本重新定义为背景"
+        );
+    }
+
+    #[test]
+    fn tcp_nic_rx_verdict_matrix_never_passes_without_complete_authoritative_data() {
+        let complete = RateStats {
+            avg_mbps: Some(850.0),
+            p10_mbps: Some(820.0),
+            coverage: 1.0,
+            rolling_coverage: 1.0,
+            ..Default::default()
+        };
+        let decision = |mode, target, stats: &RateStats| {
+            let (verdict, code, _) = evaluate_nic_rx(mode, target, stats);
+            (verdict, code)
+        };
+
+        assert_eq!(
+            decision(RateMode::Verify, Some(800.0), &RateStats::default()),
+            (Verdict::NotEvaluated, "NIC_RATE_MISSING".into())
+        );
+        let zero = RateStats {
+            avg_mbps: Some(0.0),
+            ..complete.clone()
+        };
+        assert_eq!(
+            decision(RateMode::Verify, Some(800.0), &zero),
+            (Verdict::NotEvaluated, "NIC_RATE_MISSING".into())
+        );
+
+        assert_eq!(
+            decision(RateMode::Observe, Some(800.0), &complete),
+            (Verdict::Measured, "TARGET_UNKNOWN".into()),
+            "observe 即使收到意外目标也只能记录测量值"
+        );
+        assert_eq!(
+            decision(RateMode::Discover, Some(800.0), &complete),
+            (Verdict::Measured, "TARGET_UNKNOWN".into())
+        );
+        assert_eq!(
+            decision(RateMode::Auto, None, &complete),
+            (Verdict::Measured, "TARGET_UNKNOWN".into())
+        );
+        assert_eq!(
+            decision(RateMode::Verify, None, &complete),
+            (Verdict::NotEvaluated, "TARGET_MISSING".into())
+        );
+        assert_eq!(
+            decision(RateMode::Verify, Some(f64::NAN), &complete),
+            (Verdict::NotEvaluated, "TARGET_MISSING".into())
+        );
+
+        let low_coverage = RateStats {
+            coverage: 0.94,
+            ..complete.clone()
+        };
+        assert_eq!(
+            decision(RateMode::Verify, Some(800.0), &low_coverage),
+            (Verdict::NotEvaluated, "SAMPLE_COVERAGE_LOW".into())
+        );
+        let nan_coverage = RateStats {
+            coverage: f64::NAN,
+            ..complete.clone()
+        };
+        assert_eq!(
+            decision(RateMode::Verify, Some(800.0), &nan_coverage),
+            (Verdict::NotEvaluated, "SAMPLE_COVERAGE_LOW".into())
+        );
+
+        let below_target = RateStats {
+            avg_mbps: Some(799.0),
+            p10_mbps: Some(790.0),
+            ..complete.clone()
+        };
+        assert_eq!(
+            decision(RateMode::Verify, Some(800.0), &below_target),
+            (Verdict::RateFail, "RX_BELOW_TARGET".into())
+        );
+        let missing_p10 = RateStats {
+            p10_mbps: None,
+            ..complete.clone()
+        };
+        assert_eq!(
+            decision(RateMode::Verify, Some(800.0), &missing_p10),
+            (Verdict::NotEvaluated, "RATE_WINDOW_COVERAGE_LOW".into())
+        );
+        let nan_p10 = RateStats {
+            p10_mbps: Some(f64::NAN),
+            ..complete.clone()
+        };
+        assert_eq!(
+            decision(RateMode::Verify, Some(800.0), &nan_p10),
+            (Verdict::NotEvaluated, "RATE_WINDOW_COVERAGE_LOW".into())
+        );
+        let low_rolling_coverage = RateStats {
+            rolling_coverage: 0.94,
+            ..complete.clone()
+        };
+        assert_eq!(
+            decision(RateMode::Verify, Some(800.0), &low_rolling_coverage),
+            (Verdict::NotEvaluated, "RATE_WINDOW_COVERAGE_LOW".into())
+        );
+
+        let unstable = RateStats {
+            p10_mbps: Some(799.0),
+            ..complete.clone()
+        };
+        assert_eq!(
+            decision(RateMode::Verify, Some(800.0), &unstable),
+            (Verdict::Unstable, "RX_UNSTABLE".into())
+        );
+        assert_eq!(
+            decision(RateMode::Verify, Some(800.0), &complete),
+            (Verdict::Pass, String::new())
         );
     }
 
@@ -9675,6 +10181,10 @@ mod tests {
             .find(|row| row.verdict == Verdict::Skip)
             .expect("CTS resume skip row");
         assert_eq!(skip.execution_status, ExecutionStatus::Skipped);
+        assert_eq!(skip.reason_code, "RESUME_FRESH_PASS");
+        assert!(skip.reason_detail.contains("正式 PASS"));
+        assert!(skip.reason_detail.contains("resume"));
+        assert!(skip.reason_detail.contains("24 小时"));
         drop(rows);
         let _ = std::fs::remove_file(db_path);
     }
@@ -9742,6 +10252,92 @@ mod tests {
         assert_eq!(summary.traffic_units, 1);
         assert_eq!(summary.traffic_usable_units, 0);
         assert!(summary.needs_traffic_failure_diagnostics());
+        let _ = std::fs::remove_file(db_path);
+    }
+
+    #[test]
+    fn successful_ping_records_reason_and_all_rtt_metrics() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let responder = std::thread::spawn(move || {
+            let request = server
+                .incoming_requests()
+                .next()
+                .expect("receive agent ping request");
+            assert_eq!(request.url(), "/ping");
+            let raw = r#"PING 192.168.1.2 (192.168.1.2): 56 data bytes
+64 bytes from 192.168.1.2: icmp_seq=0 ttl=64 time=1.250 ms
+64 bytes from 192.168.1.2: icmp_seq=1 ttl=64 time=2.500 ms
+64 bytes from 192.168.1.2: icmp_seq=2 ttl=64 time=3.750 ms
+
+--- 192.168.1.2 ping statistics ---
+3 packets transmitted, 3 packets received, 0.0% packet loss
+round-trip min/avg/max/stddev = 1.250/2.500/3.750/1.021 ms
+"#;
+            let response = tiny_http::Response::from_string(ok_json(PingOut {
+                ok: true,
+                sent: 3,
+                received: 3,
+                lost: 0,
+                loss_pct: 0.0,
+                rtt_min: Some(1.25),
+                rtt_avg: Some(2.5),
+                rtt_max: Some(3.75),
+                cmd: "ping -c 3 192.168.1.2".into(),
+                raw: raw.into(),
+            }));
+            request.respond(response).expect("respond to agent ping");
+        });
+        let unit = Unit {
+            id: "agent-ping-success".into(),
+            title: "PING V4 -l 1400 n=3".into(),
+            bidir: false,
+            legs: vec![Leg {
+                tag: String::new(),
+                kind: LegKind::Ping(PingTask {
+                    v6: false,
+                    src: endpoint(Side::Agent, "agent0", "192.168.1.3"),
+                    dst: endpoint(Side::Master, "master0", "192.168.1.2"),
+                    count: 3,
+                    payload: 1400,
+                    purpose: PingPurpose::SubnetTest,
+                }),
+            }],
+            est_secs: 1,
+        };
+        let (ctx, db_path) = isolated_ctx(port);
+
+        let summary = ctx.run_all_with_preflight(&[unit], None);
+
+        assert_eq!(summary.pass, 1);
+        responder.join().expect("agent ping responder");
+        let rows = ctx.rows.lock().unwrap();
+        let detail = rows.iter().find(|row| !row.is_unit_summary).unwrap();
+        assert_eq!(detail.verdict, Verdict::Pass);
+        assert_eq!(detail.execution_status, ExecutionStatus::Completed);
+        assert_eq!(detail.reason_code, "PING_OK");
+        assert!(detail.reason_detail.contains("发送/接收=3/3"));
+        assert!(detail.reason_detail.contains("丢包率 0.0%"));
+        assert!(detail
+            .reason_detail
+            .contains("RTT 最小/平均/最大=1.250/2.500/3.750 ms"));
+        assert_eq!(detail.ping_loss, Some(0.0));
+        assert_eq!(detail.ping_min, Some(1.25));
+        assert_eq!(detail.ping_avg, Some(2.5));
+        assert_eq!(detail.ping_max, Some(3.75));
+
+        let unit_summary = rows.iter().find(|row| row.is_unit_summary).unwrap();
+        assert_eq!(unit_summary.reason_code, "PING_OK");
+        assert!(unit_summary.reason_detail.contains("PING_OK"));
+        assert!(unit_summary.reason_detail.contains("发送/接收=3/3"));
+        assert_eq!(unit_summary.ping_min, Some(1.25));
+        assert_eq!(unit_summary.ping_avg, Some(2.5));
+        assert_eq!(unit_summary.ping_max, Some(3.75));
+        assert_eq!(unit_summary.direction_summaries.len(), 1);
+        assert_eq!(unit_summary.direction_summaries[0].ping_min, Some(1.25));
+        assert_eq!(unit_summary.direction_summaries[0].ping_avg, Some(2.5));
+        assert_eq!(unit_summary.direction_summaries[0].ping_max, Some(3.75));
+        drop(rows);
         let _ = std::fs::remove_file(db_path);
     }
 

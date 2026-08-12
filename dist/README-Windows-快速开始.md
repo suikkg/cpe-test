@@ -1,8 +1,8 @@
 # CPE 测试工具 Windows 包
 
-> 如果你从 Git 仓库下载的是 `cpe_test-v4.2.4-windows-config-docs.zip`，那是一份只含
+> 如果你从 Git 仓库下载的是 `cpe_test-v4.2.5-windows-config-docs.zip`，那是一份只含
 > 配置、文档和启动脚本的资料包，不含 `cpe_test.exe`、`ctsTraffic.exe` 或 iperf3。
-> 开箱即用请下载 GitHub Release 的 `cpe_test-v4.2.4-windows-x86_64.zip`；也可以自行
+> 开箱即用请下载 GitHub Release 的 `cpe_test-v4.2.5-windows-x86_64.zip`；也可以自行
 > 编译程序后，把资料包内容与 exe 放到同一目录。
 
 将这个文件夹完整复制到**主控机**和**辅测机**。两台电脑必须使用同一个
@@ -11,7 +11,7 @@
 ## 包内文件与系统要求
 
 - `cpe_test.exe`：主控、agent、网卡扫描和监控共用的程序。
-- `ctsTraffic.exe`：Microsoft ctsTraffic 2.0.4.0 x64，随官方 v4.2.4 Windows 包固定捆绑并校验；仅支持 Windows 10 或更高版本。
+- `ctsTraffic.exe`：Microsoft ctsTraffic 2.0.4.0 x64，随官方 v4.2.5 Windows 包固定捆绑并校验；仅支持 Windows 10 或更高版本。
 - `start_*.bat`：双击启动脚本。
 - `configs\`：SGMII、Wi-Fi、10GUSB 等具名配置。
 - `THIRD_PARTY_NOTICES.md` 及 CTS/WIL 许可文件：第三方归属和许可说明。

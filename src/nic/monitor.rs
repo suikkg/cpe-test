@@ -60,13 +60,9 @@ pub fn read_rx_bytes(iface: &str) -> Result<u64, String> {
 #[cfg(target_os = "macos")]
 fn counters_macos(iface: &str) -> Result<(u64, u64), String> {
     use crate::util::run_cmd;
+    use std::time::Duration;
     let out = run_cmd("netstat", &["-ibn"], Duration::from_secs(10));
     parse_netstat_counters(&out.stdout, iface)
-}
-
-#[cfg(not(any(windows, target_os = "macos")))]
-pub fn read_rx_bytes(_iface: &str) -> Result<u64, String> {
-    Err("平台不支持".into())
 }
 
 /// netstat -ibn 的 <Link#N> 行含全接口计数；
@@ -293,6 +289,12 @@ pub struct MonitorMgr {
     seq: AtomicU64,
     clock: Arc<dyn MonotonicClock>,
     reader: Arc<dyn NicCounterReader>,
+}
+
+impl Default for MonitorMgr {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MonitorMgr {

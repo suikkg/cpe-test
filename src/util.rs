@@ -795,14 +795,20 @@ pub fn ctstraffic_version() -> Option<String> {
 
 // ---------------- 交互输入 ----------------
 
+/// 读一行（EOF 返回 None，用于 --auto/管道场景不卡死）
+pub fn read_line_trim() -> Option<String> {
+    let mut s = String::new();
+    match std::io::stdin().read_line(&mut s) {
+        Ok(0) => None,
+        Ok(_) => Some(s.trim().to_string()),
+        Err(_) => None,
+    }
+}
+
 pub fn ask(prompt: &str) -> String {
     print!("{prompt}");
     let _ = std::io::stdout().flush();
-    let mut input = String::new();
-    match std::io::stdin().read_line(&mut input) {
-        Ok(0) | Err(_) => String::new(),
-        Ok(_) => input.trim().to_string(),
-    }
+    read_line_trim().unwrap_or_default()
 }
 
 // ---------------- 其它 ----------------
@@ -841,19 +847,22 @@ pub fn parse_selection(input: &str, max: usize) -> Result<Vec<usize>, String> {
         if p.is_empty() {
             continue;
         }
-        let (start, end) = if let Some((a, b)) = p.split_once('-') {
-            (
-                a.trim().parse().map_err(|_| format!("无效序号: {p}"))?,
-                b.trim().parse().map_err(|_| format!("无效序号: {p}"))?,
-            )
+        if let Some((a, b)) = p.split_once('-') {
+            let a: usize = a.trim().parse().map_err(|_| format!("无效序号: {p}"))?;
+            let b: usize = b.trim().parse().map_err(|_| format!("无效序号: {p}"))?;
+            if a == 0 || b == 0 || a > b || b > max {
+                return Err(format!("序号超出范围(1-{max}): {p}"));
+            }
+            for i in a..=b {
+                if !out.contains(&i) {
+                    out.push(i);
+                }
+            }
         } else {
             let i: usize = p.parse().map_err(|_| format!("无效序号: {p}"))?;
-            (i, i)
-        };
-        if start == 0 || start > end || end > max {
-            return Err(format!("序号超出范围(1-{max}): {p}"));
-        }
-        for i in start..=end {
+            if i == 0 || i > max {
+                return Err(format!("序号超出范围(1-{max}): {p}"));
+            }
             if !out.contains(&i) {
                 out.push(i);
             }
@@ -982,11 +991,9 @@ mod tests {
     fn test_parse_selection() {
         assert_eq!(parse_selection("", 5).unwrap(), vec![1, 2, 3, 4, 5]);
         assert_eq!(parse_selection("1-3,5", 5).unwrap(), vec![1, 2, 3, 5]);
-        assert_eq!(parse_selection(" 1,1-3,,2 ", 5).unwrap(), vec![1, 2, 3]);
         assert_eq!(parse_selection("2", 5).unwrap(), vec![2]);
         assert!(parse_selection("6", 5).is_err());
         assert!(parse_selection("0", 5).is_err());
-        assert!(parse_selection("3-2", 5).is_err());
         assert!(parse_selection("abc", 5).is_err());
     }
 

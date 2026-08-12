@@ -238,7 +238,6 @@ struct ServerTombstone {
 }
 
 /// iperf3 server 注册表（agent 端与主控本地共用）
-#[derive(Default)]
 pub struct IperfServerMgr {
     inner: Mutex<HashMap<u16, SrvEntry>>,
     /// 只串行化同一端口的 start/stop；不同端口仍可并行准备。
@@ -247,6 +246,12 @@ pub struct IperfServerMgr {
     request_locks: [Mutex<()>; LIFECYCLE_LOCK_STRIPES],
     /// 让 stop 重试可重放，并阻止 stop 后迟到的 start 复活同一 request。
     tombstones: Mutex<HashMap<String, ServerTombstone>>,
+}
+
+impl Default for IperfServerMgr {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl IperfServerMgr {
@@ -821,6 +826,10 @@ fn finish_server_output(entry: &mut SrvEntry) -> String {
     format!("$ {}\n{}", entry.cmd, decode_bytes(&output))
 }
 
+// ---------------- client 执行 ----------------
+
+use std::time::Duration as StdDuration;
+
 /// TCP connect 探测 iperf3 server 是否已就绪（兼容 IPv4 / IPv6，跨平台）
 fn wait_server_tcp_ready<F>(
     bind_ip: String,
@@ -833,18 +842,17 @@ where
 {
     let deadline = Instant::now() + timeout;
     // probe 地址要去掉 zone（%en0 / %6），getaddrinfo 不支持带 zone 解析
-    let clean = bind_ip.split_once('%').map_or(bind_ip, |(ip, _)| ip);
+    let clean = if let Some(idx) = bind_ip.find('%') {
+        &bind_ip[..idx]
+    } else {
+        &bind_ip
+    };
     // IPv6 需要用 [addr]:port 格式
     let addr_str = if clean.contains(':') {
         format!("[{clean}]:{port}")
     } else {
         format!("{clean}:{port}")
     };
-    let addr = addr_str
-        .to_socket_addrs()
-        .map_err(|e| format!("解析地址失败 {addr_str}: {e}"))?
-        .last()
-        .ok_or_else(|| format!("无法解析地址 {addr_str}"))?;
     while Instant::now() < deadline {
         confirm_child_running()?;
         let addrs = addr_str
@@ -862,16 +870,12 @@ where
         } else {
             return Err(format!("无法解析地址 {addr_str}"));
         }
-        // ConnectionRefused 正常（server 还没好）
-        std::thread::sleep(Duration::from_millis(200));
     }
     Err(format!(
         "iperf3 server 端口 {port} 在 {:.1} 秒内未响应 TCP connect",
         timeout.as_secs_f64()
     ))
 }
-
-// ---------------- client 执行 ----------------
 
 fn is_transient_error(out: &str) -> bool {
     let l = out.to_lowercase();

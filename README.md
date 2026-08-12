@@ -2,6 +2,14 @@
 
 > 两台电脑间自动化 ping + iperf3 / Microsoft ctsTraffic 灌包测试，零 Python/零 PowerShell
 
+## v4.2.5
+
+- 报告测试概览补齐 Ping 丢包率与 RTT 最小/平均/最大值，并用 `PING_OK`、`RESUME_FRESH_PASS` 等原因码解释 PASS 和 SKIP；不会再把通过原因显示成“不适用”。
+- 恢复逐行诊断可见性：主控/辅测截图、实际灌包命令、独立 raw log、NIC CSV 和内嵌原始输出都在报告中有明确入口，移动端也保留这些内容。
+- 双向 TCP/UDP 报告按 AB、BA 分开汇总，显示各方向接收端 RX 平均、RX-P10、目标和判定，并给出 AB + BA 的 RX 平均合计；RX-P10 不做无意义相加，原因码会与展示指标交叉核对。
+- 执行行计数改为测试语义：TCP 双向显示两个方向，UDP 显示流明细与方向组合计，Ping 显示 Ping 行；Windows/iperf3 UDP 并发使用独立 client，不在单条命令上追加 `-P`。
+- UDP resume identity 升级到 `iperf_v4`，避免复用旧统计窗口语义下的缓存 PASS；全量测试、Clippy、格式检查和桌面/移动端报告验收均通过。
+
 ## v4.2.4
 
 - [P1] 修复 `status()` 先复制事件、再读完成状态的竞态：done=true 的快照现在保证包含 completion 写入前推送的全部事件，主控不会因停止轮询而永久漏掉尾部 Traffic/Ended。
@@ -74,7 +82,7 @@ CPE（Customer Premises Equipment）子网测试工具用于在**两台电脑之
 ```
 cpe_test.exe          ← 本工具（单文件）
 iperf3.exe            ← 从 iperf.fr 下载（只测 Ping/ctsTraffic 可不放）
-ctsTraffic.exe        ← v4.2.4 Windows Release 已捆绑（仅 Windows 10+）
+ctsTraffic.exe        ← v4.2.5 Windows Release 已捆绑（仅 Windows 10+）
 start_agent.bat       ← 辅测机双击
 start_master.bat      ← 主控机双击
 start_master_select_config.bat ← 主控机选择网口配置后双击
@@ -417,7 +425,7 @@ UDP 单流、并发组和双向测试现在走同一套调度器：先把所有�
 
 #### 网卡实测速率与 iperf 时间区间
 
-报告里的“接收网卡平均/P10/中位/P95/最低/最高”和用于目标吞吐 PASS/FAIL 的 RX/TX 数据始终来自操作系统网卡累计字节计数器（Windows `GetIfTable2`、macOS `netstat -ibn`、Linux sysfs），不是 iperf3 自报速率。工具输出仍有一个不可替代的用途：必须由 iperf3/CTS 自身的 rate、bytes、frame/datagram 证据确认流确实建立；NIC 只验证已建立流的正式目标，不能用背景流量证明灌通。
+报告里的“网卡 RX 平均/P10/中位/P95/最低/最高”和用于目标吞吐 PASS/FAIL 的正式接收速率始终来自接收端操作系统网卡累计字节计数器（Windows `GetIfTable2`、macOS `netstat -ibn`、Linux sysfs），不是 iperf3 自报速率。工具输出仍有一个不可替代的用途：必须由 iperf3/CTS 自身的 rate、bytes、frame/datagram 证据确认流确实建立；NIC 只验证已建立流的正式目标，不能用背景流量证明灌通。没有可信目标时只标记 `MEASURED`，不会仅因工具执行完成而标记 `PASS`。
 
 TCP 和 UDP 运行期间现在使用同一套日志口径，例如：
 
@@ -704,10 +712,10 @@ HTML 报告底部的“原始输出”仍内嵌便于查看的内容，并提供
 | 执行状态 / 原因码 / 原因详情 | 区分性能不达标、负载不足、窗口不足、连接或采样环境异常 |
 | 请求/活跃/要求流、重试 | 展示真实并发建立情况；2 流只通 1 流时可直接定位 |
 | 目标、TX 均值/P10 | 验证是否向 CPE 提供了足够 offered load |
-| 接收网卡平均/P10/中位/P95/最低/最高 Mbps | **共同有效窗口内的网卡口径吞吐** |
+| 网卡 RX 平均/P10/中位/P95/最低/最高 Mbps | **共同有效窗口内接收端 OS 网卡的权威吞吐口径** |
 | 有效/要求秒、采样覆盖率 | 验证是否取得完整有效窗口；滚动窗口不足时原因详情会列出 RX/TX 覆盖百分比 |
 | 对向接收 Mbps | 双向时对端实测吞吐 |
-| 后端发送/接收 Mbps | iperf3 或 ctsTraffic 的工具证据，用于确认起流和诊断；不代替 NIC 正式吞吐口径 |
+| 流量工具 sender/receiver 汇总（诊断） | iperf3 或 ctsTraffic 的工具自报证据，用于确认起流和诊断；不代替接收端 OS 网卡 RX 的正式吞吐口径 |
 | UDP/Ping 丢包率 | 丢包百分比 |
 | Ping 平均 ms | 平均时延 |
 | 截图 / 执行命令 | 用于复现 |
@@ -799,7 +807,7 @@ cargo build --release --locked
 
 自行编译后，把 `cpe_test.exe`、启动脚本和所需吞吐工具放到两台 Windows 电脑同一目录：
 iperf3 测试需要完整的 iperf3 Windows 发行包；ctsTraffic 测试需要 `ctsTraffic.exe`。
-官方 v4.2.4 Windows Release ZIP 已捆绑固定且校验过的 ctsTraffic 2.0.4.0，但由于发行包差异不内置 iperf3。
+官方 v4.2.5 Windows Release ZIP 已捆绑固定且校验过的 ctsTraffic 2.0.4.0，但由于发行包差异不内置 iperf3。
 
 ### GitHub Actions CI
 
@@ -822,7 +830,7 @@ Windows ZIP 包含启动脚本、四份配置、固定 CTS 二进制和第三方
 `tar.gz` 保留 `cpe_test` 可执行位。发布作业会再次核对资产名称、数量、内部结构和哈希。
 
 仓库同时跟踪一份不含可执行程序的
-[`cpe_test-v4.2.4-windows-config-docs.zip`](dist/cpe_test-v4.2.4-windows-config-docs.zip)，
+[`cpe_test-v4.2.5-windows-config-docs.zip`](dist/cpe_test-v4.2.5-windows-config-docs.zip)，
 便于直接从 Git 下载 Windows 配置、文档和启动脚本。其 SHA-256 位于同目录的
 `.zip.sha256` 文件；CI 会逐文件确认压缩包内容与仓库源文件一致。需要开箱即用的程序、
 固定版 ctsTraffic 和许可证全集时，仍应下载上面的正式 Windows Release ZIP。

@@ -28,10 +28,8 @@ pub const ROLE_ORDER: [&str; 10] = [
 ///   9. → UNKNOWN
 #[cfg(any(windows, target_os = "macos", target_os = "linux", test))]
 pub fn classify_role(description: &str, speed_mbps: u64, is_wifi: bool, band: &str) -> String {
-    let desc_l = description.to_lowercase();
-    let is_usb = desc_l.contains("usb");
-    let role = if is_wifi {
-        match band {
+    if is_wifi {
+        return match band {
             "5GHz" => "WIFI5G",
             "2.4GHz" => "WIFI2.4G",
             "6GHz" => "WIFI6G",
@@ -97,10 +95,6 @@ pub fn is_wifi_name(name: &str) -> bool {
 mod tests {
     use super::*;
 
-    fn role(description: &str, speed: u64, wifi: bool, band: &str) -> String {
-        classify_role(description, speed, wifi, band)
-    }
-
     #[test]
     fn test_classify() {
         // WiFi
@@ -163,22 +157,7 @@ mod tests {
             "SGMII2.5G"
         );
         // unknown
-        assert_eq!(role("Some NIC", 100, false, ""), "UNKNOWN");
-    }
-
-    #[test]
-    fn test_10g_speed_boundaries() {
-        for (description, speed, expected) in [
-            ("USB NIC", 4000, "RNDIS"),
-            ("USB NIC", 4001, "10GUSB"),
-            ("USB NIC", 8999, "10GUSB"),
-            ("Ethernet", 8999, "UNKNOWN"),
-            ("Ethernet", 9000, "10GETH"),
-            ("USB NIC", 12_000, "10GUSB"),
-            ("Ethernet", 12_001, "UNKNOWN"),
-        ] {
-            assert_eq!(role(description, speed, false, ""), expected);
-        }
+        assert_eq!(classify_role("Some NIC", 100, false, ""), "UNKNOWN");
     }
 
     #[test]

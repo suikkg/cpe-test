@@ -271,9 +271,12 @@ pub fn run_master(opts: MasterOpts) -> i32 {
         } else {
             interactive_build_specs(&cfg, &master_info, &agent_info)
         }
+    } else if let Some(ref pairs) = cfg.pairs {
+        // pairs 模式：从角色对自动生成全量测试
+        generate_specs_from_pairs(pairs, &cfg, &master_info, &agent_info)
     } else {
         if opts.auto {
-            logln("!! --auto 模式需要配置文件里有 tests[]");
+            logln("!! --auto 模式需要配置 tests[] 或 pairs");
             return 2;
         }
         interactive_build_specs(&cfg, &master_info, &agent_info)
@@ -307,7 +310,11 @@ pub fn run_master(opts: MasterOpts) -> i32 {
             let inp = ask("输入要执行的任务序号(逗号/连字符, 如 1-5,8; 回车=全部): ");
             match parse_selection(&inp, units.len()) {
                 Ok(sel) => {
-                    units = sel.into_iter().map(|i| units[i - 1].clone()).collect();
+                    let mut picked: Vec<Unit> = Vec::new();
+                    for i in &sel {
+                        picked.push(units[*i - 1].clone());
+                    }
+                    units = picked;
                     break;
                 }
                 Err(e) => logln(&format!("!! {e}")),
@@ -621,9 +628,9 @@ fn interactive_build_specs(cfg: &Config, master: &HostInfo, agent: &HostInfo) ->
     let mode = choose_single(
         "选择配置方式:",
         &[
-            "全部任务勾选(自动生成全部任务，勾选要测的，推荐)",
-            "批量模式(按角色配对，统一参数)",
-            "精细模式(逐对选源/目标，可逐对不同参数)",
+            "全部任务勾选(自动生成全部任务，勾选要测的，推荐)".into(),
+            "批量模式(按角色配对，统一参数)".into(),
+            "精细模式(逐对选源/目标，可逐对不同参数)".into(),
         ],
         0,
     );
@@ -661,17 +668,21 @@ fn interactive_build_specs(cfg: &Config, master: &HostInfo, agent: &HostInfo) ->
         }
         _ => {
             // 精细模式
-            let eps: Vec<Endpoint> = master
-                .interfaces
-                .iter()
-                .map(|n| endpoint(Side::Master, master, n))
-                .chain(
-                    agent
-                        .interfaces
-                        .iter()
-                        .map(|n| endpoint(Side::Agent, agent, n)),
-                )
-                .collect();
+            let mut eps: Vec<Endpoint> = Vec::new();
+            for n in &master.interfaces {
+                eps.push(Endpoint {
+                    side: Side::Master,
+                    pc: master.hostname.clone(),
+                    nic: n.clone(),
+                });
+            }
+            for n in &agent.interfaces {
+                eps.push(Endpoint {
+                    side: Side::Agent,
+                    pc: agent.hostname.clone(),
+                    nic: n.clone(),
+                });
+            }
             let mut specs = Vec::new();
             loop {
                 logln("\n可用网口:");
@@ -707,8 +718,16 @@ fn interactive_build_specs(cfg: &Config, master: &HostInfo, agent: &HostInfo) ->
 /// 配对枚举：跨机同角色 + 主控同机两两 + 辅测同机两两
 fn enumerate_pairs(master: &HostInfo, agent: &HostInfo) -> Vec<(Endpoint, Endpoint, String)> {
     let mut out = Vec::new();
-    let mep = |n| endpoint(Side::Master, master, n);
-    let aep = |n| endpoint(Side::Agent, agent, n);
+    let mep = |n: &crate::protocol::NicInfo| Endpoint {
+        side: Side::Master,
+        pc: master.hostname.clone(),
+        nic: n.clone(),
+    };
+    let aep = |n: &crate::protocol::NicInfo| Endpoint {
+        side: Side::Agent,
+        pc: agent.hostname.clone(),
+        nic: n.clone(),
+    };
     // 跨机全部组合（不限同角色）
     for m in &master.interfaces {
         for a in &agent.interfaces {
@@ -733,32 +752,6 @@ fn enumerate_pairs(master: &HostInfo, agent: &HostInfo) -> Vec<(Endpoint, Endpoi
         }
     }
     out
-}
-
-fn endpoint(side: Side, host: &HostInfo, nic: &crate::protocol::NicInfo) -> Endpoint {
-    Endpoint {
-        side,
-        pc: host.hostname.clone(),
-        nic: nic.clone(),
-    }
-}
-
-fn push_local_pairs(
-    out: &mut Vec<(Endpoint, Endpoint, String)>,
-    host: &HostInfo,
-    side: Side,
-    side_name: &str,
-) {
-    for i in 0..host.interfaces.len() {
-        for b in &host.interfaces[i + 1..] {
-            let a = &host.interfaces[i];
-            out.push((
-                endpoint(side, host, a),
-                endpoint(side, host, b),
-                format!("{side_name}同机 {}<->{}", a.role, b.role),
-            ));
-        }
-    }
 }
 
 /// 从 config.json 的 pairs 字段自动生成测试规格
@@ -929,15 +922,19 @@ fn ask_traffic_scalar(prompt: &str, default: u64, label: &str, min: u64, max: u6
 }
 
 fn ask_universal_params(cfg: &Config, mode: usize) -> UniversalParams {
-    let dir_default: &[usize] = match mode {
-        0 => &[0, 1, 2],
-        1 => &[0, 1],
-        _ => &[0],
+    let dir_default: Vec<usize> = match mode {
+        0 => vec![0, 1, 2],
+        1 => vec![0, 1],
+        _ => vec![0],
     };
     let dirs = choose_multi(
         "方向(可多选):",
-        &["A->B 单向", "B->A 单向", "双向并发(A<->B)"],
-        dir_default,
+        &[
+            "A->B 单向".into(),
+            "B->A 单向".into(),
+            "双向并发(A<->B)".into(),
+        ],
+        &dir_default,
     );
     let directions: Vec<String> = dirs
         .iter()
@@ -984,8 +981,11 @@ fn ask_universal_params(cfg: &Config, mode: usize) -> UniversalParams {
         vec![]
     };
 
-    let ipvers: Vec<String> = match choose_single("IP 版本:", &["仅IPv4", "仅IPv6", "IPv4+IPv6"], 0)
-    {
+    let ipvers: Vec<String> = match choose_single(
+        "IP 版本:",
+        &["仅IPv4".into(), "仅IPv6".into(), "IPv4+IPv6".into()],
+        0,
+    ) {
         1 => vec!["v6".into()],
         2 => vec!["v4".into(), "v6".into()],
         _ => vec!["v4".into()],
@@ -994,7 +994,7 @@ fn ask_universal_params(cfg: &Config, mode: usize) -> UniversalParams {
     let udp_limit = if transports.iter().any(|t| t == "udp") {
         choose_single(
             "UDP 按网口协商速率限制(协商不准如 4.2G 实际 10G 请关闭):",
-            &["开启(默认)", "关闭(不限速)"],
+            &["开启(默认)".into(), "关闭(不限速)".into()],
             0,
         ) == 0
     } else {
@@ -1112,12 +1112,21 @@ fn spec_from_params(
 }
 
 fn pick_one(prompt: &str, eps: &[Endpoint]) -> Option<Endpoint> {
-    ask_index(prompt, eps.len(), None).map(|i| eps[i].clone())
+    loop {
+        let inp = ask(prompt);
+        if inp.is_empty() {
+            return None;
+        }
+        match inp.parse::<usize>() {
+            Ok(i) if i >= 1 && i <= eps.len() => return Some(eps[i - 1].clone()),
+            _ => logln(&format!("!! 请输入 1-{}", eps.len())),
+        }
+    }
 }
 
 // ---------------- 菜单小工具 ----------------
 
-fn choose_single(title: &str, options: &[&str], default: usize) -> usize {
+fn choose_single(title: &str, options: &[String], default: usize) -> usize {
     logln(&format!("\n{title}"));
     for (i, o) in options.iter().enumerate() {
         logln(&format!(
@@ -1127,15 +1136,19 @@ fn choose_single(title: &str, options: &[&str], default: usize) -> usize {
             if i == default { " *" } else { "" }
         ));
     }
-    ask_index(
-        &format!("选择(回车=默认{}): ", default + 1),
-        options.len(),
-        Some(default),
-    )
-    .expect("default index")
+    loop {
+        let inp = ask(&format!("选择(回车=默认{}): ", default + 1));
+        if inp.is_empty() {
+            return default;
+        }
+        match inp.parse::<usize>() {
+            Ok(v) if v >= 1 && v <= options.len() => return v - 1,
+            _ => logln(&format!("!! 请输入 1-{}", options.len())),
+        }
+    }
 }
 
-fn choose_multi(title: &str, options: &[&str], defaults: &[usize]) -> Vec<usize> {
+fn choose_multi(title: &str, options: &[String], defaults: &[usize]) -> Vec<usize> {
     logln(&format!("\n{title}"));
     for (i, o) in options.iter().enumerate() {
         logln(&format!(
@@ -1157,19 +1170,6 @@ fn choose_multi(title: &str, options: &[&str], defaults: &[usize]) -> Vec<usize>
         match parse_selection(&inp, options.len()) {
             Ok(v) => return v.iter().map(|i| i - 1).collect(),
             Err(e) => logln(&format!("!! {e}")),
-        }
-    }
-}
-
-fn ask_index(prompt: &str, max: usize, default: Option<usize>) -> Option<usize> {
-    loop {
-        let input = ask(prompt);
-        if input.is_empty() {
-            return default;
-        }
-        match input.parse::<usize>() {
-            Ok(value) if (1..=max).contains(&value) => return Some(value - 1),
-            _ => logln(&format!("!! 请输入 1-{max}")),
         }
     }
 }

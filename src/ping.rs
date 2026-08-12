@@ -359,11 +359,11 @@ pub fn parse(text: &str, count: u32) -> PingOut {
 /// "<1" -> 0
 fn parse_ms(s: &str) -> Option<f64> {
     let t = s.trim();
-    if t.starts_with('<') {
-        Some(0.0)
-    } else {
-        t.parse().ok()
+    if let Some(stripped) = t.strip_prefix('<') {
+        let _ = stripped;
+        return Some(0.0);
     }
+    t.parse().ok()
 }
 
 #[cfg(test)]
