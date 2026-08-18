@@ -95,6 +95,9 @@ pub struct DirectionSummary {
     pub ping_min: Option<f64>,
     pub ping_avg: Option<f64>,
     pub ping_max: Option<f64>,
+    /// 该方向主行的截图路径；概览把接收速率和截图并排展示。
+    pub screenshot_master: String,
+    pub screenshot_agent: String,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -182,6 +185,38 @@ fn screenshot_link(path: &str, label: &str) -> String {
     }
 }
 
+/// 结果标签在窄列里必须能换行，否则最长的 NOT_EVALUATED 会顶到相邻列上去。
+/// 在下划线后插入 `<wbr>`，让浏览器优先断在 `NOT_` / `EVALUATED` 这种语义边界，
+/// 而不是 `overflow-wrap: anywhere` 那样断成 `NOT_EVALUAT` / `ED`。
+fn status_label_html(verdict: Verdict) -> String {
+    // 标签都是 ASCII 常量，不含需要转义的字符。
+    verdict.label().replace('_', "_<wbr>")
+}
+
+/// 概览用的紧凑截图缩略图：与接收速率同一行，不必展开诊断面板。
+fn overview_shot(path: &str, label: &str) -> String {
+    if path.is_empty() {
+        return String::new();
+    }
+    let path = esc(path);
+    let label = esc(label);
+    format!(
+        "<a class=\"shot-mini\" href=\"{path}\" target=\"_blank\" rel=\"noopener\" title=\"查看{label}原图\" aria-label=\"打开{label}原图\"><img src=\"{path}\" alt=\"{label}缩略图\" loading=\"lazy\" decoding=\"async\"><span>{label}</span></a>"
+    )
+}
+
+fn overview_shot_cell(master: &str, agent: &str) -> String {
+    let shots = [overview_shot(master, "主控"), overview_shot(agent, "辅测")]
+        .into_iter()
+        .filter(|shot| !shot.is_empty())
+        .collect::<Vec<_>>();
+    if shots.is_empty() {
+        NOT_COLLECTED.to_string()
+    } else {
+        format!("<div class=\"shot-cell\">{}</div>", shots.join(""))
+    }
+}
+
 fn artifact_link(path: &str, label: &str) -> String {
     if path.is_empty() {
         String::new()
@@ -198,6 +233,10 @@ fn esc(s: &str) -> String {
 }
 
 const NOT_APPLICABLE: &str = "—（不适用）";
+/// 网卡计数器是按接口（即按方向）采的，拆不到单条流上：一个方向无论跑 1 条还是
+/// 20 条流，都只有一个网卡 RX 序列，只挂在该方向的组合计行。流明细行的网卡列
+/// 因此永远是空的——但空着不解释会被读成「这条流没测到」，必须写明去哪看。
+const NIC_ON_GROUPTOTAL: &str = "—（按方向统计，见组合计行）";
 const NOT_COLLECTED: &str = "未采集";
 const INSUFFICIENT_SAMPLES: &str = "样本不足";
 
@@ -253,8 +292,36 @@ fn verdict_priority(verdict: Verdict) -> u8 {
     }
 }
 
+/// 单流 UDP 在安全耗尽全部尝试后仍无工具测量，是用户指定的硬失败原因码。
+const HARD_SINGLE_UDP_FAILURE_CODES: [&str; 2] = [
+    "SINGLE_UDP_STREAM_FAILED",
+    "CTSTRAFFIC_SINGLE_UDP_STREAM_FAILED",
+];
+
+fn row_is_hard_single_udp_failure(row: &Row) -> bool {
+    row.verdict == Verdict::RateFail
+        && HARD_SINGLE_UDP_FAILURE_CODES.contains(&row.reason_code.as_str())
+}
+
 fn group_verdict(group: &UnitGroup<'_>) -> Verdict {
     group.summary.map(|row| row.verdict).unwrap_or_else(|| {
+        // 没有单元汇总行时（旧报告数据、被中断的运行）仍要复刻 executor 的
+        // 聚合顺序：SetupError 优先，其次是单流硬失败——它不能被另一方向普通的
+        // NOT_EVALUATED 掩盖，否则概览会把必须灌通的方向失败读成“无法评价”。
+        if group
+            .details
+            .iter()
+            .any(|row| row.verdict == Verdict::SetupError)
+        {
+            return Verdict::SetupError;
+        }
+        if group
+            .details
+            .iter()
+            .any(|row| row_is_hard_single_udp_failure(row))
+        {
+            return Verdict::RateFail;
+        }
         group
             .details
             .iter()
@@ -386,6 +453,8 @@ fn direction_from_row(row: &Row) -> DirectionSummary {
         ping_min: row.ping_min,
         ping_avg: row.ping_avg,
         ping_max: row.ping_max,
+        screenshot_master: row.screenshot_master.clone(),
+        screenshot_agent: row.screenshot_agent.clone(),
     }
 }
 
@@ -467,6 +536,16 @@ fn merge_missing_direction_fields(target: &mut DirectionSummary, fallback: &Dire
     if target.ping_max.is_none() {
         target.ping_max = fallback.ping_max;
     }
+    if target.screenshot_master.is_empty() {
+        target
+            .screenshot_master
+            .clone_from(&fallback.screenshot_master);
+    }
+    if target.screenshot_agent.is_empty() {
+        target
+            .screenshot_agent
+            .clone_from(&fallback.screenshot_agent);
+    }
 }
 
 fn group_direction_summaries(group: &UnitGroup<'_>) -> Vec<DirectionSummary> {
@@ -533,6 +612,23 @@ fn coverage_text(value: Option<f64>, is_ping: bool) -> String {
         },
         |value| format!("{:.1}%", value * 100.0),
     )
+}
+
+/// 流量工具（iperf3 / ctsTraffic）自报的发送/接收速率。
+///
+/// 它不是正式判定口径——正式口径永远是接收端 OS 网卡 RX——但它是「这条流确实
+/// 建立了」的唯一证据。单条流明细行本来就没有网卡数据（网卡计数器是按方向采的，
+/// 只挂在组合计行上），把它藏进折叠的诊断面板，流明细整行就只剩「未采集」。
+fn tool_rate_text(tx_mbps: Option<f64>, rx_mbps: Option<f64>) -> String {
+    match (tx_mbps, rx_mbps) {
+        (None, None) => NOT_COLLECTED.into(),
+        (tx, rx) => {
+            let fmt = |value: Option<f64>| {
+                value.map_or_else(|| NOT_COLLECTED.to_string(), |value| format!("{value:.3}"))
+            };
+            format!("发 {} / 收 {} Mbps", fmt(tx), fmt(rx))
+        }
+    }
 }
 
 fn streams_text(value: Option<StreamCounts>) -> String {
@@ -726,27 +822,57 @@ fn group_reason(group: &UnitGroup<'_>) -> String {
 }
 
 fn push_overview(h: &mut String, groups: &[UnitGroup<'_>]) {
+    // 先把方向汇总物化一遍：既用来决定是否需要「截图」列，也避免在渲染循环里
+    // 重复推导。整表宽度按“常见 1440 宽屏不横向滚动”来配，判定原因单独占一行。
+    let rendered: Vec<(&UnitGroup<'_>, Verdict, Vec<DirectionSummary>)> = groups
+        .iter()
+        .map(|group| {
+            let unit_verdict = group_verdict(group);
+            let mut directions = group_direction_summaries(group);
+            if directions.is_empty() {
+                directions.push(DirectionSummary {
+                    tag: NOT_APPLICABLE.into(),
+                    verdict: unit_verdict,
+                    ..Default::default()
+                });
+            }
+            (group, unit_verdict, directions)
+        })
+        .collect();
+    // 截图默认开启，但关掉截图或纯 Ping 报告里整列都是「未采集」；那种情况下
+    // 这一列只会白占约 190px，直接不渲染。
+    let has_shots = rendered.iter().any(|(_, _, directions)| {
+        directions.iter().any(|direction| {
+            !direction.screenshot_master.is_empty() || !direction.screenshot_agent.is_empty()
+        })
+    });
+    let column_count = if has_shots { 11 } else { 10 };
+
     h.push_str(
         "<section class=\"overview-section\" aria-labelledby=\"overview-heading\"><h2 id=\"overview-heading\">测试概览</h2>\n",
     );
     h.push_str(
-        "<div class=\"overview-scroll\" role=\"region\" aria-labelledby=\"overview-heading\" tabindex=\"0\"><table class=\"overview-table\"><caption class=\"sr-only\">按测试单元和方向展示网卡 RX 判定指标</caption><thead><tr><th scope=\"col\">结果</th><th scope=\"col\">测试单元</th><th scope=\"col\">方向</th><th scope=\"col\">源端 → 接收端</th><th scope=\"col\">请求/活跃/要求流</th><th scope=\"col\">网卡 RX 平均</th><th scope=\"col\">网卡 RX-P10</th><th scope=\"col\">目标</th><th scope=\"col\">采样覆盖率</th><th scope=\"col\">质量指标</th><th scope=\"col\">原因</th></tr></thead><tbody>\n",
+        "<div class=\"overview-scroll\" role=\"region\" aria-labelledby=\"overview-heading\" tabindex=\"0\"><table class=\"overview-table\"><caption class=\"sr-only\">按测试单元和方向展示接收端网卡 RX 判定指标、截图与判定原因</caption><colgroup><col class=\"c-verdict\"><col class=\"c-unit\"><col class=\"c-dir\"><col class=\"c-endpoints\"><col class=\"c-streams\"><col class=\"c-rate\"><col class=\"c-rate\"><col class=\"c-target\">",
+    );
+    if has_shots {
+        h.push_str("<col class=\"c-shot\">");
+    }
+    h.push_str(
+        "<col class=\"c-coverage\"><col class=\"c-quality\"></colgroup><thead><tr><th scope=\"col\">结果</th><th scope=\"col\">测试单元</th><th scope=\"col\">方向</th><th scope=\"col\">源端 → 接收端</th><th scope=\"col\">请求/活跃/要求流</th><th scope=\"col\">接收端 RX 平均</th><th scope=\"col\">接收端 RX-P10</th><th scope=\"col\">目标</th>",
+    );
+    if has_shots {
+        h.push_str("<th scope=\"col\">截图</th>");
+    }
+    h.push_str(
+        "<th scope=\"col\">采样覆盖率</th><th scope=\"col\">质量指标</th></tr></thead><tbody>\n",
     );
 
-    for group in groups {
-        let unit_verdict = group_verdict(group);
+    for (group, unit_verdict, directions) in &rendered {
+        let unit_verdict = *unit_verdict;
         let execution_status = group_execution_status(group);
         let is_ping = group_is_ping(group);
         let unit_reason = group_reason(group);
-        let mut directions = group_direction_summaries(group);
-        if directions.is_empty() {
-            directions.push(DirectionSummary {
-                tag: NOT_APPLICABLE.into(),
-                verdict: unit_verdict,
-                ..Default::default()
-            });
-        }
-        for direction in directions {
+        for (index, direction) in directions.iter().enumerate() {
             let tag = normalized_direction_tag(&direction.tag);
             let src = if direction.src.is_empty() {
                 NOT_APPLICABLE
@@ -759,7 +885,7 @@ fn push_overview(h: &mut String, groups: &[UnitGroup<'_>]) {
                 &direction.dst
             };
             let endpoints = format!("{src} → {dst}");
-            let mut reason = direction_reason_text(&direction, &unit_reason);
+            let mut reason = direction_reason_text(direction, &unit_reason);
             if is_ping
                 && direction.verdict == Verdict::Pass
                 && (reason.is_empty() || reason == NOT_APPLICABLE)
@@ -771,20 +897,43 @@ fn push_overview(h: &mut String, groups: &[UnitGroup<'_>]) {
                     direction.ping_max,
                 );
             }
+            // 单元判定只写在该单元的第一行：概览首列是方向判定，双向单元里
+            // 一个 PASS 方向很容易被当成整个测试项通过。冻结的「测试单元」列
+            // 里始终带上单元级结论，才是记录时真正要抄的那一个。
+            let unit_cell = if index == 0 {
+                format!(
+                    "{}<br><small class=\"unit-verdict-note\">单元判定 <strong class=\"status {}\">{}</strong></small>",
+                    esc(group_title(group)),
+                    unit_verdict.css(),
+                    status_label_html(unit_verdict),
+                )
+            } else {
+                esc(group_title(group))
+            };
+            let shot_cell = if has_shots {
+                format!(
+                    "<td class=\"shot-col\">{}</td>",
+                    overview_shot_cell(&direction.screenshot_master, &direction.screenshot_agent)
+                )
+            } else {
+                String::new()
+            };
             h.push_str(&format!(
-                "<tr data-unit-id=\"{}\" data-direction=\"{}\"><td><strong class=\"status {}\">{}</strong><br><small>{}</small></td><td>{}</td><td><strong>{}</strong></td><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td>{}</td><td class=\"reason-cell\">{}</td></tr>\n",
+                "<tr class=\"{}\" data-unit-id=\"{}\" data-direction=\"{}\"><td><strong class=\"status {}\">{}</strong><br><small>{}</small></td><td>{}</td><td><strong>{}</strong></td><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td>{}<td class=\"num\">{}</td><td>{}</td></tr>\n",
+                if index == 0 { "unit-first" } else { "unit-cont" },
                 esc(&group.key),
                 esc(&tag),
                 direction.verdict.css(),
-                direction.verdict.label(),
+                status_label_html(direction.verdict),
                 execution_status.label(),
-                esc(group_title(group)),
+                unit_cell,
                 esc(&tag),
                 esc(&endpoints),
                 esc(&streams_text(direction.streams)),
                 esc(&rx_avg_text(direction.rx_avg, is_ping)),
                 esc(&rx_p10_text(direction.rx_p10, direction.rx_avg, is_ping)),
                 esc(&target_text(direction.target_mbps)),
+                shot_cell,
                 esc(&coverage_text(direction.sample_coverage, is_ping)),
                 esc(&quality_text(
                     direction.udp_loss,
@@ -794,8 +943,18 @@ fn push_overview(h: &mut String, groups: &[UnitGroup<'_>]) {
                     direction.ping_max,
                     is_ping,
                 )),
-                esc(&reason),
             ));
+            // 判定原因是最长的一段文字。放进定宽列里只会被截断，所以让它独占
+            // 整行宽度紧跟在指标行下面——扫指标、看原因，不用左右拖。
+            if !reason.is_empty() && reason != NOT_APPLICABLE {
+                h.push_str(&format!(
+                    "<tr class=\"reason-row\" data-unit-id=\"{}\" data-direction=\"{}\"><td colspan=\"{column_count}\"><span class=\"reason-tag\">{} 判定</span>{}</td></tr>\n",
+                    esc(&group.key),
+                    esc(&tag),
+                    esc(&tag),
+                    esc(&reason),
+                ));
+            }
         }
     }
     h.push_str("</tbody></table></div></section>\n");
@@ -911,16 +1070,7 @@ fn push_row_diagnostics(h: &mut String, row: &Row, is_ping: bool, aria_context: 
         _ => NOT_COLLECTED.into(),
     };
     diagnostic_item(h, "网卡 RX 范围", &rx_range);
-    diagnostic_item(
-        h,
-        "流量工具 sender 汇总（诊断）",
-        &diagnostic_metric(row.tx_mbps, is_ping),
-    );
-    diagnostic_item(
-        h,
-        "流量工具 receiver 汇总（诊断）",
-        &diagnostic_metric(row.rx_mbps, is_ping),
-    );
+    // 流量工具自报速率已提升为表内独立列，这里不再重复。
     diagnostic_item(
         h,
         "对向网卡 RX 平均",
@@ -983,6 +1133,16 @@ fn push_row_diagnostics(h: &mut String, row: &Row, is_ping: bool, aria_context: 
     h.push_str("</div></details>");
 }
 
+/// 流明细行的网卡指标为空时，说明去向而不是留一个光秃秃的「未采集」。
+/// 组合计行和 Ping 行有自己的真实取值/口径，不套用。
+fn nic_cell(row: &Row, is_ping: bool, rendered: String) -> String {
+    if !row.is_grouptotal && !is_ping && rendered == NOT_COLLECTED {
+        NIC_ON_GROUPTOTAL.to_string()
+    } else {
+        rendered
+    }
+}
+
 fn push_detail_row(h: &mut String, row: &Row, group_title: &str) {
     let is_ping = row_is_ping(row);
     let direction = infer_direction_tag(row);
@@ -1011,7 +1171,7 @@ fn push_detail_row(h: &mut String, row: &Row, group_title: &str) {
         ""
     };
     h.push_str(&format!(
-        "<tr{row_class} data-detail-row=\"true\"><td><span class=\"status {}\">{}</span></td><td>{}</td><td>{}</td><td><strong>{}</strong><br><small>{}</small></td><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td>{}</td><td class=\"reason-cell\">{}</td><td>",
+        "<tr{row_class} data-detail-row=\"true\"><td><span class=\"status {}\">{}</span></td><td>{}</td><td>{}</td><td><strong>{}</strong><br><small>{}</small></td><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num tool-rate\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td>{}</td><td>",
         row.verdict.css(),
         row.verdict.label(),
         esc(&row.time),
@@ -1020,10 +1180,19 @@ fn push_detail_row(h: &mut String, row: &Row, group_title: &str) {
         esc(&row.param),
         esc(&protocol),
         esc(&streams_text(stream_counts(row))),
-        esc(&rx_avg_text(row.rx_avg, is_ping)),
-        esc(&rx_p10_text(row.rx_p10, row.rx_avg, is_ping)),
+        esc(&nic_cell(row, is_ping, rx_avg_text(row.rx_avg, is_ping))),
+        esc(&nic_cell(
+            row,
+            is_ping,
+            rx_p10_text(row.rx_p10, row.rx_avg, is_ping),
+        )),
+        esc(&tool_rate_text(row.tx_mbps, row.rx_mbps)),
         esc(&target_text(row.target_mbps)),
-        esc(&coverage_text(row.sample_coverage, is_ping)),
+        esc(&nic_cell(
+            row,
+            is_ping,
+            coverage_text(row.sample_coverage, is_ping),
+        )),
         esc(&quality_text(
             row.udp_loss,
             row.ping_loss,
@@ -1032,10 +1201,17 @@ fn push_detail_row(h: &mut String, row: &Row, group_title: &str) {
             row.ping_max,
             is_ping,
         )),
-        esc(&reason),
     ));
     push_row_diagnostics(h, row, is_ping, &format!("{group_title} {direction}"));
     h.push_str("</td></tr>\n");
+    // 与概览同一处理：判定原因是最长的一段文字，挤进定宽列会被压成一列一个字。
+    if !reason.is_empty() && reason != NOT_APPLICABLE {
+        h.push_str(&format!(
+            "<tr class=\"reason-row\" data-reason-row=\"true\"><td colspan=\"13\"><span class=\"reason-tag\">{} 判定</span>{}</td></tr>\n",
+            esc(&direction),
+            esc(&reason),
+        ));
+    }
 }
 
 fn group_is_udp(group: &UnitGroup<'_>) -> bool {
@@ -1122,13 +1298,22 @@ fn push_bidirectional_direction(
 ) {
     let tag = normalized_direction_tag(&direction.tag);
     let reason = direction_reason_text(direction, fallback_reason);
+    let shots = if direction.screenshot_master.is_empty() && direction.screenshot_agent.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<span class=\"direction-summary-shots\">{}</span>",
+            overview_shot_cell(&direction.screenshot_master, &direction.screenshot_agent)
+        )
+    };
     h.push_str(&format!(
-        "<div class=\"direction-summary-row\"><span class=\"direction-summary-tag\">{}</span><span class=\"direction-summary-endpoints\">{}</span><span>接收端 RX 平均 <strong>{}</strong></span><span>RX-P10 <strong>{}</strong></span><span>目标 <strong>{}</strong></span><span class=\"direction-summary-reason\">判定：{}</span></div>",
+        "<div class=\"direction-summary-row\"><span class=\"direction-summary-tag\">{}</span><span class=\"direction-summary-endpoints\">{}</span><span>接收端 RX 平均 <strong>{}</strong></span><span>RX-P10 <strong>{}</strong></span><span>目标 <strong>{}</strong></span>{}<span class=\"direction-summary-reason\">判定：{}</span></div>",
         esc(&tag),
         esc(&direction_endpoint_text(direction)),
         esc(&rx_avg_text(direction.rx_avg, false)),
         esc(&rx_p10_text(direction.rx_p10, direction.rx_avg, false)),
         esc(&target_text(direction.target_mbps)),
+        shots,
         esc(&reason),
     ));
 }
@@ -1149,18 +1334,11 @@ fn push_bidirectional_summary(h: &mut String, group: &UnitGroup<'_>) {
     };
     let fallback_reason = group_reason(group);
     h.push_str(
-        "<div class=\"direction-summary\" role=\"group\" aria-label=\"双向方向汇总\"><strong class=\"direction-summary-title\">双向方向汇总</strong>",
+        "<div class=\"direction-summary\" role=\"group\" aria-label=\"双向方向汇总\"><strong class=\"direction-summary-title\">双向方向汇总（每个方向各自按接收端 RX 判定）</strong>",
     );
     push_bidirectional_direction(h, ab, &fallback_reason);
     push_bidirectional_direction(h, ba, &fallback_reason);
-    let combined = match (ab.rx_avg, ba.rx_avg) {
-        (Some(ab_avg), Some(ba_avg)) => format!("{:.3} Mbps", ab_avg + ba_avg),
-        _ => format!("{NOT_COLLECTED}（至少一个方向缺少 RX 平均）"),
-    };
-    h.push_str(&format!(
-        "<p class=\"direction-summary-total\"><strong>AB + BA 接收端 RX 平均合计</strong>：{}</p></div>",
-        esc(&combined),
-    ));
+    h.push_str("</div>");
 }
 
 fn push_unit_details(h: &mut String, groups: &[UnitGroup<'_>]) {
@@ -1192,7 +1370,7 @@ fn push_unit_details(h: &mut String, groups: &[UnitGroup<'_>]) {
             h.push_str("<p class=\"summary-note\">本次没有执行行；请结合单元状态和原因查看。</p>");
         } else {
             h.push_str(&format!(
-                "<div class=\"table-scroll\" role=\"region\" aria-labelledby=\"unit-toggle-{index}\" tabindex=\"0\"><table class=\"results-table\"><caption class=\"sr-only\">{}的逐行执行明细</caption><thead><tr><th scope=\"col\">结果</th><th scope=\"col\">时间</th><th scope=\"col\">方向</th><th scope=\"col\">类型 / 参数</th><th scope=\"col\">传输</th><th scope=\"col\">请求/活跃/要求流</th><th scope=\"col\">网卡 RX 平均</th><th scope=\"col\">网卡 RX-P10</th><th scope=\"col\">目标</th><th scope=\"col\">采样覆盖率</th><th scope=\"col\">质量指标</th><th scope=\"col\">原因</th><th scope=\"col\">诊断详情</th></tr></thead><tbody>\n",
+                "<div class=\"table-scroll\" role=\"region\" aria-labelledby=\"unit-toggle-{index}\" tabindex=\"0\"><table class=\"results-table\"><caption class=\"sr-only\">{}的逐行执行明细</caption><thead><tr><th scope=\"col\">结果</th><th scope=\"col\">时间</th><th scope=\"col\">方向</th><th scope=\"col\">类型 / 参数</th><th scope=\"col\">传输</th><th scope=\"col\">请求/活跃/要求流</th><th scope=\"col\">网卡 RX 平均</th><th scope=\"col\">网卡 RX-P10</th><th scope=\"col\">流量工具自报（非判定口径）</th><th scope=\"col\">目标</th><th scope=\"col\">采样覆盖率</th><th scope=\"col\">质量指标</th><th scope=\"col\">诊断详情</th></tr></thead><tbody>\n",
                 esc(title),
             ));
             for row in &group.details {
@@ -1281,13 +1459,50 @@ h2 { margin: 28px 0 10px; font-size: 17px; line-height: 1.3; }
 .status.not-evaluated { color: #7542a8; }
 .status.error { color: #a42121; }
 .status.skip { color: #59636c; }
-.overview-scroll { max-width: 100%; overflow: auto; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); }
+/* 横向滚动条必须始终留在视口内：限制容器高度，否则宽表的滚动条会被推到
+   页面最底部，只有把整页滚到底才能左右拖动。 */
+.overview-scroll { max-width: 100%; max-height: 72vh; overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); }
 .overview-table, .results-table { border-collapse: separate; border-spacing: 0; width: 100%; background: var(--surface); font-size: 12px; }
-.overview-table { min-width: 1120px; table-layout: fixed; }
+/* 基准宽度 1384px（含截图列），留出 1440 宽屏的 body padding 和纵向滚动条槽，
+   常见笔记本屏幕即可完整看完不必横向拖。
+   列宽写成百分比而不是 px：table-layout:fixed 下 px 列宽是硬约束，撤掉 min-width
+   也不会压缩，窄屏只会继续溢出。百分比按 min-width 或容器宽度解析，因此
+   窄屏能等比压缩，而横向真的溢出时（min-width 生效）又正好还原成下面
+   冻结列偏移所依赖的 116 / 250 / 48 px。
+   c-verdict 必须容得下最长的 NOT_EVALUATED，否则结果列会被裁成 NOT_EVALUATE。 */
+.overview-table { min-width: 1384px; table-layout: fixed; }
+.overview-table col.c-verdict { width: 8.382%; }
+.overview-table col.c-unit { width: 18.064%; }
+.overview-table col.c-dir { width: 3.468%; }
+.overview-table col.c-endpoints { width: 13.728%; }
+.overview-table col.c-streams { width: 6.358%; }
+.overview-table col.c-rate { width: 7.659%; }
+.overview-table col.c-target { width: 7.081%; }
+.overview-table col.c-shot { width: 13.150%; }
+.overview-table col.c-coverage { width: 5.636%; }
+.overview-table col.c-quality { width: 8.815%; }
 .overview-table th, .overview-table td, .results-table th, .results-table td { border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); padding: 6px 8px; text-align: left; vertical-align: top; }
 .overview-table th:last-child, .overview-table td:last-child, .results-table th:last-child, .results-table td:last-child { border-right: 0; }
-.overview-table th { background: var(--head); white-space: nowrap; }
+/* 列变窄后表头必须允许换行，否则「请求/活跃/要求流」这种标题会被裁掉。 */
+.overview-table th { position: sticky; top: 0; z-index: 3; background: var(--head); white-space: normal; line-height: 1.25; vertical-align: bottom; }
 .overview-table td { overflow-wrap: anywhere; }
+/* 每个测试单元成块：扫描和抄记录时不会把上一单元的方向行读串。 */
+.overview-table tr.unit-first > td { border-top: 2px solid #c3ccd4; }
+.overview-table tbody tr:first-child > td { border-top: 0; }
+.unit-verdict-note { display: block; margin-top: 2px; color: var(--muted); font-size: 11px; }
+/* 结果列很窄，标签必须允许在 <wbr> 处折行，不能 nowrap 溢出到相邻列。
+   同时要盖掉单元格上的 overflow-wrap: anywhere，否则会断成 NOT_/EVALUATE/D。 */
+.overview-table tr:not(.reason-row) > td:nth-child(1) .status, .unit-verdict-note .status { white-space: normal; overflow-wrap: normal; word-break: keep-all; }
+/* 判定原因独占整行：文字最长，定宽列里必被截断。 */
+.overview-table tr.reason-row > td { padding: 4px 10px 7px; color: var(--muted); background: #fafbfc; overflow-wrap: anywhere; }
+.reason-tag { margin-right: 6px; padding: 0 5px; border: 1px solid var(--line); border-radius: 3px; background: var(--surface); color: #145a94; font-size: 11px; font-weight: 700; }
+/* 左侧「测试场景」三列冻结：窄屏横向拖到接收速率/截图时仍看得到是哪个测试项。
+   原因行是 colspan 整行，绝不能被当成第一列跟着冻结。 */
+.overview-table th:nth-child(-n+3), .overview-table tr:not(.reason-row) > td:nth-child(-n+3) { position: sticky; z-index: 2; background: var(--surface); }
+.overview-table th:nth-child(-n+3) { z-index: 4; background: var(--head); }
+.overview-table th:nth-child(1), .overview-table tr:not(.reason-row) > td:nth-child(1) { left: 0; }
+.overview-table th:nth-child(2), .overview-table tr:not(.reason-row) > td:nth-child(2) { left: 116px; }
+.overview-table th:nth-child(3), .overview-table tr:not(.reason-row) > td:nth-child(3) { left: 366px; box-shadow: 2px 0 0 rgba(23, 32, 42, .08); }
 .overview-table td.num, .results-table td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .overview-table tr:last-child td, .results-table tr:last-child td { border-bottom: 0; }
 .reason-cell { color: var(--muted); overflow-wrap: anywhere; }
@@ -1304,15 +1519,28 @@ h2 { margin: 28px 0 10px; font-size: 17px; line-height: 1.3; }
 .direction-summary-tag { min-width: 24px; color: #145a94; font-weight: 700; }
 .direction-summary-endpoints { flex: 1 1 260px; min-width: 0; overflow-wrap: anywhere; }
 .direction-summary-reason { flex: 1 1 100%; color: var(--muted); overflow-wrap: anywhere; }
-.direction-summary-total { margin: 5px 0 0; }
+.direction-summary-shots { flex: 0 0 auto; }
+.shot-col { vertical-align: middle; }
+/* 两张缩略图必须并排放进 182px 的截图列（80+80+6+2×8 内边距 = 182）；一旦换行
+   堆叠，行高会从约 75px 涨到约 175px，一屏就只剩三四个测试项。窄屏等比压缩时
+   两张图跟着一起缩，绝不能溢出去盖住右边的采样覆盖率。 */
+.shot-col { overflow: hidden; }
+.shot-cell { display: flex; flex-wrap: nowrap; gap: 6px; }
+.shot-mini { flex: 1 1 0; min-width: 0; display: inline-flex; flex-direction: column; align-items: center; gap: 1px; color: #145a94; font-size: 11px; font-weight: 600; text-decoration: none; }
+.shot-mini img { display: block; width: 100%; max-width: 80px; height: auto; aspect-ratio: 40 / 23; border: 1px solid #b8c2cb; border-radius: 3px; background: #eef2f5; object-fit: cover; }
+.shot-mini:hover img, .shot-mini:focus-visible img { border-color: #1769aa; outline: 2px solid #9dc6e8; outline-offset: 1px; }
 .table-scroll { max-width: 100%; max-height: 68vh; overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; background: var(--surface); }
-.results-table { min-width: 1120px; }
+.results-table { min-width: 1480px; }
+/* 时间戳不能被 overflow-wrap: anywhere 拆成一列一个字符，那会把行高撑到十几行。 */
+.results-table td:nth-child(2), .results-table th:nth-child(2) { white-space: nowrap; }
+/* 工具自报速率是「流确实建立了」的证据，不是判定口径；弱化显示以免和左边的
+   网卡 RX 抢注意力。 */
+.results-table td.tool-rate { color: var(--muted); white-space: normal; }
 .results-table th { position: sticky; top: 0; z-index: 3; background: var(--head); white-space: nowrap; }
-.results-table th:first-child, .results-table td:first-child { position: sticky; left: 0; z-index: 2; background: var(--surface); box-shadow: 2px 0 0 rgba(23, 32, 42, .08); }
+.results-table th:first-child, .results-table tr:not(.reason-row) > td:first-child { position: sticky; left: 0; z-index: 2; background: var(--surface); box-shadow: 2px 0 0 rgba(23, 32, 42, .08); }
 .results-table th:first-child { z-index: 4; background: var(--head); }
-.results-table tr:nth-child(even) td { background: #fbfcfd; }
-.results-table tr:nth-child(even) td:first-child { background: #fbfcfd; }
 .results-table tr.grouptotal td, .results-table tr.grouptotal td:first-child { background: var(--yellow); font-weight: 700; }
+.results-table tr.reason-row > td { padding: 4px 10px 7px; color: var(--muted); background: #fafbfc; overflow-wrap: anywhere; }
 .results-table td { overflow-wrap: anywhere; }
 .row-diagnostics { min-width: 90px; }
 .row-diagnostics > summary { color: #145a94; cursor: pointer; font-weight: 700; }
@@ -1335,6 +1563,25 @@ details.raw-section > summary { cursor: pointer; font-weight: 700; overflow-wrap
 .raw-links { margin: 8px 0; }
 .raw-links a, .artifact-list a { color: #145a94; }
 summary:focus-visible, a:focus-visible, .table-scroll:focus-visible, .overview-scroll:focus-visible { outline: 3px solid #2b78b8; outline-offset: 2px; }
+/* 概览整表需要 1384px。屏幕更窄时不要求用户去找横向滚动条：撤掉 min-width，
+   让定宽列按比例压缩、数字换行，一屏内全部看完。滚动条即使限制了容器高度，
+   也可能因为上方 meta/统计块把容器底部推到视口之外，所以能不横向滚动最好。 */
+@media (max-width: 1460px) {
+    .overview-table { min-width: 0; }
+    .overview-table td.num, .overview-table th { white-space: normal; }
+    /* 等比压缩后不再横向溢出，冻结列没有意义；而 sticky 的 left 约束即使
+       scrollLeft=0 也会把单元格顶到 116/366px，把后面几列压重叠。 */
+    .overview-table th:nth-child(-n+3), .overview-table tr:not(.reason-row) > td:nth-child(-n+3) { position: static; box-shadow: none; }
+}
+/* 再窄就压不动了：恢复横向滚动 + 冻结列，并压低容器高度让滚动条尽量在视口内。 */
+@media (max-width: 1000px) {
+    .overview-table { min-width: 1384px; }
+    /* 窄屏上方的 meta/统计块会换行变高，把表格推得更靠下；容器再压低一点，
+       横向滚动条才不至于又跑到视口外面。 */
+    .overview-scroll { max-height: 50vh; }
+    .overview-table th:nth-child(-n+3), .overview-table tr:not(.reason-row) > td:nth-child(-n+3) { position: sticky; }
+    .overview-table tr:not(.reason-row) > td:nth-child(3), .overview-table th:nth-child(3) { box-shadow: 2px 0 0 rgba(23, 32, 42, .08); }
+}
 @media (max-width: 1100px) {
     body { padding: 12px; }
     .meta { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -1358,6 +1605,9 @@ summary:focus-visible, a:focus-visible, .table-scroll:focus-visible, .overview-s
     .table-scroll, .overview-scroll { max-height: none; overflow: visible; border: 0; }
     .overview-table, .results-table { min-width: 0; font-size: 8px; }
     .overview-table th, .overview-table td, .results-table th, .results-table td { padding: 2px 3px; }
+    /* 打印时表格不再横向滚动，冻结列会错位；缩略图也放不下，只留链接文字。 */
+    .overview-table th, .overview-table td, .results-table th, .results-table td { position: static; box-shadow: none; }
+    .shot-mini img { display: none; }
     .raw-section, .shot, .row-diagnostics { display: none; }
 }
 </style></head><body><main class="report">
@@ -1545,8 +1795,28 @@ mod tests {
         assert!(html.contains("overflow: auto"));
         assert!(html.contains("position: sticky"));
         assert!(html.contains("<details class=\"unit-section\""));
-        assert!(html.contains("流量工具 sender 汇总（诊断）"));
-        assert!(html.contains("流量工具 receiver 汇总（诊断）"));
+        // 工具自报速率是「流确实建立了」的唯一证据，且单条流明细行没有网卡数据，
+        // 必须留在表内可见，不能只藏在折叠的诊断面板里。
+        assert!(html.contains("<th scope=\"col\">流量工具自报（非判定口径）</th>"));
+        assert!(html.contains("发 940.000 / 收 920.000 Mbps"));
+        assert!(!html.contains("流量工具 sender 汇总（诊断）"));
+        assert!(!html.contains("流量工具 receiver 汇总（诊断）"));
+        assert_eq!(tool_rate_text(None, None), "未采集");
+        // 网卡计数器按方向采，拆不到单条流上；流明细行必须写明去组合计行看，
+        // 不能只留「未采集」让人以为这条流没测到。
+        let mut bare = traffic_detail("unit-bare", (0, 0, 0, 0));
+        bare.rx_avg = None;
+        bare.rx_p10 = None;
+        bare.sample_coverage = None;
+        bare.tx_mbps = Some(500.0);
+        bare.rx_mbps = Some(498.2);
+        let bare_html = render(vec![bare, unit_summary("unit-bare", Verdict::Measured)]);
+        assert!(bare_html.contains("—（按方向统计，见组合计行）"));
+        assert!(bare_html.contains("发 500.000 / 收 498.200 Mbps"));
+        assert_eq!(
+            tool_rate_text(Some(500.0), None),
+            "发 500.000 / 收 未采集 Mbps"
+        );
         assert!(html.contains("950.000 Mbps (BA)"));
         assert!(html.contains("的诊断详情\"><span>诊断</span>"));
         for label in [
@@ -1625,6 +1895,138 @@ mod tests {
     }
 
     #[test]
+    fn legacy_group_without_summary_keeps_single_udp_hard_failure_visible() {
+        for code in [
+            "SINGLE_UDP_STREAM_FAILED",
+            "CTSTRAFFIC_SINGLE_UDP_STREAM_FAILED",
+        ] {
+            let mut hard_failure = traffic_detail("legacy-hard", (0, 0, 0, 0));
+            hard_failure.verdict = Verdict::RateFail;
+            hard_failure.reason_code = code.into();
+            let mut not_evaluated = traffic_detail("legacy-hard", (0, 1, 0, 0));
+            not_evaluated.verdict = Verdict::NotEvaluated;
+            not_evaluated.reason_code = "SAMPLE_COVERAGE_LOW".into();
+
+            let rows = vec![hard_failure, not_evaluated];
+            let groups = group_rows(&rows);
+            // 必须灌通的方向硬失败不能被另一腿普通的 NOT_EVALUATED 掩盖。
+            assert_eq!(group_verdict(&groups[0]), Verdict::RateFail, "code={code}");
+        }
+
+        // SetupError 仍然优先于硬失败，与 executor 的聚合顺序一致。
+        let mut hard_failure = traffic_detail("legacy-setup", (0, 0, 0, 0));
+        hard_failure.verdict = Verdict::RateFail;
+        hard_failure.reason_code = "SINGLE_UDP_STREAM_FAILED".into();
+        let mut setup_error = traffic_detail("legacy-setup", (0, 1, 0, 0));
+        setup_error.verdict = Verdict::SetupError;
+        let rows = vec![hard_failure, setup_error];
+        let groups = group_rows(&rows);
+        assert_eq!(group_verdict(&groups[0]), Verdict::SetupError);
+    }
+
+    #[test]
+    fn overview_keeps_scenario_columns_and_screenshots_reachable_without_page_scroll() {
+        let mut summary = unit_summary("unit-shot", Verdict::Pass);
+        summary.task = "★双向 IPERF V4 UDP -b 500m".into();
+        summary.direction_summaries = vec![
+            DirectionSummary {
+                tag: "AB".into(),
+                src: "master/eth0".into(),
+                dst: "agent/eth1".into(),
+                verdict: Verdict::Pass,
+                rx_avg: Some(8500.0),
+                rx_p10: Some(8450.0),
+                target_mbps: Some(8400.0),
+                screenshot_master: "./iperf_outputs/ab_master.png".into(),
+                screenshot_agent: "./iperf_outputs/ab_agent.png".into(),
+                ..Default::default()
+            },
+            DirectionSummary {
+                tag: "BA".into(),
+                src: "agent/eth1".into(),
+                dst: "master/eth0".into(),
+                verdict: Verdict::Pass,
+                rx_avg: Some(6500.0),
+                rx_p10: Some(6450.0),
+                target_mbps: Some(6400.0),
+                screenshot_master: "./iperf_outputs/ba_master.png".into(),
+                ..Default::default()
+            },
+        ];
+        let html = render(vec![summary]);
+
+        // 横向滚动条留在视口内，而不是被推到整页最底部。
+        assert!(
+            html.contains(".overview-scroll { max-width: 100%; max-height: 72vh; overflow: auto;")
+        );
+        // 左侧「结果 / 测试单元 / 方向」三列冻结，右拖看速率时仍知道是哪个测试项。
+        assert!(html.contains(".overview-table th:nth-child(-n+3), .overview-table tr:not(.reason-row) > td:nth-child(-n+3) { position: sticky;"));
+        // 冻结偏移必须与 colgroup 列宽一致（104 + 240 = 344）。
+        assert!(html.contains(
+            ".overview-table th:nth-child(3), .overview-table tr:not(.reason-row) > td:nth-child(3) { left: 366px;"
+        ));
+        // 基准 1384px 下 8.382% = 116px、18.064% = 250px，正好等于上面的冻结偏移。
+        assert!(html.contains(".overview-table { min-width: 1384px; table-layout: fixed; }"));
+        assert!(html.contains(".overview-table col.c-verdict { width: 8.382%; }"));
+        assert!(html.contains(".overview-table col.c-unit { width: 18.064%; }"));
+        // 屏幕装不下时改为等比压缩，不让用户去页面底部找横向滚动条。
+        assert!(html.contains("@media (max-width: 1460px)"));
+        // 窄列里最长的结果标签必须能在下划线处折行，不能溢出盖住相邻列。
+        assert_eq!(
+            status_label_html(Verdict::NotEvaluated),
+            "NOT_<wbr>EVALUATED"
+        );
+        assert_eq!(status_label_html(Verdict::SetupError), "SETUP_<wbr>ERROR");
+        assert_eq!(status_label_html(Verdict::Pass), "PASS");
+        assert!(html.contains(
+            ".overview-table tr:not(.reason-row) > td:nth-child(1) .status, .unit-verdict-note .status { white-space: normal; overflow-wrap: normal;"
+        ));
+        // 两张缩略图必须并排，换行堆叠会把行高翻倍。
+        assert!(html.contains(".shot-cell { display: flex; flex-wrap: nowrap;"));
+        assert!(html.contains(".shot-mini img { display: block; width: 100%; max-width: 80px;"));
+        assert!(html.contains("<th scope=\"col\">接收端 RX 平均</th>"));
+        // 判定原因独占整行，不再挤在定宽列里被截断。
+        assert!(!html.contains("<th scope=\"col\">原因</th>"));
+        assert!(html.contains("<tr class=\"reason-row\""));
+        assert!(html.contains("colspan=\"11\""));
+        // 截图列与接收速率同排，不必展开诊断面板。
+        assert!(html.contains("<th scope=\"col\">截图</th>"));
+        assert!(html.contains("<col class=\"c-shot\">"));
+        for path in [
+            "./iperf_outputs/ab_master.png",
+            "./iperf_outputs/ab_agent.png",
+            "./iperf_outputs/ba_master.png",
+        ] {
+            assert!(html.contains(path), "missing overview screenshot: {path}");
+        }
+        // BA 只有主控截图时，辅测不能渲染成空缩略图。
+        assert_eq!(html.matches("class=\"shot-mini\"").count(), 6);
+    }
+
+    #[test]
+    fn overview_drops_the_screenshot_column_when_nothing_was_captured() {
+        let mut summary = unit_summary("unit-noshot", Verdict::Pass);
+        summary.task = "IPERF V4 UDP".into();
+        summary.direction_summaries = vec![DirectionSummary {
+            tag: "单向".into(),
+            src: "master/eth0".into(),
+            dst: "agent/eth1".into(),
+            verdict: Verdict::Measured,
+            reason_code: "TARGET_UNKNOWN".into(),
+            reason_detail: "Observe 模式仅记录实际能力".into(),
+            rx_avg: Some(940.0),
+            ..Default::default()
+        }];
+        let html = render(vec![summary]);
+
+        // 关掉截图时整列都会是「未采集」，白占约 190px，应该整列不渲染。
+        assert!(!html.contains("<th scope=\"col\">截图</th>"));
+        assert!(!html.contains("<col class=\"c-shot\">"));
+        assert!(html.contains("colspan=\"10\""));
+        assert!(html.contains("TARGET_UNKNOWN: Observe 模式仅记录实际能力"));
+    }
+
+    #[test]
     fn screenshot_thumbnail_and_text_link_to_original_image() {
         let html = screenshot_link("./iperf_outputs/shot&1.png", "主控截图");
 
@@ -1687,7 +2089,11 @@ mod tests {
         assert!(html.contains("RX_P10_BELOW_TARGET"));
         assert!(html.contains("双向方向汇总"));
         assert!(html.contains("2 个方向执行行（AB / BA）"));
-        assert!(html.contains("AB + BA 接收端 RX 平均合计</strong>：1700.000 Mbps"));
+        // 双向只按各自方向的接收端速率判定；任何形式的 AB+BA 相加都会被误读成
+        // 整机吞吐，尤其是一个方向未评价时。
+        assert!(!html.contains("AB + BA"));
+        assert!(!html.contains("RX 平均合计"));
+        assert!(!html.contains("1700.000 Mbps"));
         assert!(!html.contains("1640.000 Mbps"));
         assert!(html.contains("data-unit-id=\"unit-bidir\" open"));
     }

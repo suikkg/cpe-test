@@ -1,13 +1,13 @@
-# cpe_test v4.2.5 Windows 配置与文档包
+# cpe_test v4.2.6 Windows 配置与文档包
 
-仓库中的 `cpe_test-v4.2.5-windows-config-docs.zip` 是便于从 Git 直接下载的
+仓库中的 `cpe_test-v4.2.6-windows-config-docs.zip` 是便于从 Git 直接下载的
 Windows 配置、说明文档和启动脚本资料包。包内文件由仓库当前版本生成，并由 CI
 逐文件与源码副本比对，避免配置或文档过期。
 
 这个资料包**不包含可执行程序或吞吐工具**：
 
 - 不包含 `cpe_test.exe`；请从 GitHub Release 下载正式
-  `cpe_test-v4.2.5-windows-x86_64.zip`，或自行编译。
+  `cpe_test-v4.2.6-windows-x86_64.zip`，或自行编译。
 - 不包含 `ctsTraffic.exe`；正式 Windows Release ZIP 会捆绑固定并校验过的
   Microsoft ctsTraffic 2.0.4.0 x64。
 - 不包含 `iperf3.exe` 及其 DLL；需要 iperf3 测试时，请放入完整的 Windows
@@ -20,7 +20,12 @@ Windows 配置、说明文档和启动脚本资料包。包内文件由仓库当
 - `start_agent.bat`、`start_master.bat`、`start_master_select_config.bat`。
 - iperf3/ctsTraffic 放置说明、MIT 许可证和第三方声明。
 
-## v4.2.5 行为要点
+## v4.2.6 行为要点
+
+- 网卡监控与控制台/CSV 时间戳带完整日期（如 2026-08-17 12:00:01），跨天监控也能对上问题发生的时刻。
+- 双向 UDP 的 attempt/retry 日志带 [ab]/[ba] 方向前缀，master.log 里两腿重试记录可区分。
+- iperf 有效窗口优先采用行内区间（即使短于要求时长也按实际裁剪），不再回退到 client 进程寿命，避免短测量被补成完整窗口并把启动爬升计入接收端平均。
+- 报告概览新增截图列（主控/辅测缩略图并排、点击开原图，未采集时整列不渲染）；单条流明细显示流量工具自报速率，网卡列注明按方向统计；双向不再显示 AB+BA 接收速率合计。
 
 - HTML 报告的 Ping 概览显示丢包率以及 RTT 最小/平均/最大值；`PING_OK` 和 `RESUME_FRESH_PASS` 会解释通过与跳过原因。
 - 逐行诊断保留主控/辅测截图、实际灌包命令、raw log、NIC CSV 和内嵌原始输出；移动端报告也可展开查看。

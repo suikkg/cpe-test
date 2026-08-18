@@ -308,6 +308,9 @@ struct UdpLegPlan {
 struct PreparedUdpFlow {
     leg_pos: usize,
     stream_pos: usize,
+    /// 方向标签（ab/ba，单向为空）。双向两腿并行时，日志必须能区分是哪一腿的
+    /// attempt/retry，否则 master.log 里两个 #1 完全分不开。
+    tag: String,
     task: IperfTask,
     server_req: Option<IperfServerStartReq>,
     client_req: Option<IperfClientReq>,
@@ -1878,6 +1881,8 @@ impl Ctx {
                     ping_min: row.ping_min,
                     ping_avg: row.ping_avg,
                     ping_max: row.ping_max,
+                    screenshot_master: row.screenshot_master.clone(),
+                    screenshot_agent: row.screenshot_agent.clone(),
                 })
             })
             .collect()
@@ -2933,7 +2938,8 @@ impl Ctx {
                 });
             }
             logln(&format!(
-                "    [CTS UDP 单流重试] 第 {} 次完整尝试无工具测量，双端清理已确认，将重启 server/client（{retry_no}/{}）",
+                "    [CTS UDP 单流重试]{} 第 {} 次完整尝试无工具测量，双端清理已确认，将重启 server/client（{retry_no}/{}）",
+                fmt_tag_bracket(tag),
                 attempt + 1,
                 max_attempts.saturating_sub(1)
             ));
@@ -3995,7 +4001,8 @@ impl Ctx {
                 state.connected = false;
             }
             logln(&format!(
-                "    [UDP流重试] {}-#{} 本轮未跑通，重新启动 server/client（{}/{}）",
+                "    [UDP流重试]{} {}-#{} 本轮未跑通，重新启动 server/client（{}/{}）",
+                fmt_tag_bracket(&prepared.tag),
                 if prepared.task.stream_idx == 0 && prepared.stream_pos == 0 {
                     "流"
                 } else {
@@ -4133,6 +4140,7 @@ impl Ctx {
                     Ok((server_req, client_req)) => prepared.push(PreparedUdpFlow {
                         leg_pos,
                         stream_pos,
+                        tag: plan.tag.clone(),
                         task: task.clone(),
                         server_req: Some(server_req),
                         client_req: Some(client_req),
@@ -4143,6 +4151,7 @@ impl Ctx {
                     Err(e) => prepared.push(PreparedUdpFlow {
                         leg_pos,
                         stream_pos,
+                        tag: plan.tag.clone(),
                         task: task.clone(),
                         server_req: None,
                         client_req: None,
@@ -4852,6 +4861,16 @@ fn fmt_tag(tag: &str) -> String {
         String::new()
     } else {
         format!("-{tag}")
+    }
+}
+
+/// 日志用的方向前缀。双向单元两腿并行输出，缺了它就无法把 attempt/retry
+/// 归属到 AB 还是 BA。
+fn fmt_tag_bracket(tag: &str) -> String {
+    if tag.is_empty() {
+        String::new()
+    } else {
+        format!("[{tag}]")
     }
 }
 
@@ -6004,25 +6023,28 @@ fn iperf_active_interval(events: &[IperfFlowEvent], required_secs: u64) -> Optio
         .collect();
     let first_traffic = traffic_events.first().map(|event| event.elapsed_ms);
 
-    // interval 行内的时间是 iperf 进程自己的测量时间，不受 stdout 块缓冲影响。
-    // 优先用最终汇总区间反推起流时刻；只有区间覆盖了用户要求的有效时长才采用，
-    // 避免把一次过早结束的短测量误扩成完整测试。
+    // interval 行内的时间是 iperf 进程自己的测量时间，不受 stdout 块缓冲影响，
+    // 是最可信的活跃区间来源，因此优先于任何事件到达时间。
+    //
+    // 即使行内区间短于用户要求的时长也必须采用：短就是短，应当由下游按
+    // 「共同有效窗口不足」判定。若因为“不够长”而丢弃它，回退项反而是更长的
+    // client 进程寿命（含 startup/settle/退出收尾），会把一次只测到 175 秒的
+    // 短测量补成完整 180 秒窗口，并把启动爬升算进 RX 平均。
     let reported_interval = traffic_events
         .iter()
         .filter_map(|event| {
             iperf_interval_ms(&event.line)
                 .map(|(start_ms, end_ms)| (end_ms.saturating_sub(start_ms), event.elapsed_ms))
         })
-        .filter(|(duration_ms, _)| {
-            duration_ms.saturating_add(FLOW_TIMELINE_TOLERANCE_MS) >= expected_ms
-        })
-        .max_by_key(|(duration_ms, event_elapsed_ms)| (*event_elapsed_ms, *duration_ms));
+        // 最终汇总行覆盖的区间最长，正常也最后到达；按时长优先排序，避免
+        // 逐秒 interval 行恰好排在汇总行之后时被当成整段测量。
+        .max_by_key(|(duration_ms, event_elapsed_ms)| (*duration_ms, *event_elapsed_ms));
     if let Some((duration_ms, event_elapsed_ms)) = reported_interval {
         // 最终汇总行已经证明吞吐测量结束；它之后到 Ended 之间只剩
         // child wait、stdout reader join 等退出收尾，不能纳入网卡平均。
         let measured_end = event_elapsed_ms.min(end);
         let start = measured_end.saturating_sub(duration_ms).max(attempt_floor);
-        if flow_duration_is_plausible(start, measured_end, expected_ms) {
+        if measured_end > start {
             return Some((start, measured_end));
         }
     }
@@ -9510,6 +9532,59 @@ mod tests {
     }
 
     #[test]
+    fn short_reported_interval_stays_short_instead_of_falling_back_to_process_lifetime() {
+        let master = endpoint(Side::Master, "master0", "192.168.1.2");
+        let agent = endpoint(Side::Agent, "agent0", "192.168.1.3");
+        // 要求 180 秒，但 iperf 行内区间只覆盖 175 秒。
+        let plan = udp_plan(0, "ab", 1, &master, &agent, 180);
+        // 块缓冲：全部 interval 在进程退出时集中到达。
+        let mut flow = udp_flow(0, 0, &plan.streams[0], 199_990, 200_000, true);
+        flow.events[0].line = "[  5]   5.00-180.00 sec  12.0 GBytes  500 Mbits/sec sender".into();
+        flow.events.insert(
+            0,
+            IperfFlowEvent {
+                kind: IperfEventKind::Started,
+                elapsed_ms: 10_000,
+                line: "started".into(),
+                ..Default::default()
+            },
+        );
+
+        // 必须按行内 175 秒裁剪，而不是回退成 client 进程寿命 190 秒 —— 后者会把
+        // 短测量补成完整窗口，还把 startup 爬升算进 RX 平均。
+        assert_eq!(flow_active_interval(&flow), Some((24_990, 199_990)));
+        let window = iperf_effective_window(&flow.events, 180, true);
+        assert!(
+            !window.complete,
+            "175 秒测量不能被判成完整 180 秒窗口: {window:?}"
+        );
+        assert_eq!(window.available_secs, 175.0);
+        // 集中到达的毫秒级 Traffic 时间不能成为活跃时长。
+        assert!(window.available_secs > 1.0);
+    }
+
+    #[test]
+    fn longest_reported_interval_wins_over_a_later_per_second_interval_line() {
+        let master = endpoint(Side::Master, "master0", "192.168.1.2");
+        let agent = endpoint(Side::Agent, "agent0", "192.168.1.3");
+        let plan = udp_plan(0, "ab", 1, &master, &agent, 180);
+        let mut flow = udp_flow(0, 0, &plan.streams[0], 200_000, 200_500, true);
+        flow.events[0].line = "[  5]   0.00-180.00 sec  10.5 GBytes  500 Mbits/sec sender".into();
+        // 逐秒 interval 行排在汇总行之后到达，不能被当成整段测量。
+        flow.events.insert(
+            1,
+            IperfFlowEvent {
+                kind: IperfEventKind::Traffic,
+                elapsed_ms: 200_100,
+                mbps: Some(500.0),
+                line: "[  5] 179.00-180.00 sec  59.6 MBytes  500 Mbits/sec".into(),
+            },
+        );
+
+        assert_eq!(flow_active_interval(&flow), Some((20_000, 200_000)));
+    }
+
+    #[test]
     fn tcp_rate_uses_only_the_event_proven_effective_window() {
         let events = vec![
             IperfFlowEvent {
@@ -10623,6 +10698,12 @@ round-trip min/avg/max/stddev = 1.250/2.500/3.750/1.021 ms
         assert!(line.contains("[灌包进度][TCP][ab]"));
         assert!(line.contains("nic-rx=2368.4Mbps"));
         assert!(line.contains("iperf=2379.0Mbps"));
+
+        // 双向两腿并行输出重试日志，缺了方向前缀就无法把 attempt/retry 归到
+        // AB 还是 BA —— master.log 里两条 #1 会完全分不开。
+        assert_eq!(fmt_tag_bracket("ab"), "[ab]");
+        assert_eq!(fmt_tag_bracket("ba"), "[ba]");
+        assert_eq!(fmt_tag_bracket(""), "");
 
         let mut state = LiveFlowState::default();
         apply_flow_event(

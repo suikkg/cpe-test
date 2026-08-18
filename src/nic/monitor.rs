@@ -602,8 +602,9 @@ pub fn run_continuous(opts: &ContinuousOpts) -> Result<(), String> {
         "\n网卡: [{}]  间隔: {}s  按 Ctrl+C 停止\n",
         opts.iface, opts.interval_secs
     );
-    println!("{:<12} {:>12}", "时间", "速率(Mbps)");
-    println!("{}", "-".repeat(26));
+    // 表头含中文（每个汉字占 2 列），宽度按显示列数补偿，与下方数据列对齐
+    println!("{:<18} {:>10}", "时间", "速率(Mbps)");
+    println!("{}", "-".repeat(34));
 
     loop {
         std::thread::sleep(wait);
@@ -624,8 +625,8 @@ pub fn run_continuous(opts: &ContinuousOpts) -> Result<(), String> {
                 let delta = new_bytes.saturating_sub(old_bytes);
                 let mbps = delta as f64 * 8.0 / dt / 1_000_000.0;
 
-                let t = chrono::Local::now().format("%H:%M:%S").to_string();
-                println!("{:<12} {:>12.2}", t, mbps);
+                let t = crate::util::now_full();
+                println!("{:<20} {:>12.2}", t, mbps);
                 records.push((t.clone(), mbps));
 
                 if let Some(p) = opts.csv_path {

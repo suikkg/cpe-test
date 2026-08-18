@@ -2,6 +2,15 @@
 
 > 两台电脑间自动化 ping + iperf3 / Microsoft ctsTraffic 灌包测试，零 Python/零 PowerShell
 
+## v4.2.6
+
+- 网卡监控与控制台/CSV 时间戳升级为完整日期时间（如 `2026-08-17 12:00:01`），跨天长时间监控也能直接定位问题发生的时刻。
+- 双向 UDP 两腿并行时，master.log 的 attempt/retry 日志带 `[ab]`/`[ba]` 方向前缀，两条腿的重试记录不再无法区分。
+- 修复 iperf 有效窗口被“补长”：iperf 行内区间是权威来源，短于要求时长也按实际裁剪，不再回退到 client 进程寿命——此前一次只测到 175 秒的短测量会被补成 180 秒完整窗口，并把启动爬升算进接收端平均。
+- 报告概览新增截图列：主控/辅测截图缩略图与接收速率并排展示、点击打开原图，未采集截图时整列不渲染；单条流明细显示流量工具自报速率（工具证据，非判定口径），并注明网卡按方向统计、见组合计行。
+- 双向判定不再展示“AB + BA 接收端 RX 平均合计”，避免把两个方向的接收速率相加误读成整机吞吐；无单元汇总行的旧数据也复刻执行端聚合顺序，单流 UDP 硬失败不会被另一方向的“无法评价”掩盖。
+- 概览表窄屏自适应：标签可在下划线处折行，判定原因独占整行不再被列宽截断；中屏等比压缩去掉横向滚动，窄屏保留冻结前 3 列并把横向滚动条压回视口内。
+
 ## v4.2.5
 
 - 报告测试概览补齐 Ping 丢包率与 RTT 最小/平均/最大值，并用 `PING_OK`、`RESUME_FRESH_PASS` 等原因码解释 PASS 和 SKIP；不会再把通过原因显示成“不适用”。
@@ -82,7 +91,7 @@ CPE（Customer Premises Equipment）子网测试工具用于在**两台电脑之
 ```
 cpe_test.exe          ← 本工具（单文件）
 iperf3.exe            ← 从 iperf.fr 下载（只测 Ping/ctsTraffic 可不放）
-ctsTraffic.exe        ← v4.2.5 Windows Release 已捆绑（仅 Windows 10+）
+ctsTraffic.exe        ← v4.2.6 Windows Release 已捆绑（仅 Windows 10+）
 start_agent.bat       ← 辅测机双击
 start_master.bat      ← 主控机双击
 start_master_select_config.bat ← 主控机选择网口配置后双击
@@ -183,10 +192,10 @@ cpe_test monitor -n "以太网" -i 5 -d 120 -c r.csv
 ```
 网卡: [以太网]  间隔: 1s  按 Ctrl+C 停止
 
-时间          速率(Mbps)
---------------------------
-12:00:01        1690.10
-12:00:02        1688.50
+时间                   速率(Mbps)
+----------------------------------
+2026-08-17 12:00:01       1690.10
+2026-08-17 12:00:02       1688.50
 ^C
 ==================================================
 网卡: 以太网
@@ -210,9 +219,11 @@ CSV : speed_log.csv
 # Peak (Mbps),1750.45
 # ================================
 Time,Speed(Mbps)
-12:00:01,1690.10
-12:00:02,1688.50
+2026-08-17 12:00:01,1690.10
+2026-08-17 12:00:02,1688.50
 ```
+
+时间戳带完整日期，跨天的长时间监控也能直接定位问题发生的时刻。
 
 ---
 
@@ -807,7 +818,7 @@ cargo build --release --locked
 
 自行编译后，把 `cpe_test.exe`、启动脚本和所需吞吐工具放到两台 Windows 电脑同一目录：
 iperf3 测试需要完整的 iperf3 Windows 发行包；ctsTraffic 测试需要 `ctsTraffic.exe`。
-官方 v4.2.5 Windows Release ZIP 已捆绑固定且校验过的 ctsTraffic 2.0.4.0，但由于发行包差异不内置 iperf3。
+官方 v4.2.6 Windows Release ZIP 已捆绑固定且校验过的 ctsTraffic 2.0.4.0，但由于发行包差异不内置 iperf3。
 
 ### GitHub Actions CI
 
@@ -830,7 +841,7 @@ Windows ZIP 包含启动脚本、四份配置、固定 CTS 二进制和第三方
 `tar.gz` 保留 `cpe_test` 可执行位。发布作业会再次核对资产名称、数量、内部结构和哈希。
 
 仓库同时跟踪一份不含可执行程序的
-[`cpe_test-v4.2.5-windows-config-docs.zip`](dist/cpe_test-v4.2.5-windows-config-docs.zip)，
+[`cpe_test-v4.2.6-windows-config-docs.zip`](dist/cpe_test-v4.2.6-windows-config-docs.zip)，
 便于直接从 Git 下载 Windows 配置、文档和启动脚本。其 SHA-256 位于同目录的
 `.zip.sha256` 文件；CI 会逐文件确认压缩包内容与仓库源文件一致。需要开箱即用的程序、
 固定版 ctsTraffic 和许可证全集时，仍应下载上面的正式 Windows Release ZIP。
