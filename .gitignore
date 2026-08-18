@@ -6,6 +6,10 @@ task_results.json
 iperf_outputs/
 config.json
 .cpe_last_agent
+# 本地运行状态（记住上次选择的网卡/agent，机器相关）
+.cpe_monitor_iface
+# 本地实验室配置：可能含 agent_token 等凭据，不进公开仓库
+/configs/
 cpe_win_pkg.zip
 cpe_test_v3.0.0_未验证.zip
 /release/

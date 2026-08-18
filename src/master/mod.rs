@@ -2,4 +2,5 @@
 
 pub mod builder;
 pub mod executor;
+pub mod rate_window;
 pub mod ui;

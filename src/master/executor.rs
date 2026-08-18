@@ -5,19 +5,24 @@ use crate::clock::MonotonicClock;
 use crate::clock::{ManualClock, SystemClock};
 use crate::cmd::ctstraffic;
 use crate::cmd::iperf::{self, IperfClientJobMgr, IperfServerMgr};
+use crate::cmd::tools::{find_ctstraffic, find_iperf3};
 use crate::config::{Config, RateCheckCfg, RateMode};
 use crate::http_client;
 use crate::master::builder::{
     v6_addrs, CtsTrafficTask, IperfTask, Leg, LegKind, PingPurpose, PingTask, Side, Unit,
     SINGLE_UDP_MIN_ATTEMPTS,
 };
-use crate::nic::monitor::{MonitorMgr, MIN_VALID_RX_MBPS};
+use crate::master::rate_window::{
+    evaluate_nic_rx, monitor_rate_stats, nearest_valid_sample, percentile,
+    rate_sample_coverage_sufficient, rate_window_coverage_sufficient, EffectiveWindow,
+    MIN_VALID_RX_MBPS,
+};
+use crate::nic::monitor::MonitorMgr;
 use crate::ping;
 use crate::protocol::*;
-use crate::report::{
-    report_endpoint, report_reason, DirectionSummary, ExecutionStatus, Row, StreamCounts, Verdict,
-};
-use crate::util::{find_ctstraffic, find_iperf3, logln, md5_hex, now_compact, now_full, sanitize};
+use crate::report::{report_endpoint, report_reason, DirectionSummary, Row, StreamCounts};
+use crate::util::{lock_recover, logln, md5_hex, now_compact, now_full, sanitize};
+use crate::verdict::{aggregate_verdict, ExecutionStatus, Verdict};
 use base64::Engine;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -29,9 +34,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const UDP_SERVER_START_RETRIES: usize = 1;
-const MIN_RATE_SAMPLE_COVERAGE: f64 = 0.95;
-const ROLLING_RATE_WINDOW_MS: u64 = 5_000;
-const ROLLING_COVERAGE_TOLERANCE_MS: u64 = 50;
 const FLOW_TIMELINE_TOLERANCE_MS: u64 = 2_000;
 const CTS_TIMELINE_TOLERANCE_MS: u64 = 100;
 const RESOURCE_LEASE_GRACE_SECS: u64 = 300;
@@ -219,6 +221,7 @@ pub struct IperfPreflightBlock {
     pub reason_detail: String,
 }
 
+#[derive(Debug)]
 struct LegOutcome {
     verdict: Verdict,
     reason_code: String,
@@ -337,31 +340,6 @@ struct UdpFlowRun {
     /// 单流方向已在每次资源清理均确认的前提下耗尽强制尝试预算。
     single_stream_exhausted: bool,
     error: String,
-}
-
-#[derive(Debug, Clone, Default)]
-struct RateStats {
-    avg_mbps: Option<f64>,
-    p10_mbps: Option<f64>,
-    median_mbps: Option<f64>,
-    p95_mbps: Option<f64>,
-    min_mbps: Option<f64>,
-    max_mbps: Option<f64>,
-    coverage: f64,
-    /// 实际可形成的完整 5 秒滚动窗口占理论窗口数的比例。
-    ///
-    /// 总采样覆盖率高并不代表稳定性窗口也完整：一次跨越多个失败周期的
-    /// 恢复样本可以补齐平均速率覆盖，却不能证明其中任意 5 秒都稳定。
-    rolling_coverage: f64,
-}
-
-#[derive(Debug, Clone, Default)]
-struct EffectiveWindow {
-    start_ms: u64,
-    end_ms: u64,
-    available_secs: f64,
-    required_secs: u64,
-    complete: bool,
 }
 
 struct CtsAttemptRun {
@@ -1336,6 +1314,7 @@ impl Ctx {
         side: Side,
         iface: &str,
         endpoint_identity: &str,
+        origin_offset_ms: u64,
         out: &MonitorStopOut,
     ) -> String {
         let side_slug = match side {
@@ -1349,7 +1328,7 @@ impl Ctx {
             sanitize(iface),
             &md5_hex(endpoint_identity)[..8]
         );
-        let contents = build_monitor_samples_csv(side.cn(), iface, out);
+        let contents = build_monitor_samples_csv(side.cn(), iface, origin_offset_ms, out);
         self.write_output_artifact(&filename, &contents, "网卡原始样本")
     }
 
@@ -1473,7 +1452,7 @@ impl Ctx {
     }
 
     fn push_row(&self, row: Row) -> usize {
-        let mut g = self.rows.lock().unwrap();
+        let mut g = lock_recover(&self.rows);
         g.push(row);
         g.len() - 1
     }
@@ -1606,7 +1585,7 @@ impl Ctx {
             let blocked = preflight_blocks.and_then(|blocks| blocks.get(&unit.id));
             logln(&format!("\n[{}/{}] {}", i + 1, total, unit.title));
             if self.cfg.resume && blocked.is_none() {
-                let fresh = { self.db.lock().unwrap().fresh_pass(&unit.id) };
+                let fresh = { lock_recover(&self.db).fresh_pass(&unit.id) };
                 if let Some(t) = fresh {
                     logln(&format!("  已PASS，上次时间: {t}，跳过 (RESUME)"));
                     sum.skip += 1;
@@ -1717,7 +1696,7 @@ impl Ctx {
 
             // 双向：互填「对向接收 Mbps」
             if unit.bidir {
-                let mut g = self.rows.lock().unwrap();
+                let mut g = lock_recover(&self.rows);
                 populate_peer_rx(&mut g, &outcomes);
             }
 
@@ -1814,7 +1793,7 @@ impl Ctx {
                 ..Default::default()
             });
             {
-                let mut db = self.db.lock().unwrap();
+                let mut db = lock_recover(&self.db);
                 db.set(&unit.id, unit_ok, &unit.title);
                 db.save();
             }
@@ -1826,7 +1805,7 @@ impl Ctx {
     }
 
     fn outcomes_have_usable_traffic_measurement(&self, outcomes: &[LegOutcome]) -> bool {
-        let rows = self.rows.lock().unwrap();
+        let rows = lock_recover(&self.rows);
         outcomes.iter().any(|outcome| {
             outcome.main_rows.iter().any(|index| {
                 rows.get(*index)
@@ -1837,7 +1816,7 @@ impl Ctx {
     }
 
     fn direction_summaries(&self, outcomes: &[LegOutcome]) -> Vec<DirectionSummary> {
-        let rows = self.rows.lock().unwrap();
+        let rows = lock_recover(&self.rows);
         outcomes
             .iter()
             .filter_map(|outcome| {
@@ -1938,7 +1917,7 @@ impl Ctx {
             // UNIT_PANIC 替换，但已写入的方向 Row 仍然有效。先按稳定排序键复用这些
             // Row，避免再生成同方向占位而得到“原 AB + 补 AB + 补 BA”。
             let (committed_rows, committed_rx_avg) = {
-                let rows = self.rows.lock().unwrap();
+                let rows = lock_recover(&self.rows);
                 let indices: Vec<usize> = rows
                     .iter()
                     .enumerate()
@@ -2906,6 +2885,25 @@ impl Ctx {
                 None
             }
         };
+        // 发送端采样：有目标时 W08 要求双侧滚动窗口都完整。启动失败只记诊断，
+        // 不像接收端那样直接影响 verdict——接收端才是正式判定口径。
+        let tx_mon_id = if task.src.key() == task.dst.key() {
+            None
+        } else {
+            let before_ms = leg_epoch.elapsed().as_millis().min(u64::MAX as u128) as u64;
+            match self.mon_start(
+                task.src.side,
+                &task.src.nic.name,
+                lifecycle.owner_id,
+                lifecycle.lease_secs,
+            ) {
+                Ok((id, call_origin_ms)) => Some((id, before_ms + call_origin_ms)),
+                Err(error) => {
+                    logln(&format!("    (CTS 发送端网卡监控启动失败: {error})"));
+                    None
+                }
+            }
+        };
 
         let mut attempts = Vec::with_capacity(max_attempts);
         for attempt in 0..max_attempts {
@@ -2946,6 +2944,7 @@ impl Ctx {
             std::thread::sleep(Duration::from_millis(500));
         }
 
+        let rx_origin_offset_ms = mon_id.as_ref().map(|(_, offset)| *offset).unwrap_or(0);
         let mon_out = match mon_id {
             Some((id, start_offset_ms)) => match self.mon_stop(task.dst.side, &id) {
                 Ok(mut output) => {
@@ -2966,6 +2965,19 @@ impl Ctx {
             },
             None => None,
         };
+        let tx_mon_out =
+            tx_mon_id.and_then(
+                |(id, start_offset_ms)| match self.mon_stop(task.src.side, &id) {
+                    Ok(mut output) => {
+                        align_monitor_samples(&mut output, start_offset_ms);
+                        Some(output)
+                    }
+                    Err(error) => {
+                        logln(&format!("    (CTS 发送端网卡监控停止失败: {error})"));
+                        None
+                    }
+                },
+            );
         let Some(selected_idx) = select_cts_attempt_index(&attempts) else {
             return self.push_cts_setup_error_row(
                 useq,
@@ -2991,6 +3003,17 @@ impl Ctx {
                 monitor_rate_stats(output, &selected.traffic_window, true, baseline_cutoff_ms)
             })
             .unwrap_or_default();
+        let tx_stats = tx_mon_out
+            .as_ref()
+            .or(if task.src.key() == task.dst.key() {
+                mon_out.as_ref()
+            } else {
+                None
+            })
+            .map(|output| {
+                monitor_rate_stats(output, &selected.traffic_window, false, baseline_cutoff_ms)
+            })
+            .unwrap_or_default();
         let rx_avg = rx_stats.avg_mbps;
         let nic_samples = mon_out
             .as_ref()
@@ -3000,6 +3023,7 @@ impl Ctx {
                     task.dst.side,
                     &task.dst.nic.name,
                     &task.dst.key(),
+                    rx_origin_offset_ms,
                     output,
                 )
             })
@@ -3143,28 +3167,12 @@ impl Ctx {
                     "ctsTraffic 最多观测到 {active_streams}/{requested_streams} 条活跃连接，正式判定至少需要 {required_streams} 条"
                 ),
             )
-        } else if task.udp && loss_limit.is_some() && loss.is_none() {
-            (
-                Verdict::NotEvaluated,
-                "CTSTRAFFIC_UDP_LOSS_DATA_MISSING".to_string(),
-                "已配置 UDP 丢帧门槛，但 ctsTraffic 输出缺少 dropped frames 数据".into(),
-            )
-        } else if task.udp
-            && loss_limit
-                .zip(loss)
-                .is_some_and(|(limit, actual)| actual > limit)
-        {
-            (
-                Verdict::RateFail,
-                "CTSTRAFFIC_UDP_LOSS_HIGH".to_string(),
-                format!(
-                    "CTS UDP 丢帧率 {:.3}% 超过限制 {:.3}%",
-                    loss.unwrap_or_default(),
-                    loss_limit.unwrap_or_default()
-                ),
-            )
         } else {
-            evaluate_nic_rx(task.rate_mode, task.rx_target_mbps, &rx_stats)
+            // 丢帧判定必须排在网卡采样/目标可信度之后，与 iperf3 路径的判定链
+            // 一致：采样不足或目标未知时先产出 NOT_EVALUATED / MEASURED，不能
+            // 拿一个无法核对的窗口去判 RATE_FAIL。
+            let nic = evaluate_nic_rx(task.rate_mode, task.rx_target_mbps, &rx_stats, &tx_stats);
+            cts_apply_udp_loss(nic, task.udp, loss_limit, loss)
         };
         let mut raw_diagnostics = Vec::new();
         if !reason_code.is_empty() {
@@ -3264,10 +3272,16 @@ impl Ctx {
             required_streams,
             retry_count: cts_retry_count(&attempts),
             target_mbps: task.rx_target_mbps,
+            tx_avg: tx_stats.avg_mbps,
+            tx_p10: tx_stats.p10_mbps,
             rx_p10: rx_stats.p10_mbps,
             effective_seconds: Some(selected.traffic_window.available_secs),
             required_seconds: Some(task.duration as f64),
             sample_coverage: Some(rx_stats.coverage),
+            window_start_ms: Some(selected.traffic_window.start_ms),
+            window_end_ms: Some(selected.traffic_window.end_ms),
+            baseline_mbps: Some(rx_stats.baseline_mbps),
+            rolling_coverage: Some(rx_stats.rolling_coverage),
             screenshot_master,
             screenshot_agent,
             raws,
@@ -3489,6 +3503,25 @@ impl Ctx {
                 None
             }
         };
+        // 发送端也要采样：有明确目标时 W08 要求 RX/TX 双侧滚动窗口都完整，
+        // 发送端采样塌了同样说明这一轮时间轴不可信。同一块网卡就不重复起。
+        let tx_mon_id = if t.src.key() == t.dst.key() {
+            None
+        } else {
+            let before_ms = leg_epoch.elapsed().as_millis().min(u64::MAX as u128) as u64;
+            match self.mon_start(
+                t.src.side,
+                &t.src.nic.name,
+                lifecycle.owner_id,
+                lifecycle.lease_secs,
+            ) {
+                Ok((id, call_origin_ms)) => Some((id, before_ms + call_origin_ms)),
+                Err(e) => {
+                    logln(&format!("    (发送端网卡监控启动失败: {e})"));
+                    None
+                }
+            }
+        };
         let live = Arc::new(Mutex::new(LiveFlowState::default()));
         let mut events = Vec::new();
         let parallel_streams = if t.udp {
@@ -3583,6 +3616,7 @@ impl Ctx {
             let _ = progress.join();
             result
         });
+        let rx_origin_offset_ms = mon_id.as_ref().map(|(_, offset)| *offset).unwrap_or(0);
         let mon_out =
             mon_id.and_then(
                 |(id, start_offset_ms)| match self.mon_stop(t.dst.side, &id) {
@@ -3596,12 +3630,35 @@ impl Ctx {
                     }
                 },
             );
+        let tx_mon_out =
+            tx_mon_id.and_then(
+                |(id, start_offset_ms)| match self.mon_stop(t.src.side, &id) {
+                    Ok(mut output) => {
+                        align_monitor_samples(&mut output, start_offset_ms);
+                        Some(output)
+                    }
+                    Err(error) => {
+                        logln(&format!("    (发送端网卡监控停止失败: {error})"));
+                        None
+                    }
+                },
+            );
         let effective_window =
             iperf_effective_window(&events, t.duration, parsed.has_measurement());
         let baseline_cutoff_ms = iperf_baseline_cutoff_ms(&events);
         let rx_stats = mon_out
             .as_ref()
             .map(|output| monitor_rate_stats(output, &effective_window, true, baseline_cutoff_ms))
+            .unwrap_or_default();
+        // 同一块网卡时 TX 与 RX 取自同一份样本，只是读另一个计数器方向。
+        let tx_stats = tx_mon_out
+            .as_ref()
+            .or(if t.src.key() == t.dst.key() {
+                mon_out.as_ref()
+            } else {
+                None
+            })
+            .map(|output| monitor_rate_stats(output, &effective_window, false, baseline_cutoff_ms))
             .unwrap_or_default();
         let rx_avg = rx_stats.avg_mbps;
         let nic_samples = mon_out
@@ -3612,6 +3669,7 @@ impl Ctx {
                     t.dst.side,
                     &t.dst.nic.name,
                     &t.dst.key(),
+                    rx_origin_offset_ms,
                     out,
                 )
             })
@@ -3640,7 +3698,7 @@ impl Ctx {
                 ),
             )
         } else {
-            evaluate_nic_rx(t.rate_mode, t.rx_target_mbps, &rx_stats)
+            evaluate_nic_rx(t.rate_mode, t.rx_target_mbps, &rx_stats, &tx_stats)
         };
         let raw_error = if raw_ok {
             String::new()
@@ -3728,6 +3786,8 @@ impl Ctx {
             },
             required_streams: parallel_streams,
             target_mbps: t.rx_target_mbps,
+            tx_avg: tx_stats.avg_mbps,
+            tx_p10: tx_stats.p10_mbps,
             rx_p10: rx_stats.p10_mbps,
             rx_median: rx_stats.median_mbps,
             rx_p95: rx_stats.p95_mbps,
@@ -3736,6 +3796,10 @@ impl Ctx {
             effective_seconds: Some(effective_window.available_secs),
             required_seconds: Some(t.duration as f64),
             sample_coverage: Some(rx_stats.coverage),
+            window_start_ms: Some(effective_window.start_ms),
+            window_end_ms: Some(effective_window.end_ms),
+            baseline_mbps: Some(rx_stats.baseline_mbps),
+            rolling_coverage: Some(rx_stats.rolling_coverage),
             raws: vec![
                 (
                     format!("iperf3 client{} 输出", fmt_tag(tag)),
@@ -4388,7 +4452,14 @@ impl Ctx {
                     for sample in &mut out.samples {
                         sample.elapsed_ms = sample.elapsed_ms.saturating_add(start_offset_ms);
                     }
-                    let sample_file = self.save_monitor_samples(owner_id, side, &iface, &key, &out);
+                    let sample_file = self.save_monitor_samples(
+                        owner_id,
+                        side,
+                        &iface,
+                        &key,
+                        start_offset_ms,
+                        &out,
+                    );
                     monitor_sample_files.insert(key.clone(), sample_file);
                     monitor_outputs.insert(key, out);
                 }
@@ -4819,6 +4890,10 @@ impl Ctx {
                 ),
                 required_seconds: Some(effective_window.required_secs as f64),
                 sample_coverage: Some(rx_stats.coverage),
+                window_start_ms: Some(effective_window.start_ms),
+                window_end_ms: Some(effective_window.end_ms),
+                baseline_mbps: Some(rx_stats.baseline_mbps),
+                rolling_coverage: Some(rx_stats.rolling_coverage),
                 udp_loss,
                 screenshot_master,
                 screenshot_agent,
@@ -5052,10 +5127,7 @@ fn row_has_usable_traffic_measurement(row: &Row) -> bool {
     {
         return false;
     }
-    if matches!(
-        row.reason_code.as_str(),
-        "SINGLE_UDP_STREAM_FAILED" | "CTSTRAFFIC_SINGLE_UDP_STREAM_FAILED"
-    ) {
+    if crate::verdict::HARD_SINGLE_UDP_FAILURE_CODES.contains(&row.reason_code.as_str()) {
         // 这两个专用硬失败的定义就是“工具自身没有任何吞吐证据”；即使
         // 同网卡存在背景流量，也必须继续触发故障诊断。
         return false;
@@ -5073,38 +5145,13 @@ fn row_has_usable_traffic_measurement(row: &Row) -> bool {
 }
 
 fn aggregate_unit_verdict(outcomes: &[LegOutcome]) -> Verdict {
-    if outcomes.is_empty() {
-        return Verdict::SetupError;
-    }
-    if outcomes
-        .iter()
-        .any(|outcome| outcome.verdict == Verdict::SetupError)
-    {
-        return Verdict::SetupError;
-    }
-    // 单流 UDP 三次安全尝试仍无测量是用户指定的硬失败，不能被另一方向
-    // 的采样不足/目标缺失等普通 NOT_EVALUATED 覆盖。
-    if outcomes.iter().any(is_hard_single_udp_failure) {
-        return Verdict::RateFail;
-    }
-    for verdict in [
-        Verdict::NotEvaluated,
-        Verdict::RateFail,
-        Verdict::Unstable,
-        Verdict::Measured,
-    ] {
-        if outcomes.iter().any(|outcome| outcome.verdict == verdict) {
-            return verdict;
-        }
-    }
-    if outcomes
-        .iter()
-        .all(|outcome| outcome.verdict == Verdict::Pass)
-    {
-        Verdict::Pass
-    } else {
-        Verdict::NotEvaluated
-    }
+    // 优先级的唯一定义在 crate::verdict::aggregate_verdict —— 报告侧的回退聚合
+    // 走同一个函数，两边不会再分叉。
+    aggregate_verdict(
+        outcomes
+            .iter()
+            .map(|outcome| (outcome.verdict, outcome.reason_code.as_str())),
+    )
 }
 
 fn aggregate_direction_streams(directions: &[DirectionSummary]) -> Option<StreamCounts> {
@@ -5167,94 +5214,43 @@ fn outcome_matching_verdict(outcomes: &[LegOutcome], verdict: Verdict) -> Option
 }
 
 fn is_hard_single_udp_failure(outcome: &LegOutcome) -> bool {
-    outcome.verdict == Verdict::RateFail
-        && matches!(
-            outcome.reason_code.as_str(),
-            "SINGLE_UDP_STREAM_FAILED" | "CTSTRAFFIC_SINGLE_UDP_STREAM_FAILED"
-        )
+    crate::verdict::is_hard_single_udp_failure(outcome.verdict, &outcome.reason_code)
 }
 
-fn evaluate_nic_rx(
-    mode: RateMode,
-    target_mbps: Option<f64>,
-    stats: &RateStats,
+/// 在网卡 RX 判定之上叠加 ctsTraffic 的 UDP 丢帧门槛。
+///
+/// 顺序对齐 iperf3 路径：只有当网卡侧已经完成一次真正的目标比对
+/// （Pass/RateFail/Unstable）时才评估丢帧；采样不足、目标缺失或未知
+/// （NotEvaluated/Measured）时原样返回，不把环境问题写成 CPE 丢帧超限。
+/// 已配置门槛却缺少丢帧数据时，缺的是判定依据本身，因此优先于速率结论。
+fn cts_apply_udp_loss(
+    nic: (Verdict, String, String),
+    is_udp: bool,
+    loss_limit: Option<f64>,
+    loss: Option<f64>,
 ) -> (Verdict, String, String) {
-    let Some(rx_avg) = stats
-        .avg_mbps
-        .filter(|value| value.is_finite() && *value > MIN_VALID_RX_MBPS)
-    else {
-        return (
-            Verdict::NotEvaluated,
-            "NIC_RATE_MISSING".into(),
-            "有效流量窗口内没有可用的接收端 OS 网卡 RX 速率".into(),
-        );
-    };
-    if !stats.coverage.is_finite() || stats.coverage < MIN_RATE_SAMPLE_COVERAGE {
-        return (
-            Verdict::NotEvaluated,
-            "SAMPLE_COVERAGE_LOW".into(),
-            format!(
-                "接收端网卡 RX 采样覆盖率 {:.1}%，低于 {:.1}%",
-                stats.coverage * 100.0,
-                MIN_RATE_SAMPLE_COVERAGE * 100.0
-            ),
-        );
+    let (verdict, code, detail) = nic;
+    if !is_udp || matches!(verdict, Verdict::NotEvaluated | Verdict::Measured) {
+        return (verdict, code, detail);
     }
-    let target_mbps = if matches!(mode, RateMode::Observe | RateMode::Discover) {
-        None
-    } else {
-        target_mbps.filter(|value| value.is_finite() && *value > 0.0)
+    let Some(limit) = loss_limit else {
+        return (verdict, code, detail);
     };
-    let Some(target) = target_mbps else {
-        return if mode == RateMode::Verify {
-            (
-                Verdict::NotEvaluated,
-                "TARGET_MISSING".into(),
-                "verify 模式必须配置可信的接收端网卡 RX 目标".into(),
-            )
-        } else {
-            (
-                Verdict::Measured,
-                "TARGET_UNKNOWN".into(),
-                format!("接收端网卡 RX 已测得 {rx_avg:.3}Mbps；未配置可信目标，因此不标记 PASS"),
-            )
-        };
+    let Some(actual) = loss else {
+        return (
+            Verdict::NotEvaluated,
+            "CTSTRAFFIC_UDP_LOSS_DATA_MISSING".to_string(),
+            "已配置 UDP 丢帧门槛，但 ctsTraffic 输出缺少 dropped frames 数据".into(),
+        );
     };
-    if rx_avg < target {
+    if verdict == Verdict::Pass && actual > limit {
         return (
             Verdict::RateFail,
-            "RX_BELOW_TARGET".into(),
-            format!("网卡 RX 平均 {rx_avg:.3}Mbps 低于目标 {target:.3}Mbps"),
+            "CTSTRAFFIC_UDP_LOSS_HIGH".to_string(),
+            format!("CTS UDP 丢帧率 {actual:.3}% 超过限制 {limit:.3}%"),
         );
     }
-    let rx_p10 = stats
-        .p10_mbps
-        .filter(|value| value.is_finite() && *value >= 0.0);
-    if !stats.rolling_coverage.is_finite()
-        || stats.rolling_coverage < MIN_RATE_SAMPLE_COVERAGE
-        || rx_p10.is_none()
-    {
-        return (
-            Verdict::NotEvaluated,
-            "RATE_WINDOW_COVERAGE_LOW".into(),
-            format!(
-                "完整 5 秒 RX 稳定性窗口覆盖率 {:.1}%，低于 {:.1}%，无法计算可信 RX-P10",
-                stats.rolling_coverage * 100.0,
-                MIN_RATE_SAMPLE_COVERAGE * 100.0
-            ),
-        );
-    }
-    let rx_p10 = rx_p10.unwrap_or_default();
-    if rx_p10 < target {
-        return (
-            Verdict::Unstable,
-            "RX_UNSTABLE".into(),
-            format!(
-                "网卡 RX 平均 {rx_avg:.3}Mbps 已达标，但 RX-P10 {rx_p10:.3}Mbps 低于目标 {target:.3}Mbps"
-            ),
-        );
-    }
-    (Verdict::Pass, String::new(), String::new())
+    (verdict, code, detail)
 }
 
 #[cfg(test)]
@@ -5263,27 +5259,6 @@ fn count_retry_events(events: &[IperfFlowEvent]) -> usize {
         .iter()
         .filter(|event| event.kind == IperfEventKind::Retry)
         .count()
-}
-
-fn rate_sample_coverage_sufficient(
-    rx_stats: &RateStats,
-    tx_stats: &RateStats,
-    target_present: bool,
-) -> bool {
-    rx_stats.coverage >= MIN_RATE_SAMPLE_COVERAGE
-        && (!target_present || tx_stats.coverage >= MIN_RATE_SAMPLE_COVERAGE)
-}
-
-fn rate_window_coverage_sufficient(
-    rx_stats: &RateStats,
-    tx_stats: &RateStats,
-    target_present: bool,
-) -> bool {
-    !target_present
-        || (rx_stats.p10_mbps.is_some()
-            && tx_stats.p10_mbps.is_some()
-            && rx_stats.rolling_coverage >= MIN_RATE_SAMPLE_COVERAGE
-            && tx_stats.rolling_coverage >= MIN_RATE_SAMPLE_COVERAGE)
 }
 
 fn should_retry_udp_flow(
@@ -5891,17 +5866,32 @@ fn csv_field(value: &str) -> String {
     }
 }
 
-fn build_monitor_samples_csv(endpoint: &str, iface: &str, out: &MonitorStopOut) -> String {
+/// `origin_offset_ms` 是把远端（或本地）采样零点对齐到本测试单元时间轴的偏移量。
+///
+/// 两台机器的系统时钟不要求同步，零点用 RPC 往返做有界估计：真实启动落在
+/// `[0, latest_start]` 区间内，取中点，因此**不确定度的半宽正好等于该偏移本身**。
+/// 共同有效窗口卡在 180.0/180.0 边界时，没有这个数就无法判断是真够还是对齐
+/// 误差凑够的——所以把估计值和它的半宽一起写进表头。
+fn build_monitor_samples_csv(
+    endpoint: &str,
+    iface: &str,
+    origin_offset_ms: u64,
+    out: &MonitorStopOut,
+) -> String {
     let mut csv = format!(
         "# CPE OS NIC counter samples\n\
 # endpoint,{}\n\
 # interface,{}\n\
+# origin_offset_ms,{}\n\
+# origin_uncertainty_half_width_ms,{}\n\
 # full_lifecycle_seconds,{:.6}\n\
 # full_lifecycle_average_rx_mbps,{:.6}\n\
 # full_lifecycle_average_tx_mbps,{:.6}\n\
 elapsed_ms,interval_ms,rx_bytes,tx_bytes,rx_delta_bytes,tx_delta_bytes,rx_mbps,tx_mbps,valid,error\n",
         csv_field(endpoint),
         csv_field(iface),
+        origin_offset_ms,
+        origin_offset_ms,
         out.seconds,
         out.avg_mbps,
         out.tx_avg_mbps
@@ -6149,18 +6139,6 @@ fn udp_flow_detail_outcome(
     }
 }
 
-fn nearest_valid_sample(
-    out: &MonitorStopOut,
-    elapsed_ms: u64,
-    max_distance_ms: u64,
-) -> Option<&MonitorSample> {
-    out.samples
-        .iter()
-        .filter(|sample| sample.valid)
-        .min_by_key(|sample| sample.elapsed_ms.abs_diff(elapsed_ms))
-        .filter(|sample| sample.elapsed_ms.abs_diff(elapsed_ms) <= max_distance_ms)
-}
-
 fn select_udp_effective_window(
     plans: &[UdpLegPlan],
     results: &[UdpFlowRun],
@@ -6289,14 +6267,6 @@ fn select_udp_effective_window(
     }
 }
 
-fn percentile(sorted: &[f64], q: f64) -> Option<f64> {
-    if sorted.is_empty() {
-        return None;
-    }
-    let idx = (((sorted.len() - 1) as f64) * q.clamp(0.0, 1.0)).round() as usize;
-    sorted.get(idx).copied()
-}
-
 fn aggregate_udp_loss(flows: &[&UdpFlowRun]) -> Option<f64> {
     let successful: Vec<&UdpFlowRun> = flows.iter().copied().filter(|flow| flow.raw_ok).collect();
     if successful.is_empty() {
@@ -6325,226 +6295,6 @@ fn aggregate_udp_loss(flows: &[&UdpFlowRun]) -> Option<f64> {
         .collect();
     (percentages.len() == successful.len())
         .then(|| percentages.iter().sum::<f64>() / percentages.len() as f64)
-}
-
-fn rolling_time_window_averages(
-    samples: &[(u64, u64, f64)],
-    range_start_ms: u64,
-    window_ms: u64,
-) -> Vec<f64> {
-    if window_ms == 0 {
-        return samples.iter().map(|(_, _, rate)| *rate).collect();
-    }
-
-    let mut rolling = Vec::new();
-    for (window_end_ms, _, _) in samples {
-        let window_start_ms = window_end_ms.saturating_sub(window_ms);
-        if window_start_ms < range_start_ms
-            || window_end_ms.saturating_sub(window_start_ms) < window_ms
-        {
-            continue;
-        }
-
-        let mut weighted_sum = 0.0;
-        let mut covered_ms = 0u64;
-        for (sample_end_ms, interval_ms, rate) in samples {
-            if *interval_ms == 0 || *sample_end_ms <= window_start_ms {
-                continue;
-            }
-            if *sample_end_ms > *window_end_ms {
-                break;
-            }
-            let sample_start_ms = sample_end_ms
-                .saturating_sub(*interval_ms)
-                .max(range_start_ms);
-            let overlap_start = sample_start_ms.max(window_start_ms);
-            let overlap_end = (*sample_end_ms).min(*window_end_ms);
-            let overlap_ms = overlap_end.saturating_sub(overlap_start);
-            if overlap_ms > 0 {
-                weighted_sum += *rate * overlap_ms as f64;
-                covered_ms = covered_ms.saturating_add(overlap_ms);
-            }
-        }
-        // 只把实际样本完整覆盖的五秒区间纳入稳定性判定；缺口由 coverage
-        // 另行约束，不能用相邻样本跨越缺口拼出一个虚假的五秒窗口。
-        // elapsed_ms/interval_ms 均由 Duration 向下取整为毫秒，多个样本边界可能
-        // 累积出数毫秒的舍入缝隙；只容忍极小误差，不能容忍真正的漏采周期。
-        if covered_ms.saturating_add(ROLLING_COVERAGE_TOLERANCE_MS) >= window_ms {
-            rolling.push(weighted_sum / covered_ms as f64);
-        }
-    }
-    rolling
-}
-
-fn nominal_monitor_interval_ms(out: &MonitorStopOut, window: &EffectiveWindow) -> Option<u64> {
-    let mut all = Vec::new();
-    let mut interior = Vec::new();
-    for sample in &out.samples {
-        if sample.interval_ms == 0
-            || sample.elapsed_ms <= window.start_ms
-            || sample.elapsed_ms.saturating_sub(sample.interval_ms) >= window.end_ms
-        {
-            continue;
-        }
-        all.push(sample.interval_ms);
-        // stop 唤醒产生的最后一个样本通常短于正常周期，优先用完全处于
-        // 窗口内部的周期推断 nominal interval，避免边界样本拉低结果。
-        if sample.elapsed_ms.saturating_sub(sample.interval_ms) >= window.start_ms
-            && sample.elapsed_ms < window.end_ms
-        {
-            interior.push(sample.interval_ms);
-        }
-    }
-    let intervals = if interior.is_empty() {
-        &mut all
-    } else {
-        &mut interior
-    };
-    if intervals.is_empty() {
-        return None;
-    }
-    intervals.sort_unstable();
-    // 取较保守的下中位数，避免“一个正常周期 + 一个跨周期恢复样本”把
-    // nominal interval 放大到足以让恢复样本伪装成稳定窗口。MonitorMgr
-    // 的真实配置上限为 5 秒，额外封顶也能识别线程长时间失调度的样本。
-    Some(intervals[(intervals.len() - 1) / 2].min(ROLLING_RATE_WINDOW_MS))
-}
-
-fn monitor_rate_stats(
-    out: &MonitorStopOut,
-    window: &EffectiveWindow,
-    rx: bool,
-    first_active_ms: u64,
-) -> RateStats {
-    if window.end_ms <= window.start_ms {
-        return RateStats::default();
-    }
-    let mut baseline_values: Vec<f64> = out
-        .samples
-        .iter()
-        .filter(|sample| {
-            sample.valid
-                && sample.interval_ms > 0
-                && sample.elapsed_ms > 0
-                && sample.elapsed_ms <= first_active_ms
-                && (if rx { sample.rx_mbps } else { sample.tx_mbps }).is_finite()
-        })
-        .map(|sample| if rx { sample.rx_mbps } else { sample.tx_mbps })
-        .collect();
-    baseline_values.sort_by(|a, b| a.total_cmp(b));
-    let baseline = percentile(&baseline_values, 0.5).unwrap_or(0.0);
-    let nominal_interval_ms = nominal_monitor_interval_ms(out, window);
-    let max_rolling_sample_ms = nominal_interval_ms.map(|nominal| {
-        nominal
-            .saturating_mul(3)
-            .saturating_div(2)
-            .saturating_add(ROLLING_COVERAGE_TOLERANCE_MS)
-    });
-
-    // 每个速率样本代表 [elapsed-interval, elapsed) 的一段时间，而不是一个
-    // 等权点。先裁到正式判定窗口，再去掉因毫秒取整或异常输入造成的重叠。
-    let mut clipped_samples: Vec<(u64, u64, f64, bool)> = out
-        .samples
-        .iter()
-        .filter(|sample| {
-            sample.valid
-                && sample.interval_ms > 0
-                && sample.elapsed_ms > window.start_ms
-                && sample.elapsed_ms.saturating_sub(sample.interval_ms) < window.end_ms
-                && (if rx { sample.rx_mbps } else { sample.tx_mbps }).is_finite()
-        })
-        .filter_map(|sample| {
-            let value = if rx { sample.rx_mbps } else { sample.tx_mbps };
-            let start_ms = sample
-                .elapsed_ms
-                .saturating_sub(sample.interval_ms)
-                .max(window.start_ms);
-            let end_ms = sample.elapsed_ms.min(window.end_ms);
-            (end_ms > start_ms).then_some((
-                start_ms,
-                end_ms,
-                (value - baseline).max(0.0),
-                max_rolling_sample_ms
-                    .is_some_and(|max_interval| sample.interval_ms <= max_interval),
-            ))
-        })
-        .collect();
-    clipped_samples.sort_by_key(|(start_ms, end_ms, _, _)| (*start_ms, *end_ms));
-
-    let mut rate_samples: Vec<(u64, u64, f64)> = Vec::with_capacity(clipped_samples.len());
-    let mut rolling_rate_samples: Vec<(u64, u64, f64)> = Vec::with_capacity(clipped_samples.len());
-    let mut covered_until_ms = window.start_ms;
-    let mut rolling_covered_until_ms = window.start_ms;
-    for (sample_start_ms, sample_end_ms, rate, rolling_eligible) in clipped_samples {
-        let non_overlapping_start_ms = sample_start_ms.max(covered_until_ms);
-        if sample_end_ms > non_overlapping_start_ms {
-            rate_samples.push((
-                sample_end_ms,
-                sample_end_ms - non_overlapping_start_ms,
-                rate,
-            ));
-            covered_until_ms = sample_end_ms;
-        }
-        if rolling_eligible {
-            let rolling_start_ms = sample_start_ms.max(rolling_covered_until_ms);
-            if sample_end_ms > rolling_start_ms {
-                rolling_rate_samples.push((sample_end_ms, sample_end_ms - rolling_start_ms, rate));
-                rolling_covered_until_ms = sample_end_ms;
-            }
-        }
-    }
-
-    let mut rates: Vec<f64> = rate_samples.iter().map(|(_, _, rate)| *rate).collect();
-    if rates.is_empty() {
-        return RateStats::default();
-    }
-    let covered_ms: u64 = rate_samples
-        .iter()
-        .map(|(_, interval_ms, _)| *interval_ms)
-        .sum();
-    if covered_ms == 0 {
-        return RateStats::default();
-    }
-    let avg = rate_samples
-        .iter()
-        .map(|(_, interval_ms, rate)| *rate * *interval_ms as f64)
-        .sum::<f64>()
-        / covered_ms as f64;
-    let min = rates.iter().copied().fold(f64::INFINITY, f64::min);
-    let max = rates.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let rolling = rolling_time_window_averages(
-        &rolling_rate_samples,
-        window.start_ms,
-        ROLLING_RATE_WINDOW_MS,
-    );
-    rates.sort_by(|a, b| a.total_cmp(b));
-    let mut rolling_sorted = rolling;
-    rolling_sorted.sort_by(|a, b| a.total_cmp(b));
-    let window_ms = window.end_ms - window.start_ms;
-    let expected_rolling_windows = nominal_interval_ms
-        .filter(|nominal| *nominal > 0 && window_ms >= ROLLING_RATE_WINDOW_MS)
-        .map(|nominal| {
-            window_ms
-                .saturating_sub(ROLLING_RATE_WINDOW_MS)
-                .saturating_div(nominal)
-                .saturating_add(1)
-        })
-        .unwrap_or(0);
-    let rolling_coverage = if expected_rolling_windows == 0 {
-        0.0
-    } else {
-        (rolling_sorted.len() as f64 / expected_rolling_windows as f64).min(1.0)
-    };
-    RateStats {
-        avg_mbps: Some(avg),
-        p10_mbps: percentile(&rolling_sorted, 0.10),
-        median_mbps: percentile(&rates, 0.50),
-        p95_mbps: percentile(&rates, 0.95),
-        min_mbps: Some(min),
-        max_mbps: Some(max),
-        coverage: (covered_ms as f64 / window_ms as f64).min(1.0),
-        rolling_coverage,
-    }
 }
 
 fn active_rate_table(
@@ -6662,7 +6412,11 @@ impl ResultDb {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // 仅测试用到的采样统计层符号；产品码不需要，放这里避免非测试构建报未用导入。
     use crate::master::builder::{Endpoint, PingPurpose, PingTask};
+    use crate::master::rate_window::{
+        rolling_time_window_averages, RateStats, MIN_RATE_SAMPLE_COVERAGE,
+    };
     use crate::protocol::NicInfo;
     use std::sync::atomic::AtomicUsize;
 
@@ -8139,117 +7893,642 @@ mod tests {
         );
     }
 
-    #[test]
-    fn tcp_nic_rx_verdict_matrix_never_passes_without_complete_authoritative_data() {
-        let complete = RateStats {
-            avg_mbps: Some(850.0),
-            p10_mbps: Some(820.0),
-            coverage: 1.0,
-            rolling_coverage: 1.0,
+    // ---------------- P1：run_udp_unit 编排层验收（U00C / U00D / W09） ----------------
+
+    /// 单条流在假 agent 上的剧本：每一轮 client attempt 是否产生工具测量。
+    #[derive(Clone)]
+    struct FlowScript {
+        /// 第 N 轮（0 起）是否产出 iperf3 自身的 rate/bytes 测量。
+        measured_at_attempt: Option<usize>,
+        /// server stop 是否确认成功；false 用于 W09「清理未确认禁止复用端口」。
+        server_stop_confirmed: bool,
+        /// client 进程是否正常结束；false 模拟"有测量但运行时出错"。
+        client_ok: bool,
+    }
+
+    impl FlowScript {
+        fn never() -> Self {
+            Self {
+                measured_at_attempt: None,
+                server_stop_confirmed: true,
+                client_ok: true,
+            }
+        }
+        fn at(attempt: usize) -> Self {
+            Self {
+                measured_at_attempt: Some(attempt),
+                server_stop_confirmed: true,
+                client_ok: true,
+            }
+        }
+        fn stop_unconfirmed() -> Self {
+            Self {
+                measured_at_attempt: None,
+                server_stop_confirmed: false,
+                client_ok: true,
+            }
+        }
+        /// 已有工具测量，但 client 非正常结束：U00G 要求按真实 runtime error 判定，
+        /// 不能再为了争取更好结果继续重试、更不能改写成"未灌通"。
+        fn measured_but_runtime_failed(attempt: usize) -> Self {
+            Self {
+                measured_at_attempt: Some(attempt),
+                server_stop_confirmed: true,
+                client_ok: false,
+            }
+        }
+    }
+
+    /// 覆盖 server / client / monitor 全部路由的假 agent，用于驱动 `run_udp_unit`
+    /// 这一层的真实状态机（交错起流、attempt 循环、清理门禁、并行两腿）。
+    ///
+    /// 剧本按端口索引，因此可以让 AB、BA 两个方向各自独立地成功或失败。
+    struct FakeUdpAgent {
+        scripts: HashMap<u16, FlowScript>,
+        /// 每个端口已经启动过的 client attempt 次数。
+        client_attempts: Mutex<HashMap<u16, usize>>,
+        /// 按到达顺序记录 (路径, 端口, request_id)，用于断言"没有在未确认清理后复用端口"。
+        calls: Mutex<Vec<(String, u16, String)>>,
+    }
+
+    impl FakeUdpAgent {
+        fn new(scripts: HashMap<u16, FlowScript>) -> Self {
+            Self {
+                scripts,
+                client_attempts: Mutex::new(HashMap::new()),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn script(&self, port: u16) -> FlowScript {
+            self.scripts
+                .get(&port)
+                .cloned()
+                .unwrap_or_else(FlowScript::never)
+        }
+
+        fn record(&self, path: &str, port: u16, request_id: &str) {
+            lock_recover(&self.calls).push((path.to_string(), port, request_id.to_string()));
+        }
+
+        fn calls_for(&self, path: &str) -> Vec<(u16, String)> {
+            lock_recover(&self.calls)
+                .iter()
+                .filter(|(p, _, _)| p == path)
+                .map(|(_, port, id)| (*port, id.clone()))
+                .collect()
+        }
+
+        /// 端口是 client 请求里的目的端口，client_start 用它索引剧本。
+        fn handle(
+            &self,
+            request: &http_client::HttpRequest,
+        ) -> Result<http_client::HttpResponse, String> {
+            let respond = |body: String| http_client::HttpResponse::new(200, body);
+            match request.path.as_str() {
+                "/iperf/server/start" => {
+                    let req: IperfServerStartReq = serde_json::from_str(&request.body)
+                        .map_err(|e| format!("server start 解析失败: {e}"))?;
+                    self.record("server/start", req.port, &req.request_id);
+                    Ok(respond(ok_json(IperfServerStartOut {
+                        cmd: format!("fake iperf3 -s -p {}", req.port),
+                    })))
+                }
+                "/iperf/server/stop" => {
+                    let req: IperfServerStopReq = serde_json::from_str(&request.body)
+                        .map_err(|e| format!("server stop 解析失败: {e}"))?;
+                    self.record("server/stop", req.port, &req.request_id);
+                    if !self.script(req.port).server_stop_confirmed {
+                        return Ok(respond(err_json("server 停止未确认：进程未回收")));
+                    }
+                    Ok(respond(ok_json(IperfServerStopOut {
+                        existed: true,
+                        terminated: true,
+                        output: format!("fake server output port {}", req.port),
+                    })))
+                }
+                "/iperf/client/start" => {
+                    let start: IperfClientStartReq = serde_json::from_str(&request.body)
+                        .map_err(|e| format!("client start 解析失败: {e}"))?;
+                    let port = start.request.port;
+                    self.record("client/start", port, &start.request_id);
+                    *lock_recover(&self.client_attempts).entry(port).or_insert(0) += 1;
+                    Ok(respond(ok_json(IperfClientStartOut {
+                        id: start.request_id.clone(),
+                        elapsed_ms: 5,
+                    })))
+                }
+                "/iperf/client/status" => {
+                    let req: IperfClientStatusReq = serde_json::from_str(&request.body)
+                        .map_err(|e| format!("client status 解析失败: {e}"))?;
+                    // request_id 形如 "<owner>:client:<port>:<attempt>"
+                    let (port, attempt) = parse_client_request_id(&req.id);
+                    let script = self.script(port);
+                    let measured = script.measured_at_attempt == Some(attempt);
+                    let events = if measured {
+                        vec![
+                            IperfFlowEvent {
+                                kind: IperfEventKind::Started,
+                                elapsed_ms: 0,
+                                ..Default::default()
+                            },
+                            IperfFlowEvent {
+                                kind: IperfEventKind::Traffic,
+                                elapsed_ms: 10_000,
+                                mbps: Some(500.0),
+                                line: "[  5]   0.00-10.00 sec  600 MBytes  500 Mbits/sec sender"
+                                    .into(),
+                            },
+                            IperfFlowEvent {
+                                kind: IperfEventKind::Ended,
+                                elapsed_ms: 10_050,
+                                ..Default::default()
+                            },
+                        ]
+                    } else {
+                        vec![
+                            IperfFlowEvent {
+                                kind: IperfEventKind::Started,
+                                elapsed_ms: 0,
+                                ..Default::default()
+                            },
+                            IperfFlowEvent {
+                                kind: IperfEventKind::Ended,
+                                elapsed_ms: 1_000,
+                                ..Default::default()
+                            },
+                        ]
+                    };
+                    let output = if measured {
+                        "[  5]   0.00-10.00 sec  600 MBytes  500 Mbits/sec sender".to_string()
+                    } else {
+                        "iperf3: no measurement in this attempt".to_string()
+                    };
+                    Ok(respond(ok_json(IperfClientStatusOut {
+                        id: req.id,
+                        done: true,
+                        next_cursor: 0,
+                        events,
+                        result: Some(IperfClientOut {
+                            ok: script.client_ok,
+                            process_started: Some(true),
+                            cleanup_confirmed: Some(true),
+                            cmd: format!("fake iperf3 client port {port}"),
+                            output,
+                            ..Default::default()
+                        }),
+                    })))
+                }
+                "/iperf/client/stop" => Ok(respond(ok_json(IperfClientStopOut {
+                    existed: true,
+                    was_done: true,
+                    terminated: true,
+                    result: None,
+                }))),
+                "/monitor/start" => {
+                    let req: MonitorStartReq = serde_json::from_str(&request.body)
+                        .map_err(|e| format!("monitor start 解析失败: {e}"))?;
+                    Ok(respond(ok_json(MonitorStartOut {
+                        id: format!("mon-{}", req.iface),
+                        elapsed_ms: 1,
+                    })))
+                }
+                "/monitor/status" => Ok(respond(ok_json(MonitorStatusOut {
+                    id: "mon".into(),
+                    iface: "fake".into(),
+                    sample_count: 1,
+                    latest_sample: Some(fake_sample(1_000, 500.0)),
+                    error_count: 0,
+                    latest_error: String::new(),
+                }))),
+                "/monitor/stop" => Ok(respond(ok_json(MonitorStopOut {
+                    avg_mbps: 500.0,
+                    tx_avg_mbps: 520.0,
+                    seconds: 40.0,
+                    bytes: 0,
+                    tx_bytes: 0,
+                    samples: (1..=40).map(|s| fake_sample(s * 1_000, 500.0)).collect(),
+                    errors: vec![],
+                }))),
+                other => Err(format!("fake udp agent 未知路径 {other}")),
+            }
+        }
+    }
+
+    fn fake_sample(elapsed_ms: u64, mbps: f64) -> MonitorSample {
+        MonitorSample {
+            elapsed_ms,
+            interval_ms: 1_000,
+            rx_mbps: mbps,
+            tx_mbps: mbps * 1.05,
+            valid: true,
             ..Default::default()
+        }
+    }
+
+    /// `lifecycle_request_id` 的逆运算：`<owner>:client:<port>:<attempt>`。
+    fn parse_client_request_id(id: &str) -> (u16, usize) {
+        let mut parts = id.rsplit(':');
+        let attempt = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+        let port = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+        (port, attempt)
+    }
+
+    /// 构造一个两端都在 agent 侧的双向 UDP 单元，让整条链路都走假 transport。
+    fn bidir_udp_unit(ab_port: u16, ba_port: u16, streams: usize) -> (Unit, Vec<UdpLegPlan>) {
+        let a = endpoint(Side::Agent, "eth0", "192.168.1.2");
+        let b = endpoint(Side::Agent, "eth1", "192.168.1.3");
+        let mk = |lidx: usize, tag: &str, src: &Endpoint, dst: &Endpoint, base: u16| UdpLegPlan {
+            lidx,
+            tag: tag.into(),
+            name: "udp_b500m".into(),
+            streams: (0..streams)
+                .map(|stream_idx| IperfTask {
+                    v6: false,
+                    udp: true,
+                    profile_name: "udp_b500m".into(),
+                    profile_label: "UDP -b 500m".into(),
+                    src: src.clone(),
+                    dst: dst.clone(),
+                    port: base + stream_idx as u16,
+                    duration: 10,
+                    extra: vec!["-b".into(), "500m".into()],
+                    stream_idx,
+                    rate_mode: RateMode::Observe,
+                    rx_target_mbps: None,
+                    offered_mbps: Some(500.0),
+                })
+                .collect(),
         };
-        let decision = |mode, target, stats: &RateStats| {
-            let (verdict, code, _) = evaluate_nic_rx(mode, target, stats);
-            (verdict, code)
+        let plans = vec![mk(0, "ab", &a, &b, ab_port), mk(1, "ba", &b, &a, ba_port)];
+        let unit = Unit {
+            id: format!("udp-orch-{ab_port}-{ba_port}"),
+            title: "★双向 IPERF V4 UDP -b 500m".into(),
+            bidir: true,
+            legs: vec![],
+            est_secs: 60,
+        };
+        (unit, plans)
+    }
+
+    /// 假 agent 直接作为 transport：这些用例的故障由 `FlowScript` 注入，
+    /// 不需要 `ScriptedTransport` 的丢包/截断脚本（那套要求逐条预排队列）。
+    impl http_client::Transport for FakeUdpAgent {
+        fn send(
+            &self,
+            request: &http_client::HttpRequest,
+            _timeout: Duration,
+        ) -> Result<http_client::HttpResponse, String> {
+            self.handle(request)
+        }
+    }
+
+    fn run_udp_orchestration(
+        scripts: HashMap<u16, FlowScript>,
+        ab_port: u16,
+        ba_port: u16,
+        streams: usize,
+    ) -> (Vec<LegOutcome>, Arc<FakeUdpAgent>, Vec<Row>) {
+        let agent = Arc::new(FakeUdpAgent::new(scripts));
+        let (mut ctx, db_path) = isolated_ctx(1);
+        ctx.transport = Arc::clone(&agent) as Arc<dyn http_client::Transport>;
+        // 基线采样会真实 sleep，测试里压到 0 秒。
+        ctx.cfg.iperf.rate_check.background_secs = 0;
+        ctx.cfg.iperf.rate_check.settle_secs = 0;
+        ctx.cfg.iperf.rate_check.launch_interval_ms = 0;
+        ctx.cfg.iperf.duration = 10;
+
+        let (unit, plans) = bidir_udp_unit(ab_port, ba_port, streams);
+        let outcomes = ctx.run_udp_unit(0, &unit, &plans, "owner-orch", 0);
+        let rows = lock_recover(&ctx.rows).clone();
+        let _ = std::fs::remove_file(db_path);
+        (outcomes, agent, rows)
+    }
+
+    /// U00D：双向每方向 1 流，各自拥有独立的三轮预算并行执行。
+    ///
+    /// 这条同时锁住四个历史易碎点：独立预算（不能两腿合计三次）、并行执行、
+    /// 单流硬失败不被另一腿的普通 NOT_EVALUATED 掩盖、每方向 retry 独立计数。
+    #[test]
+    fn udp_bidirectional_single_stream_legs_get_independent_three_attempt_budgets() {
+        let scripts = HashMap::from([
+            // AB：前两轮无测量，第三轮灌通。
+            (57_000, FlowScript::at(2)),
+            // BA：三轮都没有工具测量 → 单流硬失败。
+            (57_100, FlowScript::never()),
+        ]);
+        let (outcomes, agent, rows) = run_udp_orchestration(scripts, 57_000, 57_100, 1);
+
+        let ab = outcomes
+            .iter()
+            .find(|o| o.tag == "ab")
+            .expect("AB 方向结果");
+        let ba = outcomes
+            .iter()
+            .find(|o| o.tag == "ba")
+            .expect("BA 方向结果");
+
+        // AB 用成功轮判定，不是硬失败。
+        assert_ne!(
+            ab.reason_code, "SINGLE_UDP_STREAM_FAILED",
+            "AB 第三轮已灌通"
+        );
+        // BA 是必须灌通却没灌通的硬失败。
+        assert_eq!(ba.verdict, Verdict::RateFail, "BA 应为硬失败: {ba:?}");
+        assert_eq!(ba.reason_code, "SINGLE_UDP_STREAM_FAILED");
+
+        // 两方向各自跑满 3 次 client attempt —— 不是合计 3 次。
+        let starts = agent.calls_for("client/start");
+        let ab_attempts = starts.iter().filter(|(port, _)| *port == 57_000).count();
+        let ba_attempts = starts.iter().filter(|(port, _)| *port == 57_100).count();
+        assert_eq!(ab_attempts, 3, "AB 应有 3 次完整尝试，实际 {ab_attempts}");
+        assert_eq!(ba_attempts, 3, "BA 应有 3 次完整尝试，实际 {ba_attempts}");
+
+        // 每轮必须用新的 request ID，前两轮的原文不能被覆盖。
+        let ab_ids: Vec<&String> = starts
+            .iter()
+            .filter(|(port, _)| *port == 57_000)
+            .map(|(_, id)| id)
+            .collect();
+        let unique: std::collections::HashSet<&&String> = ab_ids.iter().collect();
+        assert_eq!(unique.len(), 3, "三轮必须使用不同 request ID: {ab_ids:?}");
+
+        // 单元汇总不能被 BA 之外的任何普通结果掩盖硬失败。
+        assert_eq!(aggregate_unit_verdict(&outcomes), Verdict::RateFail);
+
+        // 报告里 BA 的组合计行保留完整尝试数（retry_count = 尝试数 - 1）。
+        let ba_total = rows
+            .iter()
+            .find(|r| r.is_grouptotal && r.kind_label.contains("ba"))
+            .expect("BA 组合计行");
+        assert_eq!(ba_total.retry_count, 2, "BA retry_count 应为 2");
+    }
+
+    /// U00C：单流三轮安全耗尽后是硬失败，不能降级成 ACTIVE_STREAMS_LOW，
+    /// 也不能因为"0 流"笼统改写成 SETUP_ERROR。
+    #[test]
+    fn udp_single_stream_safe_exhaustion_is_rate_fail_not_active_streams_low() {
+        let scripts = HashMap::from([(57_200, FlowScript::never()), (57_300, FlowScript::never())]);
+        let (outcomes, agent, _) = run_udp_orchestration(scripts, 57_200, 57_300, 1);
+
+        for outcome in &outcomes {
+            assert_eq!(
+                outcome.verdict,
+                Verdict::RateFail,
+                "{} 方向应为 RATE_FAIL: {outcome:?}",
+                outcome.tag
+            );
+            assert_eq!(outcome.reason_code, "SINGLE_UDP_STREAM_FAILED");
+            assert_ne!(outcome.reason_code, "ACTIVE_STREAMS_LOW");
+            assert_ne!(outcome.reason_code, "NO_STREAM_STARTED");
+        }
+        // 两个方向各自安全跑满预算。
+        assert_eq!(agent.calls_for("client/start").len(), 6);
+    }
+
+    /// W09：某轮 server stop 未确认时，禁止在同端口用新 request 继续重试，
+    /// 必须以 SETUP_ERROR 报告资源清理问题，且不得计入"安全耗尽"。
+    #[test]
+    fn udp_flow_stops_retrying_when_server_cleanup_is_unconfirmed() {
+        let scripts = HashMap::from([
+            // AB 的 server stop 永远返回未确认。
+            (57_400, FlowScript::stop_unconfirmed()),
+            (57_500, FlowScript::at(0)),
+        ]);
+        let (outcomes, agent, _) = run_udp_orchestration(scripts, 57_400, 57_500, 1);
+
+        let ab = outcomes.iter().find(|o| o.tag == "ab").expect("AB 结果");
+        assert_eq!(
+            ab.verdict,
+            Verdict::SetupError,
+            "清理未确认必须是 SETUP_ERROR，不能伪装成单流硬失败: {ab:?}"
+        );
+        assert_ne!(ab.reason_code, "SINGLE_UDP_STREAM_FAILED");
+
+        // 关键断言：未确认之后不能再有第二次 client start 打到同一端口。
+        let ab_starts = agent
+            .calls_for("client/start")
+            .into_iter()
+            .filter(|(port, _)| *port == 57_400)
+            .count();
+        assert_eq!(
+            ab_starts, 1,
+            "清理未确认后禁止复用端口 57400 重试，实际启动 {ab_starts} 次"
+        );
+
+        // 另一方向不受影响，正常灌通。
+        let ba = outcomes.iter().find(|o| o.tag == "ba").expect("BA 结果");
+        assert_ne!(ba.reason_code, "SINGLE_UDP_STREAM_FAILED", "BA 首轮即灌通");
+    }
+
+    /// 多流方向：只重启没跑通的那条流，已经稳定的流不重启（U02 的核心不变量）。
+    #[test]
+    fn udp_group_retry_only_restarts_the_flow_that_failed() {
+        let scripts = HashMap::from([
+            // AB 两条流：#0 首轮即通，#1 从不通。
+            (57_600, FlowScript::at(0)),
+            (57_601, FlowScript::never()),
+            (57_700, FlowScript::at(0)),
+            (57_701, FlowScript::at(0)),
+        ]);
+        let (_, agent, _) = run_udp_orchestration(scripts, 57_600, 57_700, 2);
+
+        let starts = agent.calls_for("client/start");
+        let flow0 = starts.iter().filter(|(port, _)| *port == 57_600).count();
+        assert_eq!(flow0, 1, "已跑通的流不能被重启，实际启动 {flow0} 次");
+        // 未跑通的流按 flow_retries 预算重试（多流不套用单流三轮硬门槛）。
+        let flow1 = starts.iter().filter(|(port, _)| *port == 57_601).count();
+        assert!(flow1 >= 1, "失败流应至少执行一次");
+        assert!(flow1 <= 3, "重试必须有限，不允许无限循环，实际 {flow1} 次");
+    }
+
+    /// U00G：已有工具测量后按真实结果判定，不再为争取更好结果继续重试，
+    /// 也不得把真实的运行时错误改写成「未灌通」。
+    #[test]
+    fn udp_keeps_the_real_runtime_error_once_a_measurement_exists() {
+        let scripts = HashMap::from([
+            (57_800, FlowScript::measured_but_runtime_failed(0)),
+            (57_900, FlowScript::at(0)),
+        ]);
+        let (outcomes, agent, _) = run_udp_orchestration(scripts, 57_800, 57_900, 1);
+
+        let ab = outcomes.iter().find(|o| o.tag == "ab").expect("AB 结果");
+        assert_eq!(ab.verdict, Verdict::RateFail, "{ab:?}");
+        assert_eq!(
+            ab.reason_code, "IPERF_RUNTIME_ERRORS",
+            "已有测量时必须保留真实的 runtime error，不能改写成 SINGLE_UDP_STREAM_FAILED"
+        );
+        // 已有测量就不该再重试去"碰运气"。
+        let ab_attempts = agent
+            .calls_for("client/start")
+            .into_iter()
+            .filter(|(port, _)| *port == 57_800)
+            .count();
+        assert_eq!(
+            ab_attempts, 1,
+            "已有测量后不得继续重试，实际 {ab_attempts} 次"
+        );
+    }
+
+    /// U00F：背景网卡流量不能把"没有工具测量"补成一条成功的流。
+    ///
+    /// 假 monitor 恒定返回 500 Mbps 的 RX（远高于最低有效速率），但工具三轮
+    /// 都没有 rate/bytes 测量——active stream 必须仍然是 0。
+    #[test]
+    fn background_nic_traffic_never_counts_as_an_established_flow() {
+        let scripts = HashMap::from([(58_000, FlowScript::never()), (58_100, FlowScript::never())]);
+        let (outcomes, _, rows) = run_udp_orchestration(scripts, 58_000, 58_100, 1);
+
+        for outcome in &outcomes {
+            assert_eq!(
+                outcome.reason_code, "SINGLE_UDP_STREAM_FAILED",
+                "{} 方向应为单流硬失败: {outcome:?}",
+                outcome.tag
+            );
+        }
+        // 组合计行的活跃流数必须是 0——网卡上有 500Mbps 背景流量也不能补上。
+        for total in rows.iter().filter(|r| r.is_grouptotal) {
+            assert_eq!(
+                total.active_streams, 0,
+                "背景网卡流量把 active 补成了 {}",
+                total.active_streams
+            );
+        }
+    }
+
+    /// U01：双向不对称流数（5 流 / 2 流）统一调度，两个方向都能正常起流并判定。
+    #[test]
+    fn udp_bidirectional_asymmetric_stream_counts_are_scheduled_together() {
+        let mut scripts = HashMap::new();
+        for i in 0..5u16 {
+            scripts.insert(58_200 + i, FlowScript::at(0));
+        }
+        for i in 0..5u16 {
+            scripts.insert(58_300 + i, FlowScript::at(0));
+        }
+        let (outcomes, agent, rows) = run_udp_orchestration(scripts, 58_200, 58_300, 5);
+
+        assert_eq!(outcomes.len(), 2, "两个方向各自一个结果");
+        for outcome in &outcomes {
+            assert_ne!(
+                outcome.verdict,
+                Verdict::RateFail,
+                "{} 方向全部灌通不应失败: {outcome:?}",
+                outcome.tag
+            );
+        }
+        // 10 条流各起一次，一次不多一次不少。
+        assert_eq!(agent.calls_for("client/start").len(), 10);
+        for total in rows.iter().filter(|r| r.is_grouptotal) {
+            assert_eq!(total.requested_streams, 5);
+            assert_eq!(total.active_streams, 5, "5 条流应全部活跃");
+            // 5 条流按默认 90% 容错要求 4 条。
+            assert_eq!(total.required_streams, 4);
+        }
+    }
+
+    /// U00E：server 起不来属于确定性环境错误，必须是 SETUP_ERROR，
+    /// 不能伪装成单流硬失败去指责被测设备。
+    #[test]
+    fn udp_server_start_failure_stays_a_setup_error() {
+        let agent = Arc::new(FakeUdpAgent::new(HashMap::new()));
+        // 让 server/start 始终失败：剧本之外的端口一律 never，但这里直接
+        // 用一个不存在的路由制造启动失败。
+        let (mut ctx, db_path) = isolated_ctx(1);
+        struct RefusingAgent;
+        impl http_client::Transport for RefusingAgent {
+            fn send(
+                &self,
+                request: &http_client::HttpRequest,
+                _timeout: Duration,
+            ) -> Result<http_client::HttpResponse, String> {
+                if request.path == "/iperf/server/start" {
+                    return Ok(http_client::HttpResponse::new(
+                        200,
+                        err_json("辅测机端口被占用，server 无法启动"),
+                    ));
+                }
+                Ok(http_client::HttpResponse::new(
+                    200,
+                    ok_json(serde_json::json!({})),
+                ))
+            }
+        }
+        ctx.transport = Arc::new(RefusingAgent);
+        ctx.cfg.iperf.rate_check.background_secs = 0;
+        ctx.cfg.iperf.rate_check.settle_secs = 0;
+        ctx.cfg.iperf.rate_check.launch_interval_ms = 0;
+        ctx.cfg.iperf.duration = 10;
+        let (unit, plans) = bidir_udp_unit(58_400, 58_500, 1);
+        let outcomes = ctx.run_udp_unit(0, &unit, &plans, "owner-setup", 0);
+        let _ = std::fs::remove_file(db_path);
+        drop(agent);
+
+        for outcome in &outcomes {
+            assert_eq!(
+                outcome.verdict,
+                Verdict::SetupError,
+                "{} 方向 server 起不来必须是 SETUP_ERROR: {outcome:?}",
+                outcome.tag
+            );
+            assert_ne!(outcome.reason_code, "SINGLE_UDP_STREAM_FAILED");
+        }
+    }
+
+    #[test]
+    fn cts_udp_loss_is_evaluated_after_nic_sampling_and_target_gates() {
+        let pass = || (Verdict::Pass, String::new(), String::new());
+        let not_evaluated = || {
+            (
+                Verdict::NotEvaluated,
+                "RATE_WINDOW_COVERAGE_LOW".to_string(),
+                "采样不足".to_string(),
+            )
+        };
+        let measured = || {
+            (
+                Verdict::Measured,
+                "TARGET_UNKNOWN".to_string(),
+                "observe".to_string(),
+            )
         };
 
+        // 采样不足时不能被改写成「丢帧超限」：环境问题不背 CPE 的锅。
+        let (verdict, code, _) = cts_apply_udp_loss(not_evaluated(), true, Some(1.0), Some(9.0));
         assert_eq!(
-            decision(RateMode::Verify, Some(800.0), &RateStats::default()),
-            (Verdict::NotEvaluated, "NIC_RATE_MISSING".into())
+            (verdict, code.as_str()),
+            (Verdict::NotEvaluated, "RATE_WINDOW_COVERAGE_LOW")
         );
-        let zero = RateStats {
-            avg_mbps: Some(0.0),
-            ..complete.clone()
-        };
+        // 目标未知时同样保持 MEASURED，不产出丢帧失败。
+        let (verdict, code, _) = cts_apply_udp_loss(measured(), true, Some(1.0), Some(9.0));
         assert_eq!(
-            decision(RateMode::Verify, Some(800.0), &zero),
-            (Verdict::NotEvaluated, "NIC_RATE_MISSING".into())
+            (verdict, code.as_str()),
+            (Verdict::Measured, "TARGET_UNKNOWN")
         );
-
+        // 已配置门槛但缺数据：缺的是判定依据本身，优先于速率结论。
+        let (verdict, code, _) = cts_apply_udp_loss(pass(), true, Some(1.0), None);
         assert_eq!(
-            decision(RateMode::Observe, Some(800.0), &complete),
-            (Verdict::Measured, "TARGET_UNKNOWN".into()),
-            "observe 即使收到意外目标也只能记录测量值"
+            (verdict, code.as_str()),
+            (Verdict::NotEvaluated, "CTSTRAFFIC_UDP_LOSS_DATA_MISSING")
         );
+        // 速率达标但丢帧超限：真实的 RATE_FAIL。
+        let (verdict, code, _) = cts_apply_udp_loss(pass(), true, Some(1.0), Some(9.0));
         assert_eq!(
-            decision(RateMode::Discover, Some(800.0), &complete),
-            (Verdict::Measured, "TARGET_UNKNOWN".into())
+            (verdict, code.as_str()),
+            (Verdict::RateFail, "CTSTRAFFIC_UDP_LOSS_HIGH")
         );
+        // 门槛内、TCP、未配置门槛都保持原判定。
         assert_eq!(
-            decision(RateMode::Auto, None, &complete),
-            (Verdict::Measured, "TARGET_UNKNOWN".into())
-        );
-        assert_eq!(
-            decision(RateMode::Verify, None, &complete),
-            (Verdict::NotEvaluated, "TARGET_MISSING".into())
-        );
-        assert_eq!(
-            decision(RateMode::Verify, Some(f64::NAN), &complete),
-            (Verdict::NotEvaluated, "TARGET_MISSING".into())
-        );
-
-        let low_coverage = RateStats {
-            coverage: 0.94,
-            ..complete.clone()
-        };
-        assert_eq!(
-            decision(RateMode::Verify, Some(800.0), &low_coverage),
-            (Verdict::NotEvaluated, "SAMPLE_COVERAGE_LOW".into())
-        );
-        let nan_coverage = RateStats {
-            coverage: f64::NAN,
-            ..complete.clone()
-        };
-        assert_eq!(
-            decision(RateMode::Verify, Some(800.0), &nan_coverage),
-            (Verdict::NotEvaluated, "SAMPLE_COVERAGE_LOW".into())
-        );
-
-        let below_target = RateStats {
-            avg_mbps: Some(799.0),
-            p10_mbps: Some(790.0),
-            ..complete.clone()
-        };
-        assert_eq!(
-            decision(RateMode::Verify, Some(800.0), &below_target),
-            (Verdict::RateFail, "RX_BELOW_TARGET".into())
-        );
-        let missing_p10 = RateStats {
-            p10_mbps: None,
-            ..complete.clone()
-        };
-        assert_eq!(
-            decision(RateMode::Verify, Some(800.0), &missing_p10),
-            (Verdict::NotEvaluated, "RATE_WINDOW_COVERAGE_LOW".into())
-        );
-        let nan_p10 = RateStats {
-            p10_mbps: Some(f64::NAN),
-            ..complete.clone()
-        };
-        assert_eq!(
-            decision(RateMode::Verify, Some(800.0), &nan_p10),
-            (Verdict::NotEvaluated, "RATE_WINDOW_COVERAGE_LOW".into())
-        );
-        let low_rolling_coverage = RateStats {
-            rolling_coverage: 0.94,
-            ..complete.clone()
-        };
-        assert_eq!(
-            decision(RateMode::Verify, Some(800.0), &low_rolling_coverage),
-            (Verdict::NotEvaluated, "RATE_WINDOW_COVERAGE_LOW".into())
-        );
-
-        let unstable = RateStats {
-            p10_mbps: Some(799.0),
-            ..complete.clone()
-        };
-        assert_eq!(
-            decision(RateMode::Verify, Some(800.0), &unstable),
-            (Verdict::Unstable, "RX_UNSTABLE".into())
+            cts_apply_udp_loss(pass(), true, Some(10.0), Some(9.0)).0,
+            Verdict::Pass
         );
         assert_eq!(
-            decision(RateMode::Verify, Some(800.0), &complete),
-            (Verdict::Pass, String::new())
+            cts_apply_udp_loss(pass(), false, Some(1.0), Some(9.0)).0,
+            Verdict::Pass
+        );
+        assert_eq!(
+            cts_apply_udp_loss(pass(), true, None, Some(9.0)).0,
+            Verdict::Pass
         );
     }
 
@@ -10900,7 +11179,11 @@ round-trip min/avg/max/stddev = 1.250/2.500/3.750/1.021 ms
             }],
             errors: vec!["counter reset".into()],
         };
-        let csv = build_monitor_samples_csv("agent", "Ethernet 2", &out);
+        let csv = build_monitor_samples_csv("agent", "Ethernet 2", 137, &out);
+        // 零点估计是 [0, latest_start] 的中点，所以不确定度半宽等于偏移本身；
+        // 共同窗口卡在边界时，靠这两行才能判断是真够还是对齐误差凑够的。
+        assert!(csv.contains("# origin_offset_ms,137"));
+        assert!(csv.contains("# origin_uncertainty_half_width_ms,137"));
         assert!(csv.contains("elapsed_ms,interval_ms,rx_bytes,tx_bytes"));
         assert!(csv.contains("1000,1000,1012500000,2011250000,12500000,11250000,100.000000,90.000000,false,counter reset"));
         assert!(csv.contains("# endpoint,agent"));

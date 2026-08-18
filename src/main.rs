@@ -11,6 +11,7 @@ mod cancel;
 pub mod clock;
 mod cmd;
 mod config;
+mod console;
 mod http_client;
 mod master;
 mod nic;
@@ -23,9 +24,10 @@ mod report;
 mod resource;
 mod screenshot;
 mod util;
+mod verdict;
 
+use console::ask;
 use master::ui::{run_master, MasterOpts};
-use util::ask;
 
 fn main() {
     setup_console();

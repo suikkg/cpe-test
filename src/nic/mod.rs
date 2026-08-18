@@ -83,3 +83,24 @@ pub fn format_nic_table(side: &str, host: &HostInfo) -> String {
     }
     s
 }
+
+/// 两个 IPv4 是否在同一个 /24。
+///
+/// 这是网络拓扑判断，不是字符串工具：跨机 iperf3/ctsTraffic 要求两端同子网，
+/// 否则测的就不是 CPE 的转发能力。放在 `nic` 而不是通用工具箱里。
+pub fn same_slash24(a: &str, b: &str) -> bool {
+    let pa: Vec<&str> = a.split('.').collect();
+    let pb: Vec<&str> = b.split('.').collect();
+    pa.len() == 4 && pb.len() == 4 && pa[..3] == pb[..3]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_same_slash24() {
+        assert!(same_slash24("192.168.1.2", "192.168.1.200"));
+        assert!(!same_slash24("192.168.1.2", "192.168.2.2"));
+    }
+}

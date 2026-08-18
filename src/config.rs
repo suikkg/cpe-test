@@ -491,6 +491,74 @@ impl OneOrMany {
 }
 
 /// 加载配置：--config 指定 > ./config.json > 程序同目录 config.json > 默认
+impl Config {
+    /// 加载后的取值校验。
+    ///
+    /// 这些字段大多在使用点各自 clamp 过，但有几个一旦写错只会让**每一个**
+    /// 吞吐单元静默变成 NOT_EVALUATED，报告里只看得到「有效窗口不足」之类的
+    /// 结果码，完全指不到是配置写错了。宁可在启动时直接报出来。
+    pub fn validate(&self) -> Vec<String> {
+        let mut problems = Vec::new();
+        let rc = &self.iperf.rate_check;
+        let duration = self.iperf.duration;
+
+        if duration == 0 {
+            problems.push("iperf.duration 为 0：不会产生任何有效测量窗口".into());
+        } else if rc.settle_secs >= duration {
+            problems.push(format!(
+                "iperf.rate_check.settle_secs={} 不小于 iperf.duration={}：丢弃 settle 后不会\
+                 剩下任何有效窗口，所有吞吐单元都会变成 NOT_EVALUATED",
+                rc.settle_secs, duration
+            ));
+        }
+        if rc.background_secs.saturating_add(rc.settle_secs) >= duration && duration > 0 {
+            problems.push(format!(
+                "iperf.rate_check.background_secs={} + settle_secs={} 不小于 duration={}：\
+                 基线采样与 settle 会吃掉整个测量窗口",
+                rc.background_secs, rc.settle_secs, duration
+            ));
+        }
+        if !(0.0..=1.0).contains(&rc.min_active_ratio) || !rc.min_active_ratio.is_finite() {
+            problems.push(format!(
+                "iperf.rate_check.min_active_ratio={} 超出 [0, 1]",
+                rc.min_active_ratio
+            ));
+        }
+        if !rc.offered_headroom_pct.is_finite() || rc.offered_headroom_pct < 0.0 {
+            problems.push(format!(
+                "iperf.rate_check.offered_headroom_pct={} 必须是非负有限值",
+                rc.offered_headroom_pct
+            ));
+        }
+        if rc.discovery_step_secs > 0 && rc.discovery_step_secs > duration {
+            problems.push(format!(
+                "iperf.rate_check.discovery_step_secs={} 大于 duration={}：discover 阶梯排到\
+                 测试结束之后，最后几档流永远起不来",
+                rc.discovery_step_secs, duration
+            ));
+        }
+        if let Some(limit) = rc.max_udp_loss_pct {
+            if !limit.is_finite() || !(0.0..=100.0).contains(&limit) {
+                problems.push(format!(
+                    "iperf.rate_check.max_udp_loss_pct={limit} 超出 [0, 100]"
+                ));
+            }
+        }
+        for (name, value) in [
+            ("evb_usb_to_eth_target_mbps", rc.evb_usb_to_eth_target_mbps),
+            ("evb_eth_to_usb_target_mbps", rc.evb_eth_to_usb_target_mbps),
+            ("cpe_path_ceiling_mbps", rc.cpe_path_ceiling_mbps),
+        ] {
+            if !value.is_finite() || value <= 0.0 {
+                problems.push(format!(
+                    "iperf.rate_check.{name}={value} 必须是大于 0 的有限值"
+                ));
+            }
+        }
+        problems
+    }
+}
+
 pub fn load_config(explicit: Option<&str>) -> (Config, Option<PathBuf>) {
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(p) = explicit {
@@ -506,7 +574,12 @@ pub fn load_config(explicit: Option<&str>) -> (Config, Option<PathBuf>) {
     for p in candidates {
         if p.exists() {
             match load_from(&p) {
-                Ok(c) => return (c, Some(p)),
+                Ok(c) => {
+                    for problem in c.validate() {
+                        eprintln!("!! 配置项异常: {problem}");
+                    }
+                    return (c, Some(p));
+                }
                 Err(e) => {
                     eprintln!("!! 配置文件 {} 解析失败: {e}", p.display());
                     eprintln!("!! 将使用默认配置继续");
@@ -545,6 +618,84 @@ fn load_from(p: &Path) -> Result<Config, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 发布包里的 `config.minimal.json` 必须真的能跑：只填三项、其余走默认，
+    /// 且不能因为携带 `_说明` 之类的注释键而解析失败。
+    #[test]
+    fn shipped_minimal_config_parses_and_falls_back_to_defaults() {
+        let text = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config.minimal.json"),
+        )
+        .expect("config.minimal.json 必须随仓库发布");
+        let cfg: Config = serde_json::from_str(&text).expect("最小配置必须能解析");
+
+        assert_eq!(cfg.agent_host, "192.168.1.3");
+        assert_eq!(cfg.iperf.duration, 180);
+        // 没填的字段全部落到默认值，且默认值本身通过校验。
+        assert_eq!(cfg.agent_port, Config::default().agent_port);
+        assert!(cfg.limit_udp_by_link_speed);
+        assert_eq!(
+            cfg.iperf.rate_check.min_active_ratio,
+            RateCheckCfg::default().min_active_ratio
+        );
+        assert!(
+            cfg.validate().is_empty(),
+            "最小配置不应触发任何校验告警: {:?}",
+            cfg.validate()
+        );
+    }
+
+    #[test]
+    fn validate_flags_settings_that_would_silently_kill_every_traffic_unit() {
+        let ok = Config::default();
+        assert!(ok.validate().is_empty(), "{:?}", ok.validate());
+
+        // settle 吃掉整个窗口：每个吞吐单元都会静默变成 NOT_EVALUATED。
+        let mut settle = Config::default();
+        settle.iperf.duration = 10;
+        settle.iperf.rate_check.settle_secs = 10;
+        assert!(settle.validate().iter().any(|p| p.contains("settle_secs")));
+
+        // 基线 + settle 合起来吃掉窗口。
+        let mut baseline = Config::default();
+        baseline.iperf.duration = 8;
+        baseline.iperf.rate_check.settle_secs = 5;
+        baseline.iperf.rate_check.background_secs = 3;
+        assert!(baseline
+            .validate()
+            .iter()
+            .any(|p| p.contains("background_secs")));
+
+        let mut ratio = Config::default();
+        ratio.iperf.rate_check.min_active_ratio = 1.5;
+        assert!(ratio
+            .validate()
+            .iter()
+            .any(|p| p.contains("min_active_ratio")));
+
+        let mut loss = Config::default();
+        loss.iperf.rate_check.max_udp_loss_pct = Some(-1.0);
+        assert!(loss
+            .validate()
+            .iter()
+            .any(|p| p.contains("max_udp_loss_pct")));
+
+        // discover 阶梯排到测试结束之后，最后几档流永远起不来。
+        let mut discover = Config::default();
+        discover.iperf.duration = 30;
+        discover.iperf.rate_check.discovery_step_secs = 60;
+        assert!(discover
+            .validate()
+            .iter()
+            .any(|p| p.contains("discovery_step_secs")));
+
+        let mut ceiling = Config::default();
+        ceiling.iperf.rate_check.cpe_path_ceiling_mbps = 0.0;
+        assert!(ceiling
+            .validate()
+            .iter()
+            .any(|p| p.contains("cpe_path_ceiling_mbps")));
+    }
 
     #[test]
     fn test_defaults() {

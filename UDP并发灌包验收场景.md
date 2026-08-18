@@ -390,6 +390,8 @@ rate、bytes、frame/datagram 测量。
 
 预期：恢复样本按完整时间参与加权平均和总覆盖率，但不能单独生成多个完整 5 秒窗口。有明确目标时，RX/TX 任一侧完整滚动窗口覆盖率低于 95% 均为 `NOT_EVALUATED / RATE_WINDOW_COVERAGE_LOW`；不足 5 秒时 P10 必须为空，不能退化成瞬时样本 P10。
 
+该双侧要求对 iperf3 UDP、iperf3 TCP 与 ctsTraffic 三条路径一致生效：三者都会在接收端与发送端各起一个网卡采样器（两端为同一块网卡时复用同一份样本）。目标未知（observe/discover）时只记录实测能力，不做双侧门槛。
+
 ### W09：失败重试前同步释放端口
 
 步骤：让某单流首轮完整执行但没有工具测量且能够安全清理，观察下一轮；再制造一次 server/client stop、kill/wait 或 reader 回收无法确认的测试桩结果。

@@ -70,7 +70,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 -c 'import glob, json; files = ["config.example.json", *sorted(glob.glob("dist/configs/*.json"))]; [json.load(open(path, encoding="utf-8")) for path in files]; print(f"validated {len(files)} JSON files")'
+          python3 -c 'import glob, json; files = ["config.example.json", "config.minimal.json", *sorted(glob.glob("dist/configs/*.json"))]; [json.load(open(path, encoding="utf-8")) for path in files]; print(f"validated {len(files)} JSON files")'
 
       - name: Validate tracked Windows configuration and documentation bundle
         shell: bash
@@ -81,14 +81,14 @@ jobs:
           from pathlib import Path
           from zipfile import ZipFile
 
-          bundle = Path("dist/cpe_test-v4.2.6-windows-config-docs.zip")
+          bundle = Path("dist/cpe_test-v4.2.7-windows-config-docs.zip")
           checksum = Path(f"{bundle}.sha256")
           expected_hash = checksum.read_text(encoding="utf-8").split()[0]
           actual_hash = sha256(bundle.read_bytes()).hexdigest()
           if actual_hash != expected_hash:
               raise SystemExit(f"bundle SHA-256 mismatch: {actual_hash}")
 
-          prefix = "cpe_test-v4.2.6-windows-config-docs"
+          prefix = "cpe_test-v4.2.7-windows-config-docs"
           source_for = {
               "Windows配置与文档包说明.md": Path("dist/Windows配置与文档包说明.md"),
               "README.md": Path("README.md"),
@@ -96,6 +96,7 @@ jobs:
               "使用说明.md": Path("使用说明.md"),
               "NIC_README.md": Path("NIC_README.md"),
               "UDP并发灌包验收场景.md": Path("UDP并发灌包验收场景.md"),
+              "config.minimal.json": Path("config.minimal.json"),
               "config.example.json": Path("config.example.json"),
               "configs/config-sgmii.json": Path("dist/configs/config-sgmii.json"),
               "configs/config-wifi5g.json": Path("dist/configs/config-wifi5g.json"),
@@ -254,9 +255,31 @@ jobs:
           $binary = Join-Path $downloadDir 'ctsTraffic.exe'
           $license = Join-Path $downloadDir 'LICENSE-ctsTraffic-Apache-2.0.txt'
           $baseUrl = "https://raw.githubusercontent.com/microsoft/ctsTraffic/$env:CTSTRAFFIC_COMMIT"
+          # 自托管兜底：上游仓库删档/改历史/临时不可达时，回退到本仓库自己发布过的
+          # 同一份二进制。两条路径下载完都要过同一个 SHA-256 门槛，所以镜像不会
+          # 降低可信度——它只是让发布链路不再单点依赖上游。
+          $mirrorUrl = "https://github.com/$env:GITHUB_REPOSITORY/releases/download/ctstraffic-mirror-$env:CTSTRAFFIC_VERSION"
 
-          Get-PinnedFile -Uri "$baseUrl/Releases/$env:CTSTRAFFIC_VERSION/x64/ctsTraffic.exe" -OutFile $binary
-          Get-PinnedFile -Uri "$baseUrl/LICENSE" -OutFile $license
+          $sources = @(
+            @{ Name = 'upstream'; Binary = "$baseUrl/Releases/$env:CTSTRAFFIC_VERSION/x64/ctsTraffic.exe"; License = "$baseUrl/LICENSE" },
+            @{ Name = 'self-hosted mirror'; Binary = "$mirrorUrl/ctsTraffic.exe"; License = "$mirrorUrl/LICENSE-ctsTraffic-Apache-2.0.txt" }
+          )
+
+          $fetched = $false
+          foreach ($source in $sources) {
+            try {
+              Get-PinnedFile -Uri $source.Binary -OutFile $binary
+              Get-PinnedFile -Uri $source.License -OutFile $license
+              Write-Host "fetched ctsTraffic from $($source.Name)"
+              $fetched = $true
+              break
+            } catch {
+              Write-Warning "ctsTraffic source '$($source.Name)' unavailable: $($_.Exception.Message)"
+            }
+          }
+          if (-not $fetched) {
+            throw 'ctsTraffic unavailable from both upstream and the self-hosted mirror'
+          }
 
           $actualHash = (Get-FileHash -LiteralPath $binary -Algorithm SHA256).Hash.ToLowerInvariant()
           if ($actualHash -ne $env:CTSTRAFFIC_SHA256) {
@@ -509,6 +532,18 @@ jobs:
           make_latest: true
           body: |
             cpe_test ${{ github.ref_name }} 的已验证跨平台发布包。
+
+            ## v4.2.7 判定口径一致性、发送端采样与报告证据
+
+            - **修复 TCP / ctsTraffic 会把「采样不可信」误判成「CPE 不达标」**：这两条路径原先先比对 RX 目标、再检查 5 秒滚动窗口覆盖率，于是「网卡计数器中断后恢复」这类环境异常会被写成 `RATE_FAIL / RX_BELOW_TARGET`。现在采样可信度一律先于任何性能结论，与 UDP 路径顺序一致。
+            - **TCP / ctsTraffic 补上发送端网卡采样**：此前只采接收端，验收要求的「有目标时 RX/TX 任一侧滚动覆盖率低于 95% 均为 NOT_EVALUATED」在这两条路径上并未生效，报告里的源网卡 TX 指标也一直是空的。现在两端各起一个采样器（同一块网卡时复用），PASS 条件相应变严。
+            - **TCP / CTS 的 resume identity 升版**（`iperf_tcp_v3`、`ctstraffic_v4`）：PASS 条件变严，旧版缓存的 PASS 不能再被 `--resume` 复用，否则会用旧语义的结论冒充新验收。
+            - **判定语义收敛到单一实现**：新增 `verdict` 模块统一 `Verdict`、原因码优先级与单元聚合，执行端与报告端不再各写一份（此前两份实现顺序不一致，先后导致过两个静默错判）；并加了源码级结构断言防止再次分叉。
+            - **报告新增判定证据**：每行给出判定窗口区间（可直接对到网卡逐样本 CSV 的 `elapsed_ms`）、已扣除的背景速率中位数、5 秒滚动窗口覆盖率；传输列区分 `iperf3 UDP` 与 `ctsTraffic UDP`，两种后端同时出现时提示其 UDP 语义不等价、不应直接互比。
+            - **原因码分层**：报告把「下一步该做什么」升为正文（是环境问题、配置问题，还是被测设备确实不达标），原有原因码降级为小字保留，不改动任何码本身。
+            - **配置**：新增 `config.minimal.json`（只需改 3 项即可跑通）；配置加载时校验会让 `settle_secs ≥ duration` 这类「静默把每个吞吐单元变成 NOT_EVALUATED」的写法直接报出来。
+            - **网卡样本 CSV** 头部新增 `origin_offset_ms` 与 `origin_uncertainty_half_width_ms`，共同窗口卡在边界时可判断是真够还是双机对齐误差凑够的。macOS 上报告会提示网卡采样经由 netstat 子进程、抖动高于 Windows/Linux。
+            - CI：ctsTraffic 二进制增加自托管镜像兜底（两条路径都过同一个 SHA-256 门槛）；单元测试 311 → 337，新增 8 个 UDP 编排层场景（U00C/U00D/U00E/U00F/U00G/U01/U02/W09）。
 
             ## v4.2.6 报告概览截图、UDP 方向日志与测量窗口修复
 

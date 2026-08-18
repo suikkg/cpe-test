@@ -2,6 +2,18 @@
 
 > 两台电脑间自动化 ping + iperf3 / Microsoft ctsTraffic 灌包测试，零 Python/零 PowerShell
 
+## v4.2.7
+
+- **修复 TCP / ctsTraffic 会把「采样不可信」误判成「CPE 不达标」**：这两条路径原先先比对 RX 目标、再检查 5 秒滚动窗口覆盖率，于是「网卡计数器中断后恢复」这类环境异常会被写成 `RATE_FAIL / RX_BELOW_TARGET`。现在采样可信度一律先于任何性能结论，与 UDP 路径顺序一致。
+- **TCP / ctsTraffic 补上发送端网卡采样**：此前只采接收端，验收要求的「有目标时 RX/TX 任一侧滚动覆盖率低于 95% 均为 NOT_EVALUATED」在这两条路径上并未生效，报告里的源网卡 TX 指标也一直是空的。现在两端各起一个采样器（同一块网卡时复用），PASS 条件相应变严。
+- **TCP / CTS 的 resume identity 升版**（`iperf_tcp_v3`、`ctstraffic_v4`）：PASS 条件变严，旧版缓存的 PASS 不能再被 `--resume` 复用，否则会用旧语义的结论冒充新验收。
+- **判定语义收敛到单一实现**：新增 `verdict` 模块统一 `Verdict`、原因码优先级与单元聚合，执行端与报告端不再各写一份（此前两份实现顺序不一致，先后导致过两个静默错判）；并加了源码级结构断言防止再次分叉。
+- **报告新增判定证据**：每行给出判定窗口区间（可直接对到网卡逐样本 CSV 的 `elapsed_ms`）、已扣除的背景速率中位数、5 秒滚动窗口覆盖率；传输列区分 `iperf3 UDP` 与 `ctsTraffic UDP`，两种后端同时出现时提示其 UDP 语义不等价、不应直接互比。
+- **原因码分层**：报告把「下一步该做什么」升为正文（是环境问题、配置问题，还是被测设备确实不达标），原有原因码降级为小字保留，不改动任何码本身。
+- **配置**：新增 `config.minimal.json`（只需改 3 项即可跑通）；配置加载时校验会让 `settle_secs ≥ duration` 这类「静默把每个吞吐单元变成 NOT_EVALUATED」的写法直接报出来。
+- **网卡样本 CSV** 头部新增 `origin_offset_ms` 与 `origin_uncertainty_half_width_ms`，共同窗口卡在边界时可判断是真够还是双机对齐误差凑够的。macOS 上报告会提示网卡采样经由 netstat 子进程、抖动高于 Windows/Linux。
+- CI：ctsTraffic 二进制增加自托管镜像兜底（两条路径都过同一个 SHA-256 门槛）；单元测试 311 → 337，新增 8 个 UDP 编排层场景（U00C/U00D/U00E/U00F/U00G/U01/U02/W09）。
+
 ## v4.2.6
 
 - 网卡监控与控制台/CSV 时间戳升级为完整日期时间（如 `2026-08-17 12:00:01`），跨天长时间监控也能直接定位问题发生的时刻。
@@ -91,7 +103,7 @@ CPE（Customer Premises Equipment）子网测试工具用于在**两台电脑之
 ```
 cpe_test.exe          ← 本工具（单文件）
 iperf3.exe            ← 从 iperf.fr 下载（只测 Ping/ctsTraffic 可不放）
-ctsTraffic.exe        ← v4.2.6 Windows Release 已捆绑（仅 Windows 10+）
+ctsTraffic.exe        ← v4.2.7 Windows Release 已捆绑（仅 Windows 10+）
 start_agent.bat       ← 辅测机双击
 start_master.bat      ← 主控机双击
 start_master_select_config.bat ← 主控机选择网口配置后双击
@@ -818,7 +830,7 @@ cargo build --release --locked
 
 自行编译后，把 `cpe_test.exe`、启动脚本和所需吞吐工具放到两台 Windows 电脑同一目录：
 iperf3 测试需要完整的 iperf3 Windows 发行包；ctsTraffic 测试需要 `ctsTraffic.exe`。
-官方 v4.2.6 Windows Release ZIP 已捆绑固定且校验过的 ctsTraffic 2.0.4.0，但由于发行包差异不内置 iperf3。
+官方 v4.2.7 Windows Release ZIP 已捆绑固定且校验过的 ctsTraffic 2.0.4.0，但由于发行包差异不内置 iperf3。
 
 ### GitHub Actions CI
 
@@ -841,7 +853,7 @@ Windows ZIP 包含启动脚本、四份配置、固定 CTS 二进制和第三方
 `tar.gz` 保留 `cpe_test` 可执行位。发布作业会再次核对资产名称、数量、内部结构和哈希。
 
 仓库同时跟踪一份不含可执行程序的
-[`cpe_test-v4.2.6-windows-config-docs.zip`](dist/cpe_test-v4.2.6-windows-config-docs.zip)，
+[`cpe_test-v4.2.7-windows-config-docs.zip`](dist/cpe_test-v4.2.7-windows-config-docs.zip)，
 便于直接从 Git 下载 Windows 配置、文档和启动脚本。其 SHA-256 位于同目录的
 `.zip.sha256` 文件；CI 会逐文件确认压缩包内容与仓库源文件一致。需要开箱即用的程序、
 固定版 ctsTraffic 和许可证全集时，仍应下载上面的正式 Windows Release ZIP。

@@ -9,15 +9,15 @@
 
 use crate::cmd::ctstraffic;
 use crate::cmd::iperf::{IperfClientJobMgr, IperfServerMgr};
+use crate::cmd::tools::{
+    ctstraffic_platform_supported, ctstraffic_version, find_ctstraffic, find_iperf3, iperf3_version,
+};
 use crate::config::Config;
 use crate::nic::monitor::MonitorMgr;
 use crate::nic::scan_host;
 use crate::protocol::*;
 use crate::resource::{AgentResourceInventory, ResourceInventory};
-use crate::util::{
-    ctstraffic_platform_supported, ctstraffic_version, find_ctstraffic, find_iperf3,
-    iperf3_version, now_hms, os_name,
-};
+use crate::util::{now_hms, os_name};
 use crate::{ping, screenshot};
 use base64::Engine;
 use std::collections::hash_map::DefaultHasher;

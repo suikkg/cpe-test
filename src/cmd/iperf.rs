@@ -2240,7 +2240,7 @@ iperf Done.
 
     #[test]
     fn real_iperf_server_start_replay_stop_and_rebind_when_available() {
-        let Some(bin) = crate::util::find_iperf3() else {
+        let Some(bin) = crate::cmd::tools::find_iperf3() else {
             return;
         };
         let reservation = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -2271,7 +2271,7 @@ iperf Done.
 
     #[test]
     fn real_iperf_client_cancel_waits_for_process_reap_when_available() {
-        let Some(bin) = crate::util::find_iperf3() else {
+        let Some(bin) = crate::cmd::tools::find_iperf3() else {
             return;
         };
         let reservation = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();

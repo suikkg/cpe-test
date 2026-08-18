@@ -8,9 +8,10 @@ use crate::config::{
     Config, CtsTrafficCfg, ParsedBandwidth, RateCheckCfg, RateMode, RateTargets, TestSpec,
     UdpProfile,
 };
+use crate::nic::same_slash24;
 use crate::protocol::{HostInfo, NicInfo};
 use crate::rate;
-use crate::util::{md5_hex, same_slash24};
+use crate::util::md5_hex;
 use std::collections::{BTreeMap, HashSet};
 
 pub const PORT_BASE: u16 = 56000;
@@ -879,6 +880,11 @@ fn udp_resume_unit_id_v4(
 /// TCP resume identity includes the resolved RX target and rate policy.  The
 /// v1 identity predates NIC-RX validation, so reusing it could silently skip
 /// a result produced under the old, tool-only PASS rule.
+///
+/// v3 隔离 v2：v2 时代的 PASS 只校验了接收端网卡采样，发送端根本没采。现在
+/// 有明确目标时 RX/TX 双侧的采样与 5 秒滚动窗口覆盖率都必须达标，PASS 变严了，
+/// 因此 v2 缓存的 PASS 不能跨语义复用——否则会静默跳过一个在新规则下未必
+/// 通得过的测试。
 fn tcp_resume_unit_id_v2(
     spec: &SpecNorm,
     ip_tag: &str,
@@ -886,7 +892,7 @@ fn tcp_resume_unit_id_v2(
     profile: &str,
     legs: &[Leg],
 ) -> String {
-    let mut identity = "iperf_tcp_v2".to_string();
+    let mut identity = "iperf_tcp_v3".to_string();
     push_resume_field(&mut identity, "transport", "tcp");
     push_resume_field(&mut identity, "ip", ip_tag);
     push_resume_field(&mut identity, "direction", direction);
@@ -1057,7 +1063,9 @@ fn cts_resume_unit_id_with_schema(
 
 fn cts_resume_unit_id(spec: &SpecNorm, ip_tag: &str, direction: &str, legs: &[Leg]) -> String {
     // v3 吸收共享 RX-P10/rolling coverage 判定；v2 结果不能跨判定语义复用。
-    cts_resume_unit_id_with_schema("ctstraffic_v3", spec, ip_tag, direction, legs)
+    // v4 再加一道：有目标时发送端网卡的采样与滚动覆盖率同样要达标（此前 CTS
+    // 压根不采发送端）。PASS 条件变严，v3 缓存同样不能复用。
+    cts_resume_unit_id_with_schema("ctstraffic_v4", spec, ip_tag, direction, legs)
 }
 
 /// 生成全部任务单元。返回 (units, 提示信息列表)
@@ -1879,6 +1887,55 @@ mod tests {
         assert_eq!(cts_unit.legs[0].tag, "");
         assert_eq!(cts_task_ref.rx_target_mbps, Some(2222.0));
         assert_eq!(cts_task_ref.rate_mode, RateMode::Verify);
+    }
+
+    /// PASS 条件变严时，旧 schema 的缓存 PASS 必须失效。
+    ///
+    /// 本版给 TCP/CTS 加了「有目标时 RX/TX 双侧采样与滚动覆盖率都要达标」的
+    /// 门槛——此前这两条路径压根不采发送端网卡。一个在 v4.2.6 下拿到 PASS 的
+    /// 单元，在新规则下未必还能 PASS；若 resume identity 不变，`--resume`
+    /// 会直接跳过它，等于用旧语义的结论冒充新语义的验收。
+    #[test]
+    fn stricter_two_sided_sampling_invalidates_previous_resume_schemas() {
+        let tcp = {
+            let mut spec = evb_tcp_spec();
+            spec.rate_mode = RateMode::Auto;
+            spec
+        };
+        let tcp_now = build_single_iperf_id(tcp.clone(), PORT_BASE);
+        let legacy_profile = format!(
+            "tcp_w{}_P{}",
+            tcp.tcp_windows[0],
+            tcp.effective_tcp_streams()
+        );
+        // 直接复刻 v2 的 identity 前缀：只要 schema 串没变，其余输入相同就会撞上。
+        let legacy_v2_prefix = "iperf_tcp_v2";
+        assert!(
+            !tcp_now.is_empty(),
+            "TCP resume identity 不能为空: profile={legacy_profile}"
+        );
+        assert_ne!(
+            tcp_now,
+            md5_hex(legacy_v2_prefix),
+            "TCP schema 必须已从 v2 升级"
+        );
+
+        // CTS 同理：v3 缓存不能跨双侧采样语义复用。
+        let cts = cts_spec("udp");
+        let cts_now = build_single_cts_id(cts.clone(), PORT_BASE);
+        let mut legacy_port = PORT_BASE;
+        let (legacy_units, _) = build_units(std::slice::from_ref(&cts), true, &mut legacy_port);
+        let legacy_v3_id = cts_resume_unit_id_with_schema(
+            "ctstraffic_v3",
+            &cts,
+            "V4",
+            "ab",
+            &legacy_units[0].legs,
+        );
+        assert_ne!(
+            cts_now, legacy_v3_id,
+            "CTS 双侧采样门槛上线后不能复用旧 ctstraffic_v3 PASS"
+        );
     }
 
     #[test]

@@ -559,6 +559,19 @@ pub fn now_hms() -> String {
 }
 
 /// 文件名安全化
+/// 取互斥锁，并在锁被"毒化"（持锁线程 panic 展开）后继续复用里面的数据。
+///
+/// 本工具刻意用 `catch_unwind` 隔离单元/流线程的 panic 并继续跑完剩余测试
+/// （见 `execute_unit_safely` 与 `UNIT_PANIC`）。如果某次 panic 恰好在持锁期间
+/// 展开，裸 `lock().unwrap()` 会让之后每一次取锁都 panic —— 包括写报告前的
+/// 最后一次，等于把整轮已经跑完的结果全部丢掉。被中断的那份数据可能不完整，
+/// 但保留它永远好过丢掉整份报告。
+pub fn lock_recover<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 pub fn sanitize(label: &str) -> String {
     label
         .chars()
@@ -657,7 +670,7 @@ fn classify_bracket_version_token(token: &str) -> BracketVersionToken {
 /// 内的空白分隔 token；方括号外的 IPv4 或三段数字完全忽略。括号不平衡、
 /// token 畸形、候选超过一个（即使值相同）或 major 超出保守范围时均拒绝。
 #[cfg(any(windows, test))]
-fn windows_major_from_ver_output(output: &str) -> Option<u32> {
+pub(crate) fn windows_major_from_ver_output(output: &str) -> Option<u32> {
     let mut bracket_start = None;
     let mut major = None;
 
@@ -690,140 +703,11 @@ fn windows_major_from_ver_output(output: &str) -> Option<u32> {
     major
 }
 
-#[cfg(any(windows, test))]
-fn windows_ver_supports_ctstraffic(output: &str) -> bool {
-    windows_major_from_ver_output(output).is_some_and(|major| major >= 10)
-}
-
-#[cfg(windows)]
-fn detect_ctstraffic_platform_support() -> bool {
-    // /D 禁止 AutoRun 注册表脚本，避免额外输出或命令替换影响版本门槛。
-    let out = run_cmd("cmd", &["/D", "/C", "ver"], Duration::from_secs(5));
-    out.ok && !out.timed_out && !out.cancelled && windows_ver_supports_ctstraffic(&out.merged())
-}
-
-#[cfg(not(windows))]
-fn detect_ctstraffic_platform_support() -> bool {
-    false
-}
-
-/// ctsTraffic 平台门槛：仅真实系统版本为 Windows 10 或更高时返回 true。
-///
-/// 不能只看 Rust 编译目标：Windows 7/8 同样会满足 `cfg!(windows)`。版本命令
-/// 执行失败或输出无法可靠解析时采取 fail-closed 策略，避免声明能力或启动 CTS。
-pub fn ctstraffic_platform_supported() -> bool {
-    static SUPPORTED: OnceLock<bool> = OnceLock::new();
-    *SUPPORTED.get_or_init(detect_ctstraffic_platform_support)
-}
-
 // ---------------- 外部灌包工具定位 ----------------
-
-static IPERF3: OnceLock<Option<String>> = OnceLock::new();
-
-fn iperf_probe_succeeded(probe: &CmdOut) -> bool {
-    probe.ok && !probe.timed_out && !probe.cancelled
-}
-
-/// 找 iperf3：优先程序同目录，其次 PATH
-pub fn find_iperf3() -> Option<String> {
-    IPERF3
-        .get_or_init(|| {
-            let fname = if cfg!(windows) {
-                "iperf3.exe"
-            } else {
-                "iperf3"
-            };
-            if let Ok(exe) = std::env::current_exe() {
-                if let Some(dir) = exe.parent() {
-                    let p = dir.join(fname);
-                    if p.exists() {
-                        return Some(p.to_string_lossy().into_owned());
-                    }
-                }
-            }
-            let probe = run_cmd("iperf3", &["--version"], Duration::from_secs(8));
-            // “启动命令失败: iperf3 ...”本身也包含 iperf，不能只靠文字
-            // 命中判断存在；只有 --version 真正成功退出才算可执行。
-            if iperf_probe_succeeded(&probe) {
-                Some("iperf3".into())
-            } else {
-                None
-            }
-        })
-        .clone()
-}
-
-pub fn iperf3_version() -> Option<String> {
-    let bin = find_iperf3()?;
-    let out = run_cmd(&bin, &["--version"], Duration::from_secs(8));
-    out.merged().lines().next().map(|s| s.trim().to_string())
-}
-
-static CTS_TRAFFIC: OnceLock<Option<String>> = OnceLock::new();
-
-/// 找 ctsTraffic：仅 Windows 支持；优先程序同目录，其次 PATH。
-pub fn find_ctstraffic() -> Option<String> {
-    CTS_TRAFFIC
-        .get_or_init(|| {
-            if !ctstraffic_platform_supported() {
-                return None;
-            }
-            if let Ok(exe) = std::env::current_exe() {
-                if let Some(dir) = exe.parent() {
-                    let p = dir.join("ctsTraffic.exe");
-                    if p.exists() {
-                        return Some(p.to_string_lossy().into_owned());
-                    }
-                }
-            }
-            // ctsTraffic 的 -Help 会打印帮助后返回非零，因此不能按退出码探测；
-            // 只要进程确实启动且输出了官方帮助标识，即可确认 PATH 中可用。
-            let probe = run_cmd("ctsTraffic.exe", &["-Help"], Duration::from_secs(8));
-            let text = probe.merged().to_ascii_lowercase();
-            (!text.contains("启动命令失败") && text.contains("ctstraffic"))
-                .then(|| "ctsTraffic.exe".into())
-        })
-        .clone()
-}
-
-pub fn ctstraffic_version() -> Option<String> {
-    let bin = find_ctstraffic()?;
-    // 官方 CLI 当前没有独立 --version；健康检查报告可执行文件位置和可用性，
-    // 精确文件版本可在 Windows 文件属性中查看。
-    Some(format!("ctsTraffic 可用 ({bin})"))
-}
 
 // ---------------- 交互输入 ----------------
 
-/// 读一行（EOF 返回 None，用于 --auto/管道场景不卡死）
-pub fn read_line_trim() -> Option<String> {
-    let mut s = String::new();
-    match std::io::stdin().read_line(&mut s) {
-        Ok(0) => None,
-        Ok(_) => Some(s.trim().to_string()),
-        Err(_) => None,
-    }
-}
-
-pub fn ask(prompt: &str) -> String {
-    print!("{prompt}");
-    let _ = std::io::stdout().flush();
-    read_line_trim().unwrap_or_default()
-}
-
 // ---------------- 其它 ----------------
-
-/// 用系统默认程序打开文件（报告自动打开）
-pub fn open_path(p: &Path) {
-    let s = p.to_string_lossy().into_owned();
-    if cfg!(windows) {
-        let _ = Command::new("cmd").args(["/C", "start", "", &s]).spawn();
-    } else if cfg!(target_os = "macos") {
-        let _ = Command::new("open").arg(&s).spawn();
-    } else {
-        let _ = Command::new("xdg-open").arg(&s).spawn();
-    }
-}
 
 pub fn md5_hex(s: &str) -> String {
     format!("{:x}", md5::compute(s.as_bytes()))
@@ -833,52 +717,6 @@ pub fn md5_hex(s: &str) -> String {
 #[cfg(target_os = "macos")]
 pub fn temp_file(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(name)
-}
-
-/// 解析 "1-5,8,10" 之类的序号（1 起），空串 => 全部
-pub fn parse_selection(input: &str, max: usize) -> Result<Vec<usize>, String> {
-    let t = input.trim();
-    if t.is_empty() {
-        return Ok((1..=max).collect());
-    }
-    let mut out: Vec<usize> = Vec::new();
-    for part in t.split(',') {
-        let p = part.trim();
-        if p.is_empty() {
-            continue;
-        }
-        if let Some((a, b)) = p.split_once('-') {
-            let a: usize = a.trim().parse().map_err(|_| format!("无效序号: {p}"))?;
-            let b: usize = b.trim().parse().map_err(|_| format!("无效序号: {p}"))?;
-            if a == 0 || b == 0 || a > b || b > max {
-                return Err(format!("序号超出范围(1-{max}): {p}"));
-            }
-            for i in a..=b {
-                if !out.contains(&i) {
-                    out.push(i);
-                }
-            }
-        } else {
-            let i: usize = p.parse().map_err(|_| format!("无效序号: {p}"))?;
-            if i == 0 || i > max {
-                return Err(format!("序号超出范围(1-{max}): {p}"));
-            }
-            if !out.contains(&i) {
-                out.push(i);
-            }
-        }
-    }
-    if out.is_empty() {
-        return Ok((1..=max).collect());
-    }
-    Ok(out)
-}
-
-/// 判断两个 IPv4 是否同 /24
-pub fn same_slash24(a: &str, b: &str) -> bool {
-    let pa: Vec<&str> = a.split('.').collect();
-    let pb: Vec<&str> = b.split('.').collect();
-    pa.len() == 4 && pb.len() == 4 && pa[..3] == pb[..3]
 }
 
 #[cfg(test)]
@@ -988,22 +826,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_selection() {
-        assert_eq!(parse_selection("", 5).unwrap(), vec![1, 2, 3, 4, 5]);
-        assert_eq!(parse_selection("1-3,5", 5).unwrap(), vec![1, 2, 3, 5]);
-        assert_eq!(parse_selection("2", 5).unwrap(), vec![2]);
-        assert!(parse_selection("6", 5).is_err());
-        assert!(parse_selection("0", 5).is_err());
-        assert!(parse_selection("abc", 5).is_err());
-    }
-
-    #[test]
-    fn test_same_slash24() {
-        assert!(same_slash24("192.168.1.2", "192.168.1.200"));
-        assert!(!same_slash24("192.168.1.2", "192.168.2.2"));
-    }
-
-    #[test]
     fn test_sanitize() {
         assert_eq!(sanitize("a b/c:d"), "a_b_c_d");
     }
@@ -1080,134 +902,6 @@ mod tests {
         assert!(!out.cleanup_confirmed());
         assert_eq!(refusing.kill_count.load(Ordering::SeqCst), 1);
         assert_eq!(refusing.reap_count.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn missing_iperf_error_text_is_not_a_successful_probe() {
-        let missing = CmdOut {
-            ok: false,
-            stderr: "启动命令失败: iperf3 (No such file or directory)".into(),
-            ..Default::default()
-        };
-        assert!(
-            !iperf_probe_succeeded(&missing),
-            "错误文本包含 iperf 也不能视为探测成功"
-        );
-
-        let found = CmdOut {
-            ok: true,
-            stdout: "iperf 3.18".into(),
-            ..Default::default()
-        };
-        assert!(iperf_probe_succeeded(&found));
-    }
-
-    #[test]
-    fn windows_ver_parser_accepts_windows_10_and_11() {
-        assert!(windows_ver_supports_ctstraffic(
-            "Microsoft Windows [Version 10.0.19045.4651]"
-        ));
-        assert!(windows_ver_supports_ctstraffic(
-            "Microsoft Windows [版本 10.0.22631.4602]"
-        ));
-        assert_eq!(
-            windows_major_from_ver_output("\r\nMicrosoft Windows [Version 10.0.26100.2894]\r\n"),
-            Some(10)
-        );
-    }
-
-    #[test]
-    fn windows_ver_parser_ignores_untrusted_numbers_outside_brackets() {
-        let output = concat!(
-            "Copyright 2026 AutoRun probe 10.0.0.1 1.2.3 999.1.1\r\n",
-            "Microsoft Windows [Version 10.0.26100.2894]\r\n",
-            "trailing 6.1.7601"
-        );
-        assert_eq!(windows_major_from_ver_output(output), Some(10));
-        assert!(windows_ver_supports_ctstraffic(output));
-
-        let windows_7 = concat!(
-            "AutoRun probe 192.168.1.1 10.0.0 88.77.66\r\n",
-            "Microsoft Windows [Version 6.1.7601]\r\n"
-        );
-        assert_eq!(windows_major_from_ver_output(windows_7), Some(6));
-        assert!(!windows_ver_supports_ctstraffic(windows_7));
-    }
-
-    #[test]
-    fn windows_ver_parser_allows_conservative_future_major_versions() {
-        assert_eq!(
-            windows_major_from_ver_output("Microsoft Windows [Version 11.0.100]"),
-            Some(11)
-        );
-        assert!(windows_ver_supports_ctstraffic(
-            "Microsoft Windows [Version 99.1.2.3.4]"
-        ));
-    }
-
-    #[test]
-    fn windows_ver_parser_rejects_windows_7_and_8() {
-        assert!(!windows_ver_supports_ctstraffic(
-            "Microsoft Windows [Version 6.1.7601]"
-        ));
-        assert!(!windows_ver_supports_ctstraffic(
-            "Microsoft Windows [Version 6.2.9200]"
-        ));
-        assert!(!windows_ver_supports_ctstraffic(
-            "Microsoft Windows [Version 6.3.9600]"
-        ));
-    }
-
-    #[test]
-    fn windows_ver_parser_fails_closed_for_malformed_output() {
-        for output in [
-            "",
-            "Microsoft Windows",
-            "Microsoft Windows Version 10.0.19045.4651",
-            "Microsoft Windows [Version unknown]",
-            "Microsoft Windows [Version 10]",
-            "Microsoft Windows [Version 10.0]",
-            "Microsoft Windows [Version 10..19045]",
-            "Microsoft Windows [Version .10.0.19045]",
-            "Microsoft Windows [Version 10.0.19045.]",
-            "Microsoft Windows [Version 10.0.x]",
-            "Microsoft Windows [Version v10.0.19045]",
-            "Microsoft Windows [Version 10.0.19045-beta]",
-            "Microsoft Windows [Version 999.1.1]",
-            "Microsoft Windows [Version 0.1.2]",
-            "Microsoft Windows [Version 10.0.19045",
-            "Microsoft Windows Version 10.0.19045]",
-            "Microsoft Windows [[Version 10.0.19045]]",
-            "Copyright 2026 Microsoft Corporation",
-        ] {
-            assert!(
-                !windows_ver_supports_ctstraffic(output),
-                "malformed output must be rejected: {output:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn windows_ver_parser_rejects_multiple_or_conflicting_bracket_candidates() {
-        for output in [
-            "Microsoft Windows [Version 10.0.19045 10.0.19045]",
-            "Microsoft Windows [Version 6.1.7601 10.0.19045]",
-            "Microsoft Windows [Version 10.0.19045] [Build 10.0.19045]",
-            "Microsoft Windows [Version 10.0.19045 10..19045]",
-            "probe [10.0.0.1] Microsoft Windows [Version 10.0.19045]",
-        ] {
-            assert_eq!(
-                windows_major_from_ver_output(output),
-                None,
-                "ambiguous output must be rejected: {output:?}"
-            );
-        }
-    }
-
-    #[cfg(not(windows))]
-    #[test]
-    fn non_windows_platform_never_supports_ctstraffic() {
-        assert!(!ctstraffic_platform_supported());
     }
 
     #[test]

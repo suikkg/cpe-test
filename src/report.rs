@@ -1,72 +1,8 @@
 //! HTML 测试报告生成（单文件、内嵌样式、含原始输出，拷走整个目录即可查看）
 
+use crate::verdict::{aggregate_verdict, disposition_advice};
+pub use crate::verdict::{ExecutionStatus, Verdict};
 use std::path::Path;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum Verdict {
-    Pass,
-    RateFail,
-    Unstable,
-    Measured,
-    #[default]
-    NotEvaluated,
-    SetupError,
-    Skip,
-}
-
-impl Verdict {
-    pub fn label(self) -> &'static str {
-        match self {
-            Verdict::Pass => "PASS",
-            Verdict::RateFail => "RATE_FAIL",
-            Verdict::Unstable => "UNSTABLE",
-            Verdict::Measured => "MEASURED",
-            Verdict::NotEvaluated => "NOT_EVALUATED",
-            Verdict::SetupError => "SETUP_ERROR",
-            Verdict::Skip => "SKIP",
-        }
-    }
-
-    pub fn css(self) -> &'static str {
-        match self {
-            Verdict::Pass => "pass",
-            Verdict::RateFail => "fail",
-            Verdict::Unstable => "warn",
-            Verdict::Measured => "measured",
-            Verdict::NotEvaluated => "not-evaluated",
-            Verdict::SetupError => "error",
-            Verdict::Skip => "skip",
-        }
-    }
-
-    pub fn is_pass(self) -> bool {
-        self == Verdict::Pass
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum ExecutionStatus {
-    #[default]
-    Completed,
-    Partial,
-    Error,
-    TimedOut,
-    Cancelled,
-    Skipped,
-}
-
-impl ExecutionStatus {
-    pub fn label(self) -> &'static str {
-        match self {
-            ExecutionStatus::Completed => "COMPLETED",
-            ExecutionStatus::Partial => "PARTIAL",
-            ExecutionStatus::Error => "ERROR",
-            ExecutionStatus::TimedOut => "TIMEOUT",
-            ExecutionStatus::Cancelled => "CANCELLED",
-            ExecutionStatus::Skipped => "SKIPPED",
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct StreamCounts {
@@ -159,6 +95,17 @@ pub struct Row {
     pub effective_seconds: Option<f64>,
     pub required_seconds: Option<f64>,
     pub sample_coverage: Option<f64>,
+    /// 本行判定实际使用的网卡样本区间（相对该测试单元 epoch 的毫秒）。
+    ///
+    /// 报告里已经有逐样本 CSV、采样覆盖率和有效/要求时长，但三者对不上号：
+    /// 看不出判定窗口是 CSV 里的哪一段。验收要求核对背景扣除是否合理，
+    /// 没有这两个端点就只能自己反推。
+    pub window_start_ms: Option<u64>,
+    pub window_end_ms: Option<u64>,
+    /// 已从每个样本中扣除的背景速率中位数。
+    pub baseline_mbps: Option<f64>,
+    /// 完整 5 秒滚动窗口的覆盖率；与总采样覆盖率是两个不同的门槛。
+    pub rolling_coverage: Option<f64>,
     /// 每个测试方向的判定指标；报告概览优先使用该字段。
     pub direction_summaries: Vec<DirectionSummary>,
 }
@@ -171,6 +118,9 @@ pub struct ReportMeta {
     pub started: String,
     pub finished: String,
     pub elapsed: String,
+    /// 本机网卡采样口径的已知差异（例如 macOS 经由 netstat 子进程采样）。
+    /// 空表示采样方式与主要目标平台一致，不必额外提示。
+    pub counter_source_caveat: String,
 }
 
 fn screenshot_link(path: &str, label: &str) -> String {
@@ -280,54 +230,16 @@ fn group_rows(rows: &[Row]) -> Vec<UnitGroup<'_>> {
     groups
 }
 
-fn verdict_priority(verdict: Verdict) -> u8 {
-    match verdict {
-        Verdict::SetupError => 7,
-        Verdict::NotEvaluated => 6,
-        Verdict::RateFail => 5,
-        Verdict::Unstable => 4,
-        Verdict::Measured => 3,
-        Verdict::Skip => 2,
-        Verdict::Pass => 1,
-    }
-}
-
-/// 单流 UDP 在安全耗尽全部尝试后仍无工具测量，是用户指定的硬失败原因码。
-const HARD_SINGLE_UDP_FAILURE_CODES: [&str; 2] = [
-    "SINGLE_UDP_STREAM_FAILED",
-    "CTSTRAFFIC_SINGLE_UDP_STREAM_FAILED",
-];
-
-fn row_is_hard_single_udp_failure(row: &Row) -> bool {
-    row.verdict == Verdict::RateFail
-        && HARD_SINGLE_UDP_FAILURE_CODES.contains(&row.reason_code.as_str())
-}
-
 fn group_verdict(group: &UnitGroup<'_>) -> Verdict {
+    // 有单元汇总行时直接采信 executor 的聚合结果；没有（旧报告数据、被中断的
+    // 运行）时用同一个 aggregate_verdict 复算，绝不在这里另写一套优先级。
     group.summary.map(|row| row.verdict).unwrap_or_else(|| {
-        // 没有单元汇总行时（旧报告数据、被中断的运行）仍要复刻 executor 的
-        // 聚合顺序：SetupError 优先，其次是单流硬失败——它不能被另一方向普通的
-        // NOT_EVALUATED 掩盖，否则概览会把必须灌通的方向失败读成“无法评价”。
-        if group
-            .details
-            .iter()
-            .any(|row| row.verdict == Verdict::SetupError)
-        {
-            return Verdict::SetupError;
-        }
-        if group
-            .details
-            .iter()
-            .any(|row| row_is_hard_single_udp_failure(row))
-        {
-            return Verdict::RateFail;
-        }
-        group
-            .details
-            .iter()
-            .map(|row| row.verdict)
-            .max_by_key(|verdict| verdict_priority(*verdict))
-            .unwrap_or(Verdict::NotEvaluated)
+        aggregate_verdict(
+            group
+                .details
+                .iter()
+                .map(|row| (row.verdict, row.reason_code.as_str())),
+        )
     })
 }
 
@@ -947,11 +859,17 @@ fn push_overview(h: &mut String, groups: &[UnitGroup<'_>]) {
             // 判定原因是最长的一段文字。放进定宽列里只会被截断，所以让它独占
             // 整行宽度紧跟在指标行下面——扫指标、看原因，不用左右拖。
             if !reason.is_empty() && reason != NOT_APPLICABLE {
+                // 处置建议是正文（用户要的是"下一步干什么"），原因码降级为小字
+                // （开发者要的是精确定位）。两者各得其位，谁都不必迁就谁。
+                let advice = disposition_advice(reason_code(&reason))
+                    .map(|advice| format!("<span class=\"advice\">{}</span>", esc(advice)))
+                    .unwrap_or_default();
                 h.push_str(&format!(
-                    "<tr class=\"reason-row\" data-unit-id=\"{}\" data-direction=\"{}\"><td colspan=\"{column_count}\"><span class=\"reason-tag\">{} 判定</span>{}</td></tr>\n",
+                    "<tr class=\"reason-row\" data-unit-id=\"{}\" data-direction=\"{}\"><td colspan=\"{column_count}\"><span class=\"reason-tag\">{} 判定</span>{}<span class=\"reason-code-detail\">{}</span></td></tr>\n",
                     esc(&group.key),
                     esc(&tag),
                     esc(&tag),
+                    advice,
                     esc(&reason),
                 ));
             }
@@ -1087,6 +1005,41 @@ fn push_row_diagnostics(h: &mut String, row: &Row, is_ping: bool, aria_context: 
         _ => NOT_COLLECTED.into(),
     };
     diagnostic_item(h, "有效/要求时长", &window);
+    // 判定窗口的两个端点相对该单元 epoch，可直接对到网卡逐样本 CSV 的 elapsed_ms 列。
+    let window_span = match (row.window_start_ms, row.window_end_ms) {
+        (Some(start), Some(end)) => format!("{start} ms – {end} ms（对应网卡样本 elapsed_ms）"),
+        _ if is_ping => NOT_APPLICABLE.into(),
+        _ => NOT_COLLECTED.into(),
+    };
+    diagnostic_item(h, "判定窗口区间", &window_span);
+    diagnostic_item(
+        h,
+        "已扣除背景速率",
+        &row.baseline_mbps.map_or_else(
+            || {
+                if is_ping {
+                    NOT_APPLICABLE.to_string()
+                } else {
+                    NOT_COLLECTED.to_string()
+                }
+            },
+            |value| format!("{value:.3} Mbps（起流前空闲期中位数）"),
+        ),
+    );
+    diagnostic_item(
+        h,
+        "5 秒滚动窗口覆盖率",
+        &row.rolling_coverage.map_or_else(
+            || {
+                if is_ping {
+                    NOT_APPLICABLE.to_string()
+                } else {
+                    NOT_COLLECTED.to_string()
+                }
+            },
+            |value| format!("{:.1}%", value * 100.0),
+        ),
+    );
     h.push_str("</dl>");
 
     let artifacts = [
@@ -1143,6 +1096,44 @@ fn nic_cell(row: &Row, is_ping: bool, rendered: String) -> String {
     }
 }
 
+/// 明细行的「传输」显示文本。
+///
+/// `Row::transport` 是逻辑字段（`row_has_usable_traffic_measurement` 等按
+/// `CTS/` 前缀分支），不能动；这里只改展示：把后端名摆出来。
+///
+/// 必要性：两个后端的 UDP 语义不等价——iperf3 用 `-b` 恒定速率发送，
+/// ctsTraffic 用 MediaStream 模型（每秒 FrameRate 帧，每帧再拆成 datagram），
+/// 突发形态和排队行为不同。报告把两者的结果放在同一个「接收端 RX 平均」列里，
+/// 不写清来源就会被当成可直接互比的数。
+fn transport_display(transport: &str) -> String {
+    match transport {
+        "" => String::new(),
+        t if t.starts_with("CTS/") => {
+            format!("ctsTraffic {}", t.trim_start_matches("CTS/"))
+        }
+        t => format!("iperf3 {t}"),
+    }
+}
+
+/// 报告是否同时包含两种吞吐后端；只有同时出现时才值得提示口径差异。
+fn report_mixes_traffic_backends(groups: &[UnitGroup<'_>]) -> bool {
+    let mut iperf = false;
+    let mut cts = false;
+    for group in groups {
+        for row in group.details.iter().copied().chain(group.summary) {
+            if row.transport.is_empty() {
+                continue;
+            }
+            if row.transport.starts_with("CTS/") {
+                cts = true;
+            } else {
+                iperf = true;
+            }
+        }
+    }
+    iperf && cts
+}
+
 fn push_detail_row(h: &mut String, row: &Row, group_title: &str) {
     let is_ping = row_is_ping(row);
     let direction = infer_direction_tag(row);
@@ -1160,9 +1151,9 @@ fn push_detail_row(h: &mut String, row: &Row, group_title: &str) {
     } else if row.transport.is_empty() {
         NOT_APPLICABLE.to_string()
     } else if row.ip.is_empty() {
-        row.transport.clone()
+        transport_display(&row.transport)
     } else {
-        format!("{} / {}", row.transport, row.ip)
+        format!("{} / {}", transport_display(&row.transport), row.ip)
     };
     let reason = direction_reason_text(&direction_from_row(row), NOT_APPLICABLE);
     let row_class = if row.is_grouptotal {
@@ -1344,8 +1335,14 @@ fn push_bidirectional_summary(h: &mut String, group: &UnitGroup<'_>) {
 fn push_unit_details(h: &mut String, groups: &[UnitGroup<'_>]) {
     let detail_count: usize = groups.iter().map(|group| group.details.len()).sum();
     h.push_str(&format!(
-        "<section class=\"details-section\" aria-labelledby=\"details-heading\"><h2 id=\"details-heading\">逐行明细（{detail_count} 行）</h2><div class=\"unit-list\">\n"
+        "<section class=\"details-section\" aria-labelledby=\"details-heading\"><h2 id=\"details-heading\">逐行明细（{detail_count} 行）</h2>"
     ));
+    if report_mixes_traffic_backends(groups) {
+        h.push_str(
+            "<p class=\"backend-note\">本次报告同时包含 iperf3 与 ctsTraffic 两种后端。二者的 UDP 语义不等价：iperf3 以 <code>-b</code> 恒定速率发送，ctsTraffic 使用 MediaStream 模型（每秒 FrameRate 帧、每帧再拆成 datagram），突发形态与排队行为不同。<strong>同一条链路上两者的 RX 曲线可以明显不同，不应直接互比</strong>；各自与自己的目标比较才有意义。</p>",
+        );
+    }
+    h.push_str("<div class=\"unit-list\">\n");
     for (index, group) in groups.iter().enumerate() {
         let verdict = group_verdict(group);
         let execution_status = group_execution_status(group);
@@ -1495,6 +1492,8 @@ h2 { margin: 28px 0 10px; font-size: 17px; line-height: 1.3; }
 .overview-table tr:not(.reason-row) > td:nth-child(1) .status, .unit-verdict-note .status { white-space: normal; overflow-wrap: normal; word-break: keep-all; }
 /* 判定原因独占整行：文字最长，定宽列里必被截断。 */
 .overview-table tr.reason-row > td { padding: 4px 10px 7px; color: var(--muted); background: #fafbfc; overflow-wrap: anywhere; }
+.advice { display: inline; color: var(--ink); font-weight: 600; }
+.reason-code-detail { display: block; margin-top: 3px; color: var(--muted); font-size: 11px; }
 .reason-tag { margin-right: 6px; padding: 0 5px; border: 1px solid var(--line); border-radius: 3px; background: var(--surface); color: #145a94; font-size: 11px; font-weight: 700; }
 /* 左侧「测试场景」三列冻结：窄屏横向拖到接收速率/截图时仍看得到是哪个测试项。
    原因行是 colspan 整行，绝不能被当成第一列跟着冻结。 */
@@ -1559,6 +1558,8 @@ h2 { margin: 28px 0 10px; font-size: 17px; line-height: 1.3; }
 pre { max-height: 420px; margin: 8px 0 0; padding: 10px; overflow: auto; border-radius: 4px; background: #182027; color: #d7ffd7; font-size: 12px; line-height: 1.4; }
 details.raw-section { margin: 8px 0; }
 details.raw-section > summary { cursor: pointer; font-weight: 700; overflow-wrap: anywhere; }
+.sampling-caveat { margin: 8px 0 0; padding: 8px 10px; border-left: 3px solid #8a5200; background: #fff8e6; color: #5e430b; }
+.backend-note { margin: 8px 0 12px; padding: 8px 10px; border-left: 3px solid #1769aa; background: #eef5fb; color: #16405e; }
 .raw-empty { margin: 8px 0; padding: 8px 10px; border-left: 3px solid #8a5200; background: #fff8e6; color: #5e430b; }
 .raw-links { margin: 8px 0; }
 .raw-links a, .artifact-list a { color: #145a94; }
@@ -1639,6 +1640,13 @@ summary:focus-visible, a:focus-visible, .table-scroll:focus-visible, .overview-s
         skipped = skipped,
     ));
 
+    if !meta.counter_source_caveat.is_empty() {
+        h.push_str(&format!(
+            "<p class=\"sampling-caveat\"><strong>采样口径提示</strong>：{}</p>\n",
+            esc(&meta.counter_source_caveat)
+        ));
+    }
+
     push_overview(&mut h, &groups);
     push_unit_details(&mut h, &groups);
 
@@ -1711,13 +1719,17 @@ mod tests {
 
     static REPORT_INDEX: AtomicUsize = AtomicUsize::new(0);
 
-    fn render(mut rows: Vec<Row>) -> String {
+    fn render(rows: Vec<Row>) -> String {
+        render_with_meta(rows, &ReportMeta::default())
+    }
+
+    fn render_with_meta(mut rows: Vec<Row>, meta: &ReportMeta) -> String {
         let index = REPORT_INDEX.fetch_add(1, Ordering::Relaxed);
         let dir =
             std::env::temp_dir().join(format!("cpe_report_test_{}_{}", std::process::id(), index));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("report.html");
-        write_report(&path, &mut rows, &ReportMeta::default()).unwrap();
+        write_report(&path, &mut rows, meta).unwrap();
         let html = std::fs::read_to_string(&path).unwrap();
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_dir(dir);
@@ -2024,6 +2036,73 @@ mod tests {
         assert!(!html.contains("<col class=\"c-shot\">"));
         assert!(html.contains("colspan=\"10\""));
         assert!(html.contains("TARGET_UNKNOWN: Observe 模式仅记录实际能力"));
+    }
+
+    #[test]
+    fn diagnostics_expose_the_window_baseline_and_rolling_coverage_used_for_judgement() {
+        let mut detail = traffic_detail("unit-window", (0, 0, 0, 0));
+        detail.is_grouptotal = true;
+        detail.window_start_ms = Some(8_000);
+        detail.window_end_ms = Some(188_000);
+        detail.baseline_mbps = Some(12.5);
+        detail.rolling_coverage = Some(0.978);
+        detail.effective_seconds = Some(180.0);
+        detail.required_seconds = Some(180.0);
+        let html = render(vec![detail, unit_summary("unit-window", Verdict::Pass)]);
+
+        // 判定窗口的两个端点必须能直接对到网卡逐样本 CSV 的 elapsed_ms 列。
+        assert!(html.contains("判定窗口区间"));
+        assert!(html.contains("8000 ms – 188000 ms（对应网卡样本 elapsed_ms）"));
+        // 验收要求核对「原始总流量 − 业务流量 ≈ 背景值」，扣除量必须报出来。
+        assert!(html.contains("12.500 Mbps（起流前空闲期中位数）"));
+        // 滚动窗口覆盖率与总采样覆盖率是两个门槛，不能只报一个。
+        assert!(html.contains("5 秒滚动窗口覆盖率"));
+        assert!(html.contains("97.8%"));
+    }
+
+    #[test]
+    fn transport_column_names_the_backend_and_warns_when_both_are_mixed() {
+        assert_eq!(transport_display("UDP"), "iperf3 UDP");
+        assert_eq!(transport_display("TCP"), "iperf3 TCP");
+        assert_eq!(transport_display("CTS/UDP"), "ctsTraffic UDP");
+        assert_eq!(transport_display("CTS/TCP"), "ctsTraffic TCP");
+        assert_eq!(transport_display(""), "");
+
+        // 只有 iperf3 时不必提示口径差异。
+        let only_iperf = traffic_detail("unit-iperf", (0, 0, 0, 0));
+        let html = render(vec![only_iperf, unit_summary("unit-iperf", Verdict::Pass)]);
+        assert!(html.contains("iperf3 TCP"));
+        assert!(!html.contains("二者的 UDP 语义不等价"));
+
+        // 两种后端同时出现时必须写明不可直接互比。
+        let mut iperf = traffic_detail("unit-mix", (0, 0, 0, 0));
+        iperf.transport = "UDP".into();
+        let mut cts = traffic_detail("unit-mix", (0, 0, 1, 0));
+        cts.transport = "CTS/UDP".into();
+        let mixed = render(vec![iperf, cts, unit_summary("unit-mix", Verdict::Pass)]);
+        assert!(mixed.contains("iperf3 UDP"));
+        assert!(mixed.contains("ctsTraffic UDP"));
+        assert!(mixed.contains("不应直接互比"));
+    }
+
+    #[test]
+    fn sampling_caveat_is_shown_only_when_the_platform_actually_differs() {
+        let detail = traffic_detail("unit-caveat", (0, 0, 0, 0));
+        let quiet = render_with_meta(
+            vec![detail.clone(), unit_summary("unit-caveat", Verdict::Pass)],
+            &ReportMeta::default(),
+        );
+        assert!(!quiet.contains("采样口径提示"));
+
+        let noisy = render_with_meta(
+            vec![detail, unit_summary("unit-caveat", Verdict::Pass)],
+            &ReportMeta {
+                counter_source_caveat: "本机为 macOS：网卡计数器经由 netstat 子进程逐次采样".into(),
+                ..Default::default()
+            },
+        );
+        assert!(noisy.contains("采样口径提示"));
+        assert!(noisy.contains("netstat 子进程"));
     }
 
     #[test]

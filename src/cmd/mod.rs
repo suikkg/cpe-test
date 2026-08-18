@@ -6,3 +6,4 @@ pub mod ipconfig;
 pub mod iperf;
 #[cfg(any(windows, test))]
 pub mod netsh;
+pub mod tools;

@@ -18,6 +18,31 @@ use std::time::{Duration, Instant};
 pub const MIN_VALID_RX_MBPS: f64 = 0.01;
 
 /// 读某接口 RX/TX 累计字节。
+/// 本平台读取网卡计数器的方式说明，供报告标注采样口径差异。
+///
+/// Windows 走 `GetIfTable2`、Linux 读 sysfs，都是进程内操作，单次开销在微秒级。
+/// macOS 没有等价的 std 接口，每个采样点都要 fork 一个 `netstat -ibn` 并全表
+/// 解析：**均值不受系统性偏差影响**（相邻样本的滞后相消），但子进程延迟的抖动
+/// 会直接进入 `interval_ms`，从而放大 5 秒滚动窗口的 P10 离散度；而且这个延迟
+/// 与系统负载正相关，恰好在高吞吐时最大。
+///
+/// 目标平台是 Windows，macOS 主要用于开发与旁路验证，因此这里不引入 libc 去调
+/// `NET_RT_IFLIST2`，而是把差异如实写进报告，让读数的人知道该怎么解读抖动。
+pub fn counter_source_caveat() -> Option<&'static str> {
+    #[cfg(target_os = "macos")]
+    {
+        Some(
+            "本机为 macOS：网卡计数器经由 netstat 子进程逐次采样，采样间隔抖动高于 \
+             Windows（GetIfTable2）与 Linux（sysfs），RX-P10 的离散度会被放大。\
+             判定边界附近的 UNSTABLE 结果建议在 Windows 上复测。",
+        )
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
 pub fn read_counters(iface: &str) -> Result<(u64, u64), String> {
     #[cfg(windows)]
     {

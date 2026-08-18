@@ -3,7 +3,11 @@
 
 use crate::clock::SystemClock;
 use crate::cmd::iperf::IperfServerMgr;
+use crate::cmd::tools::{
+    ctstraffic_platform_supported, ctstraffic_version, find_ctstraffic, find_iperf3, iperf3_version,
+};
 use crate::config::{load_config, Config};
+use crate::console::{ask, open_path, parse_selection};
 use crate::http_client;
 use crate::master::builder::{self, build_units, Endpoint, LegKind, Side, SpecNorm, Unit};
 use crate::master::executor::{Ctx, IperfPreflightBlock, ResultDb};
@@ -13,10 +17,7 @@ use crate::protocol::{
     HealthOut, HostInfo, InfoReq, Resp, CTS_TRAFFIC_CAPABILITY, RELIABLE_LIFECYCLE_CAPABILITY,
 };
 use crate::report::{write_report, ReportMeta};
-use crate::util::{
-    ask, ctstraffic_platform_supported, ctstraffic_version, find_ctstraffic, find_iperf3,
-    iperf3_version, log_to_file, logln, now_compact, now_full, open_path, parse_selection,
-};
+use crate::util::{lock_recover, log_to_file, logln, now_compact, now_full};
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -440,9 +441,14 @@ pub fn run_master(opts: MasterOpts) -> i32 {
         started,
         finished: now_full(),
         elapsed: elapsed.clone(),
+        counter_source_caveat: crate::nic::monitor::counter_source_caveat()
+            .unwrap_or_default()
+            .to_string(),
     };
     {
-        let mut rows = ctx.rows.lock().unwrap();
+        // 写报告是最后一次取这把锁：即使前面某个单元 panic 毒化了它，也必须
+        // 把已经跑完的结果落盘，而不是连整份报告一起丢掉。
+        let mut rows = lock_recover(&ctx.rows);
         match write_report(&run_paths.report, &mut rows, &meta) {
             Ok(_) => logln(&format!("\n报告已生成: {}", run_paths.report.display())),
             Err(e) => logln(&format!("!! 报告写入失败: {e}")),

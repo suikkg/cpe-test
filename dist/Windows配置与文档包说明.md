@@ -1,13 +1,13 @@
-# cpe_test v4.2.6 Windows 配置与文档包
+# cpe_test v4.2.7 Windows 配置与文档包
 
-仓库中的 `cpe_test-v4.2.6-windows-config-docs.zip` 是便于从 Git 直接下载的
+仓库中的 `cpe_test-v4.2.7-windows-config-docs.zip` 是便于从 Git 直接下载的
 Windows 配置、说明文档和启动脚本资料包。包内文件由仓库当前版本生成，并由 CI
 逐文件与源码副本比对，避免配置或文档过期。
 
 这个资料包**不包含可执行程序或吞吐工具**：
 
 - 不包含 `cpe_test.exe`；请从 GitHub Release 下载正式
-  `cpe_test-v4.2.6-windows-x86_64.zip`，或自行编译。
+  `cpe_test-v4.2.7-windows-x86_64.zip`，或自行编译。
 - 不包含 `ctsTraffic.exe`；正式 Windows Release ZIP 会捆绑固定并校验过的
   Microsoft ctsTraffic 2.0.4.0 x64。
 - 不包含 `iperf3.exe` 及其 DLL；需要 iperf3 测试时，请放入完整的 Windows
@@ -16,9 +16,20 @@ Windows 配置、说明文档和启动脚本资料包。包内文件由仓库当
 ## 包内内容
 
 - Windows 快速开始、完整 README、使用说明、NIC 说明和 UDP 验收场景。
-- `config.example.json` 与 `configs/` 下四份可直接选择的具名配置。
+- `config.minimal.json`（最小可用：首次跑通只需改 `agent_host`、`agent_token`、
+  `iperf.duration` 三项，其余走内置默认值）。
+- `config.example.json`（完整字段面）与 `configs/` 下四份可直接选择的具名配置。
 - `start_agent.bat`、`start_master.bat`、`start_master_select_config.bat`。
 - iperf3/ctsTraffic 放置说明、MIT 许可证和第三方声明。
+
+## v4.2.7 行为要点
+
+- 修复 TCP / ctsTraffic 会把「网卡采样不可信」误判成「CPE 不达标」：采样可信度现在一律先于任何性能结论。
+- TCP / ctsTraffic 补上发送端网卡采样；有明确目标时 RX/TX 双侧的采样与 5 秒滚动覆盖率都要达标，PASS 条件变严。
+- TCP / CTS 的 resume identity 升版，旧版缓存的 PASS 不会被 `--resume` 复用。
+- 报告新增判定证据：判定窗口区间、已扣除的背景速率、5 秒滚动窗口覆盖率；传输列区分 iperf3 与 ctsTraffic，两者 UDP 语义不等价、不应直接互比。
+- 原因码分层：报告正文直接说明下一步该做什么（环境问题 / 配置问题 / 设备确实不达标），原有原因码保留为小字。
+- 新增 `config.minimal.json`，首次跑通只需改三项。
 
 ## v4.2.6 行为要点
 
