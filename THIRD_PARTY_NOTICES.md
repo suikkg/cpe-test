@@ -20,6 +20,16 @@ The release workflow downloads the binary from the immutable commit above,
 verifies the SHA-256 before packaging, and places the upstream Apache-2.0
 license in the Windows archive as `LICENSE-ctsTraffic-Apache-2.0.txt`.
 
+This repository also hosts an unmodified byte-for-byte mirror of the same
+binary and license, published as release `ctstraffic-mirror-2.0.4.0`, so that
+the build does not depend on a single upstream source being reachable. The
+mirror is a verbatim redistribution permitted by the Apache-2.0 license; it
+carries no modifications, and the build verifies the identical SHA-256 no
+matter which source it was fetched from. Bumping the pinned ctsTraffic version
+requires publishing a matching `ctstraffic-mirror-<version>` release alongside
+the workflow's `CTSTRAFFIC_VERSION` / `CTSTRAFFIC_COMMIT` / `CTSTRAFFIC_SHA256`
+update.
+
 ## Windows Implementation Library (WIL)
 
 ctsTraffic uses Microsoft's Windows Implementation Library (WIL), which is
