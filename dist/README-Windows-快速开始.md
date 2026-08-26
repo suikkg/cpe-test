@@ -1,8 +1,8 @@
 # CPE 测试工具 Windows 包
 
-> 如果你从 Git 仓库下载的是 `cpe_test-v4.2.7-windows-config-docs.zip`，那是一份只含
+> 如果你从 Git 仓库下载的是 `cpe_test-v4.3.0-windows-config-docs.zip`，那是一份只含
 > 配置、文档和启动脚本的资料包，不含 `cpe_test.exe`、`ctsTraffic.exe` 或 iperf3。
-> 开箱即用请下载 GitHub Release 的 `cpe_test-v4.2.7-windows-x86_64.zip`；也可以自行
+> 开箱即用请下载 GitHub Release 的 `cpe_test-v4.3.0-windows-x86_64.zip`；也可以自行
 > 编译程序后，把资料包内容与 exe 放到同一目录。
 
 将这个文件夹完整复制到**主控机**和**辅测机**。两台电脑必须使用同一个
@@ -11,8 +11,8 @@
 ## 包内文件与系统要求
 
 - `cpe_test.exe`：主控、agent、网卡扫描和监控共用的程序。
-- `ctsTraffic.exe`：Microsoft ctsTraffic 2.0.4.0 x64，随官方 v4.2.7 Windows 包固定捆绑并校验；仅支持 Windows 10 或更高版本。
-- `start_*.bat`：双击启动脚本。
+- `ctsTraffic.exe`：Microsoft ctsTraffic 2.0.4.0 x64，随官方 v4.3.0 Windows 包固定捆绑并校验；仅支持 Windows 10 或更高版本。
+- `start_*.bat`：双击启动脚本。`start_ui.bat` 是图形控制台，`start_master*.bat` 是命令行问答式。
 - `configs\`：SGMII、Wi-Fi、10GUSB 等具名配置。
 - `THIRD_PARTY_NOTICES.md` 及 CTS/WIL 许可文件：第三方归属和许可说明。
 
@@ -24,15 +24,33 @@ ctsTraffic 测试要求主控和辅测都是 Windows 10+，且两边都能在 `c
 或 `PATH` 中找到 `ctsTraffic.exe`。程序会实际检查两端 Windows major 版本，只有不低于 10 才通过；
 Windows 7/8/8.1、版本无法确认以及 macOS/Linux 都不支持 CTS，但不会阻断已选的 iperf3/Ping。
 
-## 使用
+## 使用（图形控制台，推荐）
 
 1. 辅测机双击 `start_agent.bat`，首次防火墙提示请选择“允许访问”。保持窗口打开，记下显示的可达 IP。
+2. 主控机双击 `start_ui.bat`，浏览器会自动打开 `http://127.0.0.1:28800`。没弹出就手动复制这个地址。
+3. 在页面里：填辅测机 IP 点“连接” → 需要的话逐网口填 RX 门限和发送端 UDP `-b`
+   → 勾选要测的网口组合、方向、协议和 IP 版本 → 填 TCP `-w` / `-P` 与 UDP `-b` 多档参数
+   → 点“预览任务”确认清单和预计耗时 → 点“开始测试”。
+4. 同一页面实时显示每个单元的进度；可“结束并出报告”，跑完后点“打开报告”。
+
+控制台只监听本机回环地址，不会被局域网上的其他机器访问到。页面上填过的数字会高亮，
+和留空后走全局/内置推导的值一眼可分；点“下载 config.json”可以把这次的勾选导出，之后用
+`cpe_test.exe master --auto --config <文件>` 无人值守重跑。
+
+## 使用（命令行问答式）
+
+习惯命令行、或者要跑既有配置文件时用这条：
+
+1. 辅测机同样先双击 `start_agent.bat`。
 2. 主控机双击 `start_master_select_config.bat`，选择对应网口配置，再输入辅测机 IP。
 3. 交互菜单中选择 iperf3、ctsTraffic、两者对比、Ping 或全部；确认任务清单后开始。
 4. 测试结束后，HTML 报告、主控日志和全部附件会保存在主控机当前目录下同一个 `runs/run_<时间>_<进程号>/` 目录中。
 
 也可直接运行 `start_master.bat configs\config-sgmii.json`，把文件名替换为
 `config-wifi5g.json`、`config-10gusb.json` 或 `config-all-common.json`。
+
+两条路径产出的报告完全一样：控制台不是另一条执行链路，它只是把勾选结果写成一份
+config，然后调用和命令行完全相同的执行流程。
 
 运行时 TCP/UDP 会打印 `[灌包进度]`：`nic-rx` 是 Windows `GetIfTable2` 网卡计数器
 实测接收速率，iperf3/CTS 自报速率不替代正式 NIC 吞吐口径；但单流是否真正建立仍必须

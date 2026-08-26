@@ -164,15 +164,30 @@ impl IperfParsed {
 }
 
 /// 解析 iperf3 文本输出（-f m）
+///
+/// UDP 丢包只认 server 汇总行（含 `receiver`）里的 `lost/total` 计数，
+/// 并且用两个整数自己算，不解析 iperf3 打印的百分比。三条理由：
+///
+/// 1. 逐秒 interval 行的最后一条常常是不足 1 秒的收尾残帧（`0/0 (0%)`），
+///    在整段文本上取「最后一次匹配」会把它当成全程丢包率；
+/// 2. iperf3 在接近满丢包时把百分比打成科学计数法（`(1e+02%)`），
+///    任何 `\d+(\.\d+)?%` 的正则都匹配不上，真正的汇总行反而被跳过；
+/// 3. sender 行的 `0/N (0%)` 是「我全发出去了」，物理上恒为 0，
+///    当接收侧丢包率用永远是错的。
+///
+/// 三条叠加曾把 99.98% 的丢包报成 0.000%（见 .ai/DESIGN-v4.3.0.md D3）。
+/// 拿不到 receiver 汇总行时返回 `None` 而不是 0——「不知道」和「没丢」
+/// 是两件事，后者会让判定误判为合格。
 pub fn parse_output(text: &str) -> IperfParsed {
     let ansi = Regex::new(r"\x1b\[[0-9;]*[A-Za-z]").expect("regex");
     let rate_re = Regex::new(r"(\d+(?:[.,]\d+)?)\s*([KMGT]?)(bits|Bytes)/sec").expect("regex");
-    let loss_re = Regex::new(r"\((\d+(?:[.,]\d+)?)%\)").expect("regex");
-    let loss_count_re = Regex::new(r"(\d+)\s*/\s*(\d+)\s*\((\d+(?:[.,]\d+)?)%\)").expect("regex");
+    // 只取计数，百分比连捕获都不做：格式由 iperf3 决定，计数不会有歧义。
+    let loss_count_re = Regex::new(r"(\d+)\s*/\s*(\d+)\s*\(").expect("regex");
 
     let mut p = IperfParsed::default();
     for raw_line in text.lines() {
         let line = ansi.replace_all(raw_line, "");
+        let is_receiver = line.contains("receiver");
         let mut last: Option<f64> = None;
         for cap in rate_re.captures_iter(&line) {
             let num: f64 = cap[1].replace(',', ".").parse().unwrap_or(0.0);
@@ -193,20 +208,30 @@ pub fn parse_output(text: &str) -> IperfParsed {
         if let Some(v) = last {
             if line.contains("sender") {
                 p.sender_mbps = Some(v);
-            } else if line.contains("receiver") {
+            } else if is_receiver {
                 p.receiver_mbps = Some(v);
             } else {
                 p.last_mbps = Some(v);
             }
         }
-    }
-    if let Some(cap) = loss_re.captures_iter(text).last() {
-        p.udp_loss_pct = cap[1].replace(',', ".").parse().ok();
-    }
-    if let Some(cap) = loss_count_re.captures_iter(text).last() {
-        p.udp_lost_datagrams = cap[1].parse().ok();
-        p.udp_total_datagrams = cap[2].parse().ok();
-        p.udp_loss_pct = cap[3].replace(',', ".").parse().ok();
+        // 多次 attempt / 多流 `[SUM]` 时，后出现的 receiver 汇总行覆盖前面的，
+        // 与上面速率字段的取值规则保持一致。
+        if is_receiver {
+            if let Some(cap) = loss_count_re.captures_iter(&line).last() {
+                let lost: Option<u64> = cap[1].parse().ok();
+                let total: Option<u64> = cap[2].parse().ok();
+                p.udp_lost_datagrams = lost;
+                p.udp_total_datagrams = total;
+                p.udp_loss_pct = match (lost, total) {
+                    // server 一个数据报都没收到时 total 为 0；此时丢包率无从谈起，
+                    // 返回 None 让上层报「未知」，不能算成 0%。
+                    (Some(lost), Some(total)) if total > 0 => {
+                        Some(lost as f64 * 100.0 / total as f64)
+                    }
+                    _ => None,
+                };
+            }
+        }
     }
     p
 }
@@ -1904,9 +1929,70 @@ iperf Done.
         let p = parse_output(UDP_SAMPLE);
         assert_eq!(p.sender_mbps, Some(100.0));
         assert_eq!(p.receiver_mbps, Some(99.6));
-        assert_eq!(p.udp_loss_pct, Some(0.36));
         assert_eq!(p.udp_lost_datagrams, Some(312));
         assert_eq!(p.udp_total_datagrams, Some(86380));
+        // 从计数算，不取 iperf3 打印的 0.36。
+        assert!((p.udp_loss_pct.unwrap() - 0.361_194_7).abs() < 1e-6);
+    }
+
+    /// 取自 run_20260825_215915_7684 的 unit-7684-33-34 udp_ab：
+    /// iperf3 在接近满丢包时把百分比打成 `1e+02%`，且 server 段最后一条
+    /// 是 0 字节的收尾残帧 `0/0 (0%)`。旧解析在整段文本上取最后一次匹配，
+    /// 于是把 99.97% 的丢包报成了 0.000%。
+    const UDP_FULL_LOSS_SAMPLE: &str = r#"
+[  5] 203.01-204.01 sec  28.0 KBytes  0.23 Mbits/sec  3535.517 ms  37544/37546 (1e+02%)
+[  5] 205.00-206.01 sec  14.0 KBytes  0.11 Mbits/sec  3590.606 ms  29235/29236 (1e+02%)
+[  5] 206.01-206.56 sec  0.00 Bytes  0.00 Mbits/sec  3590.606 ms  0/0 (0%)
+- - - - - - - - - - - - - - - - - - - - - - - - -
+[  5]   0.00-206.00 sec  40.8 GBytes  1701 Mbits/sec  0.000 ms  0/3054905 (0%)  sender
+[  5]   0.00-206.56 sec  14.4 MBytes  0.59 Mbits/sec  3590.606 ms  3035698/3036752 (1e+02%)  receiver
+"#;
+
+    #[test]
+    fn scientific_notation_loss_is_read_from_the_receiver_summary_not_the_tail_interval() {
+        let p = parse_output(UDP_FULL_LOSS_SAMPLE);
+        assert_eq!(p.sender_mbps, Some(1701.0));
+        assert_eq!(p.receiver_mbps, Some(0.59));
+        assert_eq!(p.udp_lost_datagrams, Some(3_035_698));
+        assert_eq!(p.udp_total_datagrams, Some(3_036_752));
+        let loss = p.udp_loss_pct.expect("满丢包必须解析出丢包率");
+        assert!(
+            (99.9..=100.0).contains(&loss),
+            "1e+02% 的 receiver 汇总行必须算出 ~100% 而不是尾部残帧的 0%，实际 {loss}"
+        );
+    }
+
+    #[test]
+    fn sender_only_zero_loss_never_becomes_the_reported_loss() {
+        // client 拿不到 server 汇总时只剩 sender 行。sender 的 0% 是
+        // 「我全发出去了」，不是「没丢」——必须报未知。
+        let p = parse_output(
+            "[  5]   0.00-206.00 sec  40.8 GBytes  1701 Mbits/sec  0.000 ms  0/3054905 (0%)  sender\n",
+        );
+        assert_eq!(p.sender_mbps, Some(1701.0));
+        assert_eq!(p.udp_loss_pct, None);
+        assert_eq!(p.udp_total_datagrams, None);
+    }
+
+    #[test]
+    fn receiver_summary_without_any_datagram_reports_unknown_loss() {
+        let p = parse_output(
+            "[  5]   0.00-10.00 sec  0.00 Bytes  0.00 Mbits/sec  0.000 ms  0/0 (0%)  receiver\n",
+        );
+        assert_eq!(p.udp_total_datagrams, Some(0));
+        assert_eq!(p.udp_loss_pct, None);
+    }
+
+    #[test]
+    fn last_receiver_summary_wins_across_retry_attempts() {
+        let text = concat!(
+            "[  5]   0.00-10.04 sec  119 MBytes  99.6 Mbits/sec  0.014 ms  312/86380 (0.36%)  receiver\n",
+            "iperf3: error - unable to connect to server\n",
+            "[  5]   0.00-10.04 sec  119 MBytes  50.0 Mbits/sec  0.014 ms  40000/80000 (50%)  receiver\n",
+        );
+        let p = parse_output(text);
+        assert_eq!(p.udp_lost_datagrams, Some(40_000));
+        assert_eq!(p.udp_loss_pct, Some(50.0));
     }
 
     #[test]

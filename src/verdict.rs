@@ -184,6 +184,9 @@ pub fn disposition_advice(reason_code: &str) -> Option<&'static str> {
         | "CTSTRAFFIC_MONITOR_RUNTIME_ERROR" => {
             "本轮网卡采样不完整，数据不足以判定性能。检查测试期间是否重启/切换过网卡，然后重跑。这不是 CPE 不达标。"
         }
+        "COUNTER_STALLED" => {
+            "样本采齐了但网卡字节计数长时间不动，说明测试中途链路已经没有流量。先确认被测设备是否掉线或重启，再重跑；这一轮的平均速率不能当结论。"
+        }
         "EFFECTIVE_WINDOW_SHORT"
         | "IPERF_EFFECTIVE_WINDOW_SHORT"
         | "CTSTRAFFIC_EFFECTIVE_WINDOW_SHORT" => {

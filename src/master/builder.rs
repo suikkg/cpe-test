@@ -5,8 +5,8 @@
 
 use crate::cmd::ctstraffic::parse_size_bytes;
 use crate::config::{
-    Config, CtsTrafficCfg, ParsedBandwidth, RateCheckCfg, RateMode, RateTargets, TestSpec,
-    UdpProfile,
+    Config, CtsTrafficCfg, LinkProfiles, ParsedBandwidth, RateCheckCfg, RateMode, RateTargets,
+    TestSpec, UdpProfile,
 };
 use crate::nic::same_slash24;
 use crate::protocol::{HostInfo, NicInfo};
@@ -77,6 +77,8 @@ pub struct SpecNorm {
     pub rate_mode: RateMode,
     pub rate_targets: RateTargets,
     pub rate_check: RateCheckCfg,
+    /// 两层链路策略（角色兜底 + 单口覆盖）；空则全部走内置推导。
+    pub link_profiles: LinkProfiles,
     pub ctstraffic: CtsTrafficCfg,
     /// 配置层中 TCP/UDP 共用的非法 CTS 标量参数。协议流数错误由各自
     /// 的任务分支根据原始值生成，避免一方错误污染另一方。
@@ -220,6 +222,121 @@ pub struct Unit {
     pub bidir: bool,
     pub legs: Vec<Leg>,
     pub est_secs: u64,
+}
+
+/// 一块网卡在重扫后相对于「计划时快照」的变化。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NicDrift {
+    /// 计划时存在的网卡，重扫后按接口名找不到了。
+    Gone { pc: String, name: String },
+    /// 还在，但关键字段变了（IPv4 / 接口索引 / 协商速率 / link-local）。
+    Changed {
+        pc: String,
+        name: String,
+        detail: String,
+    },
+}
+
+impl NicDrift {
+    pub fn is_gone(&self) -> bool {
+        matches!(self, NicDrift::Gone { .. })
+    }
+
+    pub fn describe(&self) -> String {
+        match self {
+            NicDrift::Gone { pc, name } => format!("{pc} / {name} 已消失"),
+            NicDrift::Changed { pc, name, detail } => format!("{pc} / {name} {detail}"),
+        }
+    }
+}
+
+/// 遍历单元里所有端点。任务类型增加时这里必须跟着加，否则新类型的端点
+/// 会静默漏掉刷新。
+fn for_each_endpoint_mut(unit: &mut Unit, mut f: impl FnMut(&mut Endpoint)) {
+    for leg in &mut unit.legs {
+        match &mut leg.kind {
+            LegKind::IperfSingle(task) => {
+                f(&mut task.src);
+                f(&mut task.dst);
+            }
+            LegKind::IperfGroup { streams, .. } => {
+                for task in streams {
+                    f(&mut task.src);
+                    f(&mut task.dst);
+                }
+            }
+            LegKind::CtsTraffic(task) => {
+                f(&mut task.src);
+                f(&mut task.dst);
+            }
+            LegKind::Ping(task) => {
+                f(&mut task.src);
+                f(&mut task.dst);
+            }
+        }
+    }
+}
+
+/// 用最新一次双端扫描的结果刷新单元里所有端点的网卡信息，并报告发生了什么变化。
+///
+/// 计划阶段的网卡快照在运行开始时取一次，之后就一路按值拷进每个 `Unit`。
+/// 一轮 120 个单元要跑近 7 小时，这段时间里 WiFi 会重新协商、USB 网卡会重新
+/// 枚举、DHCP 会换租约——用开跑那一刻的 `2882Mbps` 去推导后面几十个单元的
+/// `-b` 与门限，基准从中途就是错的，而报告里印的也是那份旧快照，
+/// 错误完全不可见（见 .ai/DESIGN-v4.3.0.md F1）。
+///
+/// 按**接口名**匹配：这是 monitor 采样时用的同一个标识（`MonitorStartReq.iface`），
+/// 用别的键匹配会出现「刷新了地址却采着另一块网卡」的错位。
+pub fn refresh_unit_endpoints(
+    unit: &mut Unit,
+    master: &HostInfo,
+    agent: &HostInfo,
+) -> Vec<NicDrift> {
+    let mut drifts: Vec<NicDrift> = Vec::new();
+    for_each_endpoint_mut(unit, |ep| {
+        let host = match ep.side {
+            Side::Master => master,
+            Side::Agent => agent,
+        };
+        let Some(fresh) = host.interfaces.iter().find(|nic| nic.name == ep.nic.name) else {
+            let drift = NicDrift::Gone {
+                pc: ep.pc.clone(),
+                name: ep.nic.name.clone(),
+            };
+            if !drifts.contains(&drift) {
+                drifts.push(drift);
+            }
+            return;
+        };
+        let mut changes: Vec<String> = Vec::new();
+        if fresh.ipv4 != ep.nic.ipv4 {
+            changes.push(format!("IPv4 {} → {}", ep.nic.ipv4, fresh.ipv4));
+        }
+        if fresh.ipv6_ll != ep.nic.ipv6_ll {
+            changes.push(format!("link-local {} → {}", ep.nic.ipv6_ll, fresh.ipv6_ll));
+        }
+        if fresh.ifindex != ep.nic.ifindex {
+            changes.push(format!("接口索引 {} → {}", ep.nic.ifindex, fresh.ifindex));
+        }
+        if fresh.speed_mbps != ep.nic.speed_mbps {
+            changes.push(format!(
+                "协商速率 {} → {}Mbps",
+                ep.nic.speed_mbps, fresh.speed_mbps
+            ));
+        }
+        if !changes.is_empty() {
+            let drift = NicDrift::Changed {
+                pc: ep.pc.clone(),
+                name: ep.nic.name.clone(),
+                detail: changes.join("，"),
+            };
+            if !drifts.contains(&drift) {
+                drifts.push(drift);
+            }
+        }
+        ep.nic = fresh.clone();
+    });
+    drifts
 }
 
 fn subnet_ping_key(src: &Endpoint, dst: &Endpoint, payload: u32) -> String {
@@ -534,6 +651,7 @@ pub fn spec_from_config(
         rate_mode: t.rate_mode.unwrap_or(cfg.iperf.rate_check.mode),
         rate_targets: t.rate_targets_mbps.clone().unwrap_or_default(),
         rate_check: cfg.iperf.rate_check.clone(),
+        link_profiles: cfg.link_profiles.clone(),
         ctstraffic: cfg.ctstraffic.clone(),
         ctstraffic_config_error: ctstraffic_common_config_error(configured_duration),
     })
@@ -561,6 +679,74 @@ fn allowed_udp_streams_for_mbps(
     }
     let max_n = (speed / bw).floor() as u32;
     max_n.min(want)
+}
+
+/// 一条方向腿实际下发的 UDP 负载：单流 `-b` 与流数。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct UdpLoad {
+    pub bits_per_second: u64,
+    pub mbps: f64,
+    pub streams: u32,
+    /// 单流带宽被路径上限压低时，记下原始请求值，供任务标签与报表说明。
+    pub clipped_from_mbps: Option<f64>,
+}
+
+impl UdpLoad {
+    /// iperf3 的无后缀带宽值按 bit/s 解释。传精确整数可避免依赖它对
+    /// `Gbps` 等长后缀的非文档兼容行为。
+    pub(crate) fn iperf_arg(self) -> String {
+        self.bits_per_second.to_string()
+    }
+}
+
+/// 按整条路径的可信负载上限决定这条腿的 `-b` 和流数。
+///
+/// 优先降流数（保持单流带宽不变），流数已经降到 1 仍然超限时才压 `-b`。
+///
+/// 旧行为在「单流带宽就已经超过路径上限」时返回 0 流，调用方据此把任务整个
+/// 跳过。run_20260825_215915_7684 里 80 条 UDP 命令全部带着同一个
+/// `-b 2600000000`，其中相当一部分打向 1Gbps 收端，制造出 60~99% 的丢包——
+/// 那是配置出来的丢包，不是测出来的。给 1Gbps 收端灌 1Gbps 拿到一个真实
+/// 结论，永远好过跳过或者灌 2.6G 拿到一个必然失败的结论。
+/// 详见 .ai/DESIGN-v4.3.0.md D4。
+pub(crate) fn udp_load_for_leg(
+    sender: &Endpoint,
+    receiver: &Endpoint,
+    requested: ParsedBandwidth,
+    want_streams: u32,
+    limit: bool,
+    explicit: bool,
+    rate_cfg: &RateCheckCfg,
+) -> UdpLoad {
+    let want = want_streams.max(1);
+    let as_requested = |streams: u32| UdpLoad {
+        bits_per_second: requested.bits_per_second,
+        mbps: requested.mbps,
+        streams,
+        clipped_from_mbps: None,
+    };
+    // `explicit` = 这条链路在 link_profiles 里被专门指定过带宽。
+    // 那是操作者对这条链路的明确判断，自动裁剪不该覆盖它——裁剪是给
+    // 没配过的链路兜底用的安全网，不是用来推翻人的决定的。
+    if explicit || !limit || requested.mbps <= 0.0 {
+        return as_requested(want);
+    }
+    let Some(ceiling) = rate::path_payload_ceiling_mbps(&sender.nic, &receiver.nic, rate_cfg)
+    else {
+        return as_requested(want);
+    };
+    let fit = (ceiling / requested.mbps).floor();
+    if fit >= 1.0 {
+        return as_requested((fit as u32).clamp(1, want));
+    }
+    // 单流就已经超过整条路径的可信上限：压 -b，而不是放弃这条腿。
+    let bits_per_second = (ceiling * 1_000_000.0).round().max(1.0) as u64;
+    UdpLoad {
+        bits_per_second,
+        mbps: bits_per_second as f64 / 1_000_000.0,
+        streams: 1,
+        clipped_from_mbps: Some(requested.mbps),
+    }
 }
 
 /// iperf UDP 单元的“预计总耗时”（秒），按典型成功路径估算：
@@ -944,6 +1130,77 @@ fn cts_window_bytes(value: &str) -> Result<Option<u32>, String> {
     }
 }
 
+/// 配置里 `by_nic.host` 用的主机键。
+fn host_key(side: Side) -> &'static str {
+    match side {
+        Side::Master => "master",
+        Side::Agent => "agent",
+    }
+}
+
+/// 解析这条 (src -> dst) 的两层链路策略。
+///
+/// 单独包一层是为了把 `Side -> 配置里的 host 字符串` 这个映射收在一处：
+/// 四个任务分支都要解析策略，映射写错一次就会静默地让整类覆盖失效。
+fn link_policy(spec: &SpecNorm, src: &Endpoint, dst: &Endpoint) -> rate::LinkPolicy {
+    rate::resolve_link_policy(
+        &spec.link_profiles,
+        host_key(src.side),
+        &src.nic,
+        host_key(dst.side),
+        &dst.nic,
+    )
+}
+
+/// `-w × 流数` 大到这条链路要花多少秒才排空；超过它就提示。
+///
+/// 2 秒是个够宽松的界：正常的 BDP 档位（64k~4m × 10 流）在 1G 上只有几十
+/// 毫秒，而一旦到了「几秒钟的链路时间」，socket 缓冲本身就变成了测量对象。
+const SOCKET_BUFFER_DRAIN_WARN_SECS: f64 = 2.0;
+
+/// `-w` 开得过大时给一条提示。
+///
+/// iperf3 的 `-w` 是 socket 缓冲，被塞进去的字节算进「发送」但可能一个都没
+/// 上线。run_20260825_215915_7684 用的是 `-w 256m -P 10`，等于 2.56GB 的
+/// 发送缓冲；65 条 TCP 记录的「发 − 收」差值稳定在 118.92 ± 1.90 Mbps，
+/// 而 `2.56GB ÷ 180s = 119.3Mbps`——那个差值整个就是缓冲，不是链路。
+/// 首秒打出的 `22271Mbps` 同样来自这里（见 .ai/DESIGN-v4.3.0.md D5）。
+///
+/// 只提示不改写：`-w` 是用户明确填的参数，工具不该背着人改测试条件。
+#[allow(clippy::too_many_arguments)]
+fn oversized_socket_buffer_notice(
+    spec_name: &str,
+    profile_label: &str,
+    window: &str,
+    streams: u32,
+    duration_secs: u64,
+    sender: &Endpoint,
+    receiver: &Endpoint,
+    rate_cfg: &RateCheckCfg,
+) -> Option<String> {
+    let window_bytes = cts_window_bytes(window).ok().flatten()? as f64;
+    let ceiling_mbps = rate::path_payload_ceiling_mbps(&sender.nic, &receiver.nic, rate_cfg)?;
+    if ceiling_mbps <= 0.0 {
+        return None;
+    }
+    let total_bytes = window_bytes * streams.max(1) as f64;
+    let drain_secs = total_bytes * 8.0 / (ceiling_mbps * 1_000_000.0);
+    if drain_secs <= SOCKET_BUFFER_DRAIN_WARN_SECS {
+        return None;
+    }
+    // 虚高幅度必须按本次实际时长折算。写死 180 的话，同一段文字里的
+    // 「总缓冲 X GB」「排空 Y 秒」和这个 Mbps 会自相矛盾；报告里的
+    // `in_flight_buffer_estimate` 用的是 required_seconds，两处也会对不上。
+    let inflation_mbps = total_bytes * 8.0 / 1e6 / duration_secs.max(1) as f64;
+    Some(format!(
+        "{spec_name} {profile_label}：-w {window} × {streams} 流 = {:.2}GB socket 缓冲，\
+         相当于这条链路 {drain_secs:.1} 秒的流量。这些字节会被算进「工具自报发送」但未必上线，\
+         使 {duration_secs}s 的测试里「发送−接收」出现约 {inflation_mbps:.0}Mbps 的恒定虚高；\
+         判定用的接收端网卡口径不受影响。",
+        total_bytes / 1e9,
+    ))
+}
+
 fn cts_task_config_errors(spec: &SpecNorm, udp: bool) -> Vec<String> {
     let mut errors = spec
         .ctstraffic_config_error
@@ -1123,18 +1380,35 @@ pub fn build_units(
                                 for w in &spec.tcp_windows {
                                     let pname = format!("tcp_w{}_P{}", w, tcp_streams);
                                     let plabel = format!("TCP -w {} -P {}", w, tcp_streams);
+                                    for (s, d, _tag) in &pairs {
+                                        if let Some(msg) = oversized_socket_buffer_notice(
+                                            &spec.name,
+                                            &plabel,
+                                            w,
+                                            tcp_streams,
+                                            spec.duration,
+                                            s,
+                                            d,
+                                            &spec.rate_check,
+                                        ) {
+                                            notices.push(msg);
+                                        }
+                                    }
                                     let mut legs = Vec::new();
                                     for (s, d, tag) in &pairs {
                                         let flow_direction =
                                             if bidir { tag.to_string() } else { dir.clone() };
-                                        let target = rate::resolve_target_mbps(
-                                            spec.rate_mode,
-                                            &spec.rate_targets,
-                                            &flow_direction,
-                                            &s.nic,
-                                            &d.nic,
-                                            &spec.rate_check,
-                                        );
+                                        let target =
+                                            link_policy(spec, s, d).rx_target_mbps.or_else(|| {
+                                                rate::resolve_target_mbps(
+                                                    spec.rate_mode,
+                                                    &spec.rate_targets,
+                                                    &flow_direction,
+                                                    &s.nic,
+                                                    &d.nic,
+                                                    &spec.rate_check,
+                                                )
+                                            });
                                         let effective_mode =
                                             rate::effective_mode(spec.rate_mode, target);
                                         let t = IperfTask {
@@ -1200,42 +1474,77 @@ pub fn build_units(
                                             continue;
                                         }
                                     };
-                                    let iperf_bandwidth = parsed_bandwidth.iperf_arg();
-                                    // 每个方向腿按各自发送口限流
-                                    let mut leg_streams: Vec<u32> = Vec::new();
-                                    let mut blocked: Option<String> = None;
-                                    for (s, _d, _tag) in &pairs {
-                                        let n = allowed_udp_streams_for_mbps(
-                                            s,
-                                            _d,
-                                            parsed_bandwidth.mbps,
-                                            udp_streams,
-                                            spec.udp_limit,
-                                            &spec.rate_check,
-                                        );
-                                        if n == 0 {
-                                            blocked = Some(format!(
-                                                "跳过 {} {}：发送口 {} 速率 {}Mbps 不足以承载 {}",
+                                    // 每个方向腿按 min(发送口, 接收口) 的路径上限
+                                    // 各自决定 -b 与流数：同一条链路的两个方向
+                                    // 能力可以差很多，共用一个 -b 没有物理依据。
+                                    let leg_loads: Vec<UdpLoad> = pairs
+                                        .iter()
+                                        .map(|(s, d, _tag)| {
+                                            // 单口覆盖 / 角色配对可以改写这条腿的
+                                            // 单流带宽；解析不了就退回全局档位，
+                                            // 绝不因为一个笔误让任务凭空消失。
+                                            let configured = link_policy(spec, s, d)
+                                                .udp_bandwidth
+                                                .and_then(|value| {
+                                                    UdpProfile::bw(&value).parsed_bandwidth().ok()
+                                                });
+                                            udp_load_for_leg(
+                                                s,
+                                                d,
+                                                configured.unwrap_or(parsed_bandwidth),
+                                                udp_streams,
+                                                spec.udp_limit,
+                                                configured.is_some(),
+                                                &spec.rate_check,
+                                            )
+                                        })
+                                        .collect();
+                                    for ((s, d, _tag), load) in pairs.iter().zip(leg_loads.iter()) {
+                                        if let Some(from) = load.clipped_from_mbps {
+                                            notices.push(format!(
+                                                "{} {}：{} -> {} 路径上限不足，-b 由 {:.0}Mbps 裁剪到 {:.0}Mbps",
                                                 spec.name,
                                                 prof.label(),
                                                 s.nic.name,
-                                                s.nic.speed_mbps,
-                                                prof.label()
+                                                d.nic.name,
+                                                from,
+                                                load.mbps
                                             ));
                                         }
-                                        leg_streams.push(n);
-                                    }
-                                    if let Some(msg) = blocked {
-                                        notices.push(msg);
-                                        continue;
                                     }
                                     let mut legs = Vec::new();
                                     let mut max_n = 1;
-                                    for ((s, d, tag), n) in pairs.iter().zip(leg_streams.iter()) {
-                                        let n = *n;
+                                    for ((s, d, tag), load) in pairs.iter().zip(leg_loads.iter()) {
+                                        let n = load.streams;
                                         max_n = max_n.max(n);
+                                        // 标签必须反映**实际下发**的 -b。链路策略
+                                        // 覆盖和路径裁剪都会改它，而报表里的
+                                        // 「类型 / 参数」列是很多人唯一会看的地方——
+                                        // 那里印着 2.6G、命令行却是 1G，比不印更糟。
+                                        // 裁剪与否只能问 clipped_from_mbps：链路策略
+                                        // 先把 2.5G 改成 2.6G、路径上限再裁回 2500，
+                                        // 拿全局档位去比会得出「没变」，把两次改写
+                                        // 一起抹掉。
+                                        let leg_label = if let Some(from) = load.clipped_from_mbps {
+                                            format!(
+                                                "{}（按路径上限从 {:.0}M 裁剪至 {:.0}M）",
+                                                prof.label(),
+                                                from,
+                                                load.mbps
+                                            )
+                                        } else if (load.mbps - parsed_bandwidth.mbps).abs()
+                                            >= f64::EPSILON
+                                        {
+                                            format!(
+                                                "{}（按链路策略至 {:.0}M）",
+                                                prof.label(),
+                                                load.mbps
+                                            )
+                                        } else {
+                                            prof.label()
+                                        };
                                         let mut extra: Vec<String> =
-                                            vec!["-b".into(), iperf_bandwidth.clone()];
+                                            vec!["-b".into(), load.iperf_arg()];
                                         if let Some(l) = &prof.length {
                                             extra.push("-l".into());
                                             extra.push(l.clone());
@@ -1246,22 +1555,27 @@ pub fn build_units(
                                         }
                                         let flow_direction =
                                             if bidir { tag.to_string() } else { dir.clone() };
-                                        let target = rate::resolve_target_mbps(
-                                            spec.rate_mode,
-                                            &spec.rate_targets,
-                                            &flow_direction,
-                                            &s.nic,
-                                            &d.nic,
-                                            &spec.rate_check,
-                                        );
+                                        let target =
+                                            link_policy(spec, s, d).rx_target_mbps.or_else(|| {
+                                                rate::resolve_target_mbps(
+                                                    spec.rate_mode,
+                                                    &spec.rate_targets,
+                                                    &flow_direction,
+                                                    &s.nic,
+                                                    &d.nic,
+                                                    &spec.rate_check,
+                                                )
+                                            });
                                         let effective_mode =
                                             rate::effective_mode(spec.rate_mode, target);
-                                        let offered_mbps = Some(parsed_bandwidth.mbps);
+                                        // offered 必须跟着实际下发的 -b 走，否则
+                                        // 报表里的「请求负载」和命令行对不上。
+                                        let offered_mbps = Some(load.mbps);
                                         let mk = |idx: usize, port: u16| IperfTask {
                                             v6,
                                             udp: true,
                                             profile_name: prof.name(),
-                                            profile_label: prof.label(),
+                                            profile_label: leg_label.clone(),
                                             src: (*s).clone(),
                                             dst: (*d).clone(),
                                             port,
@@ -1293,11 +1607,54 @@ pub fn build_units(
                                     } else {
                                         String::new()
                                     };
+                                    // 标题里的 -b 必须是**实际下发**的值。链路策略和
+                                    // 路径裁剪都会改它，而任务清单（控制台的「预览
+                                    // 任务」、日志开头的编号列表）是很多人唯一会看
+                                    // 的地方——那里印着全局档位、命令行却是别的数，
+                                    // 会让人以为自己填的值没生效。
+                                    //
+                                    // 两条腿取值不同时退回档位标签：一个标题写不下
+                                    // 两个方向，逐行的 profile_label 里各自写着准确值。
+                                    let uniform = leg_loads.first().is_some_and(|first| {
+                                        leg_loads.iter().all(|load| {
+                                            (load.mbps - first.mbps).abs() < f64::EPSILON
+                                        })
+                                    });
+                                    let effective = leg_loads
+                                        .first()
+                                        .map(|first| first.mbps)
+                                        .unwrap_or(parsed_bandwidth.mbps);
+                                    let changed = leg_loads.iter().any(|load| {
+                                        (load.mbps - parsed_bandwidth.mbps).abs() >= f64::EPSILON
+                                    });
+                                    let profile_label = if !changed {
+                                        prof.label()
+                                    } else {
+                                        // 两条腿取值不同就两个都印（顺序即腿序 ab/ba）：
+                                        // 退回全局档位会显示一个谁都没在用的数。
+                                        let bw = if uniform {
+                                            format!("{effective:.0}m")
+                                        } else {
+                                            leg_loads
+                                                .iter()
+                                                .map(|load| format!("{:.0}m", load.mbps))
+                                                .collect::<Vec<_>>()
+                                                .join("/")
+                                        };
+                                        let mut label = format!("UDP -b {bw}");
+                                        if let Some(l) = &prof.length {
+                                            label.push_str(&format!(" -l {l}"));
+                                        }
+                                        if let Some(w) = &prof.window {
+                                            label.push_str(&format!(" -w {w}"));
+                                        }
+                                        label
+                                    };
                                     let title = format!(
                                         "{}IPERF {} {}{} | {}",
                                         if bidir { "★★双向 " } else { "" },
                                         ip_tag,
-                                        prof.label(),
+                                        profile_label,
                                         stream_note,
                                         route_str
                                     );
@@ -1390,14 +1747,17 @@ pub fn build_units(
                                 for (src, dst, tag) in &pairs {
                                     let flow_direction =
                                         if bidir { tag.to_string() } else { dir.clone() };
-                                    let target = rate::resolve_target_mbps(
-                                        spec.rate_mode,
-                                        &spec.rate_targets,
-                                        &flow_direction,
-                                        &src.nic,
-                                        &dst.nic,
-                                        &spec.rate_check,
-                                    );
+                                    let target =
+                                        link_policy(spec, src, dst).rx_target_mbps.or_else(|| {
+                                            rate::resolve_target_mbps(
+                                                spec.rate_mode,
+                                                &spec.rate_targets,
+                                                &flow_direction,
+                                                &src.nic,
+                                                &dst.nic,
+                                                &spec.rate_check,
+                                            )
+                                        });
                                     let effective_mode =
                                         rate::effective_mode(spec.rate_mode, target);
                                     legs.push(Leg {
@@ -1527,14 +1887,17 @@ pub fn build_units(
                                     max_streams = max_streams.max(streams);
                                     let flow_direction =
                                         if bidir { tag.to_string() } else { dir.clone() };
-                                    let target = rate::resolve_target_mbps(
-                                        spec.rate_mode,
-                                        &spec.rate_targets,
-                                        &flow_direction,
-                                        &src.nic,
-                                        &dst.nic,
-                                        &spec.rate_check,
-                                    );
+                                    let target =
+                                        link_policy(spec, src, dst).rx_target_mbps.or_else(|| {
+                                            rate::resolve_target_mbps(
+                                                spec.rate_mode,
+                                                &spec.rate_targets,
+                                                &flow_direction,
+                                                &src.nic,
+                                                &dst.nic,
+                                                &spec.rate_check,
+                                            )
+                                        });
                                     let effective_mode =
                                         rate::effective_mode(spec.rate_mode, target);
                                     let offered_mbps =
@@ -1661,7 +2024,7 @@ fn alloc_port(next: &mut u16) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::UdpProfile;
+    use crate::config::{DirectionalBandwidth, NicProfile, RoleProfile, UdpProfile};
 
     fn nic(name: &str, role: &str, ip: &str, speed: u64) -> NicInfo {
         NicInfo {
@@ -1712,6 +2075,7 @@ mod tests {
             rate_mode: RateMode::Auto,
             rate_targets: RateTargets::default(),
             rate_check: RateCheckCfg::default(),
+            link_profiles: LinkProfiles::default(),
             ctstraffic: CtsTrafficCfg::default(),
             ctstraffic_config_error: None,
         }
@@ -2687,31 +3051,336 @@ mod tests {
         }
     }
 
+    /// 造一个跨机 iperf 单元，用来验证端点刷新。
+    fn refreshable_unit() -> Unit {
+        let mut spec = base_spec();
+        spec.src = ep(Side::Master, "以太网 6", "SGMII2.5G", "192.168.0.101", 2500);
+        spec.dst = ep(Side::Agent, "WLAN 3", "WIFI5G", "192.168.0.104", 2882);
+        spec.transports = vec!["tcp".into()];
+        let mut port = PORT_BASE;
+        let (units, _) = build_units(&[spec], true, &mut port);
+        units.into_iter().next().expect("应生成一个单元")
+    }
+
+    fn host_with(hostname: &str, nics: Vec<NicInfo>) -> HostInfo {
+        HostInfo {
+            hostname: hostname.into(),
+            os: "test".into(),
+            interfaces: nics,
+        }
+    }
+
+    /// WiFi 在一轮 7 小时的测试里会重新协商，DHCP 会换租约。用开跑那一刻的
+    /// 快照跑完全程，后面几十个单元的基准从中途起就是错的，而报告里印的也是
+    /// 那份旧快照，错误完全不可见。
     #[test]
-    fn test_udp_limit() {
+    fn refreshing_endpoints_reports_and_applies_what_changed() {
+        let mut unit = refreshable_unit();
+        let master = host_with(
+            "master",
+            vec![nic("以太网 6", "SGMII2.5G", "192.168.0.101", 2500)],
+        );
+        // 辅测 WiFi 换了 IP、重新协商到一半速率、接口索引也变了。
+        let mut moved = nic("WLAN 3", "WIFI5G", "192.168.0.150", 1441);
+        moved.ifindex = 27;
+        let agent = host_with("agent", vec![moved]);
+
+        let drifts = refresh_unit_endpoints(&mut unit, &master, &agent);
+        assert_eq!(drifts.len(), 1, "同一块网卡只报一次: {drifts:?}");
+        let detail = drifts[0].describe();
+        assert!(detail.contains("192.168.0.104 → 192.168.0.150"), "{detail}");
+        assert!(detail.contains("2882 → 1441Mbps"), "{detail}");
+        assert!(detail.contains("接口索引"), "{detail}");
+        assert!(!drifts[0].is_gone());
+
+        // 变更必须真的落到任务上，否则 iperf 会继续连旧地址。
+        let task = match &unit.legs[0].kind {
+            LegKind::IperfSingle(task) => task,
+            LegKind::IperfGroup { streams, .. } => &streams[0],
+            _ => panic!("expect iperf leg"),
+        };
+        assert_eq!(task.dst.nic.ipv4, "192.168.0.150");
+        assert_eq!(task.dst.nic.speed_mbps, 1441);
+        assert_eq!(task.dst.nic.ifindex, 27);
+        assert_eq!(task.src.nic.ipv4, "192.168.0.101", "没变的那端不该被动");
+    }
+
+    /// 网卡整块消失时必须报出来：对着不存在的接口起 monitor，
+    /// 采到的要么是别的网卡，要么静默全零——两种都比直接判死更糟。
+    #[test]
+    fn a_vanished_nic_is_reported_as_gone() {
+        let mut unit = refreshable_unit();
+        let master = host_with(
+            "master",
+            vec![nic("以太网 6", "SGMII2.5G", "192.168.0.101", 2500)],
+        );
+        let agent = host_with(
+            "agent",
+            vec![nic("以太网", "SGMII1G", "192.168.0.102", 1000)],
+        );
+
+        let drifts = refresh_unit_endpoints(&mut unit, &master, &agent);
+        assert_eq!(drifts.len(), 1);
+        assert!(drifts[0].is_gone(), "{drifts:?}");
+        assert!(drifts[0].describe().contains("WLAN 3"));
+    }
+
+    #[test]
+    fn an_unchanged_topology_produces_no_noise() {
+        let mut unit = refreshable_unit();
+        let master = host_with(
+            "master",
+            vec![nic("以太网 6", "SGMII2.5G", "192.168.0.101", 2500)],
+        );
+        let agent = host_with(
+            "agent",
+            vec![nic("WLAN 3", "WIFI5G", "192.168.0.104", 2882)],
+        );
+        assert!(refresh_unit_endpoints(&mut unit, &master, &agent).is_empty());
+    }
+
+    /// 从生成的单元里取出第一条 iperf 流实际下发的 `-b` 值（bit/s 字符串）。
+    fn first_bandwidth_arg(unit: &Unit) -> String {
+        let task = match &unit.legs[0].kind {
+            LegKind::IperfSingle(task) => task,
+            LegKind::IperfGroup { streams, .. } => &streams[0],
+            _ => panic!("expect iperf leg"),
+        };
+        let pos = task
+            .extra
+            .iter()
+            .position(|arg| arg == "-b")
+            .expect("UDP 任务必须带 -b");
+        task.extra[pos + 1].clone()
+    }
+
+    /// 单流带宽超过路径上限时，压 `-b` 而不是把任务整个跳过。
+    /// 旧行为会让「1G 收端 + -b 2.5G」这类组合完全没有测量结果；
+    /// 而实际发生的是它根本没触发，80 条命令全用了同一个超限的 -b。
+    #[test]
+    fn test_udp_over_path_ceiling_clips_bandwidth_instead_of_skipping() {
         let mut spec = base_spec();
         spec.src = ep(Side::Master, "eth1", "SGMII1G", "192.168.1.2", 1000);
         spec.transports = vec!["udp".into()];
         spec.udp_profiles = vec![UdpProfile::bw("2500m")];
         let mut port = PORT_BASE;
         let (units, notices) = build_units(&[spec], true, &mut port);
-        assert_eq!(units.len(), 0);
+
+        assert_eq!(units.len(), 1, "不能因为超限就没有任务");
+        assert_eq!(
+            first_bandwidth_arg(&units[0]),
+            "1000000000",
+            "-b 必须压到 min(发送口, 接收口) = 1000Mbps"
+        );
         assert_eq!(notices.len(), 1);
-        assert!(notices[0].contains("跳过"));
+        assert!(
+            notices[0].contains("裁剪") && notices[0].contains("1000"),
+            "裁剪必须在提示里说明: {}",
+            notices[0]
+        );
+        // 标题印的是实际下发的值，不是被裁之前的档位——任务清单是很多人
+        // 唯一会看的地方，那里写 2500m 会让人以为真的在灌 2.5G。
+        assert!(
+            units[0].title.contains("-b 1000m"),
+            "标题要反映实际下发的 -b: {}",
+            units[0].title
+        );
     }
 
+    /// WiFi 的负载上限**不跟协商速率**。
+    ///
+    /// 协商值是 PHY 速率，同一块 Wi-Fi 7 网卡会在一轮测试里于 2402 / 2882
+    /// 之间来回跳；跟着它裁 -b，相邻两个单元的灌包强度都不一样，结果没法
+    /// 横向比较。实践中 WiFi 一律按固定档灌（协商到 2.4G 还是 2.8G 都用
+    /// -b 2.6G），所以这里用 wifi_payload_ceiling_mbps 而不是 866。
     #[test]
-    fn test_udp_limit_wifi_uses_path_ceiling() {
+    fn wifi_ceiling_ignores_the_fluctuating_negotiated_rate() {
         let mut spec = base_spec();
         let mut e = ep(Side::Master, "wlan", "WIFI5G", "192.168.1.5", 866);
         e.nic.is_wifi = true;
         spec.src = e;
+        spec.dst = ep(Side::Agent, "wlan3", "WIFI5G", "192.168.1.6", 2402);
+        spec.transports = vec!["udp".into()];
+        spec.udp_profiles = vec![UdpProfile::bw("2.6G")];
+        let mut port = PORT_BASE;
+        let (units, notices) = build_units(&[spec], true, &mut port);
+        assert_eq!(units.len(), 1);
+        assert_eq!(
+            first_bandwidth_arg(&units[0]),
+            "2600000000",
+            "2.6G 在默认 2800 的 WiFi 上限内，不该被协商到的 866/2402 裁掉"
+        );
+        assert!(notices.is_empty(), "{notices:?}");
+
+        // 把上限调低才裁——这条依然由配置说了算。
+        let mut strict = base_spec();
+        strict.src = ep(Side::Master, "wlan", "WIFI5G", "192.168.1.5", 866);
+        strict.dst = ep(Side::Agent, "wlan3", "WIFI5G", "192.168.1.6", 2402);
+        strict.transports = vec!["udp".into()];
+        strict.udp_profiles = vec![UdpProfile::bw("2.6G")];
+        strict.rate_check.wifi_payload_ceiling_mbps = 1000.0;
+        let mut port = PORT_BASE;
+        let (units, _) = build_units(&[strict], true, &mut port);
+        assert_eq!(first_bandwidth_arg(&units[0]), "1000000000");
+    }
+
+    /// 端到端串一遍两层策略：单口覆盖改写 -b 和门限，最后仍要过路径裁剪。
+    #[test]
+    fn link_profiles_drive_both_bandwidth_and_target_end_to_end() {
+        let mut spec = base_spec();
+        spec.src = ep(Side::Master, "以太网 6", "SGMII2.5G", "192.168.0.101", 2500);
+        spec.dst = ep(Side::Agent, "WLAN 3", "WIFI5G", "192.168.0.104", 2882);
+        spec.transports = vec!["udp".into()];
+        spec.udp_profiles = vec![UdpProfile::bw("2500m")];
+        spec.link_profiles = LinkProfiles {
+            by_role: vec![RoleProfile {
+                pair: "SGMII2.5G<->WIFI5G".into(),
+                rx_target_mbps: RateTargets {
+                    ab: Some(1600.0),
+                    ..Default::default()
+                },
+                udp_bandwidth: DirectionalBandwidth {
+                    ab: Some("2.6G".into()),
+                    ..Default::default()
+                },
+            }],
+            by_nic: vec![NicProfile {
+                host: "agent".into(),
+                name: "WLAN 3".into(),
+                ipv4: "192.168.0.104".into(),
+                rx_target_mbps: Some(1800.0),
+                udp_bandwidth: None,
+            }],
+        };
+        let mut port = PORT_BASE;
+        let (units, _) = build_units(&[spec], true, &mut port);
+        let task = match &units[0].legs[0].kind {
+            LegKind::IperfSingle(task) => task,
+            LegKind::IperfGroup { streams, .. } => &streams[0],
+            _ => panic!("expect iperf leg"),
+        };
+
+        // 带宽：角色层的 2.6G 覆盖全局的 2500m，并且**不再被自动裁剪**——
+        // 在 link_profiles 里专门为这条链路写下的值是明确判断，
+        // 安全网不该推翻它。
+        let pos = task.extra.iter().position(|arg| arg == "-b").unwrap();
+        assert_eq!(task.extra[pos + 1], "2600000000");
+        assert!(
+            task.profile_label.contains("链路策略至 2600M"),
+            "{}",
+            task.profile_label
+        );
+
+        // 门限：单口覆盖压过角色层。
+        assert_eq!(task.rx_target_mbps, Some(1800.0));
+        assert_eq!(task.rate_mode, RateMode::Verify, "有目标就该进 verify");
+    }
+
+    /// 关掉 limit_udp_by_link_speed 时不得擅自改写用户填的 -b。
+    #[test]
+    fn test_udp_bandwidth_is_untouched_when_limit_is_off() {
+        let mut spec = base_spec();
+        spec.src = ep(Side::Master, "eth1", "SGMII1G", "192.168.1.2", 1000);
+        spec.transports = vec!["udp".into()];
+        spec.udp_profiles = vec![UdpProfile::bw("2500m")];
+        spec.udp_limit = false;
+        let mut port = PORT_BASE;
+        let (units, notices) = build_units(&[spec], true, &mut port);
+        assert_eq!(units.len(), 1);
+        assert_eq!(first_bandwidth_arg(&units[0]), "2500000000");
+        assert!(notices.is_empty());
+    }
+
+    /// 双向单元的两条腿各按自己的路径上限裁剪：同一条链路两个方向的
+    /// 能力可以差很多，共用一个 -b 没有物理依据。
+    #[test]
+    fn bidirectional_udp_clips_each_leg_against_its_own_path_ceiling() {
+        let mut spec = base_spec();
+        spec.src = ep(Side::Master, "eth0", "SGMII2.5G", "192.168.1.2", 2500);
+        spec.dst = ep(Side::Agent, "eth1", "SGMII1G", "192.168.1.3", 1000);
+        spec.directions = vec!["bidir".into()];
         spec.transports = vec!["udp".into()];
         spec.udp_profiles = vec![UdpProfile::bw("2500m")];
         let mut port = PORT_BASE;
+        let (units, _) = build_units(&[spec], true, &mut port);
+        assert_eq!(units.len(), 1);
+        assert_eq!(units[0].legs.len(), 2);
+        // 两条腿都受 1G 那一端约束，都要被压到 1000Mbps。
+        for leg in &units[0].legs {
+            let task = match &leg.kind {
+                LegKind::IperfSingle(task) => task,
+                LegKind::IperfGroup { streams, .. } => &streams[0],
+                _ => panic!("expect iperf leg"),
+            };
+            let pos = task.extra.iter().position(|arg| arg == "-b").unwrap();
+            assert_eq!(task.extra[pos + 1], "1000000000", "腿 {} 未裁剪", leg.tag);
+            assert_eq!(
+                task.offered_mbps,
+                Some(1000.0),
+                "offered 必须跟着实际 -b 走"
+            );
+            assert!(
+                task.profile_label.contains("裁剪"),
+                "报表标签要说明裁剪: {}",
+                task.profile_label
+            );
+        }
+    }
+
+    /// `-w 256m -P 10` = 2.56GB 发送缓冲，等于 1G 链路 20 秒的流量。
+    /// 这些字节会被算进「工具自报发送」，让「发−收」出现约 119Mbps 的恒定
+    /// 虚高——这不是链路特性，是参数造出来的。
+    #[test]
+    fn an_oversized_socket_buffer_is_flagged_but_not_rewritten() {
+        let mut spec = base_spec();
+        spec.dst = ep(Side::Agent, "eth1", "SGMII1G", "192.168.1.3", 1000);
+        spec.transports = vec!["tcp".into()];
+        spec.tcp_streams = 10;
+        spec.tcp_windows = vec!["256m".into()];
+        let mut port = PORT_BASE;
         let (units, notices) = build_units(&[spec], true, &mut port);
-        assert!(units.is_empty());
-        assert_eq!(notices.len(), 1);
+
+        assert_eq!(units.len(), 1, "只提示，不能把任务砍掉");
+        let task = match &units[0].legs[0].kind {
+            LegKind::IperfSingle(task) => task,
+            LegKind::IperfGroup { streams, .. } => &streams[0],
+            _ => panic!("expect iperf leg"),
+        };
+        let pos = task.extra.iter().position(|arg| arg == "-w").unwrap();
+        assert_eq!(
+            task.extra[pos + 1],
+            "256m",
+            "-w 是用户明确填的参数，工具不该背着人改测试条件"
+        );
+
+        let notice = notices
+            .iter()
+            .find(|n| n.contains("socket 缓冲"))
+            .unwrap_or_else(|| panic!("应提示缓冲过大: {notices:?}"));
+        assert!(
+            notice.contains("2.68GB") || notice.contains("2.6"),
+            "{notice}"
+        );
+        assert!(
+            notice.contains("119") || notice.contains("虚高"),
+            "{notice}"
+        );
+    }
+
+    /// 常规档位不该产生噪音提示。
+    #[test]
+    fn a_normal_socket_buffer_is_silent() {
+        let mut spec = base_spec();
+        spec.dst = ep(Side::Agent, "eth1", "SGMII1G", "192.168.1.3", 1000);
+        spec.transports = vec!["tcp".into()];
+        spec.tcp_streams = 10;
+        spec.tcp_windows = vec!["4m".into()];
+        let mut port = PORT_BASE;
+        let (_, notices) = build_units(&[spec], true, &mut port);
+        assert!(
+            !notices.iter().any(|n| n.contains("socket 缓冲")),
+            "{notices:?}"
+        );
     }
 
     #[test]

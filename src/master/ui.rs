@@ -391,6 +391,12 @@ pub fn run_master(opts: MasterOpts) -> i32 {
         agent_port: cfg.agent_port,
         cfg: cfg.clone(),
         outdir: run_paths.outdir.clone(),
+        topology: Some(Arc::new(LiveTopology {
+            agent_host: agent_host.clone(),
+            agent_port: cfg.agent_port,
+            prefixes: cfg.ipv4_prefixes.clone(),
+            token: cfg.agent_token.clone(),
+        })),
         transport: Arc::new(http_client::TcpTransport),
         clock: Arc::new(SystemClock),
         local_servers: IperfServerMgr::new(),
@@ -444,6 +450,7 @@ pub fn run_master(opts: MasterOpts) -> i32 {
         counter_source_caveat: crate::nic::monitor::counter_source_caveat()
             .unwrap_or_default()
             .to_string(),
+        run_health: sum.run_health_banner(),
     };
     {
         // 写报告是最后一次取这把锁：即使前面某个单元 panic 毒化了它，也必须
@@ -626,6 +633,30 @@ fn agent_info(host: &str, port: u16, prefixes: &[String], token: &str) -> Result
         return Err(r.error.unwrap_or_else(|| "未知错误".into()));
     }
     r.data.ok_or_else(|| "响应缺 data".into())
+}
+
+/// 生产路径的双端网卡快照来源：本机实扫 + 辅测机 `/info`。
+///
+/// agent 侧的 `/info` 本来就是每次调用都重新扫描、没有任何缓存；
+/// 需要修的是主控这边——它在开跑时扫一次，然后一路把那份快照按值拷进
+/// 每个 `Unit`，之后几个小时都不再更新。
+struct LiveTopology {
+    agent_host: String,
+    agent_port: u16,
+    prefixes: Vec<String>,
+    token: String,
+}
+
+impl crate::master::executor::TopologySource for LiveTopology {
+    fn snapshot(&self) -> Result<(HostInfo, HostInfo), String> {
+        let agent = agent_info(
+            &self.agent_host,
+            self.agent_port,
+            &self.prefixes,
+            &self.token,
+        )?;
+        Ok((scan_host(&self.prefixes), agent))
+    }
 }
 
 // ---------------- 交互式任务构建 ----------------
@@ -887,6 +918,7 @@ fn generate_specs_from_pairs(
             rate_mode,
             rate_targets,
             rate_check: cfg.iperf.rate_check.clone(),
+            link_profiles: cfg.link_profiles.clone(),
             ctstraffic: cfg.ctstraffic.clone(),
             ctstraffic_config_error: builder::ctstraffic_common_config_error(duration),
         });
@@ -1112,6 +1144,7 @@ fn spec_from_params(
         rate_mode: cfg.iperf.rate_check.mode,
         rate_targets: cfg.iperf.rate_check.targets_mbps.clone(),
         rate_check: cfg.iperf.rate_check.clone(),
+        link_profiles: cfg.link_profiles.clone(),
         ctstraffic: cfg.ctstraffic.clone(),
         ctstraffic_config_error: builder::ctstraffic_common_config_error(p.duration),
     }

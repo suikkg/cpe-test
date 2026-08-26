@@ -10,6 +10,34 @@
   "resume": false,
   "open_report": true,
 
+  "_abort_after_dead_traffic_units": "连续这么多个灌包单元一条测量都没产生时中止剩余队列；0=只告警不中止（默认）",
+  "abort_after_dead_traffic_units": 0,
+
+  "_link_profiles": "两层链路策略：by_role 给默认值（配对串左边是A、右边是B，ab/ba 相对这个顺序），by_nic 按单块网卡覆盖。优先级 单口 > 角色 > 全局 rate_check.targets_mbps > 内置推导。注意：在这里显式写下的 UDP -b 属于操作者的明确判断，不再参与 min(发送口,接收口) 的自动裁剪——自动裁剪只在依赖内置推导（即本节没配这条链路）时兜底。整节不写就全部走内置推导。",
+  "link_profiles": {
+    "by_role": [
+      {
+        "pair": "SGMII2.5G<->SGMII1G",
+        "rx_target_mbps": { "ab": 900, "ba": 900 },
+        "udp_bandwidth": { "ab": "1G", "ba": "1G" }
+      },
+      {
+        "pair": "SGMII2.5G<->WIFI5G",
+        "rx_target_mbps": { "ab": 1600, "ba": 1600 },
+        "udp_bandwidth": { "ab": "2.6G", "ba": "2.6G" }
+      }
+    ],
+    "by_nic": [
+      {
+        "host": "agent",
+        "name": "WLAN 3",
+        "ipv4": "192.168.0.104",
+        "rx_target_mbps": 1800,
+        "udp_bandwidth": "2.8G"
+      }
+    ]
+  },
+
   "iperf": {
     "duration": 180,
     "tcp_windows": ["64k", "1m", "4m"],

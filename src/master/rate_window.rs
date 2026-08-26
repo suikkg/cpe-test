@@ -45,6 +45,13 @@ pub(crate) struct RateStats {
     /// 验收要求核对「原始网卡总流量与报告业务流量差值接近背景值」，
     /// 但差值只有把扣除量本身报出来才可核对。
     pub baseline_mbps: f64,
+    /// 判定窗口内「计数器连续零增长」的最长一段占已覆盖时长的比例。
+    ///
+    /// 这是与采样覆盖率**正交**的一种不可信：样本采到了、`valid` 也是 true，
+    /// 只是绝对计数器一个字节都没往前走。run_20260825_215915_7684 的
+    /// unit-114-115 里 `rx_bytes` 在 elapsed 7078ms 之后 193 秒纹丝不动，
+    /// 覆盖率却是 100%——光看覆盖率永远发现不了这件事。
+    pub stalled_ratio: f64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -68,6 +75,23 @@ pub(crate) fn evaluate_nic_rx(
     stats: &RateStats,
     tx_stats: &RateStats,
 ) -> (Verdict, String, String) {
+    // 计数器停滞必须排在最前面：它命中的场景里 avg 通常也是 0，会被
+    // NIC_RATE_MISSING 抢先吃掉，而「采到样本但计数器不动」比「没有可用速率」
+    // 具体得多——前者直接指向链路或网卡侧，后者只说明这一行没结论。
+    //
+    // 门槛与采样覆盖率共用同一个常量：窗口里至少 95% 的时间要有真实推进的
+    // 计数，剩下 5% 留给起流/收尾的空档。
+    if stats.stalled_ratio > 1.0 - MIN_RATE_SAMPLE_COVERAGE {
+        return (
+            Verdict::NotEvaluated,
+            "COUNTER_STALLED".into(),
+            format!(
+                "判定窗口内接收端 OS 网卡计数器有 {:.1}% 的时间零增长（采到了样本，\
+                 但字节计数一直没推进），本轮平均速率不可信",
+                stats.stalled_ratio * 100.0
+            ),
+        );
+    }
     let Some(rx_avg) = stats
         .avg_mbps
         .filter(|value| value.is_finite() && *value > MIN_VALID_RX_MBPS)
@@ -431,12 +455,153 @@ pub(crate) fn monitor_rate_stats(
         coverage: (covered_ms as f64 / window_ms as f64).min(1.0),
         rolling_coverage,
         baseline_mbps: baseline,
+        stalled_ratio: (longest_zero_delta_run_ms(out, window, rx) as f64 / covered_ms as f64)
+            .clamp(0.0, 1.0),
     }
+}
+
+/// 判定窗口内计数器**连续零增长**的最长一段时长（毫秒）。
+///
+/// 看的是 `*_delta_bytes == 0` 这个原始事实，而不是扣完背景之后的速率：
+/// 速率为 0 可能只是背景扣除的结果，计数器零增长则是硬事实——这一秒里
+/// 这块网卡一个字节都没进/出。
+///
+/// 取「最长连续一段」而不是零样本总数，是为了区分两种形态：
+/// 起流前后各零几秒是正常的（分散的短段），而中途卡死不动是异常的（一整段）。
+fn longest_zero_delta_run_ms(out: &MonitorStopOut, window: &EffectiveWindow, rx: bool) -> u64 {
+    let mut longest = 0u64;
+    let mut current = 0u64;
+    for sample in &out.samples {
+        if !sample.valid
+            || sample.interval_ms == 0
+            || sample.elapsed_ms <= window.start_ms
+            || sample.elapsed_ms.saturating_sub(sample.interval_ms) >= window.end_ms
+        {
+            continue;
+        }
+        let delta = if rx {
+            sample.rx_delta_bytes
+        } else {
+            sample.tx_delta_bytes
+        };
+        if delta == 0 {
+            current = current.saturating_add(sample.interval_ms);
+            longest = longest.max(current);
+        } else {
+            current = 0;
+        }
+    }
+    longest
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample(elapsed_ms: u64, rx_delta_bytes: u64) -> MonitorSample {
+        MonitorSample {
+            elapsed_ms,
+            interval_ms: 1_000,
+            rx_delta_bytes,
+            rx_mbps: rx_delta_bytes as f64 * 8.0 / 1_000_000.0,
+            valid: true,
+            ..Default::default()
+        }
+    }
+
+    /// 取自 run_20260825_215915_7684 的 unit-114-115：前 6 秒 rx_bytes 正常
+    /// 推进（~530Mbps），此后 193 秒纹丝不动，`valid` 全程 true、`error` 全程
+    /// 为空。当时报表对这一行写的是「采样覆盖率 100.0%」——覆盖率检查抓不到
+    /// 计数器停滞，因为样本确实一条不缺。
+    #[test]
+    fn a_frozen_counter_is_caught_even_though_sample_coverage_is_perfect() {
+        let mut samples: Vec<MonitorSample> =
+            (1..=6).map(|i| sample(i * 1_000, 66_000_000)).collect();
+        samples.extend((7..=200).map(|i| sample(i * 1_000, 0)));
+        let out = MonitorStopOut {
+            samples,
+            ..Default::default()
+        };
+        let window = EffectiveWindow {
+            start_ms: 0,
+            end_ms: 200_000,
+            available_secs: 200.0,
+            required_secs: 180,
+            complete: true,
+        };
+        let stats = monitor_rate_stats(&out, &window, true, 0);
+
+        assert!(
+            stats.coverage > 0.99,
+            "样本一条不缺，覆盖率本来就该是满的: {}",
+            stats.coverage
+        );
+        assert!(
+            stats.stalled_ratio > 0.95,
+            "194/200 秒计数器零增长必须被记下来: {}",
+            stats.stalled_ratio
+        );
+
+        let (verdict, code, detail) =
+            evaluate_nic_rx(RateMode::Observe, None, &stats, &RateStats::default());
+        assert_eq!(verdict, Verdict::NotEvaluated);
+        assert_eq!(
+            code, "COUNTER_STALLED",
+            "必须说清是计数器不动，而不是笼统的「没有可用速率」"
+        );
+        assert!(detail.contains("零增长"), "{detail}");
+    }
+
+    /// 起流前后各空几秒是正常的，不能把正常测量误判成停滞——所以取的是
+    /// 「最长连续一段」而不是零样本总数。
+    #[test]
+    fn short_idle_gaps_at_both_ends_are_not_a_stall() {
+        let mut samples = vec![sample(1_000, 0), sample(2_000, 0)];
+        samples.extend((3..=198).map(|i| sample(i * 1_000, 120_000_000)));
+        samples.push(sample(199_000, 0));
+        samples.push(sample(200_000, 0));
+        let out = MonitorStopOut {
+            samples,
+            ..Default::default()
+        };
+        let window = EffectiveWindow {
+            start_ms: 0,
+            end_ms: 200_000,
+            available_secs: 200.0,
+            required_secs: 180,
+            complete: true,
+        };
+        let stats = monitor_rate_stats(&out, &window, true, 0);
+        assert!(stats.stalled_ratio < 0.05, "{}", stats.stalled_ratio);
+        let (verdict, _, _) =
+            evaluate_nic_rx(RateMode::Observe, None, &stats, &RateStats::default());
+        assert_eq!(verdict, Verdict::Measured);
+    }
+
+    /// 窗口没攒够要求时长时，判定确实不该给结论，但**速率必须照常算出来**。
+    ///
+    /// 「这一行不作数」和「这一行什么都没测到」是两回事：前者是判定的克制，
+    /// 后者是数据的缺失。把两者混成一个「未采集」，读报告的人就没法判断
+    /// 到底该重跑还是该查链路。
+    #[test]
+    fn a_short_window_still_produces_a_receive_rate() {
+        let out = MonitorStopOut {
+            samples: (1..=169).map(|i| sample(i * 1_000, 118_750_000)).collect(),
+            ..Default::default()
+        };
+        let short = EffectiveWindow {
+            start_ms: 0,
+            end_ms: 169_000,
+            available_secs: 169.0,
+            required_secs: 180,
+            complete: false,
+        };
+        let stats = monitor_rate_stats(&out, &short, true, 0);
+        let avg = stats.avg_mbps.expect("窗口短不等于没速率");
+        assert!((avg - 950.0).abs() < 1.0, "实际 {avg}");
+        assert!(stats.coverage > 0.99);
+        assert!(stats.p10_mbps.is_some(), "P10 同样要算");
+    }
 
     /// 两条判定链的一致性属性：**采样不可信时，谁都不许对 CPE 下结论**。
     ///

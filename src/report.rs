@@ -121,6 +121,12 @@ pub struct ReportMeta {
     /// 本机网卡采样口径的已知差异（例如 macOS 经由 netstat 子进程采样）。
     /// 空表示采样方式与主要目标平台一致，不必额外提示。
     pub counter_source_caveat: String,
+    /// 本轮运行健康横幅：链路中途失联、队列被中止之类必须在最顶上
+    /// 说清楚的事实。空表示没有需要提示的异常。
+    ///
+    /// 之所以放在报告最顶而不是混进某一行的原因里：链路失联影响的是
+    /// 一整段单元，逐行看的人永远拼不出「从某一刻起后面全是空跑」这件事。
+    pub run_health: String,
 }
 
 fn screenshot_link(path: &str, label: &str) -> String {
@@ -256,6 +262,20 @@ fn unit_open_by_default(verdict: Verdict) -> bool {
         verdict,
         Verdict::RateFail | Verdict::Unstable | Verdict::NotEvaluated | Verdict::SetupError
     )
+}
+
+/// 测试单元的执行序号，与控制台打印的 `[N/总数]` 完全一致。
+///
+/// 报告和控制台是同一次运行的两份记录，抄结果的人要在两边来回对。
+/// 概览里只有标题的话，「主控 以太网 6 -> 辅测 以太网」这类标题在
+/// 120 个单元里会重复出现十几次，光靠标题根本定位不到是哪一条。
+fn group_seq(group: &UnitGroup<'_>) -> usize {
+    group
+        .summary
+        .map(|row| row.sort_key.0)
+        .or_else(|| group.details.first().map(|row| row.sort_key.0))
+        .unwrap_or(0)
+        .saturating_add(1)
 }
 
 fn group_title<'a>(group: &'a UnitGroup<'_>) -> &'a str {
@@ -758,19 +778,19 @@ fn push_overview(h: &mut String, groups: &[UnitGroup<'_>]) {
             !direction.screenshot_master.is_empty() || !direction.screenshot_agent.is_empty()
         })
     });
-    let column_count = if has_shots { 11 } else { 10 };
+    let column_count = if has_shots { 12 } else { 11 };
 
     h.push_str(
         "<section class=\"overview-section\" aria-labelledby=\"overview-heading\"><h2 id=\"overview-heading\">测试概览</h2>\n",
     );
     h.push_str(
-        "<div class=\"overview-scroll\" role=\"region\" aria-labelledby=\"overview-heading\" tabindex=\"0\"><table class=\"overview-table\"><caption class=\"sr-only\">按测试单元和方向展示接收端网卡 RX 判定指标、截图与判定原因</caption><colgroup><col class=\"c-verdict\"><col class=\"c-unit\"><col class=\"c-dir\"><col class=\"c-endpoints\"><col class=\"c-streams\"><col class=\"c-rate\"><col class=\"c-rate\"><col class=\"c-target\">",
+        "<div class=\"overview-scroll\" role=\"region\" aria-labelledby=\"overview-heading\" tabindex=\"0\"><table class=\"overview-table\"><caption class=\"sr-only\">按测试单元和方向展示接收端网卡 RX 判定指标、截图与判定原因</caption><colgroup><col class=\"c-seq\"><col class=\"c-verdict\"><col class=\"c-unit\"><col class=\"c-dir\"><col class=\"c-endpoints\"><col class=\"c-streams\"><col class=\"c-rate\"><col class=\"c-rate\"><col class=\"c-target\">",
     );
     if has_shots {
         h.push_str("<col class=\"c-shot\">");
     }
     h.push_str(
-        "<col class=\"c-coverage\"><col class=\"c-quality\"></colgroup><thead><tr><th scope=\"col\">结果</th><th scope=\"col\">测试单元</th><th scope=\"col\">方向</th><th scope=\"col\">源端 → 接收端</th><th scope=\"col\">请求/活跃/要求流</th><th scope=\"col\">接收端 RX 平均</th><th scope=\"col\">接收端 RX-P10</th><th scope=\"col\">目标</th>",
+        "<col class=\"c-coverage\"><col class=\"c-quality\"></colgroup><thead><tr><th scope=\"col\">#</th><th scope=\"col\">结果</th><th scope=\"col\">测试单元</th><th scope=\"col\">方向</th><th scope=\"col\">源端 → 接收端</th><th scope=\"col\">请求/活跃/要求流</th><th scope=\"col\">接收端 RX 平均</th><th scope=\"col\">接收端 RX-P10</th><th scope=\"col\">目标</th>",
     );
     if has_shots {
         h.push_str("<th scope=\"col\">截图</th>");
@@ -831,10 +851,15 @@ fn push_overview(h: &mut String, groups: &[UnitGroup<'_>]) {
                 String::new()
             };
             h.push_str(&format!(
-                "<tr class=\"{}\" data-unit-id=\"{}\" data-direction=\"{}\"><td><strong class=\"status {}\">{}</strong><br><small>{}</small></td><td>{}</td><td><strong>{}</strong></td><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td>{}<td class=\"num\">{}</td><td>{}</td></tr>\n",
+                "<tr class=\"{}\" data-unit-id=\"{}\" data-direction=\"{}\"><td class=\"num seq-col\">{}</td><td><strong class=\"status {}\">{}</strong><br><small>{}</small></td><td>{}</td><td><strong>{}</strong></td><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td>{}<td class=\"num\">{}</td><td>{}</td></tr>\n",
                 if index == 0 { "unit-first" } else { "unit-cont" },
                 esc(&group.key),
                 esc(&tag),
+                if index == 0 {
+                    group_seq(group).to_string()
+                } else {
+                    String::new()
+                },
                 direction.verdict.css(),
                 status_label_html(direction.verdict),
                 execution_status.label(),
@@ -889,6 +914,52 @@ fn diagnostic_metric(value: Option<f64>, is_ping: bool) -> String {
         },
         |value| format!("{value:.3} Mbps"),
     )
+}
+
+/// 从实际执行的命令里估算「被 socket 缓冲吃掉、未必上线」的字节数。
+///
+/// iperf3 的 `-w` 是 socket 缓冲，塞进去的字节会被算进 sender 汇总，但可能
+/// 一个都没上线。run_20260825_215915_7684 的 65 条 TCP 记录里，
+/// 「发 − 收」稳定在 118.92 ± 1.90 Mbps，而 `-w 256m × 10 流 ÷ 180s`
+/// 正好是 119.3Mbps——那个差值整个就是缓冲。
+///
+/// 把这个数印出来，是为了让读报告的人能自己核对「发送」列虚高了多少，
+/// 而不是对着一个对不上的数字猜。判定口径一直是接收端网卡，不受影响。
+fn in_flight_buffer_estimate(row: &Row) -> Option<String> {
+    let mut args = row.command.split_whitespace();
+    let mut window: Option<&str> = None;
+    let mut streams: u32 = 1;
+    while let Some(arg) = args.next() {
+        match arg {
+            "-w" => window = args.next(),
+            "-P" => streams = args.next().and_then(|v| v.parse().ok()).unwrap_or(1),
+            _ => {}
+        }
+    }
+    let bytes = parse_iperf_size(window?)? * u64::from(streams.max(1));
+    let secs = row.required_seconds.filter(|v| *v > 0.0)?;
+    Some(format!(
+        "{:.2} GB（-w × {streams} 流）≈ {:.0} Mbps 计入「发送」但未必上线",
+        bytes as f64 / 1e9,
+        bytes as f64 * 8.0 / 1e6 / secs
+    ))
+}
+
+/// 解析 iperf3 的 `-w` 尺寸后缀（k/m/g，二进制单位）。
+fn parse_iperf_size(value: &str) -> Option<u64> {
+    let lower = value.trim().to_ascii_lowercase();
+    let (digits, factor) = match lower.strip_suffix(['k', 'm', 'g']) {
+        Some(rest) => {
+            let factor = match lower.as_bytes().last()? {
+                b'k' => 1024,
+                b'm' => 1024 * 1024,
+                _ => 1024 * 1024 * 1024,
+            };
+            (rest, factor)
+        }
+        None => (lower.as_str(), 1),
+    };
+    digits.parse::<u64>().ok()?.checked_mul(factor)
 }
 
 fn diagnostic_item(h: &mut String, label: &str, value: &str) {
@@ -1012,6 +1083,9 @@ fn push_row_diagnostics(h: &mut String, row: &Row, is_ping: bool, aria_context: 
         _ => NOT_COLLECTED.into(),
     };
     diagnostic_item(h, "判定窗口区间", &window_span);
+    if let Some(estimate) = in_flight_buffer_estimate(row) {
+        diagnostic_item(h, "估算在途缓冲", &estimate);
+    }
     diagnostic_item(
         h,
         "已扣除背景速率",
@@ -1354,8 +1428,9 @@ fn push_unit_details(h: &mut String, groups: &[UnitGroup<'_>]) {
         let title = group_title(group);
         let execution_meta = unit_execution_meta(group);
         h.push_str(&format!(
-            "<details class=\"unit-section\" data-unit-id=\"{}\"{open}><summary class=\"unit-toggle\" id=\"unit-toggle-{index}\"><span class=\"status {}\">{}</span><span class=\"unit-title\">{}</span><span class=\"unit-meta\">{} · {}</span></summary>",
+            "<details class=\"unit-section\" data-unit-id=\"{}\"{open}><summary class=\"unit-toggle\" id=\"unit-toggle-{index}\"><span class=\"unit-seq\">#{}</span><span class=\"status {}\">{}</span><span class=\"unit-title\">{}</span><span class=\"unit-meta\">{} · {}</span></summary>",
             esc(&group.key),
+            group_seq(group),
             verdict.css(),
             verdict.label(),
             esc(title),
@@ -1460,24 +1535,28 @@ h2 { margin: 28px 0 10px; font-size: 17px; line-height: 1.3; }
    页面最底部，只有把整页滚到底才能左右拖动。 */
 .overview-scroll { max-width: 100%; max-height: 72vh; overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); }
 .overview-table, .results-table { border-collapse: separate; border-spacing: 0; width: 100%; background: var(--surface); font-size: 12px; }
-/* 基准宽度 1384px（含截图列），留出 1440 宽屏的 body padding 和纵向滚动条槽，
+/* 基准宽度 1432px（序号列 + 截图列），留出 1440 宽屏的 body padding 和纵向滚动条槽，
    常见笔记本屏幕即可完整看完不必横向拖。
    列宽写成百分比而不是 px：table-layout:fixed 下 px 列宽是硬约束，撤掉 min-width
    也不会压缩，窄屏只会继续溢出。百分比按 min-width 或容器宽度解析，因此
    窄屏能等比压缩，而横向真的溢出时（min-width 生效）又正好还原成下面
-   冻结列偏移所依赖的 116 / 250 / 48 px。
+   冻结列偏移所依赖的 48 / 116 / 250 px。
    c-verdict 必须容得下最长的 NOT_EVALUATED，否则结果列会被裁成 NOT_EVALUATE。 */
-.overview-table { min-width: 1384px; table-layout: fixed; }
-.overview-table col.c-verdict { width: 8.382%; }
-.overview-table col.c-unit { width: 18.064%; }
-.overview-table col.c-dir { width: 3.468%; }
-.overview-table col.c-endpoints { width: 13.728%; }
-.overview-table col.c-streams { width: 6.358%; }
-.overview-table col.c-rate { width: 7.659%; }
-.overview-table col.c-target { width: 7.081%; }
-.overview-table col.c-shot { width: 13.150%; }
-.overview-table col.c-coverage { width: 5.636%; }
-.overview-table col.c-quality { width: 8.815%; }
+.overview-table { min-width: 1432px; table-layout: fixed; }
+/* 序号列按 48px 折算；其余列等比缩，冻结列偏移随之改为 0/48/164/414。 */
+.overview-table col.c-seq { width: 3.352%; }
+.overview-table col.c-verdict { width: 8.101%; }
+.overview-table col.c-unit { width: 17.459%; }
+.overview-table col.c-dir { width: 3.352%; }
+.overview-table col.c-endpoints { width: 13.268%; }
+.overview-table col.c-streams { width: 6.145%; }
+.overview-table col.c-rate { width: 7.402%; }
+.overview-table col.c-target { width: 6.844%; }
+.overview-table col.c-shot { width: 12.709%; }
+.overview-table col.c-coverage { width: 5.447%; }
+.overview-table col.c-quality { width: 8.520%; }
+/* 序号只写在单元首行，续行留空；加粗让它在长表里可扫。 */
+.overview-table td.seq-col { font-weight: 700; color: var(--muted); }
 .overview-table th, .overview-table td, .results-table th, .results-table td { border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); padding: 6px 8px; text-align: left; vertical-align: top; }
 .overview-table th:last-child, .overview-table td:last-child, .results-table th:last-child, .results-table td:last-child { border-right: 0; }
 /* 列变窄后表头必须允许换行，否则「请求/活跃/要求流」这种标题会被裁掉。 */
@@ -1489,25 +1568,28 @@ h2 { margin: 28px 0 10px; font-size: 17px; line-height: 1.3; }
 .unit-verdict-note { display: block; margin-top: 2px; color: var(--muted); font-size: 11px; }
 /* 结果列很窄，标签必须允许在 <wbr> 处折行，不能 nowrap 溢出到相邻列。
    同时要盖掉单元格上的 overflow-wrap: anywhere，否则会断成 NOT_/EVALUATE/D。 */
-.overview-table tr:not(.reason-row) > td:nth-child(1) .status, .unit-verdict-note .status { white-space: normal; overflow-wrap: normal; word-break: keep-all; }
+.overview-table tr:not(.reason-row) > td:nth-child(2) .status, .unit-verdict-note .status { white-space: normal; overflow-wrap: normal; word-break: keep-all; }
 /* 判定原因独占整行：文字最长，定宽列里必被截断。 */
 .overview-table tr.reason-row > td { padding: 4px 10px 7px; color: var(--muted); background: #fafbfc; overflow-wrap: anywhere; }
 .advice { display: inline; color: var(--ink); font-weight: 600; }
 .reason-code-detail { display: block; margin-top: 3px; color: var(--muted); font-size: 11px; }
 .reason-tag { margin-right: 6px; padding: 0 5px; border: 1px solid var(--line); border-radius: 3px; background: var(--surface); color: #145a94; font-size: 11px; font-weight: 700; }
-/* 左侧「测试场景」三列冻结：窄屏横向拖到接收速率/截图时仍看得到是哪个测试项。
+/* 左侧「测试场景」四列冻结（序号 + 结果 + 单元 + 方向）：窄屏横向拖到接收速率/截图时仍看得到是哪个测试项。
    原因行是 colspan 整行，绝不能被当成第一列跟着冻结。 */
-.overview-table th:nth-child(-n+3), .overview-table tr:not(.reason-row) > td:nth-child(-n+3) { position: sticky; z-index: 2; background: var(--surface); }
-.overview-table th:nth-child(-n+3) { z-index: 4; background: var(--head); }
+.overview-table th:nth-child(-n+4), .overview-table tr:not(.reason-row) > td:nth-child(-n+4) { position: sticky; z-index: 2; background: var(--surface); }
+.overview-table th:nth-child(-n+4) { z-index: 4; background: var(--head); }
 .overview-table th:nth-child(1), .overview-table tr:not(.reason-row) > td:nth-child(1) { left: 0; }
-.overview-table th:nth-child(2), .overview-table tr:not(.reason-row) > td:nth-child(2) { left: 116px; }
-.overview-table th:nth-child(3), .overview-table tr:not(.reason-row) > td:nth-child(3) { left: 366px; box-shadow: 2px 0 0 rgba(23, 32, 42, .08); }
+.overview-table th:nth-child(2), .overview-table tr:not(.reason-row) > td:nth-child(2) { left: 48px; }
+.overview-table th:nth-child(3), .overview-table tr:not(.reason-row) > td:nth-child(3) { left: 164px; }
+.overview-table th:nth-child(4), .overview-table tr:not(.reason-row) > td:nth-child(4) { left: 414px; box-shadow: 2px 0 0 rgba(23, 32, 42, .08); }
 .overview-table td.num, .results-table td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .overview-table tr:last-child td, .results-table tr:last-child td { border-bottom: 0; }
 .reason-cell { color: var(--muted); overflow-wrap: anywhere; }
 .unit-list { display: grid; gap: 8px; }
 .unit-section { min-width: 0; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); }
-.unit-toggle { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: start; gap: 10px; padding: 9px 11px; cursor: pointer; font-weight: 700; }
+.unit-toggle { display: grid; grid-template-columns: auto auto minmax(0, 1fr) auto; align-items: start; gap: 10px; padding: 9px 11px; cursor: pointer; font-weight: 700; }
+/* 明细区的序号与概览首列是同一个数，两个区之间靠它对应。 */
+.unit-seq { color: var(--muted); font-variant-numeric: tabular-nums; }
 .unit-toggle::marker { color: #1769aa; }
 .unit-title { min-width: 0; overflow-wrap: anywhere; }
 .unit-meta { color: var(--muted); font-size: 12px; font-weight: 400; white-space: nowrap; }
@@ -1559,12 +1641,14 @@ pre { max-height: 420px; margin: 8px 0 0; padding: 10px; overflow: auto; border-
 details.raw-section { margin: 8px 0; }
 details.raw-section > summary { cursor: pointer; font-weight: 700; overflow-wrap: anywhere; }
 .sampling-caveat { margin: 8px 0 0; padding: 8px 10px; border-left: 3px solid #8a5200; background: #fff8e6; color: #5e430b; }
+/* 链路失联这类横跨一整段单元的事实必须比逐行原因更显眼，用 fail 色而不是警告色。 */
+.run-health { margin: 8px 0 0; padding: 8px 10px; border-left: 3px solid #bd2c2c; background: #fdecec; color: #7d1d1d; font-weight: 600; }
 .backend-note { margin: 8px 0 12px; padding: 8px 10px; border-left: 3px solid #1769aa; background: #eef5fb; color: #16405e; }
 .raw-empty { margin: 8px 0; padding: 8px 10px; border-left: 3px solid #8a5200; background: #fff8e6; color: #5e430b; }
 .raw-links { margin: 8px 0; }
 .raw-links a, .artifact-list a { color: #145a94; }
 summary:focus-visible, a:focus-visible, .table-scroll:focus-visible, .overview-scroll:focus-visible { outline: 3px solid #2b78b8; outline-offset: 2px; }
-/* 概览整表需要 1384px。屏幕更窄时不要求用户去找横向滚动条：撤掉 min-width，
+/* 概览整表需要 1432px。屏幕更窄时不要求用户去找横向滚动条：撤掉 min-width，
    让定宽列按比例压缩、数字换行，一屏内全部看完。滚动条即使限制了容器高度，
    也可能因为上方 meta/统计块把容器底部推到视口之外，所以能不横向滚动最好。 */
 @media (max-width: 1460px) {
@@ -1572,16 +1656,20 @@ summary:focus-visible, a:focus-visible, .table-scroll:focus-visible, .overview-s
     .overview-table td.num, .overview-table th { white-space: normal; }
     /* 等比压缩后不再横向溢出，冻结列没有意义；而 sticky 的 left 约束即使
        scrollLeft=0 也会把单元格顶到 116/366px，把后面几列压重叠。 */
-    .overview-table th:nth-child(-n+3), .overview-table tr:not(.reason-row) > td:nth-child(-n+3) { position: static; box-shadow: none; }
+    .overview-table th:nth-child(-n+4), .overview-table tr:not(.reason-row) > td:nth-child(-n+4) { position: static; box-shadow: none; }
 }
 /* 再窄就压不动了：恢复横向滚动 + 冻结列，并压低容器高度让滚动条尽量在视口内。 */
 @media (max-width: 1000px) {
-    .overview-table { min-width: 1384px; }
+    /* 必须与基准一致：sticky 的 left 偏移是按 1432px 基准算出的 0/48/164/414 px
+       字面量，这里若还写 1384px，列宽会等比缩小而偏移不变，冻结列直接压到相邻列上。 */
+    .overview-table { min-width: 1432px; }
     /* 窄屏上方的 meta/统计块会换行变高，把表格推得更靠下；容器再压低一点，
        横向滚动条才不至于又跑到视口外面。 */
     .overview-scroll { max-height: 50vh; }
-    .overview-table th:nth-child(-n+3), .overview-table tr:not(.reason-row) > td:nth-child(-n+3) { position: sticky; }
-    .overview-table tr:not(.reason-row) > td:nth-child(3), .overview-table th:nth-child(3) { box-shadow: 2px 0 0 rgba(23, 32, 42, .08); }
+    .overview-table th:nth-child(-n+4), .overview-table tr:not(.reason-row) > td:nth-child(-n+4) { position: sticky; }
+    /* 分隔阴影落在冻结块的最后一列（方向列）。写 nth-child(3) 会在冻结块中间
+       多画一道线，而基准规则里第 4 列的那道并不会因此消失。 */
+    .overview-table tr:not(.reason-row) > td:nth-child(4), .overview-table th:nth-child(4) { box-shadow: 2px 0 0 rgba(23, 32, 42, .08); }
 }
 @media (max-width: 1100px) {
     body { padding: 12px; }
@@ -1594,7 +1682,7 @@ summary:focus-visible, a:focus-visible, .table-scroll:focus-visible, .overview-s
     .meta { grid-template-columns: 1fr; }
     .summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; }
     .stat-value { font-size: 18px; }
-    .unit-toggle { grid-template-columns: auto minmax(0, 1fr); }
+    .unit-toggle { grid-template-columns: auto auto minmax(0, 1fr); }
     .unit-meta { grid-column: 2; white-space: normal; }
     .diagnostic-panel { width: 720px; max-width: 72vw; }
     .raw-section, .row-diagnostics { display: block; }
@@ -1639,6 +1727,13 @@ summary:focus-visible, a:focus-visible, .table-scroll:focus-visible, .overview-s
         not_evaluated = not_evaluated,
         skipped = skipped,
     ));
+
+    if !meta.run_health.is_empty() {
+        h.push_str(&format!(
+            "<p class=\"run-health\" role=\"alert\"><strong>运行健康</strong>：{}</p>\n",
+            esc(&meta.run_health)
+        ));
+    }
 
     if !meta.counter_source_caveat.is_empty() {
         h.push_str(&format!(
@@ -1971,16 +2066,17 @@ mod tests {
         assert!(
             html.contains(".overview-scroll { max-width: 100%; max-height: 72vh; overflow: auto;")
         );
-        // 左侧「结果 / 测试单元 / 方向」三列冻结，右拖看速率时仍知道是哪个测试项。
-        assert!(html.contains(".overview-table th:nth-child(-n+3), .overview-table tr:not(.reason-row) > td:nth-child(-n+3) { position: sticky;"));
-        // 冻结偏移必须与 colgroup 列宽一致（104 + 240 = 344）。
+        // 左侧「序号 / 结果 / 测试单元 / 方向」四列冻结，右拖看速率时仍知道是哪个测试项。
+        assert!(html.contains(".overview-table th:nth-child(-n+4), .overview-table tr:not(.reason-row) > td:nth-child(-n+4) { position: sticky;"));
+        // 冻结偏移必须与 colgroup 列宽一致：48 + 116 + 250 = 414。
         assert!(html.contains(
-            ".overview-table th:nth-child(3), .overview-table tr:not(.reason-row) > td:nth-child(3) { left: 366px;"
+            ".overview-table th:nth-child(4), .overview-table tr:not(.reason-row) > td:nth-child(4) { left: 414px;"
         ));
-        // 基准 1384px 下 8.382% = 116px、18.064% = 250px，正好等于上面的冻结偏移。
-        assert!(html.contains(".overview-table { min-width: 1384px; table-layout: fixed; }"));
-        assert!(html.contains(".overview-table col.c-verdict { width: 8.382%; }"));
-        assert!(html.contains(".overview-table col.c-unit { width: 18.064%; }"));
+        // 基准 1432px 下 3.352% = 48px、8.101% = 116px、17.459% = 250px。
+        assert!(html.contains(".overview-table { min-width: 1432px; table-layout: fixed; }"));
+        assert!(html.contains(".overview-table col.c-seq { width: 3.352%; }"));
+        assert!(html.contains(".overview-table col.c-verdict { width: 8.101%; }"));
+        assert!(html.contains(".overview-table col.c-unit { width: 17.459%; }"));
         // 屏幕装不下时改为等比压缩，不让用户去页面底部找横向滚动条。
         assert!(html.contains("@media (max-width: 1460px)"));
         // 窄列里最长的结果标签必须能在下划线处折行，不能溢出盖住相邻列。
@@ -1991,7 +2087,7 @@ mod tests {
         assert_eq!(status_label_html(Verdict::SetupError), "SETUP_<wbr>ERROR");
         assert_eq!(status_label_html(Verdict::Pass), "PASS");
         assert!(html.contains(
-            ".overview-table tr:not(.reason-row) > td:nth-child(1) .status, .unit-verdict-note .status { white-space: normal; overflow-wrap: normal;"
+            ".overview-table tr:not(.reason-row) > td:nth-child(2) .status, .unit-verdict-note .status { white-space: normal; overflow-wrap: normal;"
         ));
         // 两张缩略图必须并排，换行堆叠会把行高翻倍。
         assert!(html.contains(".shot-cell { display: flex; flex-wrap: nowrap;"));
@@ -2000,7 +2096,7 @@ mod tests {
         // 判定原因独占整行，不再挤在定宽列里被截断。
         assert!(!html.contains("<th scope=\"col\">原因</th>"));
         assert!(html.contains("<tr class=\"reason-row\""));
-        assert!(html.contains("colspan=\"11\""));
+        assert!(html.contains("colspan=\"12\""));
         // 截图列与接收速率同排，不必展开诊断面板。
         assert!(html.contains("<th scope=\"col\">截图</th>"));
         assert!(html.contains("<col class=\"c-shot\">"));
@@ -2013,6 +2109,33 @@ mod tests {
         }
         // BA 只有主控截图时，辅测不能渲染成空缩略图。
         assert_eq!(html.matches("class=\"shot-mini\"").count(), 6);
+    }
+
+    /// 概览和明细都必须带执行序号，且与控制台打印的 `[N/总数]` 一致。
+    ///
+    /// 120 个单元里「主控 以太网 6 -> 辅测 以太网」这类标题会重复十几次，
+    /// 只有标题的话，拿着控制台记录去报告里找对应项根本定位不到。
+    #[test]
+    fn every_unit_carries_the_console_sequence_number() {
+        let mut first = unit_summary("unit-a", Verdict::Measured);
+        first.sort_key = (0, usize::MAX, usize::MAX, u8::MAX);
+        first.task = "IPERF V4 TCP | 主控 以太网 6 -> 辅测 以太网".into();
+        let mut later = unit_summary("unit-b", Verdict::Measured);
+        later.sort_key = (113, usize::MAX, usize::MAX, u8::MAX);
+        later.task = "IPERF V4 TCP | 主控 以太网 6 -> 辅测 以太网".into();
+
+        let html = render(vec![first, later]);
+
+        // 序号从 1 开始，与控制台的 [1/120] / [114/120] 对齐。
+        assert!(html.contains("<th scope=\"col\">#</th>"));
+        assert!(html.contains(">1</td>"), "第一个单元应显示 1");
+        assert!(
+            html.contains(">114</td>"),
+            "sort_key.0=113 的单元应显示 114"
+        );
+        // 明细区用同一个数，两个区之间才对得上。
+        assert!(html.contains("<span class=\"unit-seq\">#1</span>"));
+        assert!(html.contains("<span class=\"unit-seq\">#114</span>"));
     }
 
     #[test]
@@ -2034,7 +2157,8 @@ mod tests {
         // 关掉截图时整列都会是「未采集」，白占约 190px，应该整列不渲染。
         assert!(!html.contains("<th scope=\"col\">截图</th>"));
         assert!(!html.contains("<col class=\"c-shot\">"));
-        assert!(html.contains("colspan=\"10\""));
+        // 序号列让整表多一列，原因行的 colspan 必须跟着走。
+        assert!(html.contains("colspan=\"11\""));
         assert!(html.contains("TARGET_UNKNOWN: Observe 模式仅记录实际能力"));
     }
 

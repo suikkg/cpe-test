@@ -26,6 +26,9 @@ mod screenshot;
 mod util;
 mod verdict;
 
+/// 控制台默认端口。与 agent 的 28801 错开，两个都在本机跑时不打架。
+const DEFAULT_UI_PORT: u16 = 28800;
+
 use console::ask;
 use master::ui::{run_master, MasterOpts};
 
@@ -103,6 +106,14 @@ fn real_main(args: Vec<String>) -> i32 {
                 csv_path,
             )
         }
+        "ui" => {
+            let f = parse_flags(&args[1..]);
+            let port = f
+                .get("port")
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(DEFAULT_UI_PORT);
+            master::webui::run(port, f.get("config").cloned())
+        }
         "-h" | "--help" | "help" => {
             print_help();
             0
@@ -115,28 +126,30 @@ fn real_main(args: Vec<String>) -> i32 {
             println!("  ctsTraffic 仅支持 Windows 10+");
             println!("==============================================");
             println!("\n请选择模式:");
-            println!("  [1] 子网测试（主控，发起 ping/iperf3/CTS 双向测试） *");
-            println!("  [2] 辅测 agent（被控端，先在那台上启动）");
-            println!("  [3] 只看本机网卡识别结果");
-            println!("  [4] 独立网卡速率监控（单机观察链路速率，按 Ctrl+C 停止）");
+            println!("  [1] 图形控制台（浏览器里勾选执行，推荐） *");
+            println!("  [2] 子网测试（主控命令行，逐项问答）");
+            println!("  [3] 辅测 agent（被控端，先在那台上启动）");
+            println!("  [4] 只看本机网卡识别结果");
+            println!("  [5] 独立网卡速率监控（单机观察链路速率，按 Ctrl+C 停止）");
             let c = ask("选择(回车=默认1): ");
             match c.trim() {
-                "2" => {
+                "2" => run_master(MasterOpts::default()),
+                "3" => {
                     let (cfg, _) = config::load_config(None);
                     agent::run(cfg.agent_port, &cfg);
                     0
                 }
-                "3" => {
+                "4" => {
                     let (cfg, _) = config::load_config(None);
                     let info = nic::scan_host(&cfg.ipv4_prefixes);
                     println!("{}", nic::format_nic_table("【本机】", &info));
                     0
                 }
-                "4" => {
+                "5" => {
                     let (cfg, _) = config::load_config(None);
                     run_monitor_mode(&cfg, None, 1, 0, None)
                 }
-                _ => run_master(MasterOpts::default()),
+                _ => master::webui::run(DEFAULT_UI_PORT, None),
             }
         }
         other => {
@@ -242,7 +255,10 @@ fn print_help() {
   ctsTraffic                 仅 Windows 10+；两端需同版本程序和 ctsTraffic.exe
 
 用法:
-  cpe_test                    交互模式（双击运行就是这个）
+  cpe_test                    交互模式（双击运行就是这个，默认进图形控制台）
+  cpe_test ui                 图形控制台：浏览器里勾选执行 (默认 127.0.0.1:28800)
+      --port N                指定控制台端口
+      --config FILE           指定配置文件 (默认找 ./config.json)
   cpe_test agent              辅测机启动常驻服务 (默认端口 28801)
       --port N                指定监听端口
       --token SECRET          共享访问令牌（agent 与主控必须一致；不配置则不启用认证）

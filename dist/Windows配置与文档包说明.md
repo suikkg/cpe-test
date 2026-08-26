@@ -1,13 +1,13 @@
-# cpe_test v4.2.7 Windows 配置与文档包
+# cpe_test v4.3.0 Windows 配置与文档包
 
-仓库中的 `cpe_test-v4.2.7-windows-config-docs.zip` 是便于从 Git 直接下载的
+仓库中的 `cpe_test-v4.3.0-windows-config-docs.zip` 是便于从 Git 直接下载的
 Windows 配置、说明文档和启动脚本资料包。包内文件由仓库当前版本生成，并由 CI
 逐文件与源码副本比对，避免配置或文档过期。
 
 这个资料包**不包含可执行程序或吞吐工具**：
 
 - 不包含 `cpe_test.exe`；请从 GitHub Release 下载正式
-  `cpe_test-v4.2.7-windows-x86_64.zip`，或自行编译。
+  `cpe_test-v4.3.0-windows-x86_64.zip`，或自行编译。
 - 不包含 `ctsTraffic.exe`；正式 Windows Release ZIP 会捆绑固定并校验过的
   Microsoft ctsTraffic 2.0.4.0 x64。
 - 不包含 `iperf3.exe` 及其 DLL；需要 iperf3 测试时，请放入完整的 Windows
@@ -19,8 +19,21 @@ Windows 配置、说明文档和启动脚本资料包。包内文件由仓库当
 - `config.minimal.json`（最小可用：首次跑通只需改 `agent_host`、`agent_token`、
   `iperf.duration` 三项，其余走内置默认值）。
 - `config.example.json`（完整字段面）与 `configs/` 下四份可直接选择的具名配置。
-- `start_agent.bat`、`start_master.bat`、`start_master_select_config.bat`。
+- `start_ui.bat`（图形控制台）、`start_agent.bat`、`start_master.bat`、`start_master_select_config.bat`。
 - iperf3/ctsTraffic 放置说明、MIT 许可证和第三方声明。
+
+## v4.3.0 行为要点
+
+- 新增图形控制台 `cpe_test ui`（`start_ui.bat`）：浏览器里逐网口配置 RX 门限/发送端 UDP `-b`，勾选网口组合、方向、协议和 IP 版本，并扫描 TCP `-w` / `-P`、UDP `-b` 多档参数；支持预览、下载 config、实时进度、优雅结束和打开报告。它仍调用和命令行相同的执行流程，不是第二条执行链路。
+- 修复双向 UDP 一条腿失败会连坐判废另一条腿的有效数据：判定窗口改为逐腿计算，「两条腿有没有真正并发」单独作为事实写进原因。
+- 修复 UDP 丢包率把接近满丢包报成 0.000%：只认 `receiver` 汇总行、用 `lost/total` 计数算，取不到报「未知」而不是 0。
+- 修复 iperf3 收尾握手失败会丢掉已测到的网卡数据：有效窗口攒够时判定完全交回接收端网卡口径。
+- 新增计数器停滞检测 `COUNTER_STALLED`：样本采齐、覆盖率 100%，但字节计数长时间不动。
+- UDP `-b` 按 `min(发送口, 接收口)` 裁剪；在 `link_profiles` 里明确配过的链路不裁。
+- WiFi 负载上限不再跟随会来回跳的协商速率，改用 `wifi_payload_ceiling_mbps`（默认 2800）。
+- 新增两层链路策略 `link_profiles`：`by_role` 角色兜底 + `by_nic` 单口覆盖，门限与带宽都按方向独立。
+- 每个测试单元开始前重新拉取双端网卡，变更记 `拓扑变更`，网卡消失判 `NIC_DISAPPEARED`。
+- 报告新增执行序号（与控制台 `[N/总数]` 一致）和运行健康横幅。
 
 ## v4.2.7 行为要点
 

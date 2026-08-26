@@ -11,7 +11,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use wait_timeout::ChildExt;
 
@@ -527,22 +527,76 @@ pub fn run_streaming_controlled_timed<F: FnMut(&str, Instant)>(
 
 // ---------------- 日志 ----------------
 
-static LOG_FILE: OnceLock<Mutex<File>> = OnceLock::new();
+// Web 控制台会在同一进程内连续跑多轮，每轮都有自己的 master.log。
+// `OnceLock<Mutex<File>>` 只能记住第一轮的句柄，第二轮以后会继续把日志写进
+// 第一轮目录；用可替换的 Option 才能在每轮开始时原子切换目标文件。
+static LOG_FILE: Mutex<Option<File>> = Mutex::new(None);
 
 /// 主控模式下开启文件日志（控制台 + 文件双写）
 pub fn log_to_file(path: &Path) {
     if let Ok(f) = OpenOptions::new().create(true).append(true).open(path) {
-        let _ = LOG_FILE.set(Mutex::new(f));
+        *lock_recover(&LOG_FILE) = Some(f);
     }
 }
+
+/// Web 控制台的内存日志镜像：只保留最近若干行，供前端轮询。
+///
+/// 之所以不让控制台去 tail `master.log`：那份文件的路径由 `run_master`
+/// 在运行开始时自己创建，界面在点下「开始测试」的那一刻还不知道它叫什么；
+/// 而且 tail 一个正在被追加的文件要处理编码和截断，得不偿失。
+static LOG_MIRROR: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// 已经产生过的总行数（含被裁掉的）。
+///
+/// 必须和镜像长度分开记：镜像被 `LOG_MIRROR_MAX_LINES` 封顶，用它当游标的话
+/// 一旦写满就永远停在 4000，前端每次都拿到「没有新行」，进度视图从此不再更新。
+/// 一次 120 单元的运行会打出三万多行，这不是边界情况而是常态。
+static LOG_MIRROR_TOTAL: Mutex<usize> = Mutex::new(0);
+const LOG_MIRROR_MAX_LINES: usize = 4000;
 
 /// 打印并写日志文件
 pub fn logln(s: &str) {
     println!("{s}");
-    if let Some(m) = LOG_FILE.get() {
-        if let Ok(mut f) = m.lock() {
+    if let Ok(mut target) = LOG_FILE.lock() {
+        if let Some(f) = target.as_mut() {
             let _ = writeln!(f, "{s}");
         }
+    }
+    if let Ok(mut mirror) = LOG_MIRROR.lock() {
+        mirror.push(s.to_string());
+        if mirror.len() > LOG_MIRROR_MAX_LINES {
+            let overflow = mirror.len() - LOG_MIRROR_MAX_LINES;
+            mirror.drain(..overflow);
+        }
+        if let Ok(mut total) = LOG_MIRROR_TOTAL.lock() {
+            *total += 1;
+        }
+    }
+}
+
+/// 取回 `from` 之后新增的日志行，以及镜像里当前的总行数。
+///
+/// 返回的行号是**镜像被裁剪前**的绝对序号，前端据此判断有没有漏读；
+/// 长时间运行会丢掉最早的行，这在进度视图里是可接受的。
+pub fn log_tail_since(from: usize) -> (usize, Vec<String>) {
+    let (Ok(mirror), Ok(total)) = (LOG_MIRROR.lock(), LOG_MIRROR_TOTAL.lock()) else {
+        return (from, Vec::new());
+    };
+    let total = *total;
+    // 镜像里第一条的绝对序号。被裁掉的行数 = 总行数 - 当前镜像长度。
+    let first_kept = total.saturating_sub(mirror.len());
+    // 请求的位置早于镜像起点，说明中间那段已经被裁掉了：从现存最早一行给起，
+    // 前端能从返回的绝对序号跳变看出漏了多少。
+    let start = from.saturating_sub(first_kept).min(mirror.len());
+    (total, mirror[start..].to_vec())
+}
+
+/// 清空内存日志镜像。控制台每次开跑前调用，避免上一轮的输出混进来。
+pub fn clear_log_mirror() {
+    if let Ok(mut mirror) = LOG_MIRROR.lock() {
+        mirror.clear();
+    }
+    if let Ok(mut total) = LOG_MIRROR_TOTAL.lock() {
+        *total = 0;
     }
 }
 
@@ -823,6 +877,59 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// 游标必须是「产生过的总行数」，不能是被封顶的镜像长度。
+    ///
+    /// 用 `mirror.len()` 当游标时，一旦写满 4000 行游标就永远停在 4000，
+    /// 前端每次轮询都拿到空列表，进度视图从此不再更新——而一次 120 单元的
+    /// 运行会打出三万多行，这是常态不是边界。
+    #[test]
+    fn log_tail_cursor_keeps_counting_past_the_mirror_cap() {
+        let _guard = log_mirror_test_lock();
+        clear_log_mirror();
+        for i in 0..LOG_MIRROR_MAX_LINES {
+            logln(&format!("line-{i}"));
+        }
+        let (cursor, lines) = log_tail_since(0);
+        assert_eq!(cursor, LOG_MIRROR_MAX_LINES);
+        assert_eq!(lines.len(), LOG_MIRROR_MAX_LINES);
+
+        // 再打 100 行：镜像会裁掉最早的 100 行，但游标必须继续往前走，
+        // 而且这 100 行必须真的被取到。
+        for i in 0..100 {
+            logln(&format!("extra-{i}"));
+        }
+        let (cursor2, lines2) = log_tail_since(cursor);
+        assert_eq!(cursor2, LOG_MIRROR_MAX_LINES + 100, "游标不能停在封顶值");
+        assert_eq!(lines2.len(), 100, "新行必须取得到");
+        assert_eq!(lines2.first().map(String::as_str), Some("extra-0"));
+        assert_eq!(lines2.last().map(String::as_str), Some("extra-99"));
+
+        // 请求的位置早于镜像起点（那一段已被裁掉）时，从现存最早一行给起，
+        // 不能 panic，也不能返回空。
+        let (cursor3, lines3) = log_tail_since(0);
+        assert_eq!(cursor3, LOG_MIRROR_MAX_LINES + 100);
+        assert_eq!(lines3.len(), LOG_MIRROR_MAX_LINES);
+        assert_eq!(lines3.first().map(String::as_str), Some("line-100"));
+        clear_log_mirror();
+    }
+
+    /// 日志镜像是进程级全局状态，两个用例并行跑会互相干扰。
+    fn log_mirror_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: Mutex<()> = Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    #[test]
+    fn clearing_the_mirror_resets_the_cursor() {
+        let _guard = log_mirror_test_lock();
+        clear_log_mirror();
+        logln("a");
+        logln("b");
+        assert_eq!(log_tail_since(0).0, 2);
+        clear_log_mirror();
+        assert_eq!(log_tail_since(0), (0, Vec::new()));
     }
 
     #[test]

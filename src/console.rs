@@ -62,6 +62,20 @@ pub fn parse_selection(input: &str, max: usize) -> Result<Vec<usize>, String> {
     Ok(out)
 }
 
+/// 用系统默认浏览器打开一个 URL。
+///
+/// 和 `open_path` 分开是因为 URL 不是路径：`Path` 在 Windows 上会把
+/// `http://host` 里的斜杠正规化成反斜杠，start 就打不开了。
+pub fn open_url(url: &str) {
+    if cfg!(windows) {
+        let _ = Command::new("cmd").args(["/C", "start", "", url]).spawn();
+    } else if cfg!(target_os = "macos") {
+        let _ = Command::new("open").arg(url).spawn();
+    } else {
+        let _ = Command::new("xdg-open").arg(url).spawn();
+    }
+}
+
 /// 用系统默认程序打开文件（报告自动打开）
 pub fn open_path(p: &Path) {
     let s = p.to_string_lossy().into_owned();

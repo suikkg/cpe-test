@@ -2,6 +2,53 @@
 
 > 两台电脑间自动化 ping + iperf3 / Microsoft ctsTraffic 灌包测试，零 Python/零 PowerShell
 
+## v4.3.0
+
+- **图形控制台**：`cpe_test ui`（双击运行的默认入口，Windows 包里是 `start_ui.bat`）在
+  `127.0.0.1:28800` 起一个本地页面——填辅测机 IP 连接、按网口填写 RX 门限和 UDP `-b`、
+  勾选网口组合与方向，并分别扫描 TCP `-w` / `-P` 和 UDP `-b` 多档参数；开始后同页看实时进度，
+  可优雅结束并生成部分报告、下载 config 或打开最终报告。**它不是第二条执行链路**：
+  「开始测试」把勾选结果写成一份 config，再调用和命令行完全相同的 `run_master()`，
+  所以 `--auto`、`--resume` 和既有配置文件的行为一个都没变。零新依赖（复用 tiny_http）。
+- **修复双向 UDP 一条腿失败会把另一条腿的有效数据一起判废**：判定窗口原先是全单元共用一个
+  （各腿采样区间求交集、且要求每个时刻每条腿都有足够活跃流），于是 ba 腿没跑通时，
+  ab 腿哪怕整整三分钟满速也会被写成 `RX均值=- 覆盖率=0.0% NOT_EVALUATED`。
+  窗口改为逐腿计算；「两条腿有没有真正并发」单独作为一个事实写进判定原因，不再吃掉测量结果。
+- **修复 UDP 丢包率会把接近满丢包报成 0.000%**：解析用的正则匹配不了 iperf3 满丢包时打印的
+  科学计数法 `(1e+02%)`，又在整段文本上取最后一次匹配（常落到 server 尾部 `0/0 (0%)` 的
+  收尾残帧）。现在只认 `receiver` 汇总行、直接用 `lost/total` 计数算，取不到就报「未知」而不是 0。
+- **修复 iperf3 收尾握手失败会丢掉已经测到的网卡数据**：`unable to send control message …
+  Connection reset by peer` 这类错误发生在灌包**结束之后**的结果交换阶段，此前整行判
+  `SETUP_ERROR / 接收=0`。现在只要有效窗口已经攒够，判定就完全交回接收端网卡口径——
+  RX 低于目标仍是 `RATE_FAIL`，RX 为 0 仍是 `NOT_EVALUATED`，只是原因里注明工具自报不可用、
+  执行状态保持 `ERROR`。
+- **新增计数器停滞检测**：样本采齐、`valid` 全是 true、覆盖率 100%，但字节计数长时间纹丝不动——
+  这是与采样覆盖率**正交**的一种不可信，光看覆盖率永远发现不了。新增 `stalled_ratio` 指标和
+  `COUNTER_STALLED` 原因码，TCP 与 UDP 两条判定链共用同一判据。
+- **UDP `-b` 按整条路径能力裁剪**：此前 `limit_udp_by_link_speed` 只裁流数、从不碰带宽，
+  于是 1Gbps 收端也会被灌 2.6G，丢包是配置出来的而不是测出来的。现在按
+  `min(发送口, 接收口)` 裁剪，裁剪动作写进任务标签和报表；在 `link_profiles` 里
+  为某条链路明确配过带宽的**不裁**——那是操作者的判断，安全网不该推翻它。
+- **WiFi 负载上限不再跟随协商速率**：协商值是 PHY 速率，同一块 Wi-Fi 7 网卡会在一轮测试里
+  于 2402 / 2882 之间来回跳，跟着它裁 `-b` 会让相邻两个单元的灌包强度都不一样。
+  新增 `wifi_payload_ceiling_mbps`（默认 2800，恰好容得下常用的 `-b 2.6G`）。
+- **新增两层链路策略 `link_profiles`**：`by_role` 按角色配对给默认值（配对串左边是 A、
+  右边是 B，`ab`/`ba` 相对这个顺序），`by_nic` 按单块网卡覆盖。RX 门限和 UDP 带宽都按方向
+  独立解析——同一条链路两个方向能力可以差 100 倍，用一个门限卡两边没有物理意义。
+- **每个测试单元开始前重新拉取双端网卡**：此前网卡快照在开跑时取一次，之后一路按值拷进每个
+  任务，一轮近 7 小时全程不更新。现在逐单元比对 IP / 接口索引 / 协商速率，变了就改任务并记
+  `拓扑变更`，网卡消失判 `SETUP_ERROR / NIC_DISAPPEARED` 而不是对着不存在的接口起采样。
+- **报告新增执行序号**：概览首列和明细区都带 `#N`，与控制台打印的 `[N/总数]` 一致。
+  同名标题在上百个单元里会重复十几次，此前拿控制台记录去报告里根本定位不到对应项。
+- **报告新增运行健康横幅**：链路中途失联这类横跨一整段单元的事实在最顶上单独说一次，
+  逐行看永远拼不出来。连续零测量的灌包单元会告警；`abort_after_dead_traffic_units`
+  可选开启自动中止（默认 0 只告警——「连续零测量」区分不了「设备掉线」和「其中一对网口本来
+  就不通」，自动中止会把别的配对一起砍掉）。
+- **`-w` 过大时给出提示与在途缓冲估算**：`-w 256m -P 10` 等于 2.56GB 发送缓冲，会让
+  「工具自报发送」恒定虚高约 119Mbps（那些字节可能一个都没上线）。现在超过「链路 2 秒流量」
+  时提示，报告诊断面板给出 `估算在途缓冲`，让这个差值可核对。参数本身不改写。
+- 单元测试 337 → 379。
+
 ## v4.2.7
 
 - **修复 TCP / ctsTraffic 会把「采样不可信」误判成「CPE 不达标」**：这两条路径原先先比对 RX 目标、再检查 5 秒滚动窗口覆盖率，于是「网卡计数器中断后恢复」这类环境异常会被写成 `RATE_FAIL / RX_BELOW_TARGET`。现在采样可信度一律先于任何性能结论，与 UDP 路径顺序一致。
@@ -103,9 +150,10 @@ CPE（Customer Premises Equipment）子网测试工具用于在**两台电脑之
 ```
 cpe_test.exe          ← 本工具（单文件）
 iperf3.exe            ← 从 iperf.fr 下载（只测 Ping/ctsTraffic 可不放）
-ctsTraffic.exe        ← v4.2.7 Windows Release 已捆绑（仅 Windows 10+）
+ctsTraffic.exe        ← v4.3.0 Windows Release 已捆绑（仅 Windows 10+）
 start_agent.bat       ← 辅测机双击
-start_master.bat      ← 主控机双击
+start_ui.bat          ← 主控机双击（图形控制台，推荐）
+start_master.bat      ← 主控机双击（命令行问答式）
 start_master_select_config.bat ← 主控机选择网口配置后双击
 configs\             ← SGMII / Wi-Fi / 10GUSB 等具名配置
 ```
@@ -130,9 +178,15 @@ agent 已启动，监听 0.0.0.0:28801
 
 ### 第 3 步：主控机测试
 
-双击 `start_master_select_config.bat`，选择本次网口配置后输入辅测机 IP。也可以双击
-`start_master.bat`（默认 SGMII 配置），或以 `start_master.bat configs\\config-wifi5g.json`
-指定配置：
+**图形控制台（推荐）**：双击 `start_ui.bat`，浏览器自动打开 `http://127.0.0.1:28800`。
+页面里填辅测机 IP 点「连接」→ 需要的话逐网口填 RX 门限和发送端 UDP `-b`
+→ 勾选网口组合、方向、协议和 IP 版本 → 填 TCP `-w` / `-P` 与 UDP `-b` 档位
+→ 「预览任务」确认清单和预计耗时 → 「开始测试」，同页看实时进度，跑完打开报告。
+控制台只监听本机回环，局域网上的其他机器访问不到。
+
+**命令行问答式**：双击 `start_master_select_config.bat`，选择本次网口配置后输入辅测机 IP。
+也可以双击 `start_master.bat`（默认 SGMII 配置），或以
+`start_master.bat configs\\config-wifi5g.json` 指定配置：
 
 ```
 请输入辅测机 IP: 192.168.8.101
@@ -140,13 +194,21 @@ agent 已启动，监听 0.0.0.0:28801
 
 程序自动扫描双端网卡 → 生成任务 → 执行 → 弹出 HTML 报告。
 
+两条路径产出的报告完全一样：控制台只是把勾选结果写成一份 config，
+再调用和命令行完全相同的执行流程。
+
 ---
 
 ## 命令行用法
 
 ```
-cpe_test                    交互选择模式（双击运行就是这个）
-  菜单: [1] 子网测试(主控)  [2] 辅测 agent  [3] 只看网卡  [4] 独立网卡速率监控
+cpe_test                    交互选择模式（双击运行就是这个，默认进图形控制台）
+  菜单: [1] 图形控制台  [2] 子网测试(主控命令行)  [3] 辅测 agent  [4] 只看网卡  [5] 网卡速率监控
+
+cpe_test ui                 图形控制台：浏览器里勾选执行
+    --port N                控制台端口（默认 28800，只监听 127.0.0.1）
+    --config FILE           指定配置文件（默认找 ./config.json）
+
 cpe_test agent              辅测机启动常驻服务
     --port N                指定监听端口（默认 28801）
     --token SECRET          共享访问令牌（与主控一致才可连接）
@@ -830,7 +892,7 @@ cargo build --release --locked
 
 自行编译后，把 `cpe_test.exe`、启动脚本和所需吞吐工具放到两台 Windows 电脑同一目录：
 iperf3 测试需要完整的 iperf3 Windows 发行包；ctsTraffic 测试需要 `ctsTraffic.exe`。
-官方 v4.2.7 Windows Release ZIP 已捆绑固定且校验过的 ctsTraffic 2.0.4.0，但由于发行包差异不内置 iperf3。
+官方 v4.3.0 Windows Release ZIP 已捆绑固定且校验过的 ctsTraffic 2.0.4.0，但由于发行包差异不内置 iperf3。
 
 ### GitHub Actions CI
 
@@ -853,7 +915,7 @@ Windows ZIP 包含启动脚本、四份配置、固定 CTS 二进制和第三方
 `tar.gz` 保留 `cpe_test` 可执行位。发布作业会再次核对资产名称、数量、内部结构和哈希。
 
 仓库同时跟踪一份不含可执行程序的
-[`cpe_test-v4.2.7-windows-config-docs.zip`](dist/cpe_test-v4.2.7-windows-config-docs.zip)，
+[`cpe_test-v4.3.0-windows-config-docs.zip`](dist/cpe_test-v4.3.0-windows-config-docs.zip)，
 便于直接从 Git 下载 Windows 配置、文档和启动脚本。其 SHA-256 位于同目录的
 `.zip.sha256` 文件；CI 会逐文件确认压缩包内容与仓库源文件一致。需要开箱即用的程序、
 固定版 ctsTraffic 和许可证全集时，仍应下载上面的正式 Windows Release ZIP。

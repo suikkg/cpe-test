@@ -81,14 +81,14 @@ jobs:
           from pathlib import Path
           from zipfile import ZipFile
 
-          bundle = Path("dist/cpe_test-v4.2.7-windows-config-docs.zip")
+          bundle = Path("dist/cpe_test-v4.3.0-windows-config-docs.zip")
           checksum = Path(f"{bundle}.sha256")
           expected_hash = checksum.read_text(encoding="utf-8").split()[0]
           actual_hash = sha256(bundle.read_bytes()).hexdigest()
           if actual_hash != expected_hash:
               raise SystemExit(f"bundle SHA-256 mismatch: {actual_hash}")
 
-          prefix = "cpe_test-v4.2.7-windows-config-docs"
+          prefix = "cpe_test-v4.3.0-windows-config-docs"
           source_for = {
               "Windows配置与文档包说明.md": Path("dist/Windows配置与文档包说明.md"),
               "README.md": Path("README.md"),
@@ -102,6 +102,7 @@ jobs:
               "configs/config-wifi5g.json": Path("dist/configs/config-wifi5g.json"),
               "configs/config-10gusb.json": Path("dist/configs/config-10gusb.json"),
               "configs/config-all-common.json": Path("dist/configs/config-all-common.json"),
+              "start_ui.bat": Path("dist/start_ui.bat"),
               "start_agent.bat": Path("dist/start_agent.bat"),
               "start_master.bat": Path("dist/start_master.bat"),
               "start_master_select_config.bat": Path("dist/start_master_select_config.bat"),
@@ -325,6 +326,7 @@ jobs:
 
           Copy-Item 'target/${{ matrix.target }}/release/cpe_test.exe' (Join-Path $stage 'cpe_test.exe')
           Copy-Item 'dist/README-Windows-快速开始.md' $stage
+          Copy-Item 'dist/start_ui.bat' $stage
           Copy-Item 'dist/start_agent.bat' $stage
           Copy-Item 'dist/start_master.bat' $stage
           Copy-Item 'dist/start_master_select_config.bat' $stage
@@ -341,6 +343,7 @@ jobs:
             'cpe_test.exe',
             'ctsTraffic.exe',
             'README-Windows-快速开始.md',
+            'start_ui.bat',
             'start_agent.bat',
             'start_master.bat',
             'start_master_select_config.bat',
@@ -463,6 +466,7 @@ jobs:
               "cpe_test.exe",
               "ctsTraffic.exe",
               "README-Windows-快速开始.md",
+              "start_ui.bat",
               "start_agent.bat",
               "start_master.bat",
               "start_master_select_config.bat",
@@ -532,6 +536,17 @@ jobs:
           make_latest: true
           body: |
             cpe_test ${{ github.ref_name }} 的已验证跨平台发布包。
+
+            ## v4.3.0 Windows 实测修复与本地图形控制台
+
+            - **新增本地图形控制台**：`cpe_test ui` / `start_ui.bat` 只监听 `127.0.0.1`，可连接辅测机、按网口设置 RX 门限和 UDP `-b`、勾选网口组合/方向/协议/IP 版本，并扫描 TCP `-w` / `-P` 与 UDP `-b` 多档参数。支持任务预览、配置下载、实时进度、优雅结束和打开报告；执行仍统一调用 `run_master()`。
+            - **修复双向 UDP 判定互相污染**：有效窗口改为逐腿计算，一条腿失败不再清空另一条腿已经测得的网卡 RX；两腿是否真正并发作为独立事实写入原因。
+            - **修复 UDP 丢包率误报 0.000%**：支持 iperf3 的科学计数法百分比输出，只解析 receiver 汇总并用 `lost/total` 重新计算；缺少可信汇总时报告未知，不再用尾部 `0/0 (0%)` 覆盖结果。
+            - **保留收尾失败前的有效网卡证据**：iperf3 在结果交换阶段出现 control-message / connection-reset 错误时，只要有效采样窗口充足，性能结论继续依据接收端网卡数据；工具执行状态和错误原因仍完整保留。
+            - **新增计数器停滞检测和运行健康提示**：`stalled_ratio` / `COUNTER_STALLED` 区分“采样在线但字节计数不动”；连续零测量会在报告顶部告警，并可通过 `abort_after_dead_traffic_units` 选择自动中止。
+            - **负载与链路策略更贴近真实路径**：UDP 默认按发送端/接收端较低链路能力裁剪，Wi-Fi 使用稳定的 payload ceiling；新增 `link_profiles.by_role` 与 `by_nic`，允许按方向分别设置 RX 门限和 UDP 带宽。
+            - **长时间运行可追溯性增强**：每个测试单元前重新获取双端网卡，拓扑变化写入任务，网卡消失明确记为 `NIC_DISAPPEARED`；报告和控制台统一显示执行序号，并估算过大 TCP socket buffer 的在途数据。
+            - **回归覆盖**：单元测试 337 → 379，新增 WebUI 配置转换、安全边界、参数档位、零任务拒绝，以及 UDP 窗口、丢包、链路裁剪、计数器停滞和报告相关场景。
 
             ## v4.2.7 判定口径一致性、发送端采样与报告证据
 

@@ -1,0 +1,439 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CPE 子网测试控制台</title>
+<style>
+:root {
+  color-scheme:light dark;
+  --canvas:#f5f8fa; --surface:#ffffff; --ink:#17242d; --muted:#586873;
+  --line:#ccd7de; --head:#eaf0f3; --accent:#08638f; --accent-hover:#064e71;
+  --on-accent:#ffffff; --ok:#14733f; --ok-bg:#e4f3e9; --bad:#b3262e;
+  --bad-bg:#fbe8e9; --info-bg:#e4f1f7; --focus:#e59b22;
+  --log-bg:#11181c; --log-ink:#dce8ee; --edited:#edf7fb;
+}
+@media (prefers-color-scheme:dark) {
+  :root:not([data-theme="light"]) {
+    --canvas:#0f1417; --surface:#151c20; --ink:#edf3f5; --muted:#a7b5bd;
+    --line:#34434b; --head:#202b31; --accent:#68bce3; --accent-hover:#8bccea;
+    --on-accent:#07151c; --ok:#76d39b; --ok-bg:#183628; --bad:#ff969b;
+    --bad-bg:#452326; --info-bg:#183341; --focus:#ffc65c;
+    --log-bg:#090d0f; --log-ink:#d8e5ea; --edited:#18313b;
+  }
+}
+:root[data-theme="dark"] {
+  --canvas:#0f1417; --surface:#151c20; --ink:#edf3f5; --muted:#a7b5bd;
+  --line:#34434b; --head:#202b31; --accent:#68bce3; --accent-hover:#8bccea;
+  --on-accent:#07151c; --ok:#76d39b; --ok-bg:#183628; --bad:#ff969b;
+  --bad-bg:#452326; --info-bg:#183341; --focus:#ffc65c;
+  --log-bg:#090d0f; --log-ink:#d8e5ea; --edited:#18313b;
+}
+* { box-sizing:border-box; letter-spacing:0; }
+body { margin:0; background:var(--canvas); color:var(--ink); font-family:"Microsoft YaHei","PingFang SC","Segoe UI",sans-serif; font-size:14px; line-height:1.5; }
+.wrap { width:min(100%,1240px); min-height:100vh; margin:0 auto; background:var(--surface); border-inline:1px solid var(--line); }
+.app-header { padding:18px 22px 14px; border-bottom:3px solid var(--accent); display:flex; align-items:baseline; justify-content:space-between; gap:16px; }
+h1 { margin:0; font-size:21px; line-height:1.25; }
+.version { color:var(--muted); font:12px/1.4 ui-monospace,Consolas,monospace; font-variant-numeric:tabular-nums; }
+section { padding:18px 22px 20px; border-bottom:1px solid var(--line); }
+h2 { margin:0 0 12px; font-size:15px; display:flex; align-items:center; gap:8px; }
+h2 .n { display:inline-flex; width:22px; height:22px; flex:0 0 22px; align-items:center; justify-content:center; border-radius:50%; background:var(--accent); color:var(--on-accent); font:700 12px/1 ui-monospace,Consolas,monospace; }
+label { color:var(--muted); }
+input[type="text"], input[type="password"], input[type="number"] { min-height:32px; padding:5px 8px; border:1px solid var(--line); border-radius:4px; outline:0; font:inherit; background:var(--surface); color:var(--ink); }
+input[type="checkbox"] { width:16px; height:16px; accent-color:var(--accent); vertical-align:-3px; }
+input.num { width:92px; text-align:right; font-variant-numeric:tabular-nums; }
+input.bw { width:100px; font-family:ui-monospace,Consolas,monospace; }
+input.list { width:190px; font-family:ui-monospace,Consolas,monospace; }
+button { min-height:32px; padding:6px 14px; border:1px solid var(--accent); border-radius:4px; background:var(--accent); color:var(--on-accent); font:inherit; font-weight:600; line-height:1.2; cursor:pointer; }
+button:hover:not(:disabled) { background:var(--accent-hover); border-color:var(--accent-hover); }
+button.ghost { background:var(--surface); color:var(--accent); }
+button.ghost:hover:not(:disabled) { background:var(--info-bg); color:var(--accent); }
+button.danger { border-color:var(--bad); background:var(--surface); color:var(--bad); }
+button.danger:hover:not(:disabled) { background:var(--bad-bg); }
+button:disabled { opacity:.5; cursor:not-allowed; }
+button.big { min-height:38px; padding:8px 20px; }
+button:focus-visible, input:focus-visible { outline:2px solid var(--focus); outline-offset:2px; }
+.row { display:flex; flex-wrap:wrap; gap:10px 14px; align-items:center; }
+.toolbar { margin-bottom:10px; }
+.sweep-note { margin:0 0 10px; }
+.run-options { margin-top:10px; }
+.actions { justify-content:flex-end; margin-top:12px; }
+table { border-collapse:collapse; width:100%; font-size:13px; }
+#nics { min-width:960px; }
+#matrix { min-width:890px; }
+th, td { text-align:left; padding:7px 9px; border-bottom:1px solid var(--line); vertical-align:middle; }
+thead th { position:sticky; top:0; z-index:1; background:var(--head); color:var(--muted); font-size:12px; white-space:nowrap; }
+tbody tr:last-child td { border-bottom:0; }
+.scroll { max-width:100%; overflow:auto; border:1px solid var(--line); }
+.status { padding:8px 10px; border-left:3px solid currentColor; margin-top:10px; }
+.status.ok { background:var(--ok-bg); color:var(--ok); }
+.status.bad { background:var(--bad-bg); color:var(--bad); }
+.status.info { background:var(--info-bg); color:var(--accent); }
+.hint { color:var(--muted); font-size:12px; }
+.field-note { display:block; margin-top:3px; color:var(--muted); font-size:11px; white-space:nowrap; }
+input.touched { border-color:var(--accent); background:var(--edited); font-weight:700; }
+#log { height:420px; overflow:auto; padding:11px 12px; border:1px solid var(--line); background:var(--log-bg); color:var(--log-ink); font:12px/1.5 ui-monospace,Consolas,monospace; white-space:pre-wrap; overflow-wrap:anywhere; }
+.hidden { display:none !important; }
+.pairname { min-width:250px; font-weight:700; }
+.dirs { white-space:nowrap; }
+.dirs label { display:inline-flex; align-items:center; gap:4px; margin-right:9px; color:var(--ink); }
+pre.hint { font-family:ui-monospace,Consolas,monospace; }
+.plan-list { max-height:240px; overflow:auto; margin:10px 0 0; padding:8px 10px; border:1px solid var(--line); background:var(--canvas); }
+@media (max-width:700px) {
+  .wrap { border:0; }
+  .app-header, section { padding-inline:12px; }
+  .app-header { align-items:flex-start; }
+  .row > label { width:100%; display:grid; grid-template-columns:minmax(110px,auto) minmax(0,1fr); align-items:center; gap:8px; }
+  .row > label input:not([type="checkbox"]) { width:100%; }
+  .actions { justify-content:stretch; }
+  .actions button { flex:1 1 150px; }
+  #log { height:54vh; }
+}
+@media (prefers-reduced-motion:reduce) {
+  * { scroll-behavior:auto !important; }
+}
+</style>
+</head><body>
+<div class="wrap">
+  <header class="app-header">
+    <h1>CPE 子网测试控制台</h1>
+    <span class="version">LOCAL · 127.0.0.1</span>
+  </header>
+
+  <section>
+    <h2><span class="n">1</span>连接辅测机</h2>
+    <div class="row">
+      <label>辅测机 IP <input type="text" id="host" size="16" placeholder="10.228.46.50"></label>
+      <label>端口 <input type="number" id="port" class="num" value="28801"></label>
+      <label>token <input type="password" id="token" size="12" placeholder="留空=不认证"></label>
+      <button type="button" id="connect">连接</button>
+      <button type="button" id="refresh" class="ghost" disabled>刷新网口</button>
+    </div>
+    <div id="connstatus"></div>
+  </section>
+
+  <section id="nicsec" class="hidden">
+    <h2><span class="n">2</span>网口与策略</h2>
+    <div class="scroll"><table id="nics"><thead><tr>
+      <th>端</th><th>接口名</th><th>角色</th><th>IPv4</th><th>协商速率</th><th>网关</th>
+      <th>作为接收端：RX 门限</th><th>作为发送端：UDP -b</th>
+    </tr></thead><tbody></tbody></table></div>
+  </section>
+
+  <section id="matrixsec" class="hidden">
+    <h2><span class="n">3</span>测试矩阵</h2>
+    <div class="row toolbar">
+      <button type="button" class="ghost" id="all">全选</button>
+      <button type="button" class="ghost" id="none">全不选</button>
+      <button type="button" class="ghost" id="cross">只选跨机</button>
+      <span class="hint">默认全不选。每个组合至少保留一个方向、协议和 IP 版本。</span>
+    </div>
+    <div class="scroll"><table id="matrix"><thead><tr>
+      <th>测</th><th>配对</th><th>方向</th><th>协议</th><th>IP</th>
+    </tr></thead><tbody></tbody></table></div>
+  </section>
+
+  <section id="runsec" class="hidden">
+    <h2><span class="n">4</span>执行</h2>
+    <p class="hint sweep-note">
+      空格或逗号分隔多个档位。按网口填写 UDP -b 后，该发送端固定使用网口值；留空的发送端继续扫描全局档位。
+    </p>
+    <div class="row">
+      <label>TCP -w <input type="text" id="win" class="list" value="4m" placeholder="2m 4m 256m"></label>
+      <label>TCP -P <input type="text" id="tcpstreams" class="list" value="10" placeholder="1 5 10"></label>
+      <label>UDP -b <input type="text" id="udpbw" class="list" value="1000m" placeholder="1m 500m 1G"></label>
+    </div>
+    <div class="row run-options">
+      <label>时长 <input type="number" id="duration" class="num" value="180" min="1" max="86400"></label>
+      <label>UDP 流 <input type="number" id="udpstreams" class="num" value="1" min="1" max="32"></label>
+      <label><input type="checkbox" id="shot"> 截图</label>
+    </div>
+    <div class="row actions">
+      <button type="button" class="ghost" id="export">下载 config.json</button>
+      <button type="button" class="ghost" id="plan">预览任务</button>
+      <button type="button" class="big" id="start">开始测试</button>
+    </div>
+    <div id="planstatus"></div>
+  </section>
+
+  <section id="progsec" class="hidden">
+    <h2><span class="n">5</span>运行进度</h2>
+    <div class="row toolbar">
+      <span id="runstate" class="hint">准备中…</span>
+      <button type="button" class="danger hidden" id="stop">结束并出报告</button>
+      <button type="button" class="ghost hidden" id="openreport">打开报告</button>
+    </div>
+    <div id="log"></div>
+  </section>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let MASTER = null, AGENT = null, PAIRS = [], FROM = 0, TIMER = null;
+
+function say(el, text, kind) {
+  el.innerHTML = text ? '<div class="status ' + (kind || 'info') + '">' + esc(text) + '</div>' : '';
+}
+function esc(s) {
+  return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+}
+async function api(path, body) {
+  const opt = body === undefined ? {} : {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-CPE-Console': '1' },
+    body: JSON.stringify(body),
+  };
+  const r = await fetch(path, opt);
+  const j = await r.json();
+  if (!j.ok) throw new Error(j.error || '请求失败');
+  return j.data;
+}
+
+// 网口两两组合成可测配对。同机两块网卡也算，走的是回环/桥接路径，
+// 是被测设备的一种真实用法。
+function buildPairs() {
+  const eps = [];
+  MASTER.interfaces.forEach((n) => eps.push({ side: 'master', cn: '主控', nic: n }));
+  AGENT.interfaces.forEach((n) => eps.push({ side: 'agent', cn: '辅测', nic: n }));
+  const out = [];
+  for (let i = 0; i < eps.length; i++) {
+    for (let j = i + 1; j < eps.length; j++) {
+      const a = eps[i], b = eps[j];
+      out.push({
+        a, b,
+        cross: a.side !== b.side,
+        label: (a.side === b.side ? a.cn + '同机 ' : '跨机 ') +
+               a.nic.role + '(' + a.nic.name + ') ↔ ' + b.nic.role + '(' + b.nic.name + ')',
+      });
+    }
+  }
+  return out;
+}
+
+function renderNics(policies) {
+  const rows = [];
+  const configured = new Map((policies || []).map((policy) => [policy.endpoint, policy]));
+  const add = (side, cn, n, i) => {
+    const policy = configured.get(side + ':NAME=' + n.name) || {};
+    const target = policy.rx_target_mbps == null ? '' : String(policy.rx_target_mbps);
+    const bandwidth = policy.udp_bandwidth || '';
+    rows.push('<tr><td>' + cn + '</td><td>' + esc(n.name) + '</td><td>' + esc(n.role) +
+    '</td><td>' + esc(n.ipv4) + '</td><td>' + (n.speed_mbps || '?') + ' Mbps</td><td>' + esc(n.gateway_v4 || '—') +
+    '</td><td><input type="number" class="num nic-target' + (target ? ' touched' : '') + '" min="0.001" step="any" data-side="' + side + '" data-ni="' + i +
+    '" value="' + esc(target) + '" placeholder="不设门限"><span class="field-note">Mbps</span></td>' +
+    '<td><input type="text" class="bw nic-bw' + (bandwidth ? ' touched' : '') + '" data-side="' + side + '" data-ni="' + i +
+    '" value="' + esc(bandwidth) + '" placeholder="走全局档位"></td></tr>');
+  };
+  MASTER.interfaces.forEach((n, i) => add('master', '主控', n, i));
+  AGENT.interfaces.forEach((n, i) => add('agent', '辅测', n, i));
+  $('nics').querySelector('tbody').innerHTML = rows.join('');
+  document.querySelectorAll('.nic-target, .nic-bw').forEach((el) => {
+    el.addEventListener('input', () => el.classList.toggle('touched', el.value.trim() !== ''));
+  });
+}
+
+function renderMatrix() {
+  const rows = PAIRS.map((p, i) => {
+    const dirs = ['ab', 'ba', 'bidir'].map((d) =>
+      '<label><input type="checkbox" data-dir="' + d + '" data-i="' + i + '"' + (d === 'bidir' ? '' : ' checked') + '>' +
+      (d === 'ab' ? 'A→B' : d === 'ba' ? 'B→A' : '双向') + '</label>').join('');
+    const tp = ['tcp', 'udp'].map((t) =>
+      '<label><input type="checkbox" data-tp="' + t + '" data-i="' + i + '" checked>' + t.toUpperCase() + '</label>').join('');
+    const ip = ['v4', 'v6'].map((v) =>
+      '<label><input type="checkbox" data-ip="' + v + '" data-i="' + i + '"' + (v === 'v4' ? ' checked' : '') + '>' + v.toUpperCase() + '</label>').join('');
+    return '<tr>' +
+      '<td><input type="checkbox" class="sel" data-i="' + i + '"></td>' +
+      '<td class="pairname">' + esc(p.label) + '</td>' +
+      '<td class="dirs">' + dirs + '</td><td class="dirs">' + tp + '</td><td class="dirs">' + ip + '</td>' +
+      '</tr>';
+  });
+  $('matrix').querySelector('tbody').innerHTML = rows.join('');
+}
+
+function collectNicPolicies() {
+  if (!MASTER || !AGENT) return [];
+  return Array.from(document.querySelectorAll('.nic-target')).map((target) => {
+    const side = target.dataset.side, i = Number(target.dataset.ni);
+    const nic = (side === 'master' ? MASTER : AGENT).interfaces[i];
+    const bandwidth = document.querySelector('.nic-bw[data-side="' + side + '"][data-ni="' + i + '"]');
+    return {
+      endpoint: side + ':NAME=' + nic.name,
+      rx_target_mbps: target.value.trim() === '' ? null : Number(target.value),
+      udp_bandwidth: bandwidth.value.trim(),
+    };
+  });
+}
+
+function collect() {
+  const pairs = [];
+  document.querySelectorAll('.sel').forEach((box) => {
+    if (!box.checked) return;
+    const i = box.dataset.i;
+    const pick = (attr) => Array.from(document.querySelectorAll('[data-' + attr + '][data-i="' + i + '"]'))
+      .filter((e) => e.checked).map((e) => e.dataset[attr]);
+    const p = PAIRS[i];
+    pairs.push({
+      src: p.a.side + ':NAME=' + p.a.nic.name,
+      dst: p.b.side + ':NAME=' + p.b.nic.name,
+      directions: pick('dir'),
+      transports: pick('tp'),
+      ip: pick('ip'),
+    });
+  });
+  return {
+    pairs,
+    nic_policies: collectNicPolicies(),
+    duration: Number($('duration').value) || 180,
+    tcp_windows: splitList($('win').value),
+    tcp_streams: splitList($('tcpstreams').value).map(Number).filter((n) => n > 0),
+    udp_bandwidths: splitList($('udpbw').value),
+    udp_streams: Number($('udpstreams').value) || 1,
+    screenshot: $('shot').checked,
+  };
+}
+
+// 空格、逗号、中文逗号都当分隔符：手抄参数时这三种都会出现。
+function splitList(raw) {
+  return String(raw || '').split(/[\s,，]+/).map((v) => v.trim()).filter((v) => v !== '');
+}
+
+function hhmm(secs) {
+  const h = Math.floor(secs / 3600), m = Math.round((secs % 3600) / 60);
+  return h > 0 ? h + ' 小时 ' + m + ' 分' : m + ' 分';
+}
+
+async function bootstrap() {
+  try {
+    const d = await api('/api/bootstrap');
+    $('host').value = d.agent_host || '';
+    $('port').value = d.agent_port || 28801;
+    $('token').placeholder = d.token_configured ? '已从配置加载' : '留空=不认证';
+    $('duration').value = d.duration || 180;
+    $('win').value = (d.tcp_windows || []).join(' ');
+    $('tcpstreams').value = (d.tcp_streams || [10]).join(' ');
+    $('udpbw').value = (d.udp_bandwidths || []).join(' ');
+    $('udpstreams').value = d.udp_streams || 1;
+    $('shot').checked = Boolean(d.screenshot);
+  } catch (e) {
+    say($('connstatus'), '读取启动配置失败：' + e.message, 'bad');
+  }
+}
+
+function mergePolicies(configured, current) {
+  const merged = new Map();
+  (configured || []).forEach((policy) => merged.set(policy.endpoint, policy));
+  (current || []).forEach((policy) => merged.set(policy.endpoint, policy));
+  return Array.from(merged.values());
+}
+
+$('connect').onclick = async () => {
+  say($('connstatus'), '连接中…', 'info');
+  try {
+    const d = await api('/api/connect', {
+      host: $('host').value.trim(), port: Number($('port').value) || 28801, token: $('token').value.trim(),
+    });
+    MASTER = d.master; AGENT = d.agent;
+    say($('connstatus'), '已连接 ' + d.health.hostname + ' (' + d.health.os + ') · agent v' + d.health.version +
+      ' · iperf3 ' + (d.health.iperf3 || '未找到') + ' · ctsTraffic ' + (d.health.ctstraffic || '未找到'), 'ok');
+    PAIRS = buildPairs();
+    renderNics(d.nic_policies); renderMatrix();
+    ['nicsec', 'matrixsec', 'runsec'].forEach((id) => $(id).classList.remove('hidden'));
+    $('refresh').disabled = false;
+  } catch (e) { say($('connstatus'), e.message, 'bad'); }
+};
+
+$('refresh').onclick = async () => {
+  say($('connstatus'), '重新扫描双端网口…', 'info');
+  try {
+    const currentPolicies = collectNicPolicies();
+    const d = await api('/api/connect', { host: $('host').value.trim(), port: Number($('port').value) || 28801, token: $('token').value.trim() });
+    MASTER = d.master; AGENT = d.agent; PAIRS = buildPairs();
+    renderNics(mergePolicies(d.nic_policies, currentPolicies)); renderMatrix();
+    say($('connstatus'), '网口已刷新（' + new Date().toLocaleTimeString() + '）', 'ok');
+  } catch (e) { say($('connstatus'), e.message, 'bad'); }
+};
+
+$('all').onclick = () => document.querySelectorAll('.sel').forEach((b) => (b.checked = true));
+$('none').onclick = () => document.querySelectorAll('.sel').forEach((b) => (b.checked = false));
+$('cross').onclick = () => document.querySelectorAll('.sel').forEach((b) => (b.checked = PAIRS[b.dataset.i].cross));
+function selectedCount() { return document.querySelectorAll('.sel:checked').length; }
+
+$('export').onclick = async () => {
+  if (selectedCount() === 0) { say($('planstatus'), '一个测试项都没勾——先在上面的矩阵里选。', 'bad'); return; }
+  try {
+    const config = await api('/api/config', collect());
+    const blob = new Blob([JSON.stringify(config, null, 2) + '\n'], { type: 'application/json' });
+    const url = URL.createObjectURL(blob), link = document.createElement('a');
+    link.href = url; link.download = 'cpe_test-ui-config.json';
+    document.body.appendChild(link); link.click(); link.remove();
+    URL.revokeObjectURL(url);
+    say($('planstatus'), '配置已下载。可用 master --auto --config 直接重跑。', 'ok');
+  } catch (e) { say($('planstatus'), e.message, 'bad'); }
+};
+
+$('plan').onclick = async () => {
+  if (selectedCount() === 0) { say($('planstatus'), '一个测试项都没勾——先在上面的矩阵里选。', 'bad'); return; }
+  say($('planstatus'), '生成中…', 'info');
+  try {
+    const d = await api('/api/plan', collect());
+    if (d.units.length === 0) throw new Error('当前选择没有生成可执行单元，请检查 IP 版本和网口组合。');
+    const head = '共 ' + d.units.length + ' 个测试单元，预计 ' + hhmm(d.est_total_secs) + '。';
+    const list = d.units.slice(0, 200).map((u) => '#' + u.seq + ' ' + u.title).join('\n');
+    $('planstatus').innerHTML = '<div class="status info">' + esc(head) +
+      (d.notices.length ? '<br>提示：' + esc(d.notices.join('；')) : '') +
+      '</div><pre class="hint plan-list">' + esc(list) + '</pre>';
+  } catch (e) { say($('planstatus'), e.message, 'bad'); }
+};
+
+$('start').onclick = async () => {
+  if (selectedCount() === 0) { say($('planstatus'), '一个测试项都没勾——先在上面的矩阵里选。', 'bad'); return; }
+  try {
+    await api('/api/run', collect());
+    $('progsec').classList.remove('hidden');
+    const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    $('progsec').scrollIntoView({ behavior: reduceMotion ? 'auto' : 'smooth' });
+    $('start').disabled = true; $('plan').disabled = true; $('export').disabled = true;
+    $('stop').disabled = false; $('stop').classList.remove('hidden');
+    $('openreport').classList.add('hidden');
+    FROM = 0; $('log').textContent = '';
+    if (TIMER) clearInterval(TIMER);
+    TIMER = setInterval(poll, 1000);
+    poll();
+  } catch (e) { say($('planstatus'), e.message, 'bad'); }
+};
+
+$('stop').onclick = async () => {
+  try {
+    await api('/api/stop', {});
+    $('stop').disabled = true;
+    $('runstate').textContent = '正在结束当前单元并生成报告…';
+  } catch (e) { $('runstate').textContent = e.message; }
+};
+
+$('openreport').onclick = async () => {
+  try { await api('/api/open-report', {}); }
+  catch (e) { $('runstate').textContent = e.message; }
+};
+
+async function poll() {
+  try {
+    const d = await api('/api/progress?from=' + FROM);
+    FROM = d.from;
+    if (d.lines.length) {
+      const box = $('log');
+      const stick = box.scrollTop + box.clientHeight >= box.scrollHeight - 40;
+      box.textContent += d.lines.join('\n') + '\n';
+      if (stick) box.scrollTop = box.scrollHeight;
+    }
+    $('runstate').textContent = d.running ? '运行中…' : '已结束';
+    if (d.report) {
+      $('openreport').classList.remove('hidden');
+    }
+    if (!d.running) {
+      clearInterval(TIMER); TIMER = null;
+      $('stop').classList.add('hidden');
+      $('start').disabled = false; $('plan').disabled = false; $('export').disabled = false;
+    }
+  } catch (e) { /* 轮询失败不打断界面，下一拍再试 */ }
+}
+bootstrap();
+</script>
+</body></html>

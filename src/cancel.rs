@@ -11,8 +11,15 @@
 //! 非 Windows：使用 `ctrlc` crate。
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Once;
 
 static CANCELLED: AtomicBool = AtomicBool::new(false);
+static HANDLER_SETUP: Once = Once::new();
+
+#[cfg(windows)]
+use std::sync::atomic::AtomicU32;
+#[cfg(windows)]
+static PRESS_COUNT: AtomicU32 = AtomicU32::new(0);
 
 /// 是否收到了取消信号（Ctrl+C）
 pub fn is_cancelled() -> bool {
@@ -24,42 +31,54 @@ pub fn cancel_flag() -> &'static AtomicBool {
     &CANCELLED
 }
 
+/// 请求当前测试优雅结束。Web 控制台的“结束并出报告”和 Ctrl+C 共用同一信号。
+pub fn request_cancel() {
+    CANCELLED.store(true, Ordering::SeqCst);
+}
+
+/// 开始新一轮长驻进程内测试前重置取消状态。
+///
+/// 命令行模式一次进程只跑一轮，不需要调用；Web 控制台会在同一进程内连续运行，
+/// 若不重置，上一轮的 Ctrl+C 或页面停止会让下一轮在第一个单元前立刻退出。
+pub fn reset() {
+    CANCELLED.store(false, Ordering::SeqCst);
+    #[cfg(windows)]
+    PRESS_COUNT.store(0, Ordering::SeqCst);
+}
+
 /// 注册 Ctrl+C 处理器。
 ///
 /// 第一次按下：设置取消标志，主循环检测到后中断测试并生成报告。
 /// 第二次按下：强退。
 pub fn setup_cancel_handler() {
-    #[cfg(windows)]
-    {
-        use std::sync::atomic::AtomicU32;
-        use windows::Win32::Foundation::BOOL;
-        use windows::Win32::System::Console::SetConsoleCtrlHandler;
+    HANDLER_SETUP.call_once(|| {
+        #[cfg(windows)]
+        {
+            use windows::Win32::Foundation::BOOL;
+            use windows::Win32::System::Console::SetConsoleCtrlHandler;
 
-        static PRESS_COUNT: AtomicU32 = AtomicU32::new(0);
-
-        unsafe extern "system" fn handler(ctrl_type: u32) -> BOOL {
-            // CTRL_C_EVENT = 0
-            if ctrl_type == 0 {
-                CANCELLED.store(true, Ordering::SeqCst);
-                let count = PRESS_COUNT.fetch_add(1, Ordering::SeqCst);
-                if count == 0 {
-                    // 第一次：吃掉信号，阻止 cmd.exe 弹出 "Terminate batch job?"
-                    return BOOL::from(true);
+            unsafe extern "system" fn handler(ctrl_type: u32) -> BOOL {
+                // CTRL_C_EVENT = 0
+                if ctrl_type == 0 {
+                    request_cancel();
+                    let count = PRESS_COUNT.fetch_add(1, Ordering::SeqCst);
+                    if count == 0 {
+                        // 第一次：吃掉信号，阻止 cmd.exe 弹出 "Terminate batch job?"
+                        return BOOL::from(true);
+                    }
                 }
+                // 第二次或非 CTRL_C：交给默认处理器
+                BOOL::from(false)
             }
-            // 第二次或非 CTRL_C：交给默认处理器
-            BOOL::from(false)
+
+            unsafe {
+                let _ = SetConsoleCtrlHandler(Some(handler), true);
+            }
         }
 
-        unsafe {
-            let _ = SetConsoleCtrlHandler(Some(handler), true);
+        #[cfg(not(windows))]
+        {
+            let _ = ctrlc::set_handler(request_cancel);
         }
-    }
-
-    #[cfg(not(windows))]
-    {
-        let _ = ctrlc::set_handler(move || {
-            CANCELLED.store(true, Ordering::SeqCst);
-        });
-    }
+    });
 }

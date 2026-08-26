@@ -29,6 +29,15 @@ pub struct Config {
     pub resume: bool,
     /// 测试完自动打开 HTML 报告
     pub open_report: bool,
+    /// 连续这么多个灌包单元一条测量都没产生时，中止剩余队列。0 表示只告警不中止。
+    ///
+    /// 默认 0 是刻意的保守选择：「连续零测量」区分不了「被测设备掉线」和
+    /// 「其中一对网口本来就不通」——后者在多配对批量测试里很常见，自动中止
+    /// 会把别的配对一起砍掉。告警无论如何都会打，报告顶部也会留痕；
+    /// 需要无人值守跑长队列时再把它设成 2~3。
+    pub abort_after_dead_traffic_units: usize,
+    /// 按角色配对 / 按单块网卡给出的 RX 门限与 UDP 带宽。
+    pub link_profiles: LinkProfiles,
     pub iperf: IperfCfg,
     /// Windows 专用 ctsTraffic 后端的简化默认参数。
     pub ctstraffic: CtsTrafficCfg,
@@ -112,6 +121,8 @@ impl Default for Config {
             screenshot: true,
             resume: false,
             open_report: true,
+            abort_after_dead_traffic_units: 0,
+            link_profiles: LinkProfiles::default(),
             iperf: IperfCfg::default(),
             ctstraffic: CtsTrafficCfg::default(),
             ping: PingCfg::default(),
@@ -231,6 +242,16 @@ pub struct RateCheckCfg {
     pub evb_eth_to_usb_target_mbps: f64,
     /// RNDIS/SGMII2.5G/受限 CPE 子网的默认负载上限，不直接作为 PASS 目标。
     pub cpe_path_ceiling_mbps: f64,
+    /// WiFi 网卡的负载上限，**不跟随协商速率**。
+    ///
+    /// WiFi 的「协商速率」是 PHY 速率，既不等于可用载荷，也会随信道条件在
+    /// 一轮测试里反复跳（同一块 Wi-Fi 7 网卡会在 2402 / 2882 之间来回）。
+    /// 拿它去裁 UDP 的 -b，等于让灌包强度跟着一个抖动的数字走，
+    /// 前后两个单元的测试条件都不一样。
+    ///
+    /// 实践中 WiFi 一律按同一档灌（例如无论协商到 2.4G 还是 2.8G 都用
+    /// -b 2.6G），所以这里给一个固定值，默认 2800 恰好容得下 2.6G。
+    pub wifi_payload_ceiling_mbps: f64,
     pub max_udp_loss_pct: Option<f64>,
 }
 
@@ -252,9 +273,69 @@ impl Default for RateCheckCfg {
             evb_usb_to_eth_target_mbps: 6400.0,
             evb_eth_to_usb_target_mbps: 8400.0,
             cpe_path_ceiling_mbps: 2500.0,
+            wifi_payload_ceiling_mbps: 2800.0,
             max_udp_loss_pct: None,
         }
     }
+}
+
+/// 按方向给出的 UDP 单流带宽，形状与 `RateTargets` 一致。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct DirectionalBandwidth {
+    pub forward: Option<String>,
+    pub ab: Option<String>,
+    pub ba: Option<String>,
+}
+
+impl DirectionalBandwidth {
+    pub fn for_direction(&self, direction: &str) -> Option<&str> {
+        match direction {
+            "ba" => self.ba.as_deref().or(self.forward.as_deref()),
+            _ => self.ab.as_deref().or(self.forward.as_deref()),
+        }
+    }
+}
+
+/// 一条**角色配对**的策略，例如 `SGMII2.5G<->WIFI5G`。
+///
+/// 配对串左边是 A、右边是 B，`ab` / `ba` 相对这个顺序解释，与运行时某个
+/// 单元自己的 A/B 无关——同一条物理链路在不同单元里可能正反着排。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct RoleProfile {
+    /// `角色A<->角色B`
+    pub pair: String,
+    pub rx_target_mbps: RateTargets,
+    pub udp_bandwidth: DirectionalBandwidth,
+}
+
+/// 单块网卡的覆盖项。同一角色的两块网卡实测能力可以差很多
+/// （Wi-Fi 7 BE200 和普通 5G 网卡都归 `WIFI5G`），角色层给默认值，
+/// 这一层给例外。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct NicProfile {
+    /// `master` / `agent`
+    pub host: String,
+    /// 接口名，与网卡扫描里显示的一致
+    pub name: String,
+    /// 可选：同名接口有歧义时再用 IPv4 收窄
+    pub ipv4: String,
+    /// 作为**接收端**时的门限
+    pub rx_target_mbps: Option<f64>,
+    /// 作为**发送端**时的 UDP 单流带宽
+    pub udp_bandwidth: Option<String>,
+}
+
+/// 两层链路策略：角色兜底 + 单口覆盖。
+///
+/// 不配置时整个节点为空，全部走既有的内置推导，老配置行为不变。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct LinkProfiles {
+    pub by_role: Vec<RoleProfile>,
+    pub by_nic: Vec<NicProfile>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -271,14 +352,6 @@ pub struct UdpProfile {
 pub(crate) struct ParsedBandwidth {
     pub mbps: f64,
     pub bits_per_second: u64,
-}
-
-impl ParsedBandwidth {
-    /// iperf3 的无后缀带宽值按 bit/s 解释。传精确整数可避免依赖其对
-    /// `Gbps` 等长后缀的非文档兼容行为。
-    pub fn iperf_arg(self) -> String {
-        self.bits_per_second.to_string()
-    }
 }
 
 impl UdpProfile {
@@ -548,6 +621,7 @@ impl Config {
             ("evb_usb_to_eth_target_mbps", rc.evb_usb_to_eth_target_mbps),
             ("evb_eth_to_usb_target_mbps", rc.evb_eth_to_usb_target_mbps),
             ("cpe_path_ceiling_mbps", rc.cpe_path_ceiling_mbps),
+            ("wifi_payload_ceiling_mbps", rc.wifi_payload_ceiling_mbps),
         ] {
             if !value.is_finite() || value <= 0.0 {
                 problems.push(format!(
@@ -764,8 +838,9 @@ mod tests {
         assert_eq!(mbps("2.8Gbps"), Some(2800.0));
         assert_eq!(mbps("2,8gBpS"), Some(2800.0));
         let parsed = UdpProfile::bw("2.8Gbps").parsed_bandwidth().unwrap();
+        // 下发给 iperf3 的是这个精确整数 bit/s（见 builder::UdpLoad::iperf_arg），
+        // 不依赖它对 `Gbps` 等长后缀的非文档兼容行为。
         assert_eq!(parsed.bits_per_second, 2_800_000_000);
-        assert_eq!(parsed.iperf_arg(), "2800000000");
         for invalid in [
             "",
             "2.8oopsGbps",

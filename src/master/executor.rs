@@ -14,8 +14,8 @@ use crate::master::builder::{
 };
 use crate::master::rate_window::{
     evaluate_nic_rx, monitor_rate_stats, nearest_valid_sample, percentile,
-    rate_sample_coverage_sufficient, rate_window_coverage_sufficient, EffectiveWindow,
-    MIN_VALID_RX_MBPS,
+    rate_sample_coverage_sufficient, rate_window_coverage_sufficient, EffectiveWindow, RateStats,
+    MIN_RATE_SAMPLE_COVERAGE, MIN_VALID_RX_MBPS,
 };
 use crate::nic::monitor::MonitorMgr;
 use crate::ping;
@@ -42,11 +42,24 @@ const RELIABLE_HTTP_RETRY_DELAY: Duration = Duration::from_millis(250);
 const RESOURCE_CLEANUP_WAIT_SECS: u64 = 10;
 static RESOURCE_OWNER_SEQ: AtomicU64 = AtomicU64::new(1);
 
+/// 双端网卡快照的来源。每个测试单元开始前调用一次。
+///
+/// 做成可注入而不是在执行器里硬编码一次 `/info`：执行器的单测用脚本化
+/// transport 精确控制每一次 RPC 的时序与失败，硬加一次调用会把几十个
+/// 与拓扑无关的用例全部拖下水。生产路径由 `ui.rs` 注入实现，
+/// 测试里保持 `None` 即维持旧行为。
+pub trait TopologySource: Send + Sync {
+    /// 返回 (主控, 辅测) 的最新网卡快照。
+    fn snapshot(&self) -> Result<(HostInfo, HostInfo), String>;
+}
+
 pub struct Ctx {
     pub agent_host: String,
     pub agent_port: u16,
     pub cfg: Config,
     pub outdir: PathBuf,
+    /// 每个单元开始前重新拉取双端网卡；`None` 表示沿用计划时的快照。
+    pub topology: Option<Arc<dyn TopologySource>>,
     /// Agent RPC transport. Production uses TCP; tests can inject a scripted
     /// transport to model loss, delay, truncation, and reordering.
     pub transport: Arc<dyn http_client::Transport>,
@@ -177,6 +190,9 @@ fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
         .unwrap_or_else(|| "未知 panic".into())
 }
 
+/// 连续多少个「零测量」灌包单元开始告警。只影响提示，不影响是否中止。
+pub const DEAD_TRAFFIC_STREAK_WARN: usize = 2;
+
 #[derive(Debug, Default, Clone)]
 pub struct RunSummary {
     pub pass: usize,
@@ -192,6 +208,14 @@ pub struct RunSummary {
     pub traffic_usable_units: usize,
     /// 最终判为 SETUP_ERROR 的灌包单元数。
     pub traffic_setup_errors: usize,
+    /// 本轮出现过的「连续零测量灌包单元」最长连击。
+    ///
+    /// run_20260825_215915_7684 的尾部有 6 个单元一条测量都没产生、白跑了
+    /// 21 分钟，而工具全程没有任何提示——这个数就是为了让那件事在报告里
+    /// 留下痕迹（见 .ai/DESIGN-v4.3.0.md D6）。
+    pub max_dead_traffic_streak: usize,
+    /// 因连续零测量而主动中止剩余队列时，记录中止点（已执行的单元序号）。
+    pub aborted_at_unit: Option<usize>,
 }
 
 impl RunSummary {
@@ -206,6 +230,29 @@ impl RunSummary {
         self.traffic_units += other.traffic_units;
         self.traffic_usable_units += other.traffic_usable_units;
         self.traffic_setup_errors += other.traffic_setup_errors;
+        self.max_dead_traffic_streak = self
+            .max_dead_traffic_streak
+            .max(other.max_dead_traffic_streak);
+        self.aborted_at_unit = self.aborted_at_unit.or(other.aborted_at_unit);
+    }
+
+    /// 报告顶部的「运行健康」横幅文案；一切正常时为空。
+    pub fn run_health_banner(&self) -> String {
+        if let Some(at) = self.aborted_at_unit {
+            return format!(
+                "本轮在第 {at} 个单元后主动中止：连续 {} 个灌包单元一条测量都没产生，\
+                 继续跑下去只会产生更多空数据。请先确认被测设备是否掉线或重启，再重跑剩余项。",
+                self.max_dead_traffic_streak
+            );
+        }
+        if self.max_dead_traffic_streak >= DEAD_TRAFFIC_STREAK_WARN {
+            return format!(
+                "本轮出现过连续 {} 个灌包单元一条测量都没产生。这通常意味着测试中途链路或\
+                 被测设备失联，这些单元的结论不代表设备性能。",
+                self.max_dead_traffic_streak
+            );
+        }
+        String::new()
     }
 
     /// 只要本轮确实选择了流量测试，但一项有效速率测量都没有，就需要追加
@@ -1572,9 +1619,24 @@ impl Ctx {
     ) -> RunSummary {
         let mut sum = RunSummary::default();
         let total = units.len();
+        let mut dead_streak = 0usize;
         for (i, unit) in units.iter().enumerate() {
             if crate::cancel::is_cancelled() {
                 logln("\n!! 用户中断 (Ctrl+C)，正在生成部分报告...");
+                break;
+            }
+            // 熔断检查放在循环开头而不是结尾：单元有多条 `continue` 提前退出的
+            // 路径（resume 命中、前置拦截、网卡消失），放在结尾时那些路径会
+            // 整个跳过它。而「网卡消失」恰恰是本设置最该拦住的场景——被测设备
+            // 掉线后每个单元的开跑前重扫都会看到网卡不见了，队列会一路空转到底。
+            let abort_at = self.cfg.abort_after_dead_traffic_units;
+            if abort_at > 0 && dead_streak >= abort_at {
+                logln(&format!(
+                    "\n!! 连续 {dead_streak} 个灌包单元没有产生任何测量，按 abort_after_dead_traffic_units={abort_at} 中止剩余 {} 个单元。\n\
+                     !! 请先确认被测设备是否掉线或重启，再重跑剩余项；已完成的部分会照常出报告。",
+                    total.saturating_sub(i)
+                ));
+                sum.aborted_at_unit = Some(i);
                 break;
             }
             let useq = sequence_offset + i;
@@ -1584,6 +1646,66 @@ impl Ctx {
             }
             let blocked = preflight_blocks.and_then(|blocks| blocks.get(&unit.id));
             logln(&format!("\n[{}/{}] {}", i + 1, total, unit.title));
+
+            // 用最新一次双端扫描刷新本单元的网卡信息。拉不到就沿用计划时的
+            // 快照继续跑——一次 RPC 抖动不该废掉整轮测试。
+            let refreshed;
+            let mut unit = unit;
+            if let Some(source) = &self.topology {
+                match source.snapshot() {
+                    Ok((master, agent)) => {
+                        let mut patched = unit.clone();
+                        let drifts = crate::master::builder::refresh_unit_endpoints(
+                            &mut patched,
+                            &master,
+                            &agent,
+                        );
+                        for drift in &drifts {
+                            logln(&format!("  [拓扑变更] {}", drift.describe()));
+                        }
+                        if let Some(gone) = drifts.iter().find(|drift| drift.is_gone()) {
+                            // 对着一块已经不存在的网卡起 monitor 只会采到别的东西
+                            // 或者静默采空，这种单元必须当场判死而不是照跑。
+                            let detail = format!(
+                                "{}；本单元用到的网卡在开始前已不存在，无法采样",
+                                gone.describe()
+                            );
+                            logln(&format!("  !! {detail}"));
+                            sum.setup_error += 1;
+                            sum.fail += 1;
+                            if is_traffic_unit {
+                                sum.traffic_setup_errors += 1;
+                                dead_streak += 1;
+                                sum.max_dead_traffic_streak =
+                                    sum.max_dead_traffic_streak.max(dead_streak);
+                            }
+                            self.push_row(Row {
+                                sort_key: (useq, 0, 0, 0),
+                                time: now_full(),
+                                task_id: unit.id.clone(),
+                                parent_id: unit.id.clone(),
+                                task: unit.title.clone(),
+                                verdict: Verdict::SetupError,
+                                execution_status: ExecutionStatus::Error,
+                                reason_code: "NIC_DISAPPEARED".into(),
+                                reason_detail: detail,
+                                kind_label: "跳过(网卡已消失)".into(),
+                                is_unit_summary: true,
+                                ..Default::default()
+                            });
+                            continue;
+                        }
+                        refreshed = patched;
+                        unit = &refreshed;
+                    }
+                    Err(error) => {
+                        logln(&format!(
+                            "  (网卡快照刷新失败，沿用计划时的信息继续: {error})"
+                        ));
+                    }
+                }
+            }
+
             if self.cfg.resume && blocked.is_none() {
                 let fresh = { lock_recover(&self.db).fresh_pass(&unit.id) };
                 if let Some(t) = fresh {
@@ -1702,8 +1824,21 @@ impl Ctx {
 
             let unit_verdict = aggregate_unit_verdict(&outcomes);
             if is_traffic_unit {
-                if blocked.is_none() && self.outcomes_have_usable_traffic_measurement(&outcomes) {
+                let usable =
+                    blocked.is_none() && self.outcomes_have_usable_traffic_measurement(&outcomes);
+                if usable {
                     sum.traffic_usable_units += 1;
+                    dead_streak = 0;
+                } else {
+                    // 「一条测量都没产生」和「测出来不达标」是两回事，这里只数前者。
+                    dead_streak += 1;
+                    sum.max_dead_traffic_streak = sum.max_dead_traffic_streak.max(dead_streak);
+                    if dead_streak >= DEAD_TRAFFIC_STREAK_WARN {
+                        logln(&format!(
+                            "  !! 连续 {dead_streak} 个灌包单元没有产生任何测量——被测设备可能已掉线。\
+                             后续单元大概率也是空跑；要自动中止请设 abort_after_dead_traffic_units。"
+                        ));
+                    }
                 }
                 if unit_verdict == Verdict::SetupError {
                     sum.traffic_setup_errors += 1;
@@ -3676,30 +3811,18 @@ impl Ctx {
             .unwrap_or_default();
 
         let measurement = parsed.has_measurement();
-        let (verdict, reason_code, reason_detail) = if !raw_ok {
-            (
-                Verdict::SetupError,
-                "IPERF_EXEC_FAILED".to_string(),
-                client.output.lines().last().unwrap_or_default().to_string(),
-            )
-        } else if !measurement {
-            (
-                Verdict::RateFail,
-                "NO_VALID_MEASUREMENT".to_string(),
-                "iperf3 已结束，但没有 rate/bytes 吞吐测量".into(),
-            )
-        } else if !effective_window.complete {
-            (
-                Verdict::NotEvaluated,
-                "IPERF_EFFECTIVE_WINDOW_SHORT".to_string(),
-                format!(
-                    "iperf3 真实流量事件窗口仅 {:.3}s，短于要求的 {}s；未把 server 启动、连接或清理时间计入平均速率",
-                    effective_window.available_secs, t.duration
-                ),
-            )
-        } else {
-            evaluate_nic_rx(t.rate_mode, t.rx_target_mbps, &rx_stats, &tx_stats)
-        };
+        let (verdict, reason_code, reason_detail) = iperf_flow_verdict(IperfFlowVerdictIn {
+            raw_ok,
+            measurement,
+            effective_window: &effective_window,
+            required_secs: t.duration,
+            rate_mode: t.rate_mode,
+            rx_target_mbps: t.rx_target_mbps,
+            rx_stats: &rx_stats,
+            tx_stats: &tx_stats,
+            client_tail: client.output.lines().last().unwrap_or_default(),
+            rx_monitor: mon_out.as_ref(),
+        });
         let raw_error = if raw_ok {
             String::new()
         } else {
@@ -4467,25 +4590,51 @@ impl Ctx {
             }
         }
 
-        let effective_window = select_udp_effective_window(
+        let windows = select_udp_effective_windows(
             plans,
             &results,
             &monitor_outputs,
             &self.cfg.iperf.rate_check,
         );
-        logln(&format!(
-            "    有效窗口: {:.1}s / {}s{}",
-            effective_window.available_secs,
-            effective_window.required_secs,
-            if effective_window.complete {
-                "（满足）"
-            } else {
-                "（不足，不能正式判定）"
-            }
-        ));
+        for (leg_pos, window) in windows.per_leg.iter().enumerate() {
+            logln(&format!(
+                "    有效窗口[{}]: {:.1}s / {}s{}",
+                plans
+                    .get(leg_pos)
+                    .map(|plan| plan.tag.as_str())
+                    .unwrap_or("?"),
+                window.available_secs,
+                window.required_secs,
+                if window.complete {
+                    "（满足）"
+                } else {
+                    "（不足，不能正式判定）"
+                }
+            ));
+        }
+        if plans.len() > 1 {
+            logln(&format!(
+                "    双向并发重叠: {:.1}s{}",
+                windows.concurrency_secs,
+                if windows.concurrency_secs <= 0.0 {
+                    "（两条腿没有真正同时在跑，各腿结论只代表单向条件）"
+                } else {
+                    ""
+                }
+            ));
+        }
 
         let mut outcomes = Vec::new();
         for (leg_pos, plan) in plans.iter().enumerate() {
+            let effective_window =
+                windows
+                    .per_leg
+                    .get(leg_pos)
+                    .cloned()
+                    .unwrap_or_else(|| EffectiveWindow {
+                        required_secs: plan.streams.first().map(|t| t.duration).unwrap_or(0),
+                        ..Default::default()
+                    });
             let leg_flows: Vec<&UdpFlowRun> =
                 results.iter().filter(|r| r.leg_pos == leg_pos).collect();
             let n = plan.streams.len();
@@ -4596,8 +4745,23 @@ impl Ctx {
                     Verdict::NotEvaluated,
                     "EFFECTIVE_WINDOW_SHORT".to_string(),
                     format!(
-                        "共同有效窗口 {:.1}s，要求 {}s",
-                        effective_window.available_secs, effective_window.required_secs
+                        "本方向有效窗口 {:.1}s，要求 {}s{}",
+                        effective_window.available_secs,
+                        effective_window.required_secs,
+                        lifecycle_rx_hint(monitor_outputs.get(&first.dst.key()))
+                    ),
+                )
+            } else if rx_stats.stalled_ratio > 1.0 - MIN_RATE_SAMPLE_COVERAGE {
+                // 与 evaluate_nic_rx 的同名判据保持一致：两条判定链在
+                // 「采样是否可信」上必须给出相同结论，否则同一种故障在
+                // TCP 和 UDP 路径上会被写成两种不同的原因码。
+                (
+                    Verdict::NotEvaluated,
+                    "COUNTER_STALLED".to_string(),
+                    format!(
+                        "判定窗口内接收端 OS 网卡计数器有 {:.1}% 的时间零增长（采到了样本，\
+                         但字节计数一直没推进），本轮平均速率不可信",
+                        rx_stats.stalled_ratio * 100.0
                     ),
                 )
             } else if !rate_present || !sample_coverage_sufficient {
@@ -4695,6 +4859,28 @@ impl Ctx {
                 )
             } else {
                 (Verdict::Pass, String::new(), String::new())
+            };
+            // 「这条腿测到了多少」和「两条腿有没有真正并发」是两件事，必须
+            // 分别说清楚。腿级窗口让前者不再被后者连坐，但如果不把后者显式
+            // 写出来，读报告的人会把单向条件下的数字当成双向并发结果。
+            let reason_detail = if plans.len() > 1 && windows.concurrency_secs <= 0.0 {
+                let peers: Vec<&str> = plans
+                    .iter()
+                    .enumerate()
+                    .filter(|(pos, _)| *pos != leg_pos)
+                    .map(|(_, other)| other.tag.as_str())
+                    .collect();
+                let head = format!(
+                    "并发重叠 0.0s（对向 {} 没有同时跑通，本行只代表单向条件下的实测）",
+                    peers.join("/")
+                );
+                if reason_detail.is_empty() {
+                    head
+                } else {
+                    format!("{head}；{reason_detail}")
+                }
+            } else {
+                reason_detail
             };
             let discovery_table = if first.rate_mode == RateMode::Discover {
                 monitor_outputs
@@ -6139,49 +6325,103 @@ fn udp_flow_detail_outcome(
     }
 }
 
-fn select_udp_effective_window(
+/// 一个 UDP 单元里各条方向腿的判定窗口。
+pub(crate) struct UdpUnitWindows {
+    /// 每条腿各自的有效窗口，下标与 `plans` 对齐。
+    pub per_leg: Vec<EffectiveWindow>,
+    /// 各腿窗口的交集时长（秒）。
+    ///
+    /// **只用于说明「双向并发」这件事到底成没成立，不参与任何一条腿的判定。**
+    pub concurrency_secs: f64,
+}
+
+/// 逐腿计算判定窗口，并另外给出各腿的重叠时长。
+///
+/// 这里曾经只产出**一个**全单元共用的窗口，做法是把所有腿的采样区间求交集
+/// （`lower.max` / `upper.min`），再要求每个时刻**每条腿**都有足够活跃流。
+/// 于是双向单元里只要有一条腿没跑通，交集就是空的，另一条腿哪怕整整三分钟
+/// 都在满速跑，也会被写成「RX均值=- 覆盖率=0.0% NOT_EVALUATED」。
+///
+/// run_20260825_215915_7684 的任务 10/12/34/36 就是这样丢掉了 8 行数据，
+/// 其中 unit-33-34 的接收端网卡 205/208 个样本有流量、均值 923.08Mbps，
+/// CSV 就在盘上，报表却说没采到（见 .ai/DESIGN-v4.3.0.md D1）。
+///
+/// 一条腿失败是一条腿的事实，不能抹掉另一条腿测到的真实速率；而「两条腿没有
+/// 真正并发」是另一件需要单独说清楚的事实——所以拆成两个返回值，而不是让前者
+/// 沉默地吃掉后者。
+fn select_udp_effective_windows(
     plans: &[UdpLegPlan],
     results: &[UdpFlowRun],
     monitors: &HashMap<String, MonitorStopOut>,
     rate_cfg: &RateCheckCfg,
-) -> EffectiveWindow {
+) -> UdpUnitWindows {
     let required_secs = plans
         .iter()
         .flat_map(|plan| plan.streams.iter().map(|task| task.duration))
         .max()
         .unwrap_or(0);
-    let mut lower = 0u64;
-    let mut upper = u64::MAX;
-    for plan in plans {
-        let Some(first) = plan.streams.first() else {
-            continue;
-        };
-        let Some(out) = monitors.get(&first.dst.key()) else {
-            return EffectiveWindow {
-                required_secs,
-                ..Default::default()
-            };
-        };
-        let Some(first_sample) = out.samples.iter().find(|sample| sample.valid) else {
-            return EffectiveWindow {
-                required_secs,
-                ..Default::default()
-            };
-        };
-        let Some(last_sample) = out.samples.iter().rev().find(|sample| sample.valid) else {
-            return EffectiveWindow {
-                required_secs,
-                ..Default::default()
-            };
-        };
-        lower = lower.max(first_sample.elapsed_ms);
-        upper = upper.min(last_sample.elapsed_ms);
+    let per_leg: Vec<EffectiveWindow> = plans
+        .iter()
+        .enumerate()
+        .map(|(leg_pos, plan)| {
+            leg_effective_window(leg_pos, plan, results, monitors, rate_cfg, required_secs)
+        })
+        .collect();
+
+    // 交集：任一腿窗口为空则并发时长为 0。
+    let mut overlap_start = 0u64;
+    let mut overlap_end = u64::MAX;
+    for window in &per_leg {
+        if window.end_ms <= window.start_ms {
+            overlap_end = 0;
+            break;
+        }
+        overlap_start = overlap_start.max(window.start_ms);
+        overlap_end = overlap_end.min(window.end_ms);
     }
-    if upper <= lower || upper == u64::MAX {
-        return EffectiveWindow {
-            required_secs,
-            ..Default::default()
-        };
+    let concurrency_secs = if per_leg.is_empty() || overlap_end <= overlap_start {
+        0.0
+    } else {
+        overlap_end.saturating_sub(overlap_start) as f64 / 1000.0
+    };
+
+    UdpUnitWindows {
+        per_leg,
+        concurrency_secs,
+    }
+}
+
+/// 单条方向腿的有效窗口：只看这条腿自己的活跃流和自己的接收端采样。
+fn leg_effective_window(
+    leg_pos: usize,
+    plan: &UdpLegPlan,
+    results: &[UdpFlowRun],
+    monitors: &HashMap<String, MonitorStopOut>,
+    rate_cfg: &RateCheckCfg,
+    required_secs: u64,
+) -> EffectiveWindow {
+    let empty = EffectiveWindow {
+        required_secs,
+        ..Default::default()
+    };
+    let Some(first) = plan.streams.first() else {
+        return empty;
+    };
+    // 这条腿的接收端 monitor 缺失，只让这条腿没结论；旧代码在这里直接
+    // `return` 整个单元的零窗口，于是 mon11 那次监控丢失连带废掉了对向腿。
+    let Some(out) = monitors.get(&first.dst.key()) else {
+        return empty;
+    };
+    let Some(first_sample) = out.samples.iter().find(|sample| sample.valid) else {
+        return empty;
+    };
+    let Some(last_sample) = out.samples.iter().rev().find(|sample| sample.valid) else {
+        return empty;
+    };
+    let lower = first_sample.elapsed_ms;
+    let upper = last_sample.elapsed_ms;
+    if upper <= lower {
+        return empty;
     }
     let sample_tolerance_ms = rate_cfg
         .sample_interval_ms
@@ -6189,32 +6429,20 @@ fn select_udp_effective_window(
         .saturating_mul(2)
         .max(1_500);
 
+    let required = required_udp_streams(
+        plan.streams.len(),
+        rate_cfg,
+        first.rx_target_mbps,
+        first.offered_mbps,
+    );
     let eligible = |t: u64| -> bool {
-        plans.iter().enumerate().all(|(leg_pos, plan)| {
-            let first = plan.streams.first();
-            let required = required_udp_streams(
-                plan.streams.len(),
-                rate_cfg,
-                first.and_then(|task| task.rx_target_mbps),
-                first.and_then(|task| task.offered_mbps),
-            );
-            let active = results
-                .iter()
-                .filter(|flow| flow.leg_pos == leg_pos)
-                .filter_map(flow_active_interval)
-                .filter(|(start, end)| *start <= t && t < *end)
-                .count();
-            if active < required {
-                return false;
-            }
-            let Some(first) = first else {
-                return false;
-            };
-            monitors
-                .get(&first.dst.key())
-                .and_then(|out| nearest_valid_sample(out, t, sample_tolerance_ms))
-                .is_some()
-        })
+        let active = results
+            .iter()
+            .filter(|flow| flow.leg_pos == leg_pos)
+            .filter_map(flow_active_interval)
+            .filter(|(start, end)| *start <= t && t < *end)
+            .count();
+        active >= required && nearest_valid_sample(out, t, sample_tolerance_ms).is_some()
     };
 
     let mut best_start = 0u64;
@@ -6267,6 +6495,120 @@ fn select_udp_effective_window(
     }
 }
 
+pub(crate) struct IperfFlowVerdictIn<'a> {
+    pub raw_ok: bool,
+    pub measurement: bool,
+    pub effective_window: &'a EffectiveWindow,
+    pub required_secs: u64,
+    pub rate_mode: RateMode,
+    pub rx_target_mbps: Option<f64>,
+    pub rx_stats: &'a RateStats,
+    pub tx_stats: &'a RateStats,
+    /// client 输出的最后一行，用作 setup 错误的可读细节。
+    pub client_tail: &'a str,
+    /// 接收端 monitor 的完整采样输出，仅用于窗口不足时给一个定位数字。
+    pub rx_monitor: Option<&'a MonitorStopOut>,
+}
+
+/// 有效窗口不足时补一句定位信息：接收端网卡在**整个采样生命周期**
+/// （含起流前后）的平均速率。
+///
+/// 它绝不能进判定。生命周期含 startup / settle / 退出收尾，会把一次只测到
+/// 175 秒的短测量补成完整窗口，并把启动爬升算进平均——这正是本项目明确
+/// 放弃 process-lifetime 回退的原因，那条边界不能动。
+///
+/// 但「这一行没结论」和「这块网卡一个字节都没收到」是两件完全不同的事。
+/// run_20260825_215915_7684 的任务 97 里，接收网卡 202/202 个样本都有流量、
+/// 全程均值 487.1Mbps、峰值 1582.4Mbps，报表却只写「未采集」，读的人无从
+/// 判断到底是没测到还是真的没流量。判定可以拒绝下结论，但不该把已经看到的
+/// 东西藏起来。
+fn lifecycle_rx_hint(out: Option<&MonitorStopOut>) -> String {
+    let Some(out) = out.filter(|out| out.seconds > 0.0 && out.avg_mbps.is_finite()) else {
+        return String::new();
+    };
+    format!(
+        "；接收端网卡全程（{:.1}s，含起停）平均 {:.3}Mbps，仅供定位，不作判定依据",
+        out.seconds, out.avg_mbps
+    )
+}
+
+/// 单条 iperf3 流的判定链。
+///
+/// 抽成纯函数是为了让下面这个区分可以被单独测试：**「环境没搭起来」和
+/// 「跑完了但最后一次结果交换失败」不是一回事**。
+///
+/// iperf3 经常在完整跑完全程之后，才在结果交换阶段报
+/// `unable to send control message … Connection reset by peer`。此时接收端
+/// 网卡计数器已经拿到了完整的正式口径，把它判成 `SETUP_ERROR` 等于让诊断
+/// 口径的故障否决正式口径的结论——run_20260825_215915_7684 里 9 行
+/// 125~1067Mbps 的实测就是这么丢的（见 .ai/DESIGN-v4.3.0.md D2）。
+///
+/// 判据用「有没有攒够要求时长的有效吞吐窗口」而不是匹配错误文本：窗口本身
+/// 就是「这一轮到底测没测成」的既有权威答案，既不需要引入新的阈值常量，
+/// 也不会随 iperf3 的措辞变化而失效。
+pub(crate) fn iperf_flow_verdict(input: IperfFlowVerdictIn<'_>) -> (Verdict, String, String) {
+    let IperfFlowVerdictIn {
+        raw_ok,
+        measurement,
+        effective_window,
+        required_secs,
+        rate_mode,
+        rx_target_mbps,
+        rx_stats,
+        tx_stats,
+        client_tail,
+        rx_monitor,
+    } = input;
+
+    let summary_lost_after_full_run = !raw_ok && measurement && effective_window.complete;
+
+    if !raw_ok && !summary_lost_after_full_run {
+        return (
+            Verdict::SetupError,
+            "IPERF_EXEC_FAILED".to_string(),
+            client_tail.to_string(),
+        );
+    }
+    if !measurement {
+        return (
+            Verdict::RateFail,
+            "NO_VALID_MEASUREMENT".to_string(),
+            "iperf3 已结束，但没有 rate/bytes 吞吐测量".into(),
+        );
+    }
+    if !effective_window.complete {
+        return (
+            Verdict::NotEvaluated,
+            "IPERF_EFFECTIVE_WINDOW_SHORT".to_string(),
+            format!(
+                "iperf3 真实流量事件窗口仅 {:.3}s，短于要求的 {}s；未把 server 启动、连接或清理时间计入平均速率{}",
+                effective_window.available_secs,
+                required_secs,
+                lifecycle_rx_hint(rx_monitor)
+            ),
+        );
+    }
+
+    let (verdict, code, detail) = evaluate_nic_rx(rate_mode, rx_target_mbps, rx_stats, tx_stats);
+    if !summary_lost_after_full_run {
+        return (verdict, code, detail);
+    }
+    // 判定本身仍然完全由网卡口径决定——RX 低于目标照样 RATE_FAIL，RX 缺失
+    // 照样 NOT_EVALUATED。这里只把「工具自报速率不可用」记进原因，并保留原始
+    // rate 结论的 reason_code，别让 RX_BELOW_TARGET 这类信息被覆盖掉。
+    // 该行的执行状态仍是 ExecutionStatus::Error，概览上显示成
+    // 「MEASURED · ERROR」，不会看起来一切正常。
+    (
+        verdict,
+        code,
+        format!(
+            "IPERF_SUMMARY_LOST: iperf3 已完成全程灌包，仅最后的结果交换失败，\
+             接收端网卡口径有效、工具自报速率不可用（{}）。{detail}",
+            client_tail.trim()
+        ),
+    )
+}
+
 fn aggregate_udp_loss(flows: &[&UdpFlowRun]) -> Option<f64> {
     let successful: Vec<&UdpFlowRun> = flows.iter().copied().filter(|flow| flow.raw_ok).collect();
     if successful.is_empty() {
@@ -6281,20 +6623,15 @@ fn aggregate_udp_loss(flows: &[&UdpFlowRun]) -> Option<f64> {
             ))
         })
         .collect();
-    if counts.len() == successful.len() {
-        let lost: u64 = counts.iter().map(|(lost, _)| *lost).sum();
-        let total: u64 = counts.iter().map(|(_, total)| *total).sum();
-        if total > 0 {
-            return Some(lost as f64 * 100.0 / total as f64);
-        }
+    if counts.len() != successful.len() {
+        // 任何一条流缺计数就不给聚合值。此前这里回退到「对各流百分比取算术
+        // 平均」，那是错误加权：100 个数据报丢 10% 和 900 个数据报丢 0%，
+        // 真实聚合是 1%，平均出来却是 5%。宁可报「未知」也不报错的数。
+        return None;
     }
-
-    let percentages: Vec<f64> = successful
-        .iter()
-        .filter_map(|flow| flow.parsed.udp_loss_pct)
-        .collect();
-    (percentages.len() == successful.len())
-        .then(|| percentages.iter().sum::<f64>() / percentages.len() as f64)
+    let lost: u64 = counts.iter().map(|(lost, _)| *lost).sum();
+    let total: u64 = counts.iter().map(|(_, total)| *total).sum();
+    (total > 0).then(|| lost as f64 * 100.0 / total as f64)
 }
 
 fn active_rate_table(
@@ -6555,6 +6892,7 @@ mod tests {
             RESOURCE_OWNER_SEQ.fetch_add(1, Ordering::SeqCst)
         ));
         let ctx = Ctx {
+            topology: None,
             agent_host: "127.0.0.1".into(),
             agent_port,
             cfg: Config {
@@ -8851,7 +9189,8 @@ mod tests {
             "[  5]   0.00-10.04 sec  119 MBytes  99.6 Mbits/sec  0.014 ms  312/86380 (0.36%) receiver";
         let parsed = iperf::parse_output(&format!("{client_output}\n{server_output}"));
         assert!(parsed.has_measurement());
-        assert_eq!(parsed.udp_loss_pct, Some(0.36));
+        // 312/86380 —— 由计数算出，比 iperf3 打印的 0.36 精确。
+        assert!((parsed.udp_loss_pct.unwrap() - 0.361_194_7).abs() < 1e-6);
 
         let next_attempt = iperf::parse_output("iperf3: error - unable to connect to server");
         assert!(!next_attempt.has_measurement());
@@ -9256,12 +9595,15 @@ mod tests {
             (agent.key(), monitor_until(190_000, 2_000.0, 2_000.0)),
             (master.key(), monitor_until(190_000, 2_000.0, 2_000.0)),
         ]);
-        let window =
-            select_udp_effective_window(&plans, &results, &monitors, &RateCheckCfg::default());
-        assert!(window.complete);
-        assert_eq!(window.start_ms, 6_000);
-        assert_eq!(window.end_ms, 186_000);
-        assert_eq!(window.available_secs, 184.0);
+        let windows =
+            select_udp_effective_windows(&plans, &results, &monitors, &RateCheckCfg::default());
+        for window in &windows.per_leg {
+            assert!(window.complete);
+            assert_eq!(window.start_ms, 6_000);
+            assert_eq!(window.end_ms, 186_000);
+            assert_eq!(window.available_secs, 184.0);
+        }
+        assert_eq!(windows.concurrency_secs, 180.0);
 
         let failed_small_leg_flow = results
             .iter_mut()
@@ -9269,16 +9611,28 @@ mod tests {
             .unwrap();
         failed_small_leg_flow.raw_ok = false;
         failed_small_leg_flow.events.clear();
-        let no_common_window =
-            select_udp_effective_window(&plans, &results, &monitors, &RateCheckCfg::default());
-        assert!(!no_common_window.complete);
-        assert_eq!(no_common_window.available_secs, 0.0);
-        assert_eq!(no_common_window.start_ms, 0);
-        assert_eq!(no_common_window.end_ms, 0);
+        let windows =
+            select_udp_effective_windows(&plans, &results, &monitors, &RateCheckCfg::default());
+
+        // 小腿的流数不够，这条腿没结论——这一条不变。
+        assert!(!windows.per_leg[1].complete);
+        assert_eq!(windows.per_leg[1].available_secs, 0.0);
+
+        // 但另一条腿整整 184 秒都在满速跑，它的数据必须留着。
+        // 旧实现在这里把两条腿一起归零，run_20260825_215915_7684 的任务
+        // 10/12/34/36 就是这样丢掉了 8 行 493~923Mbps 的实测。
+        assert!(
+            windows.per_leg[0].complete,
+            "对向腿失败不得连坐抹掉本腿的有效窗口"
+        );
+        assert_eq!(windows.per_leg[0].available_secs, 184.0);
+
+        // 并发确实没成立，这件事单独报，不混进腿的判定。
+        assert_eq!(windows.concurrency_secs, 0.0);
     }
 
     #[test]
-    fn test_effective_window_short_when_one_direction_drops_early() {
+    fn test_leg_window_shortens_only_for_the_direction_that_dropped_early() {
         let master = endpoint(Side::Master, "master0", "192.168.1.2");
         let agent = endpoint(Side::Agent, "agent0", "192.168.1.3");
         let plans = vec![
@@ -9300,10 +9654,16 @@ mod tests {
             (agent.key(), monitor_until(190_000, 2_000.0, 2_000.0)),
             (master.key(), monitor_until(190_000, 2_000.0, 2_000.0)),
         ]);
-        let window =
-            select_udp_effective_window(&plans, &results, &monitors, &RateCheckCfg::default());
-        assert!(!window.complete);
-        assert_eq!(window.available_secs, 169.0);
+        let windows =
+            select_udp_effective_windows(&plans, &results, &monitors, &RateCheckCfg::default());
+        // ba 腿有一条流 175s 就停了，只有这条腿的窗口被截短。
+        assert!(!windows.per_leg[1].complete);
+        assert_eq!(windows.per_leg[1].available_secs, 169.0);
+        // ab 腿全程正常，不受影响。
+        assert!(windows.per_leg[0].complete);
+        assert_eq!(windows.per_leg[0].available_secs, 184.0);
+        // 两条腿确实重叠过，重叠时长取交集。
+        assert_eq!(windows.concurrency_secs, 169.0);
     }
 
     #[test]
@@ -9336,9 +9696,46 @@ mod tests {
             sample_interval_ms: 5_000,
             ..Default::default()
         };
-        let window = select_udp_effective_window(&plans, &results, &monitors, &cfg);
-        assert!(window.complete);
-        assert_eq!(window.end_ms - window.start_ms, 180_000);
+        let windows = select_udp_effective_windows(&plans, &results, &monitors, &cfg);
+        assert!(windows.per_leg[0].complete);
+        assert_eq!(
+            windows.per_leg[0].end_ms - windows.per_leg[0].start_ms,
+            180_000
+        );
+    }
+
+    /// 接收端 monitor 缺失只能让**这一条腿**没结论。
+    ///
+    /// run_20260825_215915_7684 的任务 10 里，辅测端采样会话丢了
+    /// （`网卡监控停止失败: 监控 ID 不存在: mon11`），旧实现在那里直接
+    /// `return` 整个单元的零窗口，于是对向腿——主控网卡实时打印了一路
+    /// 975.7Mbps——也一起被写成「未采集」。
+    #[test]
+    fn a_missing_monitor_only_blanks_its_own_leg() {
+        let master = endpoint(Side::Master, "master0", "192.168.1.2");
+        let agent = endpoint(Side::Agent, "agent0", "192.168.1.3");
+        let plans = vec![
+            udp_plan(0, "ab", 1, &master, &agent, 180),
+            udp_plan(1, "ba", 1, &agent, &master, 180),
+        ];
+        let mut results = Vec::new();
+        for (leg_pos, plan) in plans.iter().enumerate() {
+            for (stream_pos, task) in plan.streams.iter().enumerate() {
+                results.push(udp_flow(leg_pos, stream_pos, task, 1_000, 190_000, true));
+            }
+        }
+        // 只有 master 侧（ba 腿的接收端）有采样；agent 侧的 monitor 丢了。
+        let monitors = HashMap::from([(master.key(), monitor_until(190_000, 2_000.0, 2_000.0))]);
+        let windows =
+            select_udp_effective_windows(&plans, &results, &monitors, &RateCheckCfg::default());
+
+        assert!(!windows.per_leg[0].complete, "ab 腿没有采样，无从判定");
+        assert_eq!(windows.per_leg[0].available_secs, 0.0);
+        assert!(
+            windows.per_leg[1].complete,
+            "ba 腿的采样是完整的，不能被对向的监控丢失连累"
+        );
+        assert_eq!(windows.concurrency_secs, 0.0);
     }
 
     #[test]
@@ -9699,6 +10096,273 @@ mod tests {
         assert!(!rate_window_coverage_sufficient(&stats, &stats, true));
     }
 
+    /// 构造一份「采样完整、RX 稳定在 rx_mbps」的统计，用于单独验证判定链。
+    fn healthy_stats(rx_mbps: f64) -> RateStats {
+        RateStats {
+            avg_mbps: Some(rx_mbps),
+            p10_mbps: Some(rx_mbps),
+            median_mbps: Some(rx_mbps),
+            p95_mbps: Some(rx_mbps),
+            min_mbps: Some(rx_mbps),
+            max_mbps: Some(rx_mbps),
+            coverage: 1.0,
+            rolling_coverage: 1.0,
+            baseline_mbps: 0.0,
+            stalled_ratio: 0.0,
+        }
+    }
+
+    fn full_window(secs: f64) -> EffectiveWindow {
+        EffectiveWindow {
+            start_ms: 0,
+            end_ms: (secs * 1000.0) as u64,
+            available_secs: secs,
+            required_secs: secs as u64,
+            complete: true,
+        }
+    }
+
+    const TAIL_HANDSHAKE_ERROR: &str = "iperf3: error - unable to send control message - port may not be available, the other side may have stopped running, etc.: Connection reset by peer";
+
+    /// run_20260825_215915_7684 任务 103：主控 WLAN → 以太网 5 完整跑满
+    /// 180s，接收端网卡实测 1067.902Mbps，只有最后的结果交换失败。
+    /// 旧代码把它判成 SETUP_ERROR / 接收=0，等于用诊断口径的故障
+    /// 否决了正式口径已经拿到的结论。
+    #[test]
+    fn client_tail_failure_after_full_window_keeps_nic_verdict() {
+        let rx = healthy_stats(1067.902);
+        let window = full_window(180.0);
+        let (verdict, code, detail) = iperf_flow_verdict(IperfFlowVerdictIn {
+            raw_ok: false,
+            measurement: true,
+            effective_window: &window,
+            required_secs: 180,
+            rate_mode: RateMode::Observe,
+            rx_target_mbps: None,
+            rx_stats: &rx,
+            tx_stats: &rx,
+            client_tail: TAIL_HANDSHAKE_ERROR,
+            rx_monitor: None,
+        });
+        assert_eq!(
+            verdict,
+            Verdict::Measured,
+            "跑满全程只是收尾握手失败，不能判成环境错误"
+        );
+        assert_eq!(
+            code, "TARGET_UNKNOWN",
+            "网卡口径的原始 reason_code 必须保留"
+        );
+        assert!(
+            detail.contains("IPERF_SUMMARY_LOST"),
+            "必须写明工具自报不可用: {detail}"
+        );
+        assert!(detail.contains("1067.902"), "必须保留网卡实测值: {detail}");
+    }
+
+    /// 同一条降级路径不能变成「有网卡数就一律放行」：RX 低于目标仍要 RATE_FAIL，
+    /// RX 缺失仍要 NOT_EVALUATED。
+    #[test]
+    fn tail_failure_downgrade_never_upgrades_a_failing_rate() {
+        let window = full_window(180.0);
+
+        let below = healthy_stats(400.0);
+        let (verdict, code, _) = iperf_flow_verdict(IperfFlowVerdictIn {
+            raw_ok: false,
+            measurement: true,
+            effective_window: &window,
+            required_secs: 180,
+            rate_mode: RateMode::Verify,
+            rx_target_mbps: Some(900.0),
+            rx_stats: &below,
+            tx_stats: &below,
+            client_tail: TAIL_HANDSHAKE_ERROR,
+            rx_monitor: None,
+        });
+        assert_eq!(verdict, Verdict::RateFail);
+        assert_eq!(code, "RX_BELOW_TARGET");
+
+        // 任务 115 那种「链路已断、网卡全零、iperf 仍自报 136Mbps」的形态：
+        // 降级路径必须交给 evaluate_nic_rx 判成 NOT_EVALUATED，
+        // 绝不能因为拿到了 sender 数字就算测到了。
+        let dead = RateStats {
+            avg_mbps: Some(0.0),
+            coverage: 1.0,
+            rolling_coverage: 1.0,
+            ..Default::default()
+        };
+        let (verdict, code, _) = iperf_flow_verdict(IperfFlowVerdictIn {
+            raw_ok: false,
+            measurement: true,
+            effective_window: &window,
+            required_secs: 180,
+            rate_mode: RateMode::Observe,
+            rx_target_mbps: None,
+            rx_stats: &dead,
+            tx_stats: &dead,
+            client_tail: TAIL_HANDSHAKE_ERROR,
+            rx_monitor: None,
+        });
+        assert_eq!(verdict, Verdict::NotEvaluated);
+        assert_eq!(code, "NIC_RATE_MISSING");
+    }
+
+    /// 链路中途失联是横跨一整段单元的事实，逐行看永远拼不出来，
+    /// 必须在报告最顶上单独说一次。
+    /// 结构断言：熔断检查必须在单元循环**开头**，不能落在结尾。
+    ///
+    /// 单元有多条提前 `continue` 的路径（resume 命中、前置拦截、网卡消失），
+    /// 检查放在结尾时那些路径会整个跳过它。而「网卡消失」恰恰是这个设置最该
+    /// 拦住的场景——被测设备掉线后，每个单元开跑前的重扫都会看到网卡不见了，
+    /// 队列一路空转到底，`aborted_at_unit` 也永远是 None。
+    ///
+    /// 这类「代码位置决定行为」的约束普通单测抓不到（把检查挪回结尾，所有
+    /// 现有用例依然全绿），所以在源码层面把门关上。
+    #[test]
+    fn the_abort_gate_runs_before_any_early_continue() {
+        let source = include_str!("executor.rs");
+        let loop_start = source
+            .find("for (i, unit) in units.iter().enumerate() {")
+            .expect("单元循环");
+        // 只截到函数结束，别把本用例自己的字符串字面量也数进去。
+        let loop_end = source[loop_start..]
+            .find("\n    fn ")
+            .map(|offset| loop_start + offset)
+            .unwrap_or(source.len());
+        let loop_body = &source[loop_start..loop_end];
+
+        let gate = loop_body
+            .find("self.cfg.abort_after_dead_traffic_units")
+            .expect("熔断检查必须在单元循环内");
+        let first_continue = loop_body.find("continue;").unwrap_or(usize::MAX);
+        assert!(
+            gate < first_continue,
+            "熔断检查必须排在任何 continue 之前，否则提前退出的路径会绕过它"
+        );
+        assert_eq!(
+            loop_body
+                .matches("self.cfg.abort_after_dead_traffic_units")
+                .count(),
+            1,
+            "只能有一处熔断检查；两处必然会漂移"
+        );
+    }
+
+    #[test]
+    fn run_health_banner_surfaces_a_dead_link_streak() {
+        let healthy = RunSummary {
+            max_dead_traffic_streak: 1,
+            ..Default::default()
+        };
+        assert!(
+            healthy.run_health_banner().is_empty(),
+            "偶发一个空单元不值得惊动读报告的人"
+        );
+
+        let dead = RunSummary {
+            max_dead_traffic_streak: 6,
+            ..Default::default()
+        };
+        let banner = dead.run_health_banner();
+        assert!(banner.contains('6'), "{banner}");
+        assert!(banner.contains("不代表设备性能"), "{banner}");
+
+        let aborted = RunSummary {
+            max_dead_traffic_streak: 2,
+            aborted_at_unit: Some(114),
+            ..Default::default()
+        };
+        let banner = aborted.run_health_banner();
+        assert!(banner.contains("114"), "必须写清在哪里停的: {banner}");
+        assert!(banner.contains("中止"), "{banner}");
+    }
+
+    /// 切不出有效窗口时，判定保持 NOT_EVALUATED，但必须把「这块网卡到底
+    /// 收到了多少」说出来。
+    ///
+    /// 任务 97 的接收网卡 202/202 个样本有流量、全程均值 487.1Mbps，
+    /// 报表却只有一个「未采集」——那既不是没测到，也不是没流量。
+    #[test]
+    fn an_unusable_window_still_reports_what_the_nic_actually_saw() {
+        let empty_window = EffectiveWindow {
+            required_secs: 180,
+            ..Default::default()
+        };
+        let monitor = MonitorStopOut {
+            seconds: 205.8,
+            avg_mbps: 487.125_869,
+            ..Default::default()
+        };
+        let (verdict, code, detail) = iperf_flow_verdict(IperfFlowVerdictIn {
+            raw_ok: true,
+            measurement: true,
+            effective_window: &empty_window,
+            required_secs: 180,
+            rate_mode: RateMode::Observe,
+            rx_target_mbps: None,
+            rx_stats: &RateStats::default(),
+            tx_stats: &RateStats::default(),
+            client_tail: "",
+            rx_monitor: Some(&monitor),
+        });
+        assert_eq!(verdict, Verdict::NotEvaluated, "窗口切不出来就是没结论");
+        assert_eq!(code, "IPERF_EFFECTIVE_WINDOW_SHORT");
+        assert!(detail.contains("487.126"), "必须给出全程实测值: {detail}");
+        assert!(
+            detail.contains("不作判定依据"),
+            "同时必须写明它不是判定口径: {detail}"
+        );
+    }
+
+    /// 没有采样数据时不能凭空编一个数出来——「未采集」在这种情况下是对的。
+    #[test]
+    fn an_unusable_window_without_samples_stays_silent() {
+        let empty_window = EffectiveWindow {
+            required_secs: 180,
+            ..Default::default()
+        };
+        let (_, _, detail) = iperf_flow_verdict(IperfFlowVerdictIn {
+            raw_ok: true,
+            measurement: true,
+            effective_window: &empty_window,
+            required_secs: 180,
+            rate_mode: RateMode::Observe,
+            rx_target_mbps: None,
+            rx_stats: &RateStats::default(),
+            tx_stats: &RateStats::default(),
+            client_tail: "",
+            rx_monitor: None,
+        });
+        assert!(!detail.contains("全程"), "{detail}");
+    }
+
+    /// 窗口没攒够就失败的，仍然是环境错误——降级只对「已经跑满」生效。
+    #[test]
+    fn client_failure_before_a_full_window_is_still_a_setup_error() {
+        let rx = healthy_stats(500.0);
+        let short = EffectiveWindow {
+            start_ms: 0,
+            end_ms: 12_000,
+            available_secs: 12.0,
+            required_secs: 180,
+            complete: false,
+        };
+        let (verdict, code, _) = iperf_flow_verdict(IperfFlowVerdictIn {
+            raw_ok: false,
+            measurement: true,
+            effective_window: &short,
+            required_secs: 180,
+            rate_mode: RateMode::Observe,
+            rx_target_mbps: None,
+            rx_stats: &rx,
+            tx_stats: &rx,
+            client_tail: "iperf3: error - unable to connect to server",
+            rx_monitor: None,
+        });
+        assert_eq!(verdict, Verdict::SetupError);
+        assert_eq!(code, "IPERF_EXEC_FAILED");
+    }
+
     #[test]
     fn test_udp_loss_uses_complete_weighted_datagram_counts() {
         let master = endpoint(Side::Master, "master0", "192.168.1.2");
@@ -9714,9 +10378,11 @@ mod tests {
         second.parsed.udp_loss_pct = Some(0.0);
         assert_eq!(aggregate_udp_loss(&[&first, &second]), Some(1.0));
 
+        // 缺计数就是「未知」。绝不能回退成对百分比取平均：那会把真实的
+        // 1.0% 报成 5.0%，且流数越不均衡错得越离谱。
         second.parsed.udp_lost_datagrams = None;
         second.parsed.udp_total_datagrams = None;
-        assert_eq!(aggregate_udp_loss(&[&first, &second]), Some(5.0));
+        assert_eq!(aggregate_udp_loss(&[&first, &second]), None);
 
         second.parsed.udp_loss_pct = None;
         assert_eq!(aggregate_udp_loss(&[&first, &second]), None);
@@ -10584,6 +11250,7 @@ mod tests {
             ..Default::default()
         };
         let ctx = Ctx {
+            topology: None,
             agent_host: "127.0.0.1".into(),
             agent_port: 1,
             cfg,
