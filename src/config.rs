@@ -252,6 +252,13 @@ pub struct RateCheckCfg {
     /// 实践中 WiFi 一律按同一档灌（例如无论协商到 2.4G 还是 2.8G 都用
     /// -b 2.6G），所以这里给一个固定值，默认 2800 恰好容得下 2.6G。
     pub wifi_payload_ceiling_mbps: f64,
+    /// 2.4GHz Wi-Fi 的负载上限，同样**不跟协商速率**。
+    ///
+    /// 必须和 5G/6G 分开：2.4GHz 只有 3 个不重叠信道、最多 40MHz 带宽，
+    /// 802.11ax 2SS 的 PHY 峰值也就 574Mbps，可用载荷更低。和 5G 共用 2800
+    /// 等于对 2.4G 口完全不裁剪，灌进去的包必然大部分丢在空口上——那是配置
+    /// 出来的丢包，不是测出来的。
+    pub wifi_24g_payload_ceiling_mbps: f64,
     pub max_udp_loss_pct: Option<f64>,
 }
 
@@ -274,6 +281,7 @@ impl Default for RateCheckCfg {
             evb_eth_to_usb_target_mbps: 8400.0,
             cpe_path_ceiling_mbps: 2500.0,
             wifi_payload_ceiling_mbps: 2800.0,
+            wifi_24g_payload_ceiling_mbps: 300.0,
             max_udp_loss_pct: None,
         }
     }
@@ -322,10 +330,20 @@ pub struct NicProfile {
     pub name: String,
     /// 可选：同名接口有歧义时再用 IPv4 收窄
     pub ipv4: String,
-    /// 作为**接收端**时的门限
+    /// 作为**接收端**时的门限，绝对值（Mbps）。与 `rx_target_percent` 二选一，
+    /// 两个都填时以绝对值为准。
     pub rx_target_mbps: Option<f64>,
+    /// 作为**接收端**时的门限，按这块网卡**协商速率**的百分比（`90` = 90%）。
+    ///
+    /// 换算用的是每个单元开跑前重扫到的协商速率，所以 Wi-Fi 这类会重新协商的
+    /// 口上，门限会跟着变。这是刻意的——按百分比要的就是「相对这条链路当前
+    /// 能力」的判据；但换算结果必须在计划提示里说出来，否则同一份配置两次跑出
+    /// 不同门限会没人看得懂。
+    pub rx_target_percent: Option<f64>,
     /// 作为**发送端**时的 UDP 单流带宽
     pub udp_bandwidth: Option<String>,
+    /// 作为**发送端**时的 UDP 报文长度（`-l`）。覆盖档位里的 `length`。
+    pub udp_length: Option<String>,
 }
 
 /// 两层链路策略：角色兜底 + 单口覆盖。
@@ -622,6 +640,10 @@ impl Config {
             ("evb_eth_to_usb_target_mbps", rc.evb_eth_to_usb_target_mbps),
             ("cpe_path_ceiling_mbps", rc.cpe_path_ceiling_mbps),
             ("wifi_payload_ceiling_mbps", rc.wifi_payload_ceiling_mbps),
+            (
+                "wifi_24g_payload_ceiling_mbps",
+                rc.wifi_24g_payload_ceiling_mbps,
+            ),
         ] {
             if !value.is_finite() || value <= 0.0 {
                 problems.push(format!(

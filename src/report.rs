@@ -945,21 +945,16 @@ fn in_flight_buffer_estimate(row: &Row) -> Option<String> {
     ))
 }
 
-/// 解析 iperf3 的 `-w` 尺寸后缀（k/m/g，二进制单位）。
+/// 解析 `-w` 尺寸后缀。
+///
+/// 复用下发命令时用的那一个解析器，而不是在这里另写一遍：报告里这行估算
+/// 必须和实际下发的 socket buffer 说的是同一个数。自带一份简化版会在
+/// `2.5m`、`4mb` 这类合法写法上解析失败——校验放行、命令照发，只有报告里
+/// 的估算无声消失。
 fn parse_iperf_size(value: &str) -> Option<u64> {
-    let lower = value.trim().to_ascii_lowercase();
-    let (digits, factor) = match lower.strip_suffix(['k', 'm', 'g']) {
-        Some(rest) => {
-            let factor = match lower.as_bytes().last()? {
-                b'k' => 1024,
-                b'm' => 1024 * 1024,
-                _ => 1024 * 1024 * 1024,
-            };
-            (rest, factor)
-        }
-        None => (lower.as_str(), 1),
-    };
-    digits.parse::<u64>().ok()?.checked_mul(factor)
+    crate::cmd::ctstraffic::parse_size_bytes(value)
+        .ok()
+        .map(u64::from)
 }
 
 fn diagnostic_item(h: &mut String, label: &str, value: &str) {
@@ -2613,5 +2608,27 @@ mod tests {
 
         assert!(html.contains("原始输出（0 条执行记录，0 项内容，内嵌文本非空 0 段）"));
         assert!(html.contains("本次报告没有可用的内嵌原始输出、独立原始记录或网卡样本文件。"));
+    }
+
+    /// `-w` 的合法写法不止 `4m`：下发命令用的解析器接受 `2.5m` / `4mb` /
+    /// `1gib`，报告这边必须用同一个，否则校验放行、命令照发，只有报告里的
+    /// 「估算在途缓冲」无声消失。
+    #[test]
+    fn the_in_flight_estimate_accepts_every_socket_buffer_spelling_the_command_does() {
+        let row = |command: &str| Row {
+            command: command.into(),
+            required_seconds: Some(180.0),
+            ..Default::default()
+        };
+        for window in ["4m", "2.5m", "4mb", "1gib", "64k"] {
+            let command = format!("iperf3 -c 10.0.0.2 -w {window} -P 4 -t 180");
+            assert!(
+                in_flight_buffer_estimate(&row(&command)).is_some(),
+                "-w {window} 能下发就必须能估算"
+            );
+        }
+        // 解析不了的写法保持沉默，不要报一个假数。
+        assert!(in_flight_buffer_estimate(&row("iperf3 -c 10.0.0.2 -w 猫 -P 4")).is_none());
+        assert!(in_flight_buffer_estimate(&row("iperf3 -c 10.0.0.2 -P 4")).is_none());
     }
 }

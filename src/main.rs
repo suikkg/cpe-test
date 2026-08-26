@@ -28,6 +28,9 @@ mod verdict;
 
 /// 控制台默认端口。与 agent 的 28801 错开，两个都在本机跑时不打架。
 const DEFAULT_UI_PORT: u16 = 28800;
+/// 辅测机状态页端口。只监听回环，和 agent 的业务端口（默认 28801）分开：
+/// 业务端口必须对局域网开放，状态页不该跟着一起开放出去。
+const DEFAULT_AGENT_UI_PORT: u16 = 28802;
 
 use console::ask;
 use master::ui::{run_master, MasterOpts};
@@ -62,7 +65,16 @@ fn real_main(args: Vec<String>) -> i32 {
             if let Some(bind) = f.get("bind") {
                 cfg.agent_bind = bind.clone();
             }
-            agent::run(port, &cfg); // 不返回
+            let ui_port = if f.contains_key("no-ui") {
+                None
+            } else {
+                Some(
+                    f.get("ui-port")
+                        .and_then(|p| p.parse().ok())
+                        .unwrap_or(DEFAULT_AGENT_UI_PORT),
+                )
+            };
+            agent::run(port, &cfg, ui_port); // 不返回
             0
         }
         "master" => {
@@ -136,7 +148,7 @@ fn real_main(args: Vec<String>) -> i32 {
                 "2" => run_master(MasterOpts::default()),
                 "3" => {
                     let (cfg, _) = config::load_config(None);
-                    agent::run(cfg.agent_port, &cfg);
+                    agent::run(cfg.agent_port, &cfg, Some(DEFAULT_AGENT_UI_PORT));
                     0
                 }
                 "4" => {
@@ -263,6 +275,8 @@ fn print_help() {
       --port N                指定监听端口
       --token SECRET          共享访问令牌（agent 与主控必须一致；不配置则不启用认证）
       --bind IP               监听地址 (默认 0.0.0.0；可设 127.0.0.1 或测试网卡 IP)
+      --ui-port N             本机状态页端口 (默认 127.0.0.1:28802，只监听回环)
+      --no-ui                 不起状态页，只跑服务
   cpe_test master             主控发起测试
       --agent-host IP         辅测机 IP
       --agent-port N          辅测机端口 (默认 28801)

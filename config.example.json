@@ -14,6 +14,7 @@
   "abort_after_dead_traffic_units": 0,
 
   "_link_profiles": "两层链路策略：by_role 给默认值（配对串左边是A、右边是B，ab/ba 相对这个顺序），by_nic 按单块网卡覆盖。优先级 单口 > 角色 > 全局 rate_check.targets_mbps > 内置推导。注意：在这里显式写下的 UDP -b 属于操作者的明确判断，不再参与 min(发送口,接收口) 的自动裁剪——自动裁剪只在依赖内置推导（即本节没配这条链路）时兜底。整节不写就全部走内置推导。",
+  "_link_profiles_by_nic": "by_nic 的门限二选一：rx_target_mbps 是绝对值（Mbps）；rx_target_percent 是该网卡协商速率的百分比（90 = 90%），按每个单元开跑前重扫到的协商速率换算，换算算式会出现在计划提示里。两个都写时以绝对值为准。udp_bandwidth / udp_length 作用于这块网卡当发送端的那条腿，覆盖 iperf.udp_profiles 里的档位；udp_length 就是 iperf3 的 -l。",
   "link_profiles": {
     "by_role": [
       {
@@ -33,7 +34,13 @@
         "name": "WLAN 3",
         "ipv4": "192.168.0.104",
         "rx_target_mbps": 1800,
-        "udp_bandwidth": "2.8G"
+        "udp_bandwidth": "2.8G",
+        "udp_length": "1400"
+      },
+      {
+        "host": "master",
+        "name": "以太网 6",
+        "rx_target_percent": 90
       }
     ]
   },
@@ -68,6 +75,9 @@
       "evb_usb_to_eth_target_mbps": 6400,
       "evb_eth_to_usb_target_mbps": 8400,
       "cpe_path_ceiling_mbps": 2500,
+      "_wifi_ceilings": "WiFi 的负载上限不跟协商速率（那是会来回跳的 PHY 速率）。5G/6G 用 wifi_payload_ceiling_mbps，2.4G 单列 wifi_24g_payload_ceiling_mbps——2.4GHz 只有 3 个不重叠信道、最多 40MHz，够不到 5G 的档。频段没识别出来的 WIFI 按 5G 档处理。",
+      "wifi_payload_ceiling_mbps": 2800,
+      "wifi_24g_payload_ceiling_mbps": 300,
       "max_udp_loss_pct": null
     }
   },

@@ -45,6 +45,12 @@ pub(crate) struct RateStats {
     /// 验收要求核对「原始网卡总流量与报告业务流量差值接近背景值」，
     /// 但差值只有把扣除量本身报出来才可核对。
     pub baseline_mbps: f64,
+    /// 按时间排列的完整 5 秒滚动窗口序列 `(窗口结束时刻ms, 均值Mbps)`。
+    ///
+    /// P10 排完序就没有顺序了，答不出「掉坑连续掉了多久」。判定需要的是
+    /// 「有没有任何一个 5 秒掉到门限以下、掉了几个、连着掉了多长」，
+    /// 这三件事都只能在有序序列上算。
+    pub rolling_series: Vec<(u64, f64)>,
     /// 判定窗口内「计数器连续零增长」的最长一段占已覆盖时长的比例。
     ///
     /// 这是与采样覆盖率**正交**的一种不可信：样本采到了、`valid` 也是 true，
@@ -61,6 +67,91 @@ pub(crate) struct EffectiveWindow {
     pub available_secs: f64,
     pub required_secs: u64,
     pub complete: bool,
+}
+
+/// 判定窗口内「掉到门限以下」的那些 5 秒滚动窗口。
+///
+/// 和 P10 是两件事：P10 只回答「有没有超过 10% 的窗口在门限以下」，一次
+/// 5 秒的断流在 175 秒的测试里只占 3%，P10 完全看不见它。而对使用者来说，
+/// 「全程平均 950、中间断了 5 秒」和「全程稳定 950」不是同一个结论。
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RxDropout {
+    /// 低于门限的窗口个数。
+    pub windows: usize,
+    /// 其中最低的一个窗口均值。
+    pub lowest_mbps: f64,
+    /// 连续掉在门限以下的最长一段时长（毫秒）。
+    pub longest_ms: u64,
+    /// 最长那一段的起始时刻（判定窗口内的相对毫秒）。
+    pub started_at_ms: u64,
+    /// 最低窗口是否已经接近零——这时该说「断流」而不是「掉坑」。
+    pub stalled: bool,
+}
+
+impl RxDropout {
+    /// 报告和日志里那句人话。
+    pub fn describe(&self, target: f64) -> String {
+        let kind = if self.stalled { "断流" } else { "掉坑" };
+        format!(
+            "{kind}：{} 个 5 秒窗口掉到门限 {target:.3}Mbps 以下，最低 {:.3}Mbps，\
+             最长连续 {:.1} 秒（自判定窗口第 {:.1} 秒起）",
+            self.windows,
+            self.lowest_mbps,
+            self.longest_ms as f64 / 1000.0,
+            self.started_at_ms as f64 / 1000.0,
+        )
+    }
+}
+
+/// 找出掉到门限以下的滚动窗口；一个都没有就返回 `None`。
+pub(crate) fn rx_dropout(series: &[(u64, f64)], target: f64) -> Option<RxDropout> {
+    if !target.is_finite() || target <= 0.0 {
+        return None;
+    }
+    let mut windows = 0usize;
+    let mut lowest = f64::INFINITY;
+    let mut longest_ms = 0u64;
+    let mut longest_start = 0u64;
+    // 连续段用「首个掉坑窗口的起点」到「最后一个掉坑窗口的终点」度量。
+    // 每个窗口覆盖 ROLLING_RATE_WINDOW_MS，相邻窗口高度重叠，累加窗口数
+    // 会把 5 秒的坑说成 175 秒。
+    let mut run_start: Option<u64> = None;
+    let mut run_end = 0u64;
+
+    for (end_ms, rate) in series {
+        if *rate < target {
+            windows += 1;
+            lowest = lowest.min(*rate);
+            let start = end_ms.saturating_sub(ROLLING_RATE_WINDOW_MS);
+            if run_start.is_none() {
+                run_start = Some(start);
+            }
+            run_end = *end_ms;
+        } else if let Some(start) = run_start.take() {
+            let span = run_end.saturating_sub(start);
+            if span > longest_ms {
+                longest_ms = span;
+                longest_start = start;
+            }
+        }
+    }
+    if let Some(start) = run_start {
+        let span = run_end.saturating_sub(start);
+        if span > longest_ms {
+            longest_ms = span;
+            longest_start = start;
+        }
+    }
+    if windows == 0 {
+        return None;
+    }
+    Some(RxDropout {
+        windows,
+        lowest_mbps: lowest,
+        longest_ms,
+        started_at_ms: longest_start,
+        stalled: lowest <= MIN_VALID_RX_MBPS,
+    })
 }
 
 /// 按接收端 OS 网卡 RX 做正式速率判定。
@@ -181,12 +272,24 @@ pub(crate) fn evaluate_nic_rx(
             format!("网卡 RX 平均 {rx_avg:.3}Mbps 低于目标 {target:.3}Mbps"),
         );
     }
-    if rx_p10 < target {
+    // 平均达标之后，还要求**判定窗口内每一个完整 5 秒都达标**。
+    //
+    // 这比 P10 严：一次 5 秒断流在 175 秒的测试里只占 3%，P10 看不见它，
+    // 但「全程平均 950、中间断了 5 秒」和「全程稳定 950」对使用者不是同一个
+    // 结论。掉坑一律判 FAIL，只在理由码上区分是大面积偏低还是偶发断流。
+    if let Some(dropout) = rx_dropout(&stats.rolling_series, target) {
+        let code = if rx_p10 < target {
+            // 超过 10% 的窗口在门限以下：不是偶发，是整体抖。
+            "RX_UNSTABLE"
+        } else {
+            "RX_DROPOUT"
+        };
         return (
-            Verdict::Unstable,
-            "RX_UNSTABLE".into(),
+            Verdict::RateFail,
+            code.into(),
             format!(
-                "网卡 RX 平均 {rx_avg:.3}Mbps 已达标，但 RX-P10 {rx_p10:.3}Mbps 低于目标 {target:.3}Mbps"
+                "网卡 RX 平均 {rx_avg:.3}Mbps、P10 {rx_p10:.3}Mbps 均达标，但{}",
+                dropout.describe(target)
             ),
         );
     }
@@ -234,13 +337,20 @@ pub(crate) fn percentile(sorted: &[f64], q: f64) -> Option<f64> {
     sorted.get(idx).copied()
 }
 
-pub(crate) fn rolling_time_window_averages(
+/// 逐个完整滚动窗口的均值，按时间排列，带窗口结束时刻。
+///
+/// 保留顺序和时刻是必需的：「掉坑连续掉了多久」只能在有序序列上算，
+/// P10 是排序后的分位数，天然丢掉了顺序。
+pub(crate) fn rolling_time_window_series(
     samples: &[(u64, u64, f64)],
     range_start_ms: u64,
     window_ms: u64,
-) -> Vec<f64> {
+) -> Vec<(u64, f64)> {
     if window_ms == 0 {
-        return samples.iter().map(|(_, _, rate)| *rate).collect();
+        return samples
+            .iter()
+            .map(|(end_ms, _, rate)| (*end_ms, *rate))
+            .collect();
     }
 
     let mut rolling = Vec::new();
@@ -277,7 +387,7 @@ pub(crate) fn rolling_time_window_averages(
         // elapsed_ms/interval_ms 均由 Duration 向下取整为毫秒，多个样本边界可能
         // 累积出数毫秒的舍入缝隙；只容忍极小误差，不能容忍真正的漏采周期。
         if covered_ms.saturating_add(ROLLING_COVERAGE_TOLERANCE_MS) >= window_ms {
-            rolling.push(weighted_sum / covered_ms as f64);
+            rolling.push((*window_end_ms, weighted_sum / covered_ms as f64));
         }
     }
     rolling
@@ -422,13 +532,13 @@ pub(crate) fn monitor_rate_stats(
         / covered_ms as f64;
     let min = rates.iter().copied().fold(f64::INFINITY, f64::min);
     let max = rates.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let rolling = rolling_time_window_averages(
+    let rolling_series = rolling_time_window_series(
         &rolling_rate_samples,
         window.start_ms,
         ROLLING_RATE_WINDOW_MS,
     );
     rates.sort_by(|a, b| a.total_cmp(b));
-    let mut rolling_sorted = rolling;
+    let mut rolling_sorted: Vec<f64> = rolling_series.iter().map(|(_, rate)| *rate).collect();
     rolling_sorted.sort_by(|a, b| a.total_cmp(b));
     let window_ms = window.end_ms - window.start_ms;
     let expected_rolling_windows = nominal_interval_ms
@@ -454,6 +564,7 @@ pub(crate) fn monitor_rate_stats(
         max_mbps: Some(max),
         coverage: (covered_ms as f64 / window_ms as f64).min(1.0),
         rolling_coverage,
+        rolling_series,
         baseline_mbps: baseline,
         stalled_ratio: (longest_zero_delta_run_ms(out, window, rx) as f64 / covered_ms as f64)
             .clamp(0.0, 1.0),
@@ -721,11 +832,13 @@ mod tests {
 
     #[test]
     fn tcp_nic_rx_verdict_matrix_never_passes_without_complete_authoritative_data() {
+        // 全程稳定在 850：35 个 5 秒窗口一个都不掉到 800 以下。
         let complete = RateStats {
             avg_mbps: Some(850.0),
             p10_mbps: Some(820.0),
             coverage: 1.0,
             rolling_coverage: 1.0,
+            rolling_series: (1..=35).map(|i| (i * 5_000, 850.0)).collect(),
             ..Default::default()
         };
         // 发送端采样默认完好，把变量隔离在接收端；TX 侧门槛另有专门用例。
@@ -856,17 +969,86 @@ mod tests {
             (Verdict::NotEvaluated, "RATE_WINDOW_COVERAGE_LOW".into())
         );
 
+        // 超过 10% 的窗口在门限以下：整体抖，不是偶发。
         let unstable = RateStats {
             p10_mbps: Some(799.0),
+            rolling_series: (1..=35)
+                .map(|i| (i * 5_000, if i <= 6 { 700.0 } else { 850.0 }))
+                .collect(),
             ..complete.clone()
         };
         assert_eq!(
             decision(RateMode::Verify, Some(800.0), &unstable),
-            (Verdict::Unstable, "RX_UNSTABLE".into())
+            (Verdict::RateFail, "RX_UNSTABLE".into())
         );
+
+        // 平均和 P10 都达标，只有一个 5 秒窗口掉下去：仍然是 FAIL。
+        // 一次 5 秒断流在 175 秒里只占 3%，P10 根本看不见它，但那一秒钟
+        // 用户的视频就是卡住了。
+        let dropout = RateStats {
+            rolling_series: (1..=35)
+                .map(|i| (i * 5_000, if i == 20 { 120.0 } else { 850.0 }))
+                .collect(),
+            ..complete.clone()
+        };
+        let (verdict, code, detail) =
+            evaluate_nic_rx(RateMode::Verify, Some(800.0), &dropout, &healthy_tx);
+        assert_eq!((verdict, code.as_str()), (Verdict::RateFail, "RX_DROPOUT"));
+        assert!(detail.contains("掉坑"), "{detail}");
+        assert!(detail.contains("120.000"), "要说出最低掉到多少: {detail}");
+
+        // 掉到接近 0 要说「断流」，不能和轻微掉坑用同一个词。
+        let stalled = RateStats {
+            rolling_series: (1..=35)
+                .map(|i| (i * 5_000, if (18..=20).contains(&i) { 0.0 } else { 850.0 }))
+                .collect(),
+            ..complete.clone()
+        };
+        let (verdict, code, detail) =
+            evaluate_nic_rx(RateMode::Verify, Some(800.0), &stalled, &healthy_tx);
+        assert_eq!((verdict, code.as_str()), (Verdict::RateFail, "RX_DROPOUT"));
+        assert!(detail.contains("断流"), "{detail}");
+
         assert_eq!(
             decision(RateMode::Verify, Some(800.0), &complete),
             (Verdict::Pass, String::new())
         );
+    }
+
+    /// 掉坑时长按「首个掉坑窗口的起点 -> 末个掉坑窗口的终点」算。
+    ///
+    /// 相邻 5 秒窗口高度重叠，按窗口个数乘 5 秒会把一次 5 秒的坑说成半分钟。
+    #[test]
+    fn a_dropout_reports_how_long_it_actually_lasted() {
+        // 1 秒一个窗口；第 20~22 号窗口掉下去 = 覆盖 15..22 秒，共 7 秒。
+        let series: Vec<(u64, f64)> = (1..=35)
+            .map(|i| {
+                (
+                    i * 1_000,
+                    if (20..=22).contains(&i) { 100.0 } else { 900.0 },
+                )
+            })
+            .collect();
+        let dropout = rx_dropout(&series, 800.0).expect("应检出掉坑");
+        assert_eq!(dropout.windows, 3);
+        assert_eq!(dropout.lowest_mbps, 100.0);
+        assert_eq!(dropout.longest_ms, 7_000, "15s 起到 22s 止");
+        assert_eq!(dropout.started_at_ms, 15_000);
+        assert!(!dropout.stalled, "100Mbps 是掉坑不是断流");
+
+        // 两段坑分开时取最长的那一段，不是加起来。
+        let split: Vec<(u64, f64)> = (1..=35)
+            .map(|i| {
+                let low = i == 10 || (20..=24).contains(&i);
+                (i * 1_000, if low { 100.0 } else { 900.0 })
+            })
+            .collect();
+        let dropout = rx_dropout(&split, 800.0).expect("应检出掉坑");
+        assert_eq!(dropout.windows, 6);
+        assert_eq!(dropout.longest_ms, 9_000, "15s 起到 24s 止的那一段");
+
+        assert!(rx_dropout(&series, 0.0).is_none(), "没有门限就没有掉坑一说");
+        let steady: Vec<(u64, f64)> = (1..=35).map(|i| (i * 1_000, 900.0)).collect();
+        assert!(rx_dropout(&steady, 800.0).is_none());
     }
 }

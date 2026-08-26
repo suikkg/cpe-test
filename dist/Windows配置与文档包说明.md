@@ -1,13 +1,13 @@
-# cpe_test v4.3.0 Windows 配置与文档包
+# cpe_test v4.3.1 Windows 配置与文档包
 
-仓库中的 `cpe_test-v4.3.0-windows-config-docs.zip` 是便于从 Git 直接下载的
+仓库中的 `cpe_test-v4.3.1-windows-config-docs.zip` 是便于从 Git 直接下载的
 Windows 配置、说明文档和启动脚本资料包。包内文件由仓库当前版本生成，并由 CI
 逐文件与源码副本比对，避免配置或文档过期。
 
 这个资料包**不包含可执行程序或吞吐工具**：
 
 - 不包含 `cpe_test.exe`；请从 GitHub Release 下载正式
-  `cpe_test-v4.3.0-windows-x86_64.zip`，或自行编译。
+  `cpe_test-v4.3.1-windows-x86_64.zip`，或自行编译。
 - 不包含 `ctsTraffic.exe`；正式 Windows Release ZIP 会捆绑固定并校验过的
   Microsoft ctsTraffic 2.0.4.0 x64。
 - 不包含 `iperf3.exe` 及其 DLL；需要 iperf3 测试时，请放入完整的 Windows
@@ -21,6 +21,14 @@ Windows 配置、说明文档和启动脚本资料包。包内文件由仓库当
 - `config.example.json`（完整字段面）与 `configs/` 下四份可直接选择的具名配置。
 - `start_ui.bat`（图形控制台）、`start_agent.bat`、`start_master.bat`、`start_master_select_config.bat`。
 - iperf3/ctsTraffic 放置说明、MIT 许可证和第三方声明。
+
+## v4.3.1 行为要点
+
+- 接收速率判定改为「判定窗口内每个完整 5 秒都要达标」：平均与 P10 都达标但中间掉过坑时判 `RATE_FAIL / RX_DROPOUT`，写明掉了几个窗口、最低多少、最长连续多少秒；掉到接近 0 报「断流」。`UNSTABLE` 不再产出。
+- Wi-Fi 2.4G 单列负载上限 `wifi_24g_payload_ceiling_mbps`（默认 300），不再与 5G/6G 共用 2800。
+- 修复控制台在「一条腿被按网口钉死 `-b`」时生成重复测试单元。
+- 辅测机新增只读状态页 `http://127.0.0.1:28802`（`start_agent.bat` 会自动打开）：运行状态、本机网卡、实时活动。
+- 控制台补齐 UDP `-l` / `-w` 多档与按网口 `-l`；RX 门限支持 `90%` 协商速率百分比；新增「按链路上限裁剪 UDP -b」开关（默认不裁剪）和「网段前缀」输入框；测试矩阵三列表头可整列开关。
 
 ## v4.3.0 行为要点
 

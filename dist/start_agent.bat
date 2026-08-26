@@ -9,6 +9,8 @@ if not exist "cpe_test.exe" (
 )
 
 echo 正在启动辅测机 Agent（端口 28801）...
+echo 浏览器会自动打开状态页 http://127.0.0.1:28802
+echo 那个页面上直接写着要报给主控的 IP，还能看到主控正在让本机做什么。
 echo 请保持此窗口打开；首次运行的防火墙提示请选择“允许访问”。
 echo.
 cpe_test.exe agent

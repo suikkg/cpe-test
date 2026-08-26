@@ -1152,6 +1152,23 @@ fn link_policy(spec: &SpecNorm, src: &Endpoint, dst: &Endpoint) -> rate::LinkPol
     )
 }
 
+/// 门限来自协商速率百分比时，把算式作为计划提示说出来（每条算式只说一次）。
+///
+/// 不说的话，同一份配置在 Wi-Fi 重新协商后跑出不同门限，报告上看不出为什么。
+fn note_rx_target(
+    notices: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+    spec_name: &str,
+    policy: &rate::LinkPolicy,
+) {
+    if let Some(note) = &policy.rx_target_note {
+        let line = format!("{spec_name}：{note}");
+        if seen.insert(line.clone()) {
+            notices.push(line);
+        }
+    }
+}
+
 /// `-w × 流数` 大到这条链路要花多少秒才排空；超过它就提示。
 ///
 /// 2 秒是个够宽松的界：正常的 BDP 档位（64k~4m × 10 流）在 1G 上只有几十
@@ -1333,6 +1350,8 @@ pub fn build_units(
 ) -> (Vec<Unit>, Vec<String>) {
     let mut units: Vec<Unit> = Vec::new();
     let mut notices: Vec<String> = Vec::new();
+    // 同一条门限算式会在每个档位 × 每条腿上重复解析出来，去重后只提示一次。
+    let mut rx_target_notes: HashSet<String> = HashSet::new();
 
     for spec in specs {
         for dir in &spec.directions {
@@ -1398,17 +1417,23 @@ pub fn build_units(
                                     for (s, d, tag) in &pairs {
                                         let flow_direction =
                                             if bidir { tag.to_string() } else { dir.clone() };
-                                        let target =
-                                            link_policy(spec, s, d).rx_target_mbps.or_else(|| {
-                                                rate::resolve_target_mbps(
-                                                    spec.rate_mode,
-                                                    &spec.rate_targets,
-                                                    &flow_direction,
-                                                    &s.nic,
-                                                    &d.nic,
-                                                    &spec.rate_check,
-                                                )
-                                            });
+                                        let leg_policy = link_policy(spec, s, d);
+                                        note_rx_target(
+                                            &mut notices,
+                                            &mut rx_target_notes,
+                                            &spec.name,
+                                            &leg_policy,
+                                        );
+                                        let target = leg_policy.rx_target_mbps.or_else(|| {
+                                            rate::resolve_target_mbps(
+                                                spec.rate_mode,
+                                                &spec.rate_targets,
+                                                &flow_direction,
+                                                &s.nic,
+                                                &d.nic,
+                                                &spec.rate_check,
+                                            )
+                                        });
                                         let effective_mode =
                                             rate::effective_mode(spec.rate_mode, target);
                                         let t = IperfTask {
@@ -1499,6 +1524,19 @@ pub fn build_units(
                                             )
                                         })
                                         .collect();
+                                    // 发送口可以单独覆盖 `-l`：同一条用例在不同网口上
+                                    // 要用不同报文长度是常见需求。按腿算一次，标签和
+                                    // 命令都从这里取，免得两边各算一遍再对不上。
+                                    let leg_profiles: Vec<UdpProfile> = pairs
+                                        .iter()
+                                        .map(|(s, d, _tag)| UdpProfile {
+                                            bandwidth: prof.bandwidth.clone(),
+                                            length: link_policy(spec, s, d)
+                                                .udp_length
+                                                .or_else(|| prof.length.clone()),
+                                            window: prof.window.clone(),
+                                        })
+                                        .collect();
                                     for ((s, d, _tag), load) in pairs.iter().zip(leg_loads.iter()) {
                                         if let Some(from) = load.clipped_from_mbps {
                                             notices.push(format!(
@@ -1514,7 +1552,9 @@ pub fn build_units(
                                     }
                                     let mut legs = Vec::new();
                                     let mut max_n = 1;
-                                    for ((s, d, tag), load) in pairs.iter().zip(leg_loads.iter()) {
+                                    for (leg_idx, ((s, d, tag), load)) in
+                                        pairs.iter().zip(leg_loads.iter()).enumerate()
+                                    {
                                         let n = load.streams;
                                         max_n = max_n.max(n);
                                         // 标签必须反映**实际下发**的 -b。链路策略
@@ -1525,10 +1565,13 @@ pub fn build_units(
                                         // 先把 2.5G 改成 2.6G、路径上限再裁回 2500，
                                         // 拿全局档位去比会得出「没变」，把两次改写
                                         // 一起抹掉。
+                                        // 标签必须反映**实际下发**的 -l，不是档位里那个。
+                                        let leg_policy = link_policy(spec, s, d);
+                                        let effective = &leg_profiles[leg_idx];
                                         let leg_label = if let Some(from) = load.clipped_from_mbps {
                                             format!(
                                                 "{}（按路径上限从 {:.0}M 裁剪至 {:.0}M）",
-                                                prof.label(),
+                                                effective.label(),
                                                 from,
                                                 load.mbps
                                             )
@@ -1537,35 +1580,40 @@ pub fn build_units(
                                         {
                                             format!(
                                                 "{}（按链路策略至 {:.0}M）",
-                                                prof.label(),
+                                                effective.label(),
                                                 load.mbps
                                             )
                                         } else {
-                                            prof.label()
+                                            effective.label()
                                         };
                                         let mut extra: Vec<String> =
                                             vec!["-b".into(), load.iperf_arg()];
-                                        if let Some(l) = &prof.length {
+                                        if let Some(l) = &effective.length {
                                             extra.push("-l".into());
                                             extra.push(l.clone());
                                         }
-                                        if let Some(w) = &prof.window {
+                                        if let Some(w) = &effective.window {
                                             extra.push("-w".into());
                                             extra.push(w.clone());
                                         }
                                         let flow_direction =
                                             if bidir { tag.to_string() } else { dir.clone() };
-                                        let target =
-                                            link_policy(spec, s, d).rx_target_mbps.or_else(|| {
-                                                rate::resolve_target_mbps(
-                                                    spec.rate_mode,
-                                                    &spec.rate_targets,
-                                                    &flow_direction,
-                                                    &s.nic,
-                                                    &d.nic,
-                                                    &spec.rate_check,
-                                                )
-                                            });
+                                        note_rx_target(
+                                            &mut notices,
+                                            &mut rx_target_notes,
+                                            &spec.name,
+                                            &leg_policy,
+                                        );
+                                        let target = leg_policy.rx_target_mbps.or_else(|| {
+                                            rate::resolve_target_mbps(
+                                                spec.rate_mode,
+                                                &spec.rate_targets,
+                                                &flow_direction,
+                                                &s.nic,
+                                                &d.nic,
+                                                &spec.rate_check,
+                                            )
+                                        });
                                         let effective_mode =
                                             rate::effective_mode(spec.rate_mode, target);
                                         // offered 必须跟着实际下发的 -b 走，否则
@@ -1624,9 +1672,16 @@ pub fn build_units(
                                         .first()
                                         .map(|first| first.mbps)
                                         .unwrap_or(parsed_bandwidth.mbps);
-                                    let changed = leg_loads.iter().any(|load| {
-                                        (load.mbps - parsed_bandwidth.mbps).abs() >= f64::EPSILON
-                                    });
+                                    // `-l` 被发送口改写时，标题同样不能再印档位里的原值。
+                                    let leg_lengths: Vec<Option<String>> =
+                                        leg_profiles.iter().map(|p| p.length.clone()).collect();
+                                    let length_changed =
+                                        leg_lengths.iter().any(|length| *length != prof.length);
+                                    let changed = length_changed
+                                        || leg_loads.iter().any(|load| {
+                                            (load.mbps - parsed_bandwidth.mbps).abs()
+                                                >= f64::EPSILON
+                                        });
                                     let profile_label = if !changed {
                                         prof.label()
                                     } else {
@@ -1642,8 +1697,21 @@ pub fn build_units(
                                                 .join("/")
                                         };
                                         let mut label = format!("UDP -b {bw}");
-                                        if let Some(l) = &prof.length {
-                                            label.push_str(&format!(" -l {l}"));
+                                        let uniform_length =
+                                            leg_lengths.first().is_some_and(|first| {
+                                                leg_lengths.iter().all(|length| length == first)
+                                            });
+                                        if uniform_length {
+                                            if let Some(Some(l)) = leg_lengths.first() {
+                                                label.push_str(&format!(" -l {l}"));
+                                            }
+                                        } else {
+                                            let shown = leg_lengths
+                                                .iter()
+                                                .map(|length| length.as_deref().unwrap_or("默认"))
+                                                .collect::<Vec<_>>()
+                                                .join("/");
+                                            label.push_str(&format!(" -l {shown}"));
                                         }
                                         if let Some(w) = &prof.window {
                                             label.push_str(&format!(" -w {w}"));
@@ -3250,6 +3318,7 @@ mod tests {
                 ipv4: "192.168.0.104".into(),
                 rx_target_mbps: Some(1800.0),
                 udp_bandwidth: None,
+                ..Default::default()
             }],
         };
         let mut port = PORT_BASE;

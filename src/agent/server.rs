@@ -128,10 +128,14 @@ pub struct AgentState {
     owner_lifecycle: OwnerLifecycle,
     /// 共享访问令牌；空表示不启用认证。
     token: String,
+    /// 状态页要显示的活动记录。业务处理不读它，只往里写。
+    activity: Arc<crate::agent::webui::Activity>,
 }
 
-/// 启动 agent（阻塞不返回）
-pub fn run(port: u16, cfg: &Config) {
+/// 启动 agent（阻塞不返回）。
+///
+/// `ui_port` 为 `None` 时不起本机状态页（`--no-ui`）。
+pub fn run(port: u16, cfg: &Config, ui_port: Option<u16>) {
     // P0: agent 也必须安装 Ctrl+C 处理器，否则无法优雅退出/清理。
     crate::cancel::setup_cancel_handler();
     println!("==============================================");
@@ -211,6 +215,8 @@ pub fn run(port: u16, cfg: &Config) {
     println!("等待主控连接...（保持本窗口开着，不要关闭；首次运行请允许防火墙放行）\n");
 
     let server = Arc::new(server);
+    let token_configured = auth.is_some();
+    let activity = Arc::new(crate::agent::webui::Activity::new());
     let state = Arc::new(AgentState {
         servers: IperfServerMgr::new(),
         clients: IperfClientJobMgr::new(),
@@ -218,7 +224,12 @@ pub fn run(port: u16, cfg: &Config) {
         default_prefixes: cfg.ipv4_prefixes.clone(),
         owner_lifecycle: OwnerLifecycle::new(),
         token: auth.unwrap_or_default(),
+        activity: Arc::clone(&activity),
     });
+
+    if let Some(ui_port) = ui_port {
+        crate::agent::webui::spawn(ui_port, &bind_addr, port, token_configured, &activity);
+    }
 
     for _ in 0..WORKERS {
         let srv = Arc::clone(&server);
@@ -296,6 +307,8 @@ fn handle(mut rq: Request, st: &Arc<AgentState>) {
         )
         .with_status_code(401)
         .with_header(header);
+        st.activity
+            .record(&peer, url.split('?').next().unwrap_or(&url), false);
         let _ = rq.respond(resp);
         return;
     }
@@ -303,6 +316,11 @@ fn handle(mut rq: Request, st: &Arc<AgentState>) {
     // handler panic 不能弄崩 server
     let resp_body = std::panic::catch_unwind(AssertUnwindSafe(|| route(&method, &url, &body, st)))
         .unwrap_or_else(|_| err_json("agent 内部错误(panic)，其余功能不受影响"));
+    st.activity.record(
+        &peer,
+        url.split('?').next().unwrap_or(&url),
+        response_succeeded(&resp_body),
+    );
 
     let header = Header::from_bytes(
         &b"Content-Type"[..],
@@ -311,6 +329,12 @@ fn handle(mut rq: Request, st: &Arc<AgentState>) {
     .expect("header");
     let resp = Response::from_data(resp_body.into_bytes()).with_header(header);
     let _ = rq.respond(resp);
+}
+
+/// 响应体是不是成功的。`ok_json` / `err_json` 产出的都是 `{"ok":bool,...}`，
+/// 状态页只需要这一个比特，不值得为它把整个响应再解析一遍。
+fn response_succeeded(body: &str) -> bool {
+    body.trim_start().starts_with("{\"ok\":true")
 }
 
 /// 校验请求的 `Authorization: Bearer <token>` 头。
@@ -643,6 +667,7 @@ mod tests {
             default_prefixes: Vec::new(),
             owner_lifecycle: OwnerLifecycle::new(),
             token: String::new(),
+            activity: Arc::new(crate::agent::webui::Activity::new()),
         })
     }
     #[test]
@@ -674,6 +699,7 @@ mod tests {
             default_prefixes: Vec::new(),
             owner_lifecycle: OwnerLifecycle::new(),
             token: "unit-secret".into(),
+            activity: Arc::new(crate::agent::webui::Activity::new()),
         });
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let port = server.server_addr().to_ip().unwrap().port();

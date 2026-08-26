@@ -57,16 +57,58 @@ struct PairSelection {
 }
 
 /// 一块网卡在所有配对中共用的判定/负载策略。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct NicPolicySelection {
     /// `master:NAME=以太网 6`
     endpoint: String,
-    /// 这块网卡作为接收端时的 RX 通过门限（Mbps）。
+    /// 这块网卡作为接收端时的 RX 通过门限。
+    ///
+    /// 两种写法共用一个输入框：`1800` = 绝对 1800Mbps，`90%` = 协商速率的
+    /// 90%。分成两个框会逼着人先想清楚用哪种，而这两种本来就是二选一。
     #[serde(default)]
-    rx_target_mbps: Option<f64>,
+    rx_target: String,
     /// 这块网卡作为发送端时的 UDP 单流带宽；留空表示走全局档位。
     #[serde(default)]
     udp_bandwidth: String,
+    /// 这块网卡作为发送端时的 UDP 报文长度（`-l`）；留空表示走全局档位。
+    #[serde(default)]
+    udp_length: String,
+}
+
+/// RX 门限输入框的两种写法。
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum RxTarget {
+    Mbps(f64),
+    /// 协商速率的百分比，`90.0` = 90%。
+    Percent(f64),
+}
+
+/// 解析 `1800` / `1800.5` / `90%`。空串返回 `Ok(None)`。
+fn parse_rx_target(raw: &str) -> Result<Option<RxTarget>, String> {
+    let text = raw.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    let (number, is_percent) = match text.strip_suffix('%') {
+        Some(rest) => (rest.trim(), true),
+        None => (text, false),
+    };
+    let value: f64 = number
+        .parse()
+        .map_err(|_| format!("看不懂的门限写法 {raw:?}，请填 1800 或 90%"))?;
+    if !value.is_finite() || value <= 0.0 {
+        return Err(format!("门限必须是大于 0 的有限值，当前 {raw:?}"));
+    }
+    if is_percent {
+        // 上限放到 200%：聚合口、多流叠加确实可能超过单口协商速率，
+        // 但一个三位数以上的百分比几乎一定是手滑。
+        if value > 200.0 {
+            return Err(format!("百分比门限 {raw:?} 超过 200%，请确认是不是写错了"));
+        }
+        Ok(Some(RxTarget::Percent(value)))
+    } else {
+        Ok(Some(RxTarget::Mbps(value)))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -86,8 +128,24 @@ struct RunRequest {
     /// UDP 单流带宽档位，逐档各跑一轮（`-b`）。
     #[serde(default)]
     udp_bandwidths: Vec<String>,
+    /// UDP 报文长度档位（`-l`）。空列表表示不下发 `-l`，用 iperf3 默认。
+    #[serde(default)]
+    udp_lengths: Vec<String>,
+    /// UDP socket buffer 档位（`-w`）。空列表表示不下发 `-w`。
+    ///
+    /// 和 TCP 的 `-w` 是两个独立的输入：UDP 的 `-w` 挂在每个 udp_profile 上，
+    /// TCP 的挂在 `iperf.tcp_windows` 上，共用一个框会让两边互相污染。
+    #[serde(default)]
+    udp_windows: Vec<String>,
     #[serde(default = "default_streams")]
     udp_streams: u32,
+    /// 是否按整条路径的可信上限裁剪 UDP `-b`。
+    ///
+    /// 界面默认关：控制台上填多少就发多少，超额灌包本来就是要看的场景之一。
+    /// 配置文件里的 `limit_udp_by_link_speed` 只作用于命令行路径，不回填到这里，
+    /// 否则同一个勾选框在不同机器上含义不同。
+    #[serde(default)]
+    limit_udp_by_link_speed: bool,
     #[serde(default)]
     screenshot: bool,
 }
@@ -112,10 +170,13 @@ struct BootstrapOut {
     agent_host: String,
     agent_port: u16,
     token_configured: bool,
+    ipv4_prefixes: Vec<String>,
     duration: u64,
     tcp_windows: Vec<String>,
     tcp_streams: Vec<u32>,
     udp_bandwidths: Vec<String>,
+    udp_lengths: Vec<String>,
+    udp_windows: Vec<String>,
     udp_streams: u32,
     screenshot: bool,
 }
@@ -267,6 +328,13 @@ struct ConnectReq {
     port: u16,
     #[serde(default)]
     token: String,
+    /// 网卡列表的 IPv4 前缀过滤；空列表 = 列出全部网卡。
+    ///
+    /// 必须能在界面上改：默认只放行 `192.168.`，在 10.x / 172.x 的实验网里
+    /// 会把整张网卡表过滤成空，而控制台存在的意义就是让人不必回去手改
+    /// config.json。
+    #[serde(default)]
+    ipv4_prefixes: Option<Vec<String>>,
 }
 
 fn api_bootstrap(console: &Arc<Console>) -> Result<serde_json::Value, String> {
@@ -294,6 +362,7 @@ fn api_bootstrap(console: &Arc<Console>) -> Result<serde_json::Value, String> {
         agent_host: state.agent_host.clone(),
         agent_port: state.cfg.agent_port,
         token_configured: !state.cfg.agent_token.is_empty(),
+        ipv4_prefixes: state.cfg.ipv4_prefixes.clone(),
         duration: state.cfg.iperf.duration,
         tcp_windows: state.cfg.iperf.tcp_windows.clone(),
         tcp_streams,
@@ -304,6 +373,22 @@ fn api_bootstrap(console: &Arc<Console>) -> Result<serde_json::Value, String> {
             .iter()
             .map(|profile| profile.bandwidth.clone())
             .collect(),
+        udp_lengths: distinct(
+            state
+                .cfg
+                .iperf
+                .udp_profiles
+                .iter()
+                .filter_map(|profile| profile.length.clone()),
+        ),
+        udp_windows: distinct(
+            state
+                .cfg
+                .iperf
+                .udp_profiles
+                .iter()
+                .filter_map(|profile| profile.window.clone()),
+        ),
         udp_streams,
         screenshot: state.cfg.screenshot,
     })
@@ -318,15 +403,22 @@ fn configured_nic_policies(
     let mut policies = Vec::new();
     for (host, info) in [("master", master), ("agent", agent)] {
         for nic in &info.interfaces {
-            if let Some(profile) = cfg.link_profiles.by_nic.iter().find(|profile| {
-                profile.host.eq_ignore_ascii_case(host)
-                    && profile.name == nic.name
-                    && (profile.ipv4.is_empty() || profile.ipv4 == nic.ipv4)
-            }) {
+            if let Some(profile) = cfg
+                .link_profiles
+                .by_nic
+                .iter()
+                .find(|profile| crate::rate::nic_profile_matches(profile, host, nic))
+            {
                 policies.push(NicPolicySelection {
                     endpoint: format!("{host}:NAME={}", nic.name),
-                    rx_target_mbps: profile.rx_target_mbps,
+                    // 回显成用户当初的写法：绝对值回显数字，百分比回显 `90%`。
+                    rx_target: match (profile.rx_target_mbps, profile.rx_target_percent) {
+                        (Some(mbps), _) => format!("{mbps}"),
+                        (None, Some(percent)) => format!("{percent}%"),
+                        (None, None) => String::new(),
+                    },
                     udp_bandwidth: profile.udp_bandwidth.clone().unwrap_or_default(),
+                    udp_length: profile.udp_length.clone().unwrap_or_default(),
                 });
             }
         }
@@ -346,6 +438,11 @@ fn api_connect(console: &Arc<Console>, body: &str) -> Result<serde_json::Value, 
     // 页面不回显配置文件里的 token；输入留空时沿用已加载值，手工填写时覆盖。
     if !req.token.is_empty() {
         state.cfg.agent_token = req.token.clone();
+    }
+    // 前缀框清空是一个有意义的选择（= 列出全部网卡），所以用 Option 区分
+    // 「没提交这个字段」和「提交了一个空列表」，不能用 is_empty 兜。
+    if let Some(prefixes) = &req.ipv4_prefixes {
+        state.cfg.ipv4_prefixes = cleaned_list(prefixes);
     }
     if state.agent_host.is_empty() {
         return Err("请先填辅测机 IP（辅测机 agent 窗口里显示的那个地址）".into());
@@ -470,6 +567,21 @@ fn validate_request(state: &UiState, req: &RunRequest) -> Result<(), String> {
             .parsed_bandwidth()
             .map_err(|error| format!("UDP -b 档位 {bandwidth:?} 无效：{error}"))?;
     }
+    for window in req.udp_windows.iter().filter(|v| !v.trim().is_empty()) {
+        crate::cmd::ctstraffic::parse_size_bytes(window.trim())
+            .map_err(|error| format!("UDP -w 档位 {window:?} 无效：{error}"))?;
+    }
+    for length in req.udp_lengths.iter().filter(|v| !v.trim().is_empty()) {
+        // iperf3 的 -l 收字节数，也收 k/m 后缀；和下发命令用同一个解析器，
+        // 免得界面放行的写法到了命令行上才炸。
+        let bytes = crate::cmd::ctstraffic::parse_size_bytes(length.trim())
+            .map_err(|error| format!("UDP -l 档位 {length:?} 无效：{error}"))?;
+        if bytes > 65_507 {
+            return Err(format!(
+                "UDP -l 档位 {length:?} 超过单个 UDP 报文上限 65507 字节"
+            ));
+        }
+    }
 
     for pair in &req.pairs {
         if pair.src == pair.dst
@@ -512,10 +624,14 @@ fn validate_request(state: &UiState, req: &RunRequest) -> Result<(), String> {
         if !seen.insert(policy.endpoint.as_str()) {
             return Err(format!("网口策略重复：{}", policy.endpoint));
         }
-        if let Some(target) = policy.rx_target_mbps {
-            if !target.is_finite() || target <= 0.0 {
+        parse_rx_target(&policy.rx_target)
+            .map_err(|error| format!("{} 的 RX 门限：{error}", policy.endpoint))?;
+        if !policy.udp_length.trim().is_empty() {
+            let bytes = crate::cmd::ctstraffic::parse_size_bytes(policy.udp_length.trim())
+                .map_err(|error| format!("{} 的 UDP -l 无效：{error}", policy.endpoint))?;
+            if bytes > 65_507 {
                 return Err(format!(
-                    "{} 的 RX 门限必须是大于 0 的有限值",
+                    "{} 的 UDP -l 超过单个 UDP 报文上限 65507 字节",
                     policy.endpoint
                 ));
             }
@@ -546,6 +662,7 @@ fn config_from_request(state: &UiState, req: &RunRequest) -> Config {
     let mut cfg = state.cfg.clone();
     cfg.agent_host = state.agent_host.clone();
     cfg.screenshot = req.screenshot;
+    cfg.limit_udp_by_link_speed = req.limit_udp_by_link_speed;
     cfg.iperf.duration = req.duration.clamp(1, 86_400);
     cfg.pairs = None;
     cfg.universal_params = None;
@@ -560,11 +677,13 @@ fn config_from_request(state: &UiState, req: &RunRequest) -> Config {
             picked
         }
     };
+    let lengths = cleaned_list(&req.udp_lengths);
+    let udp_windows = cleaned_list(&req.udp_windows);
     let global_udp: Vec<UdpProfile> = req
         .udp_bandwidths
         .iter()
         .filter(|b| !b.trim().is_empty())
-        .map(|b| UdpProfile::bw(b.trim()))
+        .flat_map(|b| udp_profiles_for(b.trim(), &lengths, &udp_windows))
         .collect();
     // 全局档位保留一份，供没有逐对覆盖时使用；builder 会在这一层之上再做
     // 路径上限裁剪。
@@ -580,11 +699,7 @@ fn config_from_request(state: &UiState, req: &RunRequest) -> Config {
         .map(|policy| policy.endpoint.clone())
         .collect();
     for policy in &req.nic_policies {
-        if let Some(profile) = nic_profile(
-            &policy.endpoint,
-            &policy.udp_bandwidth,
-            policy.rx_target_mbps,
-        ) {
+        if let Some(profile) = nic_profile(policy) {
             cfg.link_profiles.by_nic.push(profile);
         }
     }
@@ -628,15 +743,25 @@ fn config_from_request(state: &UiState, req: &RunRequest) -> Config {
             }
         }
         if want_udp {
-            let mut spec = base(format!("ui-{}-udp", idx + 1), vec!["udp".into()]);
-            let sends_ab = directions.iter().any(|d| d == "ab" || d == "bidir");
-            let sends_ba = directions.iter().any(|d| d == "ba" || d == "bidir");
-            let all_senders_explicit = (!sends_ab || explicit_udp_senders.contains(&pair.src))
-                && (!sends_ba || explicit_udp_senders.contains(&pair.dst));
+            let src_pinned = explicit_udp_senders.contains(&pair.src);
+            let dst_pinned = explicit_udp_senders.contains(&pair.dst);
+            // 一个方向的每条发送腿都有按网口覆盖时，全局 -b 档位对它不起作用：
+            // builder 会把每一档都替换回那个覆盖值，扫 N 档就得到 N 个完全相同
+            // 的单元。必须**逐方向**判断而不是整对判断——「ab 被发送端钉死、
+            // 反向 ba 仍要扫档位」是最常见的组合，按整对判断时那三个 ab 单元
+            // 会一模一样地各跑一遍全程。
+            let pinned_direction = |d: &String| match d.as_str() {
+                "ab" => src_pinned,
+                "ba" => dst_pinned,
+                "bidir" => src_pinned && dst_pinned,
+                _ => false,
+            };
+            let (pinned, swept): (Vec<String>, Vec<String>) =
+                directions.iter().cloned().partition(pinned_direction);
 
-            spec.udp_profiles = Some(if all_senders_explicit {
-                // 所有会发送的腿都有按网口覆盖时，扫全局档位只会生成重复单元。
-                // 用任一实际覆盖值作占位；builder 会按腿替换成各自的精确值。
+            if !pinned.is_empty() {
+                // 占位值：builder 会按腿替换成各自的精确覆盖值，这里填什么都行，
+                // 取一个真实值只是为了万一覆盖项被后续校验剔除时不至于离谱。
                 let placeholder = req
                     .nic_policies
                     .iter()
@@ -646,21 +771,76 @@ fn config_from_request(state: &UiState, req: &RunRequest) -> Config {
                     })
                     .map(|policy| policy.udp_bandwidth.trim())
                     .unwrap_or("1m");
-                vec![UdpProfile::bw(placeholder)]
-            } else {
-                // 只覆盖了一条腿时，未覆盖的腿仍逐个扫描全局 -b 档位；已覆盖的腿
-                // 在每个单元里保持固定值。不能因为“任一腿有覆盖”就压成一档。
-                if global_udp.is_empty() {
+                let mut spec = base(format!("ui-{}-udp-pinned", idx + 1), vec!["udp".into()]);
+                spec.direction = OneOrMany::Many(pinned);
+                // -b 被网口钉死，但 -l 档位仍要逐档跑：钉住的是带宽，不是报文长度。
+                spec.udp_profiles = Some(udp_profiles_for(placeholder, &lengths, &udp_windows));
+                tests.push(spec);
+            }
+            if !swept.is_empty() {
+                // 还有腿没被覆盖的方向照常逐档扫描；已覆盖的那条腿在每个单元里
+                // 保持固定值（双向单元里一钉一扫就是这种情况）。
+                let mut spec = base(format!("ui-{}-udp", idx + 1), vec!["udp".into()]);
+                spec.direction = OneOrMany::Many(swept);
+                spec.udp_profiles = Some(if global_udp.is_empty() {
                     cfg.iperf.udp_profiles.clone()
                 } else {
                     global_udp.clone()
-                }
-            });
-            tests.push(spec);
+                });
+                tests.push(spec);
+            }
         }
     }
     cfg.tests = tests;
     cfg
+}
+
+/// 去空白、丢空项。手抄进来的参数列表和网段前缀共用这一份清洗。
+///
+/// 只清洗，不替换成默认值：清洗后剩下空列表在两处都是有意义的选择
+/// （前缀清空 = 列出全部网口，`-l` 清空 = 不下发 `-l`）。
+fn cleaned_list(raw: &[String]) -> Vec<String> {
+    raw.iter()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+/// 一个 `-b` 档位 × 全部 `-l` 档位 × 全部 `-w` 档位。
+///
+/// 某一项留空就在那一维退化成一档、且**完全不下发该参数**——不能拿 iperf3 的
+/// 默认值写死进命令，那会把「没指定」变成「指定了某个具体值」，两者在报告里
+/// 读起来完全不同。
+fn udp_profiles_for(bandwidth: &str, lengths: &[String], windows: &[String]) -> Vec<UdpProfile> {
+    let one_none = [None];
+    let lengths: Vec<Option<String>> = if lengths.is_empty() {
+        one_none.to_vec()
+    } else {
+        lengths.iter().cloned().map(Some).collect()
+    };
+    let windows: Vec<Option<String>> = if windows.is_empty() {
+        one_none.to_vec()
+    } else {
+        windows.iter().cloned().map(Some).collect()
+    };
+    let mut out = Vec::with_capacity(lengths.len() * windows.len());
+    for length in &lengths {
+        for window in &windows {
+            out.push(UdpProfile {
+                bandwidth: bandwidth.to_string(),
+                length: length.clone(),
+                window: window.clone(),
+            });
+        }
+    }
+    out
+}
+
+/// 保序去重。配置文件里同一个 `-l` / `-w` 常在多个档位上重复出现，
+/// 回填到界面时得压成一份，否则一打开页面档位就自己翻倍。
+fn distinct(values: impl Iterator<Item = String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    values.filter(|value| seen.insert(value.clone())).collect()
 }
 
 /// 界面没填就退回配置文件里的既有值，不要用空列表把它清掉。
@@ -677,23 +857,30 @@ fn non_empty(picked: &[String], fallback: &[String]) -> Vec<String> {
     }
 }
 
-/// `master:NAME=以太网 6` -> 一条 by_nic 覆盖。
-fn nic_profile(
-    endpoint: &str,
-    bandwidth: &str,
-    rx_target: Option<f64>,
-) -> Option<crate::config::NicProfile> {
-    if bandwidth.trim().is_empty() && rx_target.is_none() {
+/// `master:NAME=以太网 6` -> 一条 by_nic 覆盖。三项全空就不生成覆盖项。
+fn nic_profile(policy: &NicPolicySelection) -> Option<crate::config::NicProfile> {
+    let target = parse_rx_target(&policy.rx_target).ok().flatten();
+    let bandwidth = policy.udp_bandwidth.trim();
+    let length = policy.udp_length.trim();
+    if target.is_none() && bandwidth.is_empty() && length.is_empty() {
         return None;
     }
-    let (host, rest) = endpoint.split_once(':')?;
+    let (host, rest) = policy.endpoint.split_once(':')?;
     let name = rest.strip_prefix("NAME=")?;
     Some(crate::config::NicProfile {
         host: host.to_string(),
         name: name.to_string(),
         ipv4: String::new(),
-        rx_target_mbps: rx_target.filter(|v| v.is_finite() && *v > 0.0),
-        udp_bandwidth: (!bandwidth.trim().is_empty()).then(|| bandwidth.trim().to_string()),
+        rx_target_mbps: match target {
+            Some(RxTarget::Mbps(value)) => Some(value),
+            _ => None,
+        },
+        rx_target_percent: match target {
+            Some(RxTarget::Percent(value)) => Some(value),
+            _ => None,
+        },
+        udp_bandwidth: (!bandwidth.is_empty()).then(|| bandwidth.to_string()),
+        udp_length: (!length.is_empty()).then(|| length.to_string()),
     })
 }
 
@@ -934,20 +1121,25 @@ mod tests {
             nic_policies: vec![
                 NicPolicySelection {
                     endpoint: "master:NAME=以太网 6".into(),
-                    rx_target_mbps: Some(1800.0),
+                    rx_target: "1800".into(),
                     udp_bandwidth: "2.6G".into(),
+                    udp_length: String::new(),
                 },
                 NicPolicySelection {
                     endpoint: "agent:NAME=WLAN 3".into(),
-                    rx_target_mbps: Some(1600.0),
+                    rx_target: "1600".into(),
                     udp_bandwidth: "2.8G".into(),
+                    udp_length: String::new(),
                 },
             ],
             duration: 60,
             tcp_windows: vec!["2m".into(), "4m".into(), "256m".into()],
             tcp_streams: vec![1, 5, 10],
             udp_bandwidths: vec!["1m".into(), "500m".into(), "1G".into()],
+            udp_lengths: Vec::new(),
+            udp_windows: Vec::new(),
             udp_streams: 1,
+            limit_udp_by_link_speed: false,
             screenshot: false,
         }
     }
@@ -1038,22 +1230,61 @@ mod tests {
         );
     }
 
-    /// 一边按网口固定、另一边留空时，留空腿仍需扫描全部全局档位。
+    /// 一边按网口固定、另一边留空时，留空腿仍需扫描全部全局档位；
+    /// 而被固定的那个方向不能跟着扫。
+    ///
+    /// 这两件事必须**逐方向**判断。按整对判断时，只要有一条腿没被覆盖就整对
+    /// 去扫档位，于是「ab 被发送端钉死」的那个方向会被复制成 N 个一模一样的
+    /// 单元——3 档 × 180s 就是 6 分钟白跑，报告里还多出两行看着像 bug 的重复项。
     #[test]
-    fn a_one_sided_bandwidth_override_keeps_the_sweep_for_the_other_leg() {
+    fn a_one_sided_bandwidth_override_sweeps_only_the_unpinned_direction() {
+        let state = state_with_pair();
         let mut req = request();
+        req.pairs[0].directions = vec!["ab".into(), "ba".into()];
+        req.pairs[0].transports = vec!["udp".into()];
+        // 发送端 master 钉死在 2.6G，反向发送端 agent 留空。
         req.nic_policies[1].udp_bandwidth.clear();
-        let cfg = config_from_request(&state_with_pair(), &req);
-        let udp = cfg
+
+        let cfg = config_from_request(&state, &req);
+        let pinned = cfg
             .tests
             .iter()
-            .find(|test| test.transports.contains(&"udp".to_string()))
-            .expect("应有 UDP spec");
+            .find(|test| test.direction.directions() == ["ab"])
+            .expect("被钉死的 ab 方向应单独成一份 spec");
         assert_eq!(
-            udp.udp_profiles.as_ref().map(Vec::len),
+            pinned.udp_profiles.as_ref().map(Vec::len),
+            Some(1),
+            "ab 的发送腿已被覆盖，扫档位只会生成重复单元"
+        );
+        let swept = cfg
+            .tests
+            .iter()
+            .find(|test| test.direction.directions() == ["ba"])
+            .expect("未覆盖的 ba 方向应保留档位扫描");
+        assert_eq!(
+            swept.udp_profiles.as_ref().map(Vec::len),
             Some(3),
             "未覆盖的反向发送腿仍要跑 1m/500m/1G 三档"
         );
+
+        // 真正要防的是队列里出现重复单元，所以一路建到 unit 再查。
+        let specs: Vec<_> = cfg
+            .tests
+            .iter()
+            .map(|test| {
+                builder::spec_from_config(test, &cfg, &state.master, &state.agent).expect("建 spec")
+            })
+            .collect();
+        let mut port = builder::PORT_BASE;
+        let (units, _) = build_units(&specs, cfg.require_same_subnet_for_iperf, &mut port);
+        let titles: Vec<&str> = units.iter().map(|unit| unit.title.as_str()).collect();
+        let unique: HashSet<&str> = titles.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            titles.len(),
+            "同一条命令不该排进队列两次: {titles:?}"
+        );
+        assert_eq!(titles.len(), 4, "ab 一个 + ba 三档: {titles:?}");
     }
 
     /// 没填就不生成覆盖项，避免用一堆空条目盖掉配置文件里原有的策略。
@@ -1061,8 +1292,9 @@ mod tests {
     fn blank_inputs_produce_no_overrides() {
         let mut req = request();
         for policy in &mut req.nic_policies {
-            policy.rx_target_mbps = None;
+            policy.rx_target.clear();
             policy.udp_bandwidth.clear();
+            policy.udp_length.clear();
         }
         let cfg = config_from_request(&state_with_pair(), &req);
         assert!(cfg.link_profiles.by_nic.is_empty());
@@ -1157,5 +1389,474 @@ mod tests {
         let error = ensure_config_builds_units(&cfg, &state).unwrap_err();
         assert!(error.contains("没有生成任何测试单元"));
         assert!(error.contains("缺少可用的 IPv6 地址"));
+    }
+
+    /// 网段前缀必须能在界面上改。默认只放行 `192.168.`，在 10.x / 172.x 的
+    /// 实验网里会把整张网卡表过滤成空——而控制台存在的意义正是让人不必回去
+    /// 手改 config.json。清空 = 列出全部网口，也必须是一个能表达的选择。
+    #[test]
+    fn the_console_can_change_which_subnets_show_up() {
+        let parse = |body: &str| serde_json::from_str::<ConnectReq>(body).expect("解析连接参数");
+
+        let req = parse(r#"{"host":"10.0.0.2","ipv4_prefixes":[" 10.228. ","172.16.",""]}"#);
+        assert_eq!(
+            cleaned_list(req.ipv4_prefixes.as_deref().expect("提交了前缀")),
+            vec!["10.228.", "172.16."],
+            "手抄进来的空白和空项要清掉"
+        );
+
+        // 提交空列表（用户把框清空）和根本没提交这个字段，是两件事。
+        let emptied = parse(r#"{"host":"10.0.0.2","ipv4_prefixes":[]}"#).ipv4_prefixes;
+        assert_eq!(
+            emptied.as_deref().map(cleaned_list),
+            Some(Vec::new()),
+            "清空 = 显式要求列出全部网口"
+        );
+        assert_eq!(
+            parse(r#"{"host":"10.0.0.2"}"#).ipv4_prefixes,
+            None,
+            "没提交就沿用已加载的配置，不能被当成清空"
+        );
+    }
+
+    /// 界面上填的网段前缀要一路带进真正下发的 config，否则改了等于没改。
+    #[test]
+    fn the_chosen_subnets_reach_the_config_that_actually_runs() {
+        let mut state = state_with_pair();
+        state.cfg.ipv4_prefixes = vec!["10.228.".into()];
+        let cfg = config_from_request(&state, &request());
+        assert_eq!(cfg.ipv4_prefixes, vec!["10.228."]);
+    }
+
+    /// `-l` 档位要和 `-b` 取组合，并且真的变成命令行上的 `-l`。
+    #[test]
+    fn udp_datagram_size_steps_cross_with_bandwidth_steps() {
+        let state = state_with_pair();
+        let mut req = request();
+        req.pairs[0].transports = vec!["udp".into()];
+        req.pairs[0].directions = vec!["ab".into()];
+        req.nic_policies
+            .iter_mut()
+            .for_each(|p| p.udp_bandwidth.clear());
+        req.udp_bandwidths = vec!["100m".into(), "500m".into()];
+        req.udp_lengths = vec!["64".into(), "1400".into()];
+
+        let cfg = config_from_request(&state, &req);
+        let udp = cfg
+            .tests
+            .iter()
+            .find(|t| t.transports.contains(&"udp".to_string()))
+            .expect("应有 UDP spec");
+        let profiles = udp.udp_profiles.as_ref().expect("应有档位");
+        let mut combos: Vec<(String, Option<String>)> = profiles
+            .iter()
+            .map(|p| (p.bandwidth.clone(), p.length.clone()))
+            .collect();
+        combos.sort();
+        assert_eq!(
+            combos,
+            vec![
+                ("100m".to_string(), Some("64".to_string())),
+                ("100m".to_string(), Some("1400".to_string())),
+                ("500m".to_string(), Some("64".to_string())),
+                ("500m".to_string(), Some("1400".to_string())),
+            ]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>(),
+            "2 个 -b × 2 个 -l = 4 档"
+        );
+
+        // 一路建到真实命令，确认 -l 没有在中途被丢掉。
+        let specs: Vec<_> = cfg
+            .tests
+            .iter()
+            .map(|t| {
+                builder::spec_from_config(t, &cfg, &state.master, &state.agent).expect("建 spec")
+            })
+            .collect();
+        let mut port = builder::PORT_BASE;
+        let (units, _) = build_units(&specs, cfg.require_same_subnet_for_iperf, &mut port);
+        let mut sent: Vec<Vec<String>> = Vec::new();
+        for unit in &units {
+            for leg in &unit.legs {
+                match &leg.kind {
+                    builder::LegKind::IperfSingle(task) => sent.push(task.extra.clone()),
+                    builder::LegKind::IperfGroup { streams, .. } => {
+                        sent.extend(streams.iter().map(|task| task.extra.clone()))
+                    }
+                    _ => {}
+                }
+            }
+        }
+        assert!(!sent.is_empty(), "应当建出 iperf 任务");
+        for extra in &sent {
+            let at = extra
+                .iter()
+                .position(|arg| arg == "-l")
+                .unwrap_or_else(|| panic!("每条 UDP 命令都要带 -l: {extra:?}"));
+            assert!(
+                matches!(
+                    extra.get(at + 1).map(String::as_str),
+                    Some("64") | Some("1400")
+                ),
+                "{extra:?}"
+            );
+        }
+    }
+
+    /// `-l` 留空时不能凭空写一个值进去：「没指定」和「指定成某个数」
+    /// 在报告里是两回事。
+    #[test]
+    fn a_blank_datagram_size_sends_no_l_flag_at_all() {
+        let mut req = request();
+        req.nic_policies
+            .iter_mut()
+            .for_each(|p| p.udp_bandwidth.clear());
+        req.udp_lengths = vec!["  ".into(), String::new()];
+        let cfg = config_from_request(&state_with_pair(), &req);
+        let udp = cfg
+            .tests
+            .iter()
+            .find(|t| t.transports.contains(&"udp".to_string()))
+            .expect("应有 UDP spec");
+        let profiles = udp.udp_profiles.as_ref().expect("应有档位");
+        assert_eq!(profiles.len(), 3, "只有三个 -b 档位");
+        assert!(profiles.iter().all(|p| p.length.is_none()));
+    }
+
+    /// 按网口钉死 -b 的方向，-l 档位仍要逐档跑：钉住的是带宽不是报文长度。
+    #[test]
+    fn pinning_the_bandwidth_does_not_pin_the_datagram_size() {
+        let mut req = request();
+        req.pairs[0].transports = vec!["udp".into()];
+        req.pairs[0].directions = vec!["ab".into()];
+        req.udp_lengths = vec!["64".into(), "1400".into()];
+        let cfg = config_from_request(&state_with_pair(), &req);
+        let pinned = cfg
+            .tests
+            .iter()
+            .find(|t| t.direction.directions() == ["ab"])
+            .expect("ab 被钉死");
+        let profiles = pinned.udp_profiles.as_ref().expect("应有档位");
+        assert_eq!(profiles.len(), 2, "两个 -l 档位各一份");
+        assert!(profiles.iter().all(|p| p.length.is_some()));
+    }
+
+    /// 控制台默认不裁剪 -b，勾上才裁剪；配置文件里的值不参与。
+    #[test]
+    fn the_console_decides_clipping_regardless_of_the_config_file() {
+        let mut state = state_with_pair();
+        state.cfg.limit_udp_by_link_speed = true;
+
+        let req = request();
+        assert!(
+            !config_from_request(&state, &req).limit_udp_by_link_speed,
+            "界面没勾就不裁剪，配置文件里的 true 不能悄悄生效"
+        );
+
+        let mut on = request();
+        on.limit_udp_by_link_speed = true;
+        assert!(config_from_request(&state, &on).limit_udp_by_link_speed);
+    }
+
+    /// -l 必须能塞进一个 UDP 报文。
+    #[test]
+    fn an_impossible_datagram_size_is_rejected_before_starting_a_run() {
+        let state = state_with_pair();
+        let mut req = request();
+        req.udp_lengths = vec!["70000".into()];
+        let error = validated_config_from_request(&state, &req).unwrap_err();
+        assert!(error.contains("65507"), "{error}");
+
+        req.udp_lengths = vec!["1400x".into()];
+        let error = validated_config_from_request(&state, &req).unwrap_err();
+        assert!(error.contains("UDP -l"), "{error}");
+    }
+
+    /// `-b` × `-l` × `-w` 三维取组合，每一项留空就在那一维退化成「不下发」。
+    #[test]
+    fn udp_socket_buffer_steps_join_the_same_cross_product() {
+        let state = state_with_pair();
+        let mut req = request();
+        req.pairs[0].transports = vec!["udp".into()];
+        req.pairs[0].directions = vec!["ab".into()];
+        req.nic_policies
+            .iter_mut()
+            .for_each(|p| p.udp_bandwidth.clear());
+        req.udp_bandwidths = vec!["500m".into()];
+        req.udp_lengths = vec!["64".into(), "1400".into()];
+        req.udp_windows = vec!["2m".into(), "8m".into()];
+
+        let cfg = config_from_request(&state, &req);
+        let udp = cfg
+            .tests
+            .iter()
+            .find(|t| t.transports.contains(&"udp".to_string()))
+            .expect("应有 UDP spec");
+        let mut labels: Vec<String> = udp
+            .udp_profiles
+            .as_ref()
+            .expect("应有档位")
+            .iter()
+            .map(|p| p.label())
+            .collect();
+        labels.sort();
+        assert_eq!(
+            labels,
+            vec![
+                "UDP -b 500m -l 1400 -w 2m",
+                "UDP -b 500m -l 1400 -w 8m",
+                "UDP -b 500m -l 64 -w 2m",
+                "UDP -b 500m -l 64 -w 8m",
+            ],
+            "1 档 -b × 2 档 -l × 2 档 -w = 4 档"
+        );
+
+        // UDP 的 -w 不能顺手改写 TCP 的 -w：两者是两个独立输入。
+        assert_eq!(cfg.iperf.tcp_windows, vec!["2m", "4m", "256m"]);
+
+        // 一路建到真实命令，确认 -w 跟着下发。
+        let specs: Vec<_> = cfg
+            .tests
+            .iter()
+            .map(|t| {
+                builder::spec_from_config(t, &cfg, &state.master, &state.agent).expect("建 spec")
+            })
+            .collect();
+        let mut port = builder::PORT_BASE;
+        let (units, _) = build_units(&specs, cfg.require_same_subnet_for_iperf, &mut port);
+        let mut seen_windows: Vec<String> = Vec::new();
+        for unit in &units {
+            for leg in &unit.legs {
+                let tasks: Vec<&builder::IperfTask> = match &leg.kind {
+                    builder::LegKind::IperfSingle(task) => vec![task],
+                    builder::LegKind::IperfGroup { streams, .. } => streams.iter().collect(),
+                    _ => Vec::new(),
+                };
+                for task in tasks {
+                    let at = task
+                        .extra
+                        .iter()
+                        .position(|arg| arg == "-w")
+                        .unwrap_or_else(|| panic!("每条 UDP 命令都要带 -w: {:?}", task.extra));
+                    seen_windows.push(task.extra[at + 1].clone());
+                }
+            }
+        }
+        seen_windows.sort();
+        seen_windows.dedup();
+        assert_eq!(seen_windows, vec!["2m", "8m"]);
+    }
+
+    /// 三项都留空时，UDP 命令上一个 `-l` / `-w` 都不该出现。
+    #[test]
+    fn blank_udp_extras_add_no_flags_to_the_command() {
+        let state = state_with_pair();
+        let mut req = request();
+        req.pairs[0].transports = vec!["udp".into()];
+        req.pairs[0].directions = vec!["ab".into()];
+        req.nic_policies
+            .iter_mut()
+            .for_each(|p| p.udp_bandwidth.clear());
+        req.udp_bandwidths = vec!["500m".into()];
+        req.udp_lengths = Vec::new();
+        req.udp_windows = Vec::new();
+
+        let cfg = config_from_request(&state, &req);
+        let profiles = cfg
+            .tests
+            .iter()
+            .find(|t| t.transports.contains(&"udp".to_string()))
+            .and_then(|t| t.udp_profiles.clone())
+            .expect("应有档位");
+        assert_eq!(profiles.len(), 1);
+        assert_eq!(profiles[0].label(), "UDP -b 500m");
+        assert!(profiles[0].length.is_none() && profiles[0].window.is_none());
+    }
+
+    /// 配置文件里重复出现的 `-l` / `-w` 回填到界面时要压成一份，
+    /// 否则打开页面档位就自己翻倍。
+    #[test]
+    fn repeated_profile_extras_collapse_when_filling_the_form() {
+        assert_eq!(
+            distinct(["2m", "8m", "2m", "8m"].iter().map(|v| v.to_string())),
+            vec!["2m", "8m"]
+        );
+    }
+
+    /// UDP 的 -w 和 TCP 一样按尺寸解析，写错要在开跑前拦下。
+    #[test]
+    fn an_invalid_udp_socket_buffer_is_rejected_before_starting_a_run() {
+        let state = state_with_pair();
+        let mut req = request();
+        req.udp_windows = vec!["8毫米".into()];
+        let error = validated_config_from_request(&state, &req).unwrap_err();
+        assert!(error.contains("UDP -w"), "{error}");
+    }
+
+    /// 门限输入框要同时收下绝对值和百分比两种写法。
+    #[test]
+    fn the_threshold_field_takes_both_mbps_and_percent() {
+        assert_eq!(parse_rx_target("1800"), Ok(Some(RxTarget::Mbps(1800.0))));
+        assert_eq!(
+            parse_rx_target(" 1800.5 "),
+            Ok(Some(RxTarget::Mbps(1800.5)))
+        );
+        assert_eq!(parse_rx_target("90%"), Ok(Some(RxTarget::Percent(90.0))));
+        assert_eq!(parse_rx_target("90 %"), Ok(Some(RxTarget::Percent(90.0))));
+        assert_eq!(parse_rx_target(""), Ok(None));
+        assert_eq!(parse_rx_target("   "), Ok(None));
+
+        assert!(parse_rx_target("0").is_err(), "0 不是门限");
+        assert!(parse_rx_target("-5").is_err());
+        assert!(parse_rx_target("很快").is_err());
+        assert!(
+            parse_rx_target("900%").is_err(),
+            "三位数百分比几乎一定是把 Mbps 写成了百分号"
+        );
+    }
+
+    /// 百分比要落到 by_nic.rx_target_percent，绝对值落到 rx_target_mbps，
+    /// 两者不能互相串。
+    #[test]
+    fn percent_and_absolute_thresholds_land_in_different_fields() {
+        let mut req = request();
+        req.nic_policies[0].rx_target = "90%".into();
+        req.nic_policies[1].rx_target = "1600".into();
+        let cfg = config_from_request(&state_with_pair(), &req);
+
+        let by_percent = cfg
+            .link_profiles
+            .by_nic
+            .iter()
+            .find(|p| p.name == "以太网 6")
+            .expect("主控网卡");
+        assert_eq!(by_percent.rx_target_percent, Some(90.0));
+        assert_eq!(by_percent.rx_target_mbps, None);
+
+        let absolute = cfg
+            .link_profiles
+            .by_nic
+            .iter()
+            .find(|p| p.name == "WLAN 3")
+            .expect("辅测网卡");
+        assert_eq!(absolute.rx_target_mbps, Some(1600.0));
+        assert_eq!(absolute.rx_target_percent, None);
+    }
+
+    /// 按网口填的 `-l` 要覆盖全局档位，且只作用于这块网卡作发送端的那条腿。
+    #[test]
+    fn a_per_nic_datagram_size_overrides_the_global_step() {
+        let state = state_with_pair();
+        let mut req = request();
+        req.pairs[0].transports = vec!["udp".into()];
+        req.pairs[0].directions = vec!["ab".into(), "ba".into()];
+        req.udp_bandwidths = vec!["100m".into()];
+        req.udp_lengths = vec!["1400".into()];
+        // 只有主控口指定 -l 64；辅测口留空，走全局的 1400。
+        req.nic_policies[0].udp_length = "64".into();
+        req.nic_policies[1].udp_length.clear();
+
+        let cfg = config_from_request(&state, &req);
+        let specs: Vec<_> = cfg
+            .tests
+            .iter()
+            .map(|t| {
+                builder::spec_from_config(t, &cfg, &state.master, &state.agent).expect("建 spec")
+            })
+            .collect();
+        let mut port = builder::PORT_BASE;
+        let (units, _) = build_units(&specs, cfg.require_same_subnet_for_iperf, &mut port);
+
+        let mut by_sender: Vec<(String, String)> = Vec::new();
+        for unit in &units {
+            for leg in &unit.legs {
+                let tasks: Vec<&builder::IperfTask> = match &leg.kind {
+                    builder::LegKind::IperfSingle(task) => vec![task],
+                    builder::LegKind::IperfGroup { streams, .. } => streams.iter().collect(),
+                    _ => Vec::new(),
+                };
+                for task in tasks {
+                    let at = task
+                        .extra
+                        .iter()
+                        .position(|arg| arg == "-l")
+                        .unwrap_or_else(|| panic!("应带 -l: {:?}", task.extra));
+                    by_sender.push((task.src.nic.name.clone(), task.extra[at + 1].clone()));
+                }
+            }
+        }
+        by_sender.sort();
+        by_sender.dedup();
+        assert_eq!(
+            by_sender,
+            vec![
+                ("WLAN 3".to_string(), "1400".to_string()),
+                ("以太网 6".to_string(), "64".to_string()),
+            ],
+            "发送口填了 -l 就用它的，没填的那条腿仍走全局档位"
+        );
+
+        // 标签必须跟着实际下发值走，不然报表里印的 -l 和命令行对不上。
+        assert!(
+            units.iter().any(|u| u.title.contains("-l 64")),
+            "{:?}",
+            units.iter().map(|u| &u.title).collect::<Vec<_>>()
+        );
+    }
+
+    /// 只填 `-l`、不填 `-b` 的网口不算「带宽被钉死」，仍要扫全局 -b 档位。
+    #[test]
+    fn a_per_nic_datagram_size_alone_does_not_pin_the_bandwidth() {
+        let mut req = request();
+        req.pairs[0].transports = vec!["udp".into()];
+        req.pairs[0].directions = vec!["ab".into()];
+        req.nic_policies
+            .iter_mut()
+            .for_each(|p| p.udp_bandwidth.clear());
+        req.nic_policies[0].udp_length = "64".into();
+        req.udp_bandwidths = vec!["1m".into(), "500m".into(), "1G".into()];
+
+        let cfg = config_from_request(&state_with_pair(), &req);
+        let udp = cfg
+            .tests
+            .iter()
+            .find(|t| t.transports.contains(&"udp".to_string()))
+            .expect("应有 UDP spec");
+        assert_eq!(
+            udp.udp_profiles.as_ref().map(Vec::len),
+            Some(3),
+            "-b 没被覆盖，三个档位都要跑"
+        );
+    }
+
+    /// 三项全空才不生成覆盖项；只填 `-l` 也要生成。
+    #[test]
+    fn a_lone_datagram_size_still_produces_an_override() {
+        let mut req = request();
+        for policy in &mut req.nic_policies {
+            policy.rx_target.clear();
+            policy.udp_bandwidth.clear();
+            policy.udp_length.clear();
+        }
+        req.nic_policies[0].udp_length = "64".into();
+        let cfg = config_from_request(&state_with_pair(), &req);
+        assert_eq!(cfg.link_profiles.by_nic.len(), 1);
+        assert_eq!(
+            cfg.link_profiles.by_nic[0].udp_length.as_deref(),
+            Some("64")
+        );
+    }
+
+    /// 按网口的 -l 同样不能超过一个 UDP 报文装得下的大小。
+    #[test]
+    fn a_per_nic_datagram_size_is_bounded_too() {
+        let state = state_with_pair();
+        let mut req = request();
+        req.nic_policies[0].udp_length = "70000".into();
+        let error = validated_config_from_request(&state, &req).unwrap_err();
+        assert!(error.contains("65507"), "{error}");
     }
 }

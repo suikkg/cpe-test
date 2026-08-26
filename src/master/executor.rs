@@ -14,8 +14,8 @@ use crate::master::builder::{
 };
 use crate::master::rate_window::{
     evaluate_nic_rx, monitor_rate_stats, nearest_valid_sample, percentile,
-    rate_sample_coverage_sufficient, rate_window_coverage_sufficient, EffectiveWindow, RateStats,
-    MIN_RATE_SAMPLE_COVERAGE, MIN_VALID_RX_MBPS,
+    rate_sample_coverage_sufficient, rate_window_coverage_sufficient, rx_dropout, EffectiveWindow,
+    RateStats, MIN_RATE_SAMPLE_COVERAGE, MIN_VALID_RX_MBPS,
 };
 use crate::nic::monitor::MonitorMgr;
 use crate::ping;
@@ -4823,14 +4823,19 @@ impl Ctx {
             } else if !rx_meets_target {
                 let target = first.rx_target_mbps.unwrap_or_default();
                 if rx_stats.avg_mbps.map(|v| v >= target).unwrap_or(false) {
-                    (
-                        Verdict::Unstable,
-                        "RX_UNSTABLE".to_string(),
-                        format!(
-                            "平均速率达到目标，但5秒滚动P10 {} 低于 {}Mbps",
-                            fmt_opt(rx_stats.p10_mbps),
-                            target
+                    // 与 TCP 路径同一口径：平均达标之后，判定窗口里每一个完整
+                    // 5 秒都必须达标，掉坑一律 FAIL。两条链的结论不能分叉。
+                    let detail = match rx_dropout(&rx_stats.rolling_series, target) {
+                        Some(dropout) => dropout.describe(target),
+                        None => format!(
+                            "5秒滚动P10 {} 低于 {target}Mbps",
+                            fmt_opt(rx_stats.p10_mbps)
                         ),
+                    };
+                    (
+                        Verdict::RateFail,
+                        "RX_UNSTABLE".to_string(),
+                        format!("平均速率达到目标，但{detail}"),
                     )
                 } else {
                     (
@@ -4843,6 +4848,20 @@ impl Ctx {
                         ),
                     )
                 }
+            } else if let Some(dropout) = first
+                .rx_target_mbps
+                .and_then(|target| rx_dropout(&rx_stats.rolling_series, target))
+            {
+                // 平均和 P10 都达标，但中间掉过坑。P10 看不见一次 5 秒断流
+                // （175 秒里只占 3%），使用者却看得见。
+                (
+                    Verdict::RateFail,
+                    "RX_DROPOUT".to_string(),
+                    format!(
+                        "平均与P10均达标，但{}",
+                        dropout.describe(first.rx_target_mbps.unwrap_or_default())
+                    ),
+                )
             } else if loss_ok == Some(false) {
                 (
                     Verdict::RateFail,
@@ -6752,7 +6771,7 @@ mod tests {
     // 仅测试用到的采样统计层符号；产品码不需要，放这里避免非测试构建报未用导入。
     use crate::master::builder::{Endpoint, PingPurpose, PingTask};
     use crate::master::rate_window::{
-        rolling_time_window_averages, RateStats, MIN_RATE_SAMPLE_COVERAGE,
+        rolling_time_window_series, RateStats, MIN_RATE_SAMPLE_COVERAGE,
     };
     use crate::protocol::NicInfo;
     use std::sync::atomic::AtomicUsize;
@@ -9984,8 +10003,8 @@ mod tests {
         let rounded_intervals: Vec<(u64, u64, f64)> =
             (1..=5).map(|second| (second * 1_000, 999, 100.0)).collect();
         assert_eq!(
-            rolling_time_window_averages(&rounded_intervals, 0, 5_000),
-            vec![100.0]
+            rolling_time_window_series(&rounded_intervals, 0, 5_000),
+            vec![(5_000, 100.0)]
         );
 
         let slow_out = MonitorStopOut {
@@ -10107,6 +10126,8 @@ mod tests {
             max_mbps: Some(rx_mbps),
             coverage: 1.0,
             rolling_coverage: 1.0,
+            // 全程稳定在 rx_mbps：35 个 5 秒窗口一个都不掉。
+            rolling_series: (1..=35).map(|i| (i * 5_000, rx_mbps)).collect(),
             baseline_mbps: 0.0,
             stalled_ratio: 0.0,
         }
@@ -11859,5 +11880,39 @@ round-trip min/avg/max/stddev = 1.250/2.500/3.750/1.021 ms
         assert!(csv.contains("# full_lifecycle_average_rx_mbps,100.000000"));
         assert!(csv.contains("# full_lifecycle_average_tx_mbps,90.000000"));
         assert!(!csv.contains("\n# average_rx_mbps,"));
+    }
+
+    /// UDP 路径必须和 TCP 路径同一口径：平均和 P10 都达标，但中间掉过坑，
+    /// 一样是 FAIL。两条链的结论分叉过一次（D2），不能再分叉第二次。
+    #[test]
+    fn a_dropout_fails_the_same_way_on_both_transports() {
+        let target = 800.0;
+        let steady: Vec<(u64, f64)> = (1..=35).map(|i| (i * 5_000, 850.0)).collect();
+        let dipped: Vec<(u64, f64)> = (1..=35)
+            .map(|i| (i * 5_000, if i == 20 { 120.0 } else { 850.0 }))
+            .collect();
+
+        // TCP 路径
+        let tx = healthy_stats(900.0);
+        let pass = RateStats {
+            rolling_series: steady.clone(),
+            ..healthy_stats(850.0)
+        };
+        let (verdict, _, _) = evaluate_nic_rx(RateMode::Verify, Some(target), &pass, &tx);
+        assert_eq!(verdict, Verdict::Pass, "全程稳定应当 PASS");
+
+        let fails = RateStats {
+            rolling_series: dipped.clone(),
+            ..healthy_stats(850.0)
+        };
+        let (verdict, code, _) = evaluate_nic_rx(RateMode::Verify, Some(target), &fails, &tx);
+        assert_eq!((verdict, code.as_str()), (Verdict::RateFail, "RX_DROPOUT"));
+
+        // UDP 路径用的是同一个 rx_dropout 谓词，直接验证它在同样输入上给出
+        // 同样的结论——两处判定链各自成文，共用的必须是这一个事实来源。
+        assert!(rx_dropout(&steady, target).is_none());
+        let dropout = rx_dropout(&dipped, target).expect("UDP 侧也要检出同一个坑");
+        assert_eq!(dropout.windows, 1);
+        assert_eq!(dropout.lowest_mbps, 120.0);
     }
 }

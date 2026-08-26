@@ -81,14 +81,14 @@ jobs:
           from pathlib import Path
           from zipfile import ZipFile
 
-          bundle = Path("dist/cpe_test-v4.3.0-windows-config-docs.zip")
+          bundle = Path("dist/cpe_test-v4.3.1-windows-config-docs.zip")
           checksum = Path(f"{bundle}.sha256")
           expected_hash = checksum.read_text(encoding="utf-8").split()[0]
           actual_hash = sha256(bundle.read_bytes()).hexdigest()
           if actual_hash != expected_hash:
               raise SystemExit(f"bundle SHA-256 mismatch: {actual_hash}")
 
-          prefix = "cpe_test-v4.3.0-windows-config-docs"
+          prefix = "cpe_test-v4.3.1-windows-config-docs"
           source_for = {
               "Windows配置与文档包说明.md": Path("dist/Windows配置与文档包说明.md"),
               "README.md": Path("README.md"),
@@ -536,6 +536,16 @@ jobs:
           make_latest: true
           body: |
             cpe_test ${{ github.ref_name }} 的已验证跨平台发布包。
+
+            ## v4.3.1 判定收紧、Wi-Fi 2.4G 上限与辅测机状态页
+
+            - **接收速率判定改为「每个 5 秒窗口都要达标」**：平均与 P10 均达标但任一完整 5 秒滚动窗口掉到门限以下时判 `RATE_FAIL / RX_DROPOUT`，写明掉了几个窗口、最低多少、最长连续多少秒；掉到接近 0 报「断流」。TCP 与 UDP 共用同一个 `rx_dropout` 谓词。`UNSTABLE` 不再产出。
+            - **Wi-Fi 2.4G 不再借用 5G 的负载上限**：新增 `wifi_24g_payload_ceiling_mbps`（默认 300）；此前 2.4G 与 5G/6G 共用 2800，等于对 2.4G 口完全不裁剪。频段未识别的 `WIFI` 仍按 5G 档。
+            - **修复控制台生成重复测试单元**：`-b` 是否被按网口覆盖改为逐方向判断；此前按整对判断会把被钉死的那个方向原样复制 N 份。
+            - **新增辅测机状态页**：`cpe_test agent` 在 `127.0.0.1:28802` 起只读页面（`--ui-port` / `--no-ui`），显示运行状态、本机网卡与实时活动（重复轮询折叠成 ×N，token 错误显示为失败记录）。
+            - **控制台参数补齐**：UDP `-l` / `-w` 多档（与 `-b` 取组合，留空则不下发）、按网口的 UDP `-l`、RX 门限支持 `90%` 协商速率百分比、「按链路上限裁剪 UDP -b」开关（默认不裁剪）、「网段前缀」输入框。
+            - **测试矩阵整列开关**：方向 / 协议 / IP 三列表头可一键全开或全关，「全选」连双向和 IPv6 一起勾。
+            - **回归覆盖**：单元测试 379 → 406。
 
             ## v4.3.0 Windows 实测修复与本地图形控制台
 

@@ -57,7 +57,7 @@ button:focus-visible, input:focus-visible { outline:2px solid var(--focus); outl
 .run-options { margin-top:10px; }
 .actions { justify-content:flex-end; margin-top:12px; }
 table { border-collapse:collapse; width:100%; font-size:13px; }
-#nics { min-width:960px; }
+#nics { min-width:1080px; }
 #matrix { min-width:890px; }
 th, td { text-align:left; padding:7px 9px; border-bottom:1px solid var(--line); vertical-align:middle; }
 thead th { position:sticky; top:0; z-index:1; background:var(--head); color:var(--muted); font-size:12px; white-space:nowrap; }
@@ -75,6 +75,10 @@ input.touched { border-color:var(--accent); background:var(--edited); font-weigh
 .pairname { min-width:250px; font-weight:700; }
 .dirs { white-space:nowrap; }
 .dirs label { display:inline-flex; align-items:center; gap:4px; margin-right:9px; color:var(--ink); }
+.colsel { display:flex; flex-wrap:wrap; gap:2px 8px; margin-top:4px; font-weight:400; }
+.colsel label { display:inline-flex; align-items:center; gap:3px; color:var(--muted); font-size:11px; white-space:nowrap; cursor:pointer; }
+.colsel input[type="checkbox"] { width:13px; height:13px; vertical-align:-2px; }
+code { font-family:ui-monospace,Consolas,monospace; background:var(--head); padding:0 4px; border-radius:3px; }
 pre.hint { font-family:ui-monospace,Consolas,monospace; }
 .plan-list { max-height:240px; overflow:auto; margin:10px 0 0; padding:8px 10px; border:1px solid var(--line); background:var(--canvas); }
 @media (max-width:700px) {
@@ -104,6 +108,7 @@ pre.hint { font-family:ui-monospace,Consolas,monospace; }
       <label>辅测机 IP <input type="text" id="host" size="16" placeholder="10.228.46.50"></label>
       <label>端口 <input type="number" id="port" class="num" value="28801"></label>
       <label>token <input type="password" id="token" size="12" placeholder="留空=不认证"></label>
+      <label>网段前缀 <input type="text" id="prefixes" size="16" placeholder="留空=列出全部网口"></label>
       <button type="button" id="connect">连接</button>
       <button type="button" id="refresh" class="ghost" disabled>刷新网口</button>
     </div>
@@ -114,8 +119,11 @@ pre.hint { font-family:ui-monospace,Consolas,monospace; }
     <h2><span class="n">2</span>网口与策略</h2>
     <div class="scroll"><table id="nics"><thead><tr>
       <th>端</th><th>接口名</th><th>角色</th><th>IPv4</th><th>协商速率</th><th>网关</th>
-      <th>作为接收端：RX 门限</th><th>作为发送端：UDP -b</th>
+      <th>作为接收端：RX 门限</th><th>作为发送端：UDP -b</th><th>作为发送端：UDP -l</th>
     </tr></thead><tbody></tbody></table></div>
+    <p class="hint">RX 门限两种写法都行：<code>1800</code> = 1800Mbps；<code>90%</code> = 该网卡协商速率的 90%，
+    每个单元开跑前按重扫到的协商速率换算，算式会出现在「预览任务」的提示里。
+    这里填的 UDP <code>-b</code> / <code>-l</code> 覆盖执行区的全局档位。</p>
   </section>
 
   <section id="matrixsec" class="hidden">
@@ -124,28 +132,47 @@ pre.hint { font-family:ui-monospace,Consolas,monospace; }
       <button type="button" class="ghost" id="all">全选</button>
       <button type="button" class="ghost" id="none">全不选</button>
       <button type="button" class="ghost" id="cross">只选跨机</button>
-      <span class="hint">默认全不选。每个组合至少保留一个方向、协议和 IP 版本。</span>
+      <span class="hint">默认全不选。表头里的小勾选框整列开关，勾一下全开、再勾一下全关。每个要跑的组合至少保留一个方向、协议和 IP 版本。</span>
     </div>
     <div class="scroll"><table id="matrix"><thead><tr>
-      <th>测</th><th>配对</th><th>方向</th><th>协议</th><th>IP</th>
+      <th>测</th><th>配对</th>
+      <th>方向<div class="colsel">
+        <label><input type="checkbox" class="colall" data-attr="dir" data-val="ab">A→B</label>
+        <label><input type="checkbox" class="colall" data-attr="dir" data-val="ba">B→A</label>
+        <label><input type="checkbox" class="colall" data-attr="dir" data-val="bidir">双向</label>
+      </div></th>
+      <th>协议<div class="colsel">
+        <label><input type="checkbox" class="colall" data-attr="tp" data-val="tcp">TCP</label>
+        <label><input type="checkbox" class="colall" data-attr="tp" data-val="udp">UDP</label>
+      </div></th>
+      <th>IP<div class="colsel">
+        <label><input type="checkbox" class="colall" data-attr="ip" data-val="v4">V4</label>
+        <label><input type="checkbox" class="colall" data-attr="ip" data-val="v6">V6</label>
+      </div></th>
     </tr></thead><tbody></tbody></table></div>
   </section>
 
   <section id="runsec" class="hidden">
     <h2><span class="n">4</span>执行</h2>
     <p class="hint sweep-note">
-      空格或逗号分隔多个档位。按网口填写 UDP -b 后，该发送端固定使用网口值；留空的发送端继续扫描全局档位。
+      空格或逗号分隔多个档位，TCP -w / -P 与 UDP -b / -l / -w 都会逐档各跑一轮
+      （UDP 三项取组合：2 档 -b × 2 档 -l × 2 档 -w = 8 个单元，跑之前用「预览任务」看一眼总数）。
+      按网口填写 UDP -b 后，该发送端固定使用网口值；留空的发送端继续扫描全局档位。
     </p>
     <div class="row">
       <label>TCP -w <input type="text" id="win" class="list" value="4m" placeholder="2m 4m 256m"></label>
       <label>TCP -P <input type="text" id="tcpstreams" class="list" value="10" placeholder="1 5 10"></label>
       <label>UDP -b <input type="text" id="udpbw" class="list" value="1000m" placeholder="1m 500m 1G"></label>
+      <label>UDP -l <input type="text" id="udplen" class="list" placeholder="留空=iperf3 默认"></label>
+      <label>UDP -w <input type="text" id="udpwin" class="list" placeholder="留空=iperf3 默认"></label>
     </div>
     <div class="row run-options">
       <label>时长 <input type="number" id="duration" class="num" value="180" min="1" max="86400"></label>
       <label>UDP 流 <input type="number" id="udpstreams" class="num" value="1" min="1" max="32"></label>
+      <label><input type="checkbox" id="clip"> 按链路上限裁剪 UDP -b</label>
       <label><input type="checkbox" id="shot"> 截图</label>
     </div>
+    <p class="hint">不勾「裁剪」时，填多少就发多少——想看链路在超额灌包下的表现就保持不勾。勾上后超过整条路径可信上限的档位会被自动压到上限，按网口单独指定的 -b 不受影响。</p>
     <div class="row actions">
       <button type="button" class="ghost" id="export">下载 config.json</button>
       <button type="button" class="ghost" id="plan">预览任务</button>
@@ -213,19 +240,25 @@ function renderNics(policies) {
   const configured = new Map((policies || []).map((policy) => [policy.endpoint, policy]));
   const add = (side, cn, n, i) => {
     const policy = configured.get(side + ':NAME=' + n.name) || {};
-    const target = policy.rx_target_mbps == null ? '' : String(policy.rx_target_mbps);
+    const target = policy.rx_target || '';
     const bandwidth = policy.udp_bandwidth || '';
+    const length = policy.udp_length || '';
+    const cell = (cls, value, placeholder, note) =>
+      '<td><input type="text" class="bw ' + cls + (value ? ' touched' : '') +
+      '" data-side="' + side + '" data-ni="' + i + '" value="' + esc(value) +
+      '" placeholder="' + placeholder + '">' + (note || '') + '</td>';
     rows.push('<tr><td>' + cn + '</td><td>' + esc(n.name) + '</td><td>' + esc(n.role) +
     '</td><td>' + esc(n.ipv4) + '</td><td>' + (n.speed_mbps || '?') + ' Mbps</td><td>' + esc(n.gateway_v4 || '—') +
-    '</td><td><input type="number" class="num nic-target' + (target ? ' touched' : '') + '" min="0.001" step="any" data-side="' + side + '" data-ni="' + i +
-    '" value="' + esc(target) + '" placeholder="不设门限"><span class="field-note">Mbps</span></td>' +
-    '<td><input type="text" class="bw nic-bw' + (bandwidth ? ' touched' : '') + '" data-side="' + side + '" data-ni="' + i +
-    '" value="' + esc(bandwidth) + '" placeholder="走全局档位"></td></tr>');
+    '</td>' +
+    cell('nic-target', target, '不设门限', '<span class="field-note">1800 或 90%</span>') +
+    cell('nic-bw', bandwidth, '走全局档位') +
+    cell('nic-len', length, '走全局档位') +
+    '</tr>');
   };
   MASTER.interfaces.forEach((n, i) => add('master', '主控', n, i));
   AGENT.interfaces.forEach((n, i) => add('agent', '辅测', n, i));
   $('nics').querySelector('tbody').innerHTML = rows.join('');
-  document.querySelectorAll('.nic-target, .nic-bw').forEach((el) => {
+  document.querySelectorAll('.nic-target, .nic-bw, .nic-len').forEach((el) => {
     el.addEventListener('input', () => el.classList.toggle('touched', el.value.trim() !== ''));
   });
 }
@@ -246,6 +279,9 @@ function renderMatrix() {
       '</tr>';
   });
   $('matrix').querySelector('tbody').innerHTML = rows.join('');
+  // 表头开关的目标行刚被重建，状态要跟着重算一次。
+  bindColumnToggles();
+  syncColumnToggles();
 }
 
 function collectNicPolicies() {
@@ -253,11 +289,15 @@ function collectNicPolicies() {
   return Array.from(document.querySelectorAll('.nic-target')).map((target) => {
     const side = target.dataset.side, i = Number(target.dataset.ni);
     const nic = (side === 'master' ? MASTER : AGENT).interfaces[i];
-    const bandwidth = document.querySelector('.nic-bw[data-side="' + side + '"][data-ni="' + i + '"]');
+    const pick = (cls) => {
+      const el = document.querySelector('.' + cls + '[data-side="' + side + '"][data-ni="' + i + '"]');
+      return el ? el.value.trim() : '';
+    };
     return {
       endpoint: side + ':NAME=' + nic.name,
-      rx_target_mbps: target.value.trim() === '' ? null : Number(target.value),
-      udp_bandwidth: bandwidth.value.trim(),
+      rx_target: target.value.trim(),
+      udp_bandwidth: pick('nic-bw'),
+      udp_length: pick('nic-len'),
     };
   });
 }
@@ -285,7 +325,10 @@ function collect() {
     tcp_windows: splitList($('win').value),
     tcp_streams: splitList($('tcpstreams').value).map(Number).filter((n) => n > 0),
     udp_bandwidths: splitList($('udpbw').value),
+    udp_lengths: splitList($('udplen').value),
+    udp_windows: splitList($('udpwin').value),
     udp_streams: Number($('udpstreams').value) || 1,
+    limit_udp_by_link_speed: $('clip').checked,
     screenshot: $('shot').checked,
   };
 }
@@ -306,10 +349,13 @@ async function bootstrap() {
     $('host').value = d.agent_host || '';
     $('port').value = d.agent_port || 28801;
     $('token').placeholder = d.token_configured ? '已从配置加载' : '留空=不认证';
+    $('prefixes').value = (d.ipv4_prefixes || []).join(' ');
     $('duration').value = d.duration || 180;
     $('win').value = (d.tcp_windows || []).join(' ');
     $('tcpstreams').value = (d.tcp_streams || [10]).join(' ');
     $('udpbw').value = (d.udp_bandwidths || []).join(' ');
+    $('udplen').value = (d.udp_lengths || []).join(' ');
+    $('udpwin').value = (d.udp_windows || []).join(' ');
     $('udpstreams').value = d.udp_streams || 1;
     $('shot').checked = Boolean(d.screenshot);
   } catch (e) {
@@ -324,12 +370,20 @@ function mergePolicies(configured, current) {
   return Array.from(merged.values());
 }
 
+// 连接参数三处共用（连接 / 刷新网口），免得只在一处加了前缀。
+function connectParams() {
+  return {
+    host: $('host').value.trim(),
+    port: Number($('port').value) || 28801,
+    token: $('token').value.trim(),
+    ipv4_prefixes: splitList($('prefixes').value),
+  };
+}
+
 $('connect').onclick = async () => {
   say($('connstatus'), '连接中…', 'info');
   try {
-    const d = await api('/api/connect', {
-      host: $('host').value.trim(), port: Number($('port').value) || 28801, token: $('token').value.trim(),
-    });
+    const d = await api('/api/connect', connectParams());
     MASTER = d.master; AGENT = d.agent;
     say($('connstatus'), '已连接 ' + d.health.hostname + ' (' + d.health.os + ') · agent v' + d.health.version +
       ' · iperf3 ' + (d.health.iperf3 || '未找到') + ' · ctsTraffic ' + (d.health.ctstraffic || '未找到'), 'ok');
@@ -344,16 +398,62 @@ $('refresh').onclick = async () => {
   say($('connstatus'), '重新扫描双端网口…', 'info');
   try {
     const currentPolicies = collectNicPolicies();
-    const d = await api('/api/connect', { host: $('host').value.trim(), port: Number($('port').value) || 28801, token: $('token').value.trim() });
+    const d = await api('/api/connect', connectParams());
     MASTER = d.master; AGENT = d.agent; PAIRS = buildPairs();
     renderNics(mergePolicies(d.nic_policies, currentPolicies)); renderMatrix();
     say($('connstatus'), '网口已刷新（' + new Date().toLocaleTimeString() + '）', 'ok');
   } catch (e) { say($('connstatus'), e.message, 'bad'); }
 };
 
-$('all').onclick = () => document.querySelectorAll('.sel').forEach((b) => (b.checked = true));
-$('none').onclick = () => document.querySelectorAll('.sel').forEach((b) => (b.checked = false));
-$('cross').onclick = () => document.querySelectorAll('.sel').forEach((b) => (b.checked = PAIRS[b.dataset.i].cross));
+// 「全选」= 整张表全测一遍，所以双向和 IPv6 这些默认不勾的项也要跟着勾上；
+// 只勾中间那一列「测」等于把全选做了一半，跑出来才发现少了方向。
+function setRowOptions(index, on) {
+  document.querySelectorAll('[data-dir][data-i="' + index + '"], [data-tp][data-i="' + index + '"], [data-ip][data-i="' + index + '"]')
+    .forEach((box) => (box.checked = on));
+}
+
+// 表头上的整列开关。逐行点 30 次去开双向，和开完之后没法一次关掉，是同一个
+// 缺口的两面：方向/协议/IP 这三列需要的是列级操作，不是行级操作。
+function columnBoxes(attr, val) {
+  return Array.from(document.querySelectorAll('[data-' + attr + '="' + val + '"]'))
+    .filter((box) => !box.classList.contains('colall'));
+}
+function syncColumnToggles() {
+  document.querySelectorAll('.colall').forEach((head) => {
+    const boxes = columnBoxes(head.dataset.attr, head.dataset.val);
+    head.checked = boxes.length > 0 && boxes.every((b) => b.checked);
+    // 部分勾选时显示成中间态，免得表头看起来像"一个都没勾"。
+    head.indeterminate = !head.checked && boxes.some((b) => b.checked);
+  });
+}
+function bindColumnToggles() {
+  document.querySelectorAll('.colall').forEach((head) => {
+    head.onchange = () => {
+      columnBoxes(head.dataset.attr, head.dataset.val).forEach((b) => (b.checked = head.checked));
+      head.indeterminate = false;
+    };
+  });
+}
+// 行内勾选也要把表头状态同步回来，否则表头会一直显示上一次的整列状态。
+$('matrix').addEventListener('change', (ev) => {
+  if (ev.target && !ev.target.classList.contains('colall')) syncColumnToggles();
+});
+
+$('all').onclick = () => {
+  document.querySelectorAll('.sel').forEach((b) => {
+    b.checked = true;
+    setRowOptions(b.dataset.i, true);
+  });
+  syncColumnToggles();
+};
+// 「全不选」只清「测」这一列。方向/协议/IP 要清空用表头的整列开关——
+// 把它们跟着一起清掉，重新勾行时会直接卡在「至少勾一个方向」的校验上。
+$('none').onclick = () => {
+  document.querySelectorAll('.sel').forEach((b) => (b.checked = false));
+};
+$('cross').onclick = () => {
+  document.querySelectorAll('.sel').forEach((b) => (b.checked = PAIRS[b.dataset.i].cross));
+};
 function selectedCount() { return document.querySelectorAll('.sel:checked').length; }
 
 $('export').onclick = async () => {

@@ -16,7 +16,14 @@ pub fn nic_payload_ceiling_mbps(nic: &NicInfo, cfg: &RateCheckCfg) -> Option<f64
         // WiFi 不跟协商速率：那是 PHY 速率，会在一轮测试里反复跳
         // （同一块 Wi-Fi 7 网卡 2402 / 2882 来回），拿它裁 -b 会让相邻两个
         // 单元的灌包强度都不一样。固定档位才能横向比较。
-        "WIFI" | "WIFI2.4G" | "WIFI5G" | "WIFI6G" => Some(cfg.wifi_payload_ceiling_mbps),
+        //
+        // 但 2.4G 必须单独一档：那个频段只有 3 个不重叠信道、最多 40MHz，
+        // 和 5G/6G 共用 2800 等于对 2.4G 口根本不裁剪。
+        "WIFI2.4G" => Some(cfg.wifi_24g_payload_ceiling_mbps),
+        // 频段没识别出来时按 5G 档，不按 2.4G 档：Windows 上 netsh 正常会报出
+        // 频段，落到这里多半是 macOS/Linux 的扫描拿不到；把它压到 2.4G 档会让
+        // 一堆真正的 5G 口被误裁，比不裁更糟。
+        "WIFI" | "WIFI5G" | "WIFI6G" => Some(cfg.wifi_payload_ceiling_mbps),
         // 10GUSB 的 4.2G 协商值是已知驱动显示问题，不能按 4.2G 裁剪。
         "10GUSB" | "10GETH" => Some(10_000.0),
         _ => negotiated,
@@ -53,10 +60,59 @@ pub struct LinkPolicy {
     pub rx_target_mbps: Option<f64>,
     /// 覆盖全局 `udp_profiles` 档位的单流带宽；`None` 表示沿用档位本身。
     pub udp_bandwidth: Option<String>,
+    /// 覆盖全局 `udp_profiles` 档位的报文长度（`-l`）；`None` 表示沿用档位本身。
+    pub udp_length: Option<String>,
+    /// 门限是按协商速率百分比算出来的时，记下算式（或算不出来的原因）。
+    ///
+    /// 协商速率会变，尤其 Wi-Fi。同一份配置两次跑出不同门限时，把算式摆在
+    /// 计划提示里是唯一能让人看懂的办法。
+    pub rx_target_note: Option<String>,
+}
+
+/// 把一条单口覆盖的门限设置换算成绝对 Mbps。
+///
+/// 绝对值优先于百分比：两个都填时按绝对值，不去猜哪个更"新"。
+fn nic_rx_target(profile: &NicProfile, nic: &NicInfo) -> (Option<f64>, Option<String>) {
+    if let Some(absolute) = profile
+        .rx_target_mbps
+        .filter(|value| value.is_finite() && *value > 0.0)
+    {
+        return (Some(absolute), None);
+    }
+    let Some(percent) = profile
+        .rx_target_percent
+        .filter(|value| value.is_finite() && *value > 0.0)
+    else {
+        return (None, None);
+    };
+    if nic.speed_mbps == 0 {
+        // 换算不出来就退回下游兜底，但必须说出来：静默地把「按 90% 判」变成
+        // 「按内置推导判」，报告上看不出门限换过。
+        return (
+            None,
+            Some(format!(
+                "接收口 {} 协商速率未知，{percent}% 门限无法换算，本条回退到默认推导",
+                nic.name
+            )),
+        );
+    }
+    let speed = nic.speed_mbps as f64;
+    let target = speed * percent / 100.0;
+    (
+        Some(target),
+        Some(format!(
+            "接收口 {} 门限按协商速率换算：{speed:.0}Mbps × {percent}% = {target:.0}Mbps",
+            nic.name
+        )),
+    )
 }
 
 /// 判断一块网卡是否命中某条单口覆盖。
-fn nic_profile_matches(profile: &NicProfile, host: &str, nic: &NicInfo) -> bool {
+/// 一条 `by_nic` 覆盖项是否落在这块网卡上。
+///
+/// 判定路径和 Web 控制台的回填共用这一份规则：两边各写一份时，界面显示的
+/// 「这块网卡已有策略」和运行时真正生效的策略会在规则变动那天悄悄分叉。
+pub(crate) fn nic_profile_matches(profile: &NicProfile, host: &str, nic: &NicInfo) -> bool {
     profile.host.eq_ignore_ascii_case(host)
         && profile.name == nic.name
         && (profile.ipv4.is_empty() || profile.ipv4 == nic.ipv4)
@@ -95,11 +151,14 @@ pub fn resolve_link_policy(
     dst: &NicInfo,
 ) -> LinkPolicy {
     // 门限看接收端，带宽看发送端：两者约束的是链路的不同侧。
-    let rx_target_mbps = profiles
+    let receiver_profile = profiles
         .by_nic
         .iter()
-        .find(|profile| nic_profile_matches(profile, dst_host, dst))
-        .and_then(|profile| profile.rx_target_mbps)
+        .find(|profile| nic_profile_matches(profile, dst_host, dst));
+    let (nic_target, rx_target_note) = receiver_profile
+        .map(|profile| nic_rx_target(profile, dst))
+        .unwrap_or((None, None));
+    let rx_target_mbps = nic_target
         .or_else(|| {
             profiles.by_role.iter().find_map(|profile| {
                 let direction = role_pair_direction(&profile.pair, src, dst)?;
@@ -108,10 +167,11 @@ pub fn resolve_link_policy(
         })
         .filter(|value| value.is_finite() && *value > 0.0);
 
-    let udp_bandwidth = profiles
+    let sender_profile = profiles
         .by_nic
         .iter()
-        .find(|profile| nic_profile_matches(profile, src_host, src))
+        .find(|profile| nic_profile_matches(profile, src_host, src));
+    let udp_bandwidth = sender_profile
         .and_then(|profile| profile.udp_bandwidth.clone())
         .or_else(|| {
             profiles.by_role.iter().find_map(|profile| {
@@ -124,9 +184,17 @@ pub fn resolve_link_policy(
         })
         .filter(|value| !value.trim().is_empty());
 
+    // `-l` 只有单口覆盖一层：报文长度是发送口的属性，没有「这个角色配对该用
+    // 多大报文」这种说法。
+    let udp_length = sender_profile
+        .and_then(|profile| profile.udp_length.clone())
+        .filter(|value| !value.trim().is_empty());
+
     LinkPolicy {
         rx_target_mbps,
         udp_bandwidth,
+        udp_length,
+        rx_target_note,
     }
 }
 
@@ -262,6 +330,7 @@ mod tests {
                 ipv4: "192.168.0.104".into(),
                 rx_target_mbps: Some(1800.0),
                 udp_bandwidth: Some("2.8G".into()),
+                ..Default::default()
             }],
         };
         let eth = named_nic("以太网 6", "SGMII2.5G", "192.168.0.101", 2500);
@@ -289,6 +358,7 @@ mod tests {
                 ipv4: "192.168.0.104".into(),
                 rx_target_mbps: Some(1800.0),
                 udp_bandwidth: None,
+                ..Default::default()
             }],
         };
         let eth = named_nic("以太网 6", "SGMII2.5G", "192.168.0.101", 2500);
@@ -431,5 +501,37 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(auto_evb_target_mbps(&usb, &eth, &cfg), None);
+    }
+
+    /// 2.4G 和 5G 必须走不同的上限。共用 2800 等于对 2.4G 口完全不裁剪。
+    #[test]
+    fn the_24g_band_does_not_borrow_the_5g_ceiling() {
+        let cfg = RateCheckCfg::default();
+        let ceiling = |role: &str, speed: u64| {
+            nic_payload_ceiling_mbps(&named_nic("wlan", role, "192.168.1.9", speed), &cfg)
+        };
+
+        assert_eq!(ceiling("WIFI5G", 2882), Some(2800.0));
+        assert_eq!(ceiling("WIFI6G", 5760), Some(2800.0));
+        assert_eq!(
+            ceiling("WIFI2.4G", 574),
+            Some(300.0),
+            "2.4GHz 只有 3 个不重叠信道、最多 40MHz，够不到 5G 的档"
+        );
+
+        // 频段没识别出来时按 5G 档：落到 WIFI 的多半是 macOS/Linux 扫不到频段，
+        // 把它压到 2.4G 档会让一堆真正的 5G 口被误裁。
+        assert_eq!(ceiling("WIFI", 866), Some(2800.0));
+    }
+
+    /// 三个频段的上限都不跟协商速率走——协商值只是 PHY 速率，会来回跳。
+    #[test]
+    fn no_wifi_band_follows_the_negotiated_phy_rate() {
+        let cfg = RateCheckCfg::default();
+        for role in ["WIFI", "WIFI2.4G", "WIFI5G", "WIFI6G"] {
+            let low = nic_payload_ceiling_mbps(&named_nic("w", role, "192.168.1.9", 72), &cfg);
+            let high = nic_payload_ceiling_mbps(&named_nic("w", role, "192.168.1.9", 5760), &cfg);
+            assert_eq!(low, high, "{role} 的上限被协商速率带偏了");
+        }
     }
 }
