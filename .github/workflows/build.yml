@@ -26,7 +26,7 @@ jobs:
     outputs:
       crate_version: ${{ steps.metadata.outputs.crate_version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -161,7 +161,7 @@ jobs:
 
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -408,7 +408,7 @@ jobs:
           tar -tzf "${out_dir}/${asset_base}.tar.gz" | grep -Fx './cpe_test'
 
       - name: Upload packaged release asset
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ steps.package.outputs.asset_base }}
           path: release-packages/${{ steps.package.outputs.asset_base }}.${{ matrix.archive }}
@@ -425,7 +425,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: release-assets
           merge-multiple: true
@@ -529,7 +529,7 @@ jobs:
           )
 
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           fail_on_unmatched_files: true
           generate_release_notes: true
