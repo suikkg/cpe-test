@@ -1,13 +1,13 @@
-# cpe_test v4.3.1 Windows 配置与文档包
+# cpe_test v4.4.0 Windows 配置与文档包
 
-仓库中的 `cpe_test-v4.3.1-windows-config-docs.zip` 是便于从 Git 直接下载的
+仓库中的 `cpe_test-v4.4.0-windows-config-docs.zip` 是便于从 Git 直接下载的
 Windows 配置、说明文档和启动脚本资料包。包内文件由仓库当前版本生成，并由 CI
 逐文件与源码副本比对，避免配置或文档过期。
 
 这个资料包**不包含可执行程序或吞吐工具**：
 
 - 不包含 `cpe_test.exe`；请从 GitHub Release 下载正式
-  `cpe_test-v4.3.1-windows-x86_64.zip`，或自行编译。
+  `cpe_test-v4.4.0-windows-x86_64.zip`，或自行编译。
 - 不包含 `ctsTraffic.exe`；正式 Windows Release ZIP 会捆绑固定并校验过的
   Microsoft ctsTraffic 2.0.4.0 x64。
 - 不包含 `iperf3.exe` 及其 DLL；需要 iperf3 测试时，请放入完整的 Windows
@@ -21,6 +21,17 @@ Windows 配置、说明文档和启动脚本资料包。包内文件由仓库当
 - `config.example.json`（完整字段面）与 `configs/` 下四份可直接选择的具名配置。
 - `start_ui.bat`（图形控制台）、`start_agent.bat`、`start_master.bat`、`start_master_select_config.bat`。
 - iperf3/ctsTraffic 放置说明、MIT 许可证和第三方声明。
+
+## v4.4.0 行为要点
+
+- 测试矩阵每行新增**按配对**的「双向门限 A→B / B→A」，只在勾了「双向」时生效。半双工介质（Wi-Fi、部分 USB 网卡）双向并发时两个方向抢同一段介质时间，拿单向门限去卡双向必然判 `RATE_FAIL`。配置字段 `rate_targets_bidir_mbps`，只收绝对 Mbps；填了却没勾「双向」会当场报错。
+- 控制台新增「监控」标签页（本机或辅测机任一网卡的实时 RX/TX 曲线，与测试并发，横轴是时间）、「本机」区（不必先连辅测机）、PING 进测试矩阵、resume 勾选框。
+- 两个 Web UI 可改绑定地址 `--ui-bind`；主控控制台放到非回环地址**必须**同时给 `--ui-token`，否则拒绝启动。两个 token 都支持环境变量。
+- 修复控制台跑过一轮测试后在 macOS/Linux 上 Ctrl+C 杀不掉进程。现在空闲时按一次即退；测试在跑时先优雅收尾出报告再退。
+- 修复辅测机上的 UI 监控最长可能空转两小时：租约改为从最后一次查询起算的心跳，UI 侧 7200s → 180s。
+- 修复 iperf3 的 Byte 单位按 1000 进位解析（实际是 1024）、`http_client` 对响应体不设上限（现与 agent 一致封在 100MB）、`RX_DROPOUT` 缺处置建议与指标交叉核对、非中英文 Windows 上扫不到网卡。
+- 删除已不再产出的 `UNSTABLE` 判定分级及报告概览里恒为 0 的那格统计。
+- 单元测试 417 → 452。
 
 ## v4.3.1 行为要点
 

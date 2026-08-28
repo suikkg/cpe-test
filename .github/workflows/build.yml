@@ -81,14 +81,14 @@ jobs:
           from pathlib import Path
           from zipfile import ZipFile
 
-          bundle = Path("dist/cpe_test-v4.3.1-windows-config-docs.zip")
+          bundle = Path("dist/cpe_test-v4.4.0-windows-config-docs.zip")
           checksum = Path(f"{bundle}.sha256")
           expected_hash = checksum.read_text(encoding="utf-8").split()[0]
           actual_hash = sha256(bundle.read_bytes()).hexdigest()
           if actual_hash != expected_hash:
               raise SystemExit(f"bundle SHA-256 mismatch: {actual_hash}")
 
-          prefix = "cpe_test-v4.3.1-windows-config-docs"
+          prefix = "cpe_test-v4.4.0-windows-config-docs"
           source_for = {
               "Windows配置与文档包说明.md": Path("dist/Windows配置与文档包说明.md"),
               "README.md": Path("README.md"),
@@ -536,6 +536,19 @@ jobs:
           make_latest: true
           body: |
             cpe_test ${{ github.ref_name }} 的已验证跨平台发布包。
+
+            ## v4.4.0 双向门限、控制台监控与一批生命周期修复
+
+            - **按配对的双向门限**：测试矩阵每行新增「双向门限 A→B / B→A」，只在勾了「双向」时生效。半双工介质（Wi-Fi、部分 USB 网卡）双向并发时两个方向抢同一段介质时间，拿单向门限去卡双向必然判 `RATE_FAIL`。**按配对而不是按网卡**——同一块 RNDIS 口和 Wi-Fi 组双向、和 SGMII 组双向能收到的速率不是一个量级。配置字段 `rate_targets_bidir_mbps`，只收绝对 Mbps；填了却没勾「双向」会当场报错。
+            - **控制台新增监控标签页**：本机或辅测机任一网卡的实时 RX/TX 曲线，与测试并发。横轴是时间而不是采样序号，断流会在图上留出空档。另新增「本机」区（不必先连辅测机）、PING 进测试矩阵、resume 勾选框。
+            - **两个 Web UI 可改绑定地址**：新增 `--ui-bind`。主控控制台放到非回环地址**必须**同时给 `--ui-token`，否则拒绝启动；两个 token 都支持环境变量。
+            - **修复控制台在 macOS/Linux 上 Ctrl+C 杀不掉**：`run_master()` 装的取消处理器只置标志不退进程且永不撤销，而取请求循环从不查那个标志。现在空闲时按一次即退；测试在跑时先优雅收尾出报告再退。
+            - **修复辅测机上的 UI 监控最长空转两小时**：租约改为从最后一次 `/monitor/status` 起算的心跳，UI 侧 7200s → 180s；监控错误列表封顶并保留准确计数。
+            - **修复 iperf3 Byte 单位进制**：bit 单位按 1000 进位、Byte 单位按 1024（实测 100 Mbits/sec 打印成 11.9 MBytes/sec），此前 `-f M` 下低报 4.6%。
+            - **客户端给响应体加了上限**：`Content-Length` 此前直接进 `Vec::resize`，对端说多大就申请多大。现与 agent 的 `MAX_BODY` 一致封在 100MB，chunked 走累计预算，另加总时限；连接不再只试解析出的第一个地址。
+            - **`RX_DROPOUT` 补进处置建议与指标交叉核对**，并新增编译期扫描测试防止后续原因码再次漏登记；删除已无产出点的 `UNSTABLE` 分级及报告里恒为 0 的那格统计。
+            - **非中英文 Windows 上不再扫不到网卡**：补德语 `-Adapter` 写法，并用 `GetIfTable2` 的接口别名做语言无关兜底。
+            - **回归覆盖**：单元测试 417 → 452。
 
             ## v4.3.1 判定收紧、Wi-Fi 2.4G 上限与辅测机状态页
 
