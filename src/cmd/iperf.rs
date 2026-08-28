@@ -193,11 +193,18 @@ pub fn parse_output(text: &str) -> IperfParsed {
             let num: f64 = cap[1].replace(',', ".").parse().unwrap_or(0.0);
             let unit = &cap[2];
             let kind = &cap[3];
+            // iperf3 的两套单位不是同一个进制：bit 单位（Kbits/Mbits/Gbits）
+            // 按 1000 进位，Byte 单位（KBytes/MBytes/GBytes）按 1024 进位。
+            // 实测：一条 100 Mbits/sec 的流，`-f M` 打印成 11.9 MBytes/sec
+            // （100e6/8/1048576 = 11.92）。两边都按 1000 算的话，
+            // M 档要低报 4.6%、G 档低报 7.0%——这个量级恰好像测量噪声，
+            // 不会触发任何断言，却会让工具自报速率和网卡口径互相矛盾。
+            let scale = if kind == "Bytes" { 1024.0 } else { 1000.0 };
             let mut mbps = match unit {
-                "K" => num / 1000.0,
-                "M" => num,
-                "G" => num * 1000.0,
-                "T" => num * 1_000_000.0,
+                "K" => num * scale / 1_000_000.0,
+                "M" => num * scale * scale / 1_000_000.0,
+                "G" => num * scale * scale * scale / 1_000_000.0,
+                "T" => num * scale * scale * scale * scale / 1_000_000.0,
                 _ => num / 1_000_000.0,
             };
             if kind == "Bytes" {
@@ -1819,6 +1826,65 @@ fn join_client_thread(
 
 #[cfg(test)]
 mod tests {
+    /// iperf3 的两套单位不是同一个进制：bit 单位按 1000 进位，Byte 单位按 1024 进位。
+    ///
+    /// 下面两段是同一条 100 Mbits/sec 的流在 `-f m` 和 `-f M` 下的**真实输出**
+    /// （iperf 3.18，回环，`-u -b 100M -t 2`）。两边解析出来必须是同一个速率；
+    /// 按 1000 进位算 Byte 单位会低报 4.6%——这个量级恰好像测量噪声，
+    /// 不会触发任何断言，却让工具自报速率和网卡口径互相矛盾。
+    ///
+    /// **今天走不到这条分支**：`extra` 由 builder 从 `-w`/`-P`/`-b`/`-l`
+    /// 这些有类型的配置字段拼出来，配置里没有任何「原样透传参数」的口子，
+    /// 所以下发的永远是 `-f m`。唯一能换格式的路径是直接调 agent 的
+    /// `/iperf/client` 接口。留着这条用例是因为解析器不该依赖调用方的自觉。
+    #[test]
+    fn byte_formatted_rates_use_the_1024_base_iperf3_actually_prints() {
+        let bits =
+            "[  5]   0.00-2.00   sec  23.8 MBytes   100 Mbits/sec  0.000 ms  0/1531 (0%)  receiver";
+        let bytes = "[  5]   0.00-2.00   sec  23.9 MBytes  11.9 MBytes/sec  0.009 ms  0/1534 (0%)  receiver";
+
+        let from_bits = parse_output(bits)
+            .receiver_mbps
+            .expect("bit 格式要解析出速率");
+        let from_bytes = parse_output(bytes)
+            .receiver_mbps
+            .expect("Byte 格式要解析出速率");
+
+        assert!(
+            (from_bits - 100.0).abs() < 0.001,
+            "bit 格式不能被改坏: {from_bits}"
+        );
+        assert!(
+            (from_bytes - 100.0).abs() < 0.5,
+            "11.9 MBytes/sec 是 1024 进制，应约等于 100 Mbps，实得 {from_bytes}"
+        );
+        assert!(
+            (from_bits - from_bytes).abs() < 0.5,
+            "同一条流的两种打印格式必须解析成同一个速率：{from_bits} vs {from_bytes}"
+        );
+    }
+
+    /// 换进制不能把常规的 bit 格式改坏——这是生产上唯一真正走到的那条。
+    #[test]
+    fn bit_formatted_rates_keep_their_decimal_base() {
+        let cases = [
+            ("[  5]  0.00-1.00  sec  1.09 GBytes  9350 Mbits/sec", 9350.0),
+            ("[  5]  0.00-1.00  sec  1.09 GBytes  9.35 Gbits/sec", 9350.0),
+            (
+                "[  5]  0.00-1.00  sec  1.09 GBytes  935000 Kbits/sec",
+                935.0,
+            ),
+            ("[  5]  0.00-1.00  sec  1.09 GBytes  1000000 bits/sec", 1.0),
+        ];
+        for (line, expected) in cases {
+            let got = parse_output(line).last_mbps.expect(line);
+            assert!(
+                (got - expected).abs() < 0.001,
+                "{line} 应解析成 {expected} Mbps，实得 {got}"
+            );
+        }
+    }
+
     use super::*;
     use crate::util::{CmdOut, ProcessSpec};
     use std::sync::atomic::AtomicUsize;
@@ -1999,8 +2065,10 @@ iperf Done.
     fn test_parse_gbits_and_bytes() {
         let p = parse_output("[  5]  0.00-10.00 sec  2.77 GBytes  2.38 Gbits/sec  sender\n");
         assert_eq!(p.sender_mbps, Some(2380.0));
+        // 1 MBytes/sec 是 1 MiB/s = 8.388608 Mbps，不是 8。这条断言原先钉的是 8.0，
+        // 等于把「Byte 单位按 1000 进位」这个错误锁进了回归防线。
         let p2 = parse_output("[  5]  0.0-1.0 sec  1.00 MBytes/sec\n");
-        assert_eq!(p2.last_mbps, Some(8.0));
+        assert_eq!(p2.last_mbps, Some(8.388608));
     }
 
     #[test]

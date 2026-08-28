@@ -76,6 +76,8 @@ pub struct SpecNorm {
     pub udp_limit: bool,
     pub rate_mode: RateMode,
     pub rate_targets: RateTargets,
+    /// 双向并发单元专用的门限，按方向（ab/ba）。空则双向也走既有兜底链。
+    pub rate_targets_bidir: RateTargets,
     pub rate_check: RateCheckCfg,
     /// 两层链路策略（角色兜底 + 单口覆盖）；空则全部走内置推导。
     pub link_profiles: LinkProfiles,
@@ -650,6 +652,7 @@ pub fn spec_from_config(
         udp_limit: cfg.limit_udp_by_link_speed,
         rate_mode: t.rate_mode.unwrap_or(cfg.iperf.rate_check.mode),
         rate_targets: t.rate_targets_mbps.clone().unwrap_or_default(),
+        rate_targets_bidir: t.rate_targets_bidir_mbps.clone().unwrap_or_default(),
         rate_check: cfg.iperf.rate_check.clone(),
         link_profiles: cfg.link_profiles.clone(),
         ctstraffic: cfg.ctstraffic.clone(),
@@ -858,6 +861,14 @@ fn push_rate_targets_identity(identity: &mut String, prefix: &str, targets: &Rat
 /// 这里有意记录原始配置而不是只记录最终目标：例如 `offered_headroom_pct` 同时改变
 /// 最低发送负载和所需成功流数，`sample_interval_ms`/`settle_secs` 会改变可判定窗口，
 /// `max_udp_loss_pct` 会直接改变 PASS/FAIL。新验收字段加入 RateCheckCfg 时也应同步加入。
+///
+/// **两个 WiFi 上限有意不在这里。** 它们影响执行的唯一通路是裁剪后的 `-b` 和流数，
+/// 而这两样已经分别经由 `task.extra` 和 `stream_count` 进了 identity；`udp_limit`
+/// 关掉时它们对执行更是毫无影响。再记一遍不会多拦住任何一次错误复用，却会让
+/// iperf / tcp / ctstraffic 三条 schema 的哈希同时改变，把所有人的 resume 缓存
+/// 白白清空一次。哪天它们开始参与 RX 门限或 verdict（而不只是裁 `-b`），
+/// 就必须补进来并同步升 schema 版本。
+/// 覆盖由 `the_24g_ceiling_reaches_resume_identity_through_the_clipped_load` 钉住。
 fn push_rate_check_identity(identity: &mut String, cfg: &RateCheckCfg) {
     push_resume_field(identity, "rate_check.mode", rate_mode_identity(cfg.mode));
     push_rate_targets_identity(identity, "rate_check.targets", &cfg.targets_mbps);
@@ -1169,6 +1180,42 @@ fn note_rx_target(
     }
 }
 
+/// 这条腿要用的 RX 门限。
+///
+/// 顺序：**双向配对门限 → 单口覆盖 → 场景 targets → 内置推导**。
+///
+/// 双向配对门限排在最前，因为它是唯一一个知道「这条腿属于哪一对网口、
+/// 而且两个方向正在同时灌」的来源。半双工介质上这两件事缺一不可：
+/// 同一块 RNDIS 口，和 Wi-Fi 组双向、和 SGMII 组双向，能收到的速率
+/// 完全不是一个量级——挂在网卡上的那个数没法同时对这两组成立。
+///
+/// 只在 `bidir` 为真时参与，所以单向单元的判定一个字节都没变。
+#[allow(clippy::too_many_arguments)]
+fn leg_rx_target(
+    spec: &SpecNorm,
+    policy: &rate::LinkPolicy,
+    flow_direction: &str,
+    bidir: bool,
+    src: &NicInfo,
+    dst: &NicInfo,
+) -> Option<f64> {
+    if bidir {
+        if let Some(target) = spec.rate_targets_bidir.for_direction(flow_direction) {
+            return Some(target);
+        }
+    }
+    policy.rx_target_mbps.or_else(|| {
+        rate::resolve_target_mbps(
+            spec.rate_mode,
+            &spec.rate_targets,
+            flow_direction,
+            src,
+            dst,
+            &spec.rate_check,
+        )
+    })
+}
+
 /// `-w × 流数` 大到这条链路要花多少秒才排空；超过它就提示。
 ///
 /// 2 秒是个够宽松的界：正常的 BDP 档位（64k~4m × 10 流）在 1G 上只有几十
@@ -1424,16 +1471,14 @@ pub fn build_units(
                                             &spec.name,
                                             &leg_policy,
                                         );
-                                        let target = leg_policy.rx_target_mbps.or_else(|| {
-                                            rate::resolve_target_mbps(
-                                                spec.rate_mode,
-                                                &spec.rate_targets,
-                                                &flow_direction,
-                                                &s.nic,
-                                                &d.nic,
-                                                &spec.rate_check,
-                                            )
-                                        });
+                                        let target = leg_rx_target(
+                                            spec,
+                                            &leg_policy,
+                                            &flow_direction,
+                                            bidir,
+                                            &s.nic,
+                                            &d.nic,
+                                        );
                                         let effective_mode =
                                             rate::effective_mode(spec.rate_mode, target);
                                         let t = IperfTask {
@@ -1604,16 +1649,14 @@ pub fn build_units(
                                             &spec.name,
                                             &leg_policy,
                                         );
-                                        let target = leg_policy.rx_target_mbps.or_else(|| {
-                                            rate::resolve_target_mbps(
-                                                spec.rate_mode,
-                                                &spec.rate_targets,
-                                                &flow_direction,
-                                                &s.nic,
-                                                &d.nic,
-                                                &spec.rate_check,
-                                            )
-                                        });
+                                        let target = leg_rx_target(
+                                            spec,
+                                            &leg_policy,
+                                            &flow_direction,
+                                            bidir,
+                                            &s.nic,
+                                            &d.nic,
+                                        );
                                         let effective_mode =
                                             rate::effective_mode(spec.rate_mode, target);
                                         // offered 必须跟着实际下发的 -b 走，否则
@@ -1815,17 +1858,14 @@ pub fn build_units(
                                 for (src, dst, tag) in &pairs {
                                     let flow_direction =
                                         if bidir { tag.to_string() } else { dir.clone() };
-                                    let target =
-                                        link_policy(spec, src, dst).rx_target_mbps.or_else(|| {
-                                            rate::resolve_target_mbps(
-                                                spec.rate_mode,
-                                                &spec.rate_targets,
-                                                &flow_direction,
-                                                &src.nic,
-                                                &dst.nic,
-                                                &spec.rate_check,
-                                            )
-                                        });
+                                    let target = leg_rx_target(
+                                        spec,
+                                        &link_policy(spec, src, dst),
+                                        &flow_direction,
+                                        bidir,
+                                        &src.nic,
+                                        &dst.nic,
+                                    );
                                     let effective_mode =
                                         rate::effective_mode(spec.rate_mode, target);
                                     legs.push(Leg {
@@ -1955,17 +1995,14 @@ pub fn build_units(
                                     max_streams = max_streams.max(streams);
                                     let flow_direction =
                                         if bidir { tag.to_string() } else { dir.clone() };
-                                    let target =
-                                        link_policy(spec, src, dst).rx_target_mbps.or_else(|| {
-                                            rate::resolve_target_mbps(
-                                                spec.rate_mode,
-                                                &spec.rate_targets,
-                                                &flow_direction,
-                                                &src.nic,
-                                                &dst.nic,
-                                                &spec.rate_check,
-                                            )
-                                        });
+                                    let target = leg_rx_target(
+                                        spec,
+                                        &link_policy(spec, src, dst),
+                                        &flow_direction,
+                                        bidir,
+                                        &src.nic,
+                                        &dst.nic,
+                                    );
                                     let effective_mode =
                                         rate::effective_mode(spec.rate_mode, target);
                                     let offered_mbps =
@@ -2142,6 +2179,7 @@ mod tests {
             udp_limit: true,
             rate_mode: RateMode::Auto,
             rate_targets: RateTargets::default(),
+            rate_targets_bidir: RateTargets::default(),
             rate_check: RateCheckCfg::default(),
             link_profiles: LinkProfiles::default(),
             ctstraffic: CtsTrafficCfg::default(),
@@ -3572,6 +3610,143 @@ mod tests {
         spec.streams = 20;
         spec.udp_profiles = vec![UdpProfile::bw("500m")];
         spec
+    }
+
+    /// 钉住 `push_rate_check_identity` 里那条「两个 WiFi 上限有意不记」的取舍：
+    /// 上限真正改变了下发的负载时，identity 必须跟着变（经由裁剪后的 `-b`）；
+    /// 裁剪关掉、上限对执行毫无影响时，identity 不该平白变化。
+    /// 双向门限按**配对**配置，且要一路走到下发的 task 上。
+    ///
+    /// 按网卡配是不够的：同一块 RNDIS 口，和 Wi-Fi 组双向、和 SGMII 组双向，
+    /// 能收到的速率完全不是一个量级——挂在网卡上的那一个数没法同时对两组成立。
+    /// 这条从 `build_units` 走完整链路，中间隔着 `leg_rx_target()` 和四个调用点。
+    #[test]
+    fn a_bidirectional_unit_uses_the_per_pair_threshold_and_a_one_way_unit_does_not() {
+        let targets = |direction: &str| -> Vec<Option<f64>> {
+            let mut spec = base_spec();
+            spec.directions = vec![direction.into()];
+            spec.rate_targets = RateTargets {
+                forward: Some(2000.0),
+                ..Default::default()
+            };
+            spec.rate_targets_bidir = RateTargets {
+                forward: None,
+                ab: Some(1000.0),
+                ba: Some(800.0),
+            };
+            let mut port = PORT_BASE;
+            let (units, _) = build_units(&[spec], true, &mut port);
+            units
+                .iter()
+                .flat_map(|unit| unit.legs.iter())
+                .filter_map(|leg| match &leg.kind {
+                    LegKind::IperfSingle(task) => Some(task.rx_target_mbps),
+                    _ => None,
+                })
+                .collect()
+        };
+
+        assert_eq!(targets("ab"), vec![Some(2000.0)], "单向仍按单向门限判");
+        assert_eq!(
+            targets("bidir"),
+            vec![Some(1000.0), Some(800.0)],
+            "双向两条腿各取各的方向门限——半双工链路两个方向本来就能差很远"
+        );
+    }
+
+    /// 双向门限没填的方向要回落，不能变成「没有目标」。
+    #[test]
+    fn a_direction_without_a_bidirectional_threshold_falls_back_to_the_normal_chain() {
+        let mut spec = base_spec();
+        spec.directions = vec!["bidir".into()];
+        spec.rate_targets = RateTargets {
+            forward: Some(2000.0),
+            ..Default::default()
+        };
+        // 只配 ab，ba 留空。
+        spec.rate_targets_bidir = RateTargets {
+            forward: None,
+            ab: Some(900.0),
+            ba: None,
+        };
+        let mut port = PORT_BASE;
+        let (units, _) = build_units(&[spec], true, &mut port);
+        let targets: Vec<Option<f64>> = units
+            .iter()
+            .flat_map(|unit| unit.legs.iter())
+            .filter_map(|leg| match &leg.kind {
+                LegKind::IperfSingle(task) => Some(task.rx_target_mbps),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            targets,
+            vec![Some(900.0), Some(2000.0)],
+            "没配双向门限的那个方向要回到既有兜底链，而不是丢掉目标"
+        );
+    }
+
+    /// 门限变了旧 PASS 就得失效——否则开 resume 会拿按 2000 判过的结果
+    /// 去顶一个现在按 1000 判的单元。
+    ///
+    /// 不需要把 `rate_targets_bidir` 单独塞进 identity：解析出来的
+    /// `task.rx_target_mbps` 本来就在 identity 里（见 `push_resume_field`
+    /// 对 `rx_target_mbps` 的处理），而那正是这个配置唯一影响执行的通路。
+    /// 再记一遍只会让所有人的 resume 缓存白白清空一次。
+    #[test]
+    fn changing_the_bidirectional_threshold_invalidates_the_resume_identity() {
+        let id_with = |ab: Option<f64>| {
+            let mut spec = base_spec();
+            spec.directions = vec!["bidir".into()];
+            spec.rate_targets_bidir = RateTargets {
+                forward: None,
+                ab,
+                ba: Some(800.0),
+            };
+            let mut port = PORT_BASE;
+            let (units, _) = build_units(&[spec], true, &mut port);
+            units[0].id.clone()
+        };
+
+        assert_ne!(id_with(Some(1000.0)), id_with(Some(1200.0)));
+        assert_eq!(id_with(None), id_with(None), "没配时 identity 要稳定");
+    }
+
+    #[test]
+    fn the_24g_ceiling_reaches_resume_identity_through_the_clipped_load() {
+        // 不用 build_single_udp_id：裁剪会产生提示行，那个辅助函数要求提示为空。
+        let udp_id = |spec: SpecNorm| {
+            let mut port = PORT_BASE;
+            let (units, _) = build_units(&[spec], true, &mut port);
+            assert_eq!(units.len(), 1);
+            units[0].id.clone()
+        };
+
+        let mut base = base_spec();
+        base.src = ep(Side::Master, "wlan", "WIFI2.4G", "192.168.1.2", 286);
+        base.dst = ep(Side::Agent, "eth0", "10GETH", "192.168.1.3", 10000);
+        base.transports = vec!["udp".into()];
+        base.udp_profiles = vec![UdpProfile::bw("1000m")];
+        base.udp_limit = true;
+        let base_id = udp_id(base.clone());
+
+        let mut raised = base.clone();
+        raised.rate_check.wifi_24g_payload_ceiling_mbps = 900.0;
+        assert_ne!(
+            base_id,
+            udp_id(raised),
+            "2.4G 上限改变了实际下发的 -b，旧 PASS 必须失效"
+        );
+
+        let mut unlimited = base.clone();
+        unlimited.udp_limit = false;
+        let unlimited_id = udp_id(unlimited.clone());
+        unlimited.rate_check.wifi_24g_payload_ceiling_mbps = 900.0;
+        assert_eq!(
+            unlimited_id,
+            udp_id(unlimited),
+            "没开裁剪时上限不参与任何计算，不该让缓存无谓失效"
+        );
     }
 
     #[test]

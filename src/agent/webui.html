@@ -92,6 +92,7 @@ td.act-bad { color:var(--bad); font-weight:700; }
       <span class="state-text" id="state">读取中…</span>
       <button type="button" id="refresh" class="ghost">重新扫描</button>
     </div>
+    <div id="scanmsg"></div>
     <dl class="facts" id="facts"></dl>
     <div id="warn"></div>
   </section>
@@ -150,8 +151,6 @@ function renderStatus(d) {
     fact('已运行', hhmmss(d.uptime_secs)),
     fact('访问令牌', d.token_configured ? '已启用（主控需填相同 token）' : '未启用', !d.token_configured),
     fact('iperf3', d.iperf3 ? d.iperf3 : '未找到', !d.iperf3),
-    fact('ctsTraffic', d.ctstraffic ? d.ctstraffic : (d.ctstraffic_supported ? '未找到' : '本平台不支持（仅 Windows 10+）'),
-         d.ctstraffic_supported && !d.ctstraffic),
   ];
   $('facts').innerHTML = facts.join('');
 
@@ -208,14 +207,41 @@ function renderActivity(d) {
 
 let LAST_INTERFACES = [];
 
-async function loadStatus() {
+function scanMsg(text, kind) {
+  $('scanmsg').innerHTML = text ? '<div class="status ' + kind + '">' + esc(text) + '</div>' : '';
+}
+
+// manual=true 是人点了「重新扫描」。这条路径必须有可见反馈：Windows 上
+// scan_host 要起 ipconfig/netsh，一两秒里页面纹丝不动，而扫完通常和扫之前
+// 长得一模一样——没有反馈的话，成功和没反应在屏幕上是同一个样子。
+async function loadStatus(manual) {
+  const btn = $('refresh');
+  if (manual) {
+    btn.disabled = true;
+    btn.textContent = '扫描中…';
+    scanMsg('正在重新扫描网卡…', 'info');
+  }
   try {
     const d = await api('/api/status');
     LAST_INTERFACES = d.nics.interfaces || [];
     renderStatus(d);
+    if (manual) {
+      scanMsg('已重新扫描 · ' + LAST_INTERFACES.length + ' 块网卡 · ' + new Date().toLocaleTimeString(), 'ok');
+    }
   } catch (e) {
-    $('state').textContent = '读取状态失败：' + e.message;
-    $('dot').className = 'dot';
+    // 手动扫描的失败写在按钮旁边，不去覆盖「运行状态」那一行：那一行归
+    // renderActivity 管，被覆盖后要等下一次 60 秒兜底轮询才恢复。
+    if (manual) {
+      scanMsg('扫描失败：' + e.message, 'bad');
+    } else {
+      $('state').textContent = '读取状态失败：' + e.message;
+      $('dot').className = 'dot';
+    }
+  } finally {
+    if (manual) {
+      btn.disabled = false;
+      btn.textContent = '重新扫描';
+    }
   }
 }
 
@@ -223,13 +249,13 @@ async function loadActivity() {
   try { renderActivity(await api('/api/activity')); } catch (e) { /* 下一轮再试 */ }
 }
 
-$('refresh').onclick = loadStatus;
+$('refresh').onclick = () => loadStatus(true);
 
 loadStatus();
 loadActivity();
 // 活动是纯内存读取，轮询很便宜；状态要重扫网卡（Windows 上要起 ipconfig/netsh），
 // 所以只在打开页面、点「重新扫描」和每 60 秒兜底刷新时才拉。
 setInterval(loadActivity, 1500);
-setInterval(loadStatus, 60000);
+setInterval(() => loadStatus(), 60000);
 </script>
 </body></html>

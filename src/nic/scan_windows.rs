@@ -139,8 +139,19 @@ pub fn counters(iface: &str) -> Result<(u64, u64), String> {
 
 /// 全量扫描（带前缀过滤），返回完整 NicInfo 列表
 pub fn scan_all(prefixes: &[String]) -> Vec<NicInfo> {
-    let adapters = ipconfig::scan();
+    // 先拿 GetIfTable2 的别名，再交给 ipconfig 解析：那份输出的适配器标题行
+    // 措辞跟界面语言走（中文「适配器」、英文「adapter」、德语「-Adapter」、
+    // 日语「アダプター」），而别名匹配不依赖任何一种。没有它的话，
+    // 非中英文 Windows 上这里会返回空表，屏幕上只有一句「没有扫到网卡」。
     let rows = if_rows();
+    let aliases: Vec<String> = rows.iter().map(|row| row.alias.clone()).collect();
+    let adapters = ipconfig::scan_with_aliases(&aliases);
+    if adapters.is_empty() && !rows.is_empty() {
+        println!(
+            "!! ipconfig /all 的输出里一块适配器都没解析出来，但系统报告有 {} 个接口。\n             !! 多半是这台 Windows 的界面语言不在已知措辞里；请把 `ipconfig /all` 的\n             !! 前十行反馈给工具维护者。",
+            rows.len()
+        );
+    }
     let rows_by_alias: HashMap<String, &IfRow> =
         rows.iter().map(|r| (r.alias.clone(), r)).collect();
     let gateways = default_gateways_v4();

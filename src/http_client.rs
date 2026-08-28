@@ -4,15 +4,53 @@
 //! [`ScriptedTransport`] 注入丢包、延迟和损坏响应，而不需要启动真实 agent。
 //! 对端是我们自己的 tiny_http agent。
 
+// 故障注入脚手架（ScriptedTransport 一族）只在测试里编译，它用到的这些
+// 依赖也跟着关进 cfg(test)：生产构建里只剩下真正发 HTTP 的那一百来行。
+#[cfg(test)]
 use crate::clock::{ManualClock, MonotonicClock};
+#[cfg(test)]
 use std::collections::{HashMap, VecDeque};
+#[cfg(test)]
 use std::fmt;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+#[cfg(test)]
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 一次响应最多读多少字节。
+///
+/// 和 agent 的 `MAX_BODY` 对齐。**服务端两侧本来都有这道闸，客户端一侧一个都没有**：
+/// `Content-Length` 出来的 `usize` 被直接拿去 `Vec::resize`，对端说 1TB 就申请 1TB。
+/// 而辅测机 IP 是人手敲进去的——敲到一台跑着别的服务的机器上，现在的表现是进程
+/// 被 OOM 掉，而不是一句「这不是 agent」。
+const MAX_RESPONSE_BYTES: usize = 100 * 1024 * 1024;
+
+/// 一次请求从连上到读完的总时限。
+///
+/// `set_read_timeout` 管的是**单次读**：对端每隔「略小于 timeout」吐一个字节
+/// 就能把一次请求无限拖住，无 `Content-Length` 的 `read_to_end` 分支尤其。
+/// 总时限按调用方给的 timeout 放宽一倍再兜一层，正常请求碰不到它。
+fn overall_deadline(timeout: Duration) -> Instant {
+    Instant::now() + timeout.saturating_mul(2) + Duration::from_secs(5)
+}
+
+/// 读取过程中的两道闸：总时限和总字节数。
+struct ReadLimits {
+    deadline: Instant,
+    max_bytes: usize,
+}
+
+impl ReadLimits {
+    fn check_deadline(&self) -> Result<(), String> {
+        if Instant::now() > self.deadline {
+            return Err("读响应超时：对端在总时限内没有发完".into());
+        }
+        Ok(())
+    }
+}
 
 /// 发送给 agent 的一次 HTTP 请求。
 ///
@@ -102,13 +140,13 @@ impl Transport for TcpTransport {
     }
 }
 
+#[cfg(test)]
 /// 可注入的一次脚本交换。
 ///
 /// `request_delay` 在“请求送达”之前等待，`response_delay` 在生成响应之前等待，
 /// 因此可以表达非对称延迟。延迟使用真实 `sleep`，默认只在测试中使用短时值；生产
 /// 主流程仍使用 [`TcpTransport`]。
 #[derive(Clone, Debug)]
-#[allow(dead_code)]
 pub struct ScriptedExchange {
     pub request_delay: Duration,
     pub response_delay: Duration,
@@ -116,7 +154,7 @@ pub struct ScriptedExchange {
     response_gate: Option<Arc<ScriptedGate>>,
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 impl ScriptedExchange {
     pub fn response(status: u16, body: impl Into<String>) -> Self {
         Self {
@@ -137,6 +175,13 @@ impl ScriptedExchange {
         }
     }
 
+    /// transport 自身失败（连不上、写不出去）。
+    ///
+    /// 目前没有用例脚本它——真实的连接失败在 `TcpTransport` 那侧，
+    /// 而资源幂等测试关心的是「请求送没送达」，用 `drop_request` /
+    /// `drop_response` 表达更准。保留是因为它和另外几种故障是同一套模型的
+    /// 一部分，删掉会让这套模型缺一角；补一条用例比重新写回来便宜。
+    #[allow(dead_code)]
     pub fn error(message: impl Into<String>) -> Self {
         Self {
             request_delay: Duration::ZERO,
@@ -202,9 +247,10 @@ impl ScriptedExchange {
     }
 }
 
+#[cfg(test)]
 /// [`ScriptedExchange`] 产生的结果。
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
+#[allow(dead_code)] // Error 分支见 ScriptedExchange::error
 pub enum ScriptedOutcome {
     Response(HttpResponse),
     HandlerResponse,
@@ -218,28 +264,29 @@ pub enum ScriptedOutcome {
     },
 }
 
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum ScriptedPhase {
     Request,
     Response,
 }
 
+#[cfg(test)]
 /// 显式响应门。工作线程到达后阻塞，测试线程按指定顺序调用 `release`。
 #[derive(Debug, Default)]
-#[allow(dead_code)]
 pub struct ScriptedGate {
     state: Mutex<ScriptedGateState>,
     wake: Condvar,
 }
 
+#[cfg(test)]
 #[derive(Debug, Default)]
 struct ScriptedGateState {
     reached: bool,
     released: bool,
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 impl ScriptedGate {
     pub fn new() -> Self {
         Self::default()
@@ -286,10 +333,10 @@ impl ScriptedGate {
     }
 }
 
+#[cfg(test)]
 /// 可观测的脚本 transport 事件。事件日志用于验证“请求是否送达”和“响应是否送达”，
 /// 这两者在调用方看来都可能只是超时，但资源幂等测试需要区分它们。
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum ScriptedEvent {
     PhaseDelayed {
         request: HttpRequest,
@@ -319,8 +366,8 @@ pub enum ScriptedEvent {
     },
 }
 
+#[cfg(test)]
 #[derive(Default)]
-#[allow(dead_code)]
 struct ScriptedState {
     queue: VecDeque<ScriptedExchange>,
     by_path: HashMap<String, VecDeque<ScriptedExchange>>,
@@ -328,27 +375,29 @@ struct ScriptedState {
     events: Vec<ScriptedEvent>,
 }
 
+#[cfg(test)]
 type ScriptedHandler = dyn Fn(&HttpRequest) -> Result<HttpResponse, String> + Send + Sync + 'static;
 
+#[cfg(test)]
 /// 一个线程安全、可复制的确定性 transport。
 ///
 /// 脚本按先进先出消费。使用 [`ScriptedTransport::push_for_path`] 可以让并发测试按
 /// URL 路径分配脚本，从而稳定地构造响应乱序，而不依赖线程启动顺序。
 #[derive(Clone)]
-#[allow(dead_code)]
 pub struct ScriptedTransport {
     state: Arc<Mutex<ScriptedState>>,
     clock: Arc<dyn MonotonicClock>,
     handler: Option<Arc<ScriptedHandler>>,
 }
 
+#[cfg(test)]
 impl Default for ScriptedTransport {
     fn default() -> Self {
         Self::with_clock(Arc::new(ManualClock::new()))
     }
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 impl fmt::Debug for ScriptedTransport {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let state = self
@@ -365,7 +414,7 @@ impl fmt::Debug for ScriptedTransport {
     }
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 impl ScriptedTransport {
     pub fn new() -> Self {
         Self::default()
@@ -428,17 +477,6 @@ impl ScriptedTransport {
             .entry((path.into(), request_id.into()))
             .or_default()
             .push_back(exchange);
-    }
-
-    pub fn clear(&self) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state.queue.clear();
-        state.by_path.clear();
-        state.by_request.clear();
-        state.events.clear();
     }
 
     pub fn remaining(&self) -> usize {
@@ -561,7 +599,7 @@ impl ScriptedTransport {
     }
 }
 
-#[allow(dead_code)]
+#[cfg(test)]
 impl Transport for ScriptedTransport {
     fn send(&self, request: &HttpRequest, timeout: Duration) -> Result<HttpResponse, String> {
         let Some(exchange) = self.take_exchange(request) else {
@@ -798,12 +836,25 @@ fn tcp_request(request: &HttpRequest, timeout: Duration) -> Result<HttpResponse,
         .to_socket_addrs()
         .map_err(|e| format!("解析地址 {addr_str} 失败: {e}"))?
         .collect();
-    let addr = addrs
-        .first()
-        .ok_or_else(|| format!("地址 {addr_str} 无法解析"))?;
-
-    let mut stream = TcpStream::connect_timeout(addr, CONNECT_TIMEOUT)
-        .map_err(|e| format!("连接 {addr_str} 失败: {e}"))?;
+    if addrs.is_empty() {
+        return Err(format!("地址 {addr_str} 无法解析"));
+    }
+    // 逐个试，不是只试第一个。主机名同时有 AAAA 和 A 记录时，解析器常把 IPv6
+    // 排在前面；那条不通的话，只试第一个等于直接失败，而 IPv4 明明是通的。
+    let mut last_error = String::new();
+    let mut stream = None;
+    for addr in &addrs {
+        match TcpStream::connect_timeout(addr, CONNECT_TIMEOUT) {
+            Ok(connected) => {
+                stream = Some(connected);
+                break;
+            }
+            Err(error) => last_error = format!("{addr}: {error}"),
+        }
+    }
+    let Some(mut stream) = stream else {
+        return Err(format!("连接 {addr_str} 失败: {last_error}"));
+    };
     stream
         .set_read_timeout(Some(timeout))
         .map_err(|e| e.to_string())?;
@@ -814,20 +865,41 @@ fn tcp_request(request: &HttpRequest, timeout: Duration) -> Result<HttpResponse,
         .write_all(&request.wire_bytes())
         .map_err(|e| format!("发送请求失败: {e}"))?;
 
-    read_tcp_response(&mut stream)
+    read_tcp_response(&mut stream, timeout)
 }
 
 /// 读出一个完整 HTTP 响应后交给公共解析器。按 Content-Length/chunked 提前停止，
 /// 避免服务端没有及时关闭连接时把一次成功请求误报成超时。
-fn read_tcp_response(stream: &mut TcpStream) -> Result<HttpResponse, String> {
+fn read_tcp_response(stream: &mut TcpStream, timeout: Duration) -> Result<HttpResponse, String> {
     let mut reader = BufReader::new(stream);
-    read_http_response(&mut reader)
+    read_http_response_limited(
+        &mut reader,
+        &ReadLimits {
+            deadline: overall_deadline(timeout),
+            max_bytes: MAX_RESPONSE_BYTES,
+        },
+    )
 }
 
+#[cfg(test)]
 fn read_http_response<R: BufRead>(reader: &mut R) -> Result<HttpResponse, String> {
+    read_http_response_limited(
+        reader,
+        &ReadLimits {
+            deadline: Instant::now() + Duration::from_secs(30),
+            max_bytes: MAX_RESPONSE_BYTES,
+        },
+    )
+}
+
+fn read_http_response_limited<R: BufRead>(
+    reader: &mut R,
+    limits: &ReadLimits,
+) -> Result<HttpResponse, String> {
     let mut head_lines: Vec<String> = Vec::new();
     let mut line_buf = String::new();
     loop {
+        limits.check_deadline()?;
         line_buf.clear();
         let n = reader
             .read_line(&mut line_buf)
@@ -847,19 +919,35 @@ fn read_http_response<R: BufRead>(reader: &mut R) -> Result<HttpResponse, String
         .to_lowercase()
         .contains("transfer-encoding: chunked");
     let body = if is_chunked {
-        read_chunked_body(reader)?
+        read_chunked_body_limited(reader, limits)?
     } else {
         let cl = parse_content_length(&head_text);
         let mut buf = Vec::new();
         if let Some(len) = cl {
+            // 先判上限**再**申请。反过来的话，判断永远来不及执行——
+            // `resize` 就是那个会把进程打死的调用。
+            if len > limits.max_bytes {
+                return Err(format!(
+                    "响应体声明 {len} 字节，超过上限 {} 字节；对端多半不是 cpe_test agent",
+                    limits.max_bytes
+                ));
+            }
             buf.resize(len, 0);
             reader
                 .read_exact(&mut buf)
                 .map_err(|e| format!("读响应体失败: {e}"))?;
         } else {
-            reader
+            // 没有 Content-Length 时同样要封顶：读到上限 +1 字节就能判断是不是超了。
+            let mut limited = reader.take(limits.max_bytes as u64 + 1);
+            limited
                 .read_to_end(&mut buf)
                 .map_err(|e| format!("读响应体失败: {e}"))?;
+            if buf.len() > limits.max_bytes {
+                return Err(format!(
+                    "响应体超过上限 {} 字节；对端多半不是 cpe_test agent",
+                    limits.max_bytes
+                ));
+            }
         }
         String::from_utf8_lossy(&buf).into_owned()
     };
@@ -870,10 +958,25 @@ fn read_http_response<R: BufRead>(reader: &mut R) -> Result<HttpResponse, String
 ///
 /// `pub(crate)` 以便 parser property/fuzz 测试入口（`parser_properties.rs`）
 /// 直接覆盖该纯函数。
+#[cfg(test)]
 pub(crate) fn read_chunked_body<R: BufRead>(reader: &mut R) -> Result<String, String> {
+    read_chunked_body_limited(
+        reader,
+        &ReadLimits {
+            deadline: Instant::now() + Duration::from_secs(30),
+            max_bytes: MAX_RESPONSE_BYTES,
+        },
+    )
+}
+
+fn read_chunked_body_limited<R: BufRead>(
+    reader: &mut R,
+    limits: &ReadLimits,
+) -> Result<String, String> {
     let mut out: Vec<u8> = Vec::new();
     let mut size_buf = String::new();
     loop {
+        limits.check_deadline()?;
         size_buf.clear();
         reader
             .read_line(&mut size_buf)
@@ -885,6 +988,14 @@ pub(crate) fn read_chunked_body<R: BufRead>(reader: &mut R) -> Result<String, St
         let size_str = size_str.split(';').next().unwrap_or(size_str);
         let size = usize::from_str_radix(size_str, 16)
             .map_err(|e| format!("chunk 大小解析失败 [{size_str}]: {e}"))?;
+        // 单个 chunk 和累计总量共用同一份预算：只卡单个 chunk 的话，
+        // 一万个 1MB 的 chunk 照样能把内存吃光。
+        if size > limits.max_bytes || out.len().saturating_add(size) > limits.max_bytes {
+            return Err(format!(
+                "chunked 响应体超过上限 {} 字节；对端多半不是 cpe_test agent",
+                limits.max_bytes
+            ));
+        }
         if size == 0 {
             // 最后的空 chunk，读掉尾部 CRLF；尾部 trailer 对本客户端没有意义。
             let _ = reader.read_line(&mut String::new());
@@ -929,6 +1040,79 @@ fn parse_status(line: &str) -> Result<u16, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 对端说多大就申请多大，是这个客户端唯一能把进程直接打死的地方。
+    ///
+    /// 辅测机 IP 是人手敲进去的。敲到一台跑着别的服务的机器上时，正确的表现是
+    /// 一句可读的错误，而不是 `Vec::resize` 照着对端声明的长度申请并写满、
+    /// 然后被 OOM killer 带走。服务端两侧本来就都有 MAX_BODY，客户端这侧
+    /// 一个 cap 都没有。
+    #[test]
+    fn an_absurd_content_length_is_refused_before_anything_is_allocated() {
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+            MAX_RESPONSE_BYTES + 1
+        );
+        let mut reader = Cursor::new(head.into_bytes());
+        let error = read_http_response(&mut reader).expect_err("超限必须被拒");
+        assert!(error.contains("超过上限"), "{error}");
+        assert!(
+            error.contains("agent"),
+            "错误要提示对端可能不是 agent：{error}"
+        );
+
+        // 正常大小照旧放行。
+        let ok = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi";
+        let mut reader = Cursor::new(ok.as_bytes().to_vec());
+        let response = read_http_response(&mut reader).expect("正常响应不能被误伤");
+        assert_eq!((response.status, response.body.as_str()), (200, "hi"));
+    }
+
+    /// 没有 Content-Length 时同样要封顶，否则 `read_to_end` 一样是无界的。
+    #[test]
+    fn a_bodyless_header_still_caps_how_much_gets_read() {
+        let mut body = b"HTTP/1.1 200 OK\r\n\r\n".to_vec();
+        body.extend(std::iter::repeat_n(b'x', MAX_RESPONSE_BYTES + 8));
+        let mut reader = Cursor::new(body);
+        let error = read_http_response(&mut reader).expect_err("无 Content-Length 也要封顶");
+        assert!(error.contains("超过上限"), "{error}");
+    }
+
+    /// chunked 的预算是**累计**的：只卡单个 chunk 的话，
+    /// 一万个 1MB 的 chunk 照样能把内存吃光。
+    #[test]
+    fn chunked_bodies_share_one_cumulative_budget() {
+        let limits = ReadLimits {
+            deadline: Instant::now() + Duration::from_secs(30),
+            max_bytes: 64,
+        };
+        // 三个 32 字节的 chunk = 96 字节，每个单独看都在 64 以内。
+        let chunk = format!("20\r\n{}\r\n", "y".repeat(32));
+        let body = format!("{chunk}{chunk}{chunk}0\r\n\r\n");
+        let mut reader = Cursor::new(body.into_bytes());
+        let error = read_chunked_body_limited(&mut reader, &limits).expect_err("累计超限必须被拒");
+        assert!(error.contains("超过上限"), "{error}");
+
+        // 预算之内的正常 chunked 响应不能被误伤。
+        let mut reader = Cursor::new(b"4\r\nabcd\r\n0\r\n\r\n".to_vec());
+        assert_eq!(
+            read_chunked_body_limited(&mut reader, &limits).unwrap(),
+            "abcd"
+        );
+    }
+
+    /// 总时限和单次读超时是两件事：对端每隔「略小于 timeout」吐一个字节，
+    /// 单次读永远不超时，整个请求却可以被无限拖住。
+    #[test]
+    fn a_blown_overall_deadline_stops_the_read() {
+        let limits = ReadLimits {
+            deadline: Instant::now() - Duration::from_secs(1),
+            max_bytes: MAX_RESPONSE_BYTES,
+        };
+        let mut reader = Cursor::new(b"HTTP/1.1 200 OK\r\n\r\n".to_vec());
+        let error = read_http_response_limited(&mut reader, &limits).expect_err("过了总时限要停");
+        assert!(error.contains("总时限"), "{error}");
+    }
     use std::io::Cursor;
     use std::sync::mpsc;
     use std::thread;

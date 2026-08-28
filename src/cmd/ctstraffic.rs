@@ -283,6 +283,17 @@ fn summary_regex(pattern: &'static str) -> &'static Regex {
     })
 }
 
+/// 解析一个状态行数字。
+///
+/// **逗号在这里是小数点，不是千分位**——和同文件 `capture_u64` 的处理相反
+/// （那边做的是 `replace(',', "")`）。两者不可能同时对，所以这条差异必须写明白：
+///
+/// - 状态行的第一列是 TimeSlice（`1.000`），逗号小数点的 locale 会打成 `1,000`；
+///   把它当千分位读会得到 1000 秒，整条时间轴报废。
+/// - 摘要行是 `Total Bytes Recv : 1,234,567` 这种计数，那里逗号必然是千分位。
+///
+/// 两位数以上的分组（`1,234,567`）在这里正则本来就匹配不上，会返回 `None`
+/// 让整行被跳过——丢一行状态好过把 1234567 读成 1.234。
 fn parse_status_number(token: &str) -> Option<f64> {
     static NUMBER: OnceLock<Regex> = OnceLock::new();
     let regex = NUMBER.get_or_init(|| {
@@ -290,7 +301,11 @@ fn parse_status_number(token: &str) -> Option<f64> {
             .expect("ctsTraffic status number regex")
     });
     let capture = regex.captures(token.trim())?;
-    let base: f64 = capture.get(1)?.as_str().replace(',', ".").parse().ok()?;
+    let raw = capture.get(1)?.as_str();
+    // 恰好三位小数位的写法（`1,234`）在两种解读下都成立，无法从单个 token
+    // 判断。ctsTraffic 的状态行不打千分位（大数用 `x^N` 记），所以按小数点读；
+    // 但这一条要留下痕迹，哪天它开始打千分位时才有地方查。
+    let base: f64 = raw.replace(',', ".").parse().ok()?;
     let exponent: i32 = capture
         .get(2)
         .map(|value| value.as_str().parse().ok())
@@ -546,6 +561,26 @@ pub fn start_managed_job(
 
 #[cfg(test)]
 mod tests {
+    /// 逗号在这个文件里有两种含义，两处都要钉住，否则哪天改动一处
+    /// 会把另一处悄悄带偏。
+    #[test]
+    fn a_comma_means_a_decimal_point_in_status_rows_and_a_group_separator_in_summaries() {
+        // 状态行：逗号是小数点。
+        assert_eq!(parse_status_number("1,000"), Some(1.0));
+        assert_eq!(parse_status_number("1.000"), Some(1.0));
+        assert_eq!(parse_status_number("123x^6"), Some(123_000_000.0));
+        // 多级分组匹配不上 -> None，整行被跳过，好过读成 1.234。
+        assert_eq!(parse_status_number("1,234,567"), None);
+
+        // 摘要行：逗号是千分位。
+        let summary = "Total Bytes Recv : 1,234,567";
+        assert_eq!(
+            capture_u64(summary_regex("recv"), summary),
+            Some(1_234_567),
+            "摘要里的逗号必须当千分位剥掉"
+        );
+    }
+
     use super::*;
 
     fn base(role: CtsTrafficRole, protocol: CtsTrafficProtocol) -> CtsTrafficReq {

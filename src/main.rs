@@ -54,16 +54,17 @@ fn real_main(args: Vec<String>) -> i32 {
     match mode {
         "agent" => {
             let f = parse_flags(&args[1..]);
-            let (mut cfg, _) = config::load_config(f.get("config").map(|s| s.as_str()));
+            let config_path = flag_value(&f, "config");
+            let (mut cfg, _) = config::load_config(config_path.as_deref());
             let port = f
                 .get("port")
                 .and_then(|p| p.parse().ok())
                 .unwrap_or(cfg.agent_port);
-            if let Some(token) = f.get("token") {
-                cfg.agent_token = token.clone();
+            if let Some(token) = flag_value(&f, "token") {
+                cfg.agent_token = token;
             }
-            if let Some(bind) = f.get("bind") {
-                cfg.agent_bind = bind.clone();
+            if let Some(bind) = flag_value(&f, "bind") {
+                cfg.agent_bind = bind;
             }
             let ui_port = if f.contains_key("no-ui") {
                 None
@@ -74,17 +75,18 @@ fn real_main(args: Vec<String>) -> i32 {
                         .unwrap_or(DEFAULT_AGENT_UI_PORT),
                 )
             };
-            agent::run(port, &cfg, ui_port); // 不返回
+            let ui_bind = flag_value(&f, "ui-bind").unwrap_or_else(|| "127.0.0.1".into());
+            agent::run(port, &cfg, ui_port, &ui_bind); // 不返回
             0
         }
         "master" => {
             let f = parse_flags(&args[1..]);
             run_master(MasterOpts {
-                agent_host: f.get("agent-host").cloned(),
+                agent_host: flag_value(&f, "agent-host"),
                 agent_port: f.get("agent-port").and_then(|p| p.parse().ok()),
-                config_path: f.get("config").cloned(),
-                prefixes: f.get("prefix").map(|p| split_csv(p)),
-                agent_token: f.get("token").cloned(),
+                config_path: flag_value(&f, "config"),
+                prefixes: flag_value(&f, "prefix").map(|p| split_csv(&p)),
+                agent_token: flag_value(&f, "token"),
                 auto: f.contains_key("auto"),
                 resume: f.contains_key("resume"),
                 no_open: f.contains_key("no-open"),
@@ -93,10 +95,9 @@ fn real_main(args: Vec<String>) -> i32 {
         }
         "scan" => {
             let f = parse_flags(&args[1..]);
-            let (cfg, _) = config::load_config(f.get("config").map(|s| s.as_str()));
-            let prefixes = f
-                .get("prefix")
-                .map(|p| split_csv(p))
+            let (cfg, _) = config::load_config(flag_value(&f, "config").as_deref());
+            let prefixes = flag_value(&f, "prefix")
+                .map(|p| split_csv(&p))
                 .unwrap_or(cfg.ipv4_prefixes);
             println!("按前缀 {prefixes:?} 扫描本机网卡...\n");
             let info = nic::scan_host(&prefixes);
@@ -106,16 +107,17 @@ fn real_main(args: Vec<String>) -> i32 {
         }
         "monitor" => {
             let f = parse_flags(&args[1..]);
-            let (cfg, _) = config::load_config(f.get("config").map(|s| s.as_str()));
+            let (cfg, _) = config::load_config(flag_value(&f, "config").as_deref());
             let interval: u64 = f.get("interval").and_then(|s| s.parse().ok()).unwrap_or(1);
             let duration: u64 = f.get("duration").and_then(|s| s.parse().ok()).unwrap_or(0);
-            let csv_path = f.get("csv").map(|s| s.as_str());
+            let csv_path = flag_value(&f, "csv");
+            let iface = flag_value(&f, "iface");
             run_monitor_mode(
                 &cfg,
-                f.get("iface").map(|s| s.as_str()),
+                iface.as_deref(),
                 interval,
                 duration,
-                csv_path,
+                csv_path.as_deref(),
             )
         }
         "ui" => {
@@ -124,7 +126,21 @@ fn real_main(args: Vec<String>) -> i32 {
                 .get("port")
                 .and_then(|p| p.parse().ok())
                 .unwrap_or(DEFAULT_UI_PORT);
-            master::webui::run(port, f.get("config").cloned())
+            // token 走命令行会留在 shell 历史和 ps 的命令行列里，同机的别人
+            // 看得到，所以两个都支持环境变量。
+            let ui_token = flag_value(&f, "ui-token")
+                .or_else(|| std::env::var("CPE_UI_TOKEN").ok())
+                .unwrap_or_default();
+            master::webui::run(master::webui::UiOpts {
+                bind: flag_value(&f, "ui-bind").unwrap_or_else(|| "127.0.0.1".into()),
+                port,
+                config_path: flag_value(&f, "config"),
+                // 页面上的 token 框留空时沿用这里的值，和配置文件里的
+                // agent_token 是同一条回落链。
+                agent_token: flag_value(&f, "token")
+                    .or_else(|| std::env::var("CPE_AGENT_TOKEN").ok()),
+                ui_token,
+            })
         }
         "-h" | "--help" | "help" => {
             print_help();
@@ -148,7 +164,12 @@ fn real_main(args: Vec<String>) -> i32 {
                 "2" => run_master(MasterOpts::default()),
                 "3" => {
                     let (cfg, _) = config::load_config(None);
-                    agent::run(cfg.agent_port, &cfg, Some(DEFAULT_AGENT_UI_PORT));
+                    agent::run(
+                        cfg.agent_port,
+                        &cfg,
+                        Some(DEFAULT_AGENT_UI_PORT),
+                        "127.0.0.1",
+                    );
                     0
                 }
                 "4" => {
@@ -161,7 +182,13 @@ fn real_main(args: Vec<String>) -> i32 {
                     let (cfg, _) = config::load_config(None);
                     run_monitor_mode(&cfg, None, 1, 0, None)
                 }
-                _ => master::webui::run(DEFAULT_UI_PORT, None),
+                _ => master::webui::run(master::webui::UiOpts {
+                    bind: "127.0.0.1".into(),
+                    port: DEFAULT_UI_PORT,
+                    config_path: None,
+                    agent_token: std::env::var("CPE_AGENT_TOKEN").ok(),
+                    ui_token: std::env::var("CPE_UI_TOKEN").unwrap_or_default(),
+                }),
             }
         }
         other => {
@@ -271,11 +298,18 @@ fn print_help() {
   cpe_test ui                 图形控制台：浏览器里勾选执行 (默认 127.0.0.1:28800)
       --port N                指定控制台端口
       --config FILE           指定配置文件 (默认找 ./config.json)
+      --token SECRET          与 agent 相同的共享令牌（页面上 token 框留空即用它）
+                              也可用 CPE_AGENT_TOKEN 环境变量
+      --ui-bind IP            控制台监听地址 (默认 127.0.0.1；IPv6 直接写 ::1 或 ::)
+                              非回环地址必须同时给 --ui-token，否则拒绝启动
+      --ui-token SECRET       浏览器打开控制台的口令；也可用 CPE_UI_TOKEN 环境变量
   cpe_test agent              辅测机启动常驻服务 (默认端口 28801)
       --port N                指定监听端口
       --token SECRET          共享访问令牌（agent 与主控必须一致；不配置则不启用认证）
       --bind IP               监听地址 (默认 0.0.0.0；可设 127.0.0.1 或测试网卡 IP)
-      --ui-port N             本机状态页端口 (默认 127.0.0.1:28802，只监听回环)
+      --ui-port N             本机状态页端口 (默认 28802)
+      --ui-bind IP            状态页监听地址 (默认 127.0.0.1；IPv6 直接写 ::1 或 ::)
+                              状态页只读且无口令，放开等于公开本机网卡与地址
       --no-ui                 不起状态页，只跑服务
   cpe_test master             主控发起测试
       --agent-host IP         辅测机 IP
@@ -304,6 +338,24 @@ fn print_help() {
 "#,
         env!("CARGO_PKG_VERSION")
     );
+}
+
+/// 取一个「必须带值」的参数。
+///
+/// `parse_flags` 见到 `--ui-bind` 后面没跟值时会记成空串——布尔开关
+/// （`--auto`、`--resume`）就是靠这条存在的，不能改。但对带值的参数来说，
+/// 空串是个会一路装成真值走下去的毒药：`--ui-bind` 空串会拼出 ":28800"
+/// 这种拼不出来的监听地址，`--ui-token` 空串会 short-circuit 掉
+/// `.or_else(|| env::var(...))`，让明明导出了环境变量的人被告知没设口令。
+/// 这里统一把空串当成「没给」，并且出声——静默忽略一个用户明确写下的参数
+/// 同样不行。
+fn flag_value(flags: &std::collections::HashMap<String, String>, key: &str) -> Option<String> {
+    let value = flags.get(key)?.trim().to_string();
+    if value.is_empty() {
+        eprintln!("!! --{key} 后面缺少值，已忽略（按默认值或环境变量处理）");
+        return None;
+    }
+    Some(value)
 }
 
 fn parse_flags(args: &[String]) -> std::collections::HashMap<String, String> {

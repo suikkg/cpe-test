@@ -173,7 +173,17 @@ struct MonitorLoopContext {
     stop: Arc<StopSignal>,
     samples: Arc<Mutex<Vec<MonitorSample>>>,
     errors: Arc<Mutex<Vec<String>>>,
+    /// 已经发生过的错误总数（含被裁掉的）。
+    ///
+    /// 必须和 `errors` 的长度分开记：网卡被拔掉时每一拍都会推一条错误，
+    /// 一路长跑的监控能攒出几万条一模一样的字符串，而消费侧只用得上
+    /// `latest_error` 和一个计数。裁掉正文、保住计数。
+    errors_total: Arc<AtomicU64>,
 }
+
+/// `errors` 里最多保留多少条。只有最后一条会被展示，留一小段是为了
+/// 出问题时还能看出「一直是同一个错」还是「错在变」。
+const MONITOR_MAX_KEPT_ERRORS: usize = 200;
 
 fn millis_u64(duration: Duration) -> u64 {
     duration.as_millis().min(u64::MAX as u128) as u64
@@ -276,8 +286,12 @@ fn run_monitor_loop<F>(
             .unwrap_or(observed_at);
         let (sample, error) = record_counter_result(result, sample_at, t0, &mut state);
         if let Some(error) = error {
+            context.errors_total.fetch_add(1, Ordering::SeqCst);
             if let Ok(mut errors) = context.errors.lock() {
                 errors.push(error);
+                while errors.len() > MONITOR_MAX_KEPT_ERRORS {
+                    errors.remove(0);
+                }
             }
         }
         if let Ok(mut samples) = context.samples.lock() {
@@ -302,6 +316,15 @@ struct MonEntry {
     start_rx: u64,
     start_tx: u64,
     t0: Instant,
+    /// 最近一次被 `status()` 问过的时刻，`sweep` 用它算年龄。
+    ///
+    /// 租约从**最后一次活动**起算而不是从 `t0` 起算，这样它就是一个心跳
+    /// 而不是一个绝对上限：还有人在看的监控不会被掐掉，而调用方进程猝死
+    /// （关终端、被 kill、崩溃）之后没人再来问，一个租约周期内就会被回收。
+    /// 从不轮询 status 的调用方（执行链路）行为不变——`last_touch` 就等于 `t0`。
+    last_touch: Instant,
+    /// 已发生的错误总数，含 `errors` 里被裁掉的部分。
+    errors_total: Arc<AtomicU64>,
     stop: Arc<StopSignal>,
     samples: Arc<Mutex<Vec<MonitorSample>>>,
     errors: Arc<Mutex<Vec<String>>>,
@@ -378,9 +401,11 @@ impl MonitorMgr {
         let stop = Arc::new(StopSignal::new());
         let samples = Arc::new(Mutex::new(Vec::new()));
         let errors = Arc::new(Mutex::new(Vec::new()));
+        let errors_total = Arc::new(AtomicU64::new(0));
         let stop_thread = Arc::clone(&stop);
         let samples_thread = Arc::clone(&samples);
         let errors_thread = Arc::clone(&errors);
+        let errors_total_thread = Arc::clone(&errors_total);
         let iface_thread = iface.to_string();
         let t0 = self.clock.now();
         let clock_thread = Arc::clone(&self.clock);
@@ -391,6 +416,7 @@ impl MonitorMgr {
                     stop: stop_thread,
                     samples: samples_thread,
                     errors: errors_thread,
+                    errors_total: errors_total_thread,
                 },
                 start_rx,
                 start_tx,
@@ -409,6 +435,8 @@ impl MonitorMgr {
                 start_rx,
                 start_tx,
                 t0,
+                last_touch: t0,
+                errors_total,
                 stop,
                 samples,
                 errors,
@@ -422,11 +450,18 @@ impl MonitorMgr {
     ///
     /// `latest_sample` 直接来自 OS 累计字节计数器的相邻差值，可用于实时日志；
     /// 完整统计和覆盖率仍应以 `stop` 返回的全部样本为准。
+    /// 查询一路监控的当前状态，**并把它当成一次心跳**。
+    ///
+    /// 每次查询都刷新 `last_touch`，`sweep` 据此判定租约是否到期。因此
+    /// 「还有人在看」的监控永远不会被回收，而调用方进程一旦消失（关终端、
+    /// 被 kill、崩溃），一个租约周期之后 agent 就会自己把它收掉。
     pub fn status(&self, id: &str) -> Result<MonitorStatusOut, String> {
-        let entries = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut entries = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let now = self.clock.now();
         let entry = entries
-            .get(id)
+            .get_mut(id)
             .ok_or_else(|| format!("监控 ID 不存在: {id}"))?;
+        entry.last_touch = now;
         let samples = entry.samples.lock().unwrap_or_else(|e| e.into_inner());
         let errors = entry.errors.lock().unwrap_or_else(|e| e.into_inner());
         Ok(MonitorStatusOut {
@@ -434,7 +469,8 @@ impl MonitorMgr {
             iface: entry.iface.clone(),
             sample_count: samples.len(),
             latest_sample: samples.last().cloned(),
-            error_count: errors.len(),
+            // 报总数而不是 `errors.len()`：正文被 MONITOR_MAX_KEPT_ERRORS 裁过。
+            error_count: entry.errors_total.load(Ordering::SeqCst) as usize,
             latest_error: errors.last().cloned().unwrap_or_default(),
         })
     }
@@ -570,6 +606,10 @@ impl MonitorMgr {
     ///
     /// 新 entry 使用自身 `lease_secs`；旧调用点以 0 表示未设置租约，继续使用
     /// 调用方传入的 `legacy_max_age`，避免固定短 TTL 误杀合法的长时间测试。
+    ///
+    /// 年龄从 `last_touch`（最近一次 `status()`）起算，不是从 `t0` 起算：
+    /// 租约因此是心跳而非绝对上限。从不轮询 status 的调用方 `last_touch == t0`，
+    /// 行为与从前完全一致。
     pub fn sweep(&self, legacy_max_age: std::time::Duration) {
         let now = self.clock.now();
         let expired: Vec<String> = {
@@ -581,7 +621,7 @@ impl MonitorMgr {
                     } else {
                         Duration::from_secs(e.lease_secs)
                     };
-                    now.saturating_duration_since(e.t0) >= max_age
+                    now.saturating_duration_since(e.last_touch) >= max_age
                 })
                 .map(|(id, _)| id.clone())
                 .collect()
@@ -740,6 +780,9 @@ mod tests {
             start_rx: 1_000,
             start_tx: 2_000,
             t0,
+            // 测试里 fake_entry 的年龄就是「多久没人问过」，两者取同一个时刻。
+            last_touch: t0,
+            errors_total: Arc::new(AtomicU64::new(0)),
             stop: Arc::new(StopSignal::new()),
             samples: Arc::new(Mutex::new(vec![MonitorSample {
                 elapsed_ms: millis_u64(age),
@@ -815,6 +858,7 @@ en0        1500  192.168.8     192.168.8.100     9219567     - 9083840014  52962
                 stop,
                 samples: Arc::clone(&samples),
                 errors: Arc::clone(&errors),
+                errors_total: Arc::new(AtomicU64::new(0)),
             },
             1_000,
             2_000,
@@ -923,6 +967,7 @@ en0        1500  192.168.8     192.168.8.100     9219567     - 9083840014  52962
                 stop: Arc::clone(&stop),
                 samples: Arc::clone(&samples),
                 errors: Arc::clone(&errors),
+                errors_total: Arc::new(AtomicU64::new(0)),
             },
             1_000,
             2_000,
@@ -1006,13 +1051,91 @@ en0        1500  192.168.8     192.168.8.100     9219567     - 9083840014  52962
             MonitorMgr::with_dependencies(Arc::clone(&clock) as Arc<dyn MonotonicClock>, reader);
         let id = manager.start_owned("fake0", 5_000, "owner", 2).unwrap();
 
+        // 活着与否用 resource_ids_for_owner 判，不能用 status()：status 本身
+        // 就是心跳，拿它当探针会把要测的东西改掉。
+        let alive = |manager: &MonitorMgr| !manager.resource_ids_for_owner("owner").is_empty();
+
         clock.advance(Duration::from_millis(1_999));
         manager.sweep(Duration::from_secs(60));
-        assert!(manager.status(&id).is_ok());
+        assert!(alive(&manager), "还没到租约就不能被扫掉");
 
         clock.advance(Duration::from_millis(1));
         manager.sweep(Duration::from_secs(60));
+        assert!(!alive(&manager), "从不轮询的监控仍按 lease_secs 到点回收");
         assert!(manager.status(&id).is_err());
+    }
+
+    /// 租约是心跳而不是绝对上限：还有人在问就不回收，没人问了就自己收摊。
+    ///
+    /// 这两条合起来才是 UI 监控能安全长跑的前提——控制台每秒来问一次，
+    /// 所以租约可以配得很短；而控制台一旦被 kill，再没人来问，
+    /// 一个租约周期之后 agent 自己就把它收掉了，不用等两小时。
+    #[test]
+    fn a_polled_monitor_keeps_its_lease_and_an_abandoned_one_expires() {
+        use crate::clock::{ManualClock, MonotonicClock};
+        use crate::nic::counter::FnNicCounterReader;
+
+        let clock = Arc::new(ManualClock::new());
+        let reader = Arc::new(FnNicCounterReader::new(|_: &str| Ok((1_000, 2_000))));
+        let manager =
+            MonitorMgr::with_dependencies(Arc::clone(&clock) as Arc<dyn MonotonicClock>, reader);
+        let id = manager.start_owned("fake0", 5_000, "ui", 10).unwrap();
+        let alive = |manager: &MonitorMgr| !manager.resource_ids_for_owner("ui").is_empty();
+
+        // 每 6 秒问一次，问 5 轮——总时长 30 秒，远超 10 秒的租约。
+        for round in 0..5 {
+            clock.advance(Duration::from_secs(6));
+            assert!(
+                manager.status(&id).is_ok(),
+                "第 {round} 轮：还在轮询的监控不该被扫掉"
+            );
+            manager.sweep(Duration::from_secs(60));
+            assert!(alive(&manager), "第 {round} 轮：心跳必须续上租约");
+        }
+
+        // 页面没了，不再有人来问。
+        clock.advance(Duration::from_secs(9));
+        manager.sweep(Duration::from_secs(60));
+        assert!(alive(&manager), "还没超过租约，不能提前回收");
+
+        clock.advance(Duration::from_secs(1));
+        manager.sweep(Duration::from_secs(60));
+        assert!(!alive(&manager), "没人再问，一个租约周期后必须自行回收");
+    }
+
+    /// 网卡消失时每一拍都会推一条错误；正文要裁掉，计数不能丢。
+    #[test]
+    fn a_flood_of_identical_errors_is_trimmed_but_still_counted() {
+        let errors = Arc::new(Mutex::new(Vec::new()));
+        let errors_total = Arc::new(AtomicU64::new(0));
+        let context = MonitorLoopContext {
+            stop: Arc::new(StopSignal::new()),
+            samples: Arc::new(Mutex::new(Vec::new())),
+            errors: Arc::clone(&errors),
+            errors_total: Arc::clone(&errors_total),
+        };
+        let pushes = MONITOR_MAX_KEPT_ERRORS + 500;
+        for i in 0..pushes {
+            context.errors_total.fetch_add(1, Ordering::SeqCst);
+            let mut kept = context.errors.lock().unwrap();
+            kept.push(format!("读取失败 #{i}"));
+            while kept.len() > MONITOR_MAX_KEPT_ERRORS {
+                kept.remove(0);
+            }
+        }
+
+        let kept = errors.lock().unwrap();
+        assert_eq!(kept.len(), MONITOR_MAX_KEPT_ERRORS, "正文必须封顶");
+        assert_eq!(
+            kept.last().map(String::as_str),
+            Some(format!("读取失败 #{}", pushes - 1).as_str()),
+            "留下的必须是最近的那批，不是最早的"
+        );
+        assert_eq!(
+            errors_total.load(Ordering::SeqCst) as usize,
+            pushes,
+            "裁掉正文不能把计数也裁掉"
+        );
     }
 
     #[test]

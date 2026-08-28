@@ -8,8 +8,8 @@
 //! 所以这里的返回值刻意区分"没找到"与"找到但平台不支持"。
 
 use crate::util::{run_cmd, CmdOut};
-use std::sync::OnceLock;
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 #[cfg(windows)]
 fn detect_ctstraffic_platform_support() -> bool {
@@ -28,7 +28,36 @@ fn windows_ver_supports_ctstraffic(output: &str) -> bool {
     crate::util::windows_major_from_ver_output(output).is_some_and(|major| major >= 10)
 }
 
-static IPERF3: OnceLock<Option<String>> = OnceLock::new();
+/// iperf3 的查找结果带**过期时间**，不是一次性缓存。
+///
+/// agent 和控制台都是常驻进程，而状态页上「iperf3 未找到」是一条会每分钟
+/// 刷新一次、看起来实时的告警。用 `OnceLock` 的话，这条完全正常的排障流程
+/// 走不通：页面说缺 → 用户把 iperf3.exe 拷到程序同目录 → 页面永远还是说缺，
+/// 只能重启 agent，而页面上没有任何地方提示要重启。
+///
+/// TTL 取 30 秒：足够挡住每 1.5 秒一次的活动轮询把 `--version` 打满，
+/// 又短到「拷完文件回头看一眼」就能看到变化。
+static IPERF3: Mutex<Option<(Instant, Option<String>)>> = Mutex::new(None);
+
+const TOOL_LOOKUP_TTL: Duration = Duration::from_secs(30);
+
+/// 读一份带 TTL 的查找缓存；过期或没有就现查一次。
+fn cached_lookup(
+    cache: &Mutex<Option<(Instant, Option<String>)>>,
+    lookup: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    let mut slot = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some((at, value)) = slot.as_ref() {
+        if at.elapsed() < TOOL_LOOKUP_TTL {
+            return value.clone();
+        }
+    }
+    let found = lookup();
+    *slot = Some((Instant::now(), found.clone()));
+    found
+}
 
 fn iperf_probe_succeeded(probe: &CmdOut) -> bool {
     probe.ok && !probe.timed_out && !probe.cancelled
@@ -38,8 +67,8 @@ static CTS_TRAFFIC: OnceLock<Option<String>> = OnceLock::new();
 
 /// 找 iperf3：优先程序同目录，其次 PATH
 pub fn find_iperf3() -> Option<String> {
-    IPERF3
-        .get_or_init(|| {
+    cached_lookup(&IPERF3, || {
+        {
             let fname = if cfg!(windows) {
                 "iperf3.exe"
             } else {
@@ -61,8 +90,8 @@ pub fn find_iperf3() -> Option<String> {
             } else {
                 None
             }
-        })
-        .clone()
+        }
+    })
 }
 
 pub fn iperf3_version() -> Option<String> {

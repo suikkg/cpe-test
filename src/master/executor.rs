@@ -200,7 +200,6 @@ pub struct RunSummary {
     pub measured: usize,
     pub not_evaluated: usize,
     pub setup_error: usize,
-    pub unstable: usize,
     pub skip: usize,
     /// 本轮选择并处理的灌包单元数（iperf3 + ctsTraffic，包括前置拦截）。
     pub traffic_units: usize,
@@ -225,7 +224,6 @@ impl RunSummary {
         self.measured += other.measured;
         self.not_evaluated += other.not_evaluated;
         self.setup_error += other.setup_error;
-        self.unstable += other.unstable;
         self.skip += other.skip;
         self.traffic_units += other.traffic_units;
         self.traffic_usable_units += other.traffic_usable_units;
@@ -1855,10 +1853,6 @@ impl Ctx {
                 }
                 Verdict::SetupError => {
                     sum.setup_error += 1;
-                    sum.fail += 1;
-                }
-                Verdict::Unstable => {
-                    sum.unstable += 1;
                     sum.fail += 1;
                 }
                 Verdict::RateFail => sum.fail += 1,

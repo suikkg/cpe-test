@@ -62,29 +62,49 @@ pub fn parse_selection(input: &str, max: usize) -> Result<Vec<usize>, String> {
     Ok(out)
 }
 
+/// 起一个「打开」子进程，并把它回收掉。
+///
+/// `Child` 被直接丢弃时 Rust **不会** wait：在 Unix 上每调用一次就留下一个
+/// 僵尸进程，直到本进程退出。命令行模式一辈子只开一两次报告无所谓，但控制台
+/// 和 agent 都是常驻进程，「打开报告」按钮点几十次就攒几十个。
+/// 起一条短命线程去 join，既不阻塞调用方，也不把回收推给进程退出。
+fn spawn_and_reap(mut command: Command) {
+    let Ok(mut child) = command.spawn() else {
+        return;
+    };
+    let _ = std::thread::Builder::new()
+        .name("cpe-open-reaper".into())
+        .spawn(move || {
+            let _ = child.wait();
+        });
+}
+
 /// 用系统默认浏览器打开一个 URL。
 ///
 /// 和 `open_path` 分开是因为 URL 不是路径：`Path` 在 Windows 上会把
 /// `http://host` 里的斜杠正规化成反斜杠，start 就打不开了。
 pub fn open_url(url: &str) {
-    if cfg!(windows) {
-        let _ = Command::new("cmd").args(["/C", "start", "", url]).spawn();
-    } else if cfg!(target_os = "macos") {
-        let _ = Command::new("open").arg(url).spawn();
-    } else {
-        let _ = Command::new("xdg-open").arg(url).spawn();
-    }
+    spawn_and_reap(opener_command(url));
 }
 
 /// 用系统默认程序打开文件（报告自动打开）
 pub fn open_path(p: &Path) {
-    let s = p.to_string_lossy().into_owned();
+    spawn_and_reap(opener_command(&p.to_string_lossy()));
+}
+
+fn opener_command(target: &str) -> Command {
     if cfg!(windows) {
-        let _ = Command::new("cmd").args(["/C", "start", "", &s]).spawn();
+        let mut command = Command::new("cmd");
+        command.args(["/C", "start", "", target]);
+        command
     } else if cfg!(target_os = "macos") {
-        let _ = Command::new("open").arg(&s).spawn();
+        let mut command = Command::new("open");
+        command.arg(target);
+        command
     } else {
-        let _ = Command::new("xdg-open").arg(&s).spawn();
+        let mut command = Command::new("xdg-open");
+        command.arg(target);
+        command
     }
 }
 

@@ -8,10 +8,14 @@
 //! 关掉测试设备的按钮，只会多一条出错路径，换不来任何东西——关窗口和 Ctrl+C
 //! 本来就能停，而且那两条路径已经带着资源清理。
 //!
-//! 和主控控制台一样只监听回环：agent 的业务端口必须对局域网开放（主控要连），
-//! 但「这台机器上有哪些网卡、主控是谁」不该跟着一起开放出去。
+//! **默认只监听回环，但可以用 `--ui-bind` 放开。** agent 的业务端口必须对局域网
+//! 开放（主控要连），「这台机器上有哪些网卡、主控是谁」却不必跟着一起开放，所以
+//! 默认值是 127.0.0.1。放开是一个需要显式写出来的选择：这个页面没有访问口令，
+//! 绑到可路由地址上就等于把网卡列表、IP、主机名和「有没有配 token」公开给同网段。
+//! 那仍然只是只读的信息泄露（页面本身不控制 agent），所以 `spawn()` 是打印一行
+//! 警告而不是像主控控制台那样拒绝启动。
 
-use crate::cmd::tools::{ctstraffic_platform_supported, ctstraffic_version, iperf3_version};
+use crate::cmd::tools::iperf3_version;
 use crate::nic::scan_host;
 use crate::protocol::HostInfo;
 use crate::util::{lock_recover, now_hms, os_name};
@@ -154,8 +158,6 @@ struct StatusOut {
     port: u16,
     token_configured: bool,
     iperf3: Option<String>,
-    ctstraffic: Option<String>,
-    ctstraffic_supported: bool,
     /// 本机全部网卡，不按前缀过滤：报给主控的地址就得从这里挑。
     nics: HostInfo,
     uptime_secs: u64,
@@ -173,22 +175,27 @@ struct Console {
 ///
 /// 绑不上端口只打印一行提示就算了：状态页是给人看的便利设施，不能因为
 /// 28802 被占用就让整台辅测机不能参与测试。
+/// `ui_bind` 是状态页自己的监听地址；`agent_bind`/`agent_port` 是协议服务的，
+/// 只用来显示在页面上。两者以前共用一个参数名，放开状态页绑定后必须分清。
 pub fn spawn(
+    ui_bind: &str,
     port: u16,
-    bind: &str,
+    agent_bind: &str,
     agent_port: u16,
     token_configured: bool,
     activity: &Arc<Activity>,
 ) {
     let console = Arc::new(Console {
-        bind: bind.to_string(),
+        bind: agent_bind.to_string(),
         port: agent_port,
         token_configured,
         started: Instant::now(),
         activity: Arc::clone(activity),
     });
-    let addr = format!("127.0.0.1:{port}");
-    let server = match Server::http(&addr) {
+    // 和主控控制台共用一个拼法：裸 IPv6 要补方括号，否则 `--ui-bind ::1`
+    // 拼出来的 "::1:28802" 根本解析不了，状态页会无声地起不来。
+    let addr = crate::master::webui::listen_addr(ui_bind, port);
+    let server = match Server::http(addr.as_str()) {
         Ok(server) => server,
         Err(error) => {
             println!("!! 状态页无法监听 {addr}（{error}）；agent 本身不受影响。");
@@ -198,19 +205,44 @@ pub fn spawn(
     };
     let url = format!("http://{addr}");
     println!("辅测机状态页: {url}");
+    if !crate::master::webui::bind_is_loopback(ui_bind) {
+        // 状态页全是只读 GET，放开的后果止于「网卡列表、IP、主机名、
+        // 有没有配 token」被同网段看见——比控制台轻得多，所以这里是提示
+        // 而不是拒绝启动。但它确实是信息泄露，不能默不作声。
+        println!("!! 状态页正监听在 {ui_bind}，同网段可见本机网卡与地址；它没有访问口令。");
+    }
     println!("（本机浏览器打开即可看到要报给主控的 IP 和实时活动；不影响测试）");
     crate::console::open_url(&url);
 
-    std::thread::Builder::new()
-        .name("cpe-agent-webui".into())
-        .spawn(move || {
-            for request in server.incoming_requests() {
-                handle(request, &console);
-            }
-        })
-        .map(|_| ())
-        .unwrap_or_else(|error| println!("!! 状态页线程启动失败（{error}）；agent 本身不受影响。"));
+    // 和主控控制台同一个理由要同一套解法：`/api/status` 要跑 `scan_host()`，
+    // Windows 上会拉起 ipconfig/netsh 一到两秒，单线程期间每 1.5 秒一次的
+    // 活动轮询全在排队——页面每分钟停顿一次。状态页的共享状态本来就在
+    // Mutex 后面，并发处理不需要额外同步。
+    let server = Arc::new(server);
+    let mut started = 0;
+    for idx in 0..AGENT_UI_WORKERS {
+        let server = Arc::clone(&server);
+        let console = Arc::clone(&console);
+        if std::thread::Builder::new()
+            .name(format!("cpe-agent-webui-{idx}"))
+            .spawn(move || {
+                while let Ok(request) = server.recv() {
+                    handle(request, &console);
+                }
+            })
+            .is_ok()
+        {
+            started += 1;
+        }
+    }
+    if started == 0 {
+        println!("!! 状态页线程启动失败；agent 本身不受影响。");
+    }
 }
+
+/// 状态页的并发处理线程数。比主控控制台少：这个页面只有两个接口，
+/// 需要挡的只是「重扫网卡的那一两秒别把活动轮询堵住」。
+const AGENT_UI_WORKERS: usize = 2;
 
 fn header(name: &'static [u8], value: &'static [u8]) -> Header {
     Header::from_bytes(name, value).expect("static response header")
@@ -268,8 +300,6 @@ fn api_status(console: &Arc<Console>) -> Result<serde_json::Value, String> {
         port: console.port,
         token_configured: console.token_configured,
         iperf3: iperf3_version(),
-        ctstraffic: ctstraffic_version(),
-        ctstraffic_supported: ctstraffic_platform_supported(),
         // 不按 ipv4_prefixes 过滤：要报给主控的那个地址常常就在被过滤掉的
         // 管理网段上，过滤过的表在这里等于把答案藏起来。
         nics: scan_host(&[]),

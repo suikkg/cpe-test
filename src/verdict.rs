@@ -19,7 +19,6 @@
 pub enum Verdict {
     Pass,
     RateFail,
-    Unstable,
     Measured,
     #[default]
     NotEvaluated,
@@ -32,7 +31,6 @@ impl Verdict {
         match self {
             Verdict::Pass => "PASS",
             Verdict::RateFail => "RATE_FAIL",
-            Verdict::Unstable => "UNSTABLE",
             Verdict::Measured => "MEASURED",
             Verdict::NotEvaluated => "NOT_EVALUATED",
             Verdict::SetupError => "SETUP_ERROR",
@@ -44,7 +42,6 @@ impl Verdict {
         match self {
             Verdict::Pass => "pass",
             Verdict::RateFail => "fail",
-            Verdict::Unstable => "warn",
             Verdict::Measured => "measured",
             Verdict::NotEvaluated => "not-evaluated",
             Verdict::SetupError => "error",
@@ -104,7 +101,7 @@ pub fn is_hard_single_udp_failure(verdict: Verdict, reason_code: &str) -> bool {
 /// 2. 任一 `SETUP_ERROR` —— 环境没搭起来，性能结论无意义；
 /// 3. 任一单流硬失败 —— 必须灌通的方向没灌通，不能被步骤 4 的
 ///    `NOT_EVALUATED` 吃掉（这正是它必须排在前面的原因）；
-/// 4. 按 `NOT_EVALUATED` → `RATE_FAIL` → `UNSTABLE` → `MEASURED` 取第一个命中：
+/// 4. 按 `NOT_EVALUATED` → `RATE_FAIL` → `MEASURED` 取第一个命中：
 ///    「无法评价」优先于「评价为不合格」，避免用一份不可信的数据下结论；
 /// 5. 含 `SKIP` —— 整体按跳过计，不计入通过率；
 /// 6. 全部 `PASS` —— 才是 `PASS`。
@@ -128,12 +125,7 @@ where
     {
         return Verdict::RateFail;
     }
-    for candidate in [
-        Verdict::NotEvaluated,
-        Verdict::RateFail,
-        Verdict::Unstable,
-        Verdict::Measured,
-    ] {
+    for candidate in [Verdict::NotEvaluated, Verdict::RateFail, Verdict::Measured] {
         if items.iter().any(|(verdict, _)| *verdict == candidate) {
             return candidate;
         }
@@ -205,6 +197,14 @@ pub fn disposition_advice(reason_code: &str) -> Option<&'static str> {
         // —— 真正的被测对象问题 ——
         "RX_BELOW_TARGET" => "接收端实测速率低于目标，这是被测链路/设备的性能问题。",
         "RX_UNSTABLE" => "平均速率达标但存在持续掉速，被测链路有周期性抖动或限速。",
+        "RX_DROPOUT" => {
+            "平均和 P10 都达标，但判定窗口里有完整 5 秒掉到门限以下。业务上那几秒就是断的：\
+             先看原因里写的掉坑起点和最长连续秒数，再对着网卡逐样本 CSV 找同一时刻发生了什么\
+             （漫游、信道切换、对端重启）。这是被测链路的问题，不是采样问题。"
+        }
+        "RX_P10_BELOW_TARGET" => {
+            "接收端速率的低十分位低于目标：不是偶发掉坑，是有相当一部分时间都没达标。按被测链路性能问题处理。"
+        }
         "UDP_LOSS_HIGH" | "CTSTRAFFIC_UDP_LOSS_HIGH" => "丢包/丢帧超过门槛，被测链路在该负载下无法无损转发。",
         "SINGLE_UDP_STREAM_FAILED" | "CTSTRAFFIC_SINGLE_UDP_STREAM_FAILED" => {
             "该方向必须灌通却始终没有任何流量测量。先确认防火墙放通了测试端口段，再检查链路是否真的不通。"
@@ -213,6 +213,17 @@ pub fn disposition_advice(reason_code: &str) -> Option<&'static str> {
         "NO_STREAM_STARTED" => "一条流都没起来，先查防火墙与测试端口段是否放通。",
         "IPERF_RUNTIME_ERRORS" | "CTSTRAFFIC_RUNTIME_ERRORS" => {
             "已有吞吐测量但进程非正常结束，链路可能在测试中途中断。"
+        }
+        "IPERF_SUMMARY_LOST" => {
+            "灌包已经跑完，但 iperf3 收尾交换结果时连接断了，工具自报速率取不到。\
+             判定已改用接收端网卡口径，这一行的结论仍然有效；工具自报那几列是空的属正常。"
+        }
+        "NO_VALID_MEASUREMENT" | "CTSTRAFFIC_NO_MEASUREMENT" => {
+            "整轮没有产生任何可用的吞吐测量。先确认防火墙放通了测试端口段、两端工具版本可用，再重跑。"
+        }
+        "NIC_DISAPPEARED" => {
+            "测试期间接收端网卡从系统里消失了（拔线、驱动重载、Wi-Fi 适配器重置）。\
+             属于测试环境问题，不是 CPE 性能问题；恢复网卡后重跑。"
         }
         "PING_UNREACHABLE" | "PING_SUBNET_UNREACHABLE" => "目标不可达，先确认两端 IP、网线和防火墙。",
         "PING_GATEWAY_UNREACHABLE" => "网关不可达，说明该网卡的链路或组网本身有问题。",
@@ -228,6 +239,71 @@ pub fn disposition_advice(reason_code: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 速率判定新增的原因码，必须同时在**消费侧**登记。
+    ///
+    /// `disposition_advice` 的兜底是 `_ => return None`，漏登记永远不会有信号：
+    /// v4.3.1 加的 `RX_DROPOUT` 就这么在报告里当了一整个版本的「无建议」，
+    /// 而它取代的 `RX_UNSTABLE` 两处都有。
+    ///
+    /// 这条把 `rate_window.rs` 整个文件在**编译期**读进来，把里面出现的
+    /// 大写原因码literal 全捞出来逐个核对。选它是因为速率判定的码全在这一个
+    /// 文件里产出，而且它干净——没有环境变量名之类的同形噪声，不需要维护
+    /// 一张越滚越大的豁免表。以后在别处新增码时，照这个样子再加一条。
+    #[test]
+    fn every_rate_reason_code_has_a_disposition() {
+        const RATE_WINDOW_SOURCE: &str = include_str!("master/rate_window.rs");
+
+        // 正常结果不需要处置建议，但必须是**显式**列出来的，不能靠兜底静默通过。
+        const NEEDS_NO_ADVICE: [&str; 0] = [];
+
+        let mut checked = 0;
+        let mut missing: Vec<String> = Vec::new();
+        for code in uppercase_literals(RATE_WINDOW_SOURCE) {
+            checked += 1;
+            if NEEDS_NO_ADVICE.contains(&code.as_str()) {
+                continue;
+            }
+            if disposition_advice(&code).is_none() {
+                missing.push(code);
+            }
+        }
+
+        assert!(checked >= 8, "没捞到码说明扫描坏了，只捞到 {checked} 个");
+        assert!(
+            missing.is_empty(),
+            "这些原因码没有处置建议，报告里会是一片空白：{missing:?}。\
+             在 disposition_advice 里补上，或显式加进 NEEDS_NO_ADVICE"
+        );
+    }
+
+    /// 从源码里捞出形如 `"RX_DROPOUT"` 的大写字面量。
+    #[cfg(test)]
+    fn uppercase_literals(source: &str) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for chunk in source.split('"').skip(1).step_by(2) {
+            let looks_like_code = chunk.len() >= 5
+                && chunk
+                    .bytes()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+                && chunk.bytes().any(|b| b.is_ascii_uppercase());
+            if looks_like_code && !out.contains(&chunk.to_string()) {
+                out.push(chunk.to_string());
+            }
+        }
+        out
+    }
+
+    /// RX_DROPOUT 是 v4.3.1 的头牌能力，两张消费侧的表都要认它。
+    #[test]
+    fn the_dropout_code_is_registered_in_both_consumer_tables() {
+        let advice = disposition_advice("RX_DROPOUT").expect("必须有处置建议");
+        assert!(advice.contains("5 秒"), "建议要说清它判的是什么：{advice}");
+        assert!(
+            disposition_advice("RX_UNSTABLE").is_some(),
+            "它取代的那个码不能因此掉队"
+        );
+    }
 
     fn v(verdict: Verdict) -> (Verdict, &'static str) {
         (verdict, "")
@@ -383,12 +459,14 @@ mod tests {
             Verdict::Measured
         );
         assert_eq!(
-            aggregate_verdict([v(Verdict::Measured), v(Verdict::Unstable)]),
-            Verdict::Unstable
+            aggregate_verdict([v(Verdict::Measured), (Verdict::RateFail, "RX_DROPOUT")]),
+            Verdict::RateFail,
+            "掉速统一归 RATE_FAIL，不能被 MEASURED 盖住"
         );
         assert_eq!(
-            aggregate_verdict([v(Verdict::Unstable), (Verdict::RateFail, "RX_BELOW_TARGET")]),
-            Verdict::RateFail
+            aggregate_verdict([v(Verdict::Measured), v(Verdict::NotEvaluated)]),
+            Verdict::NotEvaluated,
+            "「无法评价」优先于「评价为不合格」"
         );
     }
 

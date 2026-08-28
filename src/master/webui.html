@@ -68,6 +68,20 @@ tbody tr:last-child td { border-bottom:0; }
 .status.bad { background:var(--bad-bg); color:var(--bad); }
 .status.info { background:var(--info-bg); color:var(--accent); }
 .hint { color:var(--muted); font-size:12px; }
+.bidir-cell { white-space:nowrap; }
+.bidir-t { display:flex; align-items:center; gap:5px; font-size:12px; color:var(--muted); margin-bottom:3px; }
+.bidir-t input { width:72px; }
+.empty { color:var(--muted); text-align:center; padding:14px; }
+.tabs { display:flex; gap:2px; padding:0 22px; background:var(--head); border-bottom:1px solid var(--line); }
+.tab { border:0; background:transparent; padding:10px 18px; font:inherit; color:var(--muted); cursor:pointer; border-bottom:3px solid transparent; border-radius:0; }
+.tab:hover { color:var(--ink); }
+.tab.active { color:var(--ink); border-bottom-color:var(--accent); font-weight:700; }
+select { min-height:32px; padding:5px 8px; border:1px solid var(--line); border-radius:4px; font:inherit; background:var(--surface); color:var(--ink); }
+.mon-readout { display:flex; flex-wrap:wrap; gap:10px 28px; margin:14px 0 6px; align-items:baseline; }
+.mon-label { color:var(--muted); font-size:12px; margin-right:8px; }
+.mon-value { font:700 26px/1.1 ui-monospace,Consolas,monospace; font-variant-numeric:tabular-nums; }
+.mon-value-sm { font:14px/1.2 ui-monospace,Consolas,monospace; font-variant-numeric:tabular-nums; }
+#monchart { width:100%; max-width:100%; border:1px solid var(--line); background:var(--surface); }
 .field-note { display:block; margin-top:3px; color:var(--muted); font-size:11px; white-space:nowrap; }
 input.touched { border-color:var(--accent); background:var(--edited); font-weight:700; }
 #log { height:420px; overflow:auto; padding:11px 12px; border:1px solid var(--line); background:var(--log-bg); color:var(--log-ink); font:12px/1.5 ui-monospace,Consolas,monospace; white-space:pre-wrap; overflow-wrap:anywhere; }
@@ -99,8 +113,29 @@ pre.hint { font-family:ui-monospace,Consolas,monospace; }
 <div class="wrap">
   <header class="app-header">
     <h1>CPE 子网测试控制台</h1>
-    <span class="version">LOCAL · 127.0.0.1</span>
+    <span class="version" id="ver">LOCAL · 127.0.0.1</span>
   </header>
+
+  <nav class="tabs">
+    <button type="button" class="tab active" data-tab="test">测试</button>
+    <button type="button" class="tab" data-tab="monitor">监控</button>
+  </nav>
+
+  <div id="tab-test">
+  <!-- 本机区不编号：它不是向导的一步，是打开就该看见的事实。连接辅测机
+       之前也完全可用，所以不能藏在 connect 成功之后。 -->
+  <section id="localsec">
+    <h2>本机</h2>
+    <div class="row">
+      <span id="localstate" class="hint">读取中…</span>
+      <button type="button" id="localrefresh" class="ghost">重新扫描</button>
+    </div>
+    <div id="localmsg"></div>
+    <div class="scroll"><table id="localnics">
+      <thead><tr><th>网卡</th><th>角色</th><th>IPv4</th><th>IPv6</th><th>网关</th><th>协商速率</th></tr></thead>
+      <tbody><tr><td colspan="6" class="empty">读取中…</td></tr></tbody>
+    </table></div>
+  </section>
 
   <section>
     <h2><span class="n">1</span>连接辅测机</h2>
@@ -134,6 +169,14 @@ pre.hint { font-family:ui-monospace,Consolas,monospace; }
       <button type="button" class="ghost" id="cross">只选跨机</button>
       <span class="hint">默认全不选。表头里的小勾选框整列开关，勾一下全开、再勾一下全关。每个要跑的组合至少保留一个方向、协议和 IP 版本。</span>
     </div>
+    <p class="hint"><strong>双向门限</strong>只在勾了「双向」时生效，留空就沿用「网口与策略」里的 RX 门限。
+    半双工介质（Wi-Fi、部分 USB 网卡）双向同时灌包时，两个方向抢同一段介质时间，
+    每个方向拿到的只有单向的一部分——拿单向门限去卡双向必然判成 <code>RATE_FAIL</code>，
+    而那是配置出来的失败、不是测出来的。典型写法：单向 2000，双向两格各填 1000。
+    <strong>它按配对填而不是按网卡</strong>：同一块 RNDIS 口，和 Wi-Fi 组双向、和 SGMII 组双向，
+    能收到的速率完全不是一个量级，挂在网卡上只能填一个数，必然有一组是错的。
+    两个方向分开是因为半双工链路的两个方向本来就能差很远。只填绝对 Mbps，不收百分比——
+    百分比要按单块网卡的协商速率换算，而那跟「这两块口凑在一起并发时能跑多少」没有关系。</p>
     <div class="scroll"><table id="matrix"><thead><tr>
       <th>测</th><th>配对</th>
       <th>方向<div class="colsel">
@@ -141,9 +184,11 @@ pre.hint { font-family:ui-monospace,Consolas,monospace; }
         <label><input type="checkbox" class="colall" data-attr="dir" data-val="ba">B→A</label>
         <label><input type="checkbox" class="colall" data-attr="dir" data-val="bidir">双向</label>
       </div></th>
+      <th>双向门限 Mbps<div class="colsel"><span class="hint">仅「双向」生效</span></div></th>
       <th>协议<div class="colsel">
         <label><input type="checkbox" class="colall" data-attr="tp" data-val="tcp">TCP</label>
         <label><input type="checkbox" class="colall" data-attr="tp" data-val="udp">UDP</label>
+        <label><input type="checkbox" class="colall" data-attr="tp" data-val="ping">PING</label>
       </div></th>
       <th>IP<div class="colsel">
         <label><input type="checkbox" class="colall" data-attr="ip" data-val="v4">V4</label>
@@ -169,7 +214,10 @@ pre.hint { font-family:ui-monospace,Consolas,monospace; }
     <div class="row run-options">
       <label>时长 <input type="number" id="duration" class="num" value="180" min="1" max="86400"></label>
       <label>UDP 流 <input type="number" id="udpstreams" class="num" value="1" min="1" max="32"></label>
+      <label>ping 次数 <input type="number" id="pingcount" class="num" value="100" min="1" max="100000"></label>
+      <label>ping 包长 <input type="text" id="pingsizes" class="list" value="32 1600 65500" placeholder="32 1600 65500"></label>
       <label><input type="checkbox" id="clip"> 按链路上限裁剪 UDP -b</label>
+      <label><input type="checkbox" id="resume"> 跳过 24 小时内已 PASS 的单元（resume）</label>
       <label><input type="checkbox" id="shot"> 截图</label>
     </div>
     <p class="hint">不勾「裁剪」时，填多少就发多少——想看链路在超额灌包下的表现就保持不勾。勾上后超过整条路径可信上限的档位会被自动压到上限，按网口单独指定的 -b 不受影响。</p>
@@ -190,11 +238,48 @@ pre.hint { font-family:ui-monospace,Consolas,monospace; }
     </div>
     <div id="log"></div>
   </section>
+  </div>
+
+  <!-- 监控是和「一轮测试」正交的一件事：不需要矩阵、不需要门限，也不需要
+       先连上辅测机（本机网卡自己就能看）。塞进那条五步向导会让向导的语义
+       崩掉，所以单开一个标签页，和测试面板共享同一份连接状态。 -->
+  <div id="tab-monitor" class="hidden">
+    <section>
+      <h2>网卡速率监控</h2>
+      <div class="row">
+        <label>监控端 <select id="monside">
+          <option value="master">本机</option>
+          <option value="agent">辅测机</option>
+        </select></label>
+        <label>网卡 <select id="moniface"></select></label>
+        <label>采样间隔 <input type="number" id="moninterval" class="num" value="1000" min="200" max="60000"> ms
+          <span class="field-note" id="monintervalnote">本机：200–60000 ms</span></label>
+        <button type="button" id="monstart">开始监控</button>
+        <button type="button" id="monstop" class="ghost" disabled>停止</button>
+      </div>
+      <div id="monmsg"></div>
+      <div class="mon-readout">
+        <div><span class="mon-label">RX</span><span id="monrx" class="mon-value">—</span></div>
+        <div><span class="mon-label">TX</span><span id="montx" class="mon-value">—</span></div>
+        <div><span class="mon-label">RX 均值 / 峰值</span><span id="monstat" class="mon-value-sm">—</span></div>
+      </div>
+      <canvas id="monchart" height="180"></canvas>
+      <p class="hint">监控与测试互不影响，可以边跑测试边看。横轴是会话开始后的时间（分:秒），
+        曲线、均值和峰值用同一个窗口。要长期留存曲线请用
+        <code>cpe_test monitor --csv</code>——网页只保留最近 7200 个采样点。</p>
+    </section>
+  </div>
 </div>
 
 <script>
 const $ = (id) => document.getElementById(id);
-let MASTER = null, AGENT = null, PAIRS = [], FROM = 0, TIMER = null;
+let MASTER = null, AGENT = null, PAIRS = [], FROM = 0, TIMER = null, LOCAL_NICS = [];
+// 日志框保留的行数，和服务端镜像的 LOG_MIRROR_MAX_LINES 对齐。
+// 不封顶的话，一次 120 单元的运行会打出三万多行全留在一个文本节点里：
+// 几 MB 的 pre-wrap 文本要反复重排，而 `textContent +=` 每秒把整段读出来
+// 再写回去，累计拷贝量是行数的平方级——测试跑到后半程页面会明显发卡。
+const LOG_MAX_LINES = 4000;
+let LOG_LINES = [];
 
 function say(el, text, kind) {
   el.innerHTML = text ? '<div class="status ' + (kind || 'info') + '">' + esc(text) + '</div>' : '';
@@ -202,16 +287,63 @@ function say(el, text, kind) {
 function esc(s) {
   return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 }
+// 启动时打印的地址里带着 ?token=。取出来收好，并把它从地址栏抹掉——留在那儿
+// 会跟着截图、跟着「复制当前网址」传出去。
+//
+// 但只放在内存里不行：抹掉地址栏之后，F5、恢复标签页、点书签都会变成一个不带
+// token 的 GET /，撞在 401 上，唯一的补救是回终端翻那行启动日志。所以先存进
+// sessionStorage——它跟着标签页走，关掉就没了，比 localStorage 留在磁盘上稳妥。
+const TOKEN_KEY = 'cpe_ui_token';
+function stashedToken() {
+  // 无痕模式等场景下 sessionStorage 可能直接抛，取不到就退回「没有」。
+  try { return sessionStorage.getItem(TOKEN_KEY) || ''; } catch (e) { return ''; }
+}
+const TOKEN_FROM_URL = new URLSearchParams(location.search).get('token') || '';
+const UI_TOKEN = TOKEN_FROM_URL || stashedToken();
+if (TOKEN_FROM_URL) {
+  try { sessionStorage.setItem(TOKEN_KEY, TOKEN_FROM_URL); } catch (e) { /* 存不下就只管这一次加载 */ }
+  history.replaceState(null, '', location.pathname);
+}
+
 async function api(path, body) {
-  const opt = body === undefined ? {} : {
+  const headers = UI_TOKEN ? { 'X-CPE-Token': UI_TOKEN } : {};
+  const opt = body === undefined ? { headers } : {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'X-CPE-Console': '1' },
+    headers: { ...headers, 'Content-Type': 'application/json', 'X-CPE-Console': '1' },
     body: JSON.stringify(body),
   };
   const r = await fetch(path, opt);
   const j = await r.json();
   if (!j.ok) throw new Error(j.error || '请求失败');
   return j.data;
+}
+
+function renderLocal(d) {
+  LOCAL_NICS = d.host.interfaces || [];
+  $('ver').textContent = 'v' + d.version + ' · ' + d.host.hostname + ' · ' + d.host.os;
+  $('localstate').textContent = 'iperf3 ' + (d.iperf3 || '未找到') +
+    ' · ' + d.host.interfaces.length + ' 块网卡';
+  const rows = d.host.interfaces.map((n) =>
+    '<tr><td>' + esc(n.name) + '</td><td>' + esc(n.role) +
+    '</td><td>' + esc(n.ipv4 || '—') +
+    '</td><td>' + esc(n.ipv6_global || n.ipv6_ll || '—') +
+    '</td><td>' + esc(n.gateway_v4 || '—') +
+    '</td><td>' + (n.speed_mbps ? n.speed_mbps + ' Mbps' : '—') + '</td></tr>');
+  $('localnics').querySelector('tbody').innerHTML = rows.length ? rows.join('')
+    : '<tr><td colspan="6" class="empty">没有扫到网卡。检查网线 / Wi-Fi 是否连上。</td></tr>';
+}
+
+async function loadLocal(manual) {
+  const btn = $('localrefresh');
+  if (manual) { btn.disabled = true; btn.textContent = '扫描中…'; }
+  try {
+    renderLocal(await api('/api/local'));
+    if (manual) say($('localmsg'), '已重新扫描 · ' + new Date().toLocaleTimeString(), 'ok');
+  } catch (e) {
+    say($('localmsg'), '读取本机信息失败：' + e.message, 'bad');
+  } finally {
+    if (manual) { btn.disabled = false; btn.textContent = '重新扫描'; }
+  }
 }
 
 // 网口两两组合成可测配对。同机两块网卡也算，走的是回环/桥接路径，
@@ -268,14 +400,24 @@ function renderMatrix() {
     const dirs = ['ab', 'ba', 'bidir'].map((d) =>
       '<label><input type="checkbox" data-dir="' + d + '" data-i="' + i + '"' + (d === 'bidir' ? '' : ' checked') + '>' +
       (d === 'ab' ? 'A→B' : d === 'ba' ? 'B→A' : '双向') + '</label>').join('');
-    const tp = ['tcp', 'udp'].map((t) =>
-      '<label><input type="checkbox" data-tp="' + t + '" data-i="' + i + '" checked>' + t.toUpperCase() + '</label>').join('');
+    const tp = ['tcp', 'udp', 'ping'].map((t) =>
+      '<label><input type="checkbox" data-tp="' + t + '" data-i="' + i + '"' +
+      (t === 'ping' ? '' : ' checked') + '>' + t.toUpperCase() + '</label>').join('');
     const ip = ['v4', 'v6'].map((v) =>
       '<label><input type="checkbox" data-ip="' + v + '" data-i="' + i + '"' + (v === 'v4' ? ' checked' : '') + '>' + v.toUpperCase() + '</label>').join('');
+    // 双向门限按**配对**填，不是按网卡：同一块 RNDIS 口和 Wi-Fi 组双向、
+    // 和 SGMII 组双向，能收到的速率完全不是一个量级。两个方向分开填，
+    // 因为半双工链路的两个方向本来就能差很远。
+    const bidirTarget = ['ab', 'ba'].map((d) =>
+      '<label class="bidir-t">' + (d === 'ab' ? 'A→B' : 'B→A') +
+      '<input type="text" class="num bidir-target" data-bt="' + d + '" data-i="' + i +
+      '" placeholder="同单向"></label>').join('');
     return '<tr>' +
       '<td><input type="checkbox" class="sel" data-i="' + i + '"></td>' +
       '<td class="pairname">' + esc(p.label) + '</td>' +
-      '<td class="dirs">' + dirs + '</td><td class="dirs">' + tp + '</td><td class="dirs">' + ip + '</td>' +
+      '<td class="dirs">' + dirs + '</td>' +
+      '<td class="dirs bidir-cell">' + bidirTarget + '</td>' +
+      '<td class="dirs">' + tp + '</td><td class="dirs">' + ip + '</td>' +
       '</tr>';
   });
   $('matrix').querySelector('tbody').innerHTML = rows.join('');
@@ -310,10 +452,16 @@ function collect() {
     const pick = (attr) => Array.from(document.querySelectorAll('[data-' + attr + '][data-i="' + i + '"]'))
       .filter((e) => e.checked).map((e) => e.dataset[attr]);
     const p = PAIRS[i];
+    const bidirTarget = (d) => {
+      const el = document.querySelector('.bidir-target[data-bt="' + d + '"][data-i="' + i + '"]');
+      return el ? el.value.trim() : '';
+    };
     pairs.push({
       src: p.a.side + ':NAME=' + p.a.nic.name,
       dst: p.b.side + ':NAME=' + p.b.nic.name,
       directions: pick('dir'),
+      rx_target_bidir_ab: bidirTarget('ab'),
+      rx_target_bidir_ba: bidirTarget('ba'),
       transports: pick('tp'),
       ip: pick('ip'),
     });
@@ -328,7 +476,10 @@ function collect() {
     udp_lengths: splitList($('udplen').value),
     udp_windows: splitList($('udpwin').value),
     udp_streams: Number($('udpstreams').value) || 1,
+    ping_count: Number($('pingcount').value) || 0,
+    ping_payload_sizes: splitList($('pingsizes').value).map(Number).filter((n) => n > 0),
     limit_udp_by_link_speed: $('clip').checked,
+    resume: $('resume').checked,
     screenshot: $('shot').checked,
   };
 }
@@ -357,6 +508,8 @@ async function bootstrap() {
     $('udplen').value = (d.udp_lengths || []).join(' ');
     $('udpwin').value = (d.udp_windows || []).join(' ');
     $('udpstreams').value = d.udp_streams || 1;
+    $('pingcount').value = d.ping_count || 100;
+    $('pingsizes').value = (d.ping_payload_sizes || []).join(' ');
     $('shot').checked = Boolean(d.screenshot);
   } catch (e) {
     say($('connstatus'), '读取启动配置失败：' + e.message, 'bad');
@@ -386,7 +539,7 @@ $('connect').onclick = async () => {
     const d = await api('/api/connect', connectParams());
     MASTER = d.master; AGENT = d.agent;
     say($('connstatus'), '已连接 ' + d.health.hostname + ' (' + d.health.os + ') · agent v' + d.health.version +
-      ' · iperf3 ' + (d.health.iperf3 || '未找到') + ' · ctsTraffic ' + (d.health.ctstraffic || '未找到'), 'ok');
+      ' · iperf3 ' + (d.health.iperf3 || '未找到'), 'ok');
     PAIRS = buildPairs();
     renderNics(d.nic_policies); renderMatrix();
     ['nicsec', 'matrixsec', 'runsec'].forEach((id) => $(id).classList.remove('hidden'));
@@ -475,8 +628,14 @@ $('plan').onclick = async () => {
   try {
     const d = await api('/api/plan', collect());
     if (d.units.length === 0) throw new Error('当前选择没有生成可执行单元，请检查 IP 版本和网口组合。');
-    const head = '共 ' + d.units.length + ' 个测试单元，预计 ' + hhmm(d.est_total_secs) + '。';
-    const list = d.units.slice(0, 200).map((u) => '#' + u.seq + ' ' + u.title).join('\n');
+    // resume 的跳过只是预判：执行时前置检查被拦、或网卡快照变了的单元照样实跑。
+    // 所以两头都报出来，别让人照着一个偏小的数字安排时间。
+    const cost = d.est_full_secs > d.est_total_secs
+      ? hhmm(d.est_total_secs) + ' ~ ' + hhmm(d.est_full_secs) + '（取决于 resume 实际跳过多少）'
+      : hhmm(d.est_total_secs);
+    const head = '共 ' + d.units.length + ' 个测试单元，预计 ' + cost + '。';
+    const list = d.units.slice(0, 200)
+      .map((u) => '#' + u.seq + ' ' + (u.resumed ? '[resume 跳过] ' : '') + u.title).join('\n');
     $('planstatus').innerHTML = '<div class="status info">' + esc(head) +
       (d.notices.length ? '<br>提示：' + esc(d.notices.join('；')) : '') +
       '</div><pre class="hint plan-list">' + esc(list) + '</pre>';
@@ -493,7 +652,7 @@ $('start').onclick = async () => {
     $('start').disabled = true; $('plan').disabled = true; $('export').disabled = true;
     $('stop').disabled = false; $('stop').classList.remove('hidden');
     $('openreport').classList.add('hidden');
-    FROM = 0; $('log').textContent = '';
+    FROM = 0; LOG_LINES = []; $('log').textContent = '';
     if (TIMER) clearInterval(TIMER);
     TIMER = setInterval(poll, 1000);
     poll();
@@ -520,7 +679,14 @@ async function poll() {
     if (d.lines.length) {
       const box = $('log');
       const stick = box.scrollTop + box.clientHeight >= box.scrollHeight - 40;
-      box.textContent += d.lines.join('\n') + '\n';
+      LOG_LINES = LOG_LINES.concat(d.lines);
+      if (LOG_LINES.length > LOG_MAX_LINES) {
+        // 到顶之后每拍重建一次已经封顶的文本；封顶前走便宜的追加。
+        LOG_LINES = LOG_LINES.slice(-LOG_MAX_LINES);
+        box.textContent = LOG_LINES.join('\n') + '\n';
+      } else {
+        box.textContent += d.lines.join('\n') + '\n';
+      }
       if (stick) box.scrollTop = box.scrollHeight;
     }
     $('runstate').textContent = d.running ? '运行中…' : '已结束';
@@ -534,6 +700,199 @@ async function poll() {
     }
   } catch (e) { /* 轮询失败不打断界面，下一拍再试 */ }
 }
+$('localrefresh').onclick = () => loadLocal(true);
+
+// ---------------- 标签页 ----------------
+document.querySelectorAll('.tab').forEach((btn) => {
+  btn.onclick = () => {
+    document.querySelectorAll('.tab').forEach((b) => b.classList.toggle('active', b === btn));
+    $('tab-test').classList.toggle('hidden', btn.dataset.tab !== 'test');
+    $('tab-monitor').classList.toggle('hidden', btn.dataset.tab !== 'monitor');
+    if (btn.dataset.tab === 'monitor') { fillMonitorIfaces(); applyIntervalLimit(); }
+  };
+});
+
+// ---------------- 网卡速率监控 ----------------
+// 和服务端的 MONITOR_MAX_POINTS 对齐。曲线、均值、峰值全部用这一个窗口，
+// 三处各用各的上限只会让并排放着的两个数对不上。
+const MON_MAX_POINTS = 7200;
+let MON = { session: null, from: 0, points: [], timer: null };
+
+function cssVar(name) {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+}
+
+// 辅测机侧的实际采样由 agent 做，它把间隔夹在 200–5000 ms
+// （见 MonitorMgr::start_owned）。界面上允许填到 60000 的话，选 10 秒时
+// agent 按 5 秒采、控制台按 10 秒取「最后一个样本」，一半样本被无声丢掉，
+// 而同样填 10 秒监控本机却是对的——同一个输入框在两个监控端下语义不同。
+// 所以上限跟着监控端走，并把它写在输入框下面。
+const AGENT_MAX_INTERVAL_MS = 5000;
+
+function applyIntervalLimit() {
+  const agent = $('monside').value === 'agent';
+  const max = agent ? AGENT_MAX_INTERVAL_MS : 60000;
+  const input = $('moninterval');
+  input.max = max;
+  if (Number(input.value) > max) input.value = max;
+  $('monintervalnote').textContent = agent
+    ? '辅测机：200–' + max + ' ms（agent 侧采样上限）'
+    : '本机：200–60000 ms';
+}
+
+function fillMonitorIfaces() {
+  const side = $('monside').value;
+  const list = side === 'master' ? LOCAL_NICS : ((AGENT && AGENT.interfaces) || []);
+  const sel = $('moniface');
+  const keep = sel.value;
+  if (!list.length) {
+    sel.innerHTML = '<option value="">' +
+      (side === 'agent' ? '先去「测试」标签连接辅测机' : '没扫到网卡') + '</option>';
+    return;
+  }
+  sel.innerHTML = list.map((n) => '<option value="' + esc(n.name) + '">' + esc(n.name) +
+    (n.ipv4 ? ' · ' + esc(n.ipv4) : '') + (n.role ? ' · ' + esc(n.role) : '') + '</option>').join('');
+  if (list.some((n) => n.name === keep)) sel.value = keep;
+}
+
+// 只画线，不引任何图表库：这个页面零外部资源是它能塞进单 exe 的前提。
+//
+// X 轴走样本自带的相对秒数 `t`，**不是数组下标**。按下标画的话，采样停顿
+// （辅测机掉线、计数器连续读失败）会被画成一段连续等距的线，看不出中间断了——
+// 而这条曲线的用途恰恰是发现掉速和断流。同理，曲线、均值、峰值三者用的是
+// 同一个窗口（整个保留缓冲），否则读数里的峰值会高过图上最高的网格线。
+function drawChart() {
+  const canvas = $('monchart'), points = MON.points;
+  const ratio = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth || 600, h = 180;
+  if (canvas.width !== Math.round(w * ratio) || canvas.height !== Math.round(h * ratio)) {
+    canvas.width = Math.round(w * ratio);
+    canvas.height = Math.round(h * ratio);
+  }
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+  if (points.length < 2) return;
+
+  const L = 46, R = w - 6, B = h - 22, T = 12;
+  const peak = Math.max(1, ...points.map((p) => Math.max(p.rx_mbps, p.tx_mbps)));
+  const t0 = points[0].t, t1 = points[points.length - 1].t;
+  const span = (t1 - t0) || 1;
+  const x = (p) => L + ((p.t - t0) / span) * (R - L);
+  const y = (v) => B - (v / peak) * (B - T);
+
+  ctx.strokeStyle = cssVar('--line');
+  ctx.fillStyle = cssVar('--muted');
+  ctx.font = '11px ui-monospace,Consolas,monospace';
+  ctx.lineWidth = 1;
+  [0, 0.5, 1].forEach((frac) => {
+    const value = peak * frac, py = Math.round(y(value)) + 0.5;
+    ctx.beginPath(); ctx.moveTo(L, py); ctx.lineTo(R, py); ctx.stroke();
+    ctx.fillText(value.toFixed(0), 4, py + 4);
+  });
+
+  // X 轴刻度：没有它，人看得出「掉了一个坑」却答不出「第几秒掉的」。
+  ctx.textAlign = 'center';
+  [0, 0.5, 1].forEach((frac) => {
+    const secs = t0 + span * frac;
+    ctx.fillText(hhmmss(Math.round(secs)), Math.min(R - 16, Math.max(L + 16, L + frac * (R - L))), h - 6);
+  });
+  ctx.textAlign = 'start';
+
+  const line = (key, color) => {
+    ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.beginPath();
+    points.forEach((p, i) => (i ? ctx.lineTo(x(p), y(p[key])) : ctx.moveTo(x(p), y(p[key]))));
+    ctx.stroke();
+  };
+  line('rx_mbps', cssVar('--accent'));
+  line('tx_mbps', cssVar('--focus'));
+}
+
+function hhmmss(secs) {
+  const m = Math.floor(secs / 60), s = secs % 60;
+  return m + ':' + String(s).padStart(2, '0');
+}
+
+function monReset(enabled) {
+  $('monstart').disabled = !enabled;
+  $('monstop').disabled = enabled;
+  $('monside').disabled = !enabled;
+  $('moniface').disabled = !enabled;
+  $('moninterval').disabled = !enabled;
+}
+
+function monFinish(text, kind) {
+  if (MON.timer) clearInterval(MON.timer);
+  MON.timer = null; MON.session = null;
+  monReset(true);
+  if (text) say($('monmsg'), text, kind || 'info');
+}
+
+async function monPoll() {
+  const session = MON.session;
+  if (!session) return;
+  try {
+    const d = await api('/api/monitor/samples?session=' +
+      encodeURIComponent(session) + '&from=' + MON.from);
+    // await 之后必须再认一次会话。服务端是并发处理的，一次采样请求完全可能
+    // 在「停掉这一路、又开了新的一路」之后才回来；照单全收会把旧会话的绝对
+    // 游标（比如 500）写进刚起步的新会话，新曲线于是空白几百个采样点，
+    // 旧点还会被接到新序列后面。
+    if (MON.session !== session) return;
+    MON.from = d.from;
+    if (d.points.length) {
+      MON.points = MON.points.concat(d.points).slice(-MON_MAX_POINTS);
+      const last = MON.points[MON.points.length - 1];
+      $('monrx').textContent = last.rx_mbps.toFixed(1) + ' Mbps';
+      $('montx').textContent = last.tx_mbps.toFixed(1) + ' Mbps';
+      const rx = MON.points.map((p) => p.rx_mbps);
+      const avg = rx.reduce((a, b) => a + b, 0) / rx.length;
+      $('monstat').textContent = avg.toFixed(1) + ' / ' + Math.max.apply(null, rx).toFixed(1) +
+        ' Mbps（最近 ' + rx.length + ' 点，' + hhmmss(Math.round(last.t - MON.points[0].t)) + '）';
+      drawChart();
+    }
+    if (d.error) say($('monmsg'), d.error, 'bad');
+    // 采样线程自己收摊了（网卡名错、辅测机掉线……）也要回收服务端那条会话，
+    // 否则每次失败都在会话表里留一条永远不会被清掉的记录。
+    if (!d.running) {
+      monFinish('采样已停止。', d.error ? 'bad' : 'info');
+      try { await api('/api/monitor/stop', { session }); } catch (e) { /* 已经没了 */ }
+    }
+  } catch (e) {
+    // 同理：迟到的失败也只能作用在它自己那一路上。
+    if (MON.session !== session) return;
+    monFinish('监控中断：' + e.message, 'bad');
+  }
+}
+
+$('monside').onchange = () => { fillMonitorIfaces(); applyIntervalLimit(); };
+
+$('monstart').onclick = async () => {
+  const side = $('monside').value, iface = $('moniface').value;
+  if (!iface) { say($('monmsg'), '先选一块网卡。', 'bad'); return; }
+  try {
+    const d = await api('/api/monitor/start', {
+      side, iface, interval_ms: Number($('moninterval').value) || 1000,
+    });
+    MON = { session: d.session, from: 0, points: [], timer: null };
+    monReset(false);
+    say($('monmsg'), '监控中：' + (side === 'master' ? '本机' : '辅测机') + ' / ' + iface, 'ok');
+    MON.timer = setInterval(monPoll, 1000);
+    monPoll();
+  } catch (e) { say($('monmsg'), e.message, 'bad'); }
+};
+
+$('monstop').onclick = async () => {
+  const session = MON.session;
+  monFinish('已停止。曲线保留在这里，重新开始会清空。');
+  if (session) {
+    try { await api('/api/monitor/stop', { session }); } catch (e) { /* 会话本来就没了 */ }
+  }
+};
+
+window.addEventListener('resize', () => { if (MON.points.length) drawChart(); });
+
 bootstrap();
+loadLocal();
 </script>
 </body></html>

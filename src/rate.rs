@@ -73,16 +73,24 @@ pub struct LinkPolicy {
 ///
 /// 绝对值优先于百分比：两个都填时按绝对值，不去猜哪个更"新"。
 fn nic_rx_target(profile: &NicProfile, nic: &NicInfo) -> (Option<f64>, Option<String>) {
-    if let Some(absolute) = profile
-        .rx_target_mbps
-        .filter(|value| value.is_finite() && *value > 0.0)
-    {
+    rx_target_from(
+        profile.rx_target_mbps,
+        profile.rx_target_percent,
+        nic,
+        "门限",
+    )
+}
+
+fn rx_target_from(
+    absolute: Option<f64>,
+    percent: Option<f64>,
+    nic: &NicInfo,
+    label: &str,
+) -> (Option<f64>, Option<String>) {
+    if let Some(absolute) = absolute.filter(|value| value.is_finite() && *value > 0.0) {
         return (Some(absolute), None);
     }
-    let Some(percent) = profile
-        .rx_target_percent
-        .filter(|value| value.is_finite() && *value > 0.0)
-    else {
+    let Some(percent) = percent.filter(|value| value.is_finite() && *value > 0.0) else {
         return (None, None);
     };
     if nic.speed_mbps == 0 {
@@ -91,7 +99,7 @@ fn nic_rx_target(profile: &NicProfile, nic: &NicInfo) -> (Option<f64>, Option<St
         return (
             None,
             Some(format!(
-                "接收口 {} 协商速率未知，{percent}% 门限无法换算，本条回退到默认推导",
+                "接收口 {} 协商速率未知，{percent}% {label}无法换算，本条回退到默认推导",
                 nic.name
             )),
         );
@@ -101,7 +109,7 @@ fn nic_rx_target(profile: &NicProfile, nic: &NicInfo) -> (Option<f64>, Option<St
     (
         Some(target),
         Some(format!(
-            "接收口 {} 门限按协商速率换算：{speed:.0}Mbps × {percent}% = {target:.0}Mbps",
+            "接收口 {} {label}按协商速率换算：{speed:.0}Mbps × {percent}% = {target:.0}Mbps",
             nic.name
         )),
     )
@@ -226,6 +234,7 @@ pub fn effective_mode(mode: RateMode, target_mbps: Option<f64>) -> RateMode {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     // 仅测试用到的配置类型；产品码只经由 LinkProfiles 间接接触它们。
     use crate::config::{DirectionalBandwidth, RoleProfile};
@@ -513,9 +522,12 @@ mod tests {
 
         assert_eq!(ceiling("WIFI5G", 2882), Some(2800.0));
         assert_eq!(ceiling("WIFI6G", 5760), Some(2800.0));
+        // 协商值特意不取 574：上限恰好等于 802.11ax 2SS 的 PHY 峰值，
+        // 若拿 574 当输入，「返回配置的上限」和「返回协商速率」两种实现
+        // 都能过这条断言，这个用例就不再有区分力了。
         assert_eq!(
-            ceiling("WIFI2.4G", 574),
-            Some(300.0),
+            ceiling("WIFI2.4G", 286),
+            Some(574.0),
             "2.4GHz 只有 3 个不重叠信道、最多 40MHz，够不到 5G 的档"
         );
 

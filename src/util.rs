@@ -1,6 +1,5 @@
 //! 公共工具：子进程执行(带超时/GBK解码)、日志、时间、iperf3 定位等
 
-#[cfg(test)]
 use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read, Write};
@@ -544,7 +543,10 @@ pub fn log_to_file(path: &Path) {
 /// 之所以不让控制台去 tail `master.log`：那份文件的路径由 `run_master`
 /// 在运行开始时自己创建，界面在点下「开始测试」的那一刻还不知道它叫什么；
 /// 而且 tail 一个正在被追加的文件要处理编码和截断，得不偿失。
-static LOG_MIRROR: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// 用 `VecDeque` 而不是 `Vec`：镜像封顶之后每写一行都要丢掉最早的一行，
+/// `Vec::drain(..1)` 每次要搬 4000 个 `String`（约 96 KB memmove），
+/// 三万行就是 3 GB 的无谓拷贝。`pop_front()` 是 O(1)。
+static LOG_MIRROR: Mutex<VecDeque<String>> = Mutex::new(VecDeque::new());
 /// 已经产生过的总行数（含被裁掉的）。
 ///
 /// 必须和镜像长度分开记：镜像被 `LOG_MIRROR_MAX_LINES` 封顶，用它当游标的话
@@ -562,10 +564,9 @@ pub fn logln(s: &str) {
         }
     }
     if let Ok(mut mirror) = LOG_MIRROR.lock() {
-        mirror.push(s.to_string());
-        if mirror.len() > LOG_MIRROR_MAX_LINES {
-            let overflow = mirror.len() - LOG_MIRROR_MAX_LINES;
-            mirror.drain(..overflow);
+        mirror.push_back(s.to_string());
+        while mirror.len() > LOG_MIRROR_MAX_LINES {
+            mirror.pop_front();
         }
         if let Ok(mut total) = LOG_MIRROR_TOTAL.lock() {
             *total += 1;
@@ -587,7 +588,7 @@ pub fn log_tail_since(from: usize) -> (usize, Vec<String>) {
     // 请求的位置早于镜像起点，说明中间那段已经被裁掉了：从现存最早一行给起，
     // 前端能从返回的绝对序号跳变看出漏了多少。
     let start = from.saturating_sub(first_kept).min(mirror.len());
-    (total, mirror[start..].to_vec())
+    (total, mirror.iter().skip(start).cloned().collect())
 }
 
 /// 清空内存日志镜像。控制台每次开跑前调用，避免上一轮的输出混进来。

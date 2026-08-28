@@ -38,6 +38,21 @@ pub struct MasterOpts {
 }
 
 const LAST_AGENT_FILE: &str = ".cpe_last_agent";
+
+/// 上一次实际连上的辅测机地址；没有记录或记录为空时返回 `None`。
+///
+/// 命令行主控一直在读写它（连上就写、下次回车即用）。控制台此前只经由
+/// `run_master` **写**、从不读，于是每跑完一轮都把地址记住了，下次打开却
+/// 还是一个空输入框。两条路径共用这一个读取口，省得各写一份 trim 逻辑。
+pub fn last_agent_host() -> Option<String> {
+    last_agent_host_at(Path::new(LAST_AGENT_FILE))
+}
+
+fn last_agent_host_at(path: &Path) -> Option<String> {
+    let host = std::fs::read_to_string(path).ok()?;
+    let host = host.trim().to_string();
+    (!host.is_empty()).then_some(host)
+}
 const IPERF_PREFLIGHT_FAILED: &str = "IPERF_PREFLIGHT_FAILED";
 const CTS_PREFLIGHT_FAILED: &str = "CTSTRAFFIC_PREFLIGHT_FAILED";
 const RUNS_DIR: &str = "runs";
@@ -136,12 +151,9 @@ pub fn run_master(opts: MasterOpts) -> i32 {
     // ---- 确定辅测机地址 ----
     let mut agent_host = cfg.agent_host.trim().to_string();
     if agent_host.is_empty() {
-        if let Ok(last) = std::fs::read_to_string(LAST_AGENT_FILE) {
-            let last = last.trim().to_string();
-            if !last.is_empty() {
-                let inp = ask(&format!("请输入辅测机 IP (回车={last}): "));
-                agent_host = if inp.is_empty() { last } else { inp };
-            }
+        if let Some(last) = last_agent_host() {
+            let inp = ask(&format!("请输入辅测机 IP (回车={last}): "));
+            agent_host = if inp.is_empty() { last } else { inp };
         }
         while agent_host.is_empty() {
             agent_host = ask("请输入辅测机 IP (辅测机 agent 窗口里显示的地址): ");
@@ -463,11 +475,10 @@ pub fn run_master(opts: MasterOpts) -> i32 {
     }
 
     logln(&format!(
-        "\n========== 全部完成 ==========\n单元总数: {}  PASS: {}  FAIL: {}  UNSTABLE: {}  MEASURED: {}  NOT_EVALUATED: {}  SETUP_ERROR: {}  跳过: {}  最终清理错误: {}  耗时: {}",
+        "\n========== 全部完成 ==========\n单元总数: {}  PASS: {}  FAIL: {}  MEASURED: {}  NOT_EVALUATED: {}  SETUP_ERROR: {}  跳过: {}  最终清理错误: {}  耗时: {}",
         sum.pass + sum.fail + sum.measured + sum.skip,
         sum.pass,
         sum.fail,
-        sum.unstable,
         sum.measured,
         sum.not_evaluated,
         sum.setup_error,
@@ -895,6 +906,10 @@ fn generate_specs_from_pairs(
             .as_ref()
             .and_then(|p| p.rate_targets_mbps.clone())
             .unwrap_or_default();
+        let rate_targets_bidir = default_params
+            .as_ref()
+            .and_then(|p| p.rate_targets_bidir_mbps.clone())
+            .unwrap_or_default();
 
         out.push(SpecNorm {
             name: format!("{}<->{}", p.master, p.agent),
@@ -917,6 +932,7 @@ fn generate_specs_from_pairs(
             udp_limit: cfg.limit_udp_by_link_speed,
             rate_mode,
             rate_targets,
+            rate_targets_bidir,
             rate_check: cfg.iperf.rate_check.clone(),
             link_profiles: cfg.link_profiles.clone(),
             ctstraffic: cfg.ctstraffic.clone(),
@@ -1143,6 +1159,9 @@ fn spec_from_params(
         udp_limit: p.udp_limit,
         rate_mode: cfg.iperf.rate_check.mode,
         rate_targets: cfg.iperf.rate_check.targets_mbps.clone(),
+        // 双向门限按配对配置，这条「全局参数」兜底路径没有配对上下文；
+        // 需要它的场景走 pairs / tests。
+        rate_targets_bidir: crate::config::RateTargets::default(),
         rate_check: cfg.iperf.rate_check.clone(),
         link_profiles: cfg.link_profiles.clone(),
         ctstraffic: cfg.ctstraffic.clone(),
@@ -1246,6 +1265,34 @@ mod tests {
     use crate::config::RateMode;
     use crate::master::builder::{CtsTrafficTask, IperfTask, Leg, PingPurpose, PingTask};
     use crate::protocol::NicInfo;
+
+    /// 空文件、只有空白、以及带换行的正常记录都要给出正确答案——
+    /// 控制台拿它预填输入框，返回一个空串会让「已记住」看起来像「没记住」。
+    #[test]
+    fn the_remembered_agent_host_ignores_missing_and_blank_records() {
+        // 固定目录名会在并发 cargo test 之间撞车（两个 checkout、CI 矩阵、
+        // 或者共用 /tmp 的两个用户）：一边 remove_dir_all 另一边正在写。
+        let dir = std::env::temp_dir().join(format!(
+            "cpe_last_agent_test_{}_{}",
+            std::process::id(),
+            now_compact()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+
+        let missing = dir.join("absent");
+        let _ = std::fs::remove_file(&missing);
+        assert_eq!(last_agent_host_at(&missing), None);
+
+        let blank = dir.join("blank");
+        std::fs::write(&blank, "  \n\t ").unwrap();
+        assert_eq!(last_agent_host_at(&blank), None, "只有空白等于没记录");
+
+        let real = dir.join("real");
+        std::fs::write(&real, "192.168.8.101\n").unwrap();
+        assert_eq!(last_agent_host_at(&real), Some("192.168.8.101".into()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn run_paths_keep_report_log_and_artifacts_in_one_unique_directory() {

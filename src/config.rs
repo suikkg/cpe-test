@@ -102,6 +102,20 @@ pub struct UniversalParams {
     /// 双向可分别配置 ab/ba；单向可用 forward。
     #[serde(default)]
     pub rate_targets_mbps: Option<RateTargets>,
+    /// **双向并发**单元专用的接收门限，按方向分别配置（`ab` / `ba`）。
+    ///
+    /// 半双工介质上，双向同时灌包时两个方向抢同一段介质时间，每个方向拿到的
+    /// 只有单向时的一部分——拿单向门限去卡双向必然判 `RATE_FAIL`，而那是配置
+    /// 出来的失败，不是测出来的。
+    ///
+    /// **按配对而不是按网卡**：同一块 RNDIS 口，和 Wi-Fi 组双向、和 SGMII 组
+    /// 双向，能拿到的接收速率完全不是一个量级；门限挂在网卡上只能填一个数，
+    /// 必然有一组是错的。受限的是这条链路，不是某一端的网卡。
+    ///
+    /// 留空 = 双向也走既有的兜底链（单口覆盖 → `rate_targets_mbps` → 内置推导），
+    /// 老配置行为不变。
+    #[serde(default)]
+    pub rate_targets_bidir_mbps: Option<RateTargets>,
 }
 
 fn default_agent_bind() -> String {
@@ -255,9 +269,14 @@ pub struct RateCheckCfg {
     /// 2.4GHz Wi-Fi 的负载上限，同样**不跟协商速率**。
     ///
     /// 必须和 5G/6G 分开：2.4GHz 只有 3 个不重叠信道、最多 40MHz 带宽，
-    /// 802.11ax 2SS 的 PHY 峰值也就 574Mbps，可用载荷更低。和 5G 共用 2800
-    /// 等于对 2.4G 口完全不裁剪，灌进去的包必然大部分丢在空口上——那是配置
-    /// 出来的丢包，不是测出来的。
+    /// 和 5G 共用 2800 等于对 2.4G 口完全不裁剪，把 5G 档的 `-b 2.6G` 原样
+    /// 丢给 2.4G 口，包必然大部分丢在空口上——那是配置出来的丢包，不是测出来的。
+    ///
+    /// 默认取 802.11ax 2SS 在 2.4GHz 的 PHY 峰值 574Mbps。**这是一条挡离谱值的线，
+    /// 不是贴近可用载荷的线**：实际可用载荷明显低于 574，所以这个上限不会裁掉
+    /// 正常量级的灌包，只拦住明显超出这个频段物理能力的配置。要按某条链路的
+    /// 实际能力裁，在 `link_profiles` 里给那块网卡明确配 `-b`——明确配过的链路
+    /// 不受本上限影响，那是操作者的判断，安全网不该推翻它。
     pub wifi_24g_payload_ceiling_mbps: f64,
     pub max_udp_loss_pct: Option<f64>,
 }
@@ -281,7 +300,7 @@ impl Default for RateCheckCfg {
             evb_eth_to_usb_target_mbps: 8400.0,
             cpe_path_ceiling_mbps: 2500.0,
             wifi_payload_ceiling_mbps: 2800.0,
-            wifi_24g_payload_ceiling_mbps: 300.0,
+            wifi_24g_payload_ceiling_mbps: 574.0,
             max_udp_loss_pct: None,
         }
     }
@@ -526,6 +545,20 @@ pub struct TestSpec {
     pub rate_mode: Option<RateMode>,
     #[serde(default)]
     pub rate_targets_mbps: Option<RateTargets>,
+    /// **双向并发**单元专用的接收门限，按方向分别配置（`ab` / `ba`）。
+    ///
+    /// 半双工介质上，双向同时灌包时两个方向抢同一段介质时间，每个方向拿到的
+    /// 只有单向时的一部分——拿单向门限去卡双向必然判 `RATE_FAIL`，而那是配置
+    /// 出来的失败，不是测出来的。
+    ///
+    /// **按配对而不是按网卡**：同一块 RNDIS 口，和 Wi-Fi 组双向、和 SGMII 组
+    /// 双向，能拿到的接收速率完全不是一个量级；门限挂在网卡上只能填一个数，
+    /// 必然有一组是错的。受限的是这条链路，不是某一端的网卡。
+    ///
+    /// 留空 = 双向也走既有的兜底链（单口覆盖 → `rate_targets_mbps` → 内置推导），
+    /// 老配置行为不变。
+    #[serde(default)]
+    pub rate_targets_bidir_mbps: Option<RateTargets>,
 }
 
 fn default_direction() -> OneOrMany {

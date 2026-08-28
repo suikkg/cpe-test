@@ -77,7 +77,7 @@
       "cpe_path_ceiling_mbps": 2500,
       "_wifi_ceilings": "WiFi 的负载上限不跟协商速率（那是会来回跳的 PHY 速率）。5G/6G 用 wifi_payload_ceiling_mbps，2.4G 单列 wifi_24g_payload_ceiling_mbps——2.4GHz 只有 3 个不重叠信道、最多 40MHz，够不到 5G 的档。频段没识别出来的 WIFI 按 5G 档处理。",
       "wifi_payload_ceiling_mbps": 2800,
-      "wifi_24g_payload_ceiling_mbps": 300,
+      "wifi_24g_payload_ceiling_mbps": 574,
       "max_udp_loss_pct": null
     }
   },
@@ -110,6 +110,11 @@
     "iperf_duration": 180,
     "rate_mode": "auto",
     "rate_targets_mbps": {
+      "forward": null,
+      "ab": null,
+      "ba": null
+    },
+    "rate_targets_bidir_mbps": {
       "forward": null,
       "ab": null,
       "ba": null

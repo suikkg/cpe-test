@@ -260,7 +260,7 @@ fn group_execution_status(group: &UnitGroup<'_>) -> ExecutionStatus {
 fn unit_open_by_default(verdict: Verdict) -> bool {
     matches!(
         verdict,
-        Verdict::RateFail | Verdict::Unstable | Verdict::NotEvaluated | Verdict::SetupError
+        Verdict::RateFail | Verdict::NotEvaluated | Verdict::SetupError
     )
 }
 
@@ -705,6 +705,21 @@ fn validate_rate_reason(
             ),
             _ => metric_reason_mismatch(code, "缺少 RX-P10 或目标，无法核对该判定"),
         },
+        // RX_DROPOUT 的成立条件是「平均达标 **且** P10 达标，但有完整 5 秒窗口掉下去」
+        // （见 rate_window::rate_verdict）。掉坑本身靠原因文本里的窗口统计说明，
+        // 这里核对的是那两个前提——它们要是不成立，说明判定和展示的指标对不上。
+        "RX_DROPOUT" => match (rx_avg, rx_p10, target_mbps) {
+            (Some(rx), Some(rx_p10), Some(target)) if rx >= target && rx_p10 >= target => {
+                reason.to_string()
+            }
+            (Some(rx), Some(rx_p10), Some(target)) => metric_reason_mismatch(
+                code,
+                &format!(
+                    "要求 RX 平均与 RX-P10 都 >= 目标；当前为 {rx:.3}/{rx_p10:.3}/{target:.3} Mbps"
+                ),
+            ),
+            _ => metric_reason_mismatch(code, "缺少 RX 平均、RX-P10 或目标，无法核对该判定"),
+        },
         "RX_UNSTABLE" => match (rx_avg, rx_p10, target_mbps) {
             (Some(rx), Some(rx_p10), Some(target)) if rx >= target && rx_p10 < target => format!(
                 "RX_UNSTABLE: RX 平均 {rx:.3} Mbps >= 目标 {target:.3} Mbps，RX-P10 {rx_p10:.3} Mbps < 目标 {target:.3} Mbps"
@@ -959,6 +974,32 @@ fn parse_iperf_size(value: &str) -> Option<u64> {
 
 fn diagnostic_item(h: &mut String, label: &str, value: &str) {
     h.push_str(&format!("<dt>{}</dt><dd>{}</dd>", esc(label), esc(value)));
+}
+
+/// 内嵌进报告的单段原始输出上限（字符）。
+///
+/// 一条 `-P 8 -i 1 -t 180` 的 iperf3 流会打出一千多行；一次 120 单元的运行
+/// 把每条流的 client + server 输出全文内嵌，单个 HTML 能涨到几十 MB。
+/// 而**同一份文本已经作为 `raw_log` 单独落盘**并在上面给了链接——
+/// 内嵌这一份是给「点开就看」用的，不是存档。
+const EMBEDDED_RAW_MAX_CHARS: usize = 20_000;
+
+/// 超长的原始输出取头尾两段。
+///
+/// 掐头去尾而不是只留开头：iperf3 和 ctsTraffic 的**汇总行在最后**，
+/// 而那正是最常要看的一段；只留开头等于把结论截掉。
+fn embedded_raw(text: &str) -> String {
+    let total = text.chars().count();
+    if total <= EMBEDDED_RAW_MAX_CHARS {
+        return text.to_string();
+    }
+    let keep = EMBEDDED_RAW_MAX_CHARS / 2;
+    let head: String = text.chars().take(keep).collect();
+    let tail: String = text.chars().skip(total - keep).collect();
+    format!(
+        "{head}\n\n……（中间省略 {} 个字符；完整内容见上方「独立原始记录」链接）……\n\n{tail}",
+        total - keep * 2
+    )
 }
 
 fn raw_anchor(row: &Row) -> String {
@@ -1465,10 +1506,6 @@ pub fn write_report(path: &Path, rows: &mut [Row], meta: &ReportMeta) -> std::io
         .iter()
         .filter(|group| group_verdict(group) == Verdict::RateFail)
         .count();
-    let unstable = groups
-        .iter()
-        .filter(|group| group_verdict(group) == Verdict::Unstable)
-        .count();
     let measured = groups
         .iter()
         .filter(|group| group_verdict(group) == Verdict::Measured)
@@ -1485,7 +1522,10 @@ pub fn write_report(path: &Path, rows: &mut [Row], meta: &ReportMeta) -> std::io
         .iter()
         .filter(|group| group_verdict(group) == Verdict::Skip)
         .count();
-    let judged = pass + rate_fail + unstable;
+    // UNSTABLE 已经不再产出（掉速统一归 RATE_FAIL，靠原因码区分严重程度），
+    // 概览里那格恒为 0 的统计块跟着一起删了——一格永远是 0 的指标会被读成
+    // 「这轮没有不稳定的」，而实际上是「这个分类已经不存在了」。
+    let judged = pass + rate_fail;
     let rate = if judged > 0 {
         pass as f64 * 100.0 / judged as f64
     } else {
@@ -1710,7 +1750,7 @@ summary:focus-visible, a:focus-visible, .table-scroll:focus-visible, .overview-s
         esc(&meta.finished)
     ));
     h.push_str(&format!(
-        "<div class=\"summary-grid\"><div class=\"stat neutral\"><span class=\"stat-label\">测试单元</span><strong class=\"stat-value\">{total}</strong></div><div class=\"stat pass\"><span class=\"stat-label\">PASS</span><strong class=\"stat-value\">{pass}</strong></div><div class=\"stat fail\"><span class=\"stat-label\">RATE_FAIL</span><strong class=\"stat-value\">{rate_fail}</strong></div><div class=\"stat neutral\"><span class=\"stat-label\">UNSTABLE</span><strong class=\"stat-value\">{unstable}</strong></div><div class=\"stat measured\"><span class=\"stat-label\">MEASURED</span><strong class=\"stat-value\">{measured}</strong></div><div class=\"stat neutral\"><span class=\"stat-label\">SETUP_ERROR</span><strong class=\"stat-value\">{setup_error}</strong></div><div class=\"stat neutral\"><span class=\"stat-label\">耗时</span><strong class=\"stat-value\">{}</strong></div></div>\n",
+        "<div class=\"summary-grid\"><div class=\"stat neutral\"><span class=\"stat-label\">测试单元</span><strong class=\"stat-value\">{total}</strong></div><div class=\"stat pass\"><span class=\"stat-label\">PASS</span><strong class=\"stat-value\">{pass}</strong></div><div class=\"stat fail\"><span class=\"stat-label\">RATE_FAIL</span><strong class=\"stat-value\">{rate_fail}</strong></div><div class=\"stat measured\"><span class=\"stat-label\">MEASURED</span><strong class=\"stat-value\">{measured}</strong></div><div class=\"stat neutral\"><span class=\"stat-label\">SETUP_ERROR</span><strong class=\"stat-value\">{setup_error}</strong></div><div class=\"stat neutral\"><span class=\"stat-label\">耗时</span><strong class=\"stat-value\">{}</strong></div></div>\n",
         esc(&meta.elapsed)
     ));
     h.push_str(&format!(
@@ -1792,7 +1832,7 @@ summary:focus-visible, a:focus-visible, .table-scroll:focus-visible, .overview-s
             h.push_str(&format!(
                 "<h3>{}</h3><pre>{}</pre>\n",
                 esc(title),
-                esc(text)
+                esc(&embedded_raw(text))
             ));
         }
         h.push_str("</details>\n");
@@ -1804,6 +1844,29 @@ summary:focus-visible, a:focus-visible, .table-scroll:focus-visible, .overview-s
 
 #[cfg(test)]
 mod tests {
+    /// 超长原始输出要掐头去尾，而不是只留开头。
+    ///
+    /// iperf3 / ctsTraffic 的汇总行在**最后**，只留开头等于把结论截掉。
+    /// 同一份文本已经作为 raw_log 单独落盘，内嵌这份是给「点开就看」用的。
+    #[test]
+    fn an_oversized_raw_segment_keeps_both_ends() {
+        let short = "一切正常";
+        assert_eq!(super::embedded_raw(short), short, "没超限的原样保留");
+
+        let body = "x".repeat(super::EMBEDDED_RAW_MAX_CHARS * 2);
+        let text = format!("开头标记\n{body}\n结尾汇总行 receiver");
+        let trimmed = super::embedded_raw(&text);
+
+        assert!(trimmed.chars().count() < text.chars().count(), "必须变短");
+        assert!(trimmed.starts_with("开头标记"), "开头要留");
+        assert!(
+            trimmed.ends_with("结尾汇总行 receiver"),
+            "结尾的汇总行必须留住，那才是最常要看的一段"
+        );
+        assert!(trimmed.contains("中间省略"), "省略要说出来");
+        assert!(trimmed.contains("独立原始记录"), "要指向完整那份");
+    }
+
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

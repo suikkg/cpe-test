@@ -135,7 +135,7 @@ pub struct AgentState {
 /// 启动 agent（阻塞不返回）。
 ///
 /// `ui_port` 为 `None` 时不起本机状态页（`--no-ui`）。
-pub fn run(port: u16, cfg: &Config, ui_port: Option<u16>) {
+pub fn run(port: u16, cfg: &Config, ui_port: Option<u16>, ui_bind: &str) {
     // P0: agent 也必须安装 Ctrl+C 处理器，否则无法优雅退出/清理。
     crate::cancel::setup_cancel_handler();
     println!("==============================================");
@@ -228,7 +228,14 @@ pub fn run(port: u16, cfg: &Config, ui_port: Option<u16>) {
     });
 
     if let Some(ui_port) = ui_port {
-        crate::agent::webui::spawn(ui_port, &bind_addr, port, token_configured, &activity);
+        crate::agent::webui::spawn(
+            ui_bind,
+            ui_port,
+            &bind_addr,
+            port,
+            token_configured,
+            &activity,
+        );
     }
 
     for _ in 0..WORKERS {

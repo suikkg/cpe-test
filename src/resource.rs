@@ -287,6 +287,66 @@ impl ResourceInventory for InMemoryResourceInventory {
 
 #[cfg(test)]
 mod tests {
+    /// 用**真** manager 跑一遍生产实现。
+    ///
+    /// 这个文件里其余的并发/故障用例打的都是 `InMemoryResourceInventory`——
+    /// 一个手写的生命周期模型。它证明的是模型自洽，不是 `AgentResourceInventory`
+    /// 正确：清理顺序写错、`stop_owner` 的 wait 传错，那些用例照样全绿。
+    /// 在这次审查之前，`AgentResourceInventory::new` 在测试里一次都没有被构造过。
+    ///
+    /// server/client 要真起进程，CI 上不保证有 iperf3，所以这里只覆盖 monitor
+    /// 这条腿——它能用注入的计数器读取器跑，而且足以钉住「委托对不对」
+    /// 和「owner 范围对不对」这两件事。
+    #[test]
+    fn the_production_inventory_delegates_and_stays_owner_scoped() {
+        use crate::clock::{MonotonicClock, SystemClock};
+        use crate::nic::counter::FnNicCounterReader;
+        use std::sync::Arc;
+
+        let servers = IperfServerMgr::new();
+        let clients = IperfClientJobMgr::new();
+        let monitors = MonitorMgr::with_dependencies(
+            Arc::new(SystemClock) as Arc<dyn MonotonicClock>,
+            Arc::new(FnNicCounterReader::new(|_: &str| Ok((1_000, 2_000)))),
+        );
+
+        let mine = monitors
+            .start_owned("fake0", 1_000, "owner-mine", 60)
+            .expect("起监控");
+        let theirs = monitors
+            .start_owned("fake0", 1_000, "owner-theirs", 60)
+            .expect("起监控");
+
+        let inventory = AgentResourceInventory::new(&clients, &servers, &monitors);
+
+        let listed = inventory.list_owner("owner-mine");
+        assert_eq!(listed.len(), 1, "自己的资源要列得出来");
+        assert_eq!(listed[0].kind, ResourceKind::Monitor);
+        assert_eq!(listed[0].id, mine);
+
+        let out = inventory.cleanup_owner("owner-mine", Duration::from_secs(2));
+        assert_eq!(out.monitors, 1, "monitor 要真的被停掉并计数");
+        assert!(out.errors.is_empty(), "{:?}", out.errors);
+
+        assert!(
+            inventory.list_owner("owner-mine").is_empty(),
+            "清理完不能再列出来"
+        );
+        assert_eq!(
+            inventory.list_owner("owner-theirs").len(),
+            1,
+            "别的 owner 的资源一根汗毛都不能动"
+        );
+        assert!(monitors.status(&theirs).is_ok(), "别的 owner 还得能查状态");
+
+        // 幂等：再清一次不能报错，也不能把别人的算进去。
+        let again = inventory.cleanup_owner("owner-mine", Duration::from_secs(2));
+        assert_eq!(again.monitors, 0);
+        assert!(again.errors.is_empty(), "{:?}", again.errors);
+
+        let _ = monitors.stop(&theirs);
+    }
+
     use super::*;
     use std::sync::{Arc, Barrier};
 

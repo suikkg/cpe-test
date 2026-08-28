@@ -20,8 +20,23 @@ pub struct IpcfgAdapter {
 
 #[cfg(windows)]
 pub fn scan() -> Vec<IpcfgAdapter> {
+    scan_with_aliases(&[])
+}
+
+/// 扫描并允许调用方提供一份**已知接口别名**。
+///
+/// `adapter_name()` 原本只认中文「适配器 」和英文「 adapter 」两种写法。
+/// 德语是 `Ethernet-Adapter`（没有前导空格）、日语是 `アダプター`、
+/// 法语是 `Carte`——三者都识别不出来，而 `scan_all()` 的主循环挂在这份结果上，
+/// 于是非中英文 Windows 上一块网卡都扫不到，屏幕上只有一句「没有扫到网卡」。
+///
+/// `GetIfTable2` 是语言无关的，它给得出每块网卡的别名，而 ipconfig 的适配器
+/// 标题行正是以那个别名结尾。把别名传进来做兜底匹配，就不再依赖任何一种
+/// 界面语言的措辞。
+#[cfg(windows)]
+pub fn scan_with_aliases(known_aliases: &[String]) -> Vec<IpcfgAdapter> {
     let out = run_cmd("ipconfig", &["/all"], Duration::from_secs(20));
-    parse(&out.merged())
+    parse_with_aliases(&out.merged(), known_aliases)
 }
 
 /// 头部形如：
@@ -30,6 +45,10 @@ pub fn scan() -> Vec<IpcfgAdapter> {
 ///   `   IPv4 地址 . . . . . . . . . . . . : 192.168.1.2(首选)`
 ///   `   本地链接 IPv6 地址. . . . . . . . : fe80::c4b:1234%12(首选)`
 pub fn parse(text: &str) -> Vec<IpcfgAdapter> {
+    parse_with_aliases(text, &[])
+}
+
+pub fn parse_with_aliases(text: &str, known_aliases: &[String]) -> Vec<IpcfgAdapter> {
     let field_re = Regex::new(r"^\s{2,}(.+?)[\s.]*:\s*(.*)$").expect("regex");
     let mut out: Vec<IpcfgAdapter> = Vec::new();
     let mut cur: Option<IpcfgAdapter> = None;
@@ -43,7 +62,7 @@ pub fn parse(text: &str) -> Vec<IpcfgAdapter> {
                 out.push(a);
             }
             let head = lt.trim_end_matches(':').trim();
-            if let Some(name) = adapter_name(head) {
+            if let Some(name) = adapter_name(head, known_aliases) {
                 cur = Some(IpcfgAdapter {
                     name,
                     ..Default::default()
@@ -101,24 +120,34 @@ pub fn parse(text: &str) -> Vec<IpcfgAdapter> {
     out
 }
 
-/// 从头部行提取适配器名
-fn adapter_name(head: &str) -> Option<String> {
+/// 从头部行提取适配器名。
+///
+/// 先按措辞找（中文「适配器 」/ 英文「 adapter 」/ 德语「-adapter 」），
+/// 找不到再拿 `GetIfTable2` 给的别名兜底——标题行以别名结尾，这条路径
+/// 不依赖任何界面语言。两者都不中就返回 `None`。
+fn adapter_name(head: &str, known_aliases: &[String]) -> Option<String> {
     if let Some(idx) = head.find("适配器 ") {
-        let name = &head[idx + "适配器 ".len()..];
-        let n = name.trim();
-        if !n.is_empty() {
-            return Some(n.to_string());
+        let name = head[idx + "适配器 ".len()..].trim();
+        if !name.is_empty() {
+            return Some(name.to_string());
         }
     }
     let low = head.to_lowercase();
-    if let Some(idx) = low.find(" adapter ") {
-        let name = &head[idx + " adapter ".len()..];
-        let n = name.trim();
-        if !n.is_empty() {
-            return Some(n.to_string());
+    // 德语把连字符当分隔符（`Ethernet-Adapter Ethernet`），所以不能只认前导空格。
+    for marker in [" adapter ", "-adapter "] {
+        if let Some(idx) = low.find(marker) {
+            let name = head[idx + marker.len()..].trim();
+            if !name.is_empty() {
+                return Some(name.to_string());
+            }
         }
     }
-    None
+    // 兜底：标题行以接口别名结尾。取最长匹配，避免「以太网」把「以太网 6」截断。
+    known_aliases
+        .iter()
+        .filter(|alias| !alias.is_empty() && head.ends_with(alias.as_str()))
+        .max_by_key(|alias| alias.len())
+        .map(|alias| alias.to_string())
 }
 
 fn strip_paren(v: &str) -> String {
@@ -132,6 +161,62 @@ fn looks_ipv4(v: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// 非中英文 Windows 上，适配器标题行的措辞一个都对不上。
+    ///
+    /// `scan_all()` 的主循环挂在这份解析结果上，所以「一条都认不出来」
+    /// 等于「一块网卡都扫不到」，而屏幕上只有一句「没有扫到网卡」——
+    /// 没有任何线索指向语言。别名来自 GetIfTable2，它不受界面语言影响。
+    #[test]
+    fn adapter_headers_in_other_locales_are_recognised_by_interface_alias() {
+        let japanese = "\
+イーサネット アダプター イーサネット 2:
+
+   IPv4 アドレス . . . . . . . . . . . .: 192.168.8.20(優先)
+";
+        assert!(
+            parse(japanese).is_empty(),
+            "措辞路径本来就认不出日语，这条用例的前提是它认不出"
+        );
+
+        let aliases = vec!["イーサネット 2".to_string(), "Wi-Fi".to_string()];
+        let parsed = parse_with_aliases(japanese, &aliases);
+        assert_eq!(parsed.len(), 1, "别名兜底必须认出来");
+        assert_eq!(parsed[0].name, "イーサネット 2");
+        assert_eq!(parsed[0].ipv4.as_deref(), Some("192.168.8.20"));
+    }
+
+    /// 德语用连字符连接（`Ethernet-Adapter`），没有前导空格，
+    /// 所以只认 `" adapter "` 的写法会漏掉它。
+    #[test]
+    fn a_hyphenated_german_adapter_header_is_recognised_without_any_alias_hint() {
+        let german = "\
+Ethernet-Adapter Ethernet:
+
+   IPv4-Adresse  . . . . . . . . . . : 192.168.8.30(Bevorzugt)
+";
+        let parsed = parse(german);
+        assert_eq!(parsed.len(), 1, "德语写法要能直接认出来");
+        assert_eq!(parsed[0].name, "Ethernet");
+        assert_eq!(parsed[0].ipv4.as_deref(), Some("192.168.8.30"));
+    }
+
+    /// 别名兜底要取最长匹配，否则「以太网」会把「以太网 6」截断成另一块网卡。
+    #[test]
+    fn the_alias_fallback_prefers_the_longest_match() {
+        let text = "\
+以太网适配器 以太网 6:
+
+   IPv4 地址 . . . . . . . . . . . . : 192.168.8.40(首选)
+";
+        let aliases = vec!["以太网".to_string(), "以太网 6".to_string()];
+        let parsed = parse_with_aliases(text, &aliases);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(
+            parsed[0].name, "以太网 6",
+            "中文措辞本来就能认出全名，别名兜底不能把它改短"
+        );
+    }
+
     use super::*;
 
     const SAMPLE_CN: &str = r#"
