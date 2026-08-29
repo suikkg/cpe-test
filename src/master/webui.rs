@@ -6026,7 +6026,14 @@ mod tests {
                 handle(request, &worker);
             }
         });
-        let wait = Duration::from_secs(5);
+        // 预算必须大于**被测端点自己允许的耗时**，否则这条测试迟早会因为
+        // 环境慢而不是闸门坏而红。`/api/local` 带对口令那一发会真的去扫本机：
+        // Windows 上 `ipconfig /all` 允许 20s、每块 Wi-Fi 卡的 `netsh` 10s、
+        // `iperf3 --version` 8s，加起来远超原来写的 5s——之前一直绿只是因为
+        // CI 机器上没有 iperf3、扫描又快，5s 侥幸够用。Windows runner 上并行
+        // 跑测试把扫描拖过 5s 时，它就报成「读头失败 (os error 10060)」，
+        // 看起来像闸门坏了。这里给的是超时上限，正常路径仍然是毫秒级返回。
+        let wait = Duration::from_secs(60);
 
         let (status, _) = crate::http_client::get("127.0.0.1", port, "/", wait).unwrap();
         assert_eq!(status, 401, "页面本身也必须要口令");
