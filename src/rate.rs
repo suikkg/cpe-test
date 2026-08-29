@@ -12,7 +12,12 @@ pub fn nic_payload_ceiling_mbps(nic: &NicInfo, cfg: &RateCheckCfg) -> Option<f64
     let negotiated = (nic.speed_mbps > 0).then_some(nic.speed_mbps as f64);
     let cap = match role.as_str() {
         "SGMII1G" => Some(1000.0),
-        "SGMII2.5G" | "RNDIS" => Some(cfg.cpe_path_ceiling_mbps),
+        "SGMII2.5G" => Some(cfg.cpe_path_ceiling_mbps),
+        // RNDIS 跟协商速率：那块口报什么就按什么裁（实测 3700）。它和下面的
+        // 10GUSB 不一样——10GUSB(NCM) 报的 4.2G 是已知的驱动显示问题，
+        // 而 RNDIS 报的值是可用的。跟协商速率的代价是「驱动报错了就裁错了」，
+        // 收益是不必为每种 USB 网卡在这张表里各钉一个数。
+        "RNDIS" => negotiated,
         // WiFi 不跟协商速率：那是 PHY 速率，会在一轮测试里反复跳
         // （同一块 Wi-Fi 7 网卡 2402 / 2882 来回），拿它裁 -b 会让相邻两个
         // 单元的灌包强度都不一样。固定档位才能横向比较。
@@ -399,19 +404,39 @@ mod tests {
         );
     }
 
+    /// 每种口的裁剪上限，逐条钉住。这张表是「按链路上限裁剪」勾上之后
+    /// 唯一决定灌多猛的东西，改动必须是明确的，不能被某次重构顺手带偏。
     #[test]
     fn test_cpe_path_ceiling() {
         let cfg = RateCheckCfg::default();
+        // 10GUSB(NCM) 报的 4.2G 是驱动显示问题，按 10G 算；这条路径的瓶颈
+        // 因此落在对端 SGMII2.5G 的 2600 上。
         assert_eq!(
             path_payload_ceiling_mbps(&nic("10GUSB", 4200), &nic("SGMII2.5G", 2500), &cfg),
-            Some(2500.0)
+            Some(2600.0)
         );
+        // RNDIS 跟协商速率：3700 就是 3700，不再压到 CPE 子网那档。
         assert_eq!(
             path_payload_ceiling_mbps(&nic("RNDIS", 3700), &nic("10GETH", 10000), &cfg),
-            Some(2500.0)
+            Some(3700.0)
         );
         assert_eq!(
             path_payload_ceiling_mbps(&nic("SGMII1G", 1000), &nic("10GETH", 10000), &cfg),
+            Some(1000.0)
+        );
+        assert_eq!(
+            path_payload_ceiling_mbps(&nic("10GETH", 10000), &nic("10GUSB", 4200), &cfg),
+            Some(10_000.0)
+        );
+        // SGMII2.5G 的上限恰好容得下这类口的常规档位 -b 2.6G，
+        // 和 Wi-Fi 那档 2800 是同一个用意。
+        assert_eq!(
+            path_payload_ceiling_mbps(&nic("SGMII2.5G", 2500), &nic("10GETH", 10000), &cfg),
+            Some(2600.0)
+        );
+        // 协商速率读不出来时退回对端，而不是当成 0 把这条腿裁没。
+        assert_eq!(
+            path_payload_ceiling_mbps(&nic("RNDIS", 0), &nic("SGMII1G", 1000), &cfg),
             Some(1000.0)
         );
     }

@@ -4804,14 +4804,18 @@ impl Ctx {
                     "UDP_LOSS_DATA_MISSING".to_string(),
                     "已配置 UDP 丢包门槛，但 iperf3 输出缺少 lost/total 数据".to_string(),
                 )
-            } else if !tx_sufficient {
+            } else if !tx_sufficient
+                && offered_shortfall_explains_rx(rx_stats.avg_mbps, tx_stats.p10_mbps)
+            {
                 (
                     Verdict::NotEvaluated,
                     "OFFERED_LOAD_LOW".to_string(),
                     format!(
-                        "TX-P10 {}，验证目标所需负载至少 {}",
+                        "TX-P10 {}，验证目标所需负载至少 {}；接收端 {} 基本等于发出的量，\
+                         无法判断被测设备还能不能再多送",
                         fmt_opt(tx_stats.p10_mbps),
-                        fmt_opt(offered_floor)
+                        fmt_opt(offered_floor),
+                        fmt_opt(rx_stats.avg_mbps)
                     ),
                 )
             } else if !rx_meets_target {
@@ -4832,11 +4836,24 @@ impl Ctx {
                         format!("平均速率达到目标，但{detail}"),
                     )
                 } else {
+                    // 没灌够却仍然判 FAIL 时，把理由说全：不然读报告的人会
+                    // 拿「TX 没到门限+余量」来质疑这个结论。
+                    let offered_note = if tx_sufficient {
+                        String::new()
+                    } else {
+                        format!(
+                            "（发送端 TX-P10 {} 未达目标+余量 {}，但接收端只有 {}，\
+                             缺口远大于发送端少灌的部分，补足负载也补不回来）",
+                            fmt_opt(tx_stats.p10_mbps),
+                            fmt_opt(offered_floor),
+                            fmt_opt(rx_stats.avg_mbps)
+                        )
+                    };
                     (
                         Verdict::RateFail,
                         "RX_BELOW_TARGET".to_string(),
                         format!(
-                            "RX平均 {} 低于目标 {}Mbps",
+                            "RX平均 {} 低于目标 {}Mbps{offered_note}",
                             fmt_opt(rx_stats.avg_mbps),
                             target
                         ),
@@ -5852,6 +5869,33 @@ fn zero_udp_stream_verdict(requested: usize, attempts_exhausted: bool) -> Verdic
     }
 }
 
+/// 接收端跟得上发送端的判据：收到的至少是发出的这个比例。
+///
+/// 和 `offered_headroom_pct` 无关，也不该跟着它走：那个说的是「要判达标，
+/// 得比门限多灌多少」，这个说的是「这条路径有没有在丢东西」。
+const RX_TRACKS_TX_RATIO: f64 = 0.95;
+
+/// 发送端没灌够时，接收端的缺口能不能用「灌得不够」解释。
+///
+/// 能解释才是真的判不了。举两个例子，门限都是 1000：
+///
+/// - 灌 1000 收 990：收到的几乎就是发出的全部，被测设备还能不能再多送 10
+///   是未知数——必须把发送量补到门限+余量再测一次，这时 `OFFERED_LOAD_LOW`
+///   是对的。
+/// - 灌 1000 收 580：路径已经丢掉 42%，而发送端的缺口只有 50。把发送量补到
+///   1050 也补不出这 420，**FAIL 在这一轮就已经成立**。此时还报「判不了」
+///   等于把一个确凿的不达标藏起来。
+///
+/// 少一边数据时保守返回 true（维持判不了）：没有对照就没有结论。
+fn offered_shortfall_explains_rx(rx_avg: Option<f64>, tx_p10: Option<f64>) -> bool {
+    match (rx_avg, tx_p10) {
+        (Some(rx), Some(tx)) if tx.is_finite() && tx > 0.0 && rx.is_finite() => {
+            rx >= tx * RX_TRACKS_TX_RATIO
+        }
+        _ => true,
+    }
+}
+
 fn required_udp_streams(
     requested: usize,
     rate_cfg: &RateCheckCfg,
@@ -6764,6 +6808,27 @@ mod tests {
     use super::*;
     // 仅测试用到的采样统计层符号；产品码不需要，放这里避免非测试构建报未用导入。
     use crate::master::builder::{Endpoint, PingPurpose, PingTask};
+
+    /// 「灌得不够」只有在接收端确实跟上了发送端时才叫判不了。
+    ///
+    /// 门限 1000、灌 1000 收 580：路径丢了 42%，而发送端只少灌 50。补足负载
+    /// 也补不回这 420——FAIL 在这一轮就已经成立，报「判不了」等于把一个确凿的
+    /// 不达标藏起来。
+    #[test]
+    fn an_offered_load_shortfall_only_excuses_a_receiver_that_kept_up() {
+        // 收到的几乎就是发出的：设备还能不能再多送是未知数，判不了。
+        assert!(offered_shortfall_explains_rx(Some(990.0), Some(1000.0)));
+        assert!(offered_shortfall_explains_rx(Some(1000.0), Some(1000.0)));
+        // 收到的明显少于发出的：缺口在路径上，和「少灌了 5%」无关。
+        assert!(!offered_shortfall_explains_rx(Some(580.0), Some(1000.0)));
+        assert!(!offered_shortfall_explains_rx(Some(0.5), Some(1000.0)));
+        // 发送端自己就只有 580：那 RX 580 说明不了被测设备的能力。
+        assert!(offered_shortfall_explains_rx(Some(580.0), Some(580.0)));
+        // 少一边数据就没有对照，保守维持「判不了」。
+        assert!(offered_shortfall_explains_rx(None, Some(1000.0)));
+        assert!(offered_shortfall_explains_rx(Some(580.0), None));
+        assert!(offered_shortfall_explains_rx(Some(580.0), Some(0.0)));
+    }
     use crate::master::rate_window::{
         rolling_time_window_series, RateStats, MIN_RATE_SAMPLE_COVERAGE,
     };

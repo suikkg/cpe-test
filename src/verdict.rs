@@ -93,6 +93,31 @@ pub fn is_hard_single_udp_failure(verdict: Verdict, reason_code: &str) -> bool {
     verdict == Verdict::RateFail && HARD_SINGLE_UDP_FAILURE_CODES.contains(&reason_code)
 }
 
+/// 只说明**这条腿自己**判定前提不成立的 `NOT_EVALUATED`。
+///
+/// 它们不该盖住同一单元里另一条腿确凿的 `RATE_FAIL`：负载没配够、缺目标，
+/// 都是这条腿的配置问题，不让另一条腿测出来的数变得可疑。盖住的后果是一个
+/// 真实的不达标从概览里消失——双向单元里 B→A 明明判了 FAIL，单元却显示
+/// 「无法评价」。
+///
+/// 反过来，采样/时间轴类的判不了（覆盖率不足、计数器停滞、有效窗口太短、
+/// 网卡消失）**必须**继续盖住：双向的两条腿跑在同一段时间窗里，那段时间的
+/// 采样塌了，另一条腿的数同样不可信，拿它判 FAIL 就是把环境异常写成 CPE
+/// 性能失败——正是这套判定一直在防的误判方向。
+///
+/// 名单只放"确定安全"的三个，其余一律按老行为盖住：这里放宽一个码，
+/// 对应的就是一批历史上判「无法评价」的单元变成 `RATE_FAIL`。
+pub const LEG_LOCAL_NOT_EVALUATED_CODES: [&str; 3] = [
+    "CONFIGURED_LOAD_TOO_LOW",
+    "OFFERED_LOAD_LOW",
+    "TARGET_MISSING",
+];
+
+/// 这一条 `NOT_EVALUATED` 会不会盖住别的腿的结论。
+fn blocks_other_legs(verdict: Verdict, reason_code: &str) -> bool {
+    verdict == Verdict::NotEvaluated && !LEG_LOCAL_NOT_EVALUATED_CODES.contains(&reason_code)
+}
+
 /// 把若干方向/执行行的结果聚合成一个测试单元的结论。
 ///
 /// 优先级（**唯一定义处**，executor 与 report 都必须走这里）：
@@ -101,10 +126,14 @@ pub fn is_hard_single_udp_failure(verdict: Verdict, reason_code: &str) -> bool {
 /// 2. 任一 `SETUP_ERROR` —— 环境没搭起来，性能结论无意义；
 /// 3. 任一单流硬失败 —— 必须灌通的方向没灌通，不能被步骤 4 的
 ///    `NOT_EVALUATED` 吃掉（这正是它必须排在前面的原因）；
-/// 4. 按 `NOT_EVALUATED` → `RATE_FAIL` → `MEASURED` 取第一个命中：
-///    「无法评价」优先于「评价为不合格」，避免用一份不可信的数据下结论；
-/// 5. 含 `SKIP` —— 整体按跳过计，不计入通过率；
-/// 6. 全部 `PASS` —— 才是 `PASS`。
+/// 4. 任一**会盖住别的腿**的 `NOT_EVALUATED`（采样/时间轴不可信，见
+///    [`blocks_other_legs`]）—— 数据不可信时不拿它下任何结论；
+/// 5. 任一 `RATE_FAIL` —— 到这里剩下的判不了都只是那条腿自己的配置问题
+///    （负载没配够、缺目标），盖住另一条腿确凿的不达标就是丢结论；
+/// 6. 任一 `NOT_EVALUATED`（腿内局部的那几种）；
+/// 7. 任一 `MEASURED`；
+/// 8. 含 `SKIP` —— 整体按跳过计，不计入通过率；
+/// 9. 全部 `PASS` —— 才是 `PASS`。
 pub fn aggregate_verdict<'a, I>(items: I) -> Verdict
 where
     I: IntoIterator<Item = (Verdict, &'a str)>,
@@ -125,7 +154,13 @@ where
     {
         return Verdict::RateFail;
     }
-    for candidate in [Verdict::NotEvaluated, Verdict::RateFail, Verdict::Measured] {
+    if items
+        .iter()
+        .any(|(verdict, code)| blocks_other_legs(*verdict, code))
+    {
+        return Verdict::NotEvaluated;
+    }
+    for candidate in [Verdict::RateFail, Verdict::NotEvaluated, Verdict::Measured] {
         if items.iter().any(|(verdict, _)| *verdict == candidate) {
             return candidate;
         }
@@ -338,6 +373,7 @@ mod tests {
                 for marker in [
                     "fn verdict_priority",
                     "HARD_SINGLE_UDP_FAILURE_CODES: [",
+                    "LEG_LOCAL_NOT_EVALUATED_CODES: [",
                     "\"SINGLE_UDP_STREAM_FAILED\" | \"CTSTRAFFIC_SINGLE_UDP_STREAM_FAILED\"",
                 ] {
                     if text.contains(marker) {
@@ -467,6 +503,59 @@ mod tests {
             aggregate_verdict([v(Verdict::Measured), v(Verdict::NotEvaluated)]),
             Verdict::NotEvaluated,
             "「无法评价」优先于「评价为不合格」"
+        );
+    }
+
+    /// 双向单元里一条腿判不了，能不能盖住另一条腿的 FAIL，取决于**为什么**判不了。
+    #[test]
+    fn only_untrustworthy_data_may_hide_the_other_leg_failure() {
+        // 采样/时间轴不可信：两条腿跑在同一段时间窗里，那条 FAIL 同样可疑。
+        for code in [
+            "SAMPLE_COVERAGE_LOW",
+            "RATE_WINDOW_COVERAGE_LOW",
+            "COUNTER_STALLED",
+            "NIC_RATE_MISSING",
+            "EFFECTIVE_WINDOW_SHORT",
+            "ACTIVE_STREAMS_LOW",
+        ] {
+            assert_eq!(
+                aggregate_verdict([
+                    (Verdict::RateFail, "RX_BELOW_TARGET"),
+                    (Verdict::NotEvaluated, code),
+                ]),
+                Verdict::NotEvaluated,
+                "{code}：数据不可信时不能拿另一条腿下结论"
+            );
+        }
+
+        // 腿内局部的配置问题：不让另一条腿的测量变可疑，FAIL 必须留下来。
+        for code in LEG_LOCAL_NOT_EVALUATED_CODES {
+            assert_eq!(
+                aggregate_verdict([
+                    (Verdict::RateFail, "RX_BELOW_TARGET"),
+                    (Verdict::NotEvaluated, code),
+                ]),
+                Verdict::RateFail,
+                "{code}：这是那条腿自己的配置问题，不该把确凿的不达标藏起来"
+            );
+        }
+
+        // 没有 FAIL 时，腿内局部的判不了仍然是判不了，不能升格成 MEASURED。
+        assert_eq!(
+            aggregate_verdict([
+                (Verdict::Measured, "TARGET_UNKNOWN"),
+                (Verdict::NotEvaluated, "OFFERED_LOAD_LOW"),
+            ]),
+            Verdict::NotEvaluated
+        );
+        // SETUP_ERROR 仍然压过一切。
+        assert_eq!(
+            aggregate_verdict([
+                (Verdict::RateFail, "RX_BELOW_TARGET"),
+                (Verdict::NotEvaluated, "OFFERED_LOAD_LOW"),
+                (Verdict::SetupError, "NO_STREAM_STARTED"),
+            ]),
+            Verdict::SetupError
         );
     }
 

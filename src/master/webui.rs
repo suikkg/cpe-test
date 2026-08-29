@@ -16,7 +16,7 @@ use crate::master::builder::{self, build_units};
 use crate::master::executor::{ResultDb, RESUME_MAX_AGE_HOURS};
 use crate::master::ui::{run_master, MasterOpts};
 use crate::protocol::{HealthOut, HostInfo, InfoReq, Resp};
-use crate::util::{clear_log_mirror, lock_recover, log_tail_since};
+use crate::util::{clear_log_mirror, lock_recover, log_tail_since, md5_hex};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
@@ -157,7 +157,7 @@ impl MonitorData {
 }
 
 /// 界面提交回来的一条配对选择。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct PairSelection {
     /// `master:NAME=以太网 6`
     src: String,
@@ -178,6 +178,23 @@ struct PairSelection {
     rx_target_bidir_ab: String,
     #[serde(default)]
     rx_target_bidir_ba: String,
+    /// 这一行要跑哪几组 UDP 参数。`0` = 默认组，`1..` 指 `RunRequest::udp_groups`
+    /// 里的第 n-1 组。空列表 = 只跑默认组（老页面/手写请求不带这个字段时的行为）。
+    ///
+    /// 用「选组」而不是「逐格覆盖」：覆盖是差量语义，每个留空的格子都要回头
+    /// 推理「这一格空着等于继承谁」，四个格子就是四次推理，而填错了在界面上
+    /// 看不出来。一个组是一份完整定义——选中哪组，跑的就是那组里写着的东西。
+    ///
+    /// 能**多选**是因为「同一对网口既按常规档位跑一遍、又用 1m 单流跑一遍」是
+    /// 一件正经事：矩阵里一对网口只有一行，不能多选就只能分两轮跑、出两份报告。
+    /// 每多选一组就多一批单元。
+    #[serde(default)]
+    udp_groups: Vec<usize>,
+    /// 这一行要跑哪几组 TCP 参数。语义和 `udp_groups` 一样：`0` = 默认组
+    /// （执行区的 `tcp_windows` / `tcp_streams`），`1..` 指 `RunRequest::tcp_groups`
+    /// 里的第 n-1 组。空列表 = 只跑默认组。
+    #[serde(default)]
+    tcp_groups: Vec<usize>,
     #[serde(default)]
     transports: Vec<String>,
     #[serde(default)]
@@ -239,7 +256,199 @@ fn parse_rx_target(raw: &str) -> Result<Option<RxTarget>, String> {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// 一组 UDP 参数。**自成一体，不继承默认组**：`-l` 留空就是不下发 `-l`，
+/// 而不是「跟着执行区那格走」。
+///
+/// 「有几对带 `-l`、另外几对不带」就是靠这一点表达的：需要的那几行选一个填了
+/// `-l` 的组，其余行留在默认组。反过来（默认组填了、某一行想明确不要）在这个
+/// 模型里表达不了，也不需要——把它倒过来写就是了。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UdpGroup {
+    /// 显示名。空则页面按序号叫「组 2」「组 3」。
+    #[serde(default)]
+    name: String,
+    /// 单流带宽档位，逐档各跑一轮。新建的组必须填，否则这组一个单元都生成不出来。
+    #[serde(default)]
+    bandwidths: Vec<String>,
+    #[serde(default)]
+    lengths: Vec<String>,
+    #[serde(default)]
+    windows: Vec<String>,
+    /// 并发流数；0 视作 1（不继承默认组，理由见结构体注释）。
+    #[serde(default)]
+    streams: u32,
+}
+
+/// 一组 TCP 参数。和 `UdpGroup` 一样自成一体、不继承默认组：`-w` 留空就是
+/// **不下发 `-w`**（用 iperf3 默认窗口），不是「跟着执行区那格走」。
+///
+/// 两个轴 `-w × -P` 取叉积，各成一个测试单元——这和默认组（执行区的
+/// `tcp_windows` × `tcp_streams`）是同一套展开，只是换了一份档位。没有像
+/// `UdpGroup` 那样的必填项：`-w`、`-P` 都留空就是最朴素的一条 TCP（默认窗口、
+/// 单流），仍是一个合法的组。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TcpGroup {
+    /// 显示名。空则页面按序号叫「组 2」「组 3」。
+    #[serde(default)]
+    name: String,
+    /// socket buffer 档位（`-w`），逐档各跑一轮。空列表 = 不下发 `-w`。
+    #[serde(default)]
+    windows: Vec<String>,
+    /// 并发流数档位（`-P`），逐档各跑一轮。空列表按 `[1]` 处理（等价单流，
+    /// 和默认组 `tcp_streams` 留空时一致）。
+    #[serde(default)]
+    streams: Vec<u32>,
+}
+
+// ---------------------------------------------------------------------------
+// Quick-plan (suite) request model
+// ---------------------------------------------------------------------------
+// The legacy matrix request above remains supported.  These DTOs model the
+// lower-dimensional planner: concrete endpoint pairs are grouped into link
+// sets, protocol tasks live in suites, and bindings assign suites to sets.
+
+/// A scalar-or-array integer accepted by recipe JSON.  A scalar is convenient
+/// for a single fixed profile; an array denotes a scan axis.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum UiU32Values {
+    One(u32),
+    Many(Vec<u32>),
+}
+
+impl Default for UiU32Values {
+    fn default() -> Self {
+        Self::Many(Vec::new())
+    }
+}
+
+impl UiU32Values {
+    fn values(&self) -> Vec<u32> {
+        match self {
+            Self::One(value) => vec![*value],
+            Self::Many(values) => values.clone(),
+        }
+    }
+}
+
+/// One complete TCP/UDP recipe profile.  Irrelevant fields are ignored for a
+/// given protocol.  `streams` can be scalar or array for fixed/scan recipes.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+struct UiRecipeProfile {
+    window: Option<String>,
+    length: Option<String>,
+    bandwidth: Option<String>,
+    streams: UiU32Values,
+    tcp_streams: Option<UiU32Values>,
+    udp_streams: Option<UiU32Values>,
+}
+
+/// A recipe may use complete `profiles`, or the axis fields below.  The
+/// compiler expands axes explicitly and never crosses TCP with UDP.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+struct UiRecipe {
+    id: String,
+    name: String,
+    mode: String,
+    profiles: Vec<UiRecipeProfile>,
+    tcp_windows: Vec<String>,
+    tcp_streams: Vec<u32>,
+    bandwidths: Vec<String>,
+    lengths: Vec<String>,
+    windows: Vec<String>,
+    udp_streams: Vec<u32>,
+    udp_profiles: Vec<UdpProfile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+struct UiRecipes {
+    tcp: Vec<UiRecipe>,
+    udp: Vec<UiRecipe>,
+    #[serde(alias = "pings")]
+    ping: Vec<UiRecipe>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+struct UiPairRef {
+    id: String,
+    src: String,
+    dst: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+struct UiLinkSet {
+    id: String,
+    name: String,
+    #[serde(alias = "pairs")]
+    pair_refs: Vec<UiPairRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+struct UiTask {
+    id: String,
+    name: String,
+    protocol: String,
+    #[serde(alias = "transport")]
+    transports: Vec<String>,
+    directions: Vec<String>,
+    ip: Vec<String>,
+    #[serde(alias = "recipe_ids", alias = "recipes")]
+    recipe_ids: Vec<String>,
+    rx_target_bidir_ab: String,
+    rx_target_bidir_ba: String,
+    rate_targets_mbps: Option<crate::config::RateTargets>,
+    rate_mode: Option<crate::config::RateMode>,
+    duration: Option<u64>,
+    ping_count: Option<u32>,
+    ping_payload_sizes: Option<Vec<u32>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+struct UiSuite {
+    id: String,
+    name: String,
+    #[serde(default)]
+    note: String,
+    execution: String,
+    #[serde(alias = "lane_order", alias = "task_order")]
+    order: Vec<String>,
+    #[serde(alias = "lanes")]
+    tasks: Vec<UiTask>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+struct UiBinding {
+    id: String,
+    link_set_id: String,
+    suite_id: String,
+    mode: String,
+    order: i64,
+    #[serde(alias = "pair_ids", alias = "pair_ref_ids")]
+    pair_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+struct UiPlan {
+    #[serde(alias = "version")]
+    ui_plan_version: u32,
+    link_sets: Vec<UiLinkSet>,
+    recipes: UiRecipes,
+    suites: Vec<UiSuite>,
+    bindings: Vec<UiBinding>,
+    /// Hash returned by `/api/plan`; excluded while calculating a fresh hash.
+    plan_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct RunRequest {
     #[serde(default)]
     pairs: Vec<PairSelection>,
@@ -267,6 +476,18 @@ struct RunRequest {
     udp_windows: Vec<String>,
     #[serde(default = "default_streams")]
     udp_streams: u32,
+    /// 默认组之外的 UDP 参数组。矩阵里 `udp_group = 1` 指的是这里的第 0 项。
+    ///
+    /// 默认组不放进这个列表：它就是执行区那几个输入框，页面上一直都在，
+    /// 单独存一份只会多一处要保持同步的地方。
+    #[serde(default)]
+    udp_groups: Vec<UdpGroup>,
+    /// 默认组之外的 TCP 参数组。矩阵里 `tcp_group = 1` 指的是这里的第 0 项。
+    ///
+    /// 默认组不放进这个列表：它就是 `tcp_windows` / `tcp_streams` 那两个框，
+    /// 和 UDP 默认组同理，单独存一份只会多一处要保持同步的地方。
+    #[serde(default)]
+    tcp_groups: Vec<TcpGroup>,
     /// ping 次数；0 = 沿用配置里的 `ping.count`。
     #[serde(default)]
     ping_count: u32,
@@ -288,6 +509,12 @@ struct RunRequest {
     resume: bool,
     #[serde(default)]
     screenshot: bool,
+    /// New suite-plan request.  It is mutually exclusive with legacy `pairs`.
+    #[serde(default)]
+    ui_plan: Option<UiPlan>,
+    /// Optional hash returned by `/api/plan`; checked by `/api/run`.
+    #[serde(default)]
+    plan_hash: Option<String>,
 }
 
 fn default_duration() -> u64 {
@@ -321,6 +548,8 @@ struct BootstrapOut {
     ping_count: u32,
     ping_payload_sizes: Vec<u32>,
     screenshot: bool,
+    /// Feature flag for pages that can send the suite-oriented `ui_plan` DTO.
+    ui_plan_supported: bool,
 }
 
 /// 本机信息。**不需要连上辅测机**——这是控制台打开就能给出的东西。
@@ -338,6 +567,13 @@ struct PlannedUnit {
     est_secs: u64,
     /// 本轮开了 resume，且这个单元在 24 小时内已有 PASS——会被跳过。
     resumed: bool,
+    /// 这个单元每条腿**最终**下发的参数。
+    ///
+    /// 「网口固定值 > 参数组 > 默认组」这条优先级，与其让人背下来，不如在跑
+    /// 之前把每条腿的最终数字摆出来：填错了当场看得见，比任何校验都直接。
+    /// 而且这里是裁剪之后的值——勾了「按链路上限裁剪」时 `-b` 和流数都可能
+    /// 和填进去的不一样。
+    load: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -348,6 +584,72 @@ struct PlanOut {
     /// 一个都不跳时的耗时。开着 resume 时页面按区间显示，理由见 `api_plan`。
     est_full_secs: u64,
     notices: Vec<String>,
+    /// Hierarchical source information for the quick planner.  Empty for a
+    /// legacy matrix request; the flat `units` field remains the compatibility
+    /// contract used by the original page.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    sections: Vec<PlanSection>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    trace: Vec<PlanTrace>,
+    /// Stable hash of the request, effective config and current topology.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plan_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    topology_fingerprint: Option<String>,
+    /// Lets newer pages feature-detect the suite planner without probing a
+    /// deliberately invalid request.
+    ui_plan_supported: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PlanTrace {
+    seq: usize,
+    pair_id: Option<String>,
+    link_set_id: Option<String>,
+    suite_id: Option<String>,
+    task_id: Option<String>,
+    /// Alias used by the initial design terminology; equal to `task_id`.
+    lane_id: Option<String>,
+    recipe_id: Option<String>,
+    protocol: Option<String>,
+    direction: Option<String>,
+    ip: Option<String>,
+    requested_args: Vec<String>,
+    effective_args: Vec<String>,
+    value_sources: Vec<String>,
+    skipped_reason: Option<String>,
+    resumed: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct PlanSection {
+    link_set_id: Option<String>,
+    suite_id: Option<String>,
+    task_id: Option<String>,
+    title: String,
+    unit_seqs: Vec<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct UiSource {
+    pair_id: String,
+    link_set_id: String,
+    suite_id: String,
+    task_id: String,
+    recipe_id: String,
+    protocol: String,
+}
+
+struct CompiledPlan {
+    cfg: Config,
+    units: Vec<builder::Unit>,
+    notices: Vec<String>,
+    resumed: Vec<bool>,
+    trace: Vec<PlanTrace>,
+    sections: Vec<PlanSection>,
+    plan_hash: String,
+    topology_fingerprint: String,
+    spec_errors: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -398,6 +700,30 @@ pub(crate) fn listen_addr(bind: &str, port: u16) -> String {
     } else {
         format!("{bind}:{port}")
     }
+}
+
+/// 把绑定地址拼成**能在浏览器里打开**的地址。
+///
+/// 监听地址不等于访问地址：`0.0.0.0` 和 `::` 是「所有网卡」的通配写法，不是
+/// 一个能连的目的地址。此前打印和自动弹出的都是监听地址原文，于是 `--ui-bind
+/// 0.0.0.0` 弹出来的是 `http://0.0.0.0:28800?token=…`——Chrome 133 起为堵
+/// 「0.0.0.0 day」直接拦掉对该地址的请求，其余浏览器靠「碰巧路由到回环」才打
+/// 得开；而口令就在那串 URL 里，人得先看懂要把主机名换掉才能进得去。
+///
+/// 通配地址换成对应的回环，其余原样保留（绑到某块网卡的 IP 时，那个 IP 本来
+/// 就是该用的访问地址）。
+pub(crate) fn display_addr(bind: &str, port: u16) -> String {
+    let host = match bind.trim() {
+        "0.0.0.0" => "127.0.0.1",
+        "::" | "[::]" => "[::1]",
+        other => other,
+    };
+    listen_addr(host, port)
+}
+
+/// 绑定地址是否是「所有网卡」的通配写法。
+pub(crate) fn bind_is_wildcard(bind: &str) -> bool {
+    matches!(bind.trim(), "0.0.0.0" | "::" | "[::]")
 }
 
 /// 同时处理请求的线程数。
@@ -469,13 +795,23 @@ pub fn run(opts: UiOpts) -> i32 {
     };
     // 口令放在 URL 的查询串里，页面加载后会把它从地址栏抹掉（见 webui.html）。
     // 这样「打开控制台」仍然是复制粘贴一个地址，不用先教人怎么加请求头。
-    let url = if ui_token.is_empty() {
-        format!("http://{addr}")
+    //
+    // 地址用 `display_addr` 而不是监听地址原文：`0.0.0.0` 打不开（见那个函数
+    // 的注释），而这一行同时是自动弹窗和「手动复制」两条路的唯一出处。
+    let open_addr = display_addr(&bind, port);
+    let query = if ui_token.is_empty() {
+        String::new()
     } else {
-        format!("http://{addr}?token={}", urlencode(&ui_token))
+        format!("?token={}", urlencode(&ui_token))
     };
+    let url = format!("http://{open_addr}{query}");
     println!("控制台已启动: {url}");
     println!("（浏览器没自动弹出的话，手动复制上面这个地址打开）");
+    if bind_is_wildcard(&bind) {
+        // 通配绑定的用意基本都是「让别的电脑连过来」，所以把远端要用的写法
+        // 一起给出来：上面那个回环地址只在本机有效，照抄到别的电脑上打不开。
+        println!("从别的电脑访问：把上面地址里的主机名换成本机的测试网 IP，端口和 ?token= 照抄。");
+    }
     if !bind_is_loopback(&bind) {
         println!("注意：控制台正监听在 {bind}，同网段能访问到它；口令泄露即等于测试控制权泄露。");
     }
@@ -739,6 +1075,8 @@ fn handle(mut request: Request, console: &Arc<Console>) {
         api_plan(console, &body)
     } else if is_post && path == "/api/config" {
         api_config(console, &body)
+    } else if is_post && path == "/api/import" {
+        api_import(console, &body)
     } else if is_post && path == "/api/run" {
         api_run(console, &body)
     } else if is_post && path == "/api/stop" {
@@ -749,8 +1087,8 @@ fn handle(mut request: Request, console: &Arc<Console>) {
         Ok(api_progress(console, &query))
     } else if is_post && path == "/api/monitor/start" {
         api_monitor_start(console, &body)
-    } else if is_get && path == "/api/monitor/samples" {
-        api_monitor_samples(console, &query)
+    } else if is_post && path == "/api/monitor/samples" {
+        api_monitor_samples(console, &body)
     } else if is_post && path == "/api/monitor/stop" {
         api_monitor_stop(console, &body)
     } else {
@@ -795,10 +1133,29 @@ fn api_local() -> Result<serde_json::Value, String> {
 
 fn api_bootstrap(console: &Arc<Console>) -> Result<serde_json::Value, String> {
     let state = lock_recover(&console.state);
+    serde_json::to_value(bootstrap_out(&state)).map_err(|error| error.to_string())
+}
+
+/// 顶部参数区的回填值。打开页面（`/api/bootstrap`）和导入 config
+/// （`/api/import`）共用这一份，两条路填出来的输入框必须一模一样。
+fn bootstrap_out(state: &UiState) -> BootstrapOut {
+    // 默认组的 -P 档位 = **跑默认 -w 档位的那些 TCP test** 的流数集合。
+    //
+    // 和下面 udp_streams 同一个坑：不能把所有 TCP test 的流数并起来。矩阵里选了
+    // 别的 TCP 参数组的行，它们的流数排在前面，会被当成默认组的填进执行区那一格
+    // ——于是导进来的默认组变成另一份东西，而它管着所有没选组的行。默认组的
+    // -w 存在 `iperf.tcp_windows` 里（附加组各带各的 tcp_windows），按它筛。
+    let default_windows = &state.cfg.iperf.tcp_windows;
     let mut tcp_streams: Vec<u32> = state
         .cfg
         .tests
         .iter()
+        .filter(|test| test.transports.iter().any(|t| t.trim() == "tcp"))
+        .filter(|test| {
+            test.tcp_windows
+                .as_ref()
+                .is_none_or(|windows| windows == default_windows)
+        })
         .filter_map(|test| test.tcp_streams)
         .filter(|value| *value > 0)
         .collect();
@@ -807,14 +1164,47 @@ fn api_bootstrap(console: &Arc<Console>) -> Result<serde_json::Value, String> {
     if tcp_streams.is_empty() {
         tcp_streams.push(10);
     }
-    let udp_streams = state
+    // 默认组的流数 = **跑默认档位的那条 UDP test** 的流数。
+    //
+    // 不能只取「第一条带 udp_streams 的 test」：矩阵里某一行选了别的参数组时，
+    // 它的 test 排在前面，那个组的流数会被当成默认组的填进执行区那一格——
+    // 于是导进来的默认组变成另一份东西，而它管着所有没选组的行。
+    let udp_tests = state
         .cfg
         .tests
         .iter()
-        .filter_map(|test| test.udp_streams)
-        .find(|value| *value > 0)
+        .filter(|test| test.transports.iter().any(|t| t.trim() == "udp"));
+    let default_profiles = &state.cfg.iperf.udp_profiles;
+    let udp_streams = udp_tests
+        .clone()
+        .find(|test| {
+            test.udp_profiles
+                .as_ref()
+                .is_none_or(|profiles| profiles == default_profiles)
+        })
+        .or_else(|| udp_tests.clone().next())
+        .and_then(|test| test.udp_streams)
+        .filter(|value| *value > 0)
         .unwrap_or(1);
-    serde_json::to_value(BootstrapOut {
+    // ping 的次数和包长和 tcp_streams 一样只落在 tests[] 上（界面就是这么写下去
+    // 的），只读 cfg.ping 的话，一份「ping 50 次 × 64 字节」的配置回填出来是
+    // 默认的「100 次 × 32/1600/65500」——三倍的单元数，而人看着框里的数字
+    // 以为就是文件里的那份。
+    let ping_count = state
+        .cfg
+        .tests
+        .iter()
+        .filter_map(|test| test.ping_count)
+        .find(|value| *value > 0)
+        .unwrap_or(state.cfg.ping.count);
+    let ping_payload_sizes = state
+        .cfg
+        .tests
+        .iter()
+        .filter_map(|test| test.ping_payload_sizes.clone())
+        .find(|sizes| !sizes.is_empty())
+        .unwrap_or_else(|| state.cfg.ping.payload_sizes.clone());
+    BootstrapOut {
         agent_host: state.agent_host.clone(),
         agent_port: state.cfg.agent_port,
         token_configured: !state.cfg.agent_token.is_empty(),
@@ -822,13 +1212,16 @@ fn api_bootstrap(console: &Arc<Console>) -> Result<serde_json::Value, String> {
         duration: state.cfg.iperf.duration,
         tcp_windows: state.cfg.iperf.tcp_windows.clone(),
         tcp_streams,
-        udp_bandwidths: state
-            .cfg
-            .iperf
-            .udp_profiles
-            .iter()
-            .map(|profile| profile.bandwidth.clone())
-            .collect(),
+        // 和 -l / -w 一样要去重：一档 `-b` 会因为 `-l`/`-w` 的每个档位各生成
+        // 一份 profile，照抄进输入框的话，「下载 → 导入」每走一轮档位就翻一倍。
+        udp_bandwidths: distinct(
+            state
+                .cfg
+                .iperf
+                .udp_profiles
+                .iter()
+                .map(|profile| profile.bandwidth.clone()),
+        ),
         udp_lengths: distinct(
             state
                 .cfg
@@ -846,11 +1239,11 @@ fn api_bootstrap(console: &Arc<Console>) -> Result<serde_json::Value, String> {
                 .filter_map(|profile| profile.window.clone()),
         ),
         udp_streams,
-        ping_count: state.cfg.ping.count,
-        ping_payload_sizes: state.cfg.ping.payload_sizes.clone(),
+        ping_count,
+        ping_payload_sizes,
         screenshot: state.cfg.screenshot,
-    })
-    .map_err(|error| error.to_string())
+        ui_plan_supported: true,
+    }
 }
 
 /// 回显成用户当初的写法：绝对值回显数字，百分比回显 `90%`。
@@ -987,6 +1380,11 @@ fn endpoint_exists(state: &UiState, endpoint: &str) -> bool {
     interfaces.iter().any(|nic| nic.name == name)
 }
 
+fn ui_endpoint_exists(state: &UiState, endpoint: &str) -> bool {
+    endpoint_exists(state, endpoint)
+        || builder::resolve_endpoint(endpoint, &state.master, &state.agent).is_ok()
+}
+
 fn values_are_allowed(values: &[String], allowed: &[&str]) -> bool {
     !values.is_empty()
         && values
@@ -996,10 +1394,99 @@ fn values_are_allowed(values: &[String], allowed: &[&str]) -> bool {
 
 /// 浏览器控件不是信任边界：即使页面会过滤，后端仍需拒绝空选择、越界数值和
 /// 无效档位。尤其不能把“用户把整列取消勾选”静默解释成默认 AB/TCP/IPv4。
+///
+/// 拆成三段是因为这三段的判据来源不同：全局档位只看 `req` 自己，逐对检查还要
+/// 看网口覆盖，网口策略要看当前扫到的网口表。混在一个函数里时，读到一半分不清
+/// 手上这个 `pair` 到底受哪些外部状态影响。
 fn validate_request(state: &UiState, req: &RunRequest) -> Result<(), String> {
+    if let Some(plan) = req.ui_plan.as_ref() {
+        if !req.pairs.is_empty() {
+            return Err("ui_plan 与 legacy pairs 不能同时提交".into());
+        }
+        validate_global_values(req)?;
+        validate_ui_plan(state, plan)?;
+    } else {
+        validate_global_sweeps(req)?;
+    }
+    for (index, group) in req.udp_groups.iter().enumerate() {
+        validate_udp_group(index + 1, group)?;
+    }
+    for (index, group) in req.tcp_groups.iter().enumerate() {
+        validate_tcp_group(index + 1, group)?;
+    }
+    if req.ui_plan.is_none() {
+        for pair in &req.pairs {
+            validate_pair(state, pair, req.udp_groups.len(), req.tcp_groups.len())?;
+        }
+    }
+    validate_nic_policies(state, req)
+}
+
+/// 一个附加的 UDP 参数组。默认组的那几格由 `validate_global_sweeps` 管。
+fn validate_udp_group(index: usize, group: &UdpGroup) -> Result<(), String> {
+    let label = if group.name.trim().is_empty() {
+        format!("UDP 参数组 {index}")
+    } else {
+        format!("UDP 参数组「{}」", group.name.trim())
+    };
+    // 组不继承默认组，所以 `-b` 空着不是「跟着全局」而是「一个档位都没有」，
+    // 那一组生成不出任何单元。这里挡住，比让人在「预览任务」里数不到强。
+    if cleaned_list(&group.bandwidths).is_empty() {
+        return Err(format!("{label} 没填 -b：组是完整定义，不继承默认组的档位"));
+    }
+    for bandwidth in cleaned_list(&group.bandwidths) {
+        check_udp_bandwidth(&bandwidth, &label)?;
+    }
+    for length in cleaned_list(&group.lengths) {
+        let bytes = crate::cmd::ctstraffic::parse_size_bytes(&length)
+            .map_err(|error| format!("{label} 的 -l {length:?} 无效：{error}"))?;
+        if bytes > 65_507 {
+            return Err(format!(
+                "{label} 的 -l {length:?} 超过单个 UDP 报文上限 65507 字节"
+            ));
+        }
+    }
+    for window in cleaned_list(&group.windows) {
+        crate::cmd::ctstraffic::parse_size_bytes(&window)
+            .map_err(|error| format!("{label} 的 -w {window:?} 无效：{error}"))?;
+    }
+    if group.streams > MAX_UDP_STREAMS {
+        return Err(format!(
+            "{label} 的流数 {} 超过上限 {MAX_UDP_STREAMS}",
+            group.streams
+        ));
+    }
+    Ok(())
+}
+
+/// 一个附加的 TCP 参数组。默认组的 `-w` / `-P` 那两个框由 `validate_global_sweeps`
+/// 管。TCP 组没有 UDP 那样的必填项（`-b`）：`-w`、`-P` 都可留空。
+fn validate_tcp_group(index: usize, group: &TcpGroup) -> Result<(), String> {
+    let label = if group.name.trim().is_empty() {
+        format!("TCP 参数组 {index}")
+    } else {
+        format!("TCP 参数组「{}」", group.name.trim())
+    };
+    for window in cleaned_list(&group.windows) {
+        crate::cmd::ctstraffic::parse_size_bytes(&window)
+            .map_err(|error| format!("{label} 的 -w {window:?} 无效：{error}"))?;
+    }
+    if group.streams.iter().any(|value| !(1..=32).contains(value)) {
+        return Err(format!("{label} 的 -P 每一档都必须在 1..=32 之间"));
+    }
+    Ok(())
+}
+
+/// 执行区那些「所有配对共用」的档位与数值。
+fn validate_global_sweeps(req: &RunRequest) -> Result<(), String> {
     if req.pairs.is_empty() {
         return Err("一个测试项都没勾".into());
     }
+    validate_global_values(req)
+}
+
+/// 全局时长、参数档位和 ping 边界检查，共用于 legacy matrix 与 suite plan。
+fn validate_global_values(req: &RunRequest) -> Result<(), String> {
     if !(1..=86_400).contains(&req.duration) {
         return Err("时长必须在 1..=86400 秒之间".into());
     }
@@ -1026,9 +1513,7 @@ fn validate_request(state: &UiState, req: &RunRequest) -> Result<(), String> {
         .iter()
         .filter(|value| !value.trim().is_empty())
     {
-        UdpProfile::bw(bandwidth.trim())
-            .parsed_bandwidth()
-            .map_err(|error| format!("UDP -b 档位 {bandwidth:?} 无效：{error}"))?;
+        check_udp_bandwidth(bandwidth.trim(), "默认组")?;
     }
     for window in req.udp_windows.iter().filter(|v| !v.trim().is_empty()) {
         crate::cmd::ctstraffic::parse_size_bytes(window.trim())
@@ -1060,75 +1545,687 @@ fn validate_request(state: &UiState, req: &RunRequest) -> Result<(), String> {
     if req.ping_count > 100_000 {
         return Err(format!("ping 次数 {} 超过上限 100000", req.ping_count));
     }
+    Ok(())
+}
 
-    for pair in &req.pairs {
-        if pair.src == pair.dst
-            || !endpoint_exists(state, &pair.src)
-            || !endpoint_exists(state, &pair.dst)
+fn canonical_ui_direction(raw: &str) -> Option<&'static str> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "ab" | "a->b" | "a>b" | "a_to_b" => Some("ab"),
+        "ba" | "b->a" | "b>a" | "b_to_a" => Some("ba"),
+        "bidir" | "both-way" | "a<->b" | "双向" => Some("bidir"),
+        // `both` is the legacy spelling for two independent one-way legs.
+        "both" => Some("both"),
+        _ => None,
+    }
+}
+
+fn canonical_ui_ip(raw: &str) -> Option<&'static str> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "v4" | "ipv4" | "4" => Some("v4"),
+        "v6" | "ipv6" | "6" => Some("v6"),
+        _ => None,
+    }
+}
+
+fn ui_task_protocol(task: &UiTask) -> Option<String> {
+    let raw = if !task.protocol.trim().is_empty() {
+        task.protocol.trim().to_ascii_lowercase()
+    } else if task.transports.len() == 1 {
+        task.transports[0].trim().to_ascii_lowercase()
+    } else {
+        String::new()
+    };
+    match raw.as_str() {
+        "tcp" | "udp" | "ping" => Some(raw),
+        _ => None,
+    }
+}
+
+fn validate_ui_recipe(protocol: &str, recipe: &UiRecipe, index: usize) -> Result<(), String> {
+    if recipe.id.trim().is_empty() {
+        return Err(format!("{protocol} 配方 {} 缺少稳定 id", index + 1));
+    }
+    if recipe.mode.trim().is_empty()
+        || matches!(
+            recipe.mode.trim().to_ascii_lowercase().as_str(),
+            "fixed" | "scan"
+        )
+    {
+        // Empty mode is the default fixed mode.  Other modes are rejected
+        // below, but keep this branch explicit for readable diagnostics.
+    } else {
+        return Err(format!(
+            "{protocol} 配方 {} 的 mode 只支持 fixed 或 scan",
+            recipe.id
+        ));
+    }
+    if protocol == "tcp" {
+        for window in recipe
+            .tcp_windows
+            .iter()
+            .chain(recipe.windows.iter())
+            .filter(|v| !v.trim().is_empty())
         {
-            return Err(format!(
-                "测试配对已失效：{} -> {}。请刷新网口后重新选择",
-                pair.src, pair.dst
-            ));
+            crate::cmd::ctstraffic::parse_size_bytes(window.trim())
+                .map_err(|e| format!("TCP 配方 {} 的 -w {:?} 无效：{e}", recipe.id, window))?;
         }
-        if !values_are_allowed(&pair.directions, &["ab", "ba", "bidir"]) {
-            return Err(format!(
-                "配对 {} / {} 至少勾一个有效方向",
-                pair.src, pair.dst
-            ));
-        }
-        // PING 和 TCP/UDP 并排放在界面的「协议」列，白名单里也必须一起放行。
-        // 漏掉它不只是「PING 跑不了」：整条请求会被判非法，连同一配对里本来
-        // 能跑的 TCP/UDP 一起废掉，而错误文案还在让人去勾 TCP 或 UDP。
-        // 双向门限只收绝对值，且只有勾了「双向」才有意义。填了却没勾双向要报错
-        // 而不是静默忽略——静默忽略的话，人会以为门限放低了、看到 FAIL 去查链路。
-        let bidir_selected = pair.directions.iter().any(|d| d == "bidir");
-        for (label, raw) in [
-            ("A→B", &pair.rx_target_bidir_ab),
-            ("B→A", &pair.rx_target_bidir_ba),
-        ] {
-            if raw.trim().is_empty() {
-                continue;
+        for profile in &recipe.profiles {
+            if let Some(window) = profile.window.as_deref().filter(|v| !v.trim().is_empty()) {
+                crate::cmd::ctstraffic::parse_size_bytes(window.trim()).map_err(|e| {
+                    format!(
+                        "TCP 配方 {} 的 profile -w {:?} 无效：{e}",
+                        recipe.id, window
+                    )
+                })?;
             }
-            if !bidir_selected {
+            for streams in profile
+                .tcp_streams
+                .as_ref()
+                .unwrap_or(&profile.streams)
+                .values()
+            {
+                if !(1..=32).contains(&streams) {
+                    return Err(format!("TCP 配方 {} 的 -P 必须在 1..=32 之间", recipe.id));
+                }
+            }
+        }
+        if recipe.tcp_streams.iter().any(|v| !(1..=32).contains(v)) {
+            return Err(format!("TCP 配方 {} 的 -P 必须在 1..=32 之间", recipe.id));
+        }
+    } else if protocol == "udp" {
+        for bandwidth in recipe.bandwidths.iter().filter(|v| !v.trim().is_empty()) {
+            check_udp_bandwidth(bandwidth.trim(), &format!("UDP 配方 {}", recipe.id))?;
+        }
+        for length in recipe.lengths.iter().filter(|v| !v.trim().is_empty()) {
+            let bytes = crate::cmd::ctstraffic::parse_size_bytes(length.trim())
+                .map_err(|e| format!("UDP 配方 {} 的 -l {:?} 无效：{e}", recipe.id, length))?;
+            if bytes > 65_507 {
+                return Err(format!("UDP 配方 {} 的 -l 超过 65507 字节", recipe.id));
+            }
+        }
+        for window in recipe.windows.iter().filter(|v| !v.trim().is_empty()) {
+            crate::cmd::ctstraffic::parse_size_bytes(window.trim())
+                .map_err(|e| format!("UDP 配方 {} 的 -w {:?} 无效：{e}", recipe.id, window))?;
+        }
+        for profile in &recipe.profiles {
+            if let Some(bandwidth) = profile
+                .bandwidth
+                .as_deref()
+                .filter(|v| !v.trim().is_empty())
+            {
+                check_udp_bandwidth(bandwidth.trim(), &format!("UDP 配方 {}", recipe.id))?;
+            }
+            if let Some(length) = profile.length.as_deref().filter(|v| !v.trim().is_empty()) {
+                let bytes =
+                    crate::cmd::ctstraffic::parse_size_bytes(length.trim()).map_err(|e| {
+                        format!(
+                            "UDP 配方 {} 的 profile -l {:?} 无效：{e}",
+                            recipe.id, length
+                        )
+                    })?;
+                if bytes > 65_507 {
+                    return Err(format!(
+                        "UDP 配方 {} 的 profile -l 超过 65507 字节",
+                        recipe.id
+                    ));
+                }
+            }
+            if let Some(window) = profile.window.as_deref().filter(|v| !v.trim().is_empty()) {
+                crate::cmd::ctstraffic::parse_size_bytes(window.trim()).map_err(|e| {
+                    format!(
+                        "UDP 配方 {} 的 profile -w {:?} 无效：{e}",
+                        recipe.id, window
+                    )
+                })?;
+            }
+            let streams = profile
+                .udp_streams
+                .as_ref()
+                .unwrap_or(&profile.streams)
+                .values();
+            if streams.iter().any(|v| !(1..=32).contains(v)) {
+                return Err(format!("UDP 配方 {} 的流数必须在 1..=32 之间", recipe.id));
+            }
+        }
+        if recipe.udp_streams.iter().any(|v| !(1..=32).contains(v)) {
+            return Err(format!("UDP 配方 {} 的流数必须在 1..=32 之间", recipe.id));
+        }
+        for profile in &recipe.udp_profiles {
+            check_udp_bandwidth(profile.bandwidth.trim(), &format!("UDP 配方 {}", recipe.id))?;
+            if let Some(length) = profile.length.as_deref().filter(|v| !v.trim().is_empty()) {
+                let bytes =
+                    crate::cmd::ctstraffic::parse_size_bytes(length.trim()).map_err(|e| {
+                        format!(
+                            "UDP 配方 {} 的 profile -l {:?} 无效：{e}",
+                            recipe.id, length
+                        )
+                    })?;
+                if bytes > 65_507 {
+                    return Err(format!(
+                        "UDP 配方 {} 的 profile -l 超过 65507 字节",
+                        recipe.id
+                    ));
+                }
+            }
+            if let Some(window) = profile.window.as_deref().filter(|v| !v.trim().is_empty()) {
+                crate::cmd::ctstraffic::parse_size_bytes(window.trim()).map_err(|e| {
+                    format!(
+                        "UDP 配方 {} 的 profile -w {:?} 无效：{e}",
+                        recipe.id, window
+                    )
+                })?;
+            }
+        }
+        // An explicitly defined UDP recipe must expand to at least one
+        // profile. Without this guard a card containing only empty fields is
+        // accepted and silently contributes no test units.
+        let has_bandwidth = if !recipe.udp_profiles.is_empty() {
+            recipe
+                .udp_profiles
+                .iter()
+                .any(|profile| !profile.bandwidth.trim().is_empty())
+        } else if !recipe.profiles.is_empty() {
+            let recipe_fallback = recipe
+                .bandwidths
+                .iter()
+                .any(|value| !value.trim().is_empty());
+            recipe.profiles.iter().any(|profile| {
+                profile
+                    .bandwidth
+                    .as_deref()
+                    .is_some_and(|value| !value.trim().is_empty())
+                    || recipe_fallback
+            })
+        } else {
+            recipe
+                .bandwidths
+                .iter()
+                .any(|value| !value.trim().is_empty())
+        };
+        // A completely empty recipe means "use the request/config default";
+        // that is useful when a suite intentionally wants the shared default
+        // without duplicating its axes.  Reject only an explicitly populated
+        // recipe whose fields all resolve to empty values, because that shape
+        // otherwise looks configured while producing zero units.
+        let explicitly_configured = !recipe.udp_profiles.is_empty()
+            || !recipe.profiles.is_empty()
+            || !recipe.bandwidths.is_empty()
+            || !recipe.lengths.is_empty()
+            || !recipe.windows.is_empty()
+            || !recipe.udp_streams.is_empty();
+        if explicitly_configured && !has_bandwidth {
+            return Err(format!(
+                "UDP 配方 {} 没有有效的 -b 档位，无法生成测试单元",
+                recipe.id
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// 校验任务级的显式验收目标。
+///
+/// `RateTargets::for_direction` 会把非法值当成“未配置”并继续走自动推导；
+/// 对来自浏览器的计划来说这会把一个明显的输入错误静默吞掉，最终报告看起来
+/// 像是用户根本没有填写目标。因此 UI 计划要在边界处拒绝非有限值和非正值。
+fn validate_ui_rate_targets(
+    label: &str,
+    targets: &crate::config::RateTargets,
+) -> Result<(), String> {
+    for (direction, value) in [
+        ("forward", targets.forward),
+        ("ab", targets.ab),
+        ("ba", targets.ba),
+    ] {
+        if let Some(value) = value {
+            if !value.is_finite() || value <= 0.0 {
                 return Err(format!(
-                    "配对 {} / {} 填了 {label} 双向门限，却没有勾「双向」。\
-                     双向门限只作用于双向并发单元；单向的门限在「网口与策略」里改",
-                    pair.src, pair.dst
+                    "{label} 的 {direction} 目标必须是大于 0 的有限 Mbps"
                 ));
             }
-            match parse_rx_target(raw).map_err(|error| {
-                format!(
-                    "配对 {} / {} 的 {label} 双向门限：{error}",
-                    pair.src, pair.dst
-                )
-            })? {
-                Some(RxTarget::Mbps(_)) => {}
-                Some(RxTarget::Percent(_)) => {
-                    return Err(format!(
-                        "配对 {} / {} 的 {label} 双向门限只能填绝对 Mbps。\
-                         百分比要按单块网卡的协商速率换算，而双向门限说的是这两块口\
-                         并发时的能力，两者不成比例",
-                        pair.src, pair.dst
-                    ))
-                }
-                None => {}
+        }
+    }
+    Ok(())
+}
+
+/// Validate a suite plan without touching the legacy matrix checks.
+fn validate_ui_plan(state: &UiState, plan: &UiPlan) -> Result<(), String> {
+    if plan.ui_plan_version > 1 {
+        return Err(format!(
+            "不支持的 ui_plan_version={}（当前支持 1）",
+            plan.ui_plan_version
+        ));
+    }
+    if plan.link_sets.is_empty() {
+        return Err("ui_plan 至少需要一个 link_set".into());
+    }
+    if plan.suites.is_empty() {
+        return Err("ui_plan 至少需要一个 suite".into());
+    }
+    if plan.bindings.is_empty() {
+        return Err("ui_plan 至少需要一个 binding".into());
+    }
+
+    let mut ids = HashSet::new();
+    for (index, set) in plan.link_sets.iter().enumerate() {
+        if set.id.trim().is_empty() || !ids.insert(set.id.clone()) {
+            return Err(format!("link_set {} 的 id 缺失或重复", index + 1));
+        }
+        let mut pair_ids = HashSet::new();
+        let mut pair_endpoints = HashSet::new();
+        for (pair_index, pair) in set.pair_refs.iter().enumerate() {
+            if pair.id.trim().is_empty() || !pair_ids.insert(pair.id.clone()) {
+                return Err(format!("link_set {} 的 pair_ref id 缺失或重复", set.id));
+            }
+            if pair.src.trim().is_empty()
+                || pair.dst.trim().is_empty()
+                || pair.src == pair.dst
+                || !ui_endpoint_exists(state, &pair.src)
+                || !ui_endpoint_exists(state, &pair.dst)
+            {
+                return Err(format!(
+                    "link_set {} 的 pair_ref {} 已失效：{} -> {}",
+                    set.id,
+                    pair_index + 1,
+                    pair.src,
+                    pair.dst
+                ));
+            }
+            // NAME= and role selectors can spell the same physical interface in
+            // different ways. Resolve both before comparing; a raw-string check
+            // alone would let a self-link through and only fail much later in the
+            // builder, after the preview had already been shown.
+            let src_endpoint = builder::resolve_endpoint(&pair.src, &state.master, &state.agent)
+                .map_err(|error| {
+                    format!(
+                        "link_set {} 的 pair_ref {} 源端点无效：{error}",
+                        set.id,
+                        pair_index + 1
+                    )
+                })?;
+            let dst_endpoint = builder::resolve_endpoint(&pair.dst, &state.master, &state.agent)
+                .map_err(|error| {
+                    format!(
+                        "link_set {} 的 pair_ref {} 目标端点无效：{error}",
+                        set.id,
+                        pair_index + 1
+                    )
+                })?;
+            if src_endpoint.key() == dst_endpoint.key() {
+                return Err(format!(
+                    "link_set {} 的 pair_ref {} 源和目标不能是同一块网口",
+                    set.id,
+                    pair_index + 1
+                ));
+            }
+            let mut endpoint_key = [src_endpoint.key(), dst_endpoint.key()];
+            endpoint_key.sort();
+            if !pair_endpoints.insert(endpoint_key) {
+                return Err(format!(
+                    "link_set {} 包含重复的网口对：{} -> {}",
+                    set.id, pair.src, pair.dst
+                ));
             }
         }
-        if !values_are_allowed(&pair.transports, &["tcp", "udp", "ping"]) {
+        // An empty set is allowed as an unbound draft.  The quick workspace
+        // lets users create a collection before selecting concrete NIC pairs,
+        // and execution requests can also contain a stale-only collection
+        // after the browser filters invalid endpoints.  A set that is actually
+        // referenced by a binding is checked below and must still contain at
+        // least one pair; keeping the distinction here avoids rejecting an
+        // otherwise runnable plan merely because an unused draft is present.
+    }
+
+    // Recipe IDs are global across protocol buckets so a binding remains
+    // stable even if the UI reorders TCP and UDP cards.  They are a separate
+    // namespace from link-set IDs: a project is perfectly entitled to call a
+    // set and a recipe both "default" because references always carry the
+    // owning field (link_set_id vs recipe_ids).  Reusing the top-level `ids`
+    // set here would reject that harmless, and common, naming pattern.
+    let mut recipe_ids = HashSet::new();
+    for (protocol, recipes) in [
+        ("tcp", &plan.recipes.tcp),
+        ("udp", &plan.recipes.udp),
+        ("ping", &plan.recipes.ping),
+    ] {
+        for (index, recipe) in recipes.iter().enumerate() {
+            if recipe.id.trim().is_empty() || !recipe_ids.insert(recipe.id.clone()) {
+                return Err(format!("{protocol} 配方 id 缺失或重复：{}", recipe.id));
+            }
+            validate_ui_recipe(protocol, recipe, index)?;
+        }
+    }
+
+    let mut suite_ids = HashSet::new();
+    for suite in &plan.suites {
+        if suite.id.trim().is_empty() || !suite_ids.insert(suite.id.clone()) {
+            return Err(format!("suite id 缺失或重复：{}", suite.id));
+        }
+        if !suite.execution.trim().is_empty() && !suite.execution.eq_ignore_ascii_case("sequential")
+        {
+            return Err(format!("suite {} 只支持 execution=sequential", suite.id));
+        }
+        if suite.tasks.is_empty() {
+            return Err(format!("suite {} 没有任务", suite.id));
+        }
+        let mut task_ids = HashSet::new();
+        for task in &suite.tasks {
+            if task.id.trim().is_empty() || !task_ids.insert(task.id.clone()) {
+                return Err(format!("suite {} 的 task id 缺失或重复", suite.id));
+            }
+            let protocol = ui_task_protocol(task)
+                .ok_or_else(|| format!("suite {} 的 task {} 协议无效", suite.id, task.id))?;
+            if task.transports.iter().any(|transport| {
+                let transport = transport.trim().to_ascii_lowercase();
+                !transport.is_empty() && transport != protocol
+            }) {
+                return Err(format!(
+                    "suite {} 的 task {} protocol 与 transports 不一致",
+                    suite.id, task.id
+                ));
+            }
+            if task.directions.is_empty()
+                || task
+                    .directions
+                    .iter()
+                    .any(|direction| canonical_ui_direction(direction).is_none())
+            {
+                return Err(format!("suite {} 的 task {} 方向无效", suite.id, task.id));
+            }
+            if task.ip.is_empty() || task.ip.iter().any(|ip| canonical_ui_ip(ip).is_none()) {
+                return Err(format!(
+                    "suite {} 的 task {} IP 版本无效",
+                    suite.id, task.id
+                ));
+            }
+            let recipe_ids = &task.recipe_ids;
+            // PING currently takes its count and payload sizes from the task
+            // (or the request-wide controls).  `UiRecipe` has no ping-specific
+            // fields, and the compiler only used a referenced id for naming,
+            // which made a non-empty PING recipe look configurable while its
+            // parameters were silently ignored.  Reject that ambiguous shape
+            // until a recipe schema with explicit ping semantics is added.
+            if protocol == "ping" && !recipe_ids.is_empty() {
+                return Err(format!(
+                    "suite {} 的 task {} 暂不支持 PING 配方引用，请直接填写 ping 次数和包长",
+                    suite.id, task.id
+                ));
+            }
+            let recipes = match protocol.as_str() {
+                "tcp" => &plan.recipes.tcp,
+                "udp" => &plan.recipes.udp,
+                _ => &plan.recipes.ping,
+            };
+            let mut seen_recipe_ids = HashSet::new();
+            for recipe_id in recipe_ids {
+                if !seen_recipe_ids.insert(recipe_id) {
+                    return Err(format!(
+                        "suite {} 的 task {} 重复引用 {} 配方 {}",
+                        suite.id, task.id, protocol, recipe_id
+                    ));
+                }
+                if !recipes.iter().any(|recipe| recipe.id == *recipe_id) {
+                    return Err(format!(
+                        "suite {} 的 task {} 引用了不存在的 {} 配方 {}",
+                        suite.id, task.id, protocol, recipe_id
+                    ));
+                }
+            }
+            if let Some(duration) = task.duration {
+                if !(1..=86_400).contains(&duration) {
+                    return Err(format!(
+                        "suite {} 的 task {} 时长必须在 1..=86400 秒之间",
+                        suite.id, task.id
+                    ));
+                }
+            }
+            if let Some(targets) = &task.rate_targets_mbps {
+                validate_ui_rate_targets(
+                    &format!("suite {} 的 task {} rate_targets_mbps", suite.id, task.id),
+                    targets,
+                )?;
+            }
+            if protocol == "ping" && task.ping_count.is_some_and(|v| v > 100_000) {
+                return Err(format!("suite {} 的 ping 次数超过 100000", suite.id));
+            }
+            if task
+                .ping_payload_sizes
+                .as_ref()
+                .is_some_and(|sizes| sizes.iter().any(|v| *v > crate::ping::MAX_PAYLOAD))
+            {
+                return Err(format!("suite {} 的 ping 包长超过上限", suite.id));
+            }
+            if protocol == "ping" && task.ping_payload_sizes.as_ref().is_some_and(Vec::is_empty) {
+                return Err(format!(
+                    "suite {} 的 task {} 至少需要一个 ping 包长",
+                    suite.id, task.id
+                ));
+            }
+            for (label, raw) in [
+                ("A→B", &task.rx_target_bidir_ab),
+                ("B→A", &task.rx_target_bidir_ba),
+            ] {
+                if raw.trim().is_empty() {
+                    continue;
+                }
+                if !task
+                    .directions
+                    .iter()
+                    .filter_map(|d| canonical_ui_direction(d))
+                    .any(|d| d == "bidir")
+                {
+                    return Err(format!(
+                        "suite {} 的 task {} 填了 {label} 双向门限但未选择双向",
+                        suite.id, task.id
+                    ));
+                }
+                if let Some(RxTarget::Percent(_)) = parse_rx_target(raw)? {
+                    return Err(format!(
+                        "suite {} 的 task {} 双向门限只能填绝对 Mbps",
+                        suite.id, task.id
+                    ));
+                }
+            }
+        }
+        if !suite.order.is_empty() {
+            let mut seen_order = HashSet::new();
+            for task_id in &suite.order {
+                if !task_ids.contains(task_id) || !seen_order.insert(task_id) {
+                    return Err(format!(
+                        "suite {} 的 order 引用了无效或重复 task {}",
+                        suite.id, task_id
+                    ));
+                }
+            }
+        }
+    }
+
+    let set_ids: HashSet<&str> = plan.link_sets.iter().map(|s| s.id.as_str()).collect();
+    let mut binding_ids = HashSet::new();
+    for binding in &plan.bindings {
+        if binding.id.trim().is_empty() || !binding_ids.insert(binding.id.clone()) {
+            return Err(format!("binding id 缺失或重复：{}", binding.id));
+        }
+        if !set_ids.contains(binding.link_set_id.as_str()) {
             return Err(format!(
-                "配对 {} / {} 至少勾 TCP / UDP / PING 之一",
+                "binding {} 引用了不存在的 link_set {}",
+                binding.id, binding.link_set_id
+            ));
+        }
+        if !suite_ids.contains(binding.suite_id.as_str()) {
+            return Err(format!(
+                "binding {} 引用了不存在的 suite {}",
+                binding.id, binding.suite_id
+            ));
+        }
+        // `append` has no defined merge semantics in the current planner:
+        // bindings already select an explicit set of pair refs and a suite,
+        // while the compiler treats every binding as a complete replacement
+        // assignment.  Accepting it here would therefore make a hand-written
+        // project appear to request append while silently executing replace.
+        // Keep the omitted/replace spellings (both mean the current behavior)
+        // and reject the unsupported mode at the API boundary.
+        if !binding.mode.trim().is_empty() && !binding.mode.trim().eq_ignore_ascii_case("replace") {
+            return Err(format!(
+                "binding {} 的 mode 只支持 replace（append 尚未支持）",
+                binding.id
+            ));
+        }
+        let set = plan
+            .link_sets
+            .iter()
+            .find(|s| s.id == binding.link_set_id)
+            .expect("set id checked above");
+        if !binding.pair_ids.is_empty() {
+            let mut seen_pair_ids = HashSet::new();
+            for pair_id in &binding.pair_ids {
+                if !seen_pair_ids.insert(pair_id) {
+                    return Err(format!(
+                        "binding {} 重复引用了 pair_ref {}",
+                        binding.id, pair_id
+                    ));
+                }
+                if !set.pair_refs.iter().any(|pair| pair.id == *pair_id) {
+                    return Err(format!(
+                        "binding {} 引用了不存在的 pair_ref {}",
+                        binding.id, pair_id
+                    ));
+                }
+            }
+        }
+        // A binding must always resolve to at least one concrete pair.  This
+        // check deliberately happens after validating `pair_ids`, so an
+        // unknown ID still gets the more useful "不存在" diagnostic above.
+        let has_effective_pairs = if binding.pair_ids.is_empty() {
+            !set.pair_refs.is_empty()
+        } else {
+            binding
+                .pair_ids
+                .iter()
+                .any(|pair_id| set.pair_refs.iter().any(|pair| pair.id == *pair_id))
+        };
+        if !has_effective_pairs {
+            return Err(format!(
+                "binding {} 没有可执行的 pair_ref；请先为链路集合添加网口对",
+                binding.id
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// 矩阵里的一行。`pinned` 是在「网口与策略」里单独指定了 UDP `-b` 的网口，
+/// 逐对档位能不能生效要看它。
+fn validate_pair(
+    state: &UiState,
+    pair: &PairSelection,
+    udp_group_count: usize,
+    tcp_group_count: usize,
+) -> Result<(), String> {
+    if pair.src == pair.dst
+        || !endpoint_exists(state, &pair.src)
+        || !endpoint_exists(state, &pair.dst)
+    {
+        return Err(format!(
+            "测试配对已失效：{} -> {}。请刷新网口后重新选择",
+            pair.src, pair.dst
+        ));
+    }
+    if !values_are_allowed(&pair.directions, &["ab", "ba", "bidir"]) {
+        return Err(format!(
+            "配对 {} / {} 至少勾一个有效方向",
+            pair.src, pair.dst
+        ));
+    }
+    // PING 和 TCP/UDP 并排放在界面的「协议」列，白名单里也必须一起放行。
+    // 漏掉它不只是「PING 跑不了」：整条请求会被判非法，连同一配对里本来
+    // 能跑的 TCP/UDP 一起废掉，而错误文案还在让人去勾 TCP 或 UDP。
+    // 双向门限只收绝对值，且只有勾了「双向」才有意义。填了却没勾双向要报错
+    // 而不是静默忽略——静默忽略的话，人会以为门限放低了、看到 FAIL 去查链路。
+    let bidir_selected = pair.directions.iter().any(|d| d == "bidir");
+    for (label, raw) in [
+        ("A→B", &pair.rx_target_bidir_ab),
+        ("B→A", &pair.rx_target_bidir_ba),
+    ] {
+        if raw.trim().is_empty() {
+            continue;
+        }
+        if !bidir_selected {
+            return Err(format!(
+                "配对 {} / {} 填了 {label} 双向门限，却没有勾「双向」。\
+                 双向门限只作用于双向并发单元；单向的门限在「网口与策略」里改",
                 pair.src, pair.dst
             ));
         }
-        if !values_are_allowed(&pair.ip, &["v4", "v6"]) {
+        match parse_rx_target(raw).map_err(|error| {
+            format!(
+                "配对 {} / {} 的 {label} 双向门限：{error}",
+                pair.src, pair.dst
+            )
+        })? {
+            Some(RxTarget::Mbps(_)) => {}
+            Some(RxTarget::Percent(_)) => {
+                return Err(format!(
+                    "配对 {} / {} 的 {label} 双向门限只能填绝对 Mbps。\
+                     百分比要按单块网卡的协商速率换算，而双向门限说的是这两块口\
+                     并发时的能力，两者不成比例",
+                    pair.src, pair.dst
+                ))
+            }
+            None => {}
+        }
+    }
+    // 选了默认组之外的组，却没勾 UDP：那几组一个单元都不会跑。和双向门限
+    // 同一条规矩——选了却不生效要当场说，静默忽略的话人会以为跑的是那组。
+    let udp_selected = pair.transports.iter().any(|t| t == "udp");
+    if !udp_selected && pair.udp_groups.iter().any(|index| *index > 0) {
+        return Err(format!(
+            "配对 {} / {} 选了 UDP 参数组，却没有勾 UDP",
+            pair.src, pair.dst
+        ));
+    }
+    for index in &pair.udp_groups {
+        if *index > udp_group_count {
             return Err(format!(
-                "配对 {} / {} 至少勾 IPv4 或 IPv6",
+                "配对 {} / {} 选的 UDP 参数组不存在（共 {udp_group_count} 个附加组）",
                 pair.src, pair.dst
             ));
         }
     }
+    // TCP 参数组同 UDP：选了默认组之外的组却没勾 TCP，那几组一个单元都不跑，
+    // 当场说清楚，别静默忽略。
+    let tcp_selected = pair.transports.iter().any(|t| t == "tcp");
+    if !tcp_selected && pair.tcp_groups.iter().any(|index| *index > 0) {
+        return Err(format!(
+            "配对 {} / {} 选了 TCP 参数组，却没有勾 TCP",
+            pair.src, pair.dst
+        ));
+    }
+    for index in &pair.tcp_groups {
+        if *index > tcp_group_count {
+            return Err(format!(
+                "配对 {} / {} 选的 TCP 参数组不存在（共 {tcp_group_count} 个附加组）",
+                pair.src, pair.dst
+            ));
+        }
+    }
+    if !values_are_allowed(&pair.transports, &["tcp", "udp", "ping"]) {
+        return Err(format!(
+            "配对 {} / {} 至少勾 TCP / UDP / PING 之一",
+            pair.src, pair.dst
+        ));
+    }
+    if !values_are_allowed(&pair.ip, &["v4", "v6"]) {
+        return Err(format!(
+            "配对 {} / {} 至少勾 IPv4 或 IPv6",
+            pair.src, pair.dst
+        ));
+    }
+    Ok(())
+}
 
+/// 「网口与策略」那张表。
+fn validate_nic_policies(state: &UiState, req: &RunRequest) -> Result<(), String> {
     let mut seen = HashSet::new();
     for policy in &req.nic_policies {
         if !endpoint_exists(state, &policy.endpoint) {
@@ -1137,7 +2234,7 @@ fn validate_request(state: &UiState, req: &RunRequest) -> Result<(), String> {
                 policy.endpoint
             ));
         }
-        if !seen.insert(policy.endpoint.as_str()) {
+        if !seen.insert(policy.endpoint.clone()) {
             return Err(format!("网口策略重复：{}", policy.endpoint));
         }
         parse_rx_target(&policy.rx_target)
@@ -1153,14 +2250,54 @@ fn validate_request(state: &UiState, req: &RunRequest) -> Result<(), String> {
             }
         }
         if !policy.udp_bandwidth.trim().is_empty() {
-            UdpProfile::bw(policy.udp_bandwidth.trim())
-                .parsed_bandwidth()
-                .map_err(|error| format!("{} 的 UDP -b 无效：{error}", policy.endpoint))?;
+            check_udp_bandwidth(policy.udp_bandwidth.trim(), &policy.endpoint)?;
         }
     }
     Ok(())
 }
 
+/// 界面上 UDP 并发流数的上限，和输入框的 `max` 对齐。
+const MAX_UDP_STREAMS: u32 = 32;
+
+/// `-b` 的量纲护栏。
+///
+/// 输入框里的裸数字按 **Mbps** 算（`UdpProfile::parsed_bandwidth` 里无后缀时
+/// 乘 10^6），而「预览任务」以前打印的是 bit/s 整数——把 `1000000000` 抄回输入框
+/// 就变成 10^9 Mbps，解析得过、校验得过，然后拿着一个天文数字去灌包。
+///
+/// 400Gbps 远高于这套工具面对的任何链路（最快 10GETH），又远低于那种手滑，
+/// 挡在这里能把「填错单位」变成一句能读懂的话。
+const MAX_UDP_BANDWIDTH_MBPS: f64 = 400_000.0;
+
+/// 解析并检查一个 `-b` 档位。`label` 用来说清是哪一格填错了。
+fn check_udp_bandwidth(raw: &str, label: &str) -> Result<(), String> {
+    let parsed = UdpProfile::bw(raw)
+        .parsed_bandwidth()
+        .map_err(|error| format!("{label} 的 UDP -b {raw:?} 无效：{error}"))?;
+    if parsed.mbps > MAX_UDP_BANDWIDTH_MBPS {
+        return Err(format!(
+            "{label} 的 UDP -b {raw:?} 折合 {:.0} Mbps，超出这套工具面对的任何链路。\
+             输入框里的裸数字按 Mbps 算（`1000` = 1000Mbps），要写 bit/s 请加后缀：\
+             `1000m` 或 `1G` 都是 1000Mbps",
+            parsed.mbps
+        ));
+    }
+    Ok(())
+}
+
+/// 在「网口与策略」里单独指定了 UDP `-b` 的那些网口。
+///
+/// 这个覆盖按**发送腿**生效（见 builder 里的 `link_policy(...).udp_bandwidth`），
+/// 所以它同时决定了「全局/逐对档位对这条腿还有没有意义」。
+fn udp_pinned_senders(req: &RunRequest) -> HashSet<String> {
+    req.nic_policies
+        .iter()
+        .filter(|policy| !policy.udp_bandwidth.trim().is_empty())
+        .map(|policy| policy.endpoint.clone())
+        .collect()
+}
+
+#[allow(dead_code)]
 fn validated_config_from_request(state: &UiState, req: &RunRequest) -> Result<Config, String> {
     validate_request(state, req)?;
     let cfg = config_from_request(state, req);
@@ -1172,9 +2309,73 @@ fn validated_config_from_request(state: &UiState, req: &RunRequest) -> Result<Co
     }
 }
 
+/// 一轮里所有配对共用的档位。
+///
+/// 逐对覆盖只在这几项上做减法（某一行自己的 `-b`、自己的流数），所以把它们收成
+/// 一个东西传给 `specs_for_pair`，而不是把七八个列表一路传参——那样每加一档
+/// 扫描维度就要改三处签名。
+struct Sweeps {
+    /// 第 0 项是默认组（执行区的 `-w` / `-P` 两个框），其余是附加组。
+    tcp_groups: Vec<ResolvedTcpGroup>,
+    /// 第 0 项是默认组（执行区那几个框），其余是附加组。
+    udp_groups: Vec<ResolvedUdpGroup>,
+    ping_sizes: Vec<u32>,
+    duration: u64,
+    /// 在「网口与策略」里单独指定了 UDP `-b` 的网口。
+    pinned_senders: HashSet<String>,
+}
+
+/// 一组 UDP 参数展开成「跑什么」。
+#[derive(Debug, Clone, Default)]
+struct ResolvedUdpGroup {
+    bandwidths: Vec<String>,
+    lengths: Vec<String>,
+    windows: Vec<String>,
+    streams: u32,
+    /// 只有默认组会用到：执行区的 `-b` 留空时，沿用配置文件里那份 profile
+    /// **原样**。那份不一定是整齐的叉积（可以是 `1m/64` + `500m/1400`），
+    /// 拆成三个轴再乘回去会把它变成另一组档位。
+    verbatim: Option<Vec<UdpProfile>>,
+}
+
+impl ResolvedUdpGroup {
+    fn profiles(&self) -> Vec<UdpProfile> {
+        if let Some(profiles) = &self.verbatim {
+            return profiles.clone();
+        }
+        self.bandwidths
+            .iter()
+            .flat_map(|bandwidth| udp_profiles_for(bandwidth, &self.lengths, &self.windows))
+            .collect()
+    }
+}
+
+/// 一组 TCP 参数展开成「跑什么」：`-w × -P` 两个轴。第 0 组是默认组。
+#[derive(Debug, Clone, Default)]
+struct ResolvedTcpGroup {
+    /// socket buffer 档位。默认组经过 `non_empty` 兜底不会为空；附加组留空
+    /// 表示这一维不下发 `-w`（builder 见到空列表跑一条不带 `-w` 的）。
+    windows: Vec<String>,
+    /// 并发流数档位；空按 `[1]`（builder 那边 -P 恒发，和 UDP 流数同理）。
+    stream_steps: Vec<u32>,
+}
+
+impl Sweeps {
+    /// 选中的那一组。越界回落到默认组——校验已经挡过一次，这里不该再 panic。
+    fn udp_group(&self, index: usize) -> &ResolvedUdpGroup {
+        self.udp_groups.get(index).unwrap_or(&self.udp_groups[0])
+    }
+    fn tcp_group(&self, index: usize) -> &ResolvedTcpGroup {
+        self.tcp_groups.get(index).unwrap_or(&self.tcp_groups[0])
+    }
+}
+
 /// 把界面状态翻译成一份 config。规划和执行都走这一个函数，
 /// 保证「预计耗时」和真正跑的是同一份东西。
 fn config_from_request(state: &UiState, req: &RunRequest) -> Config {
+    if let Some(plan) = req.ui_plan.as_ref() {
+        return config_from_ui_plan(state, req, plan);
+    }
     let mut cfg = state.cfg.clone();
     cfg.agent_host = state.agent_host.clone();
     cfg.screenshot = req.screenshot;
@@ -1207,156 +2408,907 @@ fn config_from_request(state: &UiState, req: &RunRequest) -> Config {
         .copied()
         .filter(|size| *size > 0 && seen_sizes.insert(*size))
         .collect();
+    // 默认组的档位同时写回 `iperf.udp_profiles`：下载出来的 config 交给
+    // `master --auto` 跑时，没有「组」这个概念，读的就是这一份。
     let global_udp: Vec<UdpProfile> = req
         .udp_bandwidths
         .iter()
         .filter(|b| !b.trim().is_empty())
         .flat_map(|b| udp_profiles_for(b.trim(), &lengths, &udp_windows))
         .collect();
-    // 全局档位保留一份，供没有逐对覆盖时使用；builder 会在这一层之上再做
-    // 路径上限裁剪。
     if !global_udp.is_empty() {
-        cfg.iperf.udp_profiles = global_udp.clone();
+        cfg.iperf.udp_profiles = global_udp;
     }
     cfg.iperf.tcp_windows = windows.clone();
 
-    let explicit_udp_senders: HashSet<String> = req
-        .nic_policies
-        .iter()
-        .filter(|policy| !policy.udp_bandwidth.trim().is_empty())
-        .map(|policy| policy.endpoint.clone())
-        .collect();
     for policy in &req.nic_policies {
         if let Some(profile) = nic_profile(policy) {
             cfg.link_profiles.by_nic.push(profile);
         }
     }
 
-    let mut tests: Vec<TestSpec> = Vec::new();
-    for (idx, pair) in req.pairs.iter().enumerate() {
-        let directions = pair.directions.clone();
-        let ip = pair.ip.clone();
-        let wants = |t: &str| pair.transports.iter().any(|x| x == t);
-        let (want_tcp, want_udp) = (wants("tcp"), wants("udp"));
-        // ping 在配置模型里是 `kinds` 而不是 `transports`——界面把它和 TCP/UDP
-        // 并排放在「协议」列只是给人看的，落到 config 上必须分开：ping 单元
-        // 不带 transport，走 builder 里那条独立分支。
-        let want_ping = wants("ping");
+    // 默认组 = 执行区那几个框；`-b` 留空时沿用配置文件里那份 profile 原样。
+    let bandwidths = cleaned_list(&req.udp_bandwidths);
+    let mut udp_groups = vec![ResolvedUdpGroup {
+        verbatim: bandwidths
+            .is_empty()
+            .then(|| cfg.iperf.udp_profiles.clone()),
+        bandwidths,
+        lengths,
+        windows: udp_windows,
+        streams: req.udp_streams.max(1),
+    }];
+    udp_groups.extend(req.udp_groups.iter().map(|group| ResolvedUdpGroup {
+        bandwidths: cleaned_list(&group.bandwidths),
+        lengths: cleaned_list(&group.lengths),
+        windows: cleaned_list(&group.windows),
+        streams: group.streams.max(1),
+        verbatim: None,
+    }));
 
-        // 双向门限只有勾了「双向」才有意义；没勾时不写进 config，
-        // 免得它出现在下载下来的 config.json 里让人以为在生效。
-        let bidir_targets = directions
+    // 默认 TCP 组 = 执行区的 `-w` / `-P`。`windows` 已经过 `non_empty` 兜底
+    // （空则回落到配置里的 tcp_windows），`stream_steps` 空则是 `[1]`。
+    let mut tcp_groups = vec![ResolvedTcpGroup {
+        windows: windows.clone(),
+        stream_steps: stream_steps.clone(),
+    }];
+    // 附加组不兜底：`-w` 留空就是那一维不下发 `-w`；`-P` 留空按 `[1]`。
+    tcp_groups.extend(req.tcp_groups.iter().map(|group| {
+        let steps: Vec<u32> = group.streams.iter().copied().filter(|n| *n > 0).collect();
+        ResolvedTcpGroup {
+            windows: cleaned_list(&group.windows),
+            stream_steps: if steps.is_empty() { vec![1] } else { steps },
+        }
+    }));
+
+    let sweeps = Sweeps {
+        tcp_groups,
+        udp_groups,
+        ping_sizes,
+        duration: req.duration.clamp(1, 86_400),
+        pinned_senders: udp_pinned_senders(req),
+    };
+    cfg.tests = req
+        .pairs
+        .iter()
+        .enumerate()
+        .flat_map(|(idx, pair)| specs_for_pair(idx, pair, req, &sweeps))
+        .collect();
+    cfg
+}
+
+/// Apply the request-wide settings shared by legacy and suite requests.  The
+/// suite compiler calls this directly so it does not have to manufacture a
+/// `PairSelection` (which would re-introduce the old shared TCP/UDP fields).
+fn ui_request_base_config(state: &UiState, req: &RunRequest) -> Config {
+    let mut cfg = state.cfg.clone();
+    cfg.agent_host = state.agent_host.clone();
+    cfg.screenshot = req.screenshot;
+    cfg.limit_udp_by_link_speed = req.limit_udp_by_link_speed;
+    cfg.resume = req.resume;
+    cfg.iperf.duration = req.duration.clamp(1, 86_400);
+    cfg.pairs = None;
+    cfg.universal_params = None;
+    cfg.link_profiles.by_nic.clear();
+
+    // Quick-plan tasks intentionally keep protocol-specific knobs on the
+    // task, but PING's convenient default controls still live at the request
+    // level (the same controls used by the legacy matrix).  Carry them into
+    // the compiled config before a task falls back to cfg.ping; otherwise a
+    // user changing "5 次 / 64 字节" in the quick workbench would silently
+    // execute the values from the loaded config instead.
+    if req.ping_count > 0 {
+        cfg.ping.count = req.ping_count;
+    }
+    if !req.ping_payload_sizes.is_empty() {
+        let mut seen = HashSet::new();
+        cfg.ping.payload_sizes = req
+            .ping_payload_sizes
             .iter()
-            .any(|d| d == "bidir")
-            .then(|| crate::config::RateTargets {
-                forward: None,
-                ab: parse_rx_target(&pair.rx_target_bidir_ab)
-                    .ok()
-                    .flatten()
-                    .and_then(rx_target_mbps),
-                ba: parse_rx_target(&pair.rx_target_bidir_ba)
-                    .ok()
-                    .flatten()
-                    .and_then(rx_target_mbps),
-            })
-            .filter(|targets| targets.ab.is_some() || targets.ba.is_some());
+            .copied()
+            .filter(|size| *size > 0 && seen.insert(*size))
+            .collect();
+    }
 
-        let base = |name: String, transports: Vec<String>| TestSpec {
-            name,
-            rate_targets_bidir_mbps: bidir_targets.clone(),
-            src: pair.src.clone(),
-            dst: pair.dst.clone(),
-            direction: OneOrMany::Many(directions.clone()),
-            kinds: vec!["iperf".into()],
-            transports,
-            ip: ip.clone(),
+    let tcp_windows = non_empty(&req.tcp_windows, &cfg.iperf.tcp_windows);
+    cfg.iperf.tcp_windows = tcp_windows;
+    let udp_bandwidths = cleaned_list(&req.udp_bandwidths);
+    if !udp_bandwidths.is_empty() {
+        let lengths = cleaned_list(&req.udp_lengths);
+        let windows = cleaned_list(&req.udp_windows);
+        cfg.iperf.udp_profiles = udp_bandwidths
+            .iter()
+            .flat_map(|b| udp_profiles_for(b, &lengths, &windows))
+            .collect();
+    }
+    for policy in &req.nic_policies {
+        if let Some(profile) = nic_profile(policy) {
+            cfg.link_profiles.by_nic.push(profile);
+        }
+    }
+    cfg
+}
+
+#[derive(Debug, Clone)]
+struct UiTcpProfile {
+    recipe_id: String,
+    window: Option<String>,
+    streams: u32,
+}
+
+#[derive(Debug, Clone)]
+struct UiUdpProfile {
+    recipe_id: String,
+    profile: UdpProfile,
+    streams: u32,
+}
+
+fn first_or_one(values: Vec<u32>, fallback: u32) -> Vec<u32> {
+    let values: Vec<u32> = values.into_iter().filter(|v| *v > 0).collect();
+    if values.is_empty() {
+        vec![fallback.max(1)]
+    } else {
+        values
+    }
+}
+
+fn recipe_tcp_profiles(recipe: &UiRecipe, fallback_streams: &[u32]) -> Vec<UiTcpProfile> {
+    let mut out = Vec::new();
+    if !recipe.profiles.is_empty() {
+        for profile in &recipe.profiles {
+            let streams = profile
+                .tcp_streams
+                .as_ref()
+                .unwrap_or(&profile.streams)
+                .values();
+            let streams = first_or_one(streams, fallback_streams.first().copied().unwrap_or(1));
+            let windows = profile
+                .window
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| vec![Some(value.to_string())])
+                .unwrap_or_else(|| vec![None]);
+            for window in windows {
+                for stream in &streams {
+                    out.push(UiTcpProfile {
+                        recipe_id: recipe.id.clone(),
+                        window: window.clone(),
+                        streams: *stream,
+                    });
+                }
+            }
+        }
+        return out;
+    }
+
+    let windows = cleaned_list(if !recipe.tcp_windows.is_empty() {
+        &recipe.tcp_windows
+    } else {
+        &recipe.windows
+    });
+    let windows: Vec<Option<String>> = if windows.is_empty() {
+        vec![None]
+    } else {
+        windows.into_iter().map(Some).collect()
+    };
+    let streams = first_or_one(
+        recipe.tcp_streams.clone(),
+        fallback_streams.first().copied().unwrap_or(1),
+    );
+    for window in windows {
+        for stream in &streams {
+            out.push(UiTcpProfile {
+                recipe_id: recipe.id.clone(),
+                window: window.clone(),
+                streams: *stream,
+            });
+        }
+    }
+    // An entirely empty recipe is a valid fixed recipe: one TCP stream and no
+    // explicit socket window.
+    if out.is_empty() {
+        out.push(UiTcpProfile {
+            recipe_id: recipe.id.clone(),
+            window: None,
             streams: 1,
-            tcp_streams: None,
-            udp_streams: Some(req.udp_streams.max(1)),
-            iperf_duration: Some(req.duration.clamp(1, 86_400)),
-            ping_count: None,
-            ping_payload_sizes: None,
-            tcp_windows: None,
-            udp_profiles: None,
-            rate_mode: None,
-            rate_targets_mbps: None,
-        };
+        });
+    }
+    out
+}
 
-        // TCP 每个 -P 档位独立成一份 TestSpec：`tcp_streams` 在配置模型里是标量，
-        // 而 -w 本来就是数组，由 builder 自己展开。TCP/UDP 也必须拆开，否则
-        // 「3 个 -P 档位」会把与 -P 无关的 UDP 单元复制三遍。
-        if want_tcp {
-            for streams in &stream_steps {
-                let mut spec = base(format!("ui-{}-tcp-P{streams}", idx + 1), vec!["tcp".into()]);
-                spec.tcp_streams = Some(*streams);
-                spec.tcp_windows = Some(windows.clone());
-                tests.push(spec);
-            }
-        }
-        if want_udp {
-            let src_pinned = explicit_udp_senders.contains(&pair.src);
-            let dst_pinned = explicit_udp_senders.contains(&pair.dst);
-            // 一个方向的每条发送腿都有按网口覆盖时，全局 -b 档位对它不起作用：
-            // builder 会把每一档都替换回那个覆盖值，扫 N 档就得到 N 个完全相同
-            // 的单元。必须**逐方向**判断而不是整对判断——「ab 被发送端钉死、
-            // 反向 ba 仍要扫档位」是最常见的组合，按整对判断时那三个 ab 单元
-            // 会一模一样地各跑一遍全程。
-            let pinned_direction = |d: &String| match d.as_str() {
-                "ab" => src_pinned,
-                "ba" => dst_pinned,
-                "bidir" => src_pinned && dst_pinned,
-                _ => false,
-            };
-            let (pinned, swept): (Vec<String>, Vec<String>) =
-                directions.iter().cloned().partition(pinned_direction);
-
-            if !pinned.is_empty() {
-                // 占位值：builder 会按腿替换成各自的精确覆盖值，这里填什么都行，
-                // 取一个真实值只是为了万一覆盖项被后续校验剔除时不至于离谱。
-                let placeholder = req
-                    .nic_policies
-                    .iter()
-                    .find(|policy| {
-                        (policy.endpoint == pair.src || policy.endpoint == pair.dst)
-                            && !policy.udp_bandwidth.trim().is_empty()
-                    })
-                    .map(|policy| policy.udp_bandwidth.trim())
-                    .unwrap_or("1m");
-                let mut spec = base(format!("ui-{}-udp-pinned", idx + 1), vec!["udp".into()]);
-                spec.direction = OneOrMany::Many(pinned);
-                // -b 被网口钉死，但 -l 档位仍要逐档跑：钉住的是带宽，不是报文长度。
-                spec.udp_profiles = Some(udp_profiles_for(placeholder, &lengths, &udp_windows));
-                tests.push(spec);
-            }
-            if !swept.is_empty() {
-                // 还有腿没被覆盖的方向照常逐档扫描；已覆盖的那条腿在每个单元里
-                // 保持固定值（双向单元里一钉一扫就是这种情况）。
-                let mut spec = base(format!("ui-{}-udp", idx + 1), vec!["udp".into()]);
-                spec.direction = OneOrMany::Many(swept);
-                spec.udp_profiles = Some(if global_udp.is_empty() {
-                    cfg.iperf.udp_profiles.clone()
-                } else {
-                    global_udp.clone()
+fn recipe_udp_profiles(
+    recipe: &UiRecipe,
+    fallback_bandwidths: &[String],
+    fallback_streams: u32,
+) -> Vec<UiUdpProfile> {
+    let mut out = Vec::new();
+    if !recipe.udp_profiles.is_empty() {
+        let streams = first_or_one(recipe.udp_streams.clone(), fallback_streams);
+        for profile in &recipe.udp_profiles {
+            for stream in &streams {
+                out.push(UiUdpProfile {
+                    recipe_id: recipe.id.clone(),
+                    profile: UdpProfile {
+                        bandwidth: profile.bandwidth.trim().to_string(),
+                        length: profile
+                            .length
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .map(str::to_string),
+                        window: profile
+                            .window
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|value| !value.is_empty())
+                            .map(str::to_string),
+                    },
+                    streams: *stream,
                 });
-                tests.push(spec);
             }
         }
-        if want_ping {
-            // 每个包长档位在 builder 里各成一个单元，所以这里必须让界面把
-            // 次数和包长填全：不填就回落到 ping.count=100 × 三档包长，
-            // 每个配对每个方向平白多出三个各一百多秒的单元，而这件事要到
-            // 「预览任务」才看得见，太晚了。
-            let mut spec = base(format!("ui-{}-ping", idx + 1), Vec::new());
-            spec.kinds = vec!["ping".into()];
-            spec.ping_count = (req.ping_count > 0).then_some(req.ping_count);
-            if !ping_sizes.is_empty() {
-                spec.ping_payload_sizes = Some(ping_sizes.clone());
+        return out;
+    }
+    if !recipe.profiles.is_empty() {
+        for profile in &recipe.profiles {
+            let bandwidths: Vec<String> = profile
+                .bandwidth
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| vec![value.trim().to_string()])
+                .unwrap_or_else(|| cleaned_list(&recipe.bandwidths));
+            if bandwidths.is_empty() {
+                continue;
             }
-            tests.push(spec);
+            let streams = profile
+                .udp_streams
+                .as_ref()
+                .unwrap_or(&profile.streams)
+                .values();
+            let streams = first_or_one(streams, fallback_streams);
+            for bandwidth in bandwidths {
+                for stream in &streams {
+                    out.push(UiUdpProfile {
+                        recipe_id: recipe.id.clone(),
+                        profile: UdpProfile {
+                            bandwidth: bandwidth.clone(),
+                            length: profile
+                                .length
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|value| !value.is_empty())
+                                .map(str::to_string),
+                            window: profile
+                                .window
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|value| !value.is_empty())
+                                .map(str::to_string),
+                        },
+                        streams: *stream,
+                    });
+                }
+            }
+        }
+        return out;
+    }
+
+    let bandwidths = cleaned_list(&recipe.bandwidths);
+    let bandwidths = if bandwidths.is_empty() {
+        cleaned_list(fallback_bandwidths)
+    } else {
+        bandwidths
+    };
+    let lengths = cleaned_list(&recipe.lengths);
+    let windows = cleaned_list(&recipe.windows);
+    let lengths: Vec<Option<String>> = if lengths.is_empty() {
+        vec![None]
+    } else {
+        lengths.into_iter().map(Some).collect()
+    };
+    let windows: Vec<Option<String>> = if windows.is_empty() {
+        vec![None]
+    } else {
+        windows.into_iter().map(Some).collect()
+    };
+    let streams = first_or_one(recipe.udp_streams.clone(), fallback_streams);
+    for bandwidth in bandwidths {
+        for length in &lengths {
+            for window in &windows {
+                for stream in &streams {
+                    out.push(UiUdpProfile {
+                        recipe_id: recipe.id.clone(),
+                        profile: UdpProfile {
+                            bandwidth: bandwidth.clone(),
+                            length: length.clone(),
+                            window: window.clone(),
+                        },
+                        streams: *stream,
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
+fn normalized_ui_directions(raw: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for value in raw {
+        match canonical_ui_direction(value) {
+            Some("both") => {
+                for direction in ["ab", "ba"] {
+                    if !out.iter().any(|v| v == direction) {
+                        out.push(direction.to_string());
+                    }
+                }
+            }
+            Some(direction) if !out.iter().any(|v| v == direction) => {
+                out.push(direction.to_string())
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn normalized_ui_ips(raw: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for value in raw {
+        if let Some(ip) = canonical_ui_ip(value) {
+            if !out.iter().any(|v| v == ip) {
+                out.push(ip.to_string());
+            }
+        }
+    }
+    out
+}
+
+fn ui_task_targets(task: &UiTask) -> Option<crate::config::RateTargets> {
+    let ab = parse_rx_target(&task.rx_target_bidir_ab)
+        .ok()
+        .flatten()
+        .and_then(rx_target_mbps);
+    let ba = parse_rx_target(&task.rx_target_bidir_ba)
+        .ok()
+        .flatten()
+        .and_then(rx_target_mbps);
+    (ab.is_some() || ba.is_some()).then_some(crate::config::RateTargets {
+        forward: None,
+        ab,
+        ba,
+    })
+}
+
+fn ui_task_base_spec(
+    name: String,
+    pair: &UiPairRef,
+    task: &UiTask,
+    protocol: &str,
+    directions: &[String],
+    ips: &[String],
+    duration: u64,
+) -> TestSpec {
+    TestSpec {
+        name,
+        src: pair.src.clone(),
+        dst: pair.dst.clone(),
+        direction: OneOrMany::Many(directions.to_vec()),
+        kinds: if protocol == "ping" {
+            vec!["ping".into()]
+        } else {
+            vec!["iperf".into()]
+        },
+        transports: if protocol == "ping" {
+            Vec::new()
+        } else {
+            vec![protocol.to_string()]
+        },
+        ip: ips.to_vec(),
+        streams: 1,
+        tcp_streams: None,
+        udp_streams: None,
+        iperf_duration: Some(task.duration.unwrap_or(duration).clamp(1, 86_400)),
+        ping_count: task.ping_count.filter(|value| *value > 0),
+        ping_payload_sizes: task.ping_payload_sizes.clone(),
+        tcp_windows: None,
+        udp_profiles: None,
+        rate_mode: task.rate_mode,
+        rate_targets_mbps: task.rate_targets_mbps.clone(),
+        rate_targets_bidir_mbps: ui_task_targets(task),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn ui_specs_for_task(
+    pair: &UiPairRef,
+    suite: &UiSuite,
+    task: &UiTask,
+    recipes: &UiRecipes,
+    req: &RunRequest,
+    cfg: &Config,
+    binding_id: &str,
+    link_set_id: &str,
+) -> Vec<TestSpec> {
+    let Some(protocol) = ui_task_protocol(task) else {
+        return Vec::new();
+    };
+    let directions = normalized_ui_directions(&task.directions);
+    let ips = normalized_ui_ips(&task.ip);
+    let mut out = Vec::new();
+    match protocol.as_str() {
+        "tcp" => {
+            let selected: Vec<&UiRecipe> = if task.recipe_ids.is_empty() {
+                Vec::new()
+            } else {
+                task.recipe_ids
+                    .iter()
+                    .filter_map(|id| recipes.tcp.iter().find(|recipe| recipe.id == *id))
+                    .collect()
+            };
+            let fallback_streams: Vec<u32> = req
+                .tcp_streams
+                .iter()
+                .copied()
+                .filter(|value| *value > 0)
+                .collect();
+            let fallback_windows = non_empty(&req.tcp_windows, &cfg.iperf.tcp_windows);
+            let fallback = UiRecipe {
+                id: "default".into(),
+                name: "默认 TCP".into(),
+                tcp_windows: fallback_windows.clone(),
+                tcp_streams: fallback_streams.clone(),
+                ..Default::default()
+            };
+            let recipes: Vec<&UiRecipe> = if selected.is_empty() {
+                vec![&fallback]
+            } else {
+                selected
+            };
+            for recipe in recipes {
+                for profile in recipe_tcp_profiles(recipe, &fallback_streams) {
+                    let suffix = format!(
+                        "{}/{}/{}/{}/{}/{}",
+                        ui_name_segment(link_set_id),
+                        ui_name_segment(binding_id),
+                        ui_name_segment(&pair.id),
+                        ui_name_segment(&suite.id),
+                        ui_name_segment(&task.id),
+                        ui_name_segment(&profile.recipe_id)
+                    );
+                    let mut spec = ui_task_base_spec(
+                        format!("ui-plan/{suffix}/tcp-P{}", profile.streams),
+                        pair,
+                        task,
+                        "tcp",
+                        &directions,
+                        &ips,
+                        req.duration,
+                    );
+                    spec.tcp_streams = Some(profile.streams);
+                    spec.tcp_windows = Some(profile.window.into_iter().collect());
+                    out.push(spec);
+                }
+            }
+        }
+        "udp" => {
+            let selected: Vec<&UiRecipe> = if task.recipe_ids.is_empty() {
+                Vec::new()
+            } else {
+                task.recipe_ids
+                    .iter()
+                    .filter_map(|id| recipes.udp.iter().find(|recipe| recipe.id == *id))
+                    .collect()
+            };
+            let fallback_bandwidths = if req.udp_bandwidths.is_empty() {
+                cfg.iperf
+                    .udp_profiles
+                    .iter()
+                    .map(|profile| profile.bandwidth.clone())
+                    .collect::<Vec<_>>()
+            } else {
+                req.udp_bandwidths.clone()
+            };
+            let mut fallback = UiRecipe {
+                id: "default".into(),
+                name: "默认 UDP".into(),
+                bandwidths: fallback_bandwidths.clone(),
+                lengths: req.udp_lengths.clone(),
+                windows: req.udp_windows.clone(),
+                udp_streams: vec![req.udp_streams.max(1)],
+                ..Default::default()
+            };
+            // With no suite recipe and no request-wide UDP axes, preserve the
+            // configured profile list verbatim (it may be intentionally
+            // non-Cartesian) instead of reconstructing it from bandwidths.
+            if req.udp_bandwidths.is_empty()
+                && req.udp_lengths.is_empty()
+                && req.udp_windows.is_empty()
+            {
+                fallback.udp_profiles = cfg.iperf.udp_profiles.clone();
+            }
+            let recipes: Vec<&UiRecipe> = if selected.is_empty() {
+                vec![&fallback]
+            } else {
+                selected
+            };
+            let src_pinned = req.nic_policies.iter().any(|policy| {
+                policy.endpoint == pair.src && !policy.udp_bandwidth.trim().is_empty()
+            });
+            let dst_pinned = req.nic_policies.iter().any(|policy| {
+                policy.endpoint == pair.dst && !policy.udp_bandwidth.trim().is_empty()
+            });
+            // A pinned sending leg does not depend on the recipe bandwidth.
+            // Collapse such profiles by their remaining dimensions so a scan
+            // over 1G/2G/3G does not run the exact same pinned command three
+            // times.  Keep stream count in the key because it is an actual
+            // execution dimension even when `-b` is overridden.
+            let mut pinned_profiles_seen: HashSet<String> = HashSet::new();
+            for recipe in recipes {
+                for profile in recipe_udp_profiles(recipe, &fallback_bandwidths, req.udp_streams) {
+                    let pinned_direction = |direction: &String| match direction.as_str() {
+                        "ab" => src_pinned,
+                        "ba" => dst_pinned,
+                        "bidir" => src_pinned && dst_pinned,
+                        _ => false,
+                    };
+                    let (pinned, swept): (Vec<String>, Vec<String>) =
+                        directions.iter().cloned().partition(pinned_direction);
+                    let suffix = format!(
+                        "{}/{}/{}/{}/{}/{}",
+                        ui_name_segment(link_set_id),
+                        ui_name_segment(binding_id),
+                        ui_name_segment(&pair.id),
+                        ui_name_segment(&suite.id),
+                        ui_name_segment(&task.id),
+                        ui_name_segment(&profile.recipe_id)
+                    );
+                    if !pinned.is_empty() {
+                        let pinned_key = format!(
+                            "{:?}|{:?}|{}",
+                            profile.profile.length, profile.profile.window, profile.streams
+                        );
+                        if !pinned_profiles_seen.insert(pinned_key) {
+                            // The same pinned profile was already emitted for
+                            // this task/recipe.  Swept directions still need
+                            // every profile and are handled below.
+                        } else {
+                            let mut spec = ui_task_base_spec(
+                                format!("ui-plan/{suffix}/udp-pinned"),
+                                pair,
+                                task,
+                                "udp",
+                                &pinned,
+                                &ips,
+                                req.duration,
+                            );
+                            let placeholder = req
+                                .nic_policies
+                                .iter()
+                                .find(|policy| {
+                                    (policy.endpoint == pair.src || policy.endpoint == pair.dst)
+                                        && !policy.udp_bandwidth.trim().is_empty()
+                                })
+                                .map(|policy| policy.udp_bandwidth.trim().to_string())
+                                .unwrap_or_else(|| profile.profile.bandwidth.clone());
+                            let mut pinned_profile = profile.profile.clone();
+                            pinned_profile.bandwidth = placeholder;
+                            spec.udp_streams = Some(profile.streams);
+                            spec.udp_profiles = Some(vec![pinned_profile]);
+                            out.push(spec);
+                        }
+                    }
+                    if !swept.is_empty() {
+                        let mut spec = ui_task_base_spec(
+                            format!("ui-plan/{suffix}/udp"),
+                            pair,
+                            task,
+                            "udp",
+                            &swept,
+                            &ips,
+                            req.duration,
+                        );
+                        spec.udp_streams = Some(profile.streams);
+                        spec.udp_profiles = Some(vec![profile.profile.clone()]);
+                        out.push(spec);
+                    }
+                }
+            }
+        }
+        "ping" => {
+            let selected: Vec<String> = if task.recipe_ids.is_empty() {
+                vec!["default".into()]
+            } else {
+                task.recipe_ids.clone()
+            };
+            for recipe_id in selected {
+                let suffix = format!(
+                    "{}/{}/{}/{}/{}/{}",
+                    ui_name_segment(link_set_id),
+                    ui_name_segment(binding_id),
+                    ui_name_segment(&pair.id),
+                    ui_name_segment(&suite.id),
+                    ui_name_segment(&task.id),
+                    ui_name_segment(&recipe_id)
+                );
+                out.push(ui_task_base_spec(
+                    format!("ui-plan/{suffix}/ping"),
+                    pair,
+                    task,
+                    "ping",
+                    &directions,
+                    &ips,
+                    req.duration,
+                ));
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+fn config_from_ui_plan(state: &UiState, req: &RunRequest, plan: &UiPlan) -> Config {
+    let mut cfg = ui_request_base_config(state, req);
+    let mut bindings: Vec<(usize, &UiBinding)> = plan.bindings.iter().enumerate().collect();
+    bindings.sort_by_key(|(index, binding)| (binding.order, *index));
+    let mut tests = Vec::new();
+    for (_, binding) in bindings {
+        let Some(set) = plan
+            .link_sets
+            .iter()
+            .find(|set| set.id == binding.link_set_id)
+        else {
+            continue;
+        };
+        let Some(suite) = plan
+            .suites
+            .iter()
+            .find(|suite| suite.id == binding.suite_id)
+        else {
+            continue;
+        };
+        let pairs: Vec<&UiPairRef> = if binding.pair_ids.is_empty() {
+            set.pair_refs.iter().collect()
+        } else {
+            binding
+                .pair_ids
+                .iter()
+                .filter_map(|id| set.pair_refs.iter().find(|pair| pair.id == *id))
+                .collect()
+        };
+        let mut tasks: Vec<&UiTask> = Vec::new();
+        if suite.order.is_empty() {
+            tasks.extend(suite.tasks.iter());
+        } else {
+            for task_id in &suite.order {
+                if let Some(task) = suite.tasks.iter().find(|task| task.id == *task_id) {
+                    tasks.push(task);
+                }
+            }
+            // Validation permits a partial order for forward compatibility;
+            // append unmentioned tasks in declaration order.
+            for task in &suite.tasks {
+                if !suite.order.iter().any(|id| id == &task.id) {
+                    tasks.push(task);
+                }
+            }
+        }
+        for pair in pairs {
+            for task in &tasks {
+                tests.extend(ui_specs_for_task(
+                    pair,
+                    suite,
+                    task,
+                    &plan.recipes,
+                    req,
+                    &cfg,
+                    &binding.id,
+                    &set.id,
+                ));
+            }
         }
     }
     cfg.tests = tests;
     cfg
+}
+
+/// 这一行要跑哪几组：去重保序，空列表按「只跑默认组」解读。
+///
+/// 去重是必须的：同一组选两次会生成两批同名单元，resume 里互相覆盖，
+/// 后写的那条赢——于是可能跳过一个其实 FAIL 了的单元。
+fn selected_udp_groups(pair: &PairSelection) -> Vec<usize> {
+    if pair.udp_groups.is_empty() {
+        return vec![0];
+    }
+    let mut seen = HashSet::new();
+    pair.udp_groups
+        .iter()
+        .copied()
+        .filter(|index| seen.insert(*index))
+        .collect()
+}
+
+/// TCP 版的同一件事：去重保序，空列表按「只跑默认组」解读。
+fn selected_tcp_groups(pair: &PairSelection) -> Vec<usize> {
+    if pair.tcp_groups.is_empty() {
+        return vec![0];
+    }
+    let mut seen = HashSet::new();
+    pair.tcp_groups
+        .iter()
+        .copied()
+        .filter(|index| seen.insert(*index))
+        .collect()
+}
+
+/// 矩阵里的一行 -> 若干条 TestSpec。
+///
+/// 一行会被拆开是因为配置模型里 `tcp_streams` 是标量、ping 挂在 `kinds` 上、
+/// 而 UDP 的「被网口钉死的方向」和「还要扫档位的方向」用的是两份不同的档位。
+fn specs_for_pair(
+    idx: usize,
+    pair: &PairSelection,
+    req: &RunRequest,
+    sweeps: &Sweeps,
+) -> Vec<TestSpec> {
+    let mut tests: Vec<TestSpec> = Vec::new();
+    let directions = pair.directions.clone();
+    let ip = pair.ip.clone();
+    let wants = |t: &str| pair.transports.iter().any(|x| x == t);
+    let (want_tcp, want_udp) = (wants("tcp"), wants("udp"));
+    // ping 在配置模型里是 `kinds` 而不是 `transports`——界面把它和 TCP/UDP
+    // 并排放在「协议」列只是给人看的，落到 config 上必须分开：ping 单元
+    // 不带 transport，走 builder 里那条独立分支。
+    let want_ping = wants("ping");
+
+    // 双向门限只有勾了「双向」才有意义；没勾时不写进 config，
+    // 免得它出现在下载下来的 config.json 里让人以为在生效。
+    let bidir_targets = directions
+        .iter()
+        .any(|d| d == "bidir")
+        .then(|| crate::config::RateTargets {
+            forward: None,
+            ab: parse_rx_target(&pair.rx_target_bidir_ab)
+                .ok()
+                .flatten()
+                .and_then(rx_target_mbps),
+            ba: parse_rx_target(&pair.rx_target_bidir_ba)
+                .ok()
+                .flatten()
+                .and_then(rx_target_mbps),
+        })
+        .filter(|targets| targets.ab.is_some() || targets.ba.is_some());
+
+    let base = |name: String, transports: Vec<String>| TestSpec {
+        name,
+        rate_targets_bidir_mbps: bidir_targets.clone(),
+        src: pair.src.clone(),
+        dst: pair.dst.clone(),
+        direction: OneOrMany::Many(directions.clone()),
+        kinds: vec!["iperf".into()],
+        transports,
+        ip: ip.clone(),
+        streams: 1,
+        tcp_streams: None,
+        // UDP 流数只写在 UDP 单元上。写在 TCP/ping 单元上既没有意义，又会让
+        // 回填时分不清「默认组的流数」是哪一个（那边是按 tests[] 反推的）。
+        udp_streams: None,
+        iperf_duration: Some(sweeps.duration),
+        ping_count: None,
+        ping_payload_sizes: None,
+        tcp_windows: None,
+        udp_profiles: None,
+        rate_mode: None,
+        rate_targets_mbps: None,
+    };
+
+    // TCP 每个 -P 档位独立成一份 TestSpec：`tcp_streams` 在配置模型里是标量，
+    // 而 -w 本来就是数组，由 builder 自己展开。TCP/UDP 也必须拆开，否则
+    // 「3 个 -P 档位」会把与 -P 无关的 UDP 单元复制三遍。
+    // 选中的每一组各生成一批 TCP 单元（`-w × -P`）。同一行选两组 = 这一对
+    // 跑两遍，参数各按各的组来——和 UDP 的多组展开一模一样。
+    if want_tcp {
+        for group_index in selected_tcp_groups(pair) {
+            let tcp = sweeps.tcp_group(group_index);
+            // 默认组沿用原来的单元名（`ui-N-tcp-P{P}`），改名会改掉 resume id
+            // ——虽然 TCP 的 resume id 只认 profile（-w/-P），不认 spec.name，
+            // 这里保持一致仍是对的。别的组各带一个后缀。
+            let suffix = if group_index == 0 {
+                String::new()
+            } else {
+                format!("-g{}", group_index + 1)
+            };
+            for streams in &tcp.stream_steps {
+                let mut spec = base(
+                    format!("ui-{}-tcp{suffix}-P{streams}", idx + 1),
+                    vec!["tcp".into()],
+                );
+                spec.tcp_streams = Some(*streams);
+                // 空列表原样传给 builder：它把「没有 -w 档位」跑成一条不带 -w
+                // 的 TCP。默认组经过 non_empty 兜底不会走到这一支。
+                spec.tcp_windows = Some(tcp.windows.clone());
+                tests.push(spec);
+            }
+        }
+    }
+    // 选中的每一组各生成一批 UDP 单元。同一行选两组 = 这一对跑两遍，
+    // 参数各按各的组来。
+    for group_index in selected_udp_groups(pair) {
+        if !want_udp {
+            break;
+        }
+        let udp = sweeps.udp_group(group_index);
+        let udp_streams = udp.streams;
+        // 第 0 组沿用原来的单元名：改名会改掉 resume id，让历史 PASS 全部失效。
+        // 别的组各带一个后缀，否则同一对的两批单元同名、resume 里互相覆盖。
+        let suffix = if group_index == 0 {
+            String::new()
+        } else {
+            format!("-g{}", group_index + 1)
+        };
+        let src_pinned = sweeps.pinned_senders.contains(&pair.src);
+        let dst_pinned = sweeps.pinned_senders.contains(&pair.dst);
+        // 一个方向的每条发送腿都有按网口覆盖时，全局 -b 档位对它不起作用：
+        // builder 会把每一档都替换回那个覆盖值，扫 N 档就得到 N 个完全相同
+        // 的单元。必须**逐方向**判断而不是整对判断——「ab 被发送端钉死、
+        // 反向 ba 仍要扫档位」是最常见的组合，按整对判断时那三个 ab 单元
+        // 会一模一样地各跑一遍全程。
+        let pinned_direction = |d: &String| match d.as_str() {
+            "ab" => src_pinned,
+            "ba" => dst_pinned,
+            "bidir" => src_pinned && dst_pinned,
+            _ => false,
+        };
+        let (pinned, swept): (Vec<String>, Vec<String>) =
+            directions.iter().cloned().partition(pinned_direction);
+
+        if !pinned.is_empty() {
+            // 占位值：builder 会按腿替换成各自的精确覆盖值，这里填什么都行，
+            // 取一个真实值只是为了万一覆盖项被后续校验剔除时不至于离谱。
+            let placeholder = req
+                .nic_policies
+                .iter()
+                .find(|policy| {
+                    (policy.endpoint == pair.src || policy.endpoint == pair.dst)
+                        && !policy.udp_bandwidth.trim().is_empty()
+                })
+                .map(|policy| policy.udp_bandwidth.trim())
+                .unwrap_or("1m");
+            let mut spec = base(
+                format!("ui-{}-udp{suffix}-pinned", idx + 1),
+                vec!["udp".into()],
+            );
+            spec.direction = OneOrMany::Many(pinned);
+            spec.udp_streams = Some(udp_streams);
+            // -b 被网口钉死，但 -l 档位仍要逐档跑：钉住的是带宽，不是报文长度。
+            spec.udp_profiles = Some(udp_profiles_for(placeholder, &udp.lengths, &udp.windows));
+            tests.push(spec);
+        }
+        if !swept.is_empty() {
+            // 还有腿没被覆盖的方向照常逐档扫描；已覆盖的那条腿在每个单元里
+            // 保持固定值（双向单元里一钉一扫就是这种情况）。
+            let mut spec = base(format!("ui-{}-udp{suffix}", idx + 1), vec!["udp".into()]);
+            spec.direction = OneOrMany::Many(swept);
+            spec.udp_streams = Some(udp_streams);
+            spec.udp_profiles = Some(udp.profiles());
+            tests.push(spec);
+        }
+    }
+    if want_ping {
+        // 每个包长档位在 builder 里各成一个单元，所以这里必须让界面把
+        // 次数和包长填全：不填就回落到 ping.count=100 × 三档包长，
+        // 每个配对每个方向平白多出三个各一百多秒的单元，而这件事要到
+        // 「预览任务」才看得见，太晚了。
+        let mut spec = base(format!("ui-{}-ping", idx + 1), Vec::new());
+        spec.kinds = vec!["ping".into()];
+        spec.ping_count = (req.ping_count > 0).then_some(req.ping_count);
+        if !sweeps.ping_sizes.is_empty() {
+            spec.ping_payload_sizes = Some(sweeps.ping_sizes.clone());
+        }
+        tests.push(spec);
+    }
+    tests
 }
 
 /// 去空白、丢空项。手抄进来的参数列表和网段前缀共用这一份清洗。
@@ -1463,78 +3415,456 @@ fn nic_profile(policy: &NicPolicySelection) -> Option<crate::config::NicProfile>
     })
 }
 
+/// 一个单元里每条腿最终下发的参数，一行一条腿。
+///
+/// 直接读 `IperfTask.extra`——那就是要交给 iperf3 的东西，不是这里再算一遍。
+/// 再算一遍就会有第二份口径，两份迟早对不上，而这行字存在的意义正是「所见即
+/// 所跑」。
+fn unit_load_lines(unit: &builder::Unit) -> Vec<String> {
+    unit.legs
+        .iter()
+        .filter_map(|leg| {
+            let (task, streams) = match &leg.kind {
+                builder::LegKind::IperfSingle(task) => (task, 1),
+                builder::LegKind::IperfGroup { streams, .. } => (streams.first()?, streams.len()),
+                // ctsTraffic 和 ping 的参数不在这套 -b/-l/-w 里，标题已经说清了。
+                _ => return None,
+            };
+            let mut text = String::new();
+            if !leg.tag.is_empty() {
+                text.push_str(match leg.tag.as_str() {
+                    "ab" => "A→B ",
+                    "ba" => "B→A ",
+                    other => other,
+                });
+            }
+            text.push_str(&readable_args(&task.extra));
+            // iperf3 的 `-P` 由它自己开流，UDP 这边是我们逐流起进程，
+            // 两种「流数」在命令里长得不一样，所以只给后者补一句。
+            if task.udp && streams > 1 {
+                text.push_str(&format!(" ×{streams} 流"));
+            }
+            Some(text)
+        })
+        .collect()
+}
+
+/// 命令参数照抄，只把 `-b` 那个数换成 Mbps 写法。
+///
+/// 下发的 `-b` 是精确的 bit/s 整数（`UdpLoad::iperf_arg`，为的是不依赖 iperf3
+/// 对 `Gbps` 这类长后缀的非文档行为）。原样打印出来是 `-b 1000000000`——十个零
+/// 要一个个数，而这一行存在的意义是"跟你填的那个数对得上"。换算成 Mbps 是同一个
+/// 数字换个写法，不是重算，所以"所见即所跑"没有被破坏。
+///
+/// 顺带避免一个真实的坑：把 `1000000000` 抄回 `-b` 输入框，那里的裸数字按 **Mbps**
+/// 算（见 `UdpProfile::parsed_bandwidth`），于是变成 10^9 Mbps。
+fn readable_args(extra: &[String]) -> String {
+    let mut out: Vec<String> = Vec::with_capacity(extra.len());
+    let mut iter = extra.iter().peekable();
+    while let Some(arg) = iter.next() {
+        out.push(arg.clone());
+        if arg != "-b" {
+            continue;
+        }
+        let Some(value) = iter.peek() else { continue };
+        let Ok(bits) = value.parse::<u64>() else {
+            continue;
+        };
+        iter.next();
+        let mbps = bits as f64 / 1_000_000.0;
+        out.push(if (mbps.fract()).abs() < f64::EPSILON {
+            format!("{mbps:.0} Mbps")
+        } else {
+            format!("{mbps:.1} Mbps")
+        });
+    }
+    out.join(" ")
+}
+
+/// Encode an arbitrary user/project ID before embedding it in the internal
+/// slash-delimited TestSpec name.  UI IDs are normally generated as hex, but
+/// the HTTP API and imported project files are allowed to carry human IDs such
+/// as `wifi/a`; letting those raw slashes through shifts every following trace
+/// field and makes the preview point at the wrong suite/task.  Percent-escape
+/// every byte outside the URI unreserved set so the transform is reversible
+/// for UTF-8 as well as punctuation.
+fn ui_name_segment(raw: &str) -> String {
+    urlencode(raw)
+}
+
+fn ui_name_segment_decode(raw: &str) -> String {
+    urldecode(raw)
+}
+
+fn topology_fingerprint(state: &UiState) -> String {
+    let value = serde_json::json!({
+        "master": state.master,
+        "agent": state.agent,
+    });
+    md5_hex(&serde_json::to_string(&value).unwrap_or_default())
+}
+
+fn request_plan_hash(req: &RunRequest, cfg: &Config, state: &UiState) -> String {
+    let mut normalized = req.clone();
+    normalized.plan_hash = None;
+    if let Some(plan) = normalized.ui_plan.as_mut() {
+        plan.plan_hash = None;
+    }
+    let request_json = serde_json::to_string(&normalized).unwrap_or_default();
+    let config_json = serde_json::to_string(cfg).unwrap_or_default();
+    let topology = topology_fingerprint(state);
+    md5_hex(&format!(
+        "ui-plan-v1|{topology}|{request_json}|{config_json}"
+    ))
+}
+
+fn ui_source_from_test_name(name: &str) -> Option<UiSource> {
+    let mut parts = name.split('/');
+    if parts.next()? != "ui-plan" {
+        return None;
+    }
+    let link_set_id = ui_name_segment_decode(parts.next()?);
+    let _binding_id = ui_name_segment_decode(parts.next()?);
+    Some(UiSource {
+        pair_id: ui_name_segment_decode(parts.next()?),
+        link_set_id,
+        suite_id: ui_name_segment_decode(parts.next()?),
+        task_id: ui_name_segment_decode(parts.next()?),
+        recipe_id: ui_name_segment_decode(parts.next()?),
+        protocol: parts.next()?.split('-').next()?.to_string(),
+    })
+}
+
+fn unit_protocol(unit: &builder::Unit) -> Option<String> {
+    unit.legs.first().map(|leg| match &leg.kind {
+        builder::LegKind::IperfSingle(task) => {
+            if task.udp {
+                "udp".to_string()
+            } else {
+                "tcp".to_string()
+            }
+        }
+        builder::LegKind::IperfGroup { streams, .. } => {
+            if streams.first().is_some_and(|task| task.udp) {
+                "udp".to_string()
+            } else {
+                "tcp".to_string()
+            }
+        }
+        builder::LegKind::CtsTraffic(task) => {
+            if task.udp {
+                "udp".to_string()
+            } else {
+                "tcp".to_string()
+            }
+        }
+        builder::LegKind::Ping(_) => "ping".to_string(),
+    })
+}
+
+fn unit_effective_args(unit: &builder::Unit) -> Vec<String> {
+    unit.legs
+        .iter()
+        .flat_map(|leg| match &leg.kind {
+            builder::LegKind::IperfSingle(task) => task.extra.clone(),
+            builder::LegKind::IperfGroup { streams, .. } => streams
+                .first()
+                .map(|task| task.extra.clone())
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        })
+        .collect()
+}
+
+/// Return the concrete endpoints carried by a unit's first leg.
+///
+/// `builder::Leg::tag` is intentionally empty for a one-way leg (the tag is
+/// reserved for the two legs inside a bidirectional unit), so it cannot be
+/// used as the direction source for the quick-plan trace.  Looking at the
+/// resolved endpoints keeps the trace correct for both A→B and B→A without
+/// changing the executor/reporting semantics of `Leg::tag`.
+fn leg_endpoints(leg: &builder::Leg) -> Option<(&builder::Endpoint, &builder::Endpoint)> {
+    match &leg.kind {
+        builder::LegKind::IperfSingle(task) => Some((&task.src, &task.dst)),
+        builder::LegKind::IperfGroup { streams, .. } => {
+            streams.first().map(|task| (&task.src, &task.dst))
+        }
+        builder::LegKind::CtsTraffic(task) => Some((&task.src, &task.dst)),
+        builder::LegKind::Ping(task) => Some((&task.src, &task.dst)),
+    }
+}
+
+/// Resolve the direction represented by a built unit relative to its source
+/// `TestSpec`.  Bidirectional units are one concurrent unit with two legs;
+/// one-way units have an empty leg tag, so compare endpoint keys instead.
+fn unit_direction_for_spec(unit: &builder::Unit, spec: &builder::SpecNorm) -> Option<String> {
+    if unit.bidir {
+        return Some("bidir".into());
+    }
+    let (src, dst) = leg_endpoints(unit.legs.first()?)?;
+    if src.key() == spec.src.key() && dst.key() == spec.dst.key() {
+        Some("ab".into())
+    } else if src.key() == spec.dst.key() && dst.key() == spec.src.key() {
+        Some("ba".into())
+    } else {
+        None
+    }
+}
+
+fn compile_request(state: &UiState, req: &RunRequest) -> Result<CompiledPlan, String> {
+    validate_request(state, req)?;
+    let cfg = config_from_request(state, req);
+    let problems = cfg.validate();
+    if !problems.is_empty() {
+        return Err(format!("配置项异常：{}", problems.join("；")));
+    }
+    let mut notices = Vec::new();
+    let mut spec_errors = Vec::new();
+    let mut units = Vec::new();
+    let mut sources: Vec<Option<UiSource>> = Vec::new();
+    let mut source_directions: Vec<Option<String>> = Vec::new();
+    let mut port = builder::PORT_BASE;
+
+    if req.ui_plan.is_some() {
+        // Build each spec separately so every generated unit can be traced back
+        // to its suite task.  Port allocation remains global and deterministic.
+        for test in &cfg.tests {
+            match builder::spec_from_config(test, &cfg, &state.master, &state.agent) {
+                Ok(spec) => {
+                    let (mut built, build_notices) = build_units(
+                        std::slice::from_ref(&spec),
+                        cfg.require_same_subnet_for_iperf,
+                        &mut port,
+                    );
+                    notices.extend(build_notices);
+                    let source = ui_source_from_test_name(&test.name);
+                    // `Leg::tag` is intentionally empty for one-way units, so
+                    // retain the concrete A→B/B→A direction while the named
+                    // source spec is still available.  Bidirectional units
+                    // are represented by a single unit and remain `bidir`.
+                    for unit in &built {
+                        sources.push(source.clone());
+                        source_directions.push(unit_direction_for_spec(unit, &spec));
+                    }
+                    units.append(&mut built);
+                }
+                Err(error) => {
+                    spec_errors.push(format!("{} 无法生成任务：{error}", test.name));
+                    notices.push(format!("跳过 {}: {error}", test.name));
+                }
+            }
+        }
+    } else {
+        let mut specs = Vec::new();
+        for test in &cfg.tests {
+            match builder::spec_from_config(test, &cfg, &state.master, &state.agent) {
+                Ok(spec) => specs.push(spec),
+                Err(error) => {
+                    spec_errors.push(format!("{} 无法生成任务：{error}", test.name));
+                    notices.push(format!("跳过 {}: {error}", test.name));
+                }
+            }
+        }
+        let (built, build_notices) =
+            build_units(&specs, cfg.require_same_subnet_for_iperf, &mut port);
+        notices.extend(build_notices);
+        units = built;
+        sources.resize(units.len(), None);
+        source_directions.resize(units.len(), None);
+    }
+
+    if req.ui_plan.is_some() {
+        // Stable builder IDs include the effective protocol/profile/endpoint
+        // shape.  If two bindings accidentally describe that same shape, keep
+        // one execution unit and make the reduction visible to the caller.
+        let mut seen_ids = HashSet::new();
+        let mut unique_units = Vec::with_capacity(units.len());
+        let mut unique_sources = Vec::with_capacity(sources.len());
+        let mut unique_directions = Vec::with_capacity(source_directions.len());
+        for (index, unit) in units.into_iter().enumerate() {
+            if seen_ids.insert(unit.id.clone()) {
+                unique_units.push(unit);
+                unique_sources.push(sources.get(index).cloned().flatten());
+                unique_directions.push(source_directions.get(index).cloned().flatten());
+            }
+        }
+        let removed_count = sources.len().saturating_sub(unique_units.len());
+        if removed_count > 0 {
+            notices.push(format!(
+                "计划去重：移除了 {removed_count} 个最终参数完全相同的重复单元"
+            ));
+        }
+        units = unique_units;
+        sources = unique_sources;
+        source_directions = unique_directions;
+    }
+
+    let resumed = if cfg.resume {
+        let db = ResultDb::load(std::path::PathBuf::from("task_results.json"));
+        units
+            .iter()
+            .map(|unit| db.fresh_pass(&unit.id).is_some())
+            .collect()
+    } else {
+        vec![false; units.len()]
+    };
+    let plan_hash = request_plan_hash(req, &cfg, state);
+    let topology_fingerprint = topology_fingerprint(state);
+    let mut trace = Vec::with_capacity(units.len());
+    let mut sections = Vec::new();
+    for (index, unit) in units.iter().enumerate() {
+        let source = sources.get(index).and_then(|source| source.clone());
+        let (pair_id, link_set_id, suite_id, task_id, recipe_id) = source
+            .as_ref()
+            .map(|source| {
+                (
+                    Some(source.pair_id.clone()),
+                    (!source.link_set_id.is_empty()).then(|| source.link_set_id.clone()),
+                    Some(source.suite_id.clone()),
+                    Some(source.task_id.clone()),
+                    Some(source.recipe_id.clone()),
+                )
+            })
+            .unwrap_or((None, None, None, None, None));
+        let protocol = source
+            .as_ref()
+            .map(|source| source.protocol.clone())
+            .or_else(|| unit_protocol(unit));
+        let direction = source_directions.get(index).cloned().flatten().or_else(|| {
+            (!unit.legs.is_empty()).then(|| {
+                unit.legs
+                    .iter()
+                    .map(|leg| {
+                        if leg.tag.is_empty() {
+                            "ab"
+                        } else {
+                            leg.tag.as_str()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+        });
+        let ip = if unit.title.contains(" V6 ") {
+            Some("v6".into())
+        } else if unit.title.contains(" V4 ") {
+            Some("v4".into())
+        } else {
+            None
+        };
+        let effective_args = unit_effective_args(unit);
+        trace.push(PlanTrace {
+            seq: index + 1,
+            pair_id: pair_id.clone(),
+            link_set_id: link_set_id.clone(),
+            suite_id: suite_id.clone(),
+            task_id: task_id.clone(),
+            lane_id: task_id.clone(),
+            recipe_id: recipe_id.clone(),
+            protocol: protocol.clone(),
+            direction,
+            ip,
+            requested_args: effective_args.clone(),
+            effective_args,
+            value_sources: if req.ui_plan.is_some() {
+                vec!["suite recipe（网口策略/链路裁剪由 builder 最终决定）".into()]
+            } else {
+                vec!["legacy matrix".into()]
+            },
+            skipped_reason: None,
+            resumed: resumed[index],
+        });
+        let key = (link_set_id.clone(), suite_id.clone(), task_id.clone());
+        if let Some(section) = sections.iter_mut().find(|section: &&mut PlanSection| {
+            (
+                section.link_set_id.clone(),
+                section.suite_id.clone(),
+                section.task_id.clone(),
+            ) == key
+        }) {
+            section.unit_seqs.push(index + 1);
+        } else {
+            sections.push(PlanSection {
+                link_set_id,
+                suite_id,
+                task_id,
+                title: unit.title.clone(),
+                unit_seqs: vec![index + 1],
+            });
+        }
+    }
+    if req.ui_plan.is_none() {
+        // Keep the legacy response compact and backwards-compatible; hierarchy
+        // is only meaningful for the suite planner.
+        trace.clear();
+        sections.clear();
+    }
+    Ok(CompiledPlan {
+        cfg,
+        units,
+        notices,
+        resumed,
+        trace,
+        sections,
+        plan_hash,
+        topology_fingerprint,
+        spec_errors,
+    })
+}
+
 fn api_plan(console: &Arc<Console>, body: &str) -> Result<serde_json::Value, String> {
     let req: RunRequest = serde_json::from_str(body).map_err(|e| format!("参数解析失败: {e}"))?;
     let state = lock_recover(&console.state);
     if state.master.interfaces.is_empty() || state.agent.interfaces.is_empty() {
         return Err("还没连上辅测机，先点「连接」".into());
     }
-    let cfg = validated_config_from_request(&state, &req)?;
-    let mut specs = Vec::new();
-    let mut notices = Vec::new();
-    for test in &cfg.tests {
-        match builder::spec_from_config(test, &cfg, &state.master, &state.agent) {
-            Ok(spec) => specs.push(spec),
-            Err(e) => notices.push(format!("跳过 {}: {e}", test.name)),
-        }
-    }
-    let mut port = builder::PORT_BASE;
-    let (units, build_notices) = build_units(&specs, cfg.require_same_subnet_for_iperf, &mut port);
-    notices.extend(build_notices);
-    // resume 开着时只提示「会跳过一些」是不够的：勾了 resume 却看到满满一屏
-    // 计划，人会以为没生效。这里直接查同一个结果库，把会被跳过的单元标出来，
-    // 并把它们从预计耗时里扣掉——否则那个数字会比实际多出好几倍。
-    //
-    // 但这只是**预判**，不能当成承诺：executor 那边的跳过还要求
-    // `blocked.is_none()`（流量后端前置检查没被拦），而且是在刷新过网卡快照、
-    // 单元 id 可能已经变了之后才查的。所以两个耗时都报出去，页面按区间显示，
-    // 免得人照着一个偏小的数字安排时间。
-    let resumed: Vec<bool> = if cfg.resume {
-        let db = ResultDb::load(std::path::PathBuf::from("task_results.json"));
-        units
-            .iter()
-            .map(|u| db.fresh_pass(&u.id).is_some())
-            .collect()
-    } else {
-        vec![false; units.len()]
-    };
-    let skip_count = resumed.iter().filter(|skipped| **skipped).count();
-    if cfg.resume {
-        notices.push(if skip_count == 0 {
+    let mut compiled = compile_request(&state, &req)?;
+    // resume 开着时提示并扣除预判会跳过的单元；executor 运行时仍会再判一次。
+    let skip_count = compiled.resumed.iter().filter(|skipped| **skipped).count();
+    if compiled.cfg.resume {
+        compiled.notices.push(if skip_count == 0 {
             format!(
                 "resume 已开启，但 {RESUME_MAX_AGE_HOURS} 小时内没有可复用的 PASS，{} 个单元全部实跑",
-                units.len()
+                compiled.units.len()
             )
         } else {
             format!(
-                "resume 已开启：{skip_count}/{} 个单元在 {RESUME_MAX_AGE_HOURS} 小时内已 PASS，预计跳过。执行时还会再判一次——前置检查被拦或网卡快照变了的单元仍要实跑，所以耗时给的是区间",
-                units.len()
+                "resume 已开启：{skip_count}/{} 个单元在 {RESUME_MAX_AGE_HOURS} 小时内已 PASS，预计跳过。执行时还会再判一次",
+                compiled.units.len()
             )
         });
     }
-    let est_total_secs = units
+    let est_total_secs = compiled
+        .units
         .iter()
-        .zip(&resumed)
+        .zip(&compiled.resumed)
         .filter(|(_, skipped)| !**skipped)
         .map(|(u, _)| u.est_secs)
         .sum();
-    let est_full_secs = units.iter().map(|u| u.est_secs).sum();
-    let units = units
+    let est_full_secs = compiled.units.iter().map(|u| u.est_secs).sum();
+    let units = compiled
+        .units
         .iter()
-        .zip(&resumed)
+        .zip(&compiled.resumed)
         .enumerate()
         .map(|(idx, (unit, skipped))| PlannedUnit {
             seq: idx + 1,
             title: unit.title.clone(),
             est_secs: unit.est_secs,
             resumed: *skipped,
+            load: unit_load_lines(unit),
         })
         .collect();
     serde_json::to_value(PlanOut {
         units,
         est_total_secs,
         est_full_secs,
-        notices,
+        notices: compiled.notices,
+        sections: compiled.sections,
+        trace: compiled.trace,
+        plan_hash: Some(compiled.plan_hash),
+        topology_fingerprint: Some(compiled.topology_fingerprint),
+        ui_plan_supported: true,
     })
     .map_err(|e| e.to_string())
 }
@@ -1545,10 +3875,538 @@ fn api_config(console: &Arc<Console>, body: &str) -> Result<serde_json::Value, S
     if state.master.interfaces.is_empty() || state.agent.interfaces.is_empty() {
         return Err("还没连上辅测机，先点「连接」".into());
     }
-    let cfg = validated_config_from_request(&state, &req)?;
-    serde_json::to_value(cfg).map_err(|error| format!("生成配置失败: {error}"))
+    let compiled = compile_request(&state, &req)?;
+    serde_json::to_value(compiled.cfg).map_err(|error| format!("生成配置失败: {error}"))
 }
 
+/// 一行矩阵勾选的回填值。`PairSelection` 只有 `Deserialize`——它是请求方向的
+/// 类型，回填是相反方向，两者字段名必须一致但生命周期不同，分开写比给请求类型
+/// 加一个只在这里用的 `Serialize` 更不容易在改动时互相带偏。
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+struct PairImport {
+    src: String,
+    dst: String,
+    directions: Vec<String>,
+    rx_target_bidir_ab: String,
+    rx_target_bidir_ba: String,
+    udp_groups: Vec<usize>,
+    tcp_groups: Vec<usize>,
+    transports: Vec<String>,
+    ip: Vec<String>,
+}
+
+/// 导入时从 `tests[]` 里认出来的 UDP 参数组。字段和 `UdpGroup` 一致，
+/// 方向相反（那个是请求，这个是回填）。
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+struct UdpGroupOut {
+    name: String,
+    bandwidths: Vec<String>,
+    lengths: Vec<String>,
+    windows: Vec<String>,
+    streams: u32,
+}
+
+/// 导入时从 `tests[]` 里认出来的 TCP 参数组。字段和 `TcpGroup` 一致。
+///
+/// 一个 TCP 组会被 `config_from_request` 拆成好几条 TestSpec（每个 `-P` 一条，
+/// 都带着这组的那份 `-w` 列表），所以回填时按「相同的 `-w` 列表」把它们并回一组，
+/// 把各条的 `-P` 收成这一组的流数档位。两组恰好用同一份 `-w` 时会被并成一组，
+/// 但跑出来的单元完全一样，不影响结果。
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+struct TcpGroupOut {
+    name: String,
+    windows: Vec<String>,
+    streams: Vec<u32>,
+}
+
+#[derive(Debug, Serialize)]
+struct ImportOut {
+    /// 顶部参数区，字段和 `/api/bootstrap` 完全一致——页面用同一段代码回填，
+    /// 免得「导入」和「打开页面」两条路把同一个输入框填成两种样子。
+    settings: BootstrapOut,
+    /// 这两项 `/api/bootstrap` 有意不回填（见 `RunRequest` 上的注释：不能让
+    /// 同一个勾选框在不同机器上悄悄变成不同含义）。导入是人明确要求「按这份
+    /// 文件来」，回填它们是对的，但要在 `notices` 里说一声。
+    limit_udp_by_link_speed: bool,
+    resume: bool,
+    pairs: Vec<PairImport>,
+    /// 默认组之外的组；矩阵行上的 `udp_group` 按 1 起指向它们。
+    udp_groups: Vec<UdpGroupOut>,
+    /// 默认组之外的 TCP 组；矩阵行上的 `tcp_group` 按 1 起指向它们。
+    tcp_groups: Vec<TcpGroupOut>,
+    nic_policies: Vec<NicPolicySelection>,
+    /// 导入过程中丢掉或改写了什么。空列表 = 这份文件被完整表示了。
+    notices: Vec<String>,
+}
+
+/// 导入一份 config.json，回填成界面状态。
+///
+/// 「下载 config.json」一直是单向的：改完一堆门限和档位，下次打开控制台又得
+/// 从头点一遍，而那份文件里明明什么都有。这里做的是它的逆运算——把 config
+/// 翻回界面选择，**不执行任何东西**。
+///
+/// 有意不要求先连上辅测机：全局参数和网口策略不依赖连接，配对选择留给页面在
+/// 连上之后按端点名匹配（对不上的行会在 `notices` 里点名）。
+fn api_import(console: &Arc<Console>, body: &str) -> Result<serde_json::Value, String> {
+    let incoming: Config = serde_json::from_str(body)
+        .map_err(|error| format!("这不是一份能解析的 config.json：{error}"))?;
+    let problems = incoming.validate();
+    if !problems.is_empty() {
+        return Err(format!("配置项异常，已拒绝导入：{}", problems.join("；")));
+    }
+
+    let mut state = lock_recover(&console.state);
+    let mut notices = Vec::new();
+    // 连接身份单独处理：token 空着时保留当前值。下载下来的 config 里带着
+    // agent_token，但人手写的那份多半没有——用文件里的空串把已经连上的
+    // 令牌冲掉，表现是导入之后「连接」突然 401。
+    if incoming.agent_token.trim().is_empty() && !state.cfg.agent_token.trim().is_empty() {
+        notices.push("文件里没有 agent_token，沿用当前已加载的令牌。".into());
+    } else {
+        state.cfg.agent_token = incoming.agent_token.clone();
+    }
+    let agent_token = state.cfg.agent_token.clone();
+    let master = state.master.clone();
+    let agent = state.agent.clone();
+
+    state.cfg = Config {
+        agent_token,
+        ..incoming
+    };
+    if !state.cfg.agent_host.trim().is_empty() {
+        state.agent_host = state.cfg.agent_host.trim().to_string();
+    }
+
+    if state.cfg.pairs.is_some() || state.cfg.universal_params.is_some() {
+        notices.push(
+            "文件用的是 pairs/universal_params 自动配对，界面矩阵是逐对勾选的，表示不了；\
+             全局参数已导入，配对请在矩阵里自己勾。"
+                .into(),
+        );
+    }
+    let connected = !master.interfaces.is_empty() && !agent.interfaces.is_empty();
+    if !connected && !state.cfg.tests.is_empty() {
+        notices.push("还没连上辅测机，配对选择先存着；点「连接」扫到网口后会自动勾上。".into());
+    }
+    // settings 要先算：逐对的 UDP 覆盖是「和全局不一样的那部分」，
+    // 没有全局值就判不出哪些该回填到行上。
+    let settings = bootstrap_out(&state);
+    // 默认组 = 执行区那几个框。文件里和它不一样的 UDP 参数会被认成附加组。
+    let default_group = UdpGroupOut {
+        name: "默认".into(),
+        bandwidths: settings.udp_bandwidths.clone(),
+        lengths: settings.udp_lengths.clone(),
+        windows: settings.udp_windows.clone(),
+        streams: settings.udp_streams,
+    };
+    // TCP 默认组 = 执行区的 `-w` / `-P`；文件里和它不一样的 TCP 参数认成附加组。
+    let default_tcp_group = TcpGroupOut {
+        name: "默认".into(),
+        windows: settings.tcp_windows.clone(),
+        streams: settings.tcp_streams.clone(),
+    };
+    let (pairs, udp_groups, tcp_groups, pair_notices) = pairs_from_tests(
+        &state.cfg,
+        &master,
+        &agent,
+        &default_group,
+        &default_tcp_group,
+    );
+    notices.extend(pair_notices);
+    if state.cfg.limit_udp_by_link_speed || state.cfg.resume {
+        notices.push("「按链路上限裁剪」和「resume」按文件里的值勾上了，跑之前确认一眼。".into());
+    }
+
+    let nic_policies = configured_nic_policies(&state.cfg, &master, &agent);
+    serde_json::to_value(ImportOut {
+        settings,
+        udp_groups,
+        tcp_groups,
+        limit_udp_by_link_speed: state.cfg.limit_udp_by_link_speed,
+        resume: state.cfg.resume,
+        pairs,
+        nic_policies,
+        notices,
+    })
+    .map_err(|error| format!("回填界面失败: {error}"))
+}
+
+/// `tests[]` -> 矩阵行。
+///
+/// 一行矩阵会被 `config_from_request` 拆成好几条 TestSpec（TCP 的每个 `-P`
+/// 档位一条、UDP 钉死/扫描各一条、ping 一条），所以这里按端点对合并回去，
+/// 方向、协议、IP 版本取并集。
+///
+/// 反向的那条（`dst`/`src` 调过来写）合并进同一行并把方向对调：矩阵一行代表的
+/// 是一对网口，A、B 谁在左边由界面的枚举顺序决定，不由文件决定。
+fn pairs_from_tests(
+    cfg: &Config,
+    master: &HostInfo,
+    agent: &HostInfo,
+    default_group: &UdpGroupOut,
+    default_tcp_group: &TcpGroupOut,
+) -> (
+    Vec<PairImport>,
+    Vec<UdpGroupOut>,
+    Vec<TcpGroupOut>,
+    Vec<String>,
+) {
+    let mut out: Vec<PairImport> = Vec::new();
+    let mut groups: Vec<UdpGroupOut> = Vec::new();
+    let mut tcp_groups: Vec<TcpGroupOut> = Vec::new();
+    // 与 `out` 同序：每行按「相同 -w 列表」聚起它跑过的 TCP 档位（-w 列表 -> 各 -P）。
+    let mut tcp_accum: Vec<std::collections::HashMap<Vec<String>, Vec<u32>>> = Vec::new();
+    let mut notices = Vec::new();
+    let mut ragged = false;
+    let mut unresolved: Vec<String> = Vec::new();
+    for test in &cfg.tests {
+        let (Some(src), Some(dst)) = (
+            canonical_endpoint(&test.src, master, agent),
+            canonical_endpoint(&test.dst, master, agent),
+        ) else {
+            for raw in [&test.src, &test.dst] {
+                if canonical_endpoint(raw, master, agent).is_none()
+                    && !unresolved.iter().any(|seen| seen == raw)
+                {
+                    unresolved.push(raw.clone());
+                }
+            }
+            continue;
+        };
+        let directions = test.direction.directions();
+        let mut transports: Vec<String> = test
+            .transports
+            .iter()
+            .map(|t| t.trim().to_lowercase())
+            .filter(|t| t == "tcp" || t == "udp")
+            .collect();
+        let transports_have_udp = transports.iter().any(|t| t == "udp");
+        let transports_have_tcp = transports.iter().any(|t| t == "tcp");
+        // ping 在配置模型里挂在 kinds 上，界面把它和 TCP/UDP 并排放在「协议」
+        // 列——回填时要走相反的那一步，否则纯 ping 的配置导进来是一行空协议。
+        if test.kinds.iter().any(|kind| kind.trim() == "ping") {
+            transports.push("ping".into());
+        }
+        let ip: Vec<String> = test
+            .ip
+            .iter()
+            .map(|v| v.trim().to_lowercase())
+            .filter(|v| v == "v4" || v == "v6")
+            .collect();
+        let bidir = test.rate_targets_bidir_mbps.clone().unwrap_or_default();
+
+        let (idx, flip) =
+            if let Some(idx) = out.iter().position(|row| row.src == src && row.dst == dst) {
+                (idx, false)
+            } else if let Some(idx) = out.iter().position(|row| row.src == dst && row.dst == src) {
+                (idx, true)
+            } else {
+                out.push(PairImport {
+                    src: src.clone(),
+                    dst: dst.clone(),
+                    ..Default::default()
+                });
+                (out.len() - 1, false)
+            };
+        // tcp_accum 与 out 对齐：新行出现就补一份空表（未解析的 test 在 idx
+        // 之前就 continue 了，不会打乱对齐）。
+        while tcp_accum.len() < out.len() {
+            tcp_accum.push(std::collections::HashMap::new());
+        }
+        if transports_have_tcp {
+            // 一条 TCP test 带着这一组的整份 -w 列表和它自己那一个 -P。手写配置
+            // 可能没写 -w（None）——按默认组的窗口回填；-P 缺省按单流。
+            let windows = test
+                .tcp_windows
+                .clone()
+                .unwrap_or_else(|| default_tcp_group.windows.clone());
+            let stream = test.tcp_streams.filter(|value| *value > 0).unwrap_or(1);
+            let steps = tcp_accum[idx].entry(windows).or_default();
+            if !steps.contains(&stream) {
+                steps.push(stream);
+            }
+        }
+        let row = &mut out[idx];
+        for direction in directions {
+            let direction = if flip {
+                match direction.as_str() {
+                    "ab" => "ba".to_string(),
+                    "ba" => "ab".to_string(),
+                    other => other.to_string(),
+                }
+            } else {
+                direction
+            };
+            if !row.directions.contains(&direction) {
+                row.directions.push(direction);
+            }
+        }
+        for transport in transports {
+            if !row.transports.contains(&transport) {
+                row.transports.push(transport);
+            }
+        }
+        for version in ip {
+            if !row.ip.contains(&version) {
+                row.ip.push(version);
+            }
+        }
+        // 这条 test 的 UDP 参数和默认组一样吗？不一样就认成一个附加组，
+        // 同样的参数只认一次（几十条 test 常常只有两三种打法）。
+        //
+        // 同一对可以有好几条 UDP test（一行选了多组），所以是**往这一行的组
+        // 列表里加**，不是只认第一条。
+        //
+        // 发送端在 `by_nic` 里另有 `-b` 时跳过：那种情况下文件里的 profile 是
+        // 占位值（见 `config_from_request` 的 pinned 分支），不是人填的选择。
+        if transports_have_udp && !test_udp_all_directions_pinned(cfg, test, &src, &dst) {
+            if let Some(profiles) = &test.udp_profiles {
+                let (group, exact) = udp_group_from_profiles(
+                    profiles,
+                    test.udp_streams
+                        .filter(|v| *v > 0)
+                        .unwrap_or(default_group.streams),
+                );
+                ragged |= !exact;
+                let selected = if group.bandwidths.is_empty() || group.same_run_as(default_group) {
+                    0
+                } else {
+                    groups
+                        .iter()
+                        .position(|known| known.same_run_as(&group))
+                        .unwrap_or_else(|| {
+                            let mut named = group.clone();
+                            named.name = format!("组 {}", groups.len() + 2);
+                            groups.push(named);
+                            groups.len() - 1
+                        })
+                        + 1
+                };
+                if !row.udp_groups.contains(&selected) {
+                    row.udp_groups.push(selected);
+                }
+            }
+        }
+
+        let (ab, ba) = if flip {
+            (bidir.ba, bidir.ab)
+        } else {
+            (bidir.ab, bidir.ba)
+        };
+        for (slot, value) in [
+            (&mut row.rx_target_bidir_ab, ab),
+            (&mut row.rx_target_bidir_ba, ba),
+        ] {
+            if let Some(value) = value.filter(|v| v.is_finite() && *v > 0.0) {
+                if slot.is_empty() {
+                    *slot = format_mbps(value);
+                }
+            }
+        }
+    }
+    // 一条 UDP test 都没认出来的行（纯 TCP/ping，或者被网口值钉死的那种）
+    // 明确写成「默认组」，别留一个空列表让页面去猜。
+    for row in &mut out {
+        if row.udp_groups.is_empty() {
+            row.udp_groups.push(0);
+        }
+    }
+    // TCP 组回填：按「相同 -w 列表」把同一行的 TCP test 并回一组，各条的 -P 收成
+    // 这组的流数档位。两组恰好共用一份 -w 会被并成一组，但跑出来的单元一样。
+    for (idx, accum) in tcp_accum.iter().enumerate() {
+        // 稳定顺序：按 -w 列表排一下，免得每次导入组的编号乱跳。
+        let mut entries: Vec<(&Vec<String>, &Vec<u32>)> = accum.iter().collect();
+        entries.sort_by(|a, b| a.0.cmp(b.0));
+        for (windows, streams) in entries {
+            let mut streams = streams.clone();
+            streams.sort_unstable();
+            let candidate = TcpGroupOut {
+                name: String::new(),
+                windows: windows.clone(),
+                streams,
+            };
+            let selected = if candidate.same_run_as(default_tcp_group) {
+                0
+            } else {
+                tcp_groups
+                    .iter()
+                    .position(|known| known.same_run_as(&candidate))
+                    .unwrap_or_else(|| {
+                        let mut named = candidate.clone();
+                        named.name = format!("TCP 组 {}", tcp_groups.len() + 2);
+                        tcp_groups.push(named);
+                        tcp_groups.len() - 1
+                    })
+                    + 1
+            };
+            if !out[idx].tcp_groups.contains(&selected) {
+                out[idx].tcp_groups.push(selected);
+            }
+        }
+    }
+    // 没认出任何 TCP test 的行（纯 UDP/ping）也写上默认组：矩阵行总有个选择。
+    for row in &mut out {
+        if row.tcp_groups.is_empty() {
+            row.tcp_groups.push(0);
+        }
+    }
+    if !unresolved.is_empty() {
+        notices.push(format!(
+            "这些端点在当前网口表里找不到，相关配对没有导入：{}",
+            unresolved.join("、")
+        ));
+    }
+    if ragged {
+        notices.push(
+            "文件里有 UDP 档位不是「每档 -b × 每档 -l × 每档 -w」的整齐组合（手写配置\
+             常见）。参数组按三个轴各取一次去重来表示，导入后跑的档位会比文件里多；\
+             要原样跑请直接 `master --auto --config 那个文件`。"
+                .into(),
+        );
+    }
+    if !tcp_groups.is_empty() {
+        notices.push(format!(
+            "文件里有 {} 组和默认组不同的 TCP 参数，已建成附加组并按行选好。",
+            tcp_groups.len()
+        ));
+    }
+    if !groups.is_empty() {
+        notices.push(format!(
+            "文件里有 {} 组和默认组不同的 UDP 参数，已建成附加组并按行选好。",
+            groups.len()
+        ));
+    }
+    (out, groups, tcp_groups, notices)
+}
+
+/// 一组 profile + 流数 -> 界面上的参数组。
+///
+/// 第二个返回值表示这份 profile 是不是一个整齐的叉积。界面上的组只能表达
+/// 「每档 -b × 每档 -l × 每档 -w」，手写的配置可以不是那样（`1m/64` 加
+/// `500m/1400`），那时按三个轴去重会**多**出组合，必须说出来。
+fn udp_group_from_profiles(profiles: &[UdpProfile], streams: u32) -> (UdpGroupOut, bool) {
+    let bandwidths = distinct(profiles.iter().map(|profile| profile.bandwidth.clone()));
+    let lengths = distinct(profiles.iter().filter_map(|profile| profile.length.clone()));
+    let windows = distinct(profiles.iter().filter_map(|profile| profile.window.clone()));
+    let combinations = bandwidths.len().max(1) * lengths.len().max(1) * windows.len().max(1);
+    let exact = combinations == profiles.len();
+    (
+        UdpGroupOut {
+            name: String::new(),
+            bandwidths,
+            lengths,
+            windows,
+            streams,
+        },
+        exact,
+    )
+}
+
+impl UdpGroupOut {
+    /// 两组会不会跑出同一批单元。名字不算——它只是给人看的。
+    fn same_run_as(&self, other: &UdpGroupOut) -> bool {
+        self.bandwidths == other.bandwidths
+            && self.lengths == other.lengths
+            && self.windows == other.windows
+            && self.streams == other.streams
+    }
+}
+
+impl TcpGroupOut {
+    /// 两组会不会跑出同一批单元。流数比之前先排序去重：回填时是从各条 -P
+    /// 收集起来的，顺序和重复都可能和默认组那份不一样；-w 档位保持原序比较。
+    fn same_run_as(&self, other: &TcpGroupOut) -> bool {
+        let norm = |values: &[u32]| {
+            let mut out = values.to_vec();
+            out.sort_unstable();
+            out.dedup();
+            out
+        };
+        self.windows == other.windows && norm(&self.streams) == norm(&other.streams)
+    }
+}
+
+/// 把 config 里的端点写法统一成矩阵用的 `master:NAME=以太网 6`。
+///
+/// 没连上辅测机时解析不了 `master:SGMII2.5G` 这种按角色写的端点（角色到网卡
+/// 名的映射来自实扫），但已经是 `NAME=` 写法的可以原样用——先连接再导入和
+/// 先导入再连接都得能走通。
+fn canonical_endpoint(raw: &str, master: &HostInfo, agent: &HostInfo) -> Option<String> {
+    if let Ok(endpoint) = builder::resolve_endpoint(raw, master, agent) {
+        let side = match endpoint.side {
+            builder::Side::Master => "master",
+            builder::Side::Agent => "agent",
+        };
+        return Some(format!("{side}:NAME={}", endpoint.nic.name));
+    }
+    let (side, rest) = raw.split_once(':')?;
+    let side = match side.trim().to_lowercase().as_str() {
+        "master" | "local" | "主控" => "master",
+        "agent" | "remote" | "辅测" => "agent",
+        _ => return None,
+    };
+    let name = rest
+        .trim()
+        .strip_prefix("NAME=")
+        .or_else(|| rest.trim().strip_prefix("name="))?
+        .trim();
+    (!name.is_empty()).then(|| format!("{side}:NAME={name}"))
+}
+
+/// 这个端点在「网口与策略」里单独指定了 UDP `-b` 吗。
+///
+/// 它决定文件里那条 test 的 profile 带宽是「人填的档位」还是「占位值」。
+fn endpoint_pins_udp_bandwidth(cfg: &Config, endpoint: &str) -> bool {
+    let Some((host, rest)) = endpoint.split_once(':') else {
+        return false;
+    };
+    let Some(name) = rest.strip_prefix("NAME=") else {
+        return false;
+    };
+    cfg.link_profiles.by_nic.iter().any(|profile| {
+        profile
+            .udp_bandwidth
+            .as_ref()
+            .is_some_and(|value| !value.trim().is_empty())
+            && profile.host.eq_ignore_ascii_case(host)
+            && profile.name.eq_ignore_ascii_case(name)
+    })
+}
+
+/// Whether every UDP sending leg represented by a test is pinned to a
+/// per-NIC bandwidth override.
+///
+/// A config generated from the matrix may split one logical pair into two UDP
+/// tests when only one endpoint is pinned: the pinned direction carries a
+/// placeholder profile, while the unpinned direction still carries the
+/// user's sweep.  Treating the pair as pinned merely because *either*
+/// endpoint has an override would make `api_import` discard that sweep and
+/// silently turn the row back into the default UDP group.  Decide per test,
+/// using its concrete directions, so only a test whose every sending leg is
+/// pinned is ignored during group reconstruction.
+fn test_udp_all_directions_pinned(cfg: &Config, test: &TestSpec, src: &str, dst: &str) -> bool {
+    let src_pinned = endpoint_pins_udp_bandwidth(cfg, src);
+    let dst_pinned = endpoint_pins_udp_bandwidth(cfg, dst);
+    let directions = test.direction.directions();
+    !directions.is_empty()
+        && directions.iter().all(|direction| match direction.as_str() {
+            "ab" => src_pinned,
+            "ba" => dst_pinned,
+            "bidir" => src_pinned && dst_pinned,
+            _ => false,
+        })
+}
+
+/// 门限回填成人写得出来的样子：整数不带小数点，其余保留一位。
+fn format_mbps(value: f64) -> String {
+    if (value.fract()).abs() < f64::EPSILON {
+        format!("{value:.0}")
+    } else {
+        format!("{value}")
+    }
+}
+
+#[allow(dead_code)]
 fn ensure_config_builds_units(cfg: &Config, state: &UiState) -> Result<(), String> {
     let mut specs = Vec::new();
     for test in &cfg.tests {
@@ -1581,14 +4439,46 @@ fn api_run(console: &Arc<Console>, body: &str) -> Result<serde_json::Value, Stri
             console.running.store(false, Ordering::SeqCst);
             return Err("还没连上辅测机，先点「连接」".into());
         }
-        match validated_config_from_request(&state, &req) {
-            Ok(cfg) => {
-                // “开始测试”不允许把无效选择或最终为空的计划静默跳过。
-                if let Err(error) = ensure_config_builds_units(&cfg, &state) {
+        match compile_request(&state, &req) {
+            Ok(compiled) => {
+                if let Some(error) = compiled.spec_errors.first() {
                     console.running.store(false, Ordering::SeqCst);
-                    return Err(error);
+                    return Err(error.clone());
                 }
-                cfg
+                if req.ui_plan.is_some()
+                    && compiled
+                        .notices
+                        .iter()
+                        .any(|notice| notice.trim_start().starts_with("跳过 "))
+                {
+                    console.running.store(false, Ordering::SeqCst);
+                    return Err("计划包含不可执行的链路或 IP 版本，请在复核页排除后重新预览".into());
+                }
+                if req.ui_plan.is_some() {
+                    let supplied = req.plan_hash.as_deref().or_else(|| {
+                        req.ui_plan
+                            .as_ref()
+                            .and_then(|plan| plan.plan_hash.as_deref())
+                    });
+                    let Some(supplied) = supplied.filter(|value| !value.trim().is_empty()) else {
+                        console.running.store(false, Ordering::SeqCst);
+                        return Err("请先预览任务并携带 plan_hash 后再开始测试".into());
+                    };
+                    if supplied != compiled.plan_hash {
+                        console.running.store(false, Ordering::SeqCst);
+                        return Err("计划已过期或网口拓扑已变化，请重新预览任务".into());
+                    }
+                }
+                if compiled.units.is_empty() {
+                    console.running.store(false, Ordering::SeqCst);
+                    let detail = if compiled.notices.is_empty() {
+                        String::new()
+                    } else {
+                        format!("：{}", compiled.notices.join("；"))
+                    };
+                    return Err(format!("所选配置最终没有生成任何测试单元{detail}"));
+                }
+                compiled.cfg
             }
             Err(error) => {
                 console.running.store(false, Ordering::SeqCst);
@@ -1708,8 +4598,27 @@ struct MonitorSessionReq {
     session: String,
 }
 
+/// 一路监控的取样游标。
+#[derive(Debug, Deserialize)]
+struct MonitorCursor {
+    session: String,
+    #[serde(default)]
+    from: usize,
+}
+
+/// 一次问完全部在跑的监控。
+///
+/// 每路各发一次请求也能work，但浏览器对同一个源的并发连接就那么几条：
+/// 8 路监控 + 运行进度轮询会把它占满，日志那一路开始一秒一顿。
+#[derive(Debug, Deserialize)]
+struct MonitorPollReq {
+    #[serde(default)]
+    cursors: Vec<MonitorCursor>,
+}
+
 #[derive(Debug, Serialize)]
-struct MonitorSamplesOut {
+struct MonitorSeriesOut {
+    session: String,
     side: String,
     iface: String,
     from: usize,
@@ -1804,37 +4713,51 @@ pub(crate) fn monitor_interval_ms(side: &str, requested: u64) -> u64 {
     requested.clamp(200, max)
 }
 
-fn api_monitor_samples(console: &Arc<Console>, query: &str) -> Result<serde_json::Value, String> {
-    let session = query
-        .split('&')
-        .find_map(|kv| kv.strip_prefix("session="))
-        .map(urldecode)
-        .ok_or("缺少 session")?;
-    let from: usize = query
-        .split('&')
-        .find_map(|kv| kv.strip_prefix("from="))
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-
+/// 批量取样。一路会话已经结束不影响其余各路：那一路自己带着 `running:false`
+/// 和原因回去，页面把它从图上摘掉即可。整个请求报错的话，正在跑的曲线会一起
+/// 断掉，而它们其实好好的。
+fn api_monitor_samples(console: &Arc<Console>, body: &str) -> Result<serde_json::Value, String> {
+    let req: MonitorPollReq =
+        serde_json::from_str(body).map_err(|e| format!("参数解析失败: {e}"))?;
+    if req.cursors.len() > MONITOR_MAX_SESSIONS {
+        return Err(format!("一次最多问 {MONITOR_MAX_SESSIONS} 路监控"));
+    }
     let mut monitors = lock_recover(&console.monitors);
     // 顺手收摊。页面轮询是这张表唯一的常规活动，回收挂在这里才不会
     // 依赖「有人再开一路监控」才发生。
     reap_dead_monitors(&mut monitors);
-    let entry = monitors.get(&session).ok_or("监控会话已结束")?;
-    let mut data = lock_recover(&entry.data);
-    data.last_poll = Some(std::time::Instant::now());
-    // 游标是绝对序号；被环形缓冲挤掉的部分直接跳过，不能装作它还在。
-    let start = from.max(data.dropped) - data.dropped;
-    let points: Vec<MonitorPoint> = data.points.iter().skip(start).cloned().collect();
-    serde_json::to_value(MonitorSamplesOut {
-        side: entry.side.clone(),
-        iface: entry.iface.clone(),
-        from: data.dropped + data.points.len(),
-        points,
-        running: data.running,
-        error: data.error.clone().unwrap_or_default(),
-    })
-    .map_err(|e| e.to_string())
+    let series: Vec<MonitorSeriesOut> = req
+        .cursors
+        .iter()
+        .map(|cursor| {
+            let Some(entry) = monitors.get(&cursor.session) else {
+                return MonitorSeriesOut {
+                    session: cursor.session.clone(),
+                    side: String::new(),
+                    iface: String::new(),
+                    from: cursor.from,
+                    points: Vec::new(),
+                    running: false,
+                    error: "监控会话已结束".into(),
+                };
+            };
+            let mut data = lock_recover(&entry.data);
+            data.last_poll = Some(std::time::Instant::now());
+            // 游标是绝对序号；被环形缓冲挤掉的部分直接跳过，不能装作它还在。
+            let start = cursor.from.max(data.dropped) - data.dropped;
+            let points: Vec<MonitorPoint> = data.points.iter().skip(start).cloned().collect();
+            MonitorSeriesOut {
+                session: cursor.session.clone(),
+                side: entry.side.clone(),
+                iface: entry.iface.clone(),
+                from: data.dropped + data.points.len(),
+                points,
+                running: data.running,
+                error: data.error.clone().unwrap_or_default(),
+            }
+        })
+        .collect();
+    serde_json::to_value(serde_json::json!({ "series": series })).map_err(|e| e.to_string())
 }
 
 fn api_monitor_stop(console: &Arc<Console>, body: &str) -> Result<serde_json::Value, String> {
@@ -2041,6 +4964,7 @@ fn api_progress(console: &Arc<Console>, query: &str) -> serde_json::Value {
 mod tests {
     use super::*;
     use crate::protocol::NicInfo;
+    use serde_json::json;
 
     fn state_with_pair() -> UiState {
         let nic = |name: &str, role: &str, ip: &str| NicInfo {
@@ -2071,6 +4995,8 @@ mod tests {
             pairs: vec![PairSelection {
                 rx_target_bidir_ab: String::new(),
                 rx_target_bidir_ba: String::new(),
+                udp_groups: Vec::new(),
+                tcp_groups: Vec::new(),
                 src: "master:NAME=以太网 6".into(),
                 dst: "agent:NAME=WLAN 3".into(),
                 directions: vec!["ab".into(), "bidir".into()],
@@ -2098,12 +5024,406 @@ mod tests {
             udp_lengths: Vec::new(),
             udp_windows: Vec::new(),
             udp_streams: 1,
+            udp_groups: Vec::new(),
+            tcp_groups: Vec::new(),
             ping_count: 0,
             ping_payload_sizes: Vec::new(),
             limit_udp_by_link_speed: false,
             resume: false,
             screenshot: false,
+            ui_plan: None,
+            plan_hash: None,
         }
+    }
+
+    fn suite_request() -> RunRequest {
+        let mut req = request();
+        req.pairs.clear();
+        req.nic_policies.clear();
+        req.tcp_windows.clear();
+        req.tcp_streams.clear();
+        req.udp_bandwidths.clear();
+        req.udp_lengths.clear();
+        req.udp_windows.clear();
+        req.udp_streams = 1;
+        req.ui_plan = Some(UiPlan {
+            ui_plan_version: 1,
+            link_sets: vec![UiLinkSet {
+                id: "set-a".into(),
+                name: "A".into(),
+                pair_refs: vec![UiPairRef {
+                    id: "pair-a".into(),
+                    src: "master:NAME=以太网 6".into(),
+                    dst: "agent:NAME=WLAN 3".into(),
+                }],
+            }],
+            recipes: UiRecipes {
+                tcp: vec![UiRecipe {
+                    id: "tcp-r".into(),
+                    name: "TCP".into(),
+                    profiles: vec![UiRecipeProfile {
+                        window: Some("4m".into()),
+                        streams: UiU32Values::One(10),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                udp: vec![UiRecipe {
+                    id: "udp-r".into(),
+                    name: "UDP".into(),
+                    profiles: vec![UiRecipeProfile {
+                        bandwidth: Some("100m".into()),
+                        length: Some("1200".into()),
+                        streams: UiU32Values::One(1),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ping: Vec::new(),
+            },
+            suites: vec![UiSuite {
+                id: "suite-a".into(),
+                name: "TCP UDP".into(),
+                note: String::new(),
+                execution: "sequential".into(),
+                order: vec!["task-tcp".into(), "task-udp".into()],
+                tasks: vec![
+                    UiTask {
+                        id: "task-tcp".into(),
+                        name: "TCP".into(),
+                        protocol: "tcp".into(),
+                        directions: vec!["ab".into()],
+                        ip: vec!["v4".into()],
+                        recipe_ids: vec!["tcp-r".into()],
+                        ..Default::default()
+                    },
+                    UiTask {
+                        id: "task-udp".into(),
+                        name: "UDP".into(),
+                        protocol: "udp".into(),
+                        directions: vec!["ba".into()],
+                        ip: vec!["v4".into()],
+                        recipe_ids: vec!["udp-r".into()],
+                        ..Default::default()
+                    },
+                ],
+            }],
+            bindings: vec![UiBinding {
+                id: "bind-a".into(),
+                link_set_id: "set-a".into(),
+                suite_id: "suite-a".into(),
+                mode: "replace".into(),
+                order: 1,
+                pair_ids: Vec::new(),
+            }],
+            plan_hash: None,
+        });
+        req.plan_hash = None;
+        req
+    }
+
+    #[test]
+    fn suite_plan_keeps_tcp_and_udp_as_independent_specs_in_suite_order() {
+        let state = state_with_pair();
+        let req = suite_request();
+        let cfg =
+            validated_config_from_request(&state, &req).expect("suite request should validate");
+        assert_eq!(
+            cfg.tests.len(),
+            2,
+            "one TCP and one UDP spec, no protocol cross product"
+        );
+        assert_eq!(cfg.tests[0].transports, vec!["tcp"]);
+        assert_eq!(cfg.tests[1].transports, vec!["udp"]);
+        assert_eq!(cfg.tests[0].direction.directions(), vec!["ab"]);
+        assert_eq!(cfg.tests[1].direction.directions(), vec!["ba"]);
+
+        let compiled = compile_request(&state, &req).expect("compile suite plan");
+        assert_eq!(
+            compiled.units.len(),
+            2,
+            "TCP and UDP each produce one independent unit"
+        );
+        assert_eq!(compiled.trace.len(), compiled.units.len());
+        assert_eq!(compiled.trace[0].protocol.as_deref(), Some("tcp"));
+        assert_eq!(compiled.trace[1].protocol.as_deref(), Some("udp"));
+        assert_eq!(compiled.trace[0].direction.as_deref(), Some("ab"));
+        assert_eq!(compiled.trace[1].direction.as_deref(), Some("ba"));
+        assert!(!compiled.plan_hash.is_empty());
+        assert!(!compiled.topology_fingerprint.is_empty());
+    }
+
+    #[test]
+    fn suite_trace_distinguishes_both_from_a_bidirectional_unit() {
+        let state = state_with_pair();
+        let mut req = suite_request();
+        let plan = req.ui_plan.as_mut().unwrap();
+        // `both` is the legacy spelling for two independent one-way legs.  It
+        // must not be collapsed into the single concurrent `bidir` unit: the
+        // trace is consumed by the review UI and needs to identify each leg.
+        plan.suites[0].tasks.retain(|task| task.id == "task-tcp");
+        plan.suites[0].order = vec!["task-tcp".into()];
+        plan.suites[0].tasks[0].directions = vec!["both".into()];
+
+        let compiled = compile_request(&state, &req).expect("both should compile");
+        assert_eq!(compiled.units.len(), 2);
+        assert!(compiled.units.iter().all(|unit| !unit.bidir));
+        assert_eq!(
+            compiled
+                .trace
+                .iter()
+                .map(|trace| trace.direction.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("ab"), Some("ba")]
+        );
+
+        // The concurrent spelling is the opposite contract: one unit with
+        // two tagged legs, represented by a single `bidir` trace direction.
+        let mut req = suite_request();
+        let plan = req.ui_plan.as_mut().unwrap();
+        plan.suites[0].tasks.retain(|task| task.id == "task-tcp");
+        plan.suites[0].order = vec!["task-tcp".into()];
+        plan.suites[0].tasks[0].directions = vec!["bidir".into()];
+        let compiled = compile_request(&state, &req).expect("bidir should compile");
+        assert_eq!(compiled.units.len(), 1);
+        assert!(compiled.units[0].bidir);
+        assert_eq!(compiled.trace[0].direction.as_deref(), Some("bidir"));
+    }
+
+    #[test]
+    fn suite_plan_rejects_legacy_pairs_and_parallel_execution() {
+        let state = state_with_pair();
+        let mut req = suite_request();
+        req.pairs = request().pairs;
+        let error = validate_request(&state, &req).expect_err("mixed request formats must fail");
+        assert!(error.contains("不能同时"), "{error}");
+
+        let mut req = suite_request();
+        req.ui_plan.as_mut().unwrap().suites[0].execution = "parallel".into();
+        let error = validate_request(&state, &req).expect_err("parallel suites are not supported");
+        assert!(error.contains("sequential"), "{error}");
+    }
+
+    #[test]
+    fn quick_plan_applies_request_level_ping_defaults() {
+        let state = state_with_pair();
+        let mut req = suite_request();
+        req.ping_count = 5;
+        req.ping_payload_sizes = vec![64, 1400];
+        let plan = req.ui_plan.as_mut().unwrap();
+        plan.recipes.ping.clear();
+        plan.suites[0].order.push("task-ping".into());
+        plan.suites[0].tasks.push(UiTask {
+            id: "task-ping".into(),
+            name: "Ping".into(),
+            protocol: "ping".into(),
+            directions: vec!["ab".into()],
+            ip: vec!["v4".into()],
+            ..Default::default()
+        });
+
+        let compiled = compile_request(&state, &req).expect("ping suite should validate");
+        assert_eq!(compiled.cfg.ping.count, 5);
+        assert_eq!(compiled.cfg.ping.payload_sizes, vec![64, 1400]);
+        let ping = compiled
+            .cfg
+            .tests
+            .iter()
+            .find(|test| test.kinds.iter().any(|kind| kind == "ping"))
+            .expect("ping task should compile");
+        assert_eq!(
+            ping.ping_count, None,
+            "task should inherit request defaults"
+        );
+        assert_eq!(ping.ping_payload_sizes, None);
+    }
+
+    #[test]
+    fn quick_plan_rejects_ping_recipe_references_until_recipe_fields_exist() {
+        let state = state_with_pair();
+        let mut req = suite_request();
+        let plan = req.ui_plan.as_mut().expect("suite plan");
+        plan.suites[0].tasks.retain(|task| task.id == "task-tcp");
+        plan.suites[0].order = vec!["task-tcp".into()];
+        plan.recipes.ping.push(UiRecipe {
+            id: "ping-r".into(),
+            name: "PING recipe".into(),
+            ..Default::default()
+        });
+        plan.suites[0].tasks.push(UiTask {
+            id: "task-ping".into(),
+            name: "PING".into(),
+            protocol: "ping".into(),
+            directions: vec!["ab".into()],
+            ip: vec!["v4".into()],
+            recipe_ids: vec!["ping-r".into()],
+            ..Default::default()
+        });
+        plan.suites[0].order.push("task-ping".into());
+
+        let error = validate_request(&state, &req)
+            .expect_err("PING recipe references must not be silently ignored");
+        assert!(error.contains("暂不支持 PING 配方"), "{error}");
+    }
+
+    #[test]
+    fn quick_plan_rejects_append_binding_mode_without_silent_replace() {
+        let state = state_with_pair();
+        let mut req = suite_request();
+        req.ui_plan.as_mut().expect("suite plan").bindings[0].mode = "append".into();
+
+        let error = validate_request(&state, &req)
+            .expect_err("unsupported append mode must fail at validation");
+        assert!(error.contains("append 尚未支持"), "{error}");
+    }
+
+    #[test]
+    fn quick_plan_ignores_unbound_empty_link_set_but_rejects_bound_empty_set() {
+        let state = state_with_pair();
+        let mut req = suite_request();
+        {
+            let plan = req.ui_plan.as_mut().expect("suite plan");
+            // The UI permits creating a draft collection before selecting pairs.
+            // An unrelated empty collection must not prevent another valid binding
+            // from being previewed.
+            plan.link_sets.push(UiLinkSet {
+                id: "empty-draft".into(),
+                name: "待填写".into(),
+                pair_refs: Vec::new(),
+            });
+        }
+        let compiled = compile_request(&state, &req).expect("unbound draft is harmless");
+        assert_eq!(compiled.cfg.tests.len(), 2);
+
+        // Once a suite is assigned to that collection, silently producing no
+        // units would be much worse than an actionable validation error.
+        req.ui_plan.as_mut().expect("suite plan").bindings[0].link_set_id = "empty-draft".into();
+        let error = validate_request(&state, &req).expect_err("bound empty set must fail");
+        assert!(error.contains("没有可执行的 pair_ref"), "{error}");
+
+        // A non-empty set with an explicit subset remains valid when the
+        // selected reference exists; the effective-pair check must not confuse
+        // `pair_ids` with an instruction to run the whole set.
+        let mut req = suite_request();
+        req.ui_plan.as_mut().expect("suite plan").bindings[0].pair_ids = vec!["pair-a".into()];
+        assert!(
+            validate_request(&state, &req).is_ok(),
+            "an existing pair_ids subset should remain executable"
+        );
+    }
+
+    #[test]
+    fn quick_plan_rejects_empty_udp_recipe_that_would_emit_no_units() {
+        let state = state_with_pair();
+        let mut req = suite_request();
+        let recipe = req.ui_plan.as_mut().unwrap().recipes.udp[0].clone();
+        let empty = UiRecipe {
+            id: recipe.id,
+            name: recipe.name,
+            mode: recipe.mode,
+            profiles: vec![UiRecipeProfile::default()],
+            ..Default::default()
+        };
+        req.ui_plan.as_mut().unwrap().recipes.udp[0] = empty;
+        let error = validate_request(&state, &req).expect_err("empty UDP recipe must fail");
+        assert!(error.contains("-b") || error.contains("有效"), "{error}");
+    }
+
+    #[test]
+    fn quick_plan_validates_task_duration_and_profile_dimensions() {
+        let state = state_with_pair();
+        let mut req = suite_request();
+        req.ui_plan.as_mut().unwrap().suites[0].tasks[0].duration = Some(0);
+        let error = validate_request(&state, &req).expect_err("zero task duration must fail");
+        assert!(error.contains("时长"), "{error}");
+
+        let mut req = suite_request();
+        req.ui_plan.as_mut().unwrap().recipes.udp[0].profiles[0].length = Some("65508".into());
+        let error = validate_request(&state, &req).expect_err("oversized UDP profile must fail");
+        assert!(error.contains("65507"), "{error}");
+
+        let mut req = suite_request();
+        req.ui_plan.as_mut().unwrap().recipes.udp[0].profiles[0].window = Some("not-size".into());
+        let error =
+            validate_request(&state, &req).expect_err("invalid UDP profile window must fail");
+        assert!(error.contains("profile -w"), "{error}");
+    }
+
+    #[test]
+    fn quick_plan_preserves_slashes_in_trace_ids() {
+        let state = state_with_pair();
+        let mut req = suite_request();
+        let plan = req.ui_plan.as_mut().unwrap();
+        plan.link_sets[0].id = "set/a".into();
+        plan.link_sets[0].pair_refs[0].id = "pair/a".into();
+        plan.recipes.tcp[0].id = "tcp/recipe".into();
+        plan.recipes.udp[0].id = "udp/recipe".into();
+        plan.suites[0].id = "suite/a".into();
+        plan.suites[0].tasks[0].id = "task/tcp".into();
+        plan.suites[0].tasks[1].id = "task/udp".into();
+        plan.suites[0].order = vec!["task/tcp".into(), "task/udp".into()];
+        plan.suites[0].tasks[0].recipe_ids = vec!["tcp/recipe".into()];
+        plan.suites[0].tasks[1].recipe_ids = vec!["udp/recipe".into()];
+        plan.bindings[0].id = "binding/a".into();
+        plan.bindings[0].link_set_id = "set/a".into();
+        plan.bindings[0].suite_id = "suite/a".into();
+
+        let compiled = compile_request(&state, &req).expect("slash IDs should be valid");
+        assert_eq!(compiled.trace[0].link_set_id.as_deref(), Some("set/a"));
+        assert_eq!(compiled.trace[0].pair_id.as_deref(), Some("pair/a"));
+        assert_eq!(compiled.trace[0].suite_id.as_deref(), Some("suite/a"));
+        assert_eq!(compiled.trace[0].task_id.as_deref(), Some("task/tcp"));
+        assert_eq!(compiled.trace[0].recipe_id.as_deref(), Some("tcp/recipe"));
+        assert_eq!(compiled.trace[1].task_id.as_deref(), Some("task/udp"));
+        assert_eq!(compiled.trace[1].recipe_id.as_deref(), Some("udp/recipe"));
+    }
+
+    #[test]
+    fn quick_plan_rejects_duplicate_pair_ids_in_a_binding() {
+        let state = state_with_pair();
+        let mut req = suite_request();
+        req.ui_plan.as_mut().unwrap().bindings[0].pair_ids = vec!["pair-a".into(), "pair-a".into()];
+        let error = validate_request(&state, &req).expect_err("duplicate pair refs must fail");
+        assert!(error.contains("重复引用"), "{error}");
+    }
+
+    #[test]
+    fn quick_plan_allows_link_set_and_recipe_ids_to_share_a_namespace_name() {
+        let state = state_with_pair();
+        let mut req = suite_request();
+        let plan = req.ui_plan.as_mut().unwrap();
+        // IDs are scoped by the field that owns them.  A human-authored
+        // project commonly calls both its first link set and its first recipe
+        // "default"; that must not be mistaken for a duplicate reference.
+        plan.link_sets[0].id = "default".into();
+        plan.recipes.tcp[0].id = "default".into();
+        plan.bindings[0].link_set_id = "default".into();
+        plan.suites[0].tasks[0].recipe_ids = vec!["default".into()];
+
+        let compiled = compile_request(&state, &req)
+            .expect("link-set and recipe IDs may match across namespaces");
+        assert_eq!(compiled.cfg.tests.len(), 2);
+    }
+
+    #[test]
+    fn quick_plan_honors_stream_axes_on_legacy_udp_profiles() {
+        let state = state_with_pair();
+        let mut req = suite_request();
+        let recipe = &mut req.ui_plan.as_mut().unwrap().recipes.udp[0];
+        recipe.profiles.clear();
+        recipe.bandwidths.clear();
+        recipe.lengths.clear();
+        recipe.windows.clear();
+        recipe.udp_profiles = vec![UdpProfile::bw("100m")];
+        recipe.udp_streams = vec![2, 3];
+        let cfg = validated_config_from_request(&state, &req).expect("legacy UDP recipe valid");
+        let streams: Vec<u32> = cfg
+            .tests
+            .iter()
+            .filter(|test| test.transports.iter().any(|transport| transport == "udp"))
+            .filter_map(|test| test.udp_streams)
+            .collect();
+        assert_eq!(streams, vec![2, 3]);
     }
 
     /// 界面上填的门限/带宽必须真的变成 link_profiles，否则勾了等于没勾。
@@ -2525,14 +5845,18 @@ mod tests {
         assert!(config_from_request(&state, &on).limit_udp_by_link_speed);
     }
 
-    fn console_for_monitor_tests() -> Arc<Console> {
+    fn console_with(state: UiState) -> Arc<Console> {
         Arc::new(Console {
-            state: Mutex::new(state_with_pair()),
+            state: Mutex::new(state),
             running: AtomicBool::new(false),
             report: Mutex::new(String::new()),
             ui_token: String::new(),
             monitors: Mutex::new(HashMap::new()),
         })
+    }
+
+    fn console_for_monitor_tests() -> Arc<Console> {
+        console_with(state_with_pair())
     }
 
     /// 环形缓冲挤掉旧点之后，游标必须还指得对。
@@ -2571,14 +5895,16 @@ mod tests {
         );
 
         // from=0 的落后游标：从现存最早的点开始给，而不是从数组第 0 个。
-        let out = api_monitor_samples(&console, "session=s1&from=0").unwrap();
+        let out =
+            api_monitor_samples(&console, r#"{"cursors":[{"session":"s1","from":0}]}"#).unwrap();
+        let first = &out["series"][0];
         assert_eq!(
-            out["points"][0]["rx_mbps"], 120.0,
+            first["points"][0]["rx_mbps"], 120.0,
             "第一个点应是未被挤掉的最早点"
         );
-        assert_eq!(out["from"], (MONITOR_MAX_POINTS + 120) as u64);
+        assert_eq!(first["from"], (MONITOR_MAX_POINTS + 120) as u64);
         assert_eq!(
-            out["points"].as_array().unwrap().len(),
+            first["points"].as_array().unwrap().len(),
             MONITOR_MAX_POINTS,
             "落后游标应拿到缓冲里现有的全部"
         );
@@ -2586,19 +5912,24 @@ mod tests {
         // 追平之后再问，应该一个点都没有。
         let out = api_monitor_samples(
             &console,
-            &format!("session=s1&from={}", MONITOR_MAX_POINTS + 120),
+            &format!(
+                r#"{{"cursors":[{{"session":"s1","from":{}}}]}}"#,
+                MONITOR_MAX_POINTS + 120
+            ),
         )
         .unwrap();
         assert!(
-            out["points"].as_array().unwrap().is_empty(),
+            out["series"][0]["points"].as_array().unwrap().is_empty(),
             "追平后不该重发"
         );
 
         api_monitor_stop(&console, r#"{"session":"s1"}"#).unwrap();
-        assert!(
-            api_monitor_samples(&console, "session=s1&from=0").is_err(),
-            "停掉的会话应当直接报错，而不是给一份空数据装作还活着"
-        );
+        // 停掉的那一路只报自己那一条，不能让整次批量取样失败——同一次请求里
+        // 还有别的曲线好好地在跑。
+        let out =
+            api_monitor_samples(&console, r#"{"cursors":[{"session":"s1","from":0}]}"#).unwrap();
+        assert_eq!(out["series"][0]["running"], false);
+        assert_eq!(out["series"][0]["error"], "监控会话已结束");
         // 再停一次不能 panic：页面上快速点两下停止是常事。
         let again = api_monitor_stop(&console, r#"{"session":"s1"}"#).unwrap();
         assert_eq!(again["stopped"], false);
@@ -2652,9 +5983,14 @@ mod tests {
         // 采样线程读不到计数器会立刻收摊并写下错误。
         let mut error = String::new();
         for _ in 0..50 {
-            let out = api_monitor_samples(&console, &format!("session={session}&from=0")).unwrap();
-            error = out["error"].as_str().unwrap_or_default().to_string();
-            if !error.is_empty() && out["running"] == false {
+            let out = api_monitor_samples(
+                &console,
+                &format!(r#"{{"cursors":[{{"session":"{session}","from":0}}]}}"#),
+            )
+            .unwrap();
+            let series = &out["series"][0];
+            error = series["error"].as_str().unwrap_or_default().to_string();
+            if !error.is_empty() && series["running"] == false {
                 break;
             }
             std::thread::sleep(Duration::from_millis(40));
@@ -2960,6 +6296,962 @@ mod tests {
 
         req.pairs[0].rx_target_bidir_ab = "1000".into();
         assert!(validate_request(&state, &req).is_ok(), "绝对值要放行");
+    }
+
+    fn state_with_two_pairs() -> UiState {
+        let nic = |name: &str, role: &str, ip: &str| NicInfo {
+            name: name.into(),
+            role: role.into(),
+            ipv4: ip.into(),
+            speed_mbps: 2500,
+            ..Default::default()
+        };
+        UiState {
+            cfg: Config::default(),
+            agent_host: "10.0.0.2".into(),
+            master: HostInfo {
+                hostname: "m".into(),
+                os: "test".into(),
+                interfaces: vec![
+                    nic("以太网 6", "SGMII2.5G", "192.168.0.101"),
+                    nic("以太网 7", "SGMII1G", "192.168.0.102"),
+                ],
+            },
+            agent: HostInfo {
+                hostname: "a".into(),
+                os: "test".into(),
+                interfaces: vec![
+                    nic("WLAN 3", "WIFI5G", "192.168.0.104"),
+                    nic("USB 4", "RNDIS", "192.168.0.105"),
+                ],
+            },
+        }
+    }
+
+    /// `-b` 在预览里按 Mbps 显示，别的参数照抄。
+    ///
+    /// 下发的是精确 bit/s 整数，原样打印是 `-b 1000000000`——十个零要一个个数，
+    /// 而且抄回输入框会变成 10^9 Mbps（那里的裸数字按 Mbps 算）。
+    #[test]
+    fn the_plan_renders_bandwidth_in_mbps() {
+        let args =
+            |items: &[&str]| -> Vec<String> { items.iter().map(|item| item.to_string()).collect() };
+        assert_eq!(
+            readable_args(&args(&["-b", "1000000000", "-l", "1200"])),
+            "-b 1000 Mbps -l 1200"
+        );
+        // 裁剪之后常常不是整 Mbps，别把它抹成整数。
+        assert_eq!(
+            readable_args(&args(&["-b", "2600500000"])),
+            "-b 2600.5 Mbps"
+        );
+        // TCP 那条没有 -b，原样照抄。
+        assert_eq!(
+            readable_args(&args(&["-w", "4m", "-P", "10"])),
+            "-w 4m -P 10"
+        );
+    }
+
+    /// 把 bit/s 填进按 Mbps 解释的输入框，要当场说清楚，而不是拿着
+    /// 10^9 Mbps 去灌包。
+    #[test]
+    fn a_bandwidth_that_is_off_by_a_million_is_rejected() {
+        let state = state_with_pair();
+        let mut req = request();
+        req.udp_bandwidths = vec!["1000000000".into()];
+        let error = validate_request(&state, &req).expect_err("必须报错");
+        assert!(
+            error.contains("按 Mbps 算"),
+            "错误要说清是单位填错了：{error}"
+        );
+
+        // 加了后缀就是正常的 1000Mbps，必须放行。
+        for ok in ["1000m", "1G", "1000mbps"] {
+            let mut req = request();
+            req.udp_bandwidths = vec![ok.into()];
+            assert!(validate_request(&state, &req).is_ok(), "{ok} 应当合法");
+        }
+    }
+
+    /// 「预览任务」要把每条腿最终下发的参数摆出来。
+    ///
+    /// 优先级（网口固定值 > 参数组 > 默认组）和链路裁剪都会改写这几个数字，
+    /// 而这两件事都发生在人看不见的地方。摆出来之后，填错了在跑之前就能发现。
+    #[test]
+    fn the_plan_shows_the_parameters_each_leg_will_actually_use() {
+        let state = state_with_pair();
+        let mut req = request();
+        req.nic_policies.clear();
+        req.udp_bandwidths = vec!["500m".into()];
+        req.udp_lengths = vec!["1200".into()];
+        req.udp_streams = 3;
+        req.pairs[0].directions = vec!["ab".into()];
+        req.pairs[0].transports = vec!["udp".into()];
+        let cfg = validated_config_from_request(&state, &req).unwrap();
+
+        let specs: Vec<_> = cfg
+            .tests
+            .iter()
+            .map(|test| builder::spec_from_config(test, &cfg, &state.master, &state.agent).unwrap())
+            .collect();
+        let mut port = builder::PORT_BASE;
+        let (units, _) = build_units(&specs, cfg.require_same_subnet_for_iperf, &mut port);
+        let lines = unit_load_lines(&units[0]);
+
+        assert_eq!(lines.len(), 1, "单向单元只有一条腿");
+        assert!(lines[0].contains("-b 500 Mbps"), "{lines:?}");
+        assert!(lines[0].contains("-l 1200"), "{lines:?}");
+        assert!(lines[0].contains("×3 流"), "{lines:?}");
+    }
+
+    /// 每一行选哪一组 UDP 参数，就跑那一组里写着的东西。
+    ///
+    /// 「这几对 2500m 单流、那几对 1000m/500m 四流、还有几对带 -l」是一轮里
+    /// 最常见的安排，而执行区那份档位是所有勾中的配对共用的，表达不了。
+    #[test]
+    fn each_row_runs_the_udp_group_it_points_at() {
+        let state = state_with_two_pairs();
+        let mut req = request();
+        req.nic_policies.clear();
+        // 默认组：-b 1m、不带 -l、2 流。
+        req.udp_bandwidths = vec!["1m".into()];
+        req.udp_lengths = Vec::new();
+        req.udp_streams = 2;
+        req.udp_groups = vec![
+            UdpGroup {
+                name: "单流打满".into(),
+                bandwidths: vec!["2500m".into()],
+                lengths: vec!["64".into()],
+                windows: Vec::new(),
+                streams: 1,
+            },
+            UdpGroup {
+                name: "多流".into(),
+                bandwidths: vec!["1000m".into(), "500m".into()],
+                lengths: Vec::new(),
+                windows: Vec::new(),
+                streams: 4,
+            },
+        ];
+        req.pairs[0].directions = vec!["ab".into()];
+        req.pairs[0].udp_groups = vec![1];
+        let mut second = req.pairs[0].clone();
+        second.src = "master:NAME=以太网 7".into();
+        second.dst = "agent:NAME=USB 4".into();
+        second.udp_groups = vec![2];
+        let mut third = req.pairs[0].clone();
+        third.src = "master:NAME=以太网 6".into();
+        third.dst = "agent:NAME=USB 4".into();
+        third.udp_groups = vec![0];
+        req.pairs.push(second);
+        req.pairs.push(third);
+
+        let cfg = validated_config_from_request(&state, &req).expect("三行都该合法");
+        // 单元名带着组号：同一对选两组时两批单元必须区分得开，否则 resume id
+        // 撞车、互相覆盖。默认组沿用原名，改名会让历史 PASS 全部失效。
+        let spec = |name: &str| {
+            cfg.tests
+                .iter()
+                .find(|test| test.name == name)
+                .unwrap_or_else(|| panic!("找不到单元 {name}"))
+        };
+        let profiles = |name: &str| -> Vec<(String, Option<String>)> {
+            spec(name)
+                .udp_profiles
+                .as_ref()
+                .unwrap()
+                .iter()
+                .map(|profile| (profile.bandwidth.clone(), profile.length.clone()))
+                .collect()
+        };
+
+        assert_eq!(
+            profiles("ui-1-udp-g2"),
+            vec![("2500m".into(), Some("64".into()))]
+        );
+        assert_eq!(spec("ui-1-udp-g2").udp_streams, Some(1));
+        assert_eq!(
+            profiles("ui-2-udp-g3"),
+            vec![("1000m".into(), None), ("500m".into(), None)],
+            "组里没填 -l 就是不下发，不继承默认组"
+        );
+        assert_eq!(spec("ui-2-udp-g3").udp_streams, Some(4));
+        assert_eq!(
+            profiles("ui-3-udp"),
+            vec![("1m".into(), None)],
+            "没选组的行跑默认组，单元名不带后缀"
+        );
+        assert_eq!(spec("ui-3-udp").udp_streams, Some(2));
+        // 默认组的档位仍然写回 iperf.udp_profiles：下载出来的 config 交给
+        // master --auto 时读的是这一份。
+        assert_eq!(
+            cfg.iperf
+                .udp_profiles
+                .iter()
+                .map(|profile| profile.bandwidth.clone())
+                .collect::<Vec<_>>(),
+            vec!["1m"]
+        );
+    }
+
+    /// 同一行选两组 = 这一对跑两批，参数各按各的组来。
+    ///
+    /// 矩阵里一对网口只有一行，不能多选的话「既按常规档位跑一遍、又用 1m 单流
+    /// 跑一遍」只能分两轮、出两份报告。
+    #[test]
+    fn one_row_can_run_several_groups() {
+        let state = state_with_pair();
+        let mut req = request();
+        req.nic_policies.clear();
+        req.udp_bandwidths = vec!["1000m".into()];
+        req.udp_streams = 4;
+        req.udp_groups = vec![UdpGroup {
+            name: "慢速单流".into(),
+            bandwidths: vec!["1m".into()],
+            lengths: Vec::new(),
+            windows: Vec::new(),
+            streams: 1,
+        }];
+        req.pairs[0].directions = vec!["ab".into()];
+        req.pairs[0].transports = vec!["udp".into()];
+        req.pairs[0].udp_groups = vec![0, 1];
+
+        let cfg = validated_config_from_request(&state, &req).unwrap();
+        let udp: Vec<&TestSpec> = cfg
+            .tests
+            .iter()
+            .filter(|test| test.transports.iter().any(|t| t == "udp"))
+            .collect();
+        assert_eq!(udp.len(), 2, "两组 = 两批单元");
+        assert_eq!(udp[0].name, "ui-1-udp");
+        assert_eq!(udp[0].udp_streams, Some(4));
+        assert_eq!(
+            udp[1].name, "ui-1-udp-g2",
+            "组号进单元名，resume id 才不撞车"
+        );
+        assert_eq!(udp[1].udp_streams, Some(1));
+
+        // 同一组选两次不该跑两遍：两批同名单元在 resume 里会互相覆盖。
+        req.pairs[0].udp_groups = vec![1, 1, 0];
+        let cfg = validated_config_from_request(&state, &req).unwrap();
+        assert_eq!(
+            cfg.tests
+                .iter()
+                .filter(|test| test.transports.iter().any(|t| t == "udp"))
+                .count(),
+            2
+        );
+
+        // 不带这个字段（老页面、手写请求）= 只跑默认组。
+        req.pairs[0].udp_groups = Vec::new();
+        let cfg = validated_config_from_request(&state, &req).unwrap();
+        let udp: Vec<&TestSpec> = cfg
+            .tests
+            .iter()
+            .filter(|test| test.transports.iter().any(|t| t == "udp"))
+            .collect();
+        assert_eq!(udp.len(), 1);
+        assert_eq!(udp[0].name, "ui-1-udp");
+    }
+
+    /// 组是完整定义，不继承默认组——空的 `-b` 生成不出任何单元，要当场挡住。
+    /// 选了组却没勾 UDP 同理：那一组一个单元都不会跑。
+    #[test]
+    fn a_group_that_would_run_nothing_is_rejected() {
+        let state = state_with_pair();
+
+        let mut req = request();
+        req.udp_groups = vec![UdpGroup {
+            name: String::new(),
+            bandwidths: Vec::new(),
+            lengths: vec!["64".into()],
+            windows: Vec::new(),
+            streams: 1,
+        }];
+        let error = validate_request(&state, &req).expect_err("没填 -b 必须报错");
+        assert!(error.contains("没填 -b"), "{error}");
+
+        let mut req = request();
+        req.udp_groups = vec![UdpGroup {
+            name: String::new(),
+            bandwidths: vec!["2500m".into()],
+            lengths: Vec::new(),
+            windows: Vec::new(),
+            streams: 1,
+        }];
+        req.pairs[0].udp_groups = vec![1];
+        req.pairs[0].transports = vec!["tcp".into()];
+        let error = validate_request(&state, &req).expect_err("没勾 UDP 必须报错");
+        assert!(error.contains("没有勾 UDP"), "{error}");
+
+        // 指向一个不存在的组：页面删组时没同步过来才会出现，静默按默认组跑
+        // 等于跑了另一件事。
+        let mut req = request();
+        req.pairs[0].udp_groups = vec![3];
+        let error = validate_request(&state, &req).expect_err("越界必须报错");
+        assert!(error.contains("不存在"), "{error}");
+
+        // 组里的档位写错要指名是哪一组。
+        let mut req = request();
+        req.udp_groups = vec![UdpGroup {
+            name: "很快组".into(),
+            bandwidths: vec!["很快".into()],
+            lengths: Vec::new(),
+            windows: Vec::new(),
+            streams: 1,
+        }];
+        let error = validate_request(&state, &req).expect_err("必须报错");
+        assert!(error.contains("很快组"), "{error}");
+    }
+
+    /// 清空 `-l` / `-w` 就是真的不下发它们，而不是替人填一个 iperf3 默认值。
+    ///
+    /// 「不指定」和「指定成某个具体值」在报告里读起来完全不同，不能混。
+    #[test]
+    fn clearing_udp_length_and_window_emits_no_such_flags() {
+        let state = state_with_pair();
+        let mut req = request();
+        req.udp_lengths = Vec::new();
+        req.udp_windows = Vec::new();
+        req.udp_bandwidths = vec!["1000m".into()];
+        req.nic_policies.clear();
+
+        let cfg = validated_config_from_request(&state, &req).unwrap();
+        assert!(
+            cfg.iperf
+                .udp_profiles
+                .iter()
+                .all(|profile| profile.length.is_none() && profile.window.is_none()),
+            "全局档位不该凭空长出 -l / -w"
+        );
+        let pair_profiles = cfg
+            .tests
+            .iter()
+            .filter_map(|test| test.udp_profiles.as_ref())
+            .flatten();
+        for profile in pair_profiles {
+            assert!(
+                profile.length.is_none() && profile.window.is_none(),
+                "逐对档位也不该凭空长出 -l / -w：{profile:?}"
+            );
+        }
+    }
+
+    /// 「下载 config.json」再导入回来，界面上的勾选必须原样回到原处。
+    ///
+    /// 导入是下载的逆运算，这条测试是它唯一的判据：两边任何一处口径不一样，
+    /// 表现都是「导进来看着差不多、跑出来不是那份配置」——比报错难查得多。
+    #[test]
+    fn downloading_then_importing_restores_the_same_selection() {
+        let state = state_with_pair();
+        let req = request();
+        let cfg = config_from_request(&state, &req);
+        let file = serde_json::to_string(&cfg).unwrap();
+
+        let console = console_with(state_with_pair());
+        let out = api_import(&console, &file).expect("自己下载的配置必须能导回来");
+
+        let pair = &out["pairs"][0];
+        assert_eq!(pair["src"], "master:NAME=以太网 6");
+        assert_eq!(pair["dst"], "agent:NAME=WLAN 3");
+        assert_eq!(
+            pair["directions"].as_array().unwrap(),
+            &vec![json!("ab"), json!("bidir")],
+            "方向要按原样回来，不能被 TCP/UDP 那几条 TestSpec 拆散"
+        );
+        assert_eq!(
+            pair["transports"].as_array().unwrap(),
+            &vec![json!("tcp"), json!("udp")]
+        );
+        assert_eq!(pair["ip"].as_array().unwrap(), &vec![json!("v4")]);
+        // 网口上钉了 -b 的那种配置，文件里的 profile 带宽是占位值，不能被
+        // 当成「这一行自己选的组」读回来。
+        assert_eq!(
+            pair["udp_groups"].as_array().unwrap(),
+            &vec![json!(0)],
+            "网口钉死时不认成附加组"
+        );
+        assert!(
+            out["udp_groups"].as_array().unwrap().is_empty(),
+            "不该凭空多出一个由占位值拼成的组"
+        );
+
+        let settings = &out["settings"];
+        assert_eq!(settings["duration"], 60);
+        assert_eq!(
+            settings["tcp_windows"].as_array().unwrap(),
+            &vec![json!("2m"), json!("4m"), json!("256m")]
+        );
+        assert_eq!(
+            settings["tcp_streams"].as_array().unwrap(),
+            &vec![json!(1), json!(5), json!(10)],
+            "每个 -P 档位是一条 TestSpec，回填时要合回一个列表"
+        );
+        assert_eq!(
+            settings["udp_bandwidths"].as_array().unwrap(),
+            &vec![json!("1m"), json!("500m"), json!("1G")]
+        );
+
+        // 网口策略是另一半：门限和按口 -b 都在 link_profiles 里，漏了它
+        // 「导入成功」就是一句空话。
+        let policies = out["nic_policies"].as_array().unwrap();
+        let master = policies
+            .iter()
+            .find(|policy| policy["endpoint"] == "master:NAME=以太网 6")
+            .expect("主控网口策略");
+        assert_eq!(master["rx_target"], "1800");
+        assert_eq!(master["udp_bandwidth"], "2.6G");
+    }
+
+    /// 文件里不同的 UDP 参数要被认成组，并按行选回去。
+    #[test]
+    fn importing_rebuilds_the_udp_groups_from_the_tests() {
+        let state = state_with_two_pairs();
+        let mut req = request();
+        req.nic_policies.clear();
+        req.udp_bandwidths = vec!["1m".into()];
+        req.udp_streams = 2;
+        req.udp_groups = vec![UdpGroup {
+            name: "多流".into(),
+            bandwidths: vec!["1000m".into(), "500m".into()],
+            lengths: Vec::new(),
+            windows: Vec::new(),
+            streams: 4,
+        }];
+        req.pairs[0].udp_groups = vec![1];
+        let mut second = req.pairs[0].clone();
+        second.src = "master:NAME=以太网 7".into();
+        second.dst = "agent:NAME=USB 4".into();
+        second.udp_groups = vec![0];
+        req.pairs.push(second);
+        let cfg = config_from_request(&state, &req);
+
+        let console = console_with(state_with_two_pairs());
+        let out = api_import(&console, &serde_json::to_string(&cfg).unwrap()).unwrap();
+        let groups = out["udp_groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 1, "只有一种和默认组不同的打法");
+        assert_eq!(
+            groups[0]["bandwidths"].as_array().unwrap(),
+            &vec![json!("1000m"), json!("500m")]
+        );
+        assert_eq!(groups[0]["streams"], 4);
+        assert_eq!(
+            out["pairs"][0]["udp_groups"].as_array().unwrap(),
+            &vec![json!(1)],
+            "第一行选那一组"
+        );
+        assert_eq!(
+            out["pairs"][1]["udp_groups"].as_array().unwrap(),
+            &vec![json!(0)],
+            "第二行留在默认组"
+        );
+        // 默认组还是执行区那份，不该被某一行的组顶掉。
+        assert_eq!(
+            out["settings"]["udp_bandwidths"].as_array().unwrap(),
+            &vec![json!("1m")]
+        );
+        assert_eq!(out["settings"]["udp_streams"], 2);
+    }
+
+    /// 当一端按网口固定 `-b`、另一端仍扫 UDP 档位时，导入不能把未固定方向
+    /// 的附加组误判成占位值而丢掉。矩阵编译会把这种组合拆成两个 test：
+    /// pinned 的一条只用于固定方向，swept 的一条仍带用户选择的 profiles。
+    #[test]
+    fn importing_keeps_udp_group_for_unpinned_direction() {
+        let state = state_with_pair();
+        let mut req = request();
+        req.nic_policies = vec![NicPolicySelection {
+            endpoint: "master:NAME=以太网 6".into(),
+            rx_target: String::new(),
+            udp_bandwidth: "3m".into(),
+            udp_length: String::new(),
+        }];
+        req.udp_bandwidths = vec!["1m".into()];
+        req.udp_lengths = vec!["1200".into()];
+        req.udp_streams = 1;
+        req.udp_groups = vec![UdpGroup {
+            name: "高带宽".into(),
+            bandwidths: vec!["500m".into()],
+            lengths: vec!["1200".into()],
+            windows: Vec::new(),
+            streams: 1,
+        }];
+        req.pairs[0].transports = vec!["udp".into()];
+        req.pairs[0].directions = vec!["ab".into(), "ba".into()];
+        req.pairs[0].udp_groups = vec![1];
+
+        let cfg = validated_config_from_request(&state, &req).expect("原始配置必须合法");
+        assert!(cfg.tests.iter().any(|test| {
+            test.direction.directions() == ["ab"]
+                && test
+                    .udp_profiles
+                    .as_ref()
+                    .is_some_and(|profiles| profiles[0].bandwidth == "3m")
+        }));
+        assert!(cfg.tests.iter().any(|test| {
+            test.direction.directions() == ["ba"]
+                && test
+                    .udp_profiles
+                    .as_ref()
+                    .is_some_and(|profiles| profiles[0].bandwidth == "500m")
+        }));
+
+        let console = console_with(state_with_pair());
+        let out = api_import(&console, &serde_json::to_string(&cfg).unwrap())
+            .expect("混合固定/扫描方向必须能导入");
+        assert_eq!(
+            out["udp_groups"][0]["bandwidths"].as_array().unwrap(),
+            &vec![json!("500m")],
+            "未固定的 B→A 方向仍应恢复附加 UDP 组"
+        );
+        assert_eq!(out["pairs"][0]["udp_groups"], json!([1]));
+    }
+
+    /// 下载 -> 导入 -> 再下载，两份配置**跑出来的单元必须一模一样**。
+    ///
+    /// 这是导入功能真正要保证的东西，比逐个字段对更硬：任何一处回填走样，
+    /// 单元列表就变了。而「走样」在实际使用里不报错——它安静地按另一份配置
+    /// 跑完一整轮。
+    ///
+    /// 比单元而不是比 config 的字节，是因为同一件事在 config 里可以有两种写法：
+    /// 界面没填 ping 次数时写的是 `null`（执行时回落到 `ping.count`），
+    /// 回填之后那一格会是回落出来的 100，两份 JSON 因此不同、跑的却是同一件事。
+    /// 单元列表是这两种写法的公共下游，也正是「跑什么」的定义。
+    #[test]
+    fn download_import_download_runs_the_same_units() {
+        let state = state_with_two_pairs();
+        let mut req = request();
+        req.nic_policies.clear();
+        req.udp_bandwidths = vec!["1m".into()];
+        req.udp_lengths = vec!["1200".into()];
+        req.udp_streams = 2;
+        req.udp_groups = vec![UdpGroup {
+            name: "单流".into(),
+            bandwidths: vec!["2500m".into()],
+            lengths: vec!["1200".into()],
+            windows: Vec::new(),
+            streams: 1,
+        }];
+        req.pairs[0].udp_groups = vec![1];
+        req.pairs[0].rx_target_bidir_ab = "1000".into();
+        let mut second = req.pairs[0].clone();
+        second.src = "master:NAME=以太网 7".into();
+        second.dst = "agent:NAME=USB 4".into();
+        req.udp_groups.push(UdpGroup {
+            name: "多流".into(),
+            bandwidths: vec!["1000m".into(), "500m".into()],
+            lengths: vec!["1200".into()],
+            windows: Vec::new(),
+            streams: 4,
+        });
+        second.udp_groups = vec![2];
+        second.rx_target_bidir_ab = String::new();
+        second.transports = vec!["udp".into(), "ping".into()];
+        req.pairs.push(second);
+
+        let first = validated_config_from_request(&state, &req).expect("原始配置必须合法");
+        let file = serde_json::to_string(&first).unwrap();
+
+        let console = console_with(state_with_two_pairs());
+        let out = api_import(&console, &file).expect("必须能导回来");
+        let replayed = request_from_import(&out);
+        let second_pass = {
+            let state = lock_recover(&console.state);
+            validated_config_from_request(&state, &replayed).expect("回填出来的必须仍然合法")
+        };
+
+        assert_eq!(
+            units_debug(&first, &state),
+            units_debug(&second_pass, &state),
+            "导入一轮之后跑的必须还是同一批单元"
+        );
+        // 顺带钉住这一轮里真正在意的那几个值，免得两边一起错还对得上。
+        let dump = units_debug(&first, &state);
+        assert!(dump.contains("2500m"), "第一行的逐对档位");
+        assert!(
+            dump.contains("1000m") && dump.contains("500m"),
+            "第二行的两档"
+        );
+    }
+
+    /// TCP 参数组和 UDP 一样要能下载再导回、跑出同一批单元；顺带盖住「附加组把
+    /// `-w` 留空 = 跑一条不带 `-w` 的 TCP」这条新路径，和「一行选多组 TCP」。
+    #[test]
+    fn tcp_groups_download_import_runs_the_same_units() {
+        let state = state_with_two_pairs();
+        let mut req = request();
+        req.nic_policies.clear();
+        // 默认 TCP 组：-w 两档 × -P 两档。
+        req.tcp_windows = vec!["4m".into(), "256m".into()];
+        req.tcp_streams = vec![1, 10];
+        // 组1：单独的 -w、单流。组2：-w 留空（不下发 -w）、-P 扫两档——走 builder
+        // 的 no-window 分支。
+        req.tcp_groups = vec![
+            TcpGroup {
+                name: "大窗".into(),
+                windows: vec!["512m".into()],
+                streams: vec![1],
+            },
+            TcpGroup {
+                name: "裸窗".into(),
+                windows: Vec::new(),
+                streams: vec![1, 4],
+            },
+        ];
+        // 第一行只跑 TCP，选默认组 + 组1；第二行只跑 TCP，选组2（裸窗）。
+        req.pairs[0].transports = vec!["tcp".into()];
+        req.pairs[0].directions = vec!["ab".into()];
+        req.pairs[0].rx_target_bidir_ab = String::new();
+        req.pairs[0].udp_groups = Vec::new();
+        req.pairs[0].tcp_groups = vec![0, 1];
+        let mut second = req.pairs[0].clone();
+        second.src = "master:NAME=以太网 7".into();
+        second.dst = "agent:NAME=USB 4".into();
+        second.tcp_groups = vec![2];
+        req.pairs.push(second);
+
+        let first = validated_config_from_request(&state, &req).expect("原始配置必须合法");
+        let file = serde_json::to_string(&first).unwrap();
+
+        let console = console_with(state_with_two_pairs());
+        let out = api_import(&console, &file).expect("必须能导回来");
+        let replayed = request_from_import(&out);
+        let second_pass = {
+            let state = lock_recover(&console.state);
+            validated_config_from_request(&state, &replayed).expect("回填出来的必须仍然合法")
+        };
+
+        assert_eq!(
+            units_debug(&first, &state),
+            units_debug(&second_pass, &state),
+            "TCP 组导入一轮之后跑的必须还是同一批单元"
+        );
+        let dump = units_debug(&first, &state);
+        assert!(dump.contains("512m"), "组1 的 -w 档位应出现在单元里");
+        // 裸窗组：应有不带 -w 的 TCP 单元（标签是 `TCP -P n` 而不是 `TCP -w .. -P n`）。
+        assert!(
+            dump.contains("TCP -P 4"),
+            "裸窗组应生成一条不带 -w 的 TCP 单元"
+        );
+    }
+
+    /// 一份 config 会生成哪些单元。Debug 里带着方向、协议、档位、流数和端口，
+    /// 「跑什么」的每一个可见维度都在。
+    fn units_debug(cfg: &Config, state: &UiState) -> String {
+        let specs: Vec<_> = cfg
+            .tests
+            .iter()
+            .map(|test| {
+                builder::spec_from_config(test, cfg, &state.master, &state.agent)
+                    .unwrap_or_else(|error| panic!("{} 生成任务失败：{error}", test.name))
+            })
+            .collect();
+        let mut port = builder::PORT_BASE;
+        let (units, _) = build_units(&specs, cfg.require_same_subnet_for_iperf, &mut port);
+        assert!(!units.is_empty(), "这份配置一个单元都没生成");
+        format!("{units:#?}")
+    }
+
+    /// 把 `/api/import` 的回包重新组装成一次「开始测试」的请求，
+    /// 也就是页面拿到它之后会做的事。
+    fn request_from_import(out: &serde_json::Value) -> RunRequest {
+        let settings = &out["settings"];
+        let list = |value: &serde_json::Value| -> Vec<String> {
+            value
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let numbers = |value: &serde_json::Value| -> Vec<u32> {
+            value
+                .as_array()
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_u64())
+                        .map(|v| v as u32)
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let pairs = out["pairs"]
+            .as_array()
+            .unwrap_or(&Vec::new())
+            .iter()
+            .map(|pair| PairSelection {
+                src: pair["src"].as_str().unwrap_or_default().to_string(),
+                dst: pair["dst"].as_str().unwrap_or_default().to_string(),
+                directions: list(&pair["directions"]),
+                rx_target_bidir_ab: pair["rx_target_bidir_ab"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                rx_target_bidir_ba: pair["rx_target_bidir_ba"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                udp_groups: pair["udp_groups"]
+                    .as_array()
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|item| item.as_u64())
+                            .map(|value| value as usize)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                tcp_groups: pair["tcp_groups"]
+                    .as_array()
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(|item| item.as_u64())
+                            .map(|value| value as usize)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                transports: list(&pair["transports"]),
+                ip: list(&pair["ip"]),
+            })
+            .collect();
+        RunRequest {
+            pairs,
+            nic_policies: serde_json::from_value(out["nic_policies"].clone()).unwrap_or_default(),
+            duration: settings["duration"].as_u64().unwrap_or(180),
+            tcp_windows: list(&settings["tcp_windows"]),
+            tcp_streams: numbers(&settings["tcp_streams"]),
+            udp_bandwidths: list(&settings["udp_bandwidths"]),
+            udp_lengths: list(&settings["udp_lengths"]),
+            udp_windows: list(&settings["udp_windows"]),
+            udp_streams: settings["udp_streams"].as_u64().unwrap_or(1) as u32,
+            udp_groups: out["udp_groups"]
+                .as_array()
+                .unwrap_or(&Vec::new())
+                .iter()
+                .map(|group| UdpGroup {
+                    name: group["name"].as_str().unwrap_or_default().to_string(),
+                    bandwidths: list(&group["bandwidths"]),
+                    lengths: list(&group["lengths"]),
+                    windows: list(&group["windows"]),
+                    streams: group["streams"].as_u64().unwrap_or(1) as u32,
+                })
+                .collect(),
+            tcp_groups: out["tcp_groups"]
+                .as_array()
+                .unwrap_or(&Vec::new())
+                .iter()
+                .map(|group| TcpGroup {
+                    name: group["name"].as_str().unwrap_or_default().to_string(),
+                    windows: list(&group["windows"]),
+                    streams: numbers(&group["streams"]),
+                })
+                .collect(),
+            ping_count: settings["ping_count"].as_u64().unwrap_or(0) as u32,
+            ping_payload_sizes: numbers(&settings["ping_payload_sizes"]),
+            limit_udp_by_link_speed: out["limit_udp_by_link_speed"].as_bool().unwrap_or(false),
+            resume: out["resume"].as_bool().unwrap_or(false),
+            screenshot: settings["screenshot"].as_bool().unwrap_or(false),
+            ui_plan: None,
+            plan_hash: None,
+        }
+    }
+
+    /// 一档 `-b` 会因为每个 `-l` 档位各生成一份 profile；回填时不去重的话，
+    /// 「下载 → 导入」每走一轮档位就翻一倍。
+    #[test]
+    fn importing_does_not_multiply_the_udp_bandwidth_steps() {
+        let state = state_with_pair();
+        let mut req = request();
+        req.udp_lengths = vec!["1200".into(), "1400".into()];
+        let cfg = config_from_request(&state, &req);
+        assert_eq!(cfg.iperf.udp_profiles.len(), 6, "3 档 -b × 2 档 -l");
+
+        let console = console_with(state_with_pair());
+        let out = api_import(&console, &serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(
+            out["settings"]["udp_bandwidths"].as_array().unwrap(),
+            &vec![json!("1m"), json!("500m"), json!("1G")]
+        );
+        assert_eq!(
+            out["settings"]["udp_lengths"].as_array().unwrap(),
+            &vec![json!("1200"), json!("1400")]
+        );
+    }
+
+    /// ping 的次数和包长只落在 tests[] 上，回填要从那里读。
+    ///
+    /// 只读 cfg.ping 的话，一份「50 次 × 64 字节」的配置会回填成默认的
+    /// 「100 次 × 三档包长」：单元数变三倍，而框里的数字看着像是文件里的。
+    #[test]
+    fn importing_reads_the_ping_settings_off_the_tests() {
+        let state = state_with_pair();
+        let mut req = request();
+        req.pairs[0].transports = vec!["ping".into()];
+        req.ping_count = 50;
+        req.ping_payload_sizes = vec![64];
+        let cfg = config_from_request(&state, &req);
+
+        let console = console_with(state_with_pair());
+        let out = api_import(&console, &serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(out["settings"]["ping_count"], 50);
+        assert_eq!(
+            out["settings"]["ping_payload_sizes"].as_array().unwrap(),
+            &vec![json!(64)]
+        );
+        assert_eq!(
+            out["pairs"][0]["transports"].as_array().unwrap(),
+            &vec![json!("ping")],
+            "ping 在配置里挂 kinds、在界面上挂协议列，回填要走相反那一步"
+        );
+    }
+
+    /// 文件把一对网口写反了（`src`/`dst` 调过来），要合进同一行并把方向对调。
+    ///
+    /// 矩阵一行代表的是**一对**网口。同一对口在文件里正着写一条、反着写一条是
+    /// 完全合法的；不合并的话它会占两行，而界面只画得出一行——另一行的勾选
+    /// 就此消失，人看不出少了什么。
+    #[test]
+    fn importing_folds_a_reversed_pair_into_one_row() {
+        let state = state_with_pair();
+        let mut cfg = config_from_request(&state, &request());
+        // 只把 UDP 那条掉个头，TCP 三条保持原样：合并要发生在两种写法之间。
+        let udp = cfg
+            .tests
+            .iter_mut()
+            .find(|test| test.transports.iter().any(|t| t == "udp"))
+            .expect("UDP 那条");
+        std::mem::swap(&mut udp.src, &mut udp.dst);
+        udp.direction = OneOrMany::Many(vec!["A->B".into()]);
+        udp.rate_targets_bidir_mbps = Some(crate::config::RateTargets {
+            forward: None,
+            ab: Some(900.0),
+            ba: None,
+        });
+
+        let console = console_with(state_with_pair());
+        let out = api_import(&console, &serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(
+            out["pairs"].as_array().unwrap().len(),
+            1,
+            "同一对口只占一行"
+        );
+        let pair = &out["pairs"][0];
+        assert_eq!(
+            pair["src"], "master:NAME=以太网 6",
+            "行的朝向按先出现的那条"
+        );
+        assert_eq!(
+            pair["directions"].as_array().unwrap(),
+            &vec![json!("ab"), json!("bidir"), json!("ba")],
+            "反着写的那条里的 A→B，在这一行是 B→A"
+        );
+        assert_eq!(pair["rx_target_bidir_ba"], "900", "双向门限跟着方向一起翻");
+        assert_eq!(pair["rx_target_bidir_ab"], "");
+    }
+
+    /// 还没连上辅测机也要能导入：全局参数当场生效，配对留给页面在连上之后按
+    /// 端点名匹配。按角色写的端点（`master:SGMII2.5G`）这时解析不了，得点名。
+    #[test]
+    fn importing_before_connecting_keeps_the_named_pairs() {
+        let mut cfg = config_from_request(&state_with_pair(), &request());
+        cfg.tests.push(TestSpec {
+            name: "by-role".into(),
+            src: "master:SGMII2.5G".into(),
+            dst: "agent:WIFI5G".into(),
+            ..cfg.tests[0].clone()
+        });
+
+        let console = console_with(UiState {
+            cfg: Config::default(),
+            agent_host: String::new(),
+            master: HostInfo::default(),
+            agent: HostInfo::default(),
+        });
+        let out = api_import(&console, &serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(
+            out["pairs"].as_array().unwrap().len(),
+            1,
+            "NAME= 写法不需要实扫就能认"
+        );
+        let notices = out["notices"].as_array().unwrap();
+        assert!(
+            notices
+                .iter()
+                .any(|n| n.as_str().unwrap().contains("SGMII2.5G")),
+            "认不出来的端点必须点名，不能默默少一行：{notices:?}"
+        );
+    }
+
+    /// 文件里没有 agent_token 时不能把已经加载的令牌冲掉。
+    ///
+    /// 手写的 config 多半不带令牌；用空串覆盖的表现是导入之后点「连接」突然
+    /// 401，而人刚做的事看起来和连接毫无关系。
+    #[test]
+    fn importing_a_file_without_a_token_keeps_the_loaded_one() {
+        let mut state = state_with_pair();
+        state.cfg.agent_token = "loaded-secret".into();
+        let console = console_with(state);
+
+        let cfg = config_from_request(&state_with_pair(), &request());
+        let out = api_import(&console, &serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(out["settings"]["token_configured"], true);
+        assert_eq!(
+            lock_recover(&console.state).cfg.agent_token,
+            "loaded-secret"
+        );
+        assert!(
+            out["notices"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|n| n.as_str().unwrap().contains("agent_token")),
+            "沿用旧令牌要说一声"
+        );
+
+        // 文件里带着令牌时以文件为准：那才是这份配置连得上的那台。
+        let mut cfg = cfg;
+        cfg.agent_token = "from-file".into();
+        api_import(&console, &serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(lock_recover(&console.state).cfg.agent_token, "from-file");
+    }
+
+    /// 导入的是**配置**，不是「一份差不多的 JSON」。看不懂要当场说清。
+    #[test]
+    fn importing_rubbish_says_so_instead_of_half_applying_it() {
+        let console = console_with(state_with_pair());
+        let error = api_import(&console, "{ 这不是 json }").expect_err("必须报错");
+        assert!(error.contains("config.json"), "{error}");
+
+        let mut cfg = config_from_request(&state_with_pair(), &request());
+        cfg.iperf.duration = 0;
+        let error = api_import(&console, &serde_json::to_string(&cfg).unwrap())
+            .expect_err("过不了 validate 的配置不能导进来");
+        assert!(error.contains("duration"), "{error}");
+        assert_eq!(
+            lock_recover(&console.state).cfg.iperf.duration,
+            Config::default().iperf.duration,
+            "被拒的导入不能改动任何现有状态"
+        );
+    }
+
+    /// 监听地址不是访问地址：`0.0.0.0` 弹给浏览器打不开。
+    #[test]
+    fn the_printed_address_is_one_a_browser_can_actually_open() {
+        assert_eq!(display_addr("0.0.0.0", 28800), "127.0.0.1:28800");
+        assert_eq!(display_addr("::", 28800), "[::1]:28800");
+        assert_eq!(display_addr("[::]", 28800), "[::1]:28800");
+        assert_eq!(display_addr(" 0.0.0.0 ", 28800), "127.0.0.1:28800");
+        // 绑到具体地址时那个地址本来就是该用的访问地址，不能改写。
+        assert_eq!(display_addr("127.0.0.1", 28800), "127.0.0.1:28800");
+        assert_eq!(display_addr("192.168.8.101", 28800), "192.168.8.101:28800");
+        assert_eq!(display_addr("::1", 28800), "[::1]:28800");
+        assert!(bind_is_wildcard("0.0.0.0") && bind_is_wildcard("::"));
+        assert!(!bind_is_wildcard("127.0.0.1") && !bind_is_wildcard("192.168.8.101"));
     }
 
     /// PING 必须能过 `validate_request`——单独勾、和 TCP/UDP 一起勾都算。

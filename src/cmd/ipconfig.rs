@@ -19,6 +19,7 @@ pub struct IpcfgAdapter {
 }
 
 #[cfg(windows)]
+#[allow(dead_code)]
 pub fn scan() -> Vec<IpcfgAdapter> {
     scan_with_aliases(&[])
 }
@@ -44,6 +45,7 @@ pub fn scan_with_aliases(known_aliases: &[String]) -> Vec<IpcfgAdapter> {
 /// 字段行形如：
 ///   `   IPv4 地址 . . . . . . . . . . . . : 192.168.1.2(首选)`
 ///   `   本地链接 IPv6 地址. . . . . . . . : fe80::c4b:1234%12(首选)`
+#[allow(dead_code)]
 pub fn parse(text: &str) -> Vec<IpcfgAdapter> {
     parse_with_aliases(text, &[])
 }

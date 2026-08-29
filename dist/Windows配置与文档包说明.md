@@ -1,13 +1,13 @@
-# cpe_test v4.4.0 Windows 配置与文档包
+# cpe_test v4.5.0 Windows 配置与文档包
 
-仓库中的 `cpe_test-v4.4.0-windows-config-docs.zip` 是便于从 Git 直接下载的
+仓库中的 `cpe_test-v4.5.0-windows-config-docs.zip` 是便于从 Git 直接下载的
 Windows 配置、说明文档和启动脚本资料包。包内文件由仓库当前版本生成，并由 CI
 逐文件与源码副本比对，避免配置或文档过期。
 
 这个资料包**不包含可执行程序或吞吐工具**：
 
 - 不包含 `cpe_test.exe`；请从 GitHub Release 下载正式
-  `cpe_test-v4.4.0-windows-x86_64.zip`，或自行编译。
+  `cpe_test-v4.5.0-windows-x86_64.zip`，或自行编译。
 - 不包含 `ctsTraffic.exe`；正式 Windows Release ZIP 会捆绑固定并校验过的
   Microsoft ctsTraffic 2.0.4.0 x64。
 - 不包含 `iperf3.exe` 及其 DLL；需要 iperf3 测试时，请放入完整的 Windows
@@ -21,6 +21,19 @@ Windows 配置、说明文档和启动脚本资料包。包内文件由仓库当
 - `config.example.json`（完整字段面）与 `configs/` 下四份可直接选择的具名配置。
 - `start_ui.bat`（图形控制台）、`start_agent.bat`、`start_master.bat`、`start_master_select_config.bat`。
 - iperf3/ctsTraffic 放置说明、MIT 许可证和第三方声明。
+
+## v4.5.0 行为要点
+
+- 控制台默认进入**快速测试计划工作台**：「链路集合 → 流量套件 → 分配 → 复核」，一次配置 20 对以上网口。套件里的 TCP、UDP、PING 是独立任务，「TCP+UDP」表示 `TCP → UDP` 连续执行而不是混合并发；执行粒度是每个具体网口对。需要逐行控制时切「高级矩阵」，旧 `pairs` 和 `config.json` 照常可用。
+- 工作台可导出/导入 `cpe-ui-project.json`（链路集合、套件、稳定 ID、绑定，不含 token）；`config.json` 仍单独下载，仍可交给 `master --auto`。
+- 「开始测试」会校验预览时的 `plan_hash`：网口刷新或计划改动后必须重新预览，避免误跑旧分配。
+- 测试矩阵上方可定义若干组 UDP / TCP 参数，每行选用哪一组；**每组是完整定义**，组里 `-l` 留空就是不下发 `-l`。优先级「网口 > 参数组」直接标在行内，「预览任务」逐单元列出每条腿最终下发的参数。
+- 双向单元里一条腿「判不了」不再一律掩盖另一条腿的 `RATE_FAIL`：只有采样/时间轴不可信才继续掩盖，腿内局部的配置问题不再藏住确凿的不达标。`OFFERED_LOAD_LOW` 同理加了前提——只有接收端确实跟上发送端时才算判不了。
+- UDP 裁剪上限逐类校准：`RNDIS` 跟自己的协商速率（实测 3700），`SGMII2.5G` 2500 → 2600（`cpe_path_ceiling_mbps`），`10GUSB`(NCM) 仍按 10G。这张表只影响裁剪，不参与 PASS/FAIL。
+- `--ui-bind` 绑通配地址时，打印和自动弹出的是能打开的回环地址（Chrome 133 起会拦掉对 `0.0.0.0` 的请求）。
+- 速率监控支持同时看 8 块网卡；`config.json` 可以导回界面。
+- `config.example.json` 与 README/使用说明里过期的负载上限说法已同步到现值。
+- 单元测试 452 → 490。
 
 ## v4.4.0 行为要点
 

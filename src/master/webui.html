@@ -3,116 +3,356 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>CPE 子网测试控制台</title>
 <style>
+/* ── 灌包测试台 · 仪表面板皮肤 ────────────────────────────────────────
+   设计立意：这是一台双机灌包仪，不是一张 SaaS 仪表盘。机箱（页面外壳、
+   控件、表格）是安静的拉丝钢，跟随明暗主题；而“数据屏”（吞吐示波屏、运行
+   日志、任务预览）永远是刻框暗玻璃 + 磷光信号色——两套主题下都长成一块真
+   正的仪表屏，这是全站唯一的“张扬”之处，其余一律克制。
+   约束：这台机器同时在灌包，任何持续动画/重绘都可能压到峰值速率，所以除
+   了一次开机淡入和一颗合成层的电源灯，界面零持续动画、零 backdrop-filter。 */
 :root {
   color-scheme:light dark;
-  --canvas:#f5f8fa; --surface:#ffffff; --ink:#17242d; --muted:#586873;
-  --line:#ccd7de; --head:#eaf0f3; --accent:#08638f; --accent-hover:#064e71;
-  --on-accent:#ffffff; --ok:#14733f; --ok-bg:#e4f3e9; --bad:#b3262e;
-  --bad-bg:#fbe8e9; --info-bg:#e4f1f7; --focus:#e59b22;
-  --log-bg:#11181c; --log-ink:#dce8ee; --edited:#edf7fb;
+  --fu:"PingFang SC","Microsoft YaHei","Segoe UI",system-ui,-apple-system,sans-serif;
+  --fm:ui-monospace,"Cascadia Mono","SFMono-Regular","JetBrains Mono",Consolas,"Liberation Mono",monospace;
+
+  /* 机箱（浅色 = 白日实验台，冷调拉丝钢） */
+  --canvas:#d3dade; --surface:#f2f5f7; --panel-2:#e9eef1;
+  --ink:#15222b; --muted:#5b6a74; --line:#c1cbd1; --head:#e5ebee;
+  --accent:#0e5a6b; --accent-hover:#0a4553; --on-accent:#eefbfd;
+  --ok:#12783e; --ok-bg:#dff0e6; --bad:#b3242f; --bad-bg:#f9e5e7;
+  --info-bg:#e1ecef; --focus:#c8811a; --edited:#e0f4ef;
+
+  /* 数据屏（明暗主题下都不变——屏永远是屏） */
+  --screen-bg:#081210; --screen-ink:#c9e7dc; --screen-dim:#5f807a;
+  --signal:#37e0bd; --scope-grid:rgba(120,190,175,.12); --scope-axis:#6f9088;
+  --bezel:#040d0b; --bezel-hi:rgba(120,190,175,.13); --glow:rgba(55,224,189,.4);
 }
 @media (prefers-color-scheme:dark) {
   :root:not([data-theme="light"]) {
-    --canvas:#0f1417; --surface:#151c20; --ink:#edf3f5; --muted:#a7b5bd;
-    --line:#34434b; --head:#202b31; --accent:#68bce3; --accent-hover:#8bccea;
-    --on-accent:#07151c; --ok:#76d39b; --ok-bg:#183628; --bad:#ff969b;
-    --bad-bg:#452326; --info-bg:#183341; --focus:#ffc65c;
-    --log-bg:#090d0f; --log-ink:#d8e5ea; --edited:#18313b;
+    --canvas:#0a0f12; --surface:#141c20; --panel-2:#101a1e;
+    --ink:#e7f0f1; --muted:#9cafb5; --line:#2a393f; --head:#19242a;
+    --accent:#3fb9ca; --accent-hover:#63cddb; --on-accent:#05161a;
+    --ok:#6ecf95; --ok-bg:#143324; --bad:#ff969b; --bad-bg:#3f2128;
+    --info-bg:#112f38; --focus:#ffc65c; --edited:#113330;
   }
 }
 :root[data-theme="dark"] {
-  --canvas:#0f1417; --surface:#151c20; --ink:#edf3f5; --muted:#a7b5bd;
-  --line:#34434b; --head:#202b31; --accent:#68bce3; --accent-hover:#8bccea;
-  --on-accent:#07151c; --ok:#76d39b; --ok-bg:#183628; --bad:#ff969b;
-  --bad-bg:#452326; --info-bg:#183341; --focus:#ffc65c;
-  --log-bg:#090d0f; --log-ink:#d8e5ea; --edited:#18313b;
+  --canvas:#0a0f12; --surface:#141c20; --panel-2:#101a1e;
+  --ink:#e7f0f1; --muted:#9cafb5; --line:#2a393f; --head:#19242a;
+  --accent:#3fb9ca; --accent-hover:#63cddb; --on-accent:#05161a;
+  --ok:#6ecf95; --ok-bg:#143324; --bad:#ff969b; --bad-bg:#3f2128;
+  --info-bg:#112f38; --focus:#ffc65c; --edited:#113330;
 }
-* { box-sizing:border-box; letter-spacing:0; }
-body { margin:0; background:var(--canvas); color:var(--ink); font-family:"Microsoft YaHei","PingFang SC","Segoe UI",sans-serif; font-size:14px; line-height:1.5; }
-.wrap { width:min(100%,1240px); min-height:100vh; margin:0 auto; background:var(--surface); border-inline:1px solid var(--line); }
-.app-header { padding:18px 22px 14px; border-bottom:3px solid var(--accent); display:flex; align-items:baseline; justify-content:space-between; gap:16px; }
-h1 { margin:0; font-size:21px; line-height:1.25; }
-.version { color:var(--muted); font:12px/1.4 ui-monospace,Consolas,monospace; font-variant-numeric:tabular-nums; }
-section { padding:18px 22px 20px; border-bottom:1px solid var(--line); }
-h2 { margin:0 0 12px; font-size:15px; display:flex; align-items:center; gap:8px; }
-h2 .n { display:inline-flex; width:22px; height:22px; flex:0 0 22px; align-items:center; justify-content:center; border-radius:50%; background:var(--accent); color:var(--on-accent); font:700 12px/1 ui-monospace,Consolas,monospace; }
+
+* { box-sizing:border-box; }
+html { -webkit-text-size-adjust:100%; }
+body { margin:0; background:var(--canvas); color:var(--ink); font-family:var(--fu);
+  font-size:14px; line-height:1.5; }
+::selection { background:var(--accent); color:var(--on-accent); }
+
+/* 机箱面板 */
+.wrap { width:min(100%,1320px); min-height:100vh; margin:0 auto; background:var(--surface);
+  border-inline:1px solid var(--line);
+  background-image:linear-gradient(var(--canvas),var(--canvas));
+  background-size:100% 0; }
+@media (min-width:760px) { .wrap { animation:boot .5s ease both; } }
+@keyframes boot { from { opacity:0; transform:translateY(6px); } to { opacity:1; transform:none; } }
+
+/* 铭牌抬头：mono 眉标 + 标题 + 右侧状态读数条 */
+.app-header { position:relative; padding:20px 24px 16px; display:flex;
+  align-items:center; justify-content:space-between; gap:16px 24px; flex-wrap:wrap;
+  border-bottom:1px solid var(--line);
+  box-shadow:inset 0 -3px 0 var(--accent); }
+.brand { display:flex; flex-direction:column; gap:4px; }
+.eyebrow { font:600 11px/1 var(--fm); letter-spacing:.26em; color:var(--accent);
+  text-transform:uppercase; }
+h1 { margin:0; font-size:21px; font-weight:700; line-height:1.2; letter-spacing:-.01em; }
+/* 右上状态读数：像仪表前面板的一小块液晶，带一颗常亮电源灯 */
+.version { display:inline-flex; align-items:center; gap:9px; padding:7px 12px;
+  background:var(--screen-bg); border:1px solid var(--bezel); border-radius:5px;
+  color:var(--screen-ink); font:12px/1.3 var(--fm); font-variant-numeric:tabular-nums;
+  box-shadow:inset 0 0 0 1px var(--bezel-hi); max-width:100%; overflow-wrap:anywhere; }
+.version::before { content:""; width:7px; height:7px; flex:0 0 7px; border-radius:50%;
+  background:var(--signal); box-shadow:0 0 7px var(--glow); }
+
+/* 通道选择器（标签页） */
+.tabs { display:flex; gap:4px; padding:10px 24px 0; background:transparent;
+  border-bottom:1px solid var(--line); }
+.tab { border:1px solid transparent; border-bottom:0; background:transparent;
+  padding:9px 18px 10px; margin-bottom:-1px; font:600 13px/1 var(--fu); color:var(--muted);
+  cursor:pointer; border-radius:5px 5px 0 0; }
+.tab:hover { color:var(--ink); background:var(--panel-2); }
+.tab.active { color:var(--ink); background:var(--surface);
+  border-color:var(--line); box-shadow:inset 0 2px 0 var(--accent); }
+
+/* 面板分区：左侧一道细脊 + 刻号 */
+section { position:relative; padding:20px 24px 22px; border-bottom:1px solid var(--line); }
+h2 { margin:0 0 14px; font-size:14px; font-weight:700; display:flex; align-items:center; gap:10px;
+  letter-spacing:.01em; }
+/* 刻号：不是圆点徽章，是面板上一枚方形丝印号 */
+h2 .n { display:inline-flex; width:24px; height:22px; flex:0 0 24px; align-items:center;
+  justify-content:center; border:1px solid var(--accent); border-radius:3px;
+  background:transparent; color:var(--accent);
+  font:700 12px/1 var(--fm); font-variant-numeric:tabular-nums; }
+
 label { color:var(--muted); }
-input[type="text"], input[type="password"], input[type="number"] { min-height:32px; padding:5px 8px; border:1px solid var(--line); border-radius:4px; outline:0; font:inherit; background:var(--surface); color:var(--ink); }
+h2 + .row label, .row > label { color:var(--ink); }
+
+/* 控件 */
+input[type="text"], input[type="password"], input[type="number"], select {
+  min-height:34px; padding:6px 9px; border:1px solid var(--line); border-radius:4px; outline:0;
+  font:inherit; background:var(--surface); color:var(--ink); }
+input:hover:not(:disabled), select:hover:not(:disabled) { border-color:var(--muted); }
 input[type="checkbox"] { width:16px; height:16px; accent-color:var(--accent); vertical-align:-3px; }
-input.num { width:92px; text-align:right; font-variant-numeric:tabular-nums; }
-input.bw { width:100px; font-family:ui-monospace,Consolas,monospace; }
-input.list { width:190px; font-family:ui-monospace,Consolas,monospace; }
-button { min-height:32px; padding:6px 14px; border:1px solid var(--accent); border-radius:4px; background:var(--accent); color:var(--on-accent); font:inherit; font-weight:600; line-height:1.2; cursor:pointer; }
+input.num { width:96px; text-align:right; font-family:var(--fm); font-variant-numeric:tabular-nums; }
+input.bw { width:104px; font-family:var(--fm); }
+input.list { width:196px; font-family:var(--fm); }
+/* 改过的值 = 已“接入”的控件：信号色描边 + 一点辉光，扫一眼就知道哪几格动过 */
+input.touched { border-color:var(--accent); background:var(--edited); font-weight:700;
+  box-shadow:0 0 0 1px var(--accent); }
+
+button { min-height:34px; padding:7px 15px; border:1px solid var(--accent); border-radius:4px;
+  background:var(--accent); color:var(--on-accent); font:600 13px/1.2 var(--fu); cursor:pointer; }
 button:hover:not(:disabled) { background:var(--accent-hover); border-color:var(--accent-hover); }
 button.ghost { background:var(--surface); color:var(--accent); }
 button.ghost:hover:not(:disabled) { background:var(--info-bg); color:var(--accent); }
 button.danger { border-color:var(--bad); background:var(--surface); color:var(--bad); }
 button.danger:hover:not(:disabled) { background:var(--bad-bg); }
-button:disabled { opacity:.5; cursor:not-allowed; }
-button.big { min-height:38px; padding:8px 20px; }
-button:focus-visible, input:focus-visible { outline:2px solid var(--focus); outline-offset:2px; }
-.row { display:flex; flex-wrap:wrap; gap:10px 14px; align-items:center; }
-.toolbar { margin-bottom:10px; }
+button:disabled { opacity:.45; cursor:not-allowed; }
+/* 主令键：整台仪器的“RUN”，做得更实、更大一号 */
+button.big { min-height:42px; padding:10px 26px; font-size:14px; letter-spacing:.04em;
+  box-shadow:0 1px 0 var(--accent-hover); }
+button:focus-visible, input:focus-visible, select:focus-visible {
+  outline:2px solid var(--focus); outline-offset:2px; }
+
+.row { display:flex; flex-wrap:wrap; gap:10px 16px; align-items:center; }
+.toolbar { margin-bottom:12px; }
 .sweep-note { margin:0 0 10px; }
 .run-options { margin-top:10px; }
-.actions { justify-content:flex-end; margin-top:12px; }
+.actions { justify-content:flex-end; margin-top:14px; gap:10px 12px; }
+
+/* 表格：仪表读数表——等宽数字、发丝行线、丝印表头 */
 table { border-collapse:collapse; width:100%; font-size:13px; }
 #nics { min-width:1080px; }
-#matrix { min-width:890px; }
-th, td { text-align:left; padding:7px 9px; border-bottom:1px solid var(--line); vertical-align:middle; }
-thead th { position:sticky; top:0; z-index:1; background:var(--head); color:var(--muted); font-size:12px; white-space:nowrap; }
+#matrix { min-width:1040px; }
+th, td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); vertical-align:middle; }
+td { font-variant-numeric:tabular-nums; }
+thead th { position:sticky; top:0; z-index:1; background:var(--head); color:var(--muted);
+  font:600 11px/1.3 var(--fm); letter-spacing:.06em; text-transform:uppercase; white-space:nowrap; }
+tbody tr:nth-child(even) td { background:color-mix(in srgb, var(--panel-2) 45%, transparent); }
+tbody tr:hover td { background:var(--info-bg); }
 tbody tr:last-child td { border-bottom:0; }
-.scroll { max-width:100%; overflow:auto; border:1px solid var(--line); }
-.status { padding:8px 10px; border-left:3px solid currentColor; margin-top:10px; }
+.scroll { max-width:100%; overflow:auto; border:1px solid var(--line); border-radius:5px;
+  background:var(--surface); }
+
+/* 状态条：面板告示灯 */
+.status { padding:9px 12px; border-left:3px solid currentColor; border-radius:0 4px 4px 0;
+  margin-top:10px; }
 .status.ok { background:var(--ok-bg); color:var(--ok); }
 .status.bad { background:var(--bad-bg); color:var(--bad); }
 .status.info { background:var(--info-bg); color:var(--accent); }
+
 .hint { color:var(--muted); font-size:12px; }
-.bidir-cell { white-space:nowrap; }
-.bidir-t { display:flex; align-items:center; gap:5px; font-size:12px; color:var(--muted); margin-bottom:3px; }
-.bidir-t input { width:72px; }
-.empty { color:var(--muted); text-align:center; padding:14px; }
-.tabs { display:flex; gap:2px; padding:0 22px; background:var(--head); border-bottom:1px solid var(--line); }
-.tab { border:0; background:transparent; padding:10px 18px; font:inherit; color:var(--muted); cursor:pointer; border-bottom:3px solid transparent; border-radius:0; }
-.tab:hover { color:var(--ink); }
-.tab.active { color:var(--ink); border-bottom-color:var(--accent); font-weight:700; }
-select { min-height:32px; padding:5px 8px; border:1px solid var(--line); border-radius:4px; font:inherit; background:var(--surface); color:var(--ink); }
-.mon-readout { display:flex; flex-wrap:wrap; gap:10px 28px; margin:14px 0 6px; align-items:baseline; }
-.mon-label { color:var(--muted); font-size:12px; margin-right:8px; }
-.mon-value { font:700 26px/1.1 ui-monospace,Consolas,monospace; font-variant-numeric:tabular-nums; }
-.mon-value-sm { font:14px/1.2 ui-monospace,Consolas,monospace; font-variant-numeric:tabular-nums; }
-#monchart { width:100%; max-width:100%; border:1px solid var(--line); background:var(--surface); }
-.field-note { display:block; margin-top:3px; color:var(--muted); font-size:11px; white-space:nowrap; }
-input.touched { border-color:var(--accent); background:var(--edited); font-weight:700; }
-#log { height:420px; overflow:auto; padding:11px 12px; border:1px solid var(--line); background:var(--log-bg); color:var(--log-ink); font:12px/1.5 ui-monospace,Consolas,monospace; white-space:pre-wrap; overflow-wrap:anywhere; }
-.hidden { display:none !important; }
+.field-note { display:block; margin-top:3px; color:var(--muted); font:11px/1.3 var(--fm);
+  white-space:nowrap; }
+code { font-family:var(--fm); background:var(--panel-2); padding:0 4px; border-radius:3px; }
+
+/* 测试矩阵 */
 .pairname { min-width:250px; font-weight:700; }
 .dirs { white-space:nowrap; }
 .dirs label { display:inline-flex; align-items:center; gap:4px; margin-right:9px; color:var(--ink); }
-.colsel { display:flex; flex-wrap:wrap; gap:2px 8px; margin-top:4px; font-weight:400; }
-.colsel label { display:inline-flex; align-items:center; gap:3px; color:var(--muted); font-size:11px; white-space:nowrap; cursor:pointer; }
+.bidir-cell { white-space:nowrap; }
+.bidir-t { display:flex; align-items:center; gap:5px; font-size:12px; color:var(--muted); margin-bottom:3px; }
+.bidir-t input { width:74px; }
+.colsel { display:flex; flex-wrap:wrap; gap:2px 8px; margin-top:5px; font-weight:400; }
+.colsel label { display:inline-flex; align-items:center; gap:3px; color:var(--muted);
+  font:11px/1.3 var(--fm); white-space:nowrap; cursor:pointer; text-transform:none; letter-spacing:0; }
 .colsel input[type="checkbox"] { width:13px; height:13px; vertical-align:-2px; }
-code { font-family:ui-monospace,Consolas,monospace; background:var(--head); padding:0 4px; border-radius:3px; }
-pre.hint { font-family:ui-monospace,Consolas,monospace; }
-.plan-list { max-height:240px; overflow:auto; margin:10px 0 0; padding:8px 10px; border:1px solid var(--line); background:var(--canvas); }
-@media (max-width:700px) {
+.udp-cell label { display:inline-flex; align-items:center; gap:4px; margin-right:9px; }
+.pin-note { display:block; margin-top:3px; color:var(--focus); font:11px/1.3 var(--fm); white-space:nowrap; }
+
+/* UDP 参数组表 */
+.udp-groups { margin:10px 0 4px; }
+#udpgroups { min-width:640px; }
+#udpgroups input.list { width:150px; }
+#udpgroups input.num { width:64px; }
+#udpgroups input[type="text"].gname { width:112px; font-family:var(--fu); }
+#udpgroups td.fixed-name { font-weight:700; white-space:nowrap; }
+
+.empty { color:var(--muted); text-align:center; padding:16px; }
+
+/* ── 数据屏：刻框暗玻璃 ─────────────────────────────────────────────
+   .screen 给日志/示波屏套一圈内嵌刻框，右上角一颗常亮磷光电源灯，左上角
+   一枚 mono 丝印标签（data-label）。屏内文字改用磷光调色板。 */
+.screen { position:relative; margin-top:12px; background:var(--screen-bg);
+  border:1px solid var(--bezel); border-radius:7px; padding:26px 14px 14px;
+  box-shadow:inset 0 0 0 1px var(--bezel-hi), inset 0 14px 46px rgba(0,0,0,.55); }
+.screen::before { content:attr(data-label); position:absolute; top:9px; left:15px;
+  font:600 10px/1 var(--fm); letter-spacing:.22em; color:var(--screen-dim); }
+.screen::after { content:""; position:absolute; top:11px; right:14px; width:6px; height:6px;
+  border-radius:50%; background:var(--signal); box-shadow:0 0 7px var(--glow); }
+.screen .hint { color:var(--screen-dim); }
+
+#log { height:420px; overflow:auto; padding:2px 6px 2px 2px; border:0; background:transparent;
+  color:var(--screen-ink); font:12px/1.55 var(--fm); white-space:pre-wrap; overflow-wrap:anywhere; }
+/* 任务预览：一块小号数据屏 */
+pre.plan-list { position:relative; max-height:260px; overflow:auto; margin:10px 0 0;
+  padding:26px 12px 12px; background:var(--screen-bg); border:1px solid var(--bezel);
+  border-radius:7px; color:var(--screen-ink); font:12px/1.5 var(--fm); white-space:pre-wrap;
+  box-shadow:inset 0 0 0 1px var(--bezel-hi), inset 0 14px 46px rgba(0,0,0,.55); }
+pre.plan-list::before { content:"PLAN · 任务预览"; position:sticky; top:0; display:block;
+  margin:-26px -12px 8px; padding:8px 15px 6px; font:600 10px/1 var(--fm); letter-spacing:.22em;
+  color:var(--screen-dim); background:var(--screen-bg); }
+pre.hint { font-family:var(--fm); }
+
+/* ── 监控标签页 ─────────────────────────────────────────────── */
+.mon-pick { display:flex; flex-wrap:wrap; gap:6px 18px; margin:12px 0 4px; }
+.mon-pick .side { width:100%; margin-top:10px; color:var(--muted);
+  font:600 11px/1.3 var(--fm); letter-spacing:.08em; text-transform:uppercase; }
+.mon-pick .side:first-child { margin-top:0; }
+.mon-pick label { display:inline-flex; align-items:center; gap:5px; color:var(--ink); }
+.mon-swatch { display:inline-block; width:11px; height:11px; border-radius:2px; }
+
+/* 示波屏 + 其下的通道读数带，共处一块屏 */
+.scope { padding:26px 12px 12px; }
+#monchart { width:100%; max-width:100%; background:transparent; border:0; display:block; }
+#monlegend { width:100%; margin:12px 0 2px; font-variant-numeric:tabular-nums;
+  border-top:1px solid var(--scope-grid); }
+.screen #monlegend td { border-bottom:1px solid var(--scope-grid); color:var(--screen-ink);
+  font-family:var(--fm); padding:6px 8px; }
+.screen #monlegend td.name { font-family:var(--fu); }
+.screen #monlegend tr:last-child td { border-bottom:0; }
+/* 机箱表格的斑马纹/悬停底色用的是浅色令牌，别让它漏进暗玻璃屏里的读数带 */
+.screen #monlegend tr:nth-child(even) td, .screen #monlegend tr:hover td { background:transparent; }
+/* 当前 RX / TX 值 = 屏上磷光读数 */
+.screen #monlegend td:nth-child(2), .screen #monlegend td:nth-child(3) {
+  color:var(--signal); text-shadow:0 0 8px var(--glow); }
+
+/* dead-safe：历史遗留的大号读数样式，保留以防有人接回来 */
+.mon-readout { display:flex; flex-wrap:wrap; gap:10px 28px; margin:14px 0 6px; align-items:baseline; }
+.mon-label { color:var(--muted); font-size:12px; margin-right:8px; }
+.mon-value { font:700 26px/1.1 var(--fm); font-variant-numeric:tabular-nums; color:var(--signal); }
+.mon-value-sm { font:14px/1.2 var(--fm); font-variant-numeric:tabular-nums; }
+
+.hidden { display:none !important; }
+.plan-list { } /* 占位：具体样式在 pre.plan-list（提高特异度压过 .hint） */
+
+/* ── 快速测试计划工作台 ─────────────────────────────────────────────
+   快速模式把「选择哪些链路」与「每条链路跑什么」拆开。旧矩阵仍保留在
+   高级模式，方便老配置和专家逐格编辑；这里的卡片只表达套件分配关系，
+   不改变 TCP/UDP 的执行器语义（TCP、UDP 仍是两个依次执行的单元）。 */
+.modebar { display:flex; align-items:center; flex-wrap:wrap; gap:8px; margin:-4px 0 16px; }
+.modebar .mode-title { margin-right:auto; font-weight:700; }
+.modebar button.active { background:var(--accent); color:var(--on-accent); }
+.quick-summary { display:flex; flex-wrap:wrap; gap:8px 18px; align-items:baseline;
+  padding:12px 14px; margin:0 0 16px; border:1px solid var(--line); border-left:3px solid var(--accent);
+  border-radius:4px; background:var(--info-bg); }
+.quick-summary strong { font:700 18px/1.2 var(--fm); font-variant-numeric:tabular-nums; color:var(--accent); }
+.quick-summary .summary-warn { color:var(--focus); }
+.quick-grid { display:grid; grid-template-columns:minmax(0,1.08fr) minmax(360px,.92fr); gap:16px; align-items:start; }
+.quick-panel { border:1px solid var(--line); border-radius:5px; background:var(--surface); min-width:0; }
+.quick-panel > .panel-head { display:flex; align-items:center; gap:10px; padding:12px 14px;
+  border-bottom:1px solid var(--line); background:var(--head); }
+.quick-panel > .panel-head h3 { margin:0; font-size:14px; }
+.quick-panel > .panel-head .hint { margin-left:auto; }
+.quick-panel > .panel-body { padding:12px 14px; }
+.link-filter { display:flex; flex-wrap:wrap; gap:8px 12px; margin-bottom:10px; }
+.link-filter label { display:inline-flex; align-items:center; gap:5px; font-size:12px; color:var(--ink); }
+.link-set-list { display:flex; flex-direction:column; gap:8px; max-height:520px; overflow:auto; }
+.link-set-card { border:1px solid var(--line); border-radius:4px; padding:9px 10px; background:var(--surface); }
+.link-set-card.selected { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent); background:var(--edited); }
+.link-set-card .set-top { display:flex; align-items:center; gap:8px; }
+.link-set-card .set-top strong { flex:1; min-width:0; overflow-wrap:anywhere; }
+.link-set-card .set-meta { display:flex; flex-wrap:wrap; gap:4px 9px; margin:5px 0 0 24px; color:var(--muted); font:11px/1.35 var(--fm); }
+.link-set-card .set-actions { display:flex; flex-wrap:wrap; gap:6px; margin:8px 0 0 24px; }
+.link-set-card .pair-list { margin:8px 0 0 24px; padding-top:7px; border-top:1px dashed var(--line); }
+.pair-mini { display:flex; align-items:center; gap:6px; padding:4px 0; font-size:12px; }
+.pair-mini .pair-label { flex:1; min-width:0; overflow-wrap:anywhere; }
+.chip-row { display:flex; flex-wrap:wrap; gap:5px; }
+.chip { display:inline-flex; align-items:center; gap:4px; padding:3px 7px; border:1px solid var(--line);
+  border-radius:999px; background:var(--panel-2); color:var(--ink); font-size:11px; line-height:1.25; }
+.chip.ok { border-color:var(--ok); color:var(--ok); background:var(--ok-bg); }
+.chip.warn { border-color:var(--focus); color:var(--focus); }
+.suite-list { display:flex; flex-direction:column; gap:9px; max-height:520px; overflow:auto; }
+.suite-card { border:1px solid var(--line); border-radius:4px; padding:10px 11px; background:var(--surface); }
+.suite-card.selected { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent); }
+.suite-card .suite-top { display:flex; align-items:center; gap:8px; }
+.suite-card .suite-top strong { flex:1; overflow-wrap:anywhere; }
+.suite-card .suite-actions { display:flex; gap:6px; }
+.suite-card .suite-note { margin:5px 0 8px; color:var(--muted); font-size:11px; }
+.suite-task { margin-top:7px; padding:8px; border-left:3px solid var(--accent); background:var(--panel-2); border-radius:0 4px 4px 0; }
+.suite-task[data-protocol="udp"] { border-left-color:#c26b21; }
+.suite-task[data-protocol="ping"] { border-left-color:#6a58b5; }
+.suite-task .task-head { display:flex; align-items:center; gap:7px; font-weight:700; }
+.suite-task .task-head .hint { margin-left:auto; font-weight:400; }
+.suite-task .task-detail { margin-top:4px; color:var(--muted); font-size:12px; overflow-wrap:anywhere; }
+.suite-task .task-detail code { white-space:nowrap; }
+.assign-toolbar { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-bottom:9px; }
+.assign-table { overflow:auto; border:1px solid var(--line); border-radius:4px; }
+.assign-table table { min-width:620px; }
+.assign-table th, .assign-table td { padding:7px 9px; }
+.assign-table th:not(:first-child), .assign-table td:not(:first-child) { text-align:center; }
+.assign-table td:first-child { min-width:220px; }
+.assign-cell { width:17px; height:17px; }
+.assign-count { color:var(--muted); font:11px/1.3 var(--fm); }
+.review-panel { margin-top:16px; }
+.review-tree { max-height:360px; overflow:auto; }
+.review-group { border-bottom:1px solid var(--line); padding:8px 0; }
+.review-group:last-child { border-bottom:0; }
+.review-line { display:flex; flex-wrap:wrap; gap:6px 12px; align-items:baseline; font-size:12px; }
+.review-line strong { min-width:170px; }
+.review-line .num { color:var(--accent); font-family:var(--fm); }
+.review-detail { margin:5px 0 0 15px; padding-left:10px; border-left:2px solid var(--line); color:var(--muted); font:11px/1.45 var(--fm); white-space:pre-wrap; }
+.quick-empty { color:var(--muted); text-align:center; padding:20px 10px; }
+.drawer-backdrop { position:fixed; inset:0; z-index:20; display:flex; justify-content:flex-end;
+  background:rgba(0,0,0,.35); }
+.drawer-backdrop.hidden { display:none; }
+.drawer { width:min(620px,100%); height:100%; overflow:auto; padding:20px; background:var(--surface);
+  border-left:1px solid var(--line); box-shadow:-8px 0 24px rgba(0,0,0,.22); }
+.drawer-head { display:flex; align-items:center; gap:10px; margin-bottom:14px; }
+.drawer-head h3 { margin:0; flex:1; }
+.form-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px 12px; }
+.form-grid > label { display:flex; flex-direction:column; gap:4px; color:var(--ink); font-size:12px; }
+.form-grid > label.wide { grid-column:1/-1; }
+.form-grid > .form-field { display:flex; flex-direction:column; gap:4px; color:var(--ink); font-size:12px; }
+.form-grid > .form-field.wide { grid-column:1/-1; }
+.form-field > .field-title { color:var(--ink); }
+.form-grid input, .form-grid select { width:100%; }
+.task-editor { margin:14px 0; padding:11px; border:1px solid var(--line); border-radius:4px; }
+.task-editor h4 { margin:0 0 9px; font-size:13px; }
+.task-editor .task-enabled { display:flex; align-items:center; gap:7px; margin-bottom:8px; }
+.editor-actions { display:flex; justify-content:flex-end; gap:8px; margin-top:16px; }
+@media (max-width:980px) { .quick-grid { grid-template-columns:1fr; } }
+@media (max-width:760px) {
+  .form-grid { grid-template-columns:1fr; }
+  .form-grid > label.wide { grid-column:auto; }
+  .drawer { padding:14px; }
+}
+
+@media (max-width:760px) {
   .wrap { border:0; }
-  .app-header, section { padding-inline:12px; }
+  .app-header, section { padding-inline:14px; }
+  .tabs { padding-inline:14px; }
   .app-header { align-items:flex-start; }
-  .row > label { width:100%; display:grid; grid-template-columns:minmax(110px,auto) minmax(0,1fr); align-items:center; gap:8px; }
+  .version { width:100%; }
+  .row > label { width:100%; display:grid; grid-template-columns:minmax(110px,auto) minmax(0,1fr);
+    align-items:center; gap:8px; }
   .row > label input:not([type="checkbox"]) { width:100%; }
   .actions { justify-content:stretch; }
   .actions button { flex:1 1 150px; }
   #log { height:54vh; }
 }
 @media (prefers-reduced-motion:reduce) {
-  * { scroll-behavior:auto !important; }
+  * { scroll-behavior:auto !important; animation:none !important; }
 }
 </style>
 </head><body>
 <div class="wrap">
   <header class="app-header">
-    <h1>CPE 子网测试控制台</h1>
+    <div class="brand">
+      <span class="eyebrow">Ping · iperf3 · ctsTraffic 灌包台</span>
+      <h1>CPE 子网测试控制台</h1>
+    </div>
     <span class="version" id="ver">LOCAL · 127.0.0.1</span>
   </header>
 
@@ -162,21 +402,118 @@ pre.hint { font-family:ui-monospace,Consolas,monospace; }
   </section>
 
   <section id="matrixsec" class="hidden">
-    <h2><span class="n">3</span>测试矩阵</h2>
+    <h2><span class="n">3</span>测试计划</h2>
+    <div class="modebar" role="tablist" aria-label="测试计划模式">
+      <span class="mode-title">选择配置方式</span>
+      <button type="button" class="ghost active" id="quickmode" role="tab" aria-selected="true">快速工作台</button>
+      <button type="button" class="ghost" id="advancedmode" role="tab" aria-selected="false">高级矩阵</button>
+      <span class="hint">快速模式把链路、套件和协议任务分开；TCP 与 UDP 按队列依次执行。</span>
+    </div>
+
+    <!-- 快速工作台：一个套件可以包含 TCP、UDP、PING 三种独立任务，
+         通过绑定批量分配给链路集合。高级矩阵保留在下方，作为兼容入口。 -->
+    <div id="quickworkspace">
+      <div id="quicksummary" class="quick-summary">
+        <span>链路集合 <strong id="qsumsets">0</strong></span>
+        <span>已分配链路 <strong id="qsumpairs">0</strong></span>
+        <span>套件 <strong id="qsumsuites">0</strong></span>
+        <span>预计单元 <strong id="qsumunits">—</strong></span>
+        <span>预计耗时 <strong id="qsumtime">—</strong></span>
+        <span id="qsumwarn" class="summary-warn"></span>
+      </div>
+      <div class="quick-grid">
+        <div class="quick-panel">
+          <div class="panel-head">
+            <h3>1 · 链路集合</h3>
+            <span class="hint">先选具体网口对，再批量分配套件</span>
+          </div>
+          <div class="panel-body">
+            <div class="link-filter">
+              <label><input type="checkbox" id="qcrossonly" checked>只显示跨机链路</label>
+              <label><input type="checkbox" id="qshowpairs">展开具体网口对</label>
+              <button type="button" class="ghost" id="qnewset">+ 新建链路集合</button>
+              <button type="button" class="ghost" id="qautogroup">按角色自动分组</button>
+            </div>
+            <div id="quicksets" class="link-set-list"></div>
+            <div id="quicksetempty" class="quick-empty hidden">连接辅测机后会生成可用链路。也可以新建集合并手动选择网口对。</div>
+          </div>
+        </div>
+
+        <div class="quick-panel">
+          <div class="panel-head">
+            <h3>2 · 流量套件</h3>
+            <span class="hint">TCP / UDP 是独立任务，按顺序执行</span>
+          </div>
+          <div class="panel-body">
+            <div class="row" style="margin-bottom:9px;gap:7px">
+              <button type="button" class="ghost" id="qnewsuite">+ 新建套件</button>
+              <button type="button" class="ghost" id="qpreset">从预设创建</button>
+            </div>
+            <div id="quickrecipes" class="chip-row" style="margin-bottom:10px"></div>
+            <div id="quicksuites" class="suite-list"></div>
+            <div id="quicksuiteempty" class="quick-empty hidden">还没有套件。创建“基线 TCP+UDP”即可开始。</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="quick-panel" style="margin-top:16px">
+        <div class="panel-head">
+          <h3>3 · 分配</h3>
+          <span class="hint">同一链路可分配多个套件；每个套件内部仍是连续队列</span>
+        </div>
+        <div class="panel-body">
+          <div class="assign-toolbar">
+            <label>套件 <select id="qassignsuite"></select></label>
+            <button type="button" class="ghost" id="qapplyselected">应用到选中集合</button>
+            <button type="button" class="ghost" id="qclearselected">清除选中集合</button>
+            <span id="qassignhint" class="assign-count"></span>
+          </div>
+          <div id="quickassign" class="assign-table"></div>
+        </div>
+      </div>
+
+      <div class="quick-panel review-panel">
+        <div class="panel-head">
+          <h3>4 · 复核</h3>
+          <span class="hint">预览以服务端实际展开的单元为准，包含网口覆盖和裁剪后的参数</span>
+        </div>
+        <div class="panel-body">
+          <div id="quickreview" class="review-tree"></div>
+          <div id="quickreviewempty" class="quick-empty hidden">至少分配一个套件后，这里会显示执行顺序和最终参数。</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 高级模式：旧矩阵完整保留。 -->
+    <div id="advancedworkspace" class="hidden">
+    <h2 class="hidden"><span class="n">3</span>测试矩阵</h2>
     <div class="row toolbar">
       <button type="button" class="ghost" id="all">全选</button>
       <button type="button" class="ghost" id="none">全不选</button>
       <button type="button" class="ghost" id="cross">只选跨机</button>
       <span class="hint">默认全不选。表头里的小勾选框整列开关，勾一下全开、再勾一下全关。每个要跑的组合至少保留一个方向、协议和 IP 版本。</span>
     </div>
-    <p class="hint"><strong>双向门限</strong>只在勾了「双向」时生效，留空就沿用「网口与策略」里的 RX 门限。
-    半双工介质（Wi-Fi、部分 USB 网卡）双向同时灌包时，两个方向抢同一段介质时间，
-    每个方向拿到的只有单向的一部分——拿单向门限去卡双向必然判成 <code>RATE_FAIL</code>，
-    而那是配置出来的失败、不是测出来的。典型写法：单向 2000，双向两格各填 1000。
-    <strong>它按配对填而不是按网卡</strong>：同一块 RNDIS 口，和 Wi-Fi 组双向、和 SGMII 组双向，
-    能收到的速率完全不是一个量级，挂在网卡上只能填一个数，必然有一组是错的。
-    两个方向分开是因为半双工链路的两个方向本来就能差很远。只填绝对 Mbps，不收百分比——
-    百分比要按单块网卡的协商速率换算，而那跟「这两块口凑在一起并发时能跑多少」没有关系。</p>
+    <!-- 说明只留「不写在这儿就会填错」的两句：为什么这么设计（半双工双向抢介质、
+         按配对而不是按网卡、只收绝对值）写在《使用说明》里。界面上堆满理由时，
+         人会整段划过去，连这两句一起漏掉。 -->
+    <p class="hint"><strong>双向门限</strong>只在勾了「双向」时生效，留空就沿用「网口与策略」里的 RX 门限。</p>
+    <!-- 参数组表是矩阵「UDP 参数」那一列的图例，所以放在矩阵**之前**：
+         先看见有哪几组，再去每行选一组。放在下面的执行区时，人在矩阵里看到的是
+         一个只有「默认」的下拉，不知道别的选项该从哪来。 -->
+    <p class="hint"><strong>UDP 参数组</strong>：新建的组必须填 <code>-b</code>。</p>
+    <div class="scroll udp-groups"><table id="udpgroups"><thead><tr>
+      <th>名称</th><th>-b 档位（必填）</th><th>-l</th><th>-w</th><th>流数</th><th></th>
+    </tr></thead><tbody></tbody></table></div>
+    <div class="row">
+      <button type="button" class="ghost" id="addgroup">+ 新建一组 UDP 参数</button>
+    </div>
+    <p class="hint"><strong>TCP 参数组</strong>：<code>-w</code> 留空 = 不下发 <code>-w</code>（用 iperf3 默认窗口）；组内 <code>-w</code> × <code>-P</code> 取组合。</p>
+    <div class="scroll udp-groups"><table id="tcpgroups"><thead><tr>
+      <th>名称</th><th>-w 窗口</th><th>-P 流数</th><th></th>
+    </tr></thead><tbody></tbody></table></div>
+    <div class="row">
+      <button type="button" class="ghost" id="addtcpgroup">+ 新建一组 TCP 参数</button>
+    </div>
     <div class="scroll"><table id="matrix"><thead><tr>
       <th>测</th><th>配对</th>
       <th>方向<div class="colsel">
@@ -190,30 +527,25 @@ pre.hint { font-family:ui-monospace,Consolas,monospace; }
         <label><input type="checkbox" class="colall" data-attr="tp" data-val="udp">UDP</label>
         <label><input type="checkbox" class="colall" data-attr="tp" data-val="ping">PING</label>
       </div></th>
+      <th>TCP 参数<div class="colsel" id="tcpcolsel"><span class="hint">见上面的参数组表</span></div></th>
+      <th>UDP 参数<div class="colsel" id="udpcolsel"><span class="hint">见上面的参数组表</span></div></th>
       <th>IP<div class="colsel">
         <label><input type="checkbox" class="colall" data-attr="ip" data-val="v4">V4</label>
         <label><input type="checkbox" class="colall" data-attr="ip" data-val="v6">V6</label>
       </div></th>
     </tr></thead><tbody></tbody></table></div>
+    </div>
   </section>
 
   <section id="runsec" class="hidden">
     <h2><span class="n">4</span>执行</h2>
     <p class="hint sweep-note">
-      空格或逗号分隔多个档位，TCP -w / -P 与 UDP -b / -l / -w 都会逐档各跑一轮
-      （UDP 三项取组合：2 档 -b × 2 档 -l × 2 档 -w = 8 个单元，跑之前用「预览任务」看一眼总数）。
-      按网口填写 UDP -b 后，该发送端固定使用网口值；留空的发送端继续扫描全局档位。
+      快速工作台中，TCP 和 UDP 参数写在各自的配方里；高级矩阵中，档位在第 3 步的参数组表里
+      （组内取组合：TCP 是 -w × -P，UDP 是 -b × -l × -w）。TCP 灌包和 UDP 灌包始终是独立任务，
+      套件只定义它们的连续执行顺序。跑之前用「预览任务」看一眼总数，那里逐单元列着每条腿最终下发的参数。
     </p>
-    <div class="row">
-      <label>TCP -w <input type="text" id="win" class="list" value="4m" placeholder="2m 4m 256m"></label>
-      <label>TCP -P <input type="text" id="tcpstreams" class="list" value="10" placeholder="1 5 10"></label>
-      <label>UDP -b <input type="text" id="udpbw" class="list" value="1000m" placeholder="1m 500m 1G"></label>
-      <label>UDP -l <input type="text" id="udplen" class="list" placeholder="留空=iperf3 默认"></label>
-      <label>UDP -w <input type="text" id="udpwin" class="list" placeholder="留空=iperf3 默认"></label>
-    </div>
     <div class="row run-options">
       <label>时长 <input type="number" id="duration" class="num" value="180" min="1" max="86400"></label>
-      <label>UDP 流 <input type="number" id="udpstreams" class="num" value="1" min="1" max="32"></label>
       <label>ping 次数 <input type="number" id="pingcount" class="num" value="100" min="1" max="100000"></label>
       <label>ping 包长 <input type="text" id="pingsizes" class="list" value="32 1600 65500" placeholder="32 1600 65500"></label>
       <label><input type="checkbox" id="clip"> 按链路上限裁剪 UDP -b</label>
@@ -222,7 +554,12 @@ pre.hint { font-family:ui-monospace,Consolas,monospace; }
     </div>
     <p class="hint">不勾「裁剪」时，填多少就发多少——想看链路在超额灌包下的表现就保持不勾。勾上后超过整条路径可信上限的档位会被自动压到上限，按网口单独指定的 -b 不受影响。</p>
     <div class="row actions">
+      <input type="file" id="importfile" class="hidden" accept=".json,application/json">
+      <input type="file" id="projectfile" class="hidden" accept=".json,application/json">
+      <button type="button" class="ghost" id="import">导入 config.json</button>
       <button type="button" class="ghost" id="export">下载 config.json</button>
+      <button type="button" class="ghost" id="project-import">导入测试项目</button>
+      <button type="button" class="ghost" id="project-export">导出测试项目</button>
       <button type="button" class="ghost" id="plan">预览任务</button>
       <button type="button" class="big" id="start">开始测试</button>
     </div>
@@ -236,7 +573,7 @@ pre.hint { font-family:ui-monospace,Consolas,monospace; }
       <button type="button" class="danger hidden" id="stop">结束并出报告</button>
       <button type="button" class="ghost hidden" id="openreport">打开报告</button>
     </div>
-    <div id="log"></div>
+    <div class="screen" data-label="CONSOLE · 运行日志"><div id="log"></div></div>
   </section>
   </div>
 
@@ -247,33 +584,96 @@ pre.hint { font-family:ui-monospace,Consolas,monospace; }
     <section>
       <h2>网卡速率监控</h2>
       <div class="row">
-        <label>监控端 <select id="monside">
-          <option value="master">本机</option>
-          <option value="agent">辅测机</option>
-        </select></label>
-        <label>网卡 <select id="moniface"></select></label>
         <label>采样间隔 <input type="number" id="moninterval" class="num" value="1000" min="200" max="60000"> ms
           <span class="field-note" id="monintervalnote">本机：200–60000 ms</span></label>
+        <label><input type="checkbox" id="monshowrx" checked>画 RX（实线）</label>
+        <label><input type="checkbox" id="monshowtx" checked>画 TX（虚线）</label>
         <button type="button" id="monstart">开始监控</button>
         <button type="button" id="monstop" class="ghost" disabled>停止</button>
       </div>
+      <!-- 网卡是多选：一条链路的两端、或者几块口同时灌包时谁在抢带宽，
+           都要放在同一张图上按同一个纵轴比才看得出来。 -->
+      <div id="monpick" class="mon-pick"></div>
       <div id="monmsg"></div>
-      <div class="mon-readout">
-        <div><span class="mon-label">RX</span><span id="monrx" class="mon-value">—</span></div>
-        <div><span class="mon-label">TX</span><span id="montx" class="mon-value">—</span></div>
-        <div><span class="mon-label">RX 均值 / 峰值</span><span id="monstat" class="mon-value-sm">—</span></div>
+      <div class="screen scope" data-label="SCOPE · 吞吐示波">
+        <canvas id="monchart" height="220"></canvas>
+        <table id="monlegend" class="hidden"><tbody></tbody></table>
       </div>
-      <canvas id="monchart" height="180"></canvas>
-      <p class="hint">监控与测试互不影响，可以边跑测试边看。横轴是会话开始后的时间（分:秒），
-        曲线、均值和峰值用同一个窗口。要长期留存曲线请用
-        <code>cpe_test monitor --csv</code>——网页只保留最近 7200 个采样点。</p>
+      <p class="hint">监控与测试互不影响，可以边跑测试边看。最多同时看 8 块网卡，主控和辅测机的口可以混着勾。
+        横轴是会话开始后的时间（分:秒），曲线、均值和峰值用同一个窗口。要长期留存曲线请用
+        <code>cpe_test monitor --csv</code>——网页每块网卡只保留最近 7200 个采样点。</p>
     </section>
   </div>
+</div>
+
+<!-- 套件编辑抽屉：只编辑计划语义，不把 TCP/UDP 合并成一个混合任务。 -->
+<div id="suite-backdrop" class="drawer-backdrop hidden" aria-hidden="true">
+  <aside class="drawer" role="dialog" aria-modal="true" aria-labelledby="suite-drawer-title">
+    <div class="drawer-head">
+      <h3 id="suite-drawer-title">编辑流量套件</h3>
+      <button type="button" class="ghost" id="suite-close">关闭</button>
+    </div>
+    <div class="form-grid">
+      <label class="wide">套件名称 <input type="text" id="suite-name" placeholder="例如：基线 TCP+UDP"></label>
+      <label>执行方式 <select id="suite-execution"><option value="sequential">TCP → UDP（依次执行）</option></select></label>
+      <label>说明 <input type="text" id="suite-note" placeholder="可选"></label>
+    </div>
+    <div id="suite-task-editors"></div>
+    <div class="editor-actions">
+      <button type="button" class="ghost" id="suite-cancel">取消</button>
+      <button type="button" id="suite-save">保存套件</button>
+    </div>
+  </aside>
 </div>
 
 <script>
 const $ = (id) => document.getElementById(id);
 let MASTER = null, AGENT = null, PAIRS = [], FROM = 0, TIMER = null, LOCAL_NICS = [];
+// 快速工作台状态。这里保存的是“计划关系”，不是旧矩阵的投影：一个套件里的
+// TCP、UDP、PING 都是独立 task，绑定只引用稳定 ID。提交时由后端展开成独立
+// TestSpec，绝不在浏览器里把 TCP/UDP 拼成混合单元。
+let MODE = 'quick';
+let LINK_SETS = [], RECIPES = { tcp: [], udp: [], ping: [] }, SUITES = [], BINDINGS = [];
+let QUICK_SET_SELECTION = new Set(), QUICK_SUITE_SELECTION = '';
+let EDITING_SUITE_ID = null, EDITING_SUITE_DRAFT = null, PENDING_PROJECT = null;
+let PLAN_HASH = '', TOPOLOGY_FINGERPRINT = '';
+// MASTER/AGENT hold the last successful scan.  Keep a separate connection
+// state because a failed reconnect must not make those stale snapshots look
+// current.  `null` is the pre-connect/embedded-test state; in that state a
+// caller that seeds both snapshots directly is treated as connected for
+// backwards compatibility, while a real failed request sets the flag false.
+let CONNECTION_STATE = null;
+// Monotonically increasing generation for quick-plan previews.  A preview is
+// asynchronous; if the user edits the plan while `/api/plan` is in flight,
+// the response belongs to an older request and must not restore its hash.
+let QUICK_PLAN_REVISION = 0;
+// 导入时还没连上辅测机的话，配对先存这儿，等「连接」扫到网口再勾。
+let PENDING_PAIRS = null;
+// 上一拍看到的运行状态，和「已经点过结束」的标记。
+let LAST_RUNNING = null, STOPPING = false;
+// 运行期间锁住整个测试配置区，但记住每个控件原本的 disabled 状态（例如未连接
+// 时 refresh 本来就应置灰）。这样进度轮询结束后能精确恢复，而不是把连接前的
+// 控件误点亮；监控标签页不在锁定范围内，仍可边跑边看。
+const RUN_LOCK_STATES = new Map();
+
+function connectionEstablished() {
+  // Do not trust a flag without the corresponding snapshots: a test harness
+  // (or a future disconnect path) may clear MASTER/AGENT while the last API
+  // result was successful.
+  if (CONNECTION_STATE === false) return false;
+  return Boolean(MASTER && AGENT);
+}
+
+function quickTopologyReady() {
+  const ready = (host) => host && Array.isArray(host.interfaces) && host.interfaces.length > 0;
+  return connectionEstablished() && ready(MASTER) && ready(AGENT);
+}
+
+// Existing callers/tests use this name for a runnable quick-workspace
+// topology.  Keep it as an explicit alias instead of conflating a successful
+// HTTP connection with a non-empty, trustworthy NIC scan.
+function quickConnected() { return quickTopologyReady(); }
+
 // 日志框保留的行数，和服务端镜像的 LOG_MIRROR_MAX_LINES 对齐。
 // 不封顶的话，一次 120 单元的运行会打出三万多行全留在一个文本节点里：
 // 几 MB 的 pre-wrap 文本要反复重排，而 `textContent +=` 每秒把整段读出来
@@ -285,7 +685,10 @@ function say(el, text, kind) {
   el.innerHTML = text ? '<div class="status ' + (kind || 'info') + '">' + esc(text) + '</div>' : '';
 }
 function esc(s) {
-  return String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+  // 网口名/端点会放进单引号属性（data-src、data-dst 等），而名称不是受控
+  // 枚举。像 "John's USB" 若不转义会截断属性，具体链路勾选后读回的端点
+  // 就会错误；对文本节点转义单引号也无害。
+  return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 // 启动时打印的地址里带着 ?token=。取出来收好，并把它从地址栏抹掉——留在那儿
 // 会跟着截图、跟着「复制当前网址」传出去。
@@ -331,6 +734,7 @@ function renderLocal(d) {
     '</td><td>' + (n.speed_mbps ? n.speed_mbps + ' Mbps' : '—') + '</td></tr>');
   $('localnics').querySelector('tbody').innerHTML = rows.length ? rows.join('')
     : '<tr><td colspan="6" class="empty">没有扫到网卡。检查网线 / Wi-Fi 是否连上。</td></tr>';
+  fillMonitorIfaces();
 }
 
 async function loadLocal(manual) {
@@ -344,6 +748,1374 @@ async function loadLocal(manual) {
   } finally {
     if (manual) { btn.disabled = false; btn.textContent = '重新扫描'; }
   }
+}
+
+// ---------------- 表格状态 ----------------
+//
+// 矩阵和网口表的**唯一事实来源**是 ROWS / NICROWS 这两份数据，DOM 是它们的
+// 投影：事件只改状态，序列化只读状态，DOM 只在结构变化时整体重画。
+//
+// 以前两边都是「写进 DOM，再用 `[data-i]` 选择器读回来」。那样每加一个字段，
+// renderMatrix / collect / applyPairs 三处就要各写一遍同一件事，而三处只靠
+// 选择器字符串保持一致——加导入功能时 applyPairs 基本是 collect 的镜像，
+// 两边必须手工对齐，多一个字段就多一处能悄悄漏掉的地方。
+let ROWS = [];
+// 按端点对记住行状态：刷新网口会重建 PAIRS，勾选不该跟着一起没。
+const ROW_MEMORY = new Map();
+let NICROWS = [];
+const NIC_MEMORY = new Map();
+
+// ---------------- 快速工作台 ----------------
+// 快速模式的 ID 不依赖数组下标。这样刷新网卡、调整集合顺序或复制套件时，
+// 已有绑定仍然指向同一个对象；项目文件也可以跨页面会话恢复。
+function qhash(raw) {
+  let h = 2166136261;
+  for (let i = 0; i < String(raw).length; i++) {
+    h ^= String(raw).charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0).toString(16).padStart(8, '0');
+}
+function qid(prefix, raw) { return prefix + '-' + qhash(raw); }
+function qpairKey(src, dst) { return JSON.stringify([src, dst]); }
+function qpairId(src, dst) {
+  const ends = [src, dst].sort();
+  return qid('pair', ends[0] + '\n' + ends[1]);
+}
+function qpairRef(pair) {
+  return { id: qpairId(endpointOf(pair.a), endpointOf(pair.b)),
+    src: endpointOf(pair.a), dst: endpointOf(pair.b) };
+}
+function qpairCurrentMap() {
+  const map = new Map();
+  PAIRS.forEach((pair) => map.set(qpairKey(endpointOf(pair.a), endpointOf(pair.b)), pair));
+  // 反向写法也视为同一条链路，但保留当前枚举方向作为 src/dst。
+  PAIRS.forEach((pair) => map.set(qpairKey(endpointOf(pair.b), endpointOf(pair.a)), pair));
+  return map;
+}
+function qroleKey(pair) {
+  return (pair.a.nic.role || pair.a.nic.name) + ' ↔ ' + (pair.b.nic.role || pair.b.nic.name);
+}
+function qnewSet(name, pairs) {
+  const seed = (name || '链路集合') + '\n' + (pairs || []).map((p) => p.src + '|' + p.dst).join('\n');
+  return { id: qid('linkset', seed + '\n' + Date.now() + '\n' + Math.random()),
+    name: name || '未命名链路集合', pair_refs: pairs || [], _auto: false };
+}
+
+function autoLinkSets() {
+  const groups = new Map();
+  PAIRS.filter((pair) => pair.cross).forEach((pair) => {
+    const key = qroleKey(pair);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(qpairRef(pair));
+  });
+  return Array.from(groups.entries()).map(([key, pairs]) => ({
+    id: qid('linkset', key), name: key, pair_refs: pairs, _auto: true,
+  }));
+}
+
+function syncQuickSets() {
+  const current = qpairCurrentMap();
+  // A project can be imported before the first connection.  In that state the
+  // endpoint table is intentionally empty, so there is no topology against
+  // which to reconcile the saved references.  Keep the imported (especially
+  // `_auto`) sets intact until connect() has populated MASTER/AGENT; otherwise
+  // merely rendering the quick workspace would drop every auto-generated set
+  // and the later connection could only restore NIC policies, not the plan.
+  // A successful connection response can still contain an empty interface list
+  // (for example while a host is booting, or when an IPv4-prefix filter hides
+  // every NIC).  There is no trustworthy topology to reconcile in that state;
+  // keep imported/custom references intact until a later refresh supplies both
+  // sides.  Otherwise an empty scan would erase auto sets and mark every custom
+  // pair stale even though nothing was actually observed.
+  if (!quickTopologyReady()) {
+    const valid = new Set(LINK_SETS.map((set) => set.id));
+    QUICK_SET_SELECTION = new Set(Array.from(QUICK_SET_SELECTION).filter((id) => valid.has(id)));
+    if (!QUICK_SET_SELECTION.size && LINK_SETS.length) QUICK_SET_SELECTION.add(LINK_SETS[0].id);
+    return;
+  }
+  if (!LINK_SETS.length) {
+    LINK_SETS = autoLinkSets();
+  } else {
+    const seen = new Set();
+    LINK_SETS.forEach((set) => {
+      set.pair_refs = (set.pair_refs || []).map((ref) => {
+        const pair = current.get(qpairKey(ref.src, ref.dst)) || current.get(qpairKey(ref.dst, ref.src));
+        // 自动集合完全由当前拓扑推导；网口短暂消失/角色刷新时丢掉旧引用，
+        // 让下一段 PAIRS 扫描重新补回，而不是把自动集合也标成失效从而
+        // 阻塞预览。用户手工编辑过的集合已将 _auto 置 false，仍保留警告。
+        if (!pair) return set._auto ? null : { ...ref, stale: true };
+        const fresh = qpairRef(pair); seen.add(qpairKey(fresh.src, fresh.dst)); return fresh;
+      }).filter(Boolean);
+    });
+    // 新扫到的链路加入同角色的自动集合；自定义集合不被悄悄改名或清空。
+    PAIRS.filter((pair) => pair.cross).forEach((pair) => {
+      const ref = qpairRef(pair), key = qpairKey(ref.src, ref.dst);
+      if (seen.has(key)) return;
+      const role = qroleKey(pair);
+      let set = LINK_SETS.find((item) => item._auto && item.name === role);
+      if (!set) {
+        set = { id: qid('linkset', role), name: role, pair_refs: [], _auto: true };
+        LINK_SETS.push(set);
+      }
+      set.pair_refs.push(ref); seen.add(key);
+    });
+  }
+  // 拓扑变化后没有任何链路的**未绑定**自动集合只会制造空卡片，可以清掉。
+  // 但有绑定的自动集合必须暂时保留：网卡角色/名称可能只是短暂变化，若这里
+  // 直接删掉集合，下面的 BINDINGS 过滤会连套件分配一起抹掉；下一次同角色链路
+  // 恢复时虽然会按相同 ID 重建集合，用户仍得重新分配套件，离线项目就被悄悄
+  // 改写了。保留一个 0 对的卡片也比丢绑定安全，用户可以先取消绑定再清理。
+  const boundSetIds = new Set(BINDINGS.map((binding) => binding.link_set_id));
+  LINK_SETS = LINK_SETS.filter((set) =>
+    !set._auto || (set.pair_refs || []).length > 0 || boundSetIds.has(set.id));
+  const currentSetIds = new Set(LINK_SETS.map((set) => set.id));
+  BINDINGS = BINDINGS.filter((binding) => currentSetIds.has(binding.link_set_id));
+  const valid = new Set(LINK_SETS.map((set) => set.id));
+  QUICK_SET_SELECTION = new Set(Array.from(QUICK_SET_SELECTION).filter((id) => valid.has(id)));
+  if (!QUICK_SET_SELECTION.size && LINK_SETS.length) QUICK_SET_SELECTION.add(LINK_SETS[0].id);
+}
+
+function tcpRecipeDefault() {
+  return { id: 'recipe-tcp-default', name: '默认 TCP', mode: 'fixed',
+    profiles: [{ window: '4m', streams: 10 }] };
+}
+function udpRecipeDefault() {
+  return { id: 'recipe-udp-default', name: '默认 UDP', mode: 'fixed',
+    profiles: [{ bandwidth: '1000m', length: '1400', streams: 1 }] };
+}
+function baselineSuite() {
+  return { id: 'suite-baseline', name: '基线 TCP+UDP', execution: 'sequential',
+    order: ['task-tcp', 'task-udp'],
+    tasks: [
+      { id: 'task-tcp', name: 'TCP', protocol: 'tcp', directions: ['ab', 'ba'], ip: ['v4'], recipe_ids: ['recipe-tcp-default'], rx_target_bidir_ab: '', rx_target_bidir_ba: '' },
+      { id: 'task-udp', name: 'UDP', protocol: 'udp', directions: ['ab', 'ba'], ip: ['v4'], recipe_ids: ['recipe-udp-default'], rx_target_bidir_ab: '', rx_target_bidir_ba: '' },
+    ],
+  };
+}
+function ensureQuickDefaults() {
+  if (!RECIPES || typeof RECIPES !== 'object') RECIPES = { tcp: [], udp: [], ping: [] };
+  RECIPES.tcp = RECIPES.tcp || []; RECIPES.udp = RECIPES.udp || []; RECIPES.ping = RECIPES.ping || [];
+  if (!RECIPES.tcp.length) RECIPES.tcp.push(tcpRecipeDefault());
+  if (!RECIPES.udp.length) RECIPES.udp.push(udpRecipeDefault());
+  if (!SUITES.length) SUITES.push(baselineSuite());
+  if (!QUICK_SUITE_SELECTION || !SUITES.some((s) => s.id === QUICK_SUITE_SELECTION)) {
+    QUICK_SUITE_SELECTION = SUITES[0].id;
+  }
+}
+function qrecipe(id, protocol) {
+  return (RECIPES[protocol] || []).find((recipe) => recipe.id === id);
+}
+function qtaskProtocol(task) {
+  const p = String(task.protocol || (task.transports || [])[0] || '').toLowerCase();
+  return ['tcp', 'udp', 'ping'].includes(p) ? p : 'tcp';
+}
+// 与后端 canonical_ui_direction 保持同一套词义：both 是两条独立的
+// A→B/B→A 单向腿；bidir 才是同一个双向并发单元。旧项目里两者都可能出现，
+// 不能把 both 显示成“双向”而在保存时悄悄改变执行语义。
+function qcanonicalDirection(raw) {
+  switch (String(raw || '').trim().toLowerCase()) {
+    case 'ab': case 'a->b': case 'a>b': case 'a_to_b': return 'ab';
+    case 'ba': case 'b->a': case 'b>a': case 'b_to_a': return 'ba';
+    case 'bidir': case 'both-way': case 'a<->b': case '双向': return 'bidir';
+    case 'both': return 'both';
+    default: return null;
+  }
+}
+function qtaskDirections(task) {
+  const labels = [];
+  (task.directions || []).forEach((raw) => {
+    const direction = qcanonicalDirection(raw);
+    const add = (label) => { if (!labels.includes(label)) labels.push(label); };
+    if (direction === 'both') add('A→B、B→A（分开执行）');
+    else if (direction === 'ab') add('A→B');
+    else if (direction === 'ba') add('B→A');
+    else if (direction === 'bidir') add('双向并发');
+    else if (String(raw).trim()) add(String(raw));
+  });
+  return labels.length ? labels.join('、') : '未选方向';
+}
+function qtaskIps(task) {
+  const ips = (task.ip || []).map((v) => ({ v4:'IPv4', v6:'IPv6', ipv4:'IPv4', ipv6:'IPv6' }[String(v).toLowerCase()] || v));
+  return ips.length ? ips.join('、') : '未选 IP';
+}
+function qrecipeSummary(recipe, protocol) {
+  if (!recipe) return '默认参数';
+  if (recipe.profiles && recipe.profiles.length) {
+    return recipe.profiles.map((p) => {
+      if (protocol === 'tcp') return (p.window ? '-w ' + p.window : '默认窗口') + ' · -P ' + (p.tcp_streams || p.streams || 1);
+      if (protocol === 'udp') return (p.bandwidth ? '-b ' + p.bandwidth : '缺少 -b') + (p.length ? ' · -l ' + p.length : '') + (p.window ? ' · -w ' + p.window : '') + ' · ' + (p.udp_streams || p.streams || 1) + ' 流';
+      return 'PING';
+    }).join('；');
+  }
+  if (protocol === 'tcp') {
+    const windows = (recipe.tcp_windows || recipe.windows || []).join(' ') || '默认窗口';
+    const streams = (recipe.tcp_streams || []).join(' ') || '1';
+    return windows + ' · -P ' + streams;
+  }
+  if (protocol === 'udp') {
+    const bandwidths = (recipe.bandwidths || []).join(' ') || '缺少 -b';
+    const lengths = (recipe.lengths || []).join(' ');
+    const windows = (recipe.windows || []).join(' ');
+    const streams = (recipe.udp_streams || []).join(' ') || '1';
+    return bandwidths + (lengths ? ' · -l ' + lengths : '') + (windows ? ' · -w ' + windows : '') + ' · ' + streams + ' 流';
+  }
+  return 'PING';
+}
+function qassigned(setId, suiteId) {
+  return BINDINGS.some((binding) => binding.link_set_id === setId && binding.suite_id === suiteId);
+}
+function qensureBinding(setId, suiteId) {
+  if (qassigned(setId, suiteId)) return;
+  BINDINGS.push({ id: qid('binding', setId + '\n' + suiteId), link_set_id: setId, suite_id: suiteId, mode: 'replace', order: BINDINGS.length + 1 });
+}
+function qremoveBinding(setId, suiteId) {
+  BINDINGS = BINDINGS.filter((binding) => !(binding.link_set_id === setId && binding.suite_id === suiteId));
+}
+// 返回某个 binding 实际会送进计划的 pair。binding.pair_ids 为空表示整组；
+// 填了 pair_ids 则只取其中指定的引用。默认排除 stale，因为这些引用不能被
+// 服务端解析；需要检查 stale 时传 includeStale=true。
+function qbindingPairs(binding, set, includeStale = false) {
+  if (!set) return [];
+  const refs = set.pair_refs || [];
+  const ids = binding && Array.isArray(binding.pair_ids) ? binding.pair_ids : [];
+  const selected = ids.length ? new Set(ids) : null;
+  return refs.filter((ref) =>
+    (includeStale || !ref.stale) && (!selected || selected.has(ref.id)));
+}
+function qsetPairs(set) {
+  return qbindingPairs(null, set, false);
+}
+function renderQuickSets() {
+  const box = $('quicksets');
+  if (!box) return;
+  const showPairs = $('qshowpairs') && $('qshowpairs').checked;
+  const crossOnly = !$('qcrossonly') || $('qcrossonly').checked;
+  const current = qpairCurrentMap();
+  const available = PAIRS.filter((pair) => !crossOnly || pair.cross);
+  const html = LINK_SETS.map((set) => {
+    const pairs = set.pair_refs || [], valid = qsetPairs(set);
+    const assigned = SUITES.filter((suite) => qassigned(set.id, suite.id));
+    const pairRows = showPairs ? available.map((pair) => {
+      const ref = qpairRef(pair), checked = pairs.some((item) => item.id === ref.id && !item.stale);
+      return '<label class="pair-mini"><input type="checkbox" class="qpair-toggle" data-set="' + esc(set.id) + '" data-src="' + esc(ref.src) + '" data-dst="' + esc(ref.dst) + '"' + (checked ? ' checked' : '') + '>' +
+        '<span class="pair-label">' + esc(pair.label) + '</span></label>';
+    }).concat(pairs.filter((ref) => ref.stale).map((ref) =>
+      '<div class="pair-mini stale-pair"><span class="pair-label">' + esc(ref.src + ' ↔ ' + ref.dst) + '</span>' +
+      '<span class="chip warn">端点已消失</span>' +
+      '<button type="button" class="ghost qpair-remove-stale" data-set="' + esc(set.id) + '" data-pair-id="' + esc(ref.id) + '">移除</button></div>'
+    )).join('') : pairs.map((ref) => '<div class="pair-mini"><span class="pair-label">' + esc(ref.src + ' ↔ ' + ref.dst) + '</span>' +
+      (ref.stale ? '<span class="chip warn">端点已消失</span>' : '') + '</div>').join('');
+    return '<article class="link-set-card' + (QUICK_SET_SELECTION.has(set.id) ? ' selected' : '') + '">' +
+      '<div class="set-top"><input type="checkbox" class="qset-select" data-set="' + esc(set.id) + '"' + (QUICK_SET_SELECTION.has(set.id) ? ' checked' : '') + '>' +
+      '<strong>' + esc(set.name || '未命名链路集合') + '</strong><span class="chip ' + (valid.length ? 'ok' : 'warn') + '">' + valid.length + ' 对</span>' +
+      '<button type="button" class="ghost qset-rename" data-set="' + esc(set.id) + '">改名</button>' +
+      (set._auto ? '' : '<button type="button" class="danger qset-delete" data-set="' + esc(set.id) + '">删除</button>') + '</div>' +
+      '<div class="set-meta"><span>跨机链路</span><span>已分配：' + (assigned.length ? assigned.map((s) => esc(s.name)).join('、') : '未分配') + '</span>' +
+      (pairs.some((ref) => ref.stale) ? '<span class="chip warn">含失效端点</span>' : '') + '</div>' +
+      '<div class="set-actions"><button type="button" class="ghost qset-expand" data-set="' + esc(set.id) + '">' + (showPairs ? '收起/隐藏选择' : '展开具体网口对') + '</button></div>' +
+      (showPairs ? '<div class="pair-list">' + (pairRows || '<span class="hint">没有符合筛选条件的链路</span>') + '</div>' : '') +
+      '</article>';
+  }).join('');
+  box.innerHTML = html;
+  $('quicksetempty').classList.toggle('hidden', LINK_SETS.length > 0);
+  $('qsumsets').textContent = LINK_SETS.length;
+}
+function renderQuickSuites() {
+  const box = $('quicksuites');
+  if (!box) return;
+  box.innerHTML = SUITES.map((suite) => {
+    const tasks = suite.tasks || [];
+    const taskHtml = tasks.map((task) => {
+      const protocol = qtaskProtocol(task);
+      const ids = task.recipe_ids || [];
+      const recipes = ids.length ? ids.map((id) => qrecipe(id, protocol)).filter(Boolean) : [];
+      const summary = recipes.length ? recipes.map((r) => qrecipeSummary(r, protocol)).join('；') : '默认参数';
+      return '<div class="suite-task" data-protocol="' + protocol + '"><div class="task-head"><span>' + esc(task.name || protocol.toUpperCase()) + '</span><span class="chip">' + protocol.toUpperCase() + '</span><span class="hint">' + esc(qtaskDirections(task)) + ' · ' + esc(qtaskIps(task)) + '</span></div><div class="task-detail"><code>' + esc(summary) + '</code></div></div>';
+    }).join('');
+    const order = (suite.order && suite.order.length) ? suite.order.map((id) => (tasks.find((t) => t.id === id) || {}).name || id).join(' → ') : tasks.map((t) => t.name || qtaskProtocol(t).toUpperCase()).join(' → ');
+    return '<article class="suite-card' + (suite.id === QUICK_SUITE_SELECTION ? ' selected' : '') + '"><div class="suite-top"><input type="radio" name="quick-suite" class="qsuite-select" data-suite="' + esc(suite.id) + '"' + (suite.id === QUICK_SUITE_SELECTION ? ' checked' : '') + '><strong>' + esc(suite.name || suite.id) + '</strong><div class="suite-actions"><button type="button" class="ghost qsuite-edit" data-suite="' + esc(suite.id) + '">编辑</button><button type="button" class="ghost qsuite-copy" data-suite="' + esc(suite.id) + '">复制</button>' + (SUITES.length > 1 ? '<button type="button" class="danger qsuite-delete" data-suite="' + esc(suite.id) + '">删除</button>' : '') + '</div></div><div class="suite-note">执行顺序：' + esc(order || '未配置') + '（TCP、UDP 独立连续执行）' + (suite.note ? ' · ' + esc(suite.note) : '') + '</div>' + taskHtml + '</article>';
+  }).join('');
+  $('quicksuiteempty').classList.toggle('hidden', SUITES.length > 0);
+  $('qsumsuites').textContent = SUITES.length;
+  const sel = $('qassignsuite');
+  if (sel) {
+    sel.innerHTML = SUITES.map((suite) => '<option value="' + esc(suite.id) + '">' + esc(suite.name || suite.id) + '</option>').join('');
+    sel.value = QUICK_SUITE_SELECTION;
+  }
+}
+function renderQuickRecipes() {
+  const box = $('quickrecipes'); if (!box) return;
+  const cards = [];
+  [['tcp', 'TCP'], ['udp', 'UDP'], ['ping', 'PING']].forEach(([protocol, label]) => {
+    (RECIPES[protocol] || []).forEach((recipe) => {
+      cards.push('<span class="chip" title="' + esc(qrecipeSummary(recipe, protocol)) + '">' + label + ' · ' + esc(recipe.name || recipe.id) + ' <button type="button" class="ghost qrecipe-edit" data-protocol="' + protocol + '" data-recipe="' + esc(recipe.id) + '" style="min-height:22px;padding:2px 6px;font-size:11px">编辑</button></span>');
+    });
+  });
+  box.innerHTML = (cards.length ? '<span class="hint" style="align-self:center">参数配方：</span>' + cards.join('') : '<span class="hint">暂无参数配方</span>') +
+    '<button type="button" class="ghost qrecipe-new" data-protocol="tcp">+ TCP 配方</button><button type="button" class="ghost qrecipe-new" data-protocol="udp">+ UDP 配方</button>';
+}
+function editQuickRecipe(protocol, id) {
+  const list = RECIPES[protocol] || [];
+  const index = list.findIndex((item) => item.id === id);
+  const original = index >= 0 ? list[index] : null;
+  const creating = !original;
+  // 在 prompt 全部确认前只改草稿。此前先改 name、再在后续 prompt 点「取消」
+  // 会留下半套配方；新建时甚至会留下一个空 recipe，预览才报错。
+  const recipe = original
+    ? JSON.parse(JSON.stringify(original))
+    : { id: qid('recipe', protocol + Date.now() + Math.random()), name: protocol.toUpperCase() + ' 配方', mode: 'fixed', profiles: [] };
+
+  // 旧项目和默认配方常用完整 profiles，而编辑器保存的是轴字段。把 profiles
+  // 先投影成 prompt 的默认值，避免打开「默认 TCP」时 4m/-P10 被误显示成空/1。
+  const profileValues = (keys) => {
+    const values = [];
+    (recipe.profiles || []).forEach((profile) => {
+      for (const key of keys) {
+        const value = profile && profile[key];
+        if (value === undefined || value === null || value === '') continue;
+        const source = Array.isArray(value) ? value : [value];
+        source.forEach((item) => {
+          const text = String(item).trim();
+          if (text && !values.includes(text)) values.push(text);
+        });
+        break;
+      }
+    });
+    return values;
+  };
+  const axisDefault = (keys, fallback) => {
+    for (const key of keys) {
+      const value = recipe[key];
+      if (Array.isArray(value) && value.length) return value.join(' ');
+      if (value !== undefined && value !== null && String(value).trim()) return String(value);
+    }
+    const values = profileValues(keys);
+    return values.length ? values.join(' ') : fallback;
+  };
+
+  const name = window.prompt('配方名称', recipe.name || recipe.id);
+  if (name === null) return;
+  recipe.name = name.trim() || recipe.name;
+  if (protocol === 'tcp') {
+    const windows = window.prompt('TCP -w 档位（空=默认窗口，可填多个空格分隔）', axisDefault(['tcp_windows', 'windows', 'window'], ''));
+    if (windows === null) return;
+    const streams = window.prompt('TCP -P 流数（可填多个空格分隔）', axisDefault(['tcp_streams', 'streams'], '1'));
+    if (streams === null) return;
+    recipe.profiles = []; recipe.tcp_windows = splitList(windows); recipe.tcp_streams = splitList(streams).map(Number).filter((n) => n > 0);
+  } else if (protocol === 'udp') {
+    const bandwidths = window.prompt('UDP -b 档位（必填，可填多个）', axisDefault(['bandwidths', 'bandwidth'], '1000m'));
+    if (bandwidths === null) return;
+    const lengths = window.prompt('UDP -l 档位（空=不下发）', axisDefault(['lengths', 'length'], '')); if (lengths === null) return;
+    const windows = window.prompt('UDP -w 档位（空=不下发）', axisDefault(['windows', 'window'], '')); if (windows === null) return;
+    const streams = window.prompt('UDP 流数（可填多个）', axisDefault(['udp_streams', 'streams'], '1')); if (streams === null) return;
+    recipe.profiles = []; recipe.bandwidths = splitList(bandwidths); recipe.lengths = splitList(lengths); recipe.windows = splitList(windows); recipe.udp_streams = splitList(streams).map(Number).filter((n) => n > 0);
+  }
+  if (creating) list.push(recipe); else list[index] = recipe;
+  RECIPES[protocol] = list;
+  markQuickDirty();
+  renderQuickWorkspace();
+}
+$('quickrecipes').addEventListener('click', (ev) => {
+  const el = ev.target; if (!el.classList) return;
+  if (el.classList.contains('qrecipe-edit')) editQuickRecipe(el.dataset.protocol, el.dataset.recipe);
+  if (el.classList.contains('qrecipe-new')) editQuickRecipe(el.dataset.protocol, null);
+});
+function renderQuickAssignments() {
+  const box = $('quickassign');
+  if (!box) return;
+  if (!LINK_SETS.length || !SUITES.length) {
+    box.innerHTML = '<div class="quick-empty">先创建链路集合和套件。</div>';
+    $('qsumpairs').textContent = '0';
+    return;
+  }
+  const head = '<table><thead><tr><th>链路集合</th>' + SUITES.map((s) => '<th>' + esc(s.name || s.id) + '</th>').join('') + '</tr></thead><tbody>';
+  const rows = LINK_SETS.map((set) => {
+    // pair_ids 是项目文件/ API 的高级子集选择；界面里的集合卡仍显示整组，
+    // 但分配表要告诉用户当前真正会被绑定套件执行的物理链路数。
+    const setBindings = BINDINGS.filter((binding) => binding.link_set_id === set.id);
+    const pairCount = setBindings.length
+      ? new Set(setBindings.flatMap((binding) =>
+        qbindingPairs(binding, set).map((pair) =>
+          pair.src && pair.dst ? qpairId(pair.src, pair.dst) : pair.id))).size
+      : qsetPairs(set).length;
+    return '<tr><td><strong>' + esc(set.name || set.id) + '</strong><div class="assign-count">' + pairCount + ' 对</div></td>' + SUITES.map((suite) => '<td><input type="checkbox" class="assign-cell qbind-toggle" data-set="' + esc(set.id) + '" data-suite="' + esc(suite.id) + '"' + (qassigned(set.id, suite.id) ? ' checked' : '') + '></td>').join('') + '</tr>';
+  }).join('');
+  box.innerHTML = head + rows + '</tbody></table>';
+  // 摘要写的是“已分配链路”，应统计真正绑定到至少一个套件的物理链路，
+  // 而不是当前勾选的集合。此前只勾选集合就会显示已分配，反过来已绑定但
+  // 未选中的集合又会显示 0；同一链路绑定多个套件也只计一条。
+  const assignedPairIds = new Set();
+  BINDINGS.forEach((binding) => {
+    const set = LINK_SETS.find((item) => item.id === binding.link_set_id);
+    if (!set) return;
+    qbindingPairs(binding, set).forEach((pair) => {
+      // 以端点组成的稳定 ID 作为物理链路键，即使旧项目漏保存 pair.id，
+      // 或同一链路在两个集合里用了不同的引用 ID，也不会被重复计数。
+      const key = pair.src && pair.dst ? qpairId(pair.src, pair.dst) : pair.id;
+      if (key) assignedPairIds.add(key);
+    });
+  });
+  $('qsumpairs').textContent = assignedPairIds.size;
+  $('qassignhint').textContent = QUICK_SET_SELECTION.size ? '已选 ' + QUICK_SET_SELECTION.size + ' 个集合' : '先勾选链路集合';
+}
+
+// 分配矩阵也是状态层的一部分：复选框只是投影，点击后必须写回 BINDINGS，
+// 否则页面看起来勾上了，collect() 仍会提交旧计划。使用委派监听是因为
+// renderQuickAssignments() 会在每次分配变化后重画整张表。
+$('quickassign').addEventListener('change', (ev) => {
+  const el = ev.target;
+  if (!el || !el.classList || !el.classList.contains('qbind-toggle')) return;
+  const setId = el.dataset.set, suiteId = el.dataset.suite;
+  if (!setId || !suiteId) return;
+  if (el.checked) qensureBinding(setId, suiteId);
+  else qremoveBinding(setId, suiteId);
+  markQuickDirty();
+  renderQuickWorkspace();
+});
+function renderQuickReview(planResult) {
+  const box = $('quickreview');
+  if (!box) return;
+  if (planResult && planResult.units) {
+    const units = planResult.units;
+    const lines = units.slice(0, 120).map((u) => esc('#' + u.seq + ' ' + (u.resumed ? '[resume] ' : '') + u.title + ((u.load || []).length ? '\n  ' + u.load.join('\n  ') : ''))).join('\n');
+    box.innerHTML = '<div class="review-group"><div class="review-line"><strong>服务端实际计划</strong><span class="num">' + units.length + ' 个单元</span><span>TCP 与 UDP 分开排队</span></div><div class="review-detail">' + lines + (units.length > 120 ? '\n…其余 ' + (units.length - 120) + ' 个单元见完整预览' : '') + '</div></div>';
+    $('quickreviewempty').classList.add('hidden');
+    return;
+  }
+  const groups = BINDINGS.map((binding) => {
+    const set = LINK_SETS.find((s) => s.id === binding.link_set_id), suite = SUITES.find((s) => s.id === binding.suite_id);
+    if (!set || !suite) return '';
+    const order = (suite.order || []).map((id) => (suite.tasks || []).find((t) => t.id === id)).filter(Boolean);
+    const tasks = order.length ? order.concat((suite.tasks || []).filter((t) => !order.includes(t))) : (suite.tasks || []);
+    const effectivePairs = qbindingPairs(binding, set);
+    const taskDetails = tasks
+      .map((t) => esc((t.name || qtaskProtocol(t).toUpperCase()) + ' · ' + qtaskDirections(t) + ' · ' + qtaskIps(t)))
+      .join('\n');
+    return '<div class="review-group"><div class="review-line"><strong>' + esc(set.name) + ' → ' + esc(suite.name) + '</strong><span class="num">' + effectivePairs.length + ' 对</span><span>' + tasks.map((t) => esc(qtaskProtocol(t).toUpperCase())).join(' → ') + '</span></div><div class="review-detail">' + taskDetails + '</div></div>';
+  }).filter(Boolean).join('');
+  box.innerHTML = groups;
+  $('quickreviewempty').classList.toggle('hidden', !groups);
+}
+function renderQuickSummary(planResult) {
+  const count = planResult && planResult.units ? planResult.units.length : '—';
+  $('qsumunits').textContent = count;
+  $('qsumtime').textContent = planResult ? hhmm(planResult.est_total_secs || 0) : '—';
+  const stale = LINK_SETS.reduce((n, set) => n + (set.pair_refs || []).filter((p) => p.stale).length, 0);
+  if (!stale) {
+    $('qsumwarn').textContent = '';
+  } else if (quickHasBoundStale()) {
+    $('qsumwarn').textContent = '警告：当前分配中有失效端点，请移除或刷新';
+  } else {
+    $('qsumwarn').textContent = '提示：有 ' + stale + ' 条未参与当前分配的链路端点已消失';
+  }
+}
+function renderQuickWorkspace(planResult) {
+  ensureQuickDefaults(); syncQuickSets();
+  renderQuickSets(); renderQuickRecipes(); renderQuickSuites(); renderQuickAssignments(); renderQuickReview(planResult); renderQuickSummary(planResult);
+}
+function quickHasAssignments() {
+  return BINDINGS.some((binding) => {
+    const set = LINK_SETS.find((item) => item.id === binding.link_set_id);
+    return qbindingPairs(binding, set).length > 0;
+  });
+}
+
+// 只有会被当前 binding 送进执行计划的失效引用才阻止预览。
+//
+// 未绑定的链路集合是用户可以先整理、稍后再分配的草稿；其中端点暂时消失
+// 不应该把另一套已经绑定且可执行的计划一并锁死。即使集合已经绑定，binding
+// 也可能通过 pair_ids 只挑其中几条，因此未被挑中的 stale 引用同样只是警告。
+// 这里保留严格边界：effective pair_refs 里只要还有 stale，就要求用户刷新或
+// 移除，避免 quickPlanObject() 过滤掉它后让预览结果悄悄少链路。
+function quickHasBoundStale() {
+  return BINDINGS.some((binding) => {
+    const set = LINK_SETS.find((item) => item.id === binding.link_set_id);
+    if (!set) return false;
+    const refs = set.pair_refs || [];
+    if (!binding.pair_ids || binding.pair_ids.length === 0) {
+      return refs.some((ref) => ref.stale);
+    }
+    const selected = new Set(binding.pair_ids);
+    return refs.some((ref) => selected.has(ref.id) && ref.stale);
+  });
+}
+function quickPlanObject(includeStale = false) {
+  const pairRefs = (set) => (set.pair_refs || [])
+    .filter((pair) => includeStale || !pair.stale)
+    .map((pair) => ({
+      id: pair.id, src: pair.src, dst: pair.dst,
+      ...(includeStale && pair.stale ? { stale: true } : {}),
+    }));
+  return {
+    ui_plan_version: 1,
+    // _auto 是网页端的生命周期标记：项目导入后只有保留它，syncQuickSets
+    // 才知道哪些集合可以随拓扑自动重建，哪些是用户手工维护的自定义集合。
+    // 后端 DTO 会忽略这个 UI 专用字段，执行请求的 pair_refs 语义不变。
+    // Execution requests omit stale endpoints so the backend can validate a
+    // clean, runnable plan.  Project artifacts keep them (with an explicit
+    // marker) so an offline topology change does not silently destroy the
+    // user's saved link set; after reconnect they can be refreshed or removed.
+    link_sets: LINK_SETS.map((set) => ({ id: set.id, name: set.name, _auto: Boolean(set._auto), pair_refs: pairRefs(set) })),
+    recipes: { tcp: RECIPES.tcp || [], udp: RECIPES.udp || [], ping: RECIPES.ping || [] },
+    suites: SUITES.map((suite) => ({ ...suite, tasks: (suite.tasks || []).map((task) => ({ ...task })) })),
+    bindings: BINDINGS.map((binding) => ({ ...binding })),
+    plan_hash: PLAN_HASH || null,
+  };
+}
+
+function resetQuickPlanState() {
+  LINK_SETS = [];
+  RECIPES = { tcp: [], udp: [], ping: [] };
+  SUITES = [];
+  BINDINGS = [];
+  QUICK_SET_SELECTION = new Set();
+  QUICK_SUITE_SELECTION = '';
+  EDITING_SUITE_ID = null;
+  EDITING_SUITE_DRAFT = null;
+  PENDING_PROJECT = null;
+  PLAN_HASH = '';
+  TOPOLOGY_FINGERPRINT = '';
+  QUICK_PLAN_REVISION++;
+  $('suite-backdrop').classList.add('hidden');
+  $('suite-backdrop').setAttribute('aria-hidden', 'true');
+}
+function quickRequestFields() {
+  const legacy = collectLegacy();
+  const { pairs, tcp_groups, udp_groups, ...fields } = legacy;
+  return fields;
+}
+function quickCollect() {
+  return { ...quickRequestFields(), pairs: [], ui_plan: quickPlanObject(), plan_hash: PLAN_HASH || null };
+}
+function invalidateQuickPreview() {
+  QUICK_PLAN_REVISION++;
+  PLAN_HASH = '';
+  renderQuickSummary();
+  // 清掉服务端预览时，同时清掉复核区的旧展开结果。只重置 hash 会留下上一
+  // 份 TCP/UDP 参数和单元数，看起来像仍可直接执行，实际开始按钮又会拒绝。
+  if (MODE === 'quick') renderQuickReview();
+}
+function markQuickDirty() { invalidateQuickPreview(); }
+
+// 预览 hash 覆盖的不只是套件关系，也包括时长、PING 档位、裁剪/resume 和
+// 网口策略。输入这些字段后必须立刻作废旧预览，否则按钮看起来仍可「开始测试」，
+// 直到服务端拒绝过期 hash 才暴露问题。套件/链路控件在各自事件里显式调用本函数；
+// 这里补上执行区的通用字段；即使当前在高级模式，也要清理旧快速预览，避免
+// 切回快速模式后误用与共享设置不匹配的 hash。
+['duration', 'pingcount', 'pingsizes', 'clip', 'resume', 'shot'].forEach((id) => {
+  const el = $(id);
+  if (!el) return;
+  ['input', 'change'].forEach((eventName) => {
+    el.addEventListener(eventName, () => { markQuickDirty(); });
+  });
+});
+
+function openSuiteEditor(id) {
+  const suite = SUITES.find((item) => item.id === id);
+  if (!suite) return;
+  EDITING_SUITE_ID = id;
+  // 编辑抽屉使用草稿，点「取消」应真正丢弃名称、任务勾选和新增/移除操作。
+  // 直接改 SUITES 会让取消按钮看起来生效，实际却把半成品带进下一次预览。
+  EDITING_SUITE_DRAFT = JSON.parse(JSON.stringify(suite));
+  $('suite-name').value = EDITING_SUITE_DRAFT.name || '';
+  $('suite-note').value = EDITING_SUITE_DRAFT.note || '';
+  $('suite-execution').value = 'sequential';
+  renderSuiteTaskEditors(EDITING_SUITE_DRAFT);
+  $('suite-backdrop').classList.remove('hidden'); $('suite-backdrop').setAttribute('aria-hidden', 'false');
+}
+function closeSuiteEditor() {
+  EDITING_SUITE_ID = null; EDITING_SUITE_DRAFT = null;
+  $('suite-backdrop').classList.add('hidden'); $('suite-backdrop').setAttribute('aria-hidden', 'true');
+}
+function renderSuiteTaskEditors(suite) {
+  const box = $('suite-task-editors');
+  const tasks = suite.tasks || [];
+  box.innerHTML = tasks.map((task) => {
+    const protocol = qtaskProtocol(task), recipes = RECIPES[protocol] || [];
+    const hasDirection = (dir) => (task.directions || []).some((raw) => {
+      const canonical = qcanonicalDirection(raw);
+      return canonical === dir || (canonical === 'both' && (dir === 'ab' || dir === 'ba'));
+    });
+    const dirs = ['ab', 'ba', 'bidir'].map((dir) => '<label><input type="checkbox" class="edit-dir" data-task="' + esc(task.id) + '" data-dir="' + dir + '"' + (hasDirection(dir) ? ' checked' : '') + '>' + ({ab:'A→B',ba:'B→A',bidir:'双向并发'}[dir]) + '</label>').join('');
+    const ips = ['v4', 'v6'].map((ip) => '<label><input type="checkbox" class="edit-ip" data-task="' + esc(task.id) + '" data-ip="' + ip + '"' + ((task.ip || []).includes(ip) ? ' checked' : '') + '>' + ip.toUpperCase() + '</label>').join('');
+    const recipeBoxes = protocol === 'ping' ? '<span class="hint">PING 使用执行区的次数和包长</span>' : recipes.map((recipe) => '<label><input type="checkbox" class="edit-recipe" data-task="' + esc(task.id) + '" data-recipe="' + esc(recipe.id) + '"' + ((task.recipe_ids || []).includes(recipe.id) ? ' checked' : '') + '>' + esc(recipe.name || recipe.id) + '<span class="field-note">' + esc(qrecipeSummary(recipe, protocol)) + '</span></label>').join('');
+    // 方向、IP 和参数配方里还要放多个可点击的 <label>。外层必须是普通容器，
+    // 不能再套一层 <label>（嵌套 label 在浏览器里会导致点击联动，也破坏无障碍
+    // 语义）。单值输入仍用 label，保留原来的键盘/点击行为。
+    return '<div class="task-editor" data-task-editor="' + esc(task.id) + '"><h4><span class="chip">' + protocol.toUpperCase() + '</span> ' + esc(task.name || protocol) + '<button type="button" class="danger edit-task-remove" data-task="' + esc(task.id) + '" style="float:right">移除</button></h4><div class="form-grid"><label>任务名称<input type="text" class="edit-task-name" data-task="' + esc(task.id) + '" value="' + esc(task.name || '') + '"></label><label>双向门限（可选）<input type="text" class="edit-target-ab" data-task="' + esc(task.id) + '" value="' + esc(task.rx_target_bidir_ab || '') + '" placeholder="A→B Mbps"></label><label>反向门限（可选）<input type="text" class="edit-target-ba" data-task="' + esc(task.id) + '" value="' + esc(task.rx_target_bidir_ba || '') + '" placeholder="B→A Mbps"></label><div class="form-field wide"><span class="field-title">方向</span><span class="chip-row">' + dirs + '</span></div><div class="form-field wide"><span class="field-title">IP 版本</span><span class="chip-row">' + ips + '</span></div><div class="form-field wide"><span class="field-title">参数配方</span><span class="chip-row">' + (recipeBoxes || '<span class="hint">暂无配方</span>') + '</span></div></div></div>';
+  }).join('') + '<div class="row" style="margin-top:10px;gap:7px"><button type="button" class="ghost" id="editor-add-tcp">+ TCP 任务</button><button type="button" class="ghost" id="editor-add-udp">+ UDP 任务</button><button type="button" class="ghost" id="editor-add-ping">+ PING 任务</button></div>';
+}
+
+// 抽屉里的输入框是草稿的 DOM 投影，而不是草稿本身。新增/移除任务会重画
+// 整个编辑区；如果不先把当前控件读回 EDITING_SUITE_DRAFT，用户刚改的名称、
+// 方向或配方就会在点击「+ TCP/UDP/PING」后悄悄丢掉。保存按钮也复用这段同步，
+// 让所有会提交草稿的入口遵循同一套字段映射。
+function syncSuiteDraftFromEditor() {
+  const suite = EDITING_SUITE_DRAFT;
+  if (!suite) return;
+  const name = $('suite-name'), note = $('suite-note');
+  if (name) suite.name = name.value;
+  if (note) suite.note = note.value;
+  suite.execution = 'sequential';
+  (suite.tasks || []).forEach((task) => {
+    const editor = document.querySelector('[data-task-editor="' + CSS.escape(task.id) + '"]');
+    if (!editor) return;
+    const value = (selector) => {
+      const input = editor.querySelector(selector);
+      return input ? input.value : '';
+    };
+    task.name = value('.edit-task-name');
+    task.rx_target_bidir_ab = value('.edit-target-ab');
+    task.rx_target_bidir_ba = value('.edit-target-ba');
+    task.directions = Array.from(editor.querySelectorAll('.edit-dir:checked'))
+      .map((el) => el.dataset.dir);
+    task.ip = Array.from(editor.querySelectorAll('.edit-ip:checked'))
+      .map((el) => el.dataset.ip);
+    // PING has no recipe controls in the current schema.  Clear any legacy
+    // ids when the draft is saved so an imported project cannot remain in an
+    // un-executable state after the user edits the task.
+    const recipeInputs = editor.querySelectorAll('.edit-recipe:checked');
+    if (recipeInputs.length || editor.querySelector('.edit-recipe')) {
+      task.recipe_ids = Array.from(recipeInputs).map((el) => el.dataset.recipe);
+    } else if (qtaskProtocol(task) === 'ping') {
+      task.recipe_ids = [];
+    }
+  });
+}
+function addTaskToEditor(protocol) {
+  const suite = EDITING_SUITE_DRAFT; if (!suite) return;
+  // 先保存当前 DOM 草稿，再重画编辑器，避免新增任务覆盖刚编辑的旧任务。
+  syncSuiteDraftFromEditor();
+  const id = qid('task', suite.id + '\n' + protocol + '\n' + Date.now() + '\n' + Math.random());
+  suite.tasks = suite.tasks || [];
+  suite.tasks.push({ id, name: protocol.toUpperCase(), protocol, directions: ['ab', 'ba'], ip: ['v4'], recipe_ids: protocol === 'ping' ? [] : (RECIPES[protocol] || []).slice(0, 1).map((r) => r.id), rx_target_bidir_ab: '', rx_target_bidir_ba: '' });
+  suite.order = (suite.order || []).concat(id); renderSuiteTaskEditors(suite);
+}
+function saveSuiteEditor() {
+  const draft = EDITING_SUITE_DRAFT, suiteIndex = SUITES.findIndex((item) => item.id === EDITING_SUITE_ID);
+  if (!draft || suiteIndex < 0) return;
+  syncSuiteDraftFromEditor();
+  const suite = draft;
+  suite.name = suite.name.trim() || '未命名套件'; suite.note = suite.note.trim();
+  SUITES[suiteIndex] = suite;
+  markQuickDirty(); closeSuiteEditor(); renderQuickWorkspace();
+}
+
+function quickProjectRecord(value, label) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error(label + '必须是对象');
+  }
+  return value;
+}
+
+function quickProjectArray(value, label) {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) throw new Error(label + '必须是数组');
+  if (value.some((item) => !item || typeof item !== 'object' || Array.isArray(item))) {
+    throw new Error(label + '中的项目必须是对象');
+  }
+  return JSON.parse(JSON.stringify(value));
+}
+
+function checkQuickArrayField(owner, key, label, objects) {
+  const value = owner[key];
+  if (value === undefined || value === null) return;
+  if (!Array.isArray(value)) throw new Error(label + '必须是数组');
+  if (objects && value.some((item) => !item || typeof item !== 'object' || Array.isArray(item))) {
+    throw new Error(label + '中的项目必须是对象');
+  }
+}
+
+// settings 是用户可以直接编辑的 JSON。只检查「外层是数组」还不够：例如
+// `tcp_streams: [{...}]` 通过 .join() 会静默变成 `[object Object]`，直到点预览
+// 才在服务端得到一个很难定位的参数错误。这里在导入边界把元素/标量类型说清楚，
+// 同时保留 null=缺省的兼容语义（和上面的 checkQuickArrayField 一致）。
+function checkQuickTypedArray(owner, key, label, kind) {
+  const value = owner[key];
+  if (value === undefined || value === null) return;
+  if (!Array.isArray(value)) throw new Error(label + '必须是数组');
+  const valid = kind === 'string'
+    ? (item) => typeof item === 'string'
+    : (item) => Number.isInteger(item) && item >= 0;
+  const expected = kind === 'string' ? '字符串' : '非负整数';
+  const bad = value.findIndex((item) => !valid(item));
+  if (bad >= 0) throw new Error(label + '[' + bad + ']必须是' + expected);
+}
+
+function checkQuickTypedScalar(owner, key, label, kind) {
+  const value = owner[key];
+  if (value === undefined || value === null) return;
+  const valid = kind === 'string' ? typeof value === 'string'
+    : kind === 'boolean' ? typeof value === 'boolean'
+      : Number.isInteger(value) && value >= 0;
+  const expected = kind === 'string' ? '字符串' : kind === 'boolean' ? '布尔值' : '非负整数';
+  if (!valid) throw new Error(label + '必须是' + expected);
+}
+
+// 项目文件是用户可编辑的 JSON，不能假定它和本页导出的形状完全一致。先做
+// 一次无副作用的结构检查并深拷贝，确认成功后才改动当前页面；否则一个损坏的
+// suites/recipes 字段会在 applySettings 已经回填一半后触发 TypeError，页面留下
+// 「半导入」状态，用户只能刷新重来。
+function prepareQuickProject(project) {
+  quickProjectRecord(project, '项目文件');
+  const rawPlan = project.ui_plan || project.plan ||
+    (project.ui_plan_version !== undefined ? project : null);
+  if (!rawPlan) throw new Error('项目文件缺少 ui_plan');
+  quickProjectRecord(rawPlan, 'ui_plan');
+  const rawRecipes = rawPlan.recipes;
+  if (rawRecipes !== undefined && rawRecipes !== null) quickProjectRecord(rawRecipes, 'ui_plan.recipes');
+  const recipes = rawRecipes || {};
+  const preparedPlan = {
+    ...rawPlan,
+    link_sets: quickProjectArray(rawPlan.link_sets, 'ui_plan.link_sets'),
+    suites: quickProjectArray(rawPlan.suites, 'ui_plan.suites'),
+    bindings: quickProjectArray(rawPlan.bindings, 'ui_plan.bindings'),
+    recipes: {
+      tcp: quickProjectArray(recipes.tcp, 'ui_plan.recipes.tcp'),
+      udp: quickProjectArray(recipes.udp, 'ui_plan.recipes.udp'),
+      // Backend accepts the historical `pings` alias; keep project import equally
+      // forgiving while always emitting the canonical `ping` key afterwards.
+      ping: quickProjectArray(recipes.ping !== undefined ? recipes.ping : recipes.pings, 'ui_plan.recipes.ping'),
+    },
+  };
+  preparedPlan.link_sets.forEach((set, index) => {
+    checkQuickArrayField(set, 'pair_refs', 'ui_plan.link_sets[' + index + '].pair_refs', true);
+    (set.pair_refs || []).forEach((pair, pairIndex) => {
+      // Pair fields are consumed as strings in qpairKey/qpairRef. Rejecting a
+      // malformed object here keeps a bad project from crashing renderQuickSets.
+      ['id', 'src', 'dst'].forEach((key) => {
+        if (pair[key] !== undefined && pair[key] !== null && typeof pair[key] !== 'string') {
+          throw new Error('ui_plan.link_sets[' + index + '].pair_refs[' + pairIndex + '].' + key + ' 必须是字符串');
+        }
+      });
+      if (pair.stale !== undefined && pair.stale !== null && typeof pair.stale !== 'boolean') {
+        throw new Error('ui_plan.link_sets[' + index + '].pair_refs[' + pairIndex + '].stale 必须是布尔值');
+      }
+    });
+    if (set._auto !== undefined && set._auto !== null && typeof set._auto !== 'boolean') {
+      throw new Error('ui_plan.link_sets[' + index + ']._auto 必须是布尔值');
+    }
+  });
+  preparedPlan.suites.forEach((suite, index) => {
+    checkQuickArrayField(suite, 'tasks', 'ui_plan.suites[' + index + '].tasks', true);
+    checkQuickArrayField(suite, 'order', 'ui_plan.suites[' + index + '].order', false);
+    (suite.tasks || []).forEach((task, taskIndex) => {
+      ['directions', 'ip', 'recipe_ids', 'transports', 'ping_payload_sizes'].forEach((key) => {
+        checkQuickArrayField(task, key, 'ui_plan.suites[' + index + '].tasks[' + taskIndex + '].' + key, false);
+      });
+    });
+  });
+  preparedPlan.bindings.forEach((binding, index) => {
+    checkQuickArrayField(binding, 'pair_ids', 'ui_plan.bindings[' + index + '].pair_ids', false);
+  });
+  ['tcp', 'udp', 'ping'].forEach((protocol) => {
+    preparedPlan.recipes[protocol].forEach((recipe, index) => {
+      const prefix = 'ui_plan.recipes.' + protocol + '[' + index + ']';
+      ['profiles', 'udp_profiles'].forEach((key) => checkQuickArrayField(recipe, key, prefix + '.' + key, true));
+      ['tcp_windows', 'tcp_streams', 'bandwidths', 'lengths', 'windows', 'udp_streams'].forEach((key) => {
+        checkQuickArrayField(recipe, key, prefix + '.' + key, false);
+      });
+    });
+  });
+  if (preparedPlan.plan_hash !== undefined && preparedPlan.plan_hash !== null &&
+      typeof preparedPlan.plan_hash !== 'string') {
+    throw new Error('ui_plan.plan_hash 必须是字符串');
+  }
+  if (project.plan_hash !== undefined && project.plan_hash !== null &&
+      typeof project.plan_hash !== 'string') {
+    throw new Error('项目 plan_hash 必须是字符串');
+  }
+  if (project.settings !== undefined && project.settings !== null) {
+    quickProjectRecord(project.settings, '项目 settings');
+  }
+  // Both the exported nested shape and the older flat shape are accepted. Do
+  // the same type checks on whichever owner actually carries a field, so a
+  // malformed settings object is rejected before any controls are mutated.
+  const fieldOwners = [[project, '项目']];
+  if (project.settings) fieldOwners.unshift([project.settings, '项目 settings']);
+  fieldOwners.forEach(([owner, prefix]) => {
+    [['ipv4_prefixes', 'string'], ['tcp_windows', 'string'], ['udp_bandwidths', 'string'],
+      ['udp_lengths', 'string'], ['udp_windows', 'string'], ['tcp_streams', 'number'],
+      ['ping_payload_sizes', 'number']].forEach(([key, kind]) => {
+      checkQuickTypedArray(owner, key, prefix + '.' + key, kind);
+    });
+    [['duration', 'number'], ['agent_port', 'number'], ['udp_streams', 'number'],
+      ['ping_count', 'number'], ['limit_udp_by_link_speed', 'boolean'], ['resume', 'boolean'],
+      ['screenshot', 'boolean'], ['agent_host', 'string']].forEach(([key, kind]) => {
+      checkQuickTypedScalar(owner, key, prefix + '.' + key, kind);
+    });
+  });
+  const fields = project.settings || project;
+  const rawPolicies = project.nic_policies !== undefined
+    ? project.nic_policies : fields.nic_policies;
+  if (rawPolicies !== undefined && rawPolicies !== null && !Array.isArray(rawPolicies)) {
+    throw new Error('项目 nic_policies 必须是数组');
+  }
+  if (Array.isArray(rawPolicies)) {
+    rawPolicies.forEach((policy, index) => {
+      if (!policy || typeof policy !== 'object' || Array.isArray(policy)) {
+        throw new Error('项目 nic_policies[' + index + '] 必须是对象');
+      }
+      // renderNics()/collectNicPolicies() call string methods on these fields.
+      // Reject a number/null here instead of letting a malformed project crash
+      // halfway through an import (or only when the user next edits the table).
+      ['endpoint', 'rx_target', 'udp_bandwidth', 'udp_length'].forEach((key) => {
+        if (policy[key] !== undefined && policy[key] !== null && typeof policy[key] !== 'string') {
+          throw new Error('项目 nic_policies[' + index + '].' + key + ' 必须是字符串');
+        }
+      });
+    });
+  }
+  if (Array.isArray(rawPolicies) && rawPolicies.some((item) => !item || typeof item !== 'object' || Array.isArray(item))) {
+    throw new Error('项目 nic_policies 中的项目必须是对象');
+  }
+  // The published project shape keeps scan axes in `settings` and execution
+  // toggles at the top level.  Accept both forms, but make an explicitly
+  // present top-level value authoritative when a hand-edited file contains
+  // both copies; this makes `false` a real choice instead of a truthiness
+  // accident.  Keep this effective object separate from the raw nested object
+  // stored in the pending project so no nested `settings` object can leak into
+  // the flat RunRequest assembled by quickCollect().
+  const effectiveSettings = { ...(project.settings || {}) };
+  const settingKeys = ['agent_host', 'agent_port', 'ipv4_prefixes', 'duration',
+    'tcp_windows', 'tcp_streams', 'udp_bandwidths', 'udp_lengths', 'udp_windows',
+    'udp_streams', 'ping_count', 'ping_payload_sizes', 'limit_udp_by_link_speed',
+    'resume', 'screenshot'];
+  settingKeys.forEach((key) => {
+    // `null` is the documented "use the default" value for hand-edited
+    // project fields.  Do not let a top-level null erase a concrete nested
+    // setting; retain explicit false/0/'' because those are real choices.
+    if (project[key] !== undefined && project[key] !== null) effectiveSettings[key] = project[key];
+  });
+  const preparedProject = { ...project, ui_plan: preparedPlan };
+  if (project.settings) preparedProject.settings = JSON.parse(JSON.stringify(project.settings));
+  if (rawPolicies !== undefined) preparedProject.nic_policies = rawPolicies === null
+    ? [] : JSON.parse(JSON.stringify(rawPolicies));
+  return { project: preparedProject, plan: preparedPlan,
+    settings: Object.keys(effectiveSettings).length ? effectiveSettings : null,
+    policies: rawPolicies === undefined ? null : (preparedProject.nic_policies || []) };
+}
+
+function applyQuickProject(project) {
+  const prepared = prepareQuickProject(project);
+  const normalizedProject = prepared.project, plan = prepared.plan;
+  const connected = connectionEstablished();
+  const topologyReady = quickTopologyReady();
+  // A quick project is a complete replacement for the legacy matrix state.
+  // If a config.json was imported before connecting, its unresolved pairs sit
+  // in PENDING_PAIRS until the next successful connect.  Letting that queue
+  // survive a subsequent project import would make connect() apply stale
+  // legacy selections on top of the new project (and switching to Advanced
+  // would expose the wrong rows).  Clear it only after the project has passed
+  // prepareQuickProject(), so a malformed project cannot destroy a valid
+  // pending import.
+  PENDING_PAIRS = null;
+  // 先回填通用设置，再覆盖计划对象；默认配方同步不会误改项目自定义配方。
+  if (prepared.settings) applySettings(prepared.settings);
+  RECIPES = JSON.parse(JSON.stringify(plan.recipes));
+  SUITES = JSON.parse(JSON.stringify(plan.suites));
+  BINDINGS = JSON.parse(JSON.stringify(plan.bindings));
+  LINK_SETS = JSON.parse(JSON.stringify(plan.link_sets));
+  PLAN_HASH = plan.plan_hash || project.plan_hash || '';
+  // Exported projects keep execution toggles at the top level while the scan
+  // axes live under settings. Merge both layers so explicit `false` values are
+  // preserved and are not lost merely because settings exists.
+  const fields = { ...normalizedProject, ...(prepared.settings || {}) };
+  const policies = prepared.policies;
+  // 显式空数组表示项目确实没有网口覆盖，应清掉当前页面残留；只有字段缺失
+  // 才沿用当前策略，不能用 `if (policies.length)` 把这两个状态混在一起。
+  if (policies !== null && topologyReady) renderNics(policies, false);
+  if (fields.limit_udp_by_link_speed !== undefined) $('clip').checked = Boolean(fields.limit_udp_by_link_speed);
+  if (fields.resume !== undefined) $('resume').checked = Boolean(fields.resume);
+  ensureQuickDefaults();
+  if (topologyReady) {
+    // A connected import is applied immediately.  Drop any older deferred
+    // project as well; otherwise a later reconnect could replay that stale
+    // snapshot on top of the project the user just chose.
+    PENDING_PROJECT = null;
+    syncQuickSets();
+  } else if (connected && CONNECTION_STATE === true) {
+    // The HTTP connection succeeded, but one side returned no usable NICs
+    // (for example while booting or because the prefix filter is too narrow).
+    // Keep only this validated snapshot as a policy replay queue; the current
+    // suite/recipe/binding objects remain authoritative if the user edits them
+    // before the next refresh.
+    PENDING_PROJECT = normalizedProject;
+  } else if (connected) {
+    // A directly seeded snapshot (used by embedded callers and older tests)
+    // has no connection-health flag.  Preserve the historical behavior of
+    // treating it as an established session even when its interface lists
+    // are empty; the topology guard above still prevents reconciliation.
+    PENDING_PROJECT = null;
+    syncQuickSets();
+  } else {
+    PENDING_PROJECT = normalizedProject;
+  }
+  markQuickDirty(); renderQuickWorkspace();
+}
+
+// Apply a project/config imported before a usable topology was available.
+// Only NIC policies are replayed: suite/task edits made while disconnected
+// must not be overwritten by the old import snapshot.  Keep the queue until
+// both sides have a non-empty scan so an empty response cannot consume it.
+function applyPendingProjectIfConnected() {
+  if (!PENDING_PROJECT || !quickTopologyReady()) return false;
+  const prepared = prepareQuickProject(PENDING_PROJECT);
+  if (prepared.policies !== null) renderNics(prepared.policies, false);
+  PENDING_PROJECT = null;
+  return true;
+}
+
+// Legacy config imports use the same deferred-topology rule.  Applying a
+// pending pair list against an empty ROWS table would report every pair as
+// missing and then discard the user's selection, so consume it only after a
+// real two-sided scan.
+function applyPendingPairsIfConnected() {
+  if (!PENDING_PAIRS || !quickTopologyReady()) return false;
+  const applied = applyPairs(PENDING_PAIRS);
+  PENDING_PAIRS = null;
+  say($('planstatus'), '导入的配对已勾上 ' + applied.matched + ' 行' +
+    (applied.missing.length ? '；对不上的：' + applied.missing.join('、') : '') + '。',
+    applied.missing.length ? 'bad' : 'ok');
+  return true;
+}
+
+function setMode(mode) {
+  const nextMode = mode === 'advanced' ? 'advanced' : 'quick';
+  const changed = MODE !== nextMode;
+  MODE = nextMode;
+  // A quick preview response can arrive after a quick → advanced → quick
+  // round-trip.  Checking only the current mode would then mistake that old
+  // response for a fresh quick preview, so mode transitions advance the same
+  // generation used by plan requests.
+  if (changed) invalidateQuickPreview();
+  if (MODE === 'quick') {
+    // Switching to the quick workspace invalidates any deferred legacy pair
+    // selection. Otherwise a later connect could silently overlay stale rows
+    // from an older config.json import onto the suite-oriented plan.
+    PENDING_PAIRS = null;
+  } else {
+    // Advanced mode is the legacy matrix.  A quick project waiting for a
+    // connection must not be applied behind the user's back after they have
+    // explicitly switched away from the quick workspace.
+    PENDING_PROJECT = null;
+  }
+  $('quickmode').classList.toggle('active', MODE === 'quick');
+  $('advancedmode').classList.toggle('active', MODE === 'advanced');
+  $('quickmode').setAttribute('aria-selected', MODE === 'quick');
+  $('advancedmode').setAttribute('aria-selected', MODE === 'advanced');
+  $('quickworkspace').classList.toggle('hidden', MODE !== 'quick');
+  $('advancedworkspace').classList.toggle('hidden', MODE !== 'advanced');
+  if (MODE === 'quick') renderQuickWorkspace();
+}
+$('quickmode').onclick = () => setMode('quick');
+$('advancedmode').onclick = () => setMode('advanced');
+$('qcrossonly').onchange = () => renderQuickWorkspace();
+$('qshowpairs').onchange = () => renderQuickWorkspace();
+$('qnewset').onclick = () => {
+  const selected = PAIRS.filter((pair, i) => ROWS[i] && ROWS[i].sel && pair.cross).map(qpairRef);
+  const name = window.prompt('链路集合名称', selected.length ? '已选链路集合' : '新链路集合');
+  if (name === null) return;
+  const set = qnewSet(name.trim() || '新链路集合', selected);
+  LINK_SETS.push(set); QUICK_SET_SELECTION = new Set([set.id]); markQuickDirty(); renderQuickWorkspace();
+};
+$('qautogroup').onclick = () => {
+  const generated = autoLinkSets();
+  if (!generated.length) { say($('planstatus'), '当前没有跨机网口对可分组。', 'bad'); return; }
+  if (BINDINGS.length && typeof window.confirm === 'function' &&
+      !window.confirm('当前已有套件分配。重新按角色分组会更新自动链路集合，但保留仍存在的绑定；继续吗？')) return;
+  // 只重建自动集合，保留用户手工创建的集合和仍然有效的绑定。此前这里
+  // 直接清空 LINK_SETS/BINDINGS，点一下「按角色自动分组」就会把已配置的
+  // 套件分配全部抹掉，且没有撤销入口。
+  const custom = LINK_SETS.filter((set) => !set._auto);
+  const customIds = new Set(custom.map((set) => set.id));
+  LINK_SETS = custom.concat(generated.filter((set) => !customIds.has(set.id)));
+  const validSetIds = new Set(LINK_SETS.map((set) => set.id));
+  const validSuiteIds = new Set(SUITES.map((suite) => suite.id));
+  BINDINGS = BINDINGS.filter((binding) => validSetIds.has(binding.link_set_id) && validSuiteIds.has(binding.suite_id));
+  QUICK_SET_SELECTION = new Set(Array.from(QUICK_SET_SELECTION).filter((id) => validSetIds.has(id)));
+  if (!QUICK_SET_SELECTION.size) QUICK_SET_SELECTION = new Set(generated.map((s) => s.id));
+  markQuickDirty(); renderQuickWorkspace();
+};
+$('quicksets').addEventListener('change', (ev) => {
+  const el = ev.target;
+  if (el.classList.contains('qset-select')) {
+    const id = el.dataset.set;
+    if (el.checked) QUICK_SET_SELECTION.add(id); else QUICK_SET_SELECTION.delete(id);
+    renderQuickAssignments(); renderQuickSets(); renderQuickSummary();
+  } else if (el.classList.contains('qpair-toggle')) {
+    const set = LINK_SETS.find((item) => item.id === el.dataset.set); if (!set) return;
+    // 自动集合一旦手工改过具体网口对，就升级成自定义集合；否则下一次刷新
+    // 网口时 syncQuickSets 会按角色把被移除的对重新塞回来，用户的编辑无法持久。
+    set._auto = false;
+    const key = qpairKey(el.dataset.src, el.dataset.dst);
+    set.pair_refs = (set.pair_refs || []).filter((ref) => ref.id !== qpairId(el.dataset.src, el.dataset.dst) && qpairKey(ref.src, ref.dst) !== key);
+    if (el.checked) set.pair_refs.push({ id: qpairId(el.dataset.src, el.dataset.dst), src: el.dataset.src, dst: el.dataset.dst });
+    markQuickDirty(); renderQuickWorkspace();
+  }
+});
+$('quicksets').addEventListener('click', (ev) => {
+  const el = ev.target; if (!el.classList) return;
+  if (el.classList.contains('qpair-remove-stale')) {
+    const set = LINK_SETS.find((item) => item.id === el.dataset.set);
+    if (!set) return;
+    set.pair_refs = (set.pair_refs || []).filter((ref) => ref.id !== el.dataset.pairId);
+    set._auto = false;
+    markQuickDirty(); renderQuickWorkspace();
+    return;
+  }
+  const set = LINK_SETS.find((item) => item.id === el.dataset.set); if (!set) return;
+  if (el.classList.contains('qset-rename')) {
+    const name = window.prompt('链路集合名称', set.name || '链路集合');
+    if (name !== null) { set.name = name.trim() || set.name; set._auto = false; markQuickDirty(); renderQuickWorkspace(); }
+  } else if (el.classList.contains('qset-delete')) {
+    LINK_SETS = LINK_SETS.filter((item) => item.id !== set.id); BINDINGS = BINDINGS.filter((b) => b.link_set_id !== set.id); QUICK_SET_SELECTION.delete(set.id); markQuickDirty(); renderQuickWorkspace();
+  } else if (el.classList.contains('qset-expand')) {
+    $('qshowpairs').checked = true; renderQuickWorkspace();
+  }
+});
+$('quicksuites').addEventListener('change', (ev) => {
+  const el = ev.target;
+  if (el.classList.contains('qsuite-select')) { QUICK_SUITE_SELECTION = el.dataset.suite; renderQuickSuites(); }
+});
+$('quicksuites').addEventListener('click', (ev) => {
+  const el = ev.target; if (!el.classList) return;
+  const id = el.dataset.suite, suite = SUITES.find((item) => item.id === id); if (!suite) return;
+  if (el.classList.contains('qsuite-edit')) openSuiteEditor(id);
+  else if (el.classList.contains('qsuite-copy')) {
+    const copy = JSON.parse(JSON.stringify(suite)); copy.id = qid('suite', suite.id + '\n' + Date.now() + '\n' + Math.random()); copy.name = (suite.name || '套件') + ' 副本';
+    copy.tasks = (copy.tasks || []).map((task) => { const old = task.id; task.id = qid('task', copy.id + '\n' + old); return task; });
+    copy.order = (copy.order || []).map((taskId) => { const idx = (suite.tasks || []).findIndex((t) => t.id === taskId); return idx >= 0 ? copy.tasks[idx].id : taskId; });
+    SUITES.push(copy); QUICK_SUITE_SELECTION = copy.id; markQuickDirty(); renderQuickWorkspace();
+  } else if (el.classList.contains('qsuite-delete')) {
+    SUITES = SUITES.filter((item) => item.id !== id); BINDINGS = BINDINGS.filter((b) => b.suite_id !== id); ensureQuickDefaults(); markQuickDirty(); renderQuickWorkspace();
+  }
+});
+$('qnewsuite').onclick = () => {
+  const suite = baselineSuite(); suite.id = qid('suite', 'new-' + Date.now() + Math.random()); suite.name = '新建套件';
+  suite.tasks = suite.tasks.map((task) => ({ ...task, id: qid('task', suite.id + '\n' + task.id) })); suite.order = suite.tasks.map((task) => task.id);
+  SUITES.push(suite); QUICK_SUITE_SELECTION = suite.id; markQuickDirty(); renderQuickWorkspace(); openSuiteEditor(suite.id);
+};
+$('qpreset').onclick = () => {
+  ensureQuickDefaults();
+  if (!SUITES.some((suite) => suite.id === 'suite-udp-stress')) {
+    RECIPES.udp.push({ id: 'recipe-udp-stress', name: 'UDP 压测', mode: 'scan', profiles: [{ bandwidth: '2500m', length: '1400', streams: 4 }] });
+    SUITES.push({ id: 'suite-udp-stress', name: 'UDP 压测', execution: 'sequential', order: ['task-udp-stress'], tasks: [{ id: 'task-udp-stress', name: 'UDP 压测', protocol: 'udp', directions: ['bidir'], ip: ['v4'], recipe_ids: ['recipe-udp-stress'], rx_target_bidir_ab: '', rx_target_bidir_ba: '' }] });
+  }
+  QUICK_SUITE_SELECTION = 'suite-baseline'; markQuickDirty(); renderQuickWorkspace();
+};
+$('qassignsuite').onchange = () => { QUICK_SUITE_SELECTION = $('qassignsuite').value; renderQuickSuites(); };
+$('qapplyselected').onclick = () => {
+  if (!QUICK_SUITE_SELECTION) return;
+  QUICK_SET_SELECTION.forEach((setId) => qensureBinding(setId, QUICK_SUITE_SELECTION)); markQuickDirty(); renderQuickWorkspace();
+};
+$('qclearselected').onclick = () => {
+  if (!QUICK_SUITE_SELECTION) return;
+  QUICK_SET_SELECTION.forEach((setId) => qremoveBinding(setId, QUICK_SUITE_SELECTION)); markQuickDirty(); renderQuickWorkspace();
+};
+$('suite-close').onclick = closeSuiteEditor; $('suite-cancel').onclick = closeSuiteEditor; $('suite-save').onclick = saveSuiteEditor;
+$('suite-backdrop').addEventListener('click', (ev) => { if (ev.target === $('suite-backdrop')) closeSuiteEditor(); });
+$('suite-task-editors').addEventListener('click', (ev) => {
+  const el = ev.target;
+  if (el.id === 'editor-add-tcp') addTaskToEditor('tcp');
+  else if (el.id === 'editor-add-udp') addTaskToEditor('udp');
+  else if (el.id === 'editor-add-ping') addTaskToEditor('ping');
+  else if (el.classList.contains('edit-task-remove')) {
+    const suite = EDITING_SUITE_DRAFT;
+    if (suite) {
+      // 移除同样会重画整个编辑区，先保留其它任务在 DOM 中的未提交改动。
+      syncSuiteDraftFromEditor();
+      suite.tasks = (suite.tasks || []).filter((task) => task.id !== el.dataset.task);
+      suite.order = (suite.order || []).filter((id) => id !== el.dataset.task);
+      renderSuiteTaskEditors(suite);
+    }
+  }
+});
+
+// 项目文件只保存 UI 关系和通用设置，不包含 token。可执行 config.json 仍由
+// “下载 config.json”单独生成，避免把稳定 ID/套件语义丢在扁平配置里。
+$('project-export').onclick = () => {
+  const project = { project_version: 1, ui_plan: quickPlanObject(true), settings: { ...quickRequestFields(), agent_host: $('host').value.trim(), agent_port: Number($('port').value) || 28801, ipv4_prefixes: splitList($('prefixes').value) }, nic_policies: collectNicPolicies(), limit_udp_by_link_speed: $('clip').checked, resume: $('resume').checked, topology_fingerprint: TOPOLOGY_FINGERPRINT };
+  delete project.settings.nic_policies;
+  // Keep execution toggles in their documented top-level slots.  They are part
+  // of quickRequestFields() for API requests, so remove the duplicate nested
+  // copies from the project artifact; the importer still accepts old files that
+  // contain both and resolves an explicit top-level value first.
+  delete project.settings.limit_udp_by_link_speed;
+  delete project.settings.resume;
+  const blob = new Blob([JSON.stringify(project, null, 2) + '\n'], { type: 'application/json' });
+  const url = URL.createObjectURL(blob), link = document.createElement('a'); link.href = url; link.download = 'cpe-ui-project.json'; document.body.appendChild(link); link.click(); link.remove(); URL.revokeObjectURL(url);
+  say($('planstatus'), '测试项目已下载（不含 token）。', 'ok');
+};
+$('project-import').onclick = () => $('projectfile').click();
+$('projectfile').onchange = async () => {
+  const file = $('projectfile').files[0]; if (!file) return;
+  try { applyQuickProject(JSON.parse(await file.text())); setMode('quick'); say($('planstatus'), '已导入测试项目 ' + file.name + '。请预览确认当前网口仍存在。', 'ok'); }
+  catch (e) { say($('planstatus'), '项目导入失败：' + e.message, 'bad'); }
+  $('projectfile').value = '';
+};
+
+const endpointOf = (end) => end.side + ':NAME=' + end.nic.name;
+const rowKey = (pair) => JSON.stringify([endpointOf(pair.a), endpointOf(pair.b)]);
+
+function defaultRow() {
+  return {
+    sel: false,
+    dir: { ab: true, ba: true, bidir: false },
+    tp: { tcp: true, udp: true, ping: false },
+    ip: { v4: true, v6: false },
+    bidir_ab: '', bidir_ba: '',
+    // 要跑哪几组：UDP_GROUPS 的下标，0 是默认组。多选 = 这一对跑几批。
+    udp_groups: [0],
+    // 同理，TCP_GROUPS 的下标。
+    tcp_groups: [0],
+  };
+}
+
+// 全部 UDP 参数组，`UDP_GROUPS[0]` 是默认组（所有没另选的配对都用它）。
+//
+// 默认组也放在这里、也长成表格里的一行，是有意的：它和别的组是同一类东西，
+// 分开放（默认组在执行区几个输入框、其余在表格里）会让人看到两种长得完全
+// 不同的控件在表达同一件事，还得额外解释"默认组"这个特例。
+let UDP_GROUPS = [defaultUdpGroup()];
+
+function defaultUdpGroup() {
+  return { name: '默认', bandwidths: '1000m', lengths: '', windows: '', streams: '1' };
+}
+
+function groupLabel(index) {
+  if (index === 0) return '默认';
+  const group = UDP_GROUPS[index];
+  return (group && group.name.trim()) || ('组 ' + (index + 1));
+}
+
+// 下拉里显示的文字带上参数摘要：不展开参数表也知道自己选的是哪一套。
+function groupOptionLabel(index) {
+  const group = UDP_GROUPS[index];
+  if (!group) return groupLabel(index);
+  const parts = [group.bandwidths.trim() || '(没填 -b)'];
+  if (group.lengths.trim()) parts.push('-l ' + group.lengths.trim());
+  if (group.windows.trim()) parts.push('-w ' + group.windows.trim());
+  parts.push('×' + (Number(group.streams) || 1) + ' 流');
+  return groupLabel(index) + ' · ' + parts.join(' ');
+}
+
+function renderUdpGroups() {
+  const cell = (i, key, cls, placeholder) =>
+    '<td><input type="text" class="' + cls + '" data-gi="' + i + '" data-gk="' + key +
+    '" value="' + esc(UDP_GROUPS[i][key]) + '" placeholder="' + placeholder + '"></td>';
+  const rows = UDP_GROUPS.map((group, i) => '<tr>' +
+    // 默认组不改名、不可删：它是"没另选时用的那一组"，换个名字或者删掉都只会
+    // 让矩阵里那一列更难读。
+    (i === 0
+      ? '<td class="fixed-name">默认<span class="field-note">没另选的都用它</span></td>'
+      : '<td><input type="text" class="gname" data-gi="' + i + '" data-gk="name" value="' +
+        esc(group.name) + '" placeholder="组 ' + (i + 1) + '"></td>') +
+    cell(i, 'bandwidths', 'list', '2500m 或 1000m 500m') +
+    cell(i, 'lengths', 'list', '留空=不下发 -l') +
+    cell(i, 'windows', 'list', '留空=不下发 -w') +
+    cell(i, 'streams', 'num', '1') +
+    // 复制：新建一组时最常见的诉求是「只改 -b 和流数，其余和这组一样」。
+    // 复制出一份**完整**定义再改那一两格，比让空着的格子去继承好——继承会
+    // 把「留空等于什么」这个问题又请回来。
+    '<td><button type="button" class="ghost copygroup" data-gi="' + i + '">复制</button>' +
+    (i === 0 ? '' : ' <button type="button" class="ghost delgroup" data-gi="' + i + '">删除</button>') +
+    '</td>' +
+    '</tr>').join('');
+  $('udpgroups').querySelector('tbody').innerHTML = rows;
+}
+
+$('addgroup').onclick = () => {
+  UDP_GROUPS.push({ name: '', bandwidths: '', lengths: '', windows: '', streams: '' });
+  renderUdpGroups();
+  renderMatrix();
+  markQuickDirty();
+};
+
+// 组表只有文本框和删除按钮，走委派：改名只需要更新矩阵里那几个 option 的
+// 文字，不必把整张矩阵重画（那会打断正在输入的门限格）。
+$('udpgroups').addEventListener('input', (ev) => {
+  const el = ev.target, index = Number(el.dataset.gi), group = UDP_GROUPS[index];
+  if (!group || !el.dataset.gk) return;
+  group[el.dataset.gk] = el.value;
+  // The default UDP group is also the request-wide fallback used by quick
+  // tasks that do not explicitly select a recipe.  Editing any group must
+  // therefore invalidate a previously previewed quick plan, even though the
+  // controls live in the Advanced tab.
+  markQuickDirty();
+  // 矩阵里那一列的标签和悬停提示带着这一组的名字与参数，改哪一格都要同步——
+  // 但只改那几个 label，不重画整张矩阵（会打断正在输入的门限格）。
+  document.querySelectorAll('#matrix tbody [data-ug="' + index + '"]').forEach((box) => {
+    box.parentNode.title = groupOptionLabel(index);
+    box.parentNode.lastChild.textContent = groupLabel(index);
+  });
+  // 表头那颗整列开关也带着组名，一并同步。
+  const head = document.querySelector('#udpcolsel [data-ug="' + index + '"]');
+  if (head) {
+    head.parentNode.title = groupOptionLabel(index);
+    head.parentNode.lastChild.textContent = groupLabel(index);
+  }
+});
+
+$('udpgroups').addEventListener('click', (ev) => {
+  const el = ev.target;
+  if (!el.classList) return;
+  const index = Number(el.dataset.gi);
+  if (el.classList.contains('copygroup')) {
+    const source = UDP_GROUPS[index];
+    UDP_GROUPS.push({
+      name: source.name.trim() ? source.name.trim() + ' 副本' : '',
+      bandwidths: source.bandwidths,
+      lengths: source.lengths,
+      windows: source.windows,
+      streams: source.streams,
+    });
+    renderUdpGroups();
+    renderMatrix();
+    markQuickDirty();
+    return;
+  }
+  if (!el.classList.contains('delgroup') || index === 0) return;
+  UDP_GROUPS.splice(index, 1);
+  // 选着被删那组的行把它去掉，选着后面几组的行跟着前移——留着一个越界的
+  // 序号，下一次「开始测试」会被后端挡下，而人根本不知道是哪一行。
+  // 删到一组都不剩的行回到默认组：矩阵里那一行总得跑点什么。
+  ROWS.forEach((row) => {
+    row.udp_groups = row.udp_groups
+      .filter((gi) => gi !== index)
+      .map((gi) => (gi > index ? gi - 1 : gi));
+    if (row.udp_groups.length === 0) row.udp_groups = [0];
+  });
+  renderUdpGroups();
+  renderMatrix();
+  markQuickDirty();
+});
+
+// ── TCP 参数组：和 UDP 参数组一整套机制，只是两个轴换成 -w 和 -P ──────────
+// TCP_GROUPS[0] 是默认组（= 执行区原来的 TCP -w / -P 两个框，现在长成表格第一行）。
+let TCP_GROUPS = [defaultTcpGroup()];
+
+function defaultTcpGroup() {
+  return { name: '默认', windows: '4m', streams: '10' };
+}
+
+function tcpGroupLabel(index) {
+  if (index === 0) return '默认';
+  const group = TCP_GROUPS[index];
+  return (group && group.name.trim()) || ('组 ' + (index + 1));
+}
+
+function tcpGroupOptionLabel(index) {
+  const group = TCP_GROUPS[index];
+  if (!group) return tcpGroupLabel(index);
+  const parts = [group.windows.trim() ? '-w ' + group.windows.trim() : '不发 -w'];
+  parts.push(group.streams.trim() ? '-P ' + group.streams.trim() : '-P 1');
+  return tcpGroupLabel(index) + ' · ' + parts.join(' ');
+}
+
+function renderTcpGroups() {
+  const cell = (i, key, placeholder) =>
+    '<td><input type="text" class="list" data-ti="' + i + '" data-tk="' + key +
+    '" value="' + esc(TCP_GROUPS[i][key]) + '" placeholder="' + placeholder + '"></td>';
+  const rows = TCP_GROUPS.map((group, i) => '<tr>' +
+    (i === 0
+      ? '<td class="fixed-name">默认<span class="field-note">没另选的都用它</span></td>'
+      : '<td><input type="text" class="gname" data-ti="' + i + '" data-tk="name" value="' +
+        esc(group.name) + '" placeholder="组 ' + (i + 1) + '"></td>') +
+    cell(i, 'windows', '留空=不下发 -w') +
+    cell(i, 'streams', '1 或 1 10') +
+    '<td><button type="button" class="ghost copytcpgroup" data-ti="' + i + '">复制</button>' +
+    (i === 0 ? '' : ' <button type="button" class="ghost deltcpgroup" data-ti="' + i + '">删除</button>') +
+    '</td>' +
+    '</tr>').join('');
+  $('tcpgroups').querySelector('tbody').innerHTML = rows;
+}
+
+$('addtcpgroup').onclick = () => {
+  TCP_GROUPS.push({ name: '', windows: '', streams: '' });
+  renderTcpGroups();
+  renderMatrix();
+  markQuickDirty();
+};
+
+$('tcpgroups').addEventListener('input', (ev) => {
+  const el = ev.target, index = Number(el.dataset.ti), group = TCP_GROUPS[index];
+  if (!group || !el.dataset.tk) return;
+  group[el.dataset.tk] = el.value;
+  // As with UDP, TCP_GROUPS[0] feeds the request-wide fallback for quick
+  // tasks.  Keep the preview hash honest while the user edits these fields.
+  markQuickDirty();
+  document.querySelectorAll('#matrix tbody [data-tg="' + index + '"]').forEach((box) => {
+    box.parentNode.title = tcpGroupOptionLabel(index);
+    box.parentNode.lastChild.textContent = tcpGroupLabel(index);
+  });
+  const head = document.querySelector('#tcpcolsel [data-tg="' + index + '"]');
+  if (head) {
+    head.parentNode.title = tcpGroupOptionLabel(index);
+    head.parentNode.lastChild.textContent = tcpGroupLabel(index);
+  }
+});
+
+$('tcpgroups').addEventListener('click', (ev) => {
+  const el = ev.target;
+  if (!el.classList) return;
+  const index = Number(el.dataset.ti);
+  if (el.classList.contains('copytcpgroup')) {
+    const source = TCP_GROUPS[index];
+    TCP_GROUPS.push({
+      name: source.name.trim() ? source.name.trim() + ' 副本' : '',
+      windows: source.windows,
+      streams: source.streams,
+    });
+    renderTcpGroups();
+    renderMatrix();
+    markQuickDirty();
+    return;
+  }
+  if (!el.classList.contains('deltcpgroup') || index === 0) return;
+  TCP_GROUPS.splice(index, 1);
+  ROWS.forEach((row) => {
+    row.tcp_groups = row.tcp_groups
+      .filter((gi) => gi !== index)
+      .map((gi) => (gi > index ? gi - 1 : gi));
+    if (row.tcp_groups.length === 0) row.tcp_groups = [0];
+  });
+  renderTcpGroups();
+  renderMatrix();
+  markQuickDirty();
+});
+
+// TCP 参数列的表头整列开关，和 UDP 那列一模一样。
+function renderTcpColToggles() {
+  const box = $('tcpcolsel');
+  if (!box) return;
+  if (TCP_GROUPS.length < 2) {
+    box.innerHTML = '<span class="hint">见上面的参数组表</span>';
+    return;
+  }
+  box.innerHTML = '<span class="hint">整列：</span>' + TCP_GROUPS.map((group, gi) =>
+    '<label title="' + esc(tcpGroupOptionLabel(gi)) + '">' +
+    '<input type="checkbox" class="colall-tcpg" data-tg="' + gi + '">' +
+    esc(tcpGroupLabel(gi)) + '</label>').join('');
+}
+
+function syncTcpGroupBoxes() {
+  document.querySelectorAll('#matrix tbody [data-tg]').forEach((box) => {
+    const row = ROWS[Number(box.dataset.i)];
+    if (row) box.checked = row.tcp_groups.indexOf(Number(box.dataset.tg)) >= 0;
+  });
+}
+
+// 与 PAIRS 同序；已经见过的配对沿用上一份状态（存的是同一个对象引用，
+// 之后的改动自动被记住）。
+function buildRows() {
+  ROWS = PAIRS.map((pair) => {
+    const key = rowKey(pair);
+    const kept = ROW_MEMORY.get(key) || defaultRow();
+    ROW_MEMORY.set(key, kept);
+    return kept;
+  });
 }
 
 // 网口两两组合成可测配对。同机两块网卡也算，走的是回环/桥接路径，
@@ -367,121 +2139,223 @@ function buildPairs() {
   return out;
 }
 
-function renderNics(policies) {
-  const rows = [];
+// 网口表。`keepEdits` 为真时保留人已经改过的值（刷新网口用），
+// 否则以传进来的这份为准（连接、导入用）。
+function renderNics(policies, keepEdits) {
   const configured = new Map((policies || []).map((policy) => [policy.endpoint, policy]));
-  const add = (side, cn, n, i) => {
-    const policy = configured.get(side + ':NAME=' + n.name) || {};
-    const target = policy.rx_target || '';
-    const bandwidth = policy.udp_bandwidth || '';
-    const length = policy.udp_length || '';
-    const cell = (cls, value, placeholder, note) =>
-      '<td><input type="text" class="bw ' + cls + (value ? ' touched' : '') +
-      '" data-side="' + side + '" data-ni="' + i + '" value="' + esc(value) +
+  const rows = [];
+  NICROWS = [];
+  const add = (side, cn, nic) => {
+    const endpoint = side + ':NAME=' + nic.name;
+    const kept = keepEdits ? NIC_MEMORY.get(endpoint) : null;
+    const policy = configured.get(endpoint) || {};
+    const row = kept || {
+      endpoint,
+      rx_target: policy.rx_target || '',
+      udp_bandwidth: policy.udp_bandwidth || '',
+      udp_length: policy.udp_length || '',
+    };
+    NIC_MEMORY.set(endpoint, row);
+    const index = NICROWS.push(row) - 1;
+    const cell = (key, placeholder, note) =>
+      '<td><input type="text" class="bw' + (row[key] ? ' touched' : '') +
+      '" data-ni="' + index + '" data-k="' + key + '" value="' + esc(row[key]) +
       '" placeholder="' + placeholder + '">' + (note || '') + '</td>';
-    rows.push('<tr><td>' + cn + '</td><td>' + esc(n.name) + '</td><td>' + esc(n.role) +
-    '</td><td>' + esc(n.ipv4) + '</td><td>' + (n.speed_mbps || '?') + ' Mbps</td><td>' + esc(n.gateway_v4 || '—') +
-    '</td>' +
-    cell('nic-target', target, '不设门限', '<span class="field-note">1800 或 90%</span>') +
-    cell('nic-bw', bandwidth, '走全局档位') +
-    cell('nic-len', length, '走全局档位') +
-    '</tr>');
+    rows.push('<tr><td>' + cn + '</td><td>' + esc(nic.name) + '</td><td>' + esc(nic.role) +
+      '</td><td>' + esc(nic.ipv4) + '</td><td>' + (nic.speed_mbps || '?') + ' Mbps</td><td>' +
+      esc(nic.gateway_v4 || '—') + '</td>' +
+      cell('rx_target', '不设门限', '<span class="field-note">1800 或 90%</span>') +
+      cell('udp_bandwidth', '走全局档位') +
+      cell('udp_length', '走全局档位') +
+      '</tr>');
   };
-  MASTER.interfaces.forEach((n, i) => add('master', '主控', n, i));
-  AGENT.interfaces.forEach((n, i) => add('agent', '辅测', n, i));
+  MASTER.interfaces.forEach((n) => add('master', '主控', n));
+  AGENT.interfaces.forEach((n) => add('agent', '辅测', n));
   $('nics').querySelector('tbody').innerHTML = rows.join('');
-  document.querySelectorAll('.nic-target, .nic-bw, .nic-len').forEach((el) => {
-    el.addEventListener('input', () => el.classList.toggle('touched', el.value.trim() !== ''));
-  });
 }
 
+// 网口表只有文本框：事件改状态，顺带把「改过」的高亮打上，不重画整表
+// （重画会打断正在输入的那一格）。
+$('nics').addEventListener('input', (ev) => {
+  const el = ev.target;
+  const row = NICROWS[Number(el.dataset.ni)];
+  if (!row || !el.dataset.k) return;
+  row[el.dataset.k] = el.value;
+  el.classList.toggle('touched', el.value.trim() !== '');
+  if (el.dataset.k === 'udp_bandwidth') refreshPinNotes();
+  // 网口策略同时影响 legacy 和快速计划；无论当前模式都让旧快速预览失效，
+  // 这样从高级矩阵切回快速模式时不会拿着过期 hash 直接执行。
+  markQuickDirty();
+});
+
 function renderMatrix() {
+  // 只有默认组时那个勾选框置灰：没建过组的人看到的是一个明确「没有别的可选」
+  // 的控件，而它本来也不允许取消（一行总得跑点什么）。
+  const lonely = UDP_GROUPS.length < 2 ? ' disabled' : '';
+  const tcpLonely = TCP_GROUPS.length < 2 ? ' disabled' : '';
   const rows = PAIRS.map((p, i) => {
-    const dirs = ['ab', 'ba', 'bidir'].map((d) =>
-      '<label><input type="checkbox" data-dir="' + d + '" data-i="' + i + '"' + (d === 'bidir' ? '' : ' checked') + '>' +
-      (d === 'ab' ? 'A→B' : d === 'ba' ? 'B→A' : '双向') + '</label>').join('');
-    const tp = ['tcp', 'udp', 'ping'].map((t) =>
-      '<label><input type="checkbox" data-tp="' + t + '" data-i="' + i + '"' +
-      (t === 'ping' ? '' : ' checked') + '>' + t.toUpperCase() + '</label>').join('');
-    const ip = ['v4', 'v6'].map((v) =>
-      '<label><input type="checkbox" data-ip="' + v + '" data-i="' + i + '"' + (v === 'v4' ? ' checked' : '') + '>' + v.toUpperCase() + '</label>').join('');
+    const row = ROWS[i];
+    const boxes = (attr, items) => items.map(([val, text]) =>
+      '<label><input type="checkbox" data-' + attr + '="' + val + '" data-i="' + i + '"' +
+      (row[attr][val] ? ' checked' : '') + '>' + text + '</label>').join('');
     // 双向门限按**配对**填，不是按网卡：同一块 RNDIS 口和 Wi-Fi 组双向、
     // 和 SGMII 组双向，能收到的速率完全不是一个量级。两个方向分开填，
     // 因为半双工链路的两个方向本来就能差很远。
-    const bidirTarget = ['ab', 'ba'].map((d) =>
-      '<label class="bidir-t">' + (d === 'ab' ? 'A→B' : 'B→A') +
-      '<input type="text" class="num bidir-target" data-bt="' + d + '" data-i="' + i +
-      '" placeholder="同单向"></label>').join('');
+    const bidirTarget = [['bidir_ab', 'A→B'], ['bidir_ba', 'B→A']].map(([key, text]) =>
+      '<label class="bidir-t">' + text +
+      '<input type="text" class="num" data-k="' + key + '" data-i="' + i +
+      '" value="' + esc(row[key]) + '" placeholder="同单向"></label>').join('');
+    // 这一行要跑哪几组。用勾选框而不是下拉：和左边方向/协议/IP 三列是同一个
+    // 读法，而且多选本来就是要表达「这一对跑两批」。参数摘要挂在 title 上，
+    // 鼠标停上去能看到，不必把一长串塞进每一行。
+    const udpGroup = UDP_GROUPS.map((group, gi) =>
+      '<label title="' + esc(groupOptionLabel(gi)) + '">' +
+      '<input type="checkbox" data-ug="' + gi + '" data-i="' + i + '"' +
+      (row.udp_groups.indexOf(gi) >= 0 ? ' checked' : '') + lonely + '>' +
+      esc(groupLabel(gi)) + '</label>').join('') +
+      '<span class="pin-note" data-pin="' + i + '">' + pinNote(i) + '</span>';
+    // TCP 参数组：和 UDP 那列同一个读法，只是没有网口固定值那条 pin-note。
+    const tcpGroup = TCP_GROUPS.map((group, gi) =>
+      '<label title="' + esc(tcpGroupOptionLabel(gi)) + '">' +
+      '<input type="checkbox" data-tg="' + gi + '" data-i="' + i + '"' +
+      (row.tcp_groups.indexOf(gi) >= 0 ? ' checked' : '') + tcpLonely + '>' +
+      esc(tcpGroupLabel(gi)) + '</label>').join('');
     return '<tr>' +
-      '<td><input type="checkbox" class="sel" data-i="' + i + '"></td>' +
+      '<td><input type="checkbox" class="sel" data-i="' + i + '"' + (row.sel ? ' checked' : '') + '></td>' +
       '<td class="pairname">' + esc(p.label) + '</td>' +
-      '<td class="dirs">' + dirs + '</td>' +
+      '<td class="dirs">' + boxes('dir', [['ab', 'A→B'], ['ba', 'B→A'], ['bidir', '双向']]) + '</td>' +
       '<td class="dirs bidir-cell">' + bidirTarget + '</td>' +
-      '<td class="dirs">' + tp + '</td><td class="dirs">' + ip + '</td>' +
+      '<td class="dirs">' + boxes('tp', [['tcp', 'TCP'], ['udp', 'UDP'], ['ping', 'PING']]) + '</td>' +
+      '<td class="dirs udp-cell">' + tcpGroup + '</td>' +
+      '<td class="dirs udp-cell">' + udpGroup + '</td>' +
+      '<td class="dirs">' + boxes('ip', [['v4', 'V4'], ['v6', 'V6']]) + '</td>' +
       '</tr>';
   });
   $('matrix').querySelector('tbody').innerHTML = rows.join('');
-  // 表头开关的目标行刚被重建，状态要跟着重算一次。
-  bindColumnToggles();
+  renderTcpColToggles();
+  renderUdpColToggles();
   syncColumnToggles();
 }
 
-function collectNicPolicies() {
-  if (!MASTER || !AGENT) return [];
-  return Array.from(document.querySelectorAll('.nic-target')).map((target) => {
-    const side = target.dataset.side, i = Number(target.dataset.ni);
-    const nic = (side === 'master' ? MASTER : AGENT).interfaces[i];
-    const pick = (cls) => {
-      const el = document.querySelector('.' + cls + '[data-side="' + side + '"][data-ni="' + i + '"]');
-      return el ? el.value.trim() : '';
-    };
-    return {
-      endpoint: side + ':NAME=' + nic.name,
-      rx_target: target.value.trim(),
-      udp_bandwidth: pick('nic-bw'),
-      udp_length: pick('nic-len'),
-    };
+// UDP 参数列的表头整列开关：每个组一个勾选框，勾一下把该组整列加上/去掉，
+// 和左边方向/协议/IP 三列同一个操作法。组是动态的（可增删改名），所以这一列
+// 的表头跟着 renderMatrix 重画。只有默认组时没什么可批量指派，仍旧只放提示。
+function renderUdpColToggles() {
+  const box = $('udpcolsel');
+  if (!box) return;
+  if (UDP_GROUPS.length < 2) {
+    box.innerHTML = '<span class="hint">见上面的参数组表</span>';
+    return;
+  }
+  box.innerHTML = '<span class="hint">整列：</span>' + UDP_GROUPS.map((group, gi) =>
+    '<label title="' + esc(groupOptionLabel(gi)) + '">' +
+    '<input type="checkbox" class="colall-ug" data-ug="' + gi + '">' +
+    esc(groupLabel(gi)) + '</label>').join('');
+}
+
+// 从 ROWS 把 UDP 组那些体格勾选整组重刷。整列开关按下后，有的行会被「至少
+// 留一组」弹回默认，受影响的不止被点那一列，所以整组重刷——但只碰这些勾选
+// 框，不动正在输入的门限格。
+function syncUdpGroupBoxes() {
+  document.querySelectorAll('#matrix tbody [data-ug]').forEach((box) => {
+    const row = ROWS[Number(box.dataset.i)];
+    if (row) box.checked = row.udp_groups.indexOf(Number(box.dataset.ug)) >= 0;
   });
 }
 
-function collect() {
+// 这一行的发送端在「网口与策略」里被钉了 UDP `-b` 吗。
+//
+// 网口值按发送腿生效、排在参数组前面，所以选了组也可能跑的不是组里那个数。
+// 这件事以前只在「预览任务」里看得见——等点开预览才发现，已经晚了一步。
+function pinNote(index) {
+  const pair = PAIRS[index];
+  if (!pair) return '';
+  const pinned = (end, arrow) => {
+    const endpoint = endpointOf(end);
+    const row = NICROWS.find((nic) => nic.endpoint === endpoint);
+    const value = row && row.udp_bandwidth.trim();
+    return value ? arrow + ' 网口固定 ' + value : '';
+  };
+  return [pinned(pair.a, 'A→B'), pinned(pair.b, 'B→A')]
+    .filter((text) => text !== '')
+    .map(esc)
+    .join(' · ');
+}
+
+// 网口表里改了 -b，矩阵里的标注要跟着变。只改那几个 span，不重画整张矩阵：
+// 人正在网口表里打字，重画矩阵没必要，也会把矩阵里正在输入的格子打断。
+function refreshPinNotes() {
+  document.querySelectorAll('#matrix tbody .pin-note').forEach((span) => {
+    span.textContent = pinNote(Number(span.dataset.pin));
+  });
+}
+
+function collectNicPolicies() {
+  return NICROWS.map((row) => ({
+    endpoint: row.endpoint,
+    rx_target: row.rx_target.trim(),
+    udp_bandwidth: row.udp_bandwidth.trim(),
+    udp_length: row.udp_length.trim(),
+  }));
+}
+
+// 纯数据 -> legacy 请求体。这里一个 querySelector 都不该有：勾选的真相在 ROWS 里。
+function collectLegacy() {
+  const on = (group) => Object.keys(group).filter((key) => group[key]);
   const pairs = [];
-  document.querySelectorAll('.sel').forEach((box) => {
-    if (!box.checked) return;
-    const i = box.dataset.i;
-    const pick = (attr) => Array.from(document.querySelectorAll('[data-' + attr + '][data-i="' + i + '"]'))
-      .filter((e) => e.checked).map((e) => e.dataset[attr]);
+  ROWS.forEach((row, i) => {
+    if (!row.sel) return;
     const p = PAIRS[i];
-    const bidirTarget = (d) => {
-      const el = document.querySelector('.bidir-target[data-bt="' + d + '"][data-i="' + i + '"]');
-      return el ? el.value.trim() : '';
-    };
     pairs.push({
-      src: p.a.side + ':NAME=' + p.a.nic.name,
-      dst: p.b.side + ':NAME=' + p.b.nic.name,
-      directions: pick('dir'),
-      rx_target_bidir_ab: bidirTarget('ab'),
-      rx_target_bidir_ba: bidirTarget('ba'),
-      transports: pick('tp'),
-      ip: pick('ip'),
+      src: endpointOf(p.a),
+      dst: endpointOf(p.b),
+      directions: on(row.dir),
+      rx_target_bidir_ab: row.bidir_ab.trim(),
+      rx_target_bidir_ba: row.bidir_ba.trim(),
+      udp_groups: row.udp_groups.slice(),
+      tcp_groups: row.tcp_groups.slice(),
+      transports: on(row.tp),
+      ip: on(row.ip),
     });
   });
   return {
     pairs,
     nic_policies: collectNicPolicies(),
     duration: Number($('duration').value) || 180,
-    tcp_windows: splitList($('win').value),
-    tcp_streams: splitList($('tcpstreams').value).map(Number).filter((n) => n > 0),
-    udp_bandwidths: splitList($('udpbw').value),
-    udp_lengths: splitList($('udplen').value),
-    udp_windows: splitList($('udpwin').value),
-    udp_streams: Number($('udpstreams').value) || 1,
+    // TCP 默认组走顶层 tcp_windows / tcp_streams，附加组走 tcp_groups——和 UDP
+    // 同一个形状，界面上把默认组画成表格第一行不改变协议。
+    tcp_windows: splitList(TCP_GROUPS[0].windows),
+    tcp_streams: splitList(TCP_GROUPS[0].streams).map(Number).filter((n) => n > 0),
+    tcp_groups: TCP_GROUPS.slice(1).map((group) => ({
+      name: group.name.trim(),
+      windows: splitList(group.windows),
+      streams: splitList(group.streams).map(Number).filter((n) => n > 0),
+    })),
+    // 默认组走请求体顶层那几个字段，附加组走 udp_groups——这是后端既有的形状，
+    // 界面上把默认组画成表格第一行不改变协议。
+    udp_bandwidths: splitList(UDP_GROUPS[0].bandwidths),
+    udp_lengths: splitList(UDP_GROUPS[0].lengths),
+    udp_windows: splitList(UDP_GROUPS[0].windows),
+    udp_streams: Number(UDP_GROUPS[0].streams) || 1,
+    udp_groups: UDP_GROUPS.slice(1).map((group) => ({
+      name: group.name.trim(),
+      bandwidths: splitList(group.bandwidths),
+      lengths: splitList(group.lengths),
+      windows: splitList(group.windows),
+      streams: Number(group.streams) || 0,
+    })),
     ping_count: Number($('pingcount').value) || 0,
     ping_payload_sizes: splitList($('pingsizes').value).map(Number).filter((n) => n > 0),
     limit_udp_by_link_speed: $('clip').checked,
     resume: $('resume').checked,
     screenshot: $('shot').checked,
   };
+}
+
+// 快速模式只提交 ui_plan；高级模式完全沿用上面的 pairs 请求。两条路径共享
+// duration、网卡策略和执行选项，因此 config/plan/run 三个 API 的语义保持一致。
+function collect() {
+  return MODE === 'quick' ? quickCollect() : collectLegacy();
 }
 
 // 空格、逗号、中文逗号都当分隔符：手抄参数时这三种都会出现。
@@ -496,31 +2370,69 @@ function hhmm(secs) {
 
 async function bootstrap() {
   try {
-    const d = await api('/api/bootstrap');
+    applySettings(await api('/api/bootstrap'));
+  } catch (e) {
+    say($('connstatus'), '读取启动配置失败：' + e.message, 'bad');
+  }
+  // 进度是服务端状态，打开页面就该看得见（见 attachToRunningTest）。
+  attachToRunningTest();
+}
+
+// 顶部参数区的回填。打开页面和导入 config.json 走同一段，两条路填出来的
+// 输入框必须一模一样——服务端那边也是同一个 `bootstrap_out`。
+function applySettings(d) {
     $('host').value = d.agent_host || '';
     $('port').value = d.agent_port || 28801;
     $('token').placeholder = d.token_configured ? '已从配置加载' : '留空=不认证';
     $('prefixes').value = (d.ipv4_prefixes || []).join(' ');
     $('duration').value = d.duration || 180;
-    $('win').value = (d.tcp_windows || []).join(' ');
-    $('tcpstreams').value = (d.tcp_streams || [10]).join(' ');
-    $('udpbw').value = (d.udp_bandwidths || []).join(' ');
-    $('udplen').value = (d.udp_lengths || []).join(' ');
-    $('udpwin').value = (d.udp_windows || []).join(' ');
-    $('udpstreams').value = d.udp_streams || 1;
+    // TCP 默认组也是参数表的第一行（原来执行区的两个框）。
+    TCP_GROUPS[0] = {
+      name: '默认',
+      windows: (d.tcp_windows || []).join(' '),
+      streams: (d.tcp_streams || [10]).join(' '),
+    };
+    renderTcpGroups();
+    RECIPES.tcp = RECIPES.tcp || [];
+    const tcpDefault = RECIPES.tcp.find((recipe) => recipe.id === 'recipe-tcp-default');
+    if (tcpDefault) {
+      // 用轴字段保存全局配置的全部档位。只取 profiles[0] 会把旧 config
+      // 中的多档 -w/-P 静默截成第一档，切到快速工作台后预计单元数随之变少。
+      // TCP 仍是独立 task；这里只是完整回填它自己的 recipe。
+      tcpDefault.profiles = [];
+      tcpDefault.tcp_windows = (d.tcp_windows || []).slice();
+      tcpDefault.tcp_streams = (d.tcp_streams || [10]).slice();
+    }
+    // 默认组是参数表的第一行，不再是几个独立的输入框。
+    UDP_GROUPS[0] = {
+      name: '默认',
+      bandwidths: (d.udp_bandwidths || []).join(' '),
+      lengths: (d.udp_lengths || []).join(' '),
+      windows: (d.udp_windows || []).join(' '),
+      streams: String(d.udp_streams || 1),
+    };
+    renderUdpGroups();
+    RECIPES.udp = RECIPES.udp || [];
+    const udpDefault = RECIPES.udp.find((recipe) => recipe.id === 'recipe-udp-default');
+    if (udpDefault) {
+      // 同理保留 UDP 的完整 -b × -l × -w 轴；TCP 与 UDP 各自维护 recipe，
+      // 不会因为回填其中一个协议而产生跨协议笛卡尔积。
+      udpDefault.profiles = [];
+      udpDefault.bandwidths = (d.udp_bandwidths || []).length ? (d.udp_bandwidths || []).slice() : ['1000m'];
+      udpDefault.lengths = (d.udp_lengths || []).slice();
+      udpDefault.windows = (d.udp_windows || []).slice();
+      udpDefault.udp_streams = [Number(d.udp_streams) || 1];
+    }
     $('pingcount').value = d.ping_count || 100;
     $('pingsizes').value = (d.ping_payload_sizes || []).join(' ');
     $('shot').checked = Boolean(d.screenshot);
-  } catch (e) {
-    say($('connstatus'), '读取启动配置失败：' + e.message, 'bad');
-  }
-}
-
-function mergePolicies(configured, current) {
-  const merged = new Map();
-  (configured || []).forEach((policy) => merged.set(policy.endpoint, policy));
-  (current || []).forEach((policy) => merged.set(policy.endpoint, policy));
-  return Array.from(merged.values());
+    // This function is also used when the asynchronous bootstrap response
+    // arrives.  If a user managed to preview a plan before that response (or
+    // a caller reapplies settings after a preview), the shared duration,
+    // protocol defaults, or PING controls may have changed underneath it.
+    // Invalidate the hash after all controls are populated so the next run
+    // must preview the effective values again.
+    markQuickDirty();
 }
 
 // 连接参数三处共用（连接 / 刷新网口），免得只在一处加了前缀。
@@ -535,82 +2447,210 @@ function connectParams() {
 
 $('connect').onclick = async () => {
   say($('connstatus'), '连接中…', 'info');
+  let connectionResponseAccepted = false;
   try {
     const d = await api('/api/connect', connectParams());
     MASTER = d.master; AGENT = d.agent;
+    CONNECTION_STATE = true;
+    connectionResponseAccepted = true;
     say($('connstatus'), '已连接 ' + d.health.hostname + ' (' + d.health.os + ') · agent v' + d.health.version +
       ' · iperf3 ' + (d.health.iperf3 || '未找到'), 'ok');
-    PAIRS = buildPairs();
+    PAIRS = buildPairs(); buildRows();
+    // 重新连接可能改变端点拓扑；任何旧快速预览都必须重新确认。
+    markQuickDirty();
     renderNics(d.nic_policies); renderMatrix();
+    ensureQuickDefaults();
+    // A project/config imported before connecting is consumed only after a
+    // trustworthy two-sided scan.  Empty interface lists leave the queue in
+    // place for a later refresh instead of silently dropping policies/pairs.
+    applyPendingProjectIfConnected();
+    syncQuickSets(); renderQuickWorkspace();
     ['nicsec', 'matrixsec', 'runsec'].forEach((id) => $(id).classList.remove('hidden'));
     $('refresh').disabled = false;
-  } catch (e) { say($('connstatus'), e.message, 'bad'); }
+    fillMonitorIfaces();
+    applyPendingPairsIfConnected();
+  } catch (e) {
+    // Preserve the last snapshots for diagnostics, but mark them stale for
+    // import/reconciliation decisions until a later connect succeeds.
+    if (!connectionResponseAccepted) CONNECTION_STATE = false;
+    say($('connstatus'), e.message, 'bad');
+  }
 };
 
 $('refresh').onclick = async () => {
   say($('connstatus'), '重新扫描双端网口…', 'info');
+  let connectionResponseAccepted = false;
   try {
-    const currentPolicies = collectNicPolicies();
     const d = await api('/api/connect', connectParams());
-    MASTER = d.master; AGENT = d.agent; PAIRS = buildPairs();
-    renderNics(mergePolicies(d.nic_policies, currentPolicies)); renderMatrix();
+    MASTER = d.master; AGENT = d.agent;
+    CONNECTION_STATE = true;
+    connectionResponseAccepted = true;
+    PAIRS = buildPairs(); buildRows();
+    // 刷新只是重扫网口，人刚填的门限和刚勾的矩阵都不该跟着没——
+    // 前者靠 keepEdits，后者靠 ROW_MEMORY 按端点对认回来。
+    renderNics(d.nic_policies, true); renderMatrix();
+    // 刷新可能让集合里的端点失效或加入新链路，旧预览 hash 不再代表当前拓扑。
+    markQuickDirty();
+    applyPendingProjectIfConnected();
+    syncQuickSets(); renderQuickWorkspace();
+    fillMonitorIfaces();
+    applyPendingPairsIfConnected();
     say($('connstatus'), '网口已刷新（' + new Date().toLocaleTimeString() + '）', 'ok');
-  } catch (e) { say($('connstatus'), e.message, 'bad'); }
+  } catch (e) {
+    if (!connectionResponseAccepted) CONNECTION_STATE = false;
+    say($('connstatus'), e.message, 'bad');
+  }
 };
 
 // 「全选」= 整张表全测一遍，所以双向和 IPv6 这些默认不勾的项也要跟着勾上；
 // 只勾中间那一列「测」等于把全选做了一半，跑出来才发现少了方向。
-function setRowOptions(index, on) {
-  document.querySelectorAll('[data-dir][data-i="' + index + '"], [data-tp][data-i="' + index + '"], [data-ip][data-i="' + index + '"]')
-    .forEach((box) => (box.checked = on));
+function setRowOptions(row, on) {
+  ['dir', 'tp', 'ip'].forEach((attr) => {
+    Object.keys(row[attr]).forEach((key) => { row[attr][key] = on; });
+  });
 }
 
 // 表头上的整列开关。逐行点 30 次去开双向，和开完之后没法一次关掉，是同一个
 // 缺口的两面：方向/协议/IP 这三列需要的是列级操作，不是行级操作。
-function columnBoxes(attr, val) {
-  return Array.from(document.querySelectorAll('[data-' + attr + '="' + val + '"]'))
-    .filter((box) => !box.classList.contains('colall'));
-}
 function syncColumnToggles() {
   document.querySelectorAll('.colall').forEach((head) => {
-    const boxes = columnBoxes(head.dataset.attr, head.dataset.val);
-    head.checked = boxes.length > 0 && boxes.every((b) => b.checked);
+    const attr = head.dataset.attr, val = head.dataset.val;
+    const on = ROWS.filter((row) => row[attr][val]).length;
+    head.checked = ROWS.length > 0 && on === ROWS.length;
     // 部分勾选时显示成中间态，免得表头看起来像"一个都没勾"。
-    head.indeterminate = !head.checked && boxes.some((b) => b.checked);
+    head.indeterminate = on > 0 && on < ROWS.length;
+  });
+  // UDP 组的整列开关：组存在 udp_groups 数组里，判「整列开没开」看有多少行含这个组号。
+  document.querySelectorAll('.colall-ug').forEach((head) => {
+    const gi = Number(head.dataset.ug);
+    const on = ROWS.filter((row) => row.udp_groups.indexOf(gi) >= 0).length;
+    head.checked = ROWS.length > 0 && on === ROWS.length;
+    head.indeterminate = on > 0 && on < ROWS.length;
+  });
+  // TCP 组的整列开关，同理。
+  document.querySelectorAll('.colall-tcpg').forEach((head) => {
+    const gi = Number(head.dataset.tg);
+    const on = ROWS.filter((row) => row.tcp_groups.indexOf(gi) >= 0).length;
+    head.checked = ROWS.length > 0 && on === ROWS.length;
+    head.indeterminate = on > 0 && on < ROWS.length;
   });
 }
-function bindColumnToggles() {
-  document.querySelectorAll('.colall').forEach((head) => {
-    head.onchange = () => {
-      columnBoxes(head.dataset.attr, head.dataset.val).forEach((b) => (b.checked = head.checked));
-      head.indeterminate = false;
-    };
-  });
-}
-// 行内勾选也要把表头状态同步回来，否则表头会一直显示上一次的整列状态。
+
+// 矩阵里所有的勾选都走这一个委派监听：目标是改 ROWS，DOM 上那一下浏览器
+// 自己已经做了。整列开关也在 #matrix 里（表头），先认它。
 $('matrix').addEventListener('change', (ev) => {
-  if (ev.target && !ev.target.classList.contains('colall')) syncColumnToggles();
+  const el = ev.target;
+  if (!el || el.type !== 'checkbox') return;
+  // 表头的 UDP 组整列开关：整列加上/去掉这一组。放最前面认——它也带 data-ug，
+  // 会被下面「体格」那一支（靠 data-i 定位行）误当成某一行的勾选。
+  if (el.classList.contains('colall-ug')) {
+    const gi = Number(el.dataset.ug);
+    ROWS.forEach((row) => {
+      const has = row.udp_groups.indexOf(gi) >= 0;
+      if (el.checked && !has) row.udp_groups.push(gi);
+      else if (!el.checked && has) row.udp_groups = row.udp_groups.filter((known) => known !== gi);
+      // 去到一组不剩就弹回默认：勾了 UDP 的行总得有一组参数（和体格同一条规矩）。
+      if (row.udp_groups.length === 0) row.udp_groups = [0];
+      row.udp_groups.sort((a, b) => a - b);
+    });
+    syncUdpGroupBoxes();
+    syncColumnToggles();
+    el.indeterminate = false;
+    return;
+  }
+  // TCP 组的整列开关，和 UDP 那支一模一样。也带 data-tg，同样要放在体格支前面。
+  if (el.classList.contains('colall-tcpg')) {
+    const gi = Number(el.dataset.tg);
+    ROWS.forEach((row) => {
+      const has = row.tcp_groups.indexOf(gi) >= 0;
+      if (el.checked && !has) row.tcp_groups.push(gi);
+      else if (!el.checked && has) row.tcp_groups = row.tcp_groups.filter((known) => known !== gi);
+      if (row.tcp_groups.length === 0) row.tcp_groups = [0];
+      row.tcp_groups.sort((a, b) => a - b);
+    });
+    syncTcpGroupBoxes();
+    syncColumnToggles();
+    el.indeterminate = false;
+    return;
+  }
+  if (el.dataset.ug !== undefined) {
+    const row = ROWS[Number(el.dataset.i)], gi = Number(el.dataset.ug);
+    if (!row) return;
+    row.udp_groups = row.udp_groups.filter((known) => known !== gi);
+    if (el.checked) row.udp_groups.push(gi);
+    row.udp_groups.sort((a, b) => a - b);
+    // 一组都不选 = 这一行的 UDP 什么都不跑。与其让它安静地少跑一批，不如
+    // 当场弹回默认组：矩阵里勾了 UDP 的行总得有一组参数。
+    if (row.udp_groups.length === 0) {
+      row.udp_groups = [0];
+      const back = document.querySelector(
+        '#matrix tbody [data-ug="0"][data-i="' + el.dataset.i + '"]');
+      if (back) back.checked = true;
+    }
+    // 体格改了也让表头那颗整列开关跟着更新（全勾/半勾/全不勾）。
+    syncColumnToggles();
+    return;
+  }
+  if (el.dataset.tg !== undefined) {
+    const row = ROWS[Number(el.dataset.i)], gi = Number(el.dataset.tg);
+    if (!row) return;
+    row.tcp_groups = row.tcp_groups.filter((known) => known !== gi);
+    if (el.checked) row.tcp_groups.push(gi);
+    row.tcp_groups.sort((a, b) => a - b);
+    if (row.tcp_groups.length === 0) {
+      row.tcp_groups = [0];
+      const back = document.querySelector(
+        '#matrix tbody [data-tg="0"][data-i="' + el.dataset.i + '"]');
+      if (back) back.checked = true;
+    }
+    syncColumnToggles();
+    return;
+  }
+  if (el.classList.contains('colall')) {
+    const attr = el.dataset.attr, val = el.dataset.val;
+    ROWS.forEach((row) => { row[attr][val] = el.checked; });
+    // 只同步这一列的那些框，不整表重画：重画会打断正在输入的门限格。
+    document.querySelectorAll('#matrix tbody [data-' + attr + '="' + val + '"]')
+      .forEach((box) => { box.checked = el.checked; });
+    el.indeterminate = false;
+    return;
+  }
+  const row = ROWS[Number(el.dataset.i)];
+  if (!row) return;
+  if (el.classList.contains('sel')) row.sel = el.checked;
+  else if (el.dataset.dir) row.dir[el.dataset.dir] = el.checked;
+  else if (el.dataset.tp) row.tp[el.dataset.tp] = el.checked;
+  else if (el.dataset.ip) row.ip[el.dataset.ip] = el.checked;
+  syncColumnToggles();
+});
+
+// 文本格（双向门限、逐对 UDP 覆盖）同理：只改状态，不重画。存原样不 trim，
+// 重画时人看到的还是自己敲的东西；trim 留给 collect。
+$('matrix').addEventListener('input', (ev) => {
+  const el = ev.target;
+  const row = ROWS[Number(el.dataset.i)];
+  if (row && el.dataset.k) row[el.dataset.k] = el.value;
 });
 
 $('all').onclick = () => {
-  document.querySelectorAll('.sel').forEach((b) => {
-    b.checked = true;
-    setRowOptions(b.dataset.i, true);
-  });
-  syncColumnToggles();
+  ROWS.forEach((row) => { row.sel = true; setRowOptions(row, true); });
+  renderMatrix();
 };
 // 「全不选」只清「测」这一列。方向/协议/IP 要清空用表头的整列开关——
 // 把它们跟着一起清掉，重新勾行时会直接卡在「至少勾一个方向」的校验上。
 $('none').onclick = () => {
-  document.querySelectorAll('.sel').forEach((b) => (b.checked = false));
+  ROWS.forEach((row) => { row.sel = false; });
+  renderMatrix();
 };
 $('cross').onclick = () => {
-  document.querySelectorAll('.sel').forEach((b) => (b.checked = PAIRS[b.dataset.i].cross));
+  ROWS.forEach((row, i) => { row.sel = PAIRS[i].cross; });
+  renderMatrix();
 };
-function selectedCount() { return document.querySelectorAll('.sel:checked').length; }
+function selectedCount() { return ROWS.filter((row) => row.sel).length; }
 
 $('export').onclick = async () => {
-  if (selectedCount() === 0) { say($('planstatus'), '一个测试项都没勾——先在上面的矩阵里选。', 'bad'); return; }
+  if (MODE === 'quick' && !quickHasAssignments()) { say($('planstatus'), '还没有有效的套件分配——先分配一个套件。', 'bad'); return; }
+  if (MODE === 'advanced' && selectedCount() === 0) { say($('planstatus'), '一个测试项都没勾——先在上面的矩阵里选。', 'bad'); return; }
   try {
     const config = await api('/api/config', collect());
     const blob = new Blob([JSON.stringify(config, null, 2) + '\n'], { type: 'application/json' });
@@ -622,46 +2662,195 @@ $('export').onclick = async () => {
   } catch (e) { say($('planstatus'), e.message, 'bad'); }
 };
 
+// 「下载 config.json」一直是单向的：改完一堆门限和档位，下次打开又得从头点
+// 一遍，而那份文件里明明什么都有。导入是它的逆运算，只回填界面、不跑任何东西。
+$('import').onclick = () => $('importfile').click();
+
+$('importfile').onchange = async () => {
+  const file = $('importfile').files[0];
+  if (!file) return;
+  say($('planstatus'), '正在导入 ' + file.name + '…', 'info');
+  try {
+    let parsed;
+    try { parsed = JSON.parse(await file.text()); }
+    catch (e) { throw new Error(file.name + ' 不是合法的 JSON（' + e.message + '）'); }
+    applyImport(await api('/api/import', parsed), file.name);
+  } catch (e) {
+    say($('planstatus'), '导入失败：' + e.message, 'bad');
+  } finally {
+    // 同一个文件改完再导一次也得能触发 change。
+    $('importfile').value = '';
+  }
+};
+
+function applyImport(d, name) {
+  setMode('advanced');
+  // legacy config 是扁平的 pairs 计划，不能和页面里旧的 suite 关系混用。
+  // 清空快速状态可避免用户导入旧配置后切回快速模式，误跑上一份项目；同时
+  // 丢弃尚未连接、等待应用的项目，防止下一次 connect 又把旧项目套回来。
+  resetQuickPlanState();
+  // resetQuickPlanState 会清空 recipes/suites；先重建一套干净的默认 quick
+  // 对象，再用 legacy settings 覆盖它的完整扫描轴。若顺序反过来，
+  // applySettings 找不到默认 recipe，只能在切回快速模式时退回硬编码的单档。
+  ensureQuickDefaults();
+  applySettings(d.settings);
+  // 组要先建好：矩阵行上的序号指着它们。默认组刚由 applySettings 填过，
+  // 整个覆盖会把它一起冲掉。
+  UDP_GROUPS = [UDP_GROUPS[0]].concat((d.udp_groups || []).map((group) => ({
+    name: group.name || '',
+    bandwidths: (group.bandwidths || []).join(' '),
+    lengths: (group.lengths || []).join(' '),
+    windows: (group.windows || []).join(' '),
+    streams: group.streams ? String(group.streams) : '',
+  })));
+  renderUdpGroups();
+  // TCP 组同理：默认组刚由 applySettings 填过，附加组接在后面。
+  TCP_GROUPS = [TCP_GROUPS[0]].concat((d.tcp_groups || []).map((group) => ({
+    name: group.name || '',
+    windows: (group.windows || []).join(' '),
+    streams: (group.streams || []).join(' '),
+  })));
+  renderTcpGroups();
+  $('clip').checked = Boolean(d.limit_udp_by_link_speed);
+  $('resume').checked = Boolean(d.resume);
+  const notes = (d.notices || []).slice();
+  if (quickConnected()) {
+    renderNics(d.nic_policies, false);
+    PENDING_PAIRS = null;
+    const applied = applyPairs(d.pairs);
+    notes.push('矩阵按文件勾上了 ' + applied.matched + ' 行。');
+    if (applied.missing.length) {
+      notes.push('这些配对在当前网口表里没有对应行，没能勾上：' + applied.missing.join('、'));
+    }
+  } else {
+    // 先导入后连接也要走得通：配对先存着，扫到网口再勾。
+    PENDING_PAIRS = d.pairs;
+  }
+  say($('planstatus'), '已导入 ' + name + '。' + notes.join(' ') + ' 跑之前点「预览任务」核对一遍。',
+    'info');
+}
+
+// 把导入回来的配对写进 ROWS。返回勾上了几行、哪几对没对上。
+function applyPairs(rows) {
+  const missing = [];
+  let matched = 0;
+  // 导入定义的是「这次跑哪些」，所以先全清：留着上一份勾选，跑出来的既不是
+  // 文件里那份、也不是人刚才勾的那份。
+  ROWS.forEach((row) => { row.sel = false; });
+  (rows || []).forEach((incoming) => {
+    let index = -1, flip = false;
+    PAIRS.forEach((p, i) => {
+      if (index >= 0) return;
+      const a = endpointOf(p.a), b = endpointOf(p.b);
+      if (incoming.src === a && incoming.dst === b) index = i;
+      else if (incoming.src === b && incoming.dst === a) { index = i; flip = true; }
+    });
+    if (index < 0) { missing.push(incoming.src + ' ↔ ' + incoming.dst); return; }
+    matched++;
+    // 矩阵一行代表一对口，A、B 谁在左边由这张表的枚举顺序定。文件写反了就
+    // 把方向和两个双向门限一起翻过来，否则勾出来的方向是反的。
+    const flipDir = (d) => (flip ? ({ ab: 'ba', ba: 'ab' }[d] || d) : d);
+    const row = ROWS[index];
+    row.sel = true;
+    const set = (attr, values) => {
+      Object.keys(row[attr]).forEach((key) => {
+        row[attr][key] = (values || []).indexOf(key) >= 0;
+      });
+    };
+    set('dir', (incoming.directions || []).map(flipDir));
+    set('tp', incoming.transports);
+    set('ip', incoming.ip);
+    row.bidir_ab = (flip ? incoming.rx_target_bidir_ba : incoming.rx_target_bidir_ab) || '';
+    row.bidir_ba = (flip ? incoming.rx_target_bidir_ab : incoming.rx_target_bidir_ba) || '';
+    // 参数组没有方向，翻不翻都一样。
+    row.udp_groups = (incoming.udp_groups || []).slice();
+    if (row.udp_groups.length === 0) row.udp_groups = [0];
+    row.tcp_groups = (incoming.tcp_groups || []).slice();
+    if (row.tcp_groups.length === 0) row.tcp_groups = [0];
+  });
+  renderMatrix();
+  return { matched, missing };
+}
+
 $('plan').onclick = async () => {
-  if (selectedCount() === 0) { say($('planstatus'), '一个测试项都没勾——先在上面的矩阵里选。', 'bad'); return; }
+  if (MODE === 'quick' && !quickHasAssignments()) { say($('planstatus'), '还没有有效的套件分配——先选择链路集合并分配一个套件。', 'bad'); return; }
+  if (MODE === 'advanced' && selectedCount() === 0) { say($('planstatus'), '一个测试项都没勾——先在上面的矩阵里选。', 'bad'); return; }
+  if (MODE === 'quick' && quickHasBoundStale()) { say($('planstatus'), '当前分配的链路集合里还有失效端点。请刷新网口，或展开集合移除失效链路后再预览。', 'bad'); return; }
+  // 即使本次预览请求本身失败（例如服务端拓扑在请求途中变化），也不能
+  // 留着上一份 hash 让「开始测试」误以为仍可执行。成功返回后再写入新 hash。
+  if (MODE === 'quick') invalidateQuickPreview();
+  const requestMode = MODE;
+  const requestRevision = QUICK_PLAN_REVISION;
   say($('planstatus'), '生成中…', 'info');
   try {
     const d = await api('/api/plan', collect());
+    // The request may have spent enough time in the server for the user to
+    // edit a suite, recipe, NIC policy, or shared setting.  Never let a stale
+    // response put its hash back; the current state must be previewed again.
+    if (MODE !== requestMode ||
+        (requestMode === 'quick' && QUICK_PLAN_REVISION !== requestRevision)) return;
     if (d.units.length === 0) throw new Error('当前选择没有生成可执行单元，请检查 IP 版本和网口组合。');
+    PLAN_HASH = d.plan_hash || '';
+    TOPOLOGY_FINGERPRINT = d.topology_fingerprint || TOPOLOGY_FINGERPRINT;
+    if (MODE === 'quick') { renderQuickReview(d); renderQuickSummary(d); }
     // resume 的跳过只是预判：执行时前置检查被拦、或网卡快照变了的单元照样实跑。
     // 所以两头都报出来，别让人照着一个偏小的数字安排时间。
     const cost = d.est_full_secs > d.est_total_secs
       ? hhmm(d.est_total_secs) + ' ~ ' + hhmm(d.est_full_secs) + '（取决于 resume 实际跳过多少）'
       : hhmm(d.est_total_secs);
     const head = '共 ' + d.units.length + ' 个测试单元，预计 ' + cost + '。';
+    // 每条腿最终下发的参数跟在标题下面：优先级（网口 > 参数组 > 默认组）和
+    // 链路裁剪都会改写这几个数字，摆出来就不用让人背规则。
     const list = d.units.slice(0, 200)
-      .map((u) => '#' + u.seq + ' ' + (u.resumed ? '[resume 跳过] ' : '') + u.title).join('\n');
+      .map((u) => '#' + u.seq + ' ' + (u.resumed ? '[resume 跳过] ' : '') + u.title +
+        (u.load || []).map((line) => '\n      ' + line).join(''))
+      .join('\n');
     $('planstatus').innerHTML = '<div class="status info">' + esc(head) +
       (d.notices.length ? '<br>提示：' + esc(d.notices.join('；')) : '') +
       '</div><pre class="hint plan-list">' + esc(list) + '</pre>';
-  } catch (e) { say($('planstatus'), e.message, 'bad'); }
+  } catch (e) {
+    // Ignore errors from a superseded request as well.  Reporting one after a
+    // newer preview/edit would overwrite the status for the state the user is
+    // actually looking at.
+    if (MODE !== requestMode ||
+        (requestMode === 'quick' && QUICK_PLAN_REVISION !== requestRevision)) return;
+    say($('planstatus'), e.message, 'bad');
+  }
 };
 
 $('start').onclick = async () => {
-  if (selectedCount() === 0) { say($('planstatus'), '一个测试项都没勾——先在上面的矩阵里选。', 'bad'); return; }
+  if (MODE === 'quick' && !quickHasAssignments()) { say($('planstatus'), '还没有有效的套件分配——先选择链路集合并分配一个套件。', 'bad'); return; }
+  if (MODE === 'advanced' && selectedCount() === 0) { say($('planstatus'), '一个测试项都没勾——先在上面的矩阵里选。', 'bad'); return; }
+  if (MODE === 'quick' && !PLAN_HASH) {
+    say($('planstatus'), '请先点「预览任务」确认服务端实际单元和参数，再开始测试。', 'bad'); return;
+  }
+  // 请求尚未返回的这段窗口也不能让人继续改配置；否则第二次点击或改动
+  // 网口策略可能和正在创建的计划交错。失败时 catch 会恢复原 disabled 状态。
+  setRunUi(true);
   try {
     await api('/api/run', collect());
     $('progsec').classList.remove('hidden');
     const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
     $('progsec').scrollIntoView({ behavior: reduceMotion ? 'auto' : 'smooth' });
-    $('start').disabled = true; $('plan').disabled = true; $('export').disabled = true;
-    $('stop').disabled = false; $('stop').classList.remove('hidden');
     $('openreport').classList.add('hidden');
+    STOPPING = false; LAST_RUNNING = null;
     FROM = 0; LOG_LINES = []; $('log').textContent = '';
-    if (TIMER) clearInterval(TIMER);
-    TIMER = setInterval(poll, 1000);
-    poll();
-  } catch (e) { say($('planstatus'), e.message, 'bad'); }
+    startPolling();
+  } catch (e) {
+    setRunUi(false);
+    // 服务端明确指出计划过期时，立刻清掉本地凭证，避免用户反复点击
+    // 「开始测试」发送同一份失效 hash；其它错误保留 hash，便于临时网络故障后重试。
+    if (MODE === 'quick' && /过期|拓扑|plan_hash|预览/.test(String(e.message || ''))) {
+      invalidateQuickPreview();
+    }
+    say($('planstatus'), e.message, 'bad');
+  }
 };
 
 $('stop').onclick = async () => {
   try {
     await api('/api/stop', {});
+    STOPPING = true;
     $('stop').disabled = true;
     $('runstate').textContent = '正在结束当前单元并生成报告…';
   } catch (e) { $('runstate').textContent = e.message; }
@@ -672,33 +2861,81 @@ $('openreport').onclick = async () => {
   catch (e) { $('runstate').textContent = e.message; }
 };
 
+// 运行状态的按钮/配置锁。每拍都会调用一次以覆盖运行期间可能被重画出来的
+// 动态控件；原 disabled 状态保存在 RUN_LOCK_STATES，结束后精确恢复。
+function setRunUi(running) {
+  const controls = document.querySelectorAll(
+    '#tab-test section:not(#progsec) input, #tab-test section:not(#progsec) select, ' +
+    '#tab-test section:not(#progsec) button, #suite-backdrop input, #suite-backdrop select, #suite-backdrop button');
+  if (running) {
+    controls.forEach((control) => {
+      if (!RUN_LOCK_STATES.has(control)) RUN_LOCK_STATES.set(control, control.disabled);
+      control.disabled = true;
+    });
+  } else {
+    RUN_LOCK_STATES.forEach((disabled, control) => {
+      if (control.isConnected) control.disabled = disabled;
+    });
+    RUN_LOCK_STATES.clear();
+  }
+  $('stop').disabled = !running;
+  $('stop').classList.toggle('hidden', !running);
+}
+
+function applyProgress(d) {
+  FROM = d.from;
+  if (d.lines.length) {
+    const box = $('log');
+    const stick = box.scrollTop + box.clientHeight >= box.scrollHeight - 40;
+    LOG_LINES = LOG_LINES.concat(d.lines);
+    if (LOG_LINES.length > LOG_MAX_LINES) {
+      // 到顶之后每拍重建一次已经封顶的文本；封顶前走便宜的追加。
+      LOG_LINES = LOG_LINES.slice(-LOG_MAX_LINES);
+      box.textContent = LOG_LINES.join('\n') + '\n';
+    } else {
+      box.textContent += d.lines.join('\n') + '\n';
+    }
+    if (stick) box.scrollTop = box.scrollHeight;
+  }
+  setRunUi(d.running);
+  if (d.running !== LAST_RUNNING) {
+    LAST_RUNNING = d.running;
+    if (!d.running) STOPPING = false;
+  }
+  $('runstate').textContent = d.running
+    ? (STOPPING ? '正在结束当前单元并生成报告…' : '运行中…')
+    : '已结束';
+  if (d.report) $('openreport').classList.remove('hidden');
+  if (!d.running && TIMER) { clearInterval(TIMER); TIMER = null; }
+}
+
+function startPolling() {
+  if (TIMER) clearInterval(TIMER);
+  TIMER = setInterval(poll, 1000);
+  poll();
+}
+
 async function poll() {
+  try { applyProgress(await api('/api/progress?from=' + FROM)); }
+  catch (e) { /* 轮询失败不打断界面，下一拍再试 */ }
+}
+
+// 打开页面就接上正在跑的那一轮。
+//
+// 进度是**服务端**状态：日志镜像和 running 标志都在控制台进程里，谁来问都
+// 是同一份。此前只在点「开始测试」时才起轮询，于是从别的电脑连过来、本机
+// 再开一个标签页、甚至只是按了 F5，看到的都是一个空白的进度区——而测试正
+// 跑着，最想看的时候看不见。跑完之后也接：报告路径还在，「打开报告」按钮
+// 不会因为刷新一下就消失。
+async function attachToRunningTest() {
   try {
-    const d = await api('/api/progress?from=' + FROM);
-    FROM = d.from;
-    if (d.lines.length) {
-      const box = $('log');
-      const stick = box.scrollTop + box.clientHeight >= box.scrollHeight - 40;
-      LOG_LINES = LOG_LINES.concat(d.lines);
-      if (LOG_LINES.length > LOG_MAX_LINES) {
-        // 到顶之后每拍重建一次已经封顶的文本；封顶前走便宜的追加。
-        LOG_LINES = LOG_LINES.slice(-LOG_MAX_LINES);
-        box.textContent = LOG_LINES.join('\n') + '\n';
-      } else {
-        box.textContent += d.lines.join('\n') + '\n';
-      }
-      if (stick) box.scrollTop = box.scrollHeight;
-    }
-    $('runstate').textContent = d.running ? '运行中…' : '已结束';
-    if (d.report) {
-      $('openreport').classList.remove('hidden');
-    }
-    if (!d.running) {
-      clearInterval(TIMER); TIMER = null;
-      $('stop').classList.add('hidden');
-      $('start').disabled = false; $('plan').disabled = false; $('export').disabled = false;
-    }
-  } catch (e) { /* 轮询失败不打断界面，下一拍再试 */ }
+    const d = await api('/api/progress?from=0');
+    if (!d.running && !d.lines.length) return;
+    $('progsec').classList.remove('hidden');
+    FROM = 0; LOG_LINES = []; $('log').textContent = '';
+    applyProgress(d);
+    if (d.running) startPolling();
+  } catch (e) { /* 接不上就当没跑过，「开始测试」照常可用 */ }
 }
 $('localrefresh').onclick = () => loadLocal(true);
 
@@ -716,7 +2953,14 @@ document.querySelectorAll('.tab').forEach((btn) => {
 // 和服务端的 MONITOR_MAX_POINTS 对齐。曲线、均值、峰值全部用这一个窗口，
 // 三处各用各的上限只会让并排放着的两个数对不上。
 const MON_MAX_POINTS = 7200;
-let MON = { session: null, from: 0, points: [], timer: null };
+// 和服务端的 MONITOR_MAX_SESSIONS 对齐：超了在这里就说，不要让人点完
+// 「开始」之后才逐块收到一半成功一半失败。
+const MON_MAX_SERIES = 8;
+// 每块网卡一个颜色，RX 实线、TX 虚线。八个色在深浅两套主题下都得认得出，
+// 所以不用主题变量（--accent 只有一个），钉死一组中等明度的颜色。
+const MON_COLORS = ['#1f8fd6', '#e07b1f', '#12a06a', '#cf3b46',
+                    '#8b62d4', '#0f9aa8', '#c8447f', '#7f8a1c'];
+let MON = { series: [], timer: null };
 
 function cssVar(name) {
   return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
@@ -726,33 +2970,50 @@ function cssVar(name) {
 // （见 MonitorMgr::start_owned）。界面上允许填到 60000 的话，选 10 秒时
 // agent 按 5 秒采、控制台按 10 秒取「最后一个样本」，一半样本被无声丢掉，
 // 而同样填 10 秒监控本机却是对的——同一个输入框在两个监控端下语义不同。
-// 所以上限跟着监控端走，并把它写在输入框下面。
+// 所以上限跟着**勾中的网卡**走：混着勾时按更严的那一头来。
 const AGENT_MAX_INTERVAL_MS = 5000;
 
+function monPicks() {
+  return Array.from(document.querySelectorAll('.monpick:checked'))
+    .map((el) => ({ side: el.dataset.side, iface: el.dataset.iface }));
+}
+
+// 网卡名里出现什么分隔符都不奇怪（"Wi-Fi 2"、带括号的 USB 名），
+// 所以键用 JSON 拼，不用自己挑一个"应该不会撞"的字符。
+function monKey(side, iface) { return JSON.stringify([side, iface]); }
+
 function applyIntervalLimit() {
-  const agent = $('monside').value === 'agent';
-  const max = agent ? AGENT_MAX_INTERVAL_MS : 60000;
+  const hasAgent = monPicks().some((p) => p.side === 'agent');
+  const max = hasAgent ? AGENT_MAX_INTERVAL_MS : 60000;
   const input = $('moninterval');
   input.max = max;
   if (Number(input.value) > max) input.value = max;
-  $('monintervalnote').textContent = agent
-    ? '辅测机：200–' + max + ' ms（agent 侧采样上限）'
-    : '本机：200–60000 ms';
+  $('monintervalnote').textContent = hasAgent
+    ? '勾了辅测机网卡：200–' + max + ' ms（agent 侧采样上限）'
+    : '只勾本机网卡：200–60000 ms';
 }
 
 function fillMonitorIfaces() {
-  const side = $('monside').value;
-  const list = side === 'master' ? LOCAL_NICS : ((AGENT && AGENT.interfaces) || []);
-  const sel = $('moniface');
-  const keep = sel.value;
-  if (!list.length) {
-    sel.innerHTML = '<option value="">' +
-      (side === 'agent' ? '先去「测试」标签连接辅测机' : '没扫到网卡') + '</option>';
-    return;
-  }
-  sel.innerHTML = list.map((n) => '<option value="' + esc(n.name) + '">' + esc(n.name) +
-    (n.ipv4 ? ' · ' + esc(n.ipv4) : '') + (n.role ? ' · ' + esc(n.role) : '') + '</option>').join('');
-  if (list.some((n) => n.name === keep)) sel.value = keep;
+  // 重画会丢掉勾选，而每次切回监控标签都会跑一遍这个函数。
+  const keep = new Set(monPicks().map((p) => monKey(p.side, p.iface)));
+  const running = MON.timer !== null;
+  const groups = [
+    { side: 'master', cn: '本机（主控）', list: LOCAL_NICS, empty: '没扫到网卡' },
+    { side: 'agent', cn: '辅测机', list: (AGENT && AGENT.interfaces) || [],
+      empty: '先去「测试」标签连接辅测机' },
+  ];
+  $('monpick').innerHTML = groups.map((g) => {
+    const items = g.list.length
+      ? g.list.map((n) => '<label><input type="checkbox" class="monpick" data-side="' + g.side +
+          '" data-iface="' + esc(n.name) + '"' +
+          (keep.has(monKey(g.side, n.name)) ? ' checked' : '') + (running ? ' disabled' : '') +
+          '>' + esc(n.name) + (n.ipv4 ? ' · ' + esc(n.ipv4) : '') +
+          (n.role ? ' · ' + esc(n.role) : '') + '</label>').join('')
+      : '<span class="hint">' + g.empty + '</span>';
+    return '<div class="side">' + g.cn + '</div>' + items;
+  }).join('');
+  document.querySelectorAll('.monpick').forEach((el) => { el.onchange = applyIntervalLimit; });
+  applyIntervalLimit();
 }
 
 // 只画线，不引任何图表库：这个页面零外部资源是它能塞进单 exe 的前提。
@@ -761,10 +3022,12 @@ function fillMonitorIfaces() {
 // （辅测机掉线、计数器连续读失败）会被画成一段连续等距的线，看不出中间断了——
 // 而这条曲线的用途恰恰是发现掉速和断流。同理，曲线、均值、峰值三者用的是
 // 同一个窗口（整个保留缓冲），否则读数里的峰值会高过图上最高的网格线。
+//
+// 多块网卡共用一个纵轴：不共用的话「谁把带宽吃掉了」这个问题图上答不了。
 function drawChart() {
-  const canvas = $('monchart'), points = MON.points;
+  const canvas = $('monchart');
   const ratio = window.devicePixelRatio || 1;
-  const w = canvas.clientWidth || 600, h = 180;
+  const w = canvas.clientWidth || 600, h = 220;
   if (canvas.width !== Math.round(w * ratio) || canvas.height !== Math.round(h * ratio)) {
     canvas.width = Math.round(w * ratio);
     canvas.height = Math.round(h * ratio);
@@ -772,19 +3035,31 @@ function drawChart() {
   const ctx = canvas.getContext('2d');
   ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
   ctx.clearRect(0, 0, w, h);
-  if (points.length < 2) return;
+  const showRx = $('monshowrx').checked, showTx = $('monshowtx').checked;
+  const drawn = MON.series.filter((s) => s.points.length > 1);
+  if (!drawn.length || (!showRx && !showTx)) return;
 
   const L = 46, R = w - 6, B = h - 22, T = 12;
-  const peak = Math.max(1, ...points.map((p) => Math.max(p.rx_mbps, p.tx_mbps)));
-  const t0 = points[0].t, t1 = points[points.length - 1].t;
+  let peak = 1, t0 = Infinity, t1 = -Infinity;
+  drawn.forEach((s) => {
+    s.points.forEach((p) => {
+      if (showRx && p.rx_mbps > peak) peak = p.rx_mbps;
+      if (showTx && p.tx_mbps > peak) peak = p.tx_mbps;
+      if (p.t < t0) t0 = p.t;
+      if (p.t > t1) t1 = p.t;
+    });
+  });
   const span = (t1 - t0) || 1;
   const x = (p) => L + ((p.t - t0) / span) * (R - L);
   const y = (v) => B - (v / peak) * (B - T);
 
-  ctx.strokeStyle = cssVar('--line');
-  ctx.fillStyle = cssVar('--muted');
+  // 网格/坐标标签取“屏”专用色（明暗主题下都一样）：示波屏永远是暗玻璃，
+  // 用机箱的 --line/--muted 会在深色主题下把网格画到近乎看不见。
+  ctx.strokeStyle = cssVar('--scope-grid');
+  ctx.fillStyle = cssVar('--scope-axis');
   ctx.font = '11px ui-monospace,Consolas,monospace';
   ctx.lineWidth = 1;
+  ctx.setLineDash([]);
   [0, 0.5, 1].forEach((frac) => {
     const value = peak * frac, py = Math.round(y(value)) + 0.5;
     ctx.beginPath(); ctx.moveTo(L, py); ctx.lineTo(R, py); ctx.stroke();
@@ -799,13 +3074,53 @@ function drawChart() {
   });
   ctx.textAlign = 'start';
 
-  const line = (key, color) => {
-    ctx.strokeStyle = color; ctx.lineWidth = 2; ctx.beginPath();
-    points.forEach((p, i) => (i ? ctx.lineTo(x(p), y(p[key])) : ctx.moveTo(x(p), y(p[key]))));
-    ctx.stroke();
+  const cols = Math.max(1, Math.round(R - L));
+  drawn.forEach((s) => {
+    const line = (key, dash) => {
+      const pts = reducePoints(s.points, key, t0, span, cols);
+      ctx.strokeStyle = s.color; ctx.lineWidth = 2; ctx.setLineDash(dash);
+      ctx.beginPath();
+      pts.forEach((p, i) => (i ? ctx.lineTo(x(p), y(p.v)) : ctx.moveTo(x(p), y(p.v))));
+      ctx.stroke();
+    };
+    if (showRx) line('rx_mbps', []);
+    if (showTx) line('tx_mbps', [5, 4]);
+  });
+  ctx.setLineDash([]);
+}
+
+// 把一列像素里的几十个点压成「这一列的最低点和最高点」两点。
+//
+// 8 块网卡 × 7200 点 × RX/TX = 十一万多条线段，每秒重画一次——而这台机器
+// 同时正在灌包，浏览器抢走的每一份 CPU 都可能压到峰值速率。同一像素列上的
+// 点本来就画在一起，压完在肉眼上没有区别。
+//
+// 压的是 min/max 而不是隔几个取一个：抽稀会把只持续一两拍的掉速整个丢掉，
+// 而这条曲线的用途恰恰是发现那种坑。
+function reducePoints(points, key, t0, span, cols) {
+  if (points.length <= cols * 2) {
+    return points.map((p) => ({ t: p.t, v: p[key] }));
+  }
+  const out = [];
+  let col = -1, lo = null, hi = null;
+  const flush = () => {
+    if (!lo) return;
+    if (lo.t <= hi.t) { out.push(lo); if (hi.t !== lo.t) out.push(hi); }
+    else { out.push(hi); out.push(lo); }
   };
-  line('rx_mbps', cssVar('--accent'));
-  line('tx_mbps', cssVar('--focus'));
+  points.forEach((p) => {
+    const c = Math.floor(((p.t - t0) / span) * cols);
+    const v = p[key];
+    if (c !== col) {
+      flush();
+      col = c; lo = { t: p.t, v }; hi = { t: p.t, v };
+    } else {
+      if (v < lo.v) lo = { t: p.t, v };
+      if (v > hi.v) hi = { t: p.t, v };
+    }
+  });
+  flush();
+  return out;
 }
 
 function hhmmss(secs) {
@@ -813,85 +3128,149 @@ function hhmmss(secs) {
   return m + ':' + String(s).padStart(2, '0');
 }
 
+// 每块网卡一行：当前值、均值、峰值。八条曲线挤在一张图上，光靠颜色认不出
+// 哪条是哪块口，也读不出准确数字。
+function renderLegend() {
+  const rows = MON.series.map((s) => {
+    const last = s.points[s.points.length - 1];
+    const rx = s.points.map((p) => p.rx_mbps);
+    const avg = rx.length ? rx.reduce((a, b) => a + b, 0) / rx.length : 0;
+    const peak = rx.length ? Math.max.apply(null, rx) : 0;
+    const span = s.points.length > 1 ? Math.round(last.t - s.points[0].t) : 0;
+    return '<tr><td class="name"><span class="mon-swatch" style="background:' + s.color + '"></span> ' +
+      (s.side === 'master' ? '本机' : '辅测') + ' · ' + esc(s.iface) +
+      (s.running ? '' : ' <span class="hint">（已停）</span>') + '</td>' +
+      '<td>RX ' + (last ? last.rx_mbps.toFixed(1) : '—') + '</td>' +
+      '<td>TX ' + (last ? last.tx_mbps.toFixed(1) : '—') + '</td>' +
+      '<td class="hint">均值 ' + avg.toFixed(1) + ' / 峰值 ' + peak.toFixed(1) + ' Mbps</td>' +
+      '<td class="hint">' + rx.length + ' 点 · ' + hhmmss(span) + '</td></tr>';
+  });
+  $('monlegend').querySelector('tbody').innerHTML = rows.join('');
+  $('monlegend').classList.toggle('hidden', rows.length === 0);
+}
+
 function monReset(enabled) {
   $('monstart').disabled = !enabled;
   $('monstop').disabled = enabled;
-  $('monside').disabled = !enabled;
-  $('moniface').disabled = !enabled;
   $('moninterval').disabled = !enabled;
+  document.querySelectorAll('.monpick').forEach((el) => { el.disabled = !enabled; });
 }
 
 function monFinish(text, kind) {
   if (MON.timer) clearInterval(MON.timer);
-  MON.timer = null; MON.session = null;
+  MON.timer = null;
   monReset(true);
   if (text) say($('monmsg'), text, kind || 'info');
 }
 
-async function monPoll() {
-  const session = MON.session;
-  if (!session) return;
-  try {
-    const d = await api('/api/monitor/samples?session=' +
-      encodeURIComponent(session) + '&from=' + MON.from);
-    // await 之后必须再认一次会话。服务端是并发处理的，一次采样请求完全可能
-    // 在「停掉这一路、又开了新的一路」之后才回来；照单全收会把旧会话的绝对
-    // 游标（比如 500）写进刚起步的新会话，新曲线于是空白几百个采样点，
-    // 旧点还会被接到新序列后面。
-    if (MON.session !== session) return;
-    MON.from = d.from;
-    if (d.points.length) {
-      MON.points = MON.points.concat(d.points).slice(-MON_MAX_POINTS);
-      const last = MON.points[MON.points.length - 1];
-      $('monrx').textContent = last.rx_mbps.toFixed(1) + ' Mbps';
-      $('montx').textContent = last.tx_mbps.toFixed(1) + ' Mbps';
-      const rx = MON.points.map((p) => p.rx_mbps);
-      const avg = rx.reduce((a, b) => a + b, 0) / rx.length;
-      $('monstat').textContent = avg.toFixed(1) + ' / ' + Math.max.apply(null, rx).toFixed(1) +
-        ' Mbps（最近 ' + rx.length + ' 点，' + hhmmss(Math.round(last.t - MON.points[0].t)) + '）';
-      drawChart();
-    }
-    if (d.error) say($('monmsg'), d.error, 'bad');
-    // 采样线程自己收摊了（网卡名错、辅测机掉线……）也要回收服务端那条会话，
-    // 否则每次失败都在会话表里留一条永远不会被清掉的记录。
-    if (!d.running) {
-      monFinish('采样已停止。', d.error ? 'bad' : 'info');
-      try { await api('/api/monitor/stop', { session }); } catch (e) { /* 已经没了 */ }
-    }
-  } catch (e) {
-    // 同理：迟到的失败也只能作用在它自己那一路上。
-    if (MON.session !== session) return;
-    monFinish('监控中断：' + e.message, 'bad');
+// 停掉的会话要还给服务端，否则它一直占着 8 个名额里的一个（辅测机侧那路
+// 还占着对面的采样线程，直到租约到期）。
+async function monStopSessions(sessions) {
+  for (const session of sessions) {
+    try { await api('/api/monitor/stop', { session }); } catch (e) { /* 已经没了 */ }
   }
 }
 
-$('monside').onchange = () => { fillMonitorIfaces(); applyIntervalLimit(); };
+async function monPoll() {
+  const gen = MON;
+  const live = gen.series.filter((s) => s.running);
+  if (!live.length) return;
+  try {
+    // 一次问完全部：浏览器对同一个源的并发连接就那么几条，八路各发一个请求
+    // 会把它占满，运行进度那一路的日志开始一秒一顿。
+    const d = await api('/api/monitor/samples', {
+      cursors: live.map((s) => ({ session: s.session, from: s.from })),
+    });
+    // await 之后必须再认一次这一代会话。服务端是并发处理的，一次采样请求
+    // 完全可能在「停掉这一批、又开了新的一批」之后才回来；照单全收会把旧
+    // 会话的绝对游标写进刚起步的新曲线，新图于是空白几百个采样点。
+    if (MON !== gen) return;
+    const dead = [];
+    (d.series || []).forEach((row) => {
+      const s = gen.series.find((item) => item.session === row.session);
+      if (!s) return;
+      s.from = row.from;
+      // push + splice 而不是 concat + slice：后者每拍给每条曲线重建一个
+      // 7200 元素的数组，八条曲线就是每秒五万多次拷贝，而这台机器正在灌包。
+      row.points.forEach((point) => s.points.push(point));
+      if (s.points.length > MON_MAX_POINTS) {
+        s.points.splice(0, s.points.length - MON_MAX_POINTS);
+      }
+      s.error = row.error || '';
+      if (s.running && !row.running) { s.running = false; dead.push(s.session); }
+    });
+    renderLegend();
+    drawChart();
+    const failed = gen.series.filter((s) => s.error);
+    if (failed.length) {
+      say($('monmsg'), failed.map((s) => s.iface + '：' + s.error).join('；'), 'bad');
+    }
+    // 某一路自己收摊了（网卡被拔、辅测机掉线）不影响其余各路继续画。
+    if (dead.length) await monStopSessions(dead);
+    if (!gen.series.some((s) => s.running)) {
+      monFinish(failed.length ? '全部采样已停止（原因见上）。' : '采样已停止。',
+        failed.length ? 'bad' : 'info');
+    }
+  } catch (e) {
+    // 同理：迟到的失败也只能作用在它自己那一代上。
+    if (MON !== gen) return;
+    monFinish('监控中断：' + e.message, 'bad');
+    await monStopSessions(gen.series.map((s) => s.session));
+  }
+}
+
+$('monshowrx').onchange = drawChart;
+$('monshowtx').onchange = drawChart;
 
 $('monstart').onclick = async () => {
-  const side = $('monside').value, iface = $('moniface').value;
-  if (!iface) { say($('monmsg'), '先选一块网卡。', 'bad'); return; }
-  try {
-    const d = await api('/api/monitor/start', {
-      side, iface, interval_ms: Number($('moninterval').value) || 1000,
-    });
-    MON = { session: d.session, from: 0, points: [], timer: null };
-    monReset(false);
-    say($('monmsg'), '监控中：' + (side === 'master' ? '本机' : '辅测机') + ' / ' + iface, 'ok');
-    MON.timer = setInterval(monPoll, 1000);
-    monPoll();
-  } catch (e) { say($('monmsg'), e.message, 'bad'); }
+  const picks = monPicks();
+  if (!picks.length) { say($('monmsg'), '先勾至少一块网卡。', 'bad'); return; }
+  if (picks.length > MON_MAX_SERIES) {
+    say($('monmsg'), '最多同时看 ' + MON_MAX_SERIES + ' 块网卡，现在勾了 ' + picks.length + ' 块。', 'bad');
+    return;
+  }
+  const interval = Number($('moninterval').value) || 1000;
+  monReset(false);
+  say($('monmsg'), '正在起 ' + picks.length + ' 路采样…', 'info');
+  const started = [], failed = [];
+  for (const pick of picks) {
+    try {
+      const d = await api('/api/monitor/start',
+        { side: pick.side, iface: pick.iface, interval_ms: interval });
+      started.push({
+        session: d.session, side: pick.side, iface: pick.iface,
+        from: 0, points: [], running: true, error: '',
+        color: MON_COLORS[started.length % MON_COLORS.length],
+      });
+    } catch (e) { failed.push(pick.iface + '：' + e.message); }
+  }
+  if (!started.length) {
+    monFinish('一路都没起来。' + failed.join('；'), 'bad');
+    return;
+  }
+  // 整个 MON 换成新对象，迟到的上一代响应靠对象身份挡掉。
+  MON = { series: started, timer: null };
+  renderLegend();
+  drawChart();
+  say($('monmsg'), '监控中：' + started.length + ' 块网卡' +
+    (failed.length ? '。起不来的：' + failed.join('；') : ''), failed.length ? 'bad' : 'ok');
+  MON.timer = setInterval(monPoll, 1000);
+  monPoll();
 };
 
 $('monstop').onclick = async () => {
-  const session = MON.session;
+  const sessions = MON.series.map((s) => s.session);
+  MON.series.forEach((s) => { s.running = false; });
   monFinish('已停止。曲线保留在这里，重新开始会清空。');
-  if (session) {
-    try { await api('/api/monitor/stop', { session }); } catch (e) { /* 会话本来就没了 */ }
-  }
+  renderLegend();
+  await monStopSessions(sessions);
 };
 
-window.addEventListener('resize', () => { if (MON.points.length) drawChart(); });
+window.addEventListener('resize', () => { if (MON.series.some((s) => s.points.length)) drawChart(); });
 
+// 快速工作台先显示空状态；连接成功后 syncQuickSets 会填入实际跨机链路。
+ensureQuickDefaults();
+renderQuickWorkspace();
 bootstrap();
 loadLocal();
 </script>

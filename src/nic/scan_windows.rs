@@ -107,16 +107,18 @@ fn default_gateways_v4() -> HashMap<u32, String> {
 
         let t = &*table;
         let rows = std::slice::from_raw_parts(t.Table.as_ptr(), t.NumEntries as usize);
-        let gateways = select_default_gateways_v4(rows.iter().filter_map(|row| {
-            (row.DestinationPrefix.PrefixLength == 0).then(|| {
-                (
-                    row.InterfaceIndex,
-                    row.Metric,
-                    Ipv4Addr::from(row.DestinationPrefix.Prefix.Ipv4.sin_addr),
-                    Ipv4Addr::from(row.NextHop.Ipv4.sin_addr),
-                )
-            })
-        }));
+        let gateways = select_default_gateways_v4(
+            rows.iter()
+                .filter(|row| row.DestinationPrefix.PrefixLength == 0)
+                .map(|row| {
+                    (
+                        row.InterfaceIndex,
+                        row.Metric,
+                        Ipv4Addr::from(row.DestinationPrefix.Prefix.Ipv4.sin_addr),
+                        Ipv4Addr::from(row.NextHop.Ipv4.sin_addr),
+                    )
+                }),
+        );
         FreeMibTable(table as *const _);
         gateways
     }

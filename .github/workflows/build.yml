@@ -81,14 +81,14 @@ jobs:
           from pathlib import Path
           from zipfile import ZipFile
 
-          bundle = Path("dist/cpe_test-v4.4.0-windows-config-docs.zip")
+          bundle = Path("dist/cpe_test-v4.5.0-windows-config-docs.zip")
           checksum = Path(f"{bundle}.sha256")
           expected_hash = checksum.read_text(encoding="utf-8").split()[0]
           actual_hash = sha256(bundle.read_bytes()).hexdigest()
           if actual_hash != expected_hash:
               raise SystemExit(f"bundle SHA-256 mismatch: {actual_hash}")
 
-          prefix = "cpe_test-v4.4.0-windows-config-docs"
+          prefix = "cpe_test-v4.5.0-windows-config-docs"
           source_for = {
               "Windows配置与文档包说明.md": Path("dist/Windows配置与文档包说明.md"),
               "README.md": Path("README.md"),
@@ -536,6 +536,21 @@ jobs:
           make_latest: true
           body: |
             cpe_test ${{ github.ref_name }} 的已验证跨平台发布包。
+
+            ## v4.5.0 快速测试计划工作台、参数组与判定去掩盖
+
+            - **快速测试计划工作台**：控制台默认进入「链路集合 → 流量套件 → 分配 → 复核」流程，一次配置 20 对以上网口不再靠逐行点矩阵。套件里的 TCP、UDP、PING 是**协议独立的任务**：「TCP+UDP」表示按 `TCP → UDP` 连续执行，不是混合并发，也不会合并成一个 Unit。执行粒度是每个具体网口对——同一对先按套件顺序跑完，再换下一对；多个绑定按 `order` 依次处理。每个任务可单独选方向和 IP，所以「TCP A→B、UDP B→A」不必复制矩阵行。需要逐行控制时切回「高级矩阵」，旧 `pairs` 和 `config.json` 全部照常可用。
+            - **项目与执行配置分离**：工作台可导出/导入 `cpe-ui-project.json`（链路集合、套件、稳定 ID、绑定关系，不含 token）；「下载 config.json」仍输出可交给 `master --auto` 的扁平执行配置。边界是明确的而不是靠猜：绑定只支持 `mode: "replace"`，`append` 在预览前直接拒绝；PING 任务当前不支持配方引用，非空 `recipe_ids` 会被拒绝，不会出现「界面显示选了配方、实际用的是默认值」。
+            - **服务端计划追踪**：`/api/plan` 返回真正展开的单元、层级 sections/trace、参数覆盖后的预览、`plan_hash` 和拓扑指纹；点「开始测试」时过期计划会被拒绝并要求重新预览，网口刷新后不会误跑旧分配。网卡消失的端点标成「端点已消失」——未参与当前分配的只提示，已绑定的必须先刷新或移除。
+            - **UDP / TCP 参数组**：一轮里常有几对要 `-b 2500m` 单流、另外几对要 1000m/500m 四流，而一份档位是所有勾中的配对一起扫的——以前只能分两轮跑、出两份报告。现在矩阵上方可定义若干组参数，每行选用哪一组。**每组都是完整定义**（组里 `-l` 留空就是不下发 `-l`，不是继承默认组），因为「留空等于继承谁」这种差量语义填错了在界面上看不出来。优先级「网口 > 参数组」直接标在那一行下面，不用背。
+            - **「预览任务」逐单元列出最终生效的参数**：每条腿真正下发的 `-b` / `-l` / `-w` / 流数（双向两条腿分开列），`-b` 按 Mbps 显示。这是链路裁剪和覆盖优先级都算完之后的值，直接取自要交给 iperf3 的那份参数，不另算一遍。另加量纲护栏：`-b` 折合超过 400Gbps 当场报错并说明单位怎么写。
+            - **一条腿判不了不再一律掩盖另一条腿的 FAIL**：聚合优先级里 `NOT_EVALUATED` 排在 `RATE_FAIL` 前面，于是双向单元里 B→A 明明判了不达标，只要 A→B 没判成，单元就报「无法评价」，概览的失败数里也看不到它。现在按**为什么判不了**分两类：采样/时间轴不可信（覆盖率不足、计数器停滞、有效窗口太短、网卡消失）继续掩盖——两条腿跑在同一段时间窗里，那段采样塌了另一条腿的数同样可疑；腿内局部的配置问题（`CONFIGURED_LOAD_TOO_LOW` / `OFFERED_LOAD_LOW` / `TARGET_MISSING`）不再掩盖，单元按 `RATE_FAIL` 报。
+            - **灌不够不再掩盖确凿的不达标**：`OFFERED_LOAD_LOW` 原来只看发送端有没有达到「门限+5% 余量」，于是「门限 1000、`-b 1000m`、实收 580」被判成判不了——那 5% 的发送缺口解释不了 420 的接收缺口。现在这道闸加了前提：只有接收端确实跟上了发送端（收到的 ≥ 发出的 95%）才算判不了。要判**达标**仍然必须灌够，灌不够最好的结果依然是「判不了」，拿不到 PASS。
+            - **UDP 裁剪上限逐类校准**：`RNDIS` 改为跟自己报的协商速率（实测 3700），不再压到 CPE 子网那档——把能跑 3.7G 的口当 2.5G 用，灌包强度凭空少三分之一；`SGMII2.5G` 从 2500 提到 2600（`cpe_path_ceiling_mbps`），这类口的常规档位就是 `-b 2.6G`。`10GUSB`(NCM) 报的 4.2G 是已知驱动显示问题，仍按 10G。这张表只影响裁剪，**不参与 PASS/FAIL**。
+            - **控制台/状态页弹出的是能打开的地址**：绑到 `0.0.0.0` / `::` 时，此前打印和自动弹给浏览器的是监听地址原文，而 Chrome 133 起直接拦掉对 `0.0.0.0` 的请求，口令又就在那串 URL 里。现在显示对应的回环地址，另加一行「从别的电脑访问怎么改」。
+            - **速率监控支持多块网卡**：最多同时 8 块，两端的口列在同一张图上按同一纵轴比较；曲线按像素列做 min/max 压缩（不是抽稀，一两拍的掉速必须保得住），macOS 上多路共用一次 `netstat -ibn`，不在灌包最忙时每秒 fork 八个子进程。
+            - **config.json 可以导回界面**：门限、档位、配对与方向全部回填到原处，只回填不执行；文件里表示不了的东西逐条点名而不是默默少勾一行。
+            - **回归覆盖**：单元测试 452 → 490。
 
             ## v4.4.0 双向门限、控制台监控与一批生命周期修复
 

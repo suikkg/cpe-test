@@ -203,8 +203,16 @@ pub fn spawn(
             return;
         }
     };
-    let url = format!("http://{addr}");
+    // 打印的是能打开的地址，不是监听地址原文：`--ui-bind 0.0.0.0` 时
+    // `http://0.0.0.0:28802` 在新版 Chrome 上直接被拦，见 `display_addr`。
+    let url = format!(
+        "http://{}",
+        crate::master::webui::display_addr(ui_bind, port)
+    );
     println!("辅测机状态页: {url}");
+    if crate::master::webui::bind_is_wildcard(ui_bind) {
+        println!("从别的电脑访问：把地址里的主机名换成本机上面列出的某个 IP，端口照抄。");
+    }
     if !crate::master::webui::bind_is_loopback(ui_bind) {
         // 状态页全是只读 GET，放开的后果止于「网卡列表、IP、主机名、
         // 有没有配 token」被同网段看见——比控制台轻得多，所以这里是提示

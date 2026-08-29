@@ -1443,21 +1443,40 @@ pub fn build_units(
                                     ));
                                 }
                                 let tcp_streams = spec.effective_tcp_streams();
-                                for w in &spec.tcp_windows {
-                                    let pname = format!("tcp_w{}_P{}", w, tcp_streams);
-                                    let plabel = format!("TCP -w {} -P {}", w, tcp_streams);
-                                    for (s, d, _tag) in &pairs {
-                                        if let Some(msg) = oversized_socket_buffer_notice(
-                                            &spec.name,
-                                            &plabel,
-                                            w,
-                                            tcp_streams,
-                                            spec.duration,
-                                            s,
-                                            d,
-                                            &spec.rate_check,
-                                        ) {
-                                            notices.push(msg);
+                                // 空的 -w 档位列表 = 跑一条不带 -w 的 TCP（附加 TCP
+                                // 参数组把 -w 留空时会这样）。默认组经过 non_empty
+                                // 兜底、老配置也总有窗口，都不会走到 None 这一支，
+                                // 行为与从前逐字一致。
+                                let windows: Vec<Option<&String>> = if spec.tcp_windows.is_empty() {
+                                    vec![None]
+                                } else {
+                                    spec.tcp_windows.iter().map(Some).collect()
+                                };
+                                for w in windows {
+                                    let (pname, plabel) = match w {
+                                        Some(w) => (
+                                            format!("tcp_w{}_P{}", w, tcp_streams),
+                                            format!("TCP -w {} -P {}", w, tcp_streams),
+                                        ),
+                                        None => (
+                                            format!("tcp_noW_P{}", tcp_streams),
+                                            format!("TCP -P {}", tcp_streams),
+                                        ),
+                                    };
+                                    if let Some(w) = w {
+                                        for (s, d, _tag) in &pairs {
+                                            if let Some(msg) = oversized_socket_buffer_notice(
+                                                &spec.name,
+                                                &plabel,
+                                                w,
+                                                tcp_streams,
+                                                spec.duration,
+                                                s,
+                                                d,
+                                                &spec.rate_check,
+                                            ) {
+                                                notices.push(msg);
+                                            }
                                         }
                                     }
                                     let mut legs = Vec::new();
@@ -1490,12 +1509,17 @@ pub fn build_units(
                                             dst: (*d).clone(),
                                             port: alloc_port(next_port),
                                             duration: spec.duration,
-                                            extra: vec![
-                                                "-w".into(),
-                                                w.clone(),
-                                                "-P".into(),
-                                                tcp_streams.to_string(),
-                                            ],
+                                            extra: match w {
+                                                Some(w) => vec![
+                                                    "-w".into(),
+                                                    w.clone(),
+                                                    "-P".into(),
+                                                    tcp_streams.to_string(),
+                                                ],
+                                                None => {
+                                                    vec!["-P".into(), tcp_streams.to_string()]
+                                                }
+                                            },
                                             stream_idx: 0,
                                             rate_mode: effective_mode,
                                             rx_target_mbps: target,
@@ -3490,8 +3514,53 @@ mod tests {
         );
     }
 
+    /// 档位里没有 `-l` / `-w` 时，命令里就不该出现它们。
+    ///
+    /// 「不指定」和「指定成 iperf3 的默认值」在报告里读起来是两件事：前者说明
+    /// 这一轮没碰报文长度，后者是一个具体的测试条件。替人填一个默认值，等于
+    /// 把没做过的选择写成做过。
     #[test]
-    fn test_rndis_3700_is_capped_to_2500_payload() {
+    fn a_profile_without_length_or_window_emits_no_such_flags() {
+        let mut spec = base_spec();
+        spec.transports = vec!["udp".into()];
+        spec.udp_profiles = vec![UdpProfile::bw("500m")];
+        let mut port = PORT_BASE;
+        let (units, _) = build_units(&[spec], true, &mut port);
+        let extra = udp_extra(&units[0].legs[0].kind);
+        assert!(extra.contains(&"-b".to_string()), "{extra:?}");
+        assert!(!extra.contains(&"-l".to_string()), "{extra:?}");
+        assert!(!extra.contains(&"-w".to_string()), "{extra:?}");
+
+        // 填了就要原样出现，别在「不下发」的实现里把「下发」一起弄丢。
+        let mut spec = base_spec();
+        spec.transports = vec!["udp".into()];
+        spec.udp_profiles = vec![UdpProfile {
+            bandwidth: "500m".into(),
+            length: Some("1200".into()),
+            window: Some("1m".into()),
+        }];
+        let mut port = PORT_BASE;
+        let (units, _) = build_units(&[spec], true, &mut port);
+        let extra = udp_extra(&units[0].legs[0].kind);
+        assert!(extra.windows(2).any(|w| w == ["-l", "1200"]), "{extra:?}");
+        assert!(extra.windows(2).any(|w| w == ["-w", "1m"]), "{extra:?}");
+    }
+
+    /// 单流走 `IperfSingle`、多流走 `IperfGroup`，取参数时别只认其中一种。
+    fn udp_extra(kind: &LegKind) -> Vec<String> {
+        match kind {
+            LegKind::IperfSingle(task) => task.extra.clone(),
+            LegKind::IperfGroup { streams, .. } => streams[0].extra.clone(),
+            other => panic!("expect an iperf leg, got {other:?}"),
+        }
+    }
+
+    /// RNDIS 按它自己报的协商速率裁，不再压到 CPE 子网那一档。
+    ///
+    /// 3700 / 500 = 7.4 -> 7 条流。压到 2500 会得到 5 条——那是把一块能跑
+    /// 3.7G 的口当成 2.5G 用，灌包强度凭空少三分之一。
+    #[test]
+    fn rndis_is_clipped_by_its_own_negotiated_rate() {
         let mut spec = base_spec();
         spec.src = ep(Side::Master, "usb", "RNDIS", "192.168.1.2", 3700);
         spec.dst = ep(Side::Agent, "10g", "10GETH", "192.168.1.3", 10000);
@@ -3502,7 +3571,27 @@ mod tests {
         let (units, notices) = build_units(&[spec], true, &mut port);
         assert!(notices.is_empty());
         match &units[0].legs[0].kind {
-            LegKind::IperfGroup { streams, .. } => assert_eq!(streams.len(), 5),
+            LegKind::IperfGroup { streams, .. } => assert_eq!(streams.len(), 7),
+            _ => panic!("expect group"),
+        }
+    }
+
+    /// 10GUSB(NCM) 报的 4.2G 是驱动显示问题，仍按 10G 裁——它和 RNDIS
+    /// 走的是两条规则，别在重构里被合并成一条。
+    #[test]
+    fn ncm_keeps_the_ten_gig_ceiling_despite_its_bogus_negotiated_rate() {
+        let mut spec = base_spec();
+        spec.src = ep(Side::Master, "usb", "10GUSB", "192.168.1.2", 4200);
+        spec.dst = ep(Side::Agent, "10g", "10GETH", "192.168.1.3", 10000);
+        spec.transports = vec!["udp".into()];
+        spec.streams = 12;
+        spec.udp_profiles = vec![UdpProfile::bw("1000m")];
+        let mut port = PORT_BASE;
+        let (units, _) = build_units(&[spec], true, &mut port);
+        match &units[0].legs[0].kind {
+            LegKind::IperfGroup { streams, .. } => {
+                assert_eq!(streams.len(), 10, "按 4200 裁会只剩 4 条流")
+            }
             _ => panic!("expect group"),
         }
     }

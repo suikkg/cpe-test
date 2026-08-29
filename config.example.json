@@ -74,7 +74,7 @@
       "discovery_step_secs": 10,
       "evb_usb_to_eth_target_mbps": 6400,
       "evb_eth_to_usb_target_mbps": 8400,
-      "cpe_path_ceiling_mbps": 2500,
+      "cpe_path_ceiling_mbps": 2600,
       "_wifi_ceilings": "WiFi 的负载上限不跟协商速率（那是会来回跳的 PHY 速率）。5G/6G 用 wifi_payload_ceiling_mbps，2.4G 单列 wifi_24g_payload_ceiling_mbps——2.4GHz 只有 3 个不重叠信道、最多 40MHz，够不到 5G 的档。频段没识别出来的 WIFI 按 5G 档处理。",
       "wifi_payload_ceiling_mbps": 2800,
       "wifi_24g_payload_ceiling_mbps": 574,

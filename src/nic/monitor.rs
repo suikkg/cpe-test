@@ -86,8 +86,41 @@ pub fn read_rx_bytes(iface: &str) -> Result<u64, String> {
 fn counters_macos(iface: &str) -> Result<(u64, u64), String> {
     use crate::util::run_cmd;
     use std::time::Duration;
-    let out = run_cmd("netstat", &["-ibn"], Duration::from_secs(10));
-    parse_netstat_counters(&out.stdout, iface)
+    let text = cached_netstat(&NETSTAT_CACHE, NETSTAT_CACHE_TTL, || {
+        run_cmd("netstat", &["-ibn"], Duration::from_secs(10)).stdout
+    });
+    parse_netstat_counters(&text, iface)
+}
+
+/// 一次 `netstat -ibn` 的输出对**所有**接口都有效，所以并发的采样线程共用一份。
+///
+/// 一路监控对一次 fork 时这不是问题；控制台现在允许同时看 8 块网卡，同一拍就是
+/// 8 个子进程，而在 macOS 上这份开销恰好落在灌包最忙的时候（见
+/// `counter_source_caveat`）。窗口取最小采样间隔的一半：同一拍里的几路必然
+/// 共用同一次读数，跨拍必然重取——不会把上一拍的计数当成这一拍的，
+/// 那会让速率算出 0。
+#[cfg(any(target_os = "macos", test))]
+const NETSTAT_CACHE_TTL: Duration = Duration::from_millis(100);
+#[cfg(target_os = "macos")]
+static NETSTAT_CACHE: Mutex<Option<(Instant, String)>> = Mutex::new(None);
+
+/// 带时间窗的共享读数。整个「查缓存 → 取数 → 写缓存」都在锁里：同一拍的几路
+/// 里只有第一路真的去取，其余几路等它写完直接拿走，而不是各取一次。
+#[cfg(any(target_os = "macos", test))]
+fn cached_netstat<F: FnOnce() -> String>(
+    cache: &Mutex<Option<(Instant, String)>>,
+    ttl: Duration,
+    fetch: F,
+) -> String {
+    let mut cache = crate::util::lock_recover(cache);
+    if let Some((at, text)) = cache.as_ref() {
+        if at.elapsed() < ttl {
+            return text.clone();
+        }
+    }
+    let text = fetch();
+    *cache = Some((Instant::now(), text.clone()));
+    text
 }
 
 /// netstat -ibn 的 <Link#N> 行含全接口计数；
@@ -770,6 +803,34 @@ fn rewrite_csv_with_header(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 同一拍里的几路监控共用一次读数，跨拍必须重取。
+    ///
+    /// 共用是为了别在 macOS 上同一秒 fork 出八个 netstat（那份开销正好落在
+    /// 灌包最忙的时候）；跨拍重取是正确性：拿上一拍的计数算这一拍的速率，
+    /// 差值是 0，曲线上就是一条假的掉底。
+    #[test]
+    fn concurrent_samplers_share_one_read_but_not_across_ticks() {
+        let cache: Mutex<Option<(Instant, String)>> = Mutex::new(None);
+        let reads = AtomicU64::new(0);
+        let fetch = || {
+            reads.fetch_add(1, Ordering::SeqCst);
+            format!("read-{}", reads.load(Ordering::SeqCst))
+        };
+
+        // 同一拍：八路只该真的读一次。
+        for _ in 0..8 {
+            assert_eq!(cached_netstat(&cache, NETSTAT_CACHE_TTL, fetch), "read-1");
+        }
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+
+        // 窗口过掉之后必须重取，不能把上一拍的计数当成这一拍的。
+        assert_eq!(
+            cached_netstat(&cache, Duration::from_nanos(0), fetch),
+            "read-2"
+        );
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+    }
 
     fn fake_entry(owner_id: &str, lease_secs: u64, age: Duration) -> MonEntry {
         let t0 = Instant::now() - age;

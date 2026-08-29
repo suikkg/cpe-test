@@ -254,7 +254,13 @@ pub struct RateCheckCfg {
     /// 兼容旧字段 evb_usb_rx_target_mbps（以 USB 接收方向命名）。
     #[serde(alias = "evb_usb_rx_target_mbps")]
     pub evb_eth_to_usb_target_mbps: f64,
-    /// RNDIS/SGMII2.5G/受限 CPE 子网的默认负载上限，不直接作为 PASS 目标。
+    /// SGMII2.5G（以及同量级的受限 CPE 子网口）的负载上限，不直接作为 PASS 目标。
+    ///
+    /// 默认 2600 而不是协商速率 2500：这类口的常规档位就是 `-b 2.6G`，上限压在
+    /// 2500 会把每一轮常规灌包都裁一刀，而「裁剪」本意是拦住离谱值、不是修正
+    /// 正常量级。和 Wi-Fi 那档 2800「恰好容得下 2.6G」是同一个用意。
+    ///
+    /// RNDIS 不再走这一档（它跟协商速率，见 `rate::nic_payload_ceiling_mbps`）。
     pub cpe_path_ceiling_mbps: f64,
     /// WiFi 网卡的负载上限，**不跟随协商速率**。
     ///
@@ -298,7 +304,7 @@ impl Default for RateCheckCfg {
             discovery_step_secs: 10,
             evb_usb_to_eth_target_mbps: 6400.0,
             evb_eth_to_usb_target_mbps: 8400.0,
-            cpe_path_ceiling_mbps: 2500.0,
+            cpe_path_ceiling_mbps: 2600.0,
             wifi_payload_ceiling_mbps: 2800.0,
             wifi_24g_payload_ceiling_mbps: 574.0,
             max_udp_loss_pct: None,
@@ -375,7 +381,7 @@ pub struct LinkProfiles {
     pub by_nic: Vec<NicProfile>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UdpProfile {
     pub bandwidth: String,
     #[serde(default)]
@@ -772,6 +778,57 @@ mod tests {
             "最小配置不应触发任何校验告警: {:?}",
             cfg.validate()
         );
+    }
+
+    /// `config.example.json` 是"完整字段面"的参考件，用户会整份抄走。
+    ///
+    /// 它必须能被真正的加载路径解析、通过校验，而且那几个**参考值**不能落后于
+    /// 代码里的默认值——这份文件里写的数就是用户以为的默认值。抄一份把上限
+    /// 钉死在旧数上，等于悄悄撤销一次校准（`cpe_path_ceiling_mbps` 2500 → 2600
+    /// 那次就是这样漏掉的）。改默认值时这条测试会把这份文件一起拽上。
+    #[test]
+    fn shipped_example_config_parses_and_keeps_the_reference_values_current() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config.example.json");
+        let cfg = load_from(&path).expect("config.example.json 必须能被真正的加载路径解析");
+        assert!(
+            cfg.validate().is_empty(),
+            "示例配置不应触发任何校验告警: {:?}",
+            cfg.validate()
+        );
+
+        let defaults = RateCheckCfg::default();
+        for (label, shipped, expected) in [
+            (
+                "cpe_path_ceiling_mbps",
+                cfg.iperf.rate_check.cpe_path_ceiling_mbps,
+                defaults.cpe_path_ceiling_mbps,
+            ),
+            (
+                "wifi_payload_ceiling_mbps",
+                cfg.iperf.rate_check.wifi_payload_ceiling_mbps,
+                defaults.wifi_payload_ceiling_mbps,
+            ),
+            (
+                "wifi_24g_payload_ceiling_mbps",
+                cfg.iperf.rate_check.wifi_24g_payload_ceiling_mbps,
+                defaults.wifi_24g_payload_ceiling_mbps,
+            ),
+            (
+                "evb_usb_to_eth_target_mbps",
+                cfg.iperf.rate_check.evb_usb_to_eth_target_mbps,
+                defaults.evb_usb_to_eth_target_mbps,
+            ),
+            (
+                "evb_eth_to_usb_target_mbps",
+                cfg.iperf.rate_check.evb_eth_to_usb_target_mbps,
+                defaults.evb_eth_to_usb_target_mbps,
+            ),
+        ] {
+            assert_eq!(
+                shipped, expected,
+                "config.example.json 里的 {label} 落后于代码默认值，改默认值时要一起改这份参考件"
+            );
+        }
     }
 
     #[test]
