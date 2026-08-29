@@ -11,6 +11,8 @@
 //! 因此把词汇表和聚合规则收敛到这一个模块：executor 与 report 都依赖它，
 //! report 只负责渲染，不再自带一份判定逻辑。
 
+use crate::reason::ReasonCode;
+
 /// 单个测试方向/执行行的结果分级。
 ///
 /// 取值口径见 `UDP并发灌包验收场景.md` 第二节；顺序不代表优先级，
@@ -80,16 +82,67 @@ impl ExecutionStatus {
     }
 }
 
+/// 一次判定的完整结论：**判什么 + 为什么 + 说给人听的那句话**。
+///
+/// 这三样此前是一个 `(Verdict, ReasonCode, String)` 裸元组，在七八个函数之间
+/// 按位置传递。位置传参在这里特别危险：三个字段里有两个是判定语义，写反了
+/// 编译器不会拦，报告上却会变成「原因码和明细对不上」——报告层为此专门有一
+/// 层 `metric_reason_mismatch` 兜底，兜的正是这个错。
+///
+/// 它只描述**结论**，不含任何测量值和执行状态：产出它的函数因此可以是纯函数，
+/// 拿一份「已经确定的事实」就能单测，不需要起进程、连对端。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct VerdictResult {
+    pub verdict: Verdict,
+    pub code: ReasonCode,
+    pub detail: String,
+}
+
+impl VerdictResult {
+    pub fn new(verdict: Verdict, code: ReasonCode, detail: impl Into<String>) -> Self {
+        Self {
+            verdict,
+            code,
+            detail: detail.into(),
+        }
+    }
+
+    /// 通过。通过不需要原因码，也不需要解释。
+    pub fn pass() -> Self {
+        Self {
+            verdict: Verdict::Pass,
+            code: ReasonCode::None,
+            detail: String::new(),
+        }
+    }
+
+    pub fn rate_fail(code: ReasonCode, detail: impl Into<String>) -> Self {
+        Self::new(Verdict::RateFail, code, detail)
+    }
+
+    pub fn not_evaluated(code: ReasonCode, detail: impl Into<String>) -> Self {
+        Self::new(Verdict::NotEvaluated, code, detail)
+    }
+
+    pub fn measured(code: ReasonCode, detail: impl Into<String>) -> Self {
+        Self::new(Verdict::Measured, code, detail)
+    }
+
+    pub fn setup_error(code: ReasonCode, detail: impl Into<String>) -> Self {
+        Self::new(Verdict::SetupError, code, detail)
+    }
+}
+
 /// 单流 UDP 在每轮清理均已确认的前提下耗尽全部尝试仍无工具测量。
 ///
 /// 这是用户指定的硬失败：该方向"必须灌通"，因此它不能被另一方向普通的
 /// `NOT_EVALUATED`（采样不足、目标缺失等）掩盖。
-pub const HARD_SINGLE_UDP_FAILURE_CODES: [&str; 2] = [
-    "SINGLE_UDP_STREAM_FAILED",
-    "CTSTRAFFIC_SINGLE_UDP_STREAM_FAILED",
+pub const HARD_SINGLE_UDP_FAILURE_CODES: [ReasonCode; 2] = [
+    ReasonCode::SingleUdpStreamFailed,
+    ReasonCode::CtsSingleUdpStreamFailed,
 ];
 
-pub fn is_hard_single_udp_failure(verdict: Verdict, reason_code: &str) -> bool {
+pub fn is_hard_single_udp_failure(verdict: Verdict, reason_code: ReasonCode) -> bool {
     verdict == Verdict::RateFail && HARD_SINGLE_UDP_FAILURE_CODES.contains(&reason_code)
 }
 
@@ -107,14 +160,14 @@ pub fn is_hard_single_udp_failure(verdict: Verdict, reason_code: &str) -> bool {
 ///
 /// 名单只放"确定安全"的三个，其余一律按老行为盖住：这里放宽一个码，
 /// 对应的就是一批历史上判「无法评价」的单元变成 `RATE_FAIL`。
-pub const LEG_LOCAL_NOT_EVALUATED_CODES: [&str; 3] = [
-    "CONFIGURED_LOAD_TOO_LOW",
-    "OFFERED_LOAD_LOW",
-    "TARGET_MISSING",
+pub const LEG_LOCAL_NOT_EVALUATED_CODES: [ReasonCode; 3] = [
+    ReasonCode::ConfiguredLoadTooLow,
+    ReasonCode::OfferedLoadLow,
+    ReasonCode::TargetMissing,
 ];
 
 /// 这一条 `NOT_EVALUATED` 会不会盖住别的腿的结论。
-fn blocks_other_legs(verdict: Verdict, reason_code: &str) -> bool {
+fn blocks_other_legs(verdict: Verdict, reason_code: ReasonCode) -> bool {
     verdict == Verdict::NotEvaluated && !LEG_LOCAL_NOT_EVALUATED_CODES.contains(&reason_code)
 }
 
@@ -134,11 +187,11 @@ fn blocks_other_legs(verdict: Verdict, reason_code: &str) -> bool {
 /// 7. 任一 `MEASURED`；
 /// 8. 含 `SKIP` —— 整体按跳过计，不计入通过率；
 /// 9. 全部 `PASS` —— 才是 `PASS`。
-pub fn aggregate_verdict<'a, I>(items: I) -> Verdict
+pub fn aggregate_verdict<I>(items: I) -> Verdict
 where
-    I: IntoIterator<Item = (Verdict, &'a str)>,
+    I: IntoIterator<Item = (Verdict, ReasonCode)>,
 {
-    let items: Vec<(Verdict, &str)> = items.into_iter().collect();
+    let items: Vec<(Verdict, ReasonCode)> = items.into_iter().collect();
     if items.is_empty() {
         return Verdict::SetupError;
     }
@@ -150,13 +203,13 @@ where
     }
     if items
         .iter()
-        .any(|(verdict, code)| is_hard_single_udp_failure(*verdict, code))
+        .any(|(verdict, code)| is_hard_single_udp_failure(*verdict, *code))
     {
         return Verdict::RateFail;
     }
     if items
         .iter()
-        .any(|(verdict, code)| blocks_other_legs(*verdict, code))
+        .any(|(verdict, code)| blocks_other_legs(*verdict, *code))
     {
         return Verdict::NotEvaluated;
     }
@@ -179,93 +232,137 @@ where
 ///
 /// 刻意**不改动任何原有码**：码进 RESUME 数据库、进用户既有认知、进自动化断言，
 /// 改一个字都是破坏性变更。这里只在渲染层加一层派生。
-pub fn disposition_advice(reason_code: &str) -> Option<&'static str> {
+pub fn disposition_advice(reason_code: ReasonCode) -> Option<&'static str> {
     let advice = match reason_code {
         // —— 环境/搭建类：不是 CPE 的问题，先修测试环境 ——
-        "IPERF_EXEC_FAILED" | "IPERF_PREFLIGHT_FAILED" => {
-            "两端都要放 iperf3 且版本可用。把 iperf3 放到程序同目录后重跑。"
+        ReasonCode::IperfExecFailed | ReasonCode::IperfPreflightFailed => {
+            "windows未设置iperf3环境变量；两端都要放 iperf3 且版本可用。把 iperf3 放到程序同目录后重跑。"
         }
-        "CTSTRAFFIC_PREFLIGHT_FAILED"
-        | "CTSTRAFFIC_ARGS_INVALID"
-        | "CTSTRAFFIC_PROCESS_START_FAILED" => {
+        ReasonCode::CtsPreflightFailed
+        | ReasonCode::CtsArgsInvalid
+        | ReasonCode::CtsProcessStartFailed => {
             "ctsTraffic 仅支持 Windows 10+，且两端都需要发布包里的固定版本 ctsTraffic.exe。"
         }
-        "RESOURCE_CLEANUP_FAILED"
-        | "CTSTRAFFIC_CLEANUP_FAILED"
-        | "CTSTRAFFIC_CLIENT_PROCESS_CLEANUP_UNCONFIRMED"
-        | "CTSTRAFFIC_SERVER_PROCESS_CLEANUP_UNCONFIRMED" => {
+        ReasonCode::ResourceCleanupFailed
+        | ReasonCode::CtsCleanupFailed
+        | ReasonCode::CtsClientProcessCleanupUnconfirmed
+        | ReasonCode::CtsServerProcessCleanupUnconfirmed => {
             "上一轮的进程或端口没能确认回收。检查两端是否有残留 iperf3/ctsTraffic 进程，清掉后重跑。"
         }
-        "UNIT_PANIC" | "LEG_THREAD_PANIC" | "UDP_GROUP_DISPATCH_ERROR" => {
+        ReasonCode::UnitPanic | ReasonCode::LegThreadPanic | ReasonCode::UdpGroupDispatchError => {
             "工具自身异常，与被测设备无关。请把本次 runs/ 目录整体反馈给工具维护者。"
         }
-        "GATEWAY_NOT_FOUND" => "该网卡没有 IPv4 默认网关，无法用网关 Ping 判断链路状态。属于组网配置问题。",
+        ReasonCode::GatewayNotFound => "该网卡没有 IPv4 默认网关，无法用网关 Ping 判断链路状态。属于组网配置问题。",
 
-        // —— 采样/窗口类：这一轮数据不可信，重跑即可，不要记成 CPE 不达标 ——
-        "SAMPLE_COVERAGE_LOW"
-        | "RATE_WINDOW_COVERAGE_LOW"
-        | "NIC_RATE_MISSING"
-        | "CTSTRAFFIC_MONITOR_START_FAILED"
-        | "CTSTRAFFIC_MONITOR_STOP_FAILED"
-        | "CTSTRAFFIC_MONITOR_NO_SAMPLES"
-        | "CTSTRAFFIC_MONITOR_RUNTIME_ERROR" => {
-            "本轮网卡采样不完整，数据不足以判定性能。检查测试期间是否重启/切换过网卡，然后重跑。这不是 CPE 不达标。"
+        // —— 采样/窗口类：这一轮数据不可信，重跑即可，不要记成速率不达标 ——
+        ReasonCode::SampleCoverageLow
+        | ReasonCode::RateWindowCoverageLow
+        | ReasonCode::NicRateMissing
+        | ReasonCode::CtsMonitorStartFailed
+        | ReasonCode::CtsMonitorStopFailed
+        | ReasonCode::CtsMonitorNoSamples
+        | ReasonCode::CtsMonitorRuntimeError => {
+            "本轮网卡采样不完整，数据不足以判定性能。检查测试期间是否重启/切换过网卡，然后重跑。这不是速率不达标。"
         }
-        "COUNTER_STALLED" => {
+        ReasonCode::CounterStalled => {
             "样本采齐了但网卡字节计数长时间不动，说明测试中途链路已经没有流量。先确认被测设备是否掉线或重启，再重跑；这一轮的平均速率不能当结论。"
         }
-        "EFFECTIVE_WINDOW_SHORT"
-        | "IPERF_EFFECTIVE_WINDOW_SHORT"
-        | "CTSTRAFFIC_EFFECTIVE_WINDOW_SHORT" => {
+        ReasonCode::EffectiveWindowShort
+        | ReasonCode::IperfEffectiveWindowShort
+        | ReasonCode::CtsEffectiveWindowShort => {
             "有效测量窗口短于要求时长，多半是流提前结束或启动过慢。确认链路稳定后重跑。"
         }
 
         // —— 配置类：改配置，不是改设备 ——
-        "CONFIGURED_LOAD_TOO_LOW" => "配置的流数×每流带宽不足以打到目标，请调大 streams 或每流 -b。",
-        "OFFERED_LOAD_LOW" => "实际发出的负载没达到目标+余量，发送端可能已是瓶颈。先确认发送端能打出足够流量。",
-        "TARGET_MISSING" => "verify 模式必须配置 rate_targets_mbps，否则无法判定合格与否。",
-        "TARGET_UNKNOWN" => "未配置可信目标，本行只记录实测能力，不代表合格或不合格。",
-        "UDP_LOSS_DATA_MISSING" | "CTSTRAFFIC_UDP_LOSS_DATA_MISSING" => {
+        ReasonCode::ConfiguredLoadTooLow => "配置的流数×每流带宽不足以打到目标，请调大 streams 或每流 -b。",
+        ReasonCode::OfferedLoadLow => "实际发出的负载没达到目标+余量，发送端可能已是瓶颈。先确认发送端能打出足够流量。",
+        ReasonCode::TargetMissing => "verify 模式必须配置 rate_targets_mbps，否则无法判定合格与否。",
+        ReasonCode::TargetUnknown => "未配置可信目标，本行只记录实测能力，不代表PASS或FAIL。",
+        ReasonCode::UdpLossDataMissing | ReasonCode::CtsUdpLossDataMissing => {
             "配置了丢包门槛但工具输出里没有丢包数据，多半是 iperf3 版本过旧。升级后重跑。"
         }
 
         // —— 真正的被测对象问题 ——
-        "RX_BELOW_TARGET" => "接收端实测速率低于目标，这是被测链路/设备的性能问题。",
-        "RX_UNSTABLE" => "平均速率达标但存在持续掉速，被测链路有周期性抖动或限速。",
-        "RX_DROPOUT" => {
-            "平均和 P10 都达标，但判定窗口里有完整 5 秒掉到门限以下。业务上那几秒就是断的：\
-             先看原因里写的掉坑起点和最长连续秒数，再对着网卡逐样本 CSV 找同一时刻发生了什么\
-             （漫游、信道切换、对端重启）。这是被测链路的问题，不是采样问题。"
+        ReasonCode::RxBelowTarget => "接收端实测速率低于目标，请检查被测链路/设备的性能问题。",
+        ReasonCode::RxUnstable => "平均速率达标但存在持续掉速，被测链路有周期性抖动或限速。",
+        ReasonCode::RxOutage => {
+            "平均速率达标，但判定窗口里有连续 5 秒以上灌包速率基本为 0——那几秒链路是真的断的。\
+             按原因里写的起点和连续秒数，去网卡逐样本 CSV 对同一时刻发生了什么（漫游、信道切换、\
+             对端重启、链路 down/up）。这个秒数是在原始逐样本序列上量出来的，可以直接和 iperf \
+             截图的同一时刻对上。"
         }
-        "RX_P10_BELOW_TARGET" => {
+        ReasonCode::RxDropout => {
+            "平均速率达标，但判定窗口里有连续 5 秒以上掉到门限的 80% 以下。没断，但业务上那几秒\
+             明显不够用：按原因里写的起点和连续秒数，去网卡逐样本 CSV 对同一时刻发生了什么。\
+             不够 5 秒的单点抖动不会判到这里——它和 Wi-Fi 发 probe、信道扫描造成的掉一拍在\
+             网卡计数器上不可区分。"
+        }
+        ReasonCode::RxP10BelowTarget => {
             "接收端速率的低十分位低于目标：不是偶发掉坑，是有相当一部分时间都没达标。按被测链路性能问题处理。"
         }
-        "UDP_LOSS_HIGH" | "CTSTRAFFIC_UDP_LOSS_HIGH" => "丢包/丢帧超过门槛，被测链路在该负载下无法无损转发。",
-        "SINGLE_UDP_STREAM_FAILED" | "CTSTRAFFIC_SINGLE_UDP_STREAM_FAILED" => {
+        // —— ctsTraffic 生命周期没确认：不是被测设备的问题，是这一轮没跑成 ——
+        ReasonCode::CtsClientStartFailed
+        | ReasonCode::CtsServerStartFailed
+        | ReasonCode::CtsClientStatusFailed
+        | ReasonCode::CtsServerStatusFailed
+        | ReasonCode::CtsClientStopFailed
+        | ReasonCode::CtsServerStopFailed
+        | ReasonCode::CtsClientJobIdMismatch
+        | ReasonCode::CtsServerJobIdMismatch
+        | ReasonCode::CtsClientWaitInvalid
+        | ReasonCode::CtsClientResultMissing
+        | ReasonCode::CtsClientProcessNotStarted
+        | ReasonCode::CtsServerProcessNotStarted
+        | ReasonCode::CtsServerExitedEarly
+        | ReasonCode::CtsServerFailed
+        | ReasonCode::CtsProcessControlFailed => {
+            "ctsTraffic 作业的启动/查询/停止没有得到确认，这一轮没有可信的执行过程。\
+             先确认辅测端还在线、ctsTraffic.exe 可执行、测试端口段没被防火墙拦，再重跑。\
+             不要把它当成被测设备不达标。"
+        }
+        // —— 被取消：人为中止或上层撤单，不是失败 ——
+        ReasonCode::CtsClientCancelled
+        | ReasonCode::CtsClientUserCancelled
+        | ReasonCode::CtsServerCancelled
+        | ReasonCode::CtsClientAborted => {
+            "这一轮被取消了（手动停止或上层撤单），没有产生可判定的数据。重跑即可。"
+        }
+        // —— 内部错误：程序自身的问题，报 issue 比重跑有用 ——
+        ReasonCode::CtsInternalNoAttempt | ReasonCode::UnitDirectionResultMissing => {
+            "程序内部状态异常：该跑的尝试一次都没记录下来。这是工具自身的缺陷，\
+             请连同本次 run 目录一起反馈，重跑多半会复现。"
+        }
+        // —— 单条流没跑通：这一条流的事，别的流的结论仍然作数 ——
+        ReasonCode::FlowFailed => {
+            "这一条流没跑通。先看同一腿其余流的结果：多数流正常说明是偶发，\
+             全部失败才需要怀疑链路或端口。"
+        }
+
+        ReasonCode::UdpLossHigh | ReasonCode::CtsUdpLossHigh => "丢包/丢帧超过门槛，被测链路在该负载下无法无损转发。",
+        ReasonCode::SingleUdpStreamFailed | ReasonCode::CtsSingleUdpStreamFailed => {
             "该方向必须灌通却始终没有任何流量测量。先确认防火墙放通了测试端口段，再检查链路是否真的不通。"
         }
-        "ACTIVE_STREAMS_LOW" => "成功建立的流数不足以支撑正式判定，通常是部分端口被拦或链路承载不了这么多流。",
-        "NO_STREAM_STARTED" => "一条流都没起来，先查防火墙与测试端口段是否放通。",
-        "IPERF_RUNTIME_ERRORS" | "CTSTRAFFIC_RUNTIME_ERRORS" => {
+        ReasonCode::ActiveStreamsLow => "成功建立的流数不足以支撑正式判定，通常是部分端口被拦或链路承载不了这么多流。",
+        ReasonCode::NoStreamStarted => "一条流都没起来，先查防火墙与测试端口段是否放通；请检查被测链路/设备的是否存在问题",
+        ReasonCode::IperfRuntimeErrors | ReasonCode::CtsRuntimeErrors => {
             "已有吞吐测量但进程非正常结束，链路可能在测试中途中断。"
         }
-        "IPERF_SUMMARY_LOST" => {
+        ReasonCode::IperfSummaryLost => {
             "灌包已经跑完，但 iperf3 收尾交换结果时连接断了，工具自报速率取不到。\
              判定已改用接收端网卡口径，这一行的结论仍然有效；工具自报那几列是空的属正常。"
         }
-        "NO_VALID_MEASUREMENT" | "CTSTRAFFIC_NO_MEASUREMENT" => {
+        ReasonCode::NoValidMeasurement | ReasonCode::CtsNoMeasurement => {
             "整轮没有产生任何可用的吞吐测量。先确认防火墙放通了测试端口段、两端工具版本可用，再重跑。"
         }
-        "NIC_DISAPPEARED" => {
-            "测试期间接收端网卡从系统里消失了（拔线、驱动重载、Wi-Fi 适配器重置）。\
-             属于测试环境问题，不是 CPE 性能问题；恢复网卡后重跑。"
+        ReasonCode::NicDisappeared => {
+            "测试期间接收端网卡从系统里消失了，请检查被测链路/设备的是否存在问题；恢复网卡后重跑。"
         }
-        "PING_UNREACHABLE" | "PING_SUBNET_UNREACHABLE" => "目标不可达，先确认两端 IP、网线和防火墙。",
-        "PING_GATEWAY_UNREACHABLE" => "网关不可达，说明该网卡的链路或组网本身有问题。",
-        "PING_TIMEOUT" | "PING_EXEC_ERROR" => "Ping 命令本身没能正常执行，属于测试环境问题。",
+        ReasonCode::PingUnreachable | ReasonCode::PingSubnetUnreachable => "目标不可达，先确认两端 IP、网线和防火墙；请检查被测链路/设备的是否存在问题",
+        ReasonCode::PingGatewayUnreachable => "网关不可达，说明该网卡的链路或组网本身有问题。",
+        ReasonCode::PingTimeout | ReasonCode::PingExecError => "Ping 命令本身没能正常执行，属于测试环境问题。",
 
         // —— 正常结果，无需处置 ——
-        "PASS" | "PING_OK" | "RX_TARGET_MET" | "FLOW_MEASURED" | "RESUME_FRESH_PASS" => return None,
+        ReasonCode::Pass | ReasonCode::PingOk | ReasonCode::RxTargetMet | ReasonCode::FlowMeasured | ReasonCode::ResumeFreshPass => return None,
         _ => return None,
     };
     Some(advice)
@@ -274,6 +371,7 @@ pub fn disposition_advice(reason_code: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reason::ALL_REASON_CODES;
 
     /// 速率判定新增的原因码，必须同时在**消费侧**登记。
     ///
@@ -285,63 +383,61 @@ mod tests {
     /// 大写原因码literal 全捞出来逐个核对。选它是因为速率判定的码全在这一个
     /// 文件里产出，而且它干净——没有环境变量名之类的同形噪声，不需要维护
     /// 一张越滚越大的豁免表。以后在别处新增码时，照这个样子再加一条。
+    /// **每一个**原因码都必须有处置建议，或者被显式豁免。
+    ///
+    /// `disposition_advice` 的兜底是 `_ => return None`，漏登记永远不会有信号：
+    /// v4.3.1 加的 `RX_DROPOUT` 就这么在报告里当了一整个版本的「无建议」。
+    ///
+    /// 老版本靠扫 `rate_window.rs` 的大写字面量来近似这件事——只覆盖得到那
+    /// 一个文件，而且码一换成 enum 就什么都扫不到了。现在直接对
+    /// [`ALL_REASON_CODES`] 穷举：新增一个码却忘了写建议，这条就红。
     #[test]
-    fn every_rate_reason_code_has_a_disposition() {
-        const RATE_WINDOW_SOURCE: &str = include_str!("master/rate_window.rs");
+    fn every_reason_code_has_a_disposition() {
+        // 正常结果不需要处置建议，但必须**显式**列出来，不能靠兜底静默通过。
+        const NEEDS_NO_ADVICE: [ReasonCode; 5] = [
+            ReasonCode::Pass,
+            ReasonCode::PingOk,
+            ReasonCode::RxTargetMet,
+            ReasonCode::FlowMeasured,
+            ReasonCode::ResumeFreshPass,
+        ];
 
-        // 正常结果不需要处置建议，但必须是**显式**列出来的，不能靠兜底静默通过。
-        const NEEDS_NO_ADVICE: [&str; 0] = [];
-
-        let mut checked = 0;
-        let mut missing: Vec<String> = Vec::new();
-        for code in uppercase_literals(RATE_WINDOW_SOURCE) {
-            checked += 1;
-            if NEEDS_NO_ADVICE.contains(&code.as_str()) {
-                continue;
-            }
-            if disposition_advice(&code).is_none() {
-                missing.push(code);
-            }
-        }
-
-        assert!(checked >= 8, "没捞到码说明扫描坏了，只捞到 {checked} 个");
+        let missing: Vec<&str> = ALL_REASON_CODES
+            .iter()
+            .filter(|code| !NEEDS_NO_ADVICE.contains(code))
+            .filter(|code| disposition_advice(**code).is_none())
+            .map(|code| code.as_str())
+            .collect();
         assert!(
             missing.is_empty(),
             "这些原因码没有处置建议，报告里会是一片空白：{missing:?}。\
              在 disposition_advice 里补上，或显式加进 NEEDS_NO_ADVICE"
         );
-    }
 
-    /// 从源码里捞出形如 `"RX_DROPOUT"` 的大写字面量。
-    #[cfg(test)]
-    fn uppercase_literals(source: &str) -> Vec<String> {
-        let mut out: Vec<String> = Vec::new();
-        for chunk in source.split('"').skip(1).step_by(2) {
-            let looks_like_code = chunk.len() >= 5
-                && chunk
-                    .bytes()
-                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
-                && chunk.bytes().any(|b| b.is_ascii_uppercase());
-            if looks_like_code && !out.contains(&chunk.to_string()) {
-                out.push(chunk.to_string());
-            }
+        // 反过来：豁免名单里的码不该有建议，否则「正常结果」也会冒出噪声。
+        for code in NEEDS_NO_ADVICE {
+            assert!(
+                disposition_advice(code).is_none(),
+                "{code} 是正常结果，不该有处置建议"
+            );
         }
-        out
+        // 没有码时静默返回 None，不能 panic，也不能编一条出来。
+        assert!(disposition_advice(ReasonCode::None).is_none());
     }
 
     /// RX_DROPOUT 是 v4.3.1 的头牌能力，两张消费侧的表都要认它。
     #[test]
     fn the_dropout_code_is_registered_in_both_consumer_tables() {
-        let advice = disposition_advice("RX_DROPOUT").expect("必须有处置建议");
+        let advice = disposition_advice(ReasonCode::RxDropout).expect("必须有处置建议");
         assert!(advice.contains("5 秒"), "建议要说清它判的是什么：{advice}");
         assert!(
-            disposition_advice("RX_UNSTABLE").is_some(),
+            disposition_advice(ReasonCode::RxUnstable).is_some(),
             "它取代的那个码不能因此掉队"
         );
     }
 
-    fn v(verdict: Verdict) -> (Verdict, &'static str) {
-        (verdict, "")
+    fn v(verdict: Verdict) -> (Verdict, ReasonCode) {
+        (verdict, ReasonCode::None)
     }
 
     /// 结构断言：判定优先级只能有一处定义。
@@ -391,53 +487,55 @@ mod tests {
     #[test]
     fn disposition_advice_separates_who_is_at_fault_without_touching_any_code() {
         // 三类结果必须给出不同指向的建议，否则这一层就没有意义。
-        let env = disposition_advice("SAMPLE_COVERAGE_LOW").expect("采样类必须有建议");
+        let env = disposition_advice(ReasonCode::SampleCoverageLow).expect("采样类必须有建议");
         assert!(
-            env.contains("不是 CPE 不达标"),
+            env.contains("不是速率不达标"),
             "采样问题不能让用户去怀疑设备: {env}"
         );
 
-        let cfg = disposition_advice("CONFIGURED_LOAD_TOO_LOW").expect("配置类必须有建议");
+        let cfg = disposition_advice(ReasonCode::ConfiguredLoadTooLow).expect("配置类必须有建议");
         assert!(
             cfg.contains("streams") || cfg.contains("-b"),
             "配置类要指到具体字段: {cfg}"
         );
 
-        let dut = disposition_advice("RX_BELOW_TARGET").expect("性能类必须有建议");
+        let dut = disposition_advice(ReasonCode::RxBelowTarget).expect("性能类必须有建议");
         assert!(dut.contains("性能问题"), "真正的性能不达标要说清楚: {dut}");
 
         // 正常结果不该冒出"处置建议"这种噪声。
         for ok in [
-            "PASS",
-            "PING_OK",
-            "TARGET_UNKNOWN".trim_end(),
-            "FLOW_MEASURED",
+            ReasonCode::Pass,
+            ReasonCode::PingOk,
+            ReasonCode::FlowMeasured,
+            ReasonCode::RxTargetMet,
+            ReasonCode::ResumeFreshPass,
         ] {
-            if ok == "TARGET_UNKNOWN" {
-                continue;
-            }
             assert!(disposition_advice(ok).is_none(), "{ok} 不该有处置建议");
         }
-        // 未知码静默返回 None，不能 panic，也不能编个建议出来。
-        assert!(disposition_advice("SOME_FUTURE_CODE").is_none());
-        assert!(disposition_advice("").is_none());
+        // 没有码时静默返回 None，不能 panic，也不能编个建议出来。
+        assert!(disposition_advice(ReasonCode::None).is_none());
     }
 
     /// 派生层不得改动任何既有原因码：码会进 RESUME 数据库和用户既有认知。
     #[test]
     fn advice_layer_never_rewrites_the_underlying_reason_codes() {
-        // 抽查各后端的代表性码，确认它们仍然原样存在于源码里。
+        // 抽查各后端的代表性码，确认它们的**字符串表示**仍然原样存在。
+        // 码进过 RESUME 数据库、进过用户既有认知、进过自动化断言，改一个字
+        // 都是破坏性变更——换成 enum 之后守的仍然是同一件事。
         let source = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/verdict.rs"),
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/reason.rs"),
         )
-        .expect("read verdict.rs");
+        .expect("read reason.rs");
         for code in [
-            "SINGLE_UDP_STREAM_FAILED",
-            "CTSTRAFFIC_SINGLE_UDP_STREAM_FAILED",
-            "RX_BELOW_TARGET",
-            "ACTIVE_STREAMS_LOW",
+            ReasonCode::SingleUdpStreamFailed,
+            ReasonCode::CtsSingleUdpStreamFailed,
+            ReasonCode::RxBelowTarget,
+            ReasonCode::ActiveStreamsLow,
         ] {
-            assert!(source.contains(code), "原因码 {code} 不得被改写或删除");
+            assert!(
+                source.contains(code.as_str()),
+                "原因码 {code} 不得被改写或删除"
+            );
         }
     }
 
@@ -455,7 +553,7 @@ mod tests {
         // 连硬失败也让位：环境没搭起来时性能结论无意义。
         assert_eq!(
             aggregate_verdict([
-                (Verdict::RateFail, "SINGLE_UDP_STREAM_FAILED"),
+                (Verdict::RateFail, ReasonCode::SingleUdpStreamFailed),
                 v(Verdict::SetupError),
             ]),
             Verdict::SetupError
@@ -468,7 +566,7 @@ mod tests {
             assert_eq!(
                 aggregate_verdict([
                     (Verdict::RateFail, code),
-                    (Verdict::NotEvaluated, "SAMPLE_COVERAGE_LOW"),
+                    (Verdict::NotEvaluated, ReasonCode::SampleCoverageLow),
                 ]),
                 Verdict::RateFail,
                 "code={code}"
@@ -481,8 +579,8 @@ mod tests {
         // 普通的速率不达标让位于「无法评价」：不能用一份不可信的数据下结论。
         assert_eq!(
             aggregate_verdict([
-                (Verdict::RateFail, "RX_BELOW_TARGET"),
-                (Verdict::NotEvaluated, "SAMPLE_COVERAGE_LOW"),
+                (Verdict::RateFail, ReasonCode::RxBelowTarget),
+                (Verdict::NotEvaluated, ReasonCode::SampleCoverageLow),
             ]),
             Verdict::NotEvaluated
         );
@@ -495,7 +593,10 @@ mod tests {
             Verdict::Measured
         );
         assert_eq!(
-            aggregate_verdict([v(Verdict::Measured), (Verdict::RateFail, "RX_DROPOUT")]),
+            aggregate_verdict([
+                v(Verdict::Measured),
+                (Verdict::RateFail, ReasonCode::RxDropout)
+            ]),
             Verdict::RateFail,
             "掉速统一归 RATE_FAIL，不能被 MEASURED 盖住"
         );
@@ -511,16 +612,16 @@ mod tests {
     fn only_untrustworthy_data_may_hide_the_other_leg_failure() {
         // 采样/时间轴不可信：两条腿跑在同一段时间窗里，那条 FAIL 同样可疑。
         for code in [
-            "SAMPLE_COVERAGE_LOW",
-            "RATE_WINDOW_COVERAGE_LOW",
-            "COUNTER_STALLED",
-            "NIC_RATE_MISSING",
-            "EFFECTIVE_WINDOW_SHORT",
-            "ACTIVE_STREAMS_LOW",
+            ReasonCode::SampleCoverageLow,
+            ReasonCode::RateWindowCoverageLow,
+            ReasonCode::CounterStalled,
+            ReasonCode::NicRateMissing,
+            ReasonCode::EffectiveWindowShort,
+            ReasonCode::ActiveStreamsLow,
         ] {
             assert_eq!(
                 aggregate_verdict([
-                    (Verdict::RateFail, "RX_BELOW_TARGET"),
+                    (Verdict::RateFail, ReasonCode::RxBelowTarget),
                     (Verdict::NotEvaluated, code),
                 ]),
                 Verdict::NotEvaluated,
@@ -532,7 +633,7 @@ mod tests {
         for code in LEG_LOCAL_NOT_EVALUATED_CODES {
             assert_eq!(
                 aggregate_verdict([
-                    (Verdict::RateFail, "RX_BELOW_TARGET"),
+                    (Verdict::RateFail, ReasonCode::RxBelowTarget),
                     (Verdict::NotEvaluated, code),
                 ]),
                 Verdict::RateFail,
@@ -543,17 +644,17 @@ mod tests {
         // 没有 FAIL 时，腿内局部的判不了仍然是判不了，不能升格成 MEASURED。
         assert_eq!(
             aggregate_verdict([
-                (Verdict::Measured, "TARGET_UNKNOWN"),
-                (Verdict::NotEvaluated, "OFFERED_LOAD_LOW"),
+                (Verdict::Measured, ReasonCode::TargetUnknown),
+                (Verdict::NotEvaluated, ReasonCode::OfferedLoadLow),
             ]),
             Verdict::NotEvaluated
         );
         // SETUP_ERROR 仍然压过一切。
         assert_eq!(
             aggregate_verdict([
-                (Verdict::RateFail, "RX_BELOW_TARGET"),
-                (Verdict::NotEvaluated, "OFFERED_LOAD_LOW"),
-                (Verdict::SetupError, "NO_STREAM_STARTED"),
+                (Verdict::RateFail, ReasonCode::RxBelowTarget),
+                (Verdict::NotEvaluated, ReasonCode::OfferedLoadLow),
+                (Verdict::SetupError, ReasonCode::NoStreamStarted),
             ]),
             Verdict::SetupError
         );
@@ -585,16 +686,16 @@ mod tests {
     fn hard_failure_detection_requires_both_verdict_and_code() {
         assert!(is_hard_single_udp_failure(
             Verdict::RateFail,
-            "SINGLE_UDP_STREAM_FAILED"
+            ReasonCode::SingleUdpStreamFailed
         ));
         // 同样的码配别的 verdict 不算硬失败（例如流明细行的诊断用法）。
         assert!(!is_hard_single_udp_failure(
             Verdict::NotEvaluated,
-            "SINGLE_UDP_STREAM_FAILED"
+            ReasonCode::SingleUdpStreamFailed
         ));
         assert!(!is_hard_single_udp_failure(
             Verdict::RateFail,
-            "RX_BELOW_TARGET"
+            ReasonCode::RxBelowTarget
         ));
     }
 }

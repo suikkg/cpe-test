@@ -2,6 +2,43 @@
 
 > 两台电脑间自动化 ping + iperf3 / Microsoft ctsTraffic 灌包测试，零 Python/零 PowerShell
 
+## v4.6.0
+
+- **掉速判定改判在原始逐样本序列上**：此前判的是「某个 5 秒滑动平均越过门限」，
+  和它自己注释宣称的「有完整 5 秒掉到门限以下」不是一回事。滑动平均会把一次 1 秒的
+  掉速摊进 5 个相邻窗口，于是一个采样周期的抖动（Wi-Fi 发 probe 就会掉一拍）足以让
+  整行 `RATE_FAIL`，报出来的「最长连续」还等于真实秒数 + 4 秒。现在越界必须自己
+  **连续够 5 秒**才算数，报出来的秒数就是真秒数，可以直接和 iperf 截图同一时刻对上；
+  不够 5 秒的单点抖动一律忽略——它和 probe、信道扫描在网卡计数器上不可区分。
+- **两档形态分开发码**：`RX_OUTAGE`（连续 ≥5 秒速率基本为 0，链路真断了）与
+  `RX_DROPOUT`（连续 ≥5 秒掉到门限的 80% 以下，没断但不够用）。门限带 20% 容差，
+  1973 vs 2000 这种噪声量级不再判 FAIL。
+- **P10 退出 PASS/FAIL**：合格线只剩「判定窗口的平均速率」一条。门限贴着链路上限设时
+  P10 几乎必挂（avg 2014 达标、P10 1996 差 0.2% 被判 FAIL），而那类用例的本意只是
+  横比两块 Wi-Fi 的协商速率差异。P10 继续算、继续进报告，只作诊断指标。
+- **采样周期抖动不再当成漏采**：辅测端采样线程被 OS 抢占是常态。此前按「周期 > 标称
+  ×1.5」把这些样本踢出滚动序列，覆盖率被压到 63.6%，整行误判成
+  `RATE_WINDOW_COVERAGE_LOW`。现在改用真正的信号识别跨漏采的恢复样本：前一条样本
+  `valid` 为假。
+- **原因码改成 Rust enum**：79 个码从字符串换成 `ReasonCode`，字符串表示一字未变，
+  历史报告和外部脚本不受影响。换的过程中暴露出 23 个码从来没有处置建议（全是
+  `CTSTRAFFIC_*` 执行失败），报告里一直是空白，现已补齐；检查也改成对全部码穷举。
+- **执行计划闸门**：`plan_hash` 改为算在**单元本身**上而不是请求报文上，带着走完
+  「预览 → 确认 → 执行」，执行端重新推导后再核对一次，对不上就拒绝跑。此前控制台
+  确认的单元会被丢弃、由执行端从配置重新推导，复核页和实际执行是两批东西。
+- **报告按协议分节**：Ping / 灌包性能·UDP / 灌包性能·TCP，每节一张表，本次没跑的
+  分类整个不显示。ctsTraffic 按协议归到 TCP，不单独占一层。
+- **参数配方可以删除了**：卡片过去只有「编辑」，点击委派里根本没有删除分支，加错一条
+  就再也去不掉。现在可删，会说清波及哪几个任务并清理引用；新增/编辑也从连点 5 个
+  `window.prompt` 换成就地表单。
+- **Windows 批处理**：`.bat` 改为 **ANSI(GBK)** 编码（此前 UTF-8，在中文 Windows 的
+  cmd 里整片乱码）；`start_ui.bat` 顶部新增 `UI_TOKEN` / `AGENT_TOKEN` / `UI_BIND`
+  三个变量，默认带口令并监听 `0.0.0.0`。注意 **`--bind-ip` 不是有效参数**，会被静默
+  忽略，正确的是 `--ui-bind`。
+- **代码结构收敛**：`executor.rs` 12007 → 1124 行、`webui.rs` 7817 → 171 行、
+  `report.rs` 2697 → 808 行，按职责拆成子模块；UDP 判定链抽成纯函数，可脱离执行环境
+  单测。行为不变。
+
 ## v4.5.0
 
 - **快速测试计划工作台**：控制台默认提供“链路集合 → 流量套件 → 分配 → 复核”流程，
@@ -404,7 +441,7 @@ CPE（Customer Premises Equipment）子网测试工具用于在**两台电脑之
 ```
 cpe_test.exe          ← 本工具（单文件）
 iperf3.exe            ← 从 iperf.fr 下载（只测 Ping/ctsTraffic 可不放）
-ctsTraffic.exe        ← v4.5.0 Windows Release 已捆绑（仅 Windows 10+）
+ctsTraffic.exe        ← v4.6.0 Windows Release 已捆绑（仅 Windows 10+）
 start_agent.bat       ← 辅测机双击
 start_ui.bat          ← 主控机双击（图形控制台，推荐）
 start_master.bat      ← 主控机双击（命令行问答式）
@@ -1159,7 +1196,7 @@ cargo build --release --locked
 
 自行编译后，把 `cpe_test.exe`、启动脚本和所需吞吐工具放到两台 Windows 电脑同一目录：
 iperf3 测试需要完整的 iperf3 Windows 发行包；ctsTraffic 测试需要 `ctsTraffic.exe`。
-官方 v4.5.0 Windows Release ZIP 已捆绑固定且校验过的 ctsTraffic 2.0.4.0，但由于发行包差异不内置 iperf3。
+官方 v4.6.0 Windows Release ZIP 已捆绑固定且校验过的 ctsTraffic 2.0.4.0，但由于发行包差异不内置 iperf3。
 
 ### GitHub Actions CI
 
@@ -1182,7 +1219,7 @@ Windows ZIP 包含启动脚本、四份配置、固定 CTS 二进制和第三方
 `tar.gz` 保留 `cpe_test` 可执行位。发布作业会再次核对资产名称、数量、内部结构和哈希。
 
 仓库同时跟踪一份不含可执行程序的
-[`cpe_test-v4.5.0-windows-config-docs.zip`](dist/cpe_test-v4.5.0-windows-config-docs.zip)，
+[`cpe_test-v4.6.0-windows-config-docs.zip`](dist/cpe_test-v4.6.0-windows-config-docs.zip)，
 便于直接从 Git 下载 Windows 配置、文档和启动脚本。其 SHA-256 位于同目录的
 `.zip.sha256` 文件；CI 会逐文件确认压缩包内容与仓库源文件一致。需要开箱即用的程序、
 固定版 ctsTraffic 和许可证全集时，仍应下载上面的正式 Windows Release ZIP。

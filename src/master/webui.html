@@ -173,6 +173,12 @@ code { font-family:var(--fm); background:var(--panel-2); padding:0 4px; border-r
 
 /* UDP 参数组表 */
 .udp-groups { margin:10px 0 4px; }
+/* 参数配方的就地编辑器：占满一行，和上面的配方 chip 明确分开。 */
+.recipe-editor { flex:1 0 100%; margin-top:8px; padding:10px 12px; border:1px solid var(--line); border-radius:6px; background:var(--head); }
+.recipe-editor .rc-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:9px; }
+.recipe-editor .rc-cell { display:flex; flex-direction:column; gap:3px; min-width:0; }
+.recipe-editor .rc-cell input { width:100%; }
+.chip.active { outline:2px solid #1769aa; outline-offset:1px; }
 #udpgroups { min-width:640px; }
 #udpgroups input.list { width:150px; }
 #udpgroups input.num { width:64px; }
@@ -350,7 +356,7 @@ pre.hint { font-family:var(--fm); }
 <div class="wrap">
   <header class="app-header">
     <div class="brand">
-      <span class="eyebrow">Ping · iperf3 · ctsTraffic 灌包台</span>
+      <span class="eyebrow">Ping · iperf3</span>
       <h1>CPE 子网测试控制台</h1>
     </div>
     <span class="version" id="ver">LOCAL · 127.0.0.1</span>
@@ -634,6 +640,8 @@ let MASTER = null, AGENT = null, PAIRS = [], FROM = 0, TIMER = null, LOCAL_NICS 
 // TestSpec，绝不在浏览器里把 TCP/UDP 拼成混合单元。
 let MODE = 'quick';
 let LINK_SETS = [], RECIPES = { tcp: [], udp: [], ping: [] }, SUITES = [], BINDINGS = [];
+// 正在就地编辑的配方草稿：{ protocol, id | null, draft }。null = 没在编辑。
+let RECIPE_EDIT = null;
 let QUICK_SET_SELECTION = new Set(), QUICK_SUITE_SELECTION = '';
 let EDITING_SUITE_ID = null, EDITING_SUITE_DRAFT = null, PENDING_PROJECT = null;
 let PLAN_HASH = '', TOPOLOGY_FINGERPRINT = '';
@@ -1044,38 +1052,100 @@ function renderQuickSuites() {
     sel.value = QUICK_SUITE_SELECTION;
   }
 }
+// 一个协议至少留一条配方：任务上勾的是配方 id，一条不剩时 ensureQuickDefaults
+// 会悄悄补回一条「默认」，用户会以为自己没删掉。与其那样，不如直接不给删。
+function recipeIsLastOfProtocol(protocol) {
+  return (RECIPES[protocol] || []).length <= 1;
+}
+
+// 有哪些任务正勾着这条配方——删之前要说清楚会波及谁。
+function recipeUsage(protocol, id) {
+  const users = [];
+  SUITES.forEach((suite) => {
+    (suite.tasks || []).forEach((task) => {
+      if (qtaskProtocol(task) !== protocol) return;
+      if ((task.recipe_ids || []).includes(id)) {
+        users.push((suite.name || suite.id) + ' / ' + (task.name || task.id));
+      }
+    });
+  });
+  return users;
+}
+
 function renderQuickRecipes() {
   const box = $('quickrecipes'); if (!box) return;
   const cards = [];
   [['tcp', 'TCP'], ['udp', 'UDP'], ['ping', 'PING']].forEach(([protocol, label]) => {
     (RECIPES[protocol] || []).forEach((recipe) => {
-      cards.push('<span class="chip" title="' + esc(qrecipeSummary(recipe, protocol)) + '">' + label + ' · ' + esc(recipe.name || recipe.id) + ' <button type="button" class="ghost qrecipe-edit" data-protocol="' + protocol + '" data-recipe="' + esc(recipe.id) + '" style="min-height:22px;padding:2px 6px;font-size:11px">编辑</button></span>');
+      const editing = RECIPE_EDIT && RECIPE_EDIT.protocol === protocol && RECIPE_EDIT.id === recipe.id;
+      const btn = (cls, text, extra) => '<button type="button" class="ghost ' + cls + '" data-protocol="' + protocol + '" data-recipe="' + esc(recipe.id) + '"' + (extra || '') + ' style="min-height:22px;padding:2px 6px;font-size:11px">' + text + '</button>';
+      // PING 没有可编辑的轴（次数和包长在执行区），只显示不给编辑。
+      const edit = protocol === 'ping' ? '' : ' ' + btn('qrecipe-edit', editing ? '收起' : '编辑');
+      const last = recipeIsLastOfProtocol(protocol);
+      const del = protocol === 'ping' || last
+        ? (last && protocol !== 'ping' ? ' <span class="field-note">最后一条，删不得</span>' : '')
+        : ' ' + btn('qrecipe-delete', '删除');
+      cards.push('<span class="chip' + (editing ? ' active' : '') + '" title="' + esc(qrecipeSummary(recipe, protocol)) + '">' + label + ' · ' + esc(recipe.name || recipe.id) + edit + del + '</span>');
     });
   });
   box.innerHTML = (cards.length ? '<span class="hint" style="align-self:center">参数配方：</span>' + cards.join('') : '<span class="hint">暂无参数配方</span>') +
-    '<button type="button" class="ghost qrecipe-new" data-protocol="tcp">+ TCP 配方</button><button type="button" class="ghost qrecipe-new" data-protocol="udp">+ UDP 配方</button>';
+    '<button type="button" class="ghost qrecipe-new" data-protocol="tcp">+ TCP 配方</button><button type="button" class="ghost qrecipe-new" data-protocol="udp">+ UDP 配方</button>' +
+    renderRecipeEditor();
 }
-function editQuickRecipe(protocol, id) {
-  const list = RECIPES[protocol] || [];
-  const index = list.findIndex((item) => item.id === id);
-  const original = index >= 0 ? list[index] : null;
-  const creating = !original;
-  // 在 prompt 全部确认前只改草稿。此前先改 name、再在后续 prompt 点「取消」
-  // 会留下半套配方；新建时甚至会留下一个空 recipe，预览才报错。
-  const recipe = original
-    ? JSON.parse(JSON.stringify(original))
-    : { id: qid('recipe', protocol + Date.now() + Math.random()), name: protocol.toUpperCase() + ' 配方', mode: 'fixed', profiles: [] };
 
-  // 旧项目和默认配方常用完整 profiles，而编辑器保存的是轴字段。把 profiles
-  // 先投影成 prompt 的默认值，避免打开「默认 TCP」时 4m/-P10 被误显示成空/1。
+// 就地编辑器。此前新建一条 UDP 配方要连点五个 window.prompt，中途取消还会
+// 留下半套数据；而且填完之后根本看不到自己填了什么，只能再点「编辑」重走一遍。
+function renderRecipeEditor() {
+  if (!RECIPE_EDIT) return '';
+  const protocol = RECIPE_EDIT.protocol, draft = RECIPE_EDIT.draft;
+  const field = (key, title, placeholder, note) =>
+    '<label class="rc-cell"><span class="field-title">' + title + '</span>' +
+    '<input type="text" class="rc-field" data-k="' + key + '" value="' + esc(draft[key] || '') + '" placeholder="' + esc(placeholder) + '">' +
+    (note ? '<span class="field-note">' + esc(note) + '</span>' : '') + '</label>';
+  const axes = protocol === 'tcp'
+    ? field('windows', 'TCP -w 档位', '留空=默认窗口', '多个用空格分隔，会展开成多组') +
+      field('streams', 'TCP -P 流数', '1 或 1 10', '多个用空格分隔')
+    : field('bandwidths', 'UDP -b 档位', '1000m', '必填；多个用空格分隔') +
+      field('lengths', 'UDP -l 档位', '留空=不下发 -l', '') +
+      field('windows', 'UDP -w 档位', '留空=不下发 -w', '') +
+      field('streams', 'UDP 流数', '1', '多个用空格分隔');
+  return '<div class="recipe-editor" data-protocol="' + protocol + '">' +
+    '<div class="rc-grid">' + field('name', '配方名称', protocol.toUpperCase() + ' 配方', '') + axes + '</div>' +
+    '<div class="row" style="gap:7px;margin-top:8px">' +
+    '<button type="button" class="ok qrecipe-save">保存</button>' +
+    '<button type="button" class="ghost qrecipe-cancel">取消</button>' +
+    (RECIPE_EDIT.id ? '' : '<span class="hint">保存后这条配方才会出现在任务的可选项里</span>') +
+    '</div></div>';
+}
+// 打开就地编辑器。只动 RECIPE_EDIT 这份草稿，保存前不碰 RECIPES——
+// 此前是边 prompt 边改，中途取消会留下半套配方，新建时甚至留下一条空的，
+// 一直到点「预览」才报错。
+function openRecipeEditor(protocol, id) {
+  const list = RECIPES[protocol] || [];
+  const original = id ? list.find((item) => item.id === id) : null;
+  if (id && !original) return;
+  RECIPE_EDIT = {
+    protocol,
+    id: id || null,
+    draft: original
+      ? recipeDraftFrom(original, protocol)
+      : { name: protocol.toUpperCase() + ' 配方', bandwidths: protocol === 'udp' ? '1000m' : '', lengths: '', windows: '', streams: '1' },
+  };
+  renderQuickRecipes();
+  const first = document.querySelector('#quickrecipes .rc-field');
+  if (first) { first.focus(); first.select(); }
+}
+
+// 旧项目和默认配方常用完整 profiles，新编辑器用的是轴字段。把 profiles
+// 投影成轴文本，打开「默认 TCP」时才不会把 4m/-P10 显示成空/1。
+function recipeDraftFrom(recipe, protocol) {
   const profileValues = (keys) => {
     const values = [];
     (recipe.profiles || []).forEach((profile) => {
       for (const key of keys) {
         const value = profile && profile[key];
         if (value === undefined || value === null || value === '') continue;
-        const source = Array.isArray(value) ? value : [value];
-        source.forEach((item) => {
+        (Array.isArray(value) ? value : [value]).forEach((item) => {
           const text = String(item).trim();
           if (text && !values.includes(text)) values.push(text);
         });
@@ -1084,7 +1154,7 @@ function editQuickRecipe(protocol, id) {
     });
     return values;
   };
-  const axisDefault = (keys, fallback) => {
+  const axis = (keys, fallback) => {
     for (const key of keys) {
       const value = recipe[key];
       if (Array.isArray(value) && value.length) return value.join(' ');
@@ -1093,33 +1163,89 @@ function editQuickRecipe(protocol, id) {
     const values = profileValues(keys);
     return values.length ? values.join(' ') : fallback;
   };
+  return protocol === 'tcp'
+    ? { name: recipe.name || recipe.id, windows: axis(['tcp_windows', 'windows', 'window'], ''), streams: axis(['tcp_streams', 'streams'], '1'), bandwidths: '', lengths: '' }
+    : { name: recipe.name || recipe.id, bandwidths: axis(['bandwidths', 'bandwidth'], '1000m'), lengths: axis(['lengths', 'length'], ''), windows: axis(['windows', 'window'], ''), streams: axis(['udp_streams', 'streams'], '1') };
+}
 
-  const name = window.prompt('配方名称', recipe.name || recipe.id);
-  if (name === null) return;
-  recipe.name = name.trim() || recipe.name;
-  if (protocol === 'tcp') {
-    const windows = window.prompt('TCP -w 档位（空=默认窗口，可填多个空格分隔）', axisDefault(['tcp_windows', 'windows', 'window'], ''));
-    if (windows === null) return;
-    const streams = window.prompt('TCP -P 流数（可填多个空格分隔）', axisDefault(['tcp_streams', 'streams'], '1'));
-    if (streams === null) return;
-    recipe.profiles = []; recipe.tcp_windows = splitList(windows); recipe.tcp_streams = splitList(streams).map(Number).filter((n) => n > 0);
-  } else if (protocol === 'udp') {
-    const bandwidths = window.prompt('UDP -b 档位（必填，可填多个）', axisDefault(['bandwidths', 'bandwidth'], '1000m'));
-    if (bandwidths === null) return;
-    const lengths = window.prompt('UDP -l 档位（空=不下发）', axisDefault(['lengths', 'length'], '')); if (lengths === null) return;
-    const windows = window.prompt('UDP -w 档位（空=不下发）', axisDefault(['windows', 'window'], '')); if (windows === null) return;
-    const streams = window.prompt('UDP 流数（可填多个）', axisDefault(['udp_streams', 'streams'], '1')); if (streams === null) return;
-    recipe.profiles = []; recipe.bandwidths = splitList(bandwidths); recipe.lengths = splitList(lengths); recipe.windows = splitList(windows); recipe.udp_streams = splitList(streams).map(Number).filter((n) => n > 0);
+// 保存：先把 DOM 里的输入读回草稿（编辑器每次重画都会重建输入框），
+// 再落进 RECIPES。
+function saveRecipeEditor() {
+  if (!RECIPE_EDIT) return;
+  const box = document.querySelector('#quickrecipes .recipe-editor');
+  if (box) {
+    box.querySelectorAll('.rc-field').forEach((el) => {
+      RECIPE_EDIT.draft[el.dataset.k] = el.value;
+    });
   }
-  if (creating) list.push(recipe); else list[index] = recipe;
+  const protocol = RECIPE_EDIT.protocol, draft = RECIPE_EDIT.draft;
+  if (protocol === 'udp' && !splitList(draft.bandwidths).length) {
+    alert('UDP 配方必须至少填一个 -b 档位。');
+    return;
+  }
+  const list = RECIPES[protocol] || [];
+  const index = RECIPE_EDIT.id ? list.findIndex((item) => item.id === RECIPE_EDIT.id) : -1;
+  const recipe = index >= 0
+    ? JSON.parse(JSON.stringify(list[index]))
+    : { id: qid('recipe', protocol + Date.now() + Math.random()), mode: 'fixed' };
+  recipe.name = draft.name.trim() || (protocol.toUpperCase() + ' 配方');
+  // 轴字段是唯一事实来源；profiles 是旧格式，保存时清掉免得两套并存。
+  recipe.profiles = [];
+  if (protocol === 'tcp') {
+    recipe.tcp_windows = splitList(draft.windows);
+    recipe.tcp_streams = splitList(draft.streams).map(Number).filter((n) => n > 0);
+  } else {
+    recipe.bandwidths = splitList(draft.bandwidths);
+    recipe.lengths = splitList(draft.lengths);
+    recipe.windows = splitList(draft.windows);
+    recipe.udp_streams = splitList(draft.streams).map(Number).filter((n) => n > 0);
+  }
+  if (index >= 0) list[index] = recipe; else list.push(recipe);
   RECIPES[protocol] = list;
+  RECIPE_EDIT = null;
   markQuickDirty();
   renderQuickWorkspace();
 }
+
+// 删除：配方 id 被任务勾着，删了不清引用，预览时会变成一个没有任何参数的
+// 任务，而人根本看不出是哪一步出的问题。所以先说清波及谁，再连引用一起清。
+function deleteQuickRecipe(protocol, id) {
+  if (protocol === 'ping' || recipeIsLastOfProtocol(protocol)) return;
+  const list = RECIPES[protocol] || [];
+  const recipe = list.find((item) => item.id === id);
+  if (!recipe) return;
+  const users = recipeUsage(protocol, id);
+  const note = users.length
+    ? '\n\n以下 ' + users.length + ' 个任务正在用它，删除后会改用同协议的第一条配方：\n· ' + users.slice(0, 8).join('\n· ') + (users.length > 8 ? '\n· …' : '')
+    : '';
+  if (!confirm('删除配方「' + (recipe.name || recipe.id) + '」？' + note)) return;
+  RECIPES[protocol] = list.filter((item) => item.id !== id);
+  const fallback = (RECIPES[protocol][0] || {}).id;
+  SUITES.forEach((suite) => {
+    (suite.tasks || []).forEach((task) => {
+      if (qtaskProtocol(task) !== protocol) return;
+      const kept = (task.recipe_ids || []).filter((rid) => rid !== id);
+      // 一条都不剩的任务回落到同协议的第一条：留个空的等于这条任务不会跑，
+      // 而用户以为只是删了一条配方。
+      task.recipe_ids = kept.length ? kept : (fallback ? [fallback] : []);
+    });
+  });
+  if (RECIPE_EDIT && RECIPE_EDIT.protocol === protocol && RECIPE_EDIT.id === id) RECIPE_EDIT = null;
+  markQuickDirty();
+  renderQuickWorkspace();
+}
+
 $('quickrecipes').addEventListener('click', (ev) => {
   const el = ev.target; if (!el.classList) return;
-  if (el.classList.contains('qrecipe-edit')) editQuickRecipe(el.dataset.protocol, el.dataset.recipe);
-  if (el.classList.contains('qrecipe-new')) editQuickRecipe(el.dataset.protocol, null);
+  if (el.classList.contains('qrecipe-edit')) {
+    // 再点一次「编辑」当收起，不然打开了没有别的路可以关掉。
+    const same = RECIPE_EDIT && RECIPE_EDIT.protocol === el.dataset.protocol && RECIPE_EDIT.id === el.dataset.recipe;
+    if (same) { RECIPE_EDIT = null; renderQuickRecipes(); }
+    else openRecipeEditor(el.dataset.protocol, el.dataset.recipe);
+  } else if (el.classList.contains('qrecipe-new')) openRecipeEditor(el.dataset.protocol, null);
+  else if (el.classList.contains('qrecipe-delete')) deleteQuickRecipe(el.dataset.protocol, el.dataset.recipe);
+  else if (el.classList.contains('qrecipe-save')) saveRecipeEditor();
+  else if (el.classList.contains('qrecipe-cancel')) { RECIPE_EDIT = null; renderQuickRecipes(); }
 });
 function renderQuickAssignments() {
   const box = $('quickassign');

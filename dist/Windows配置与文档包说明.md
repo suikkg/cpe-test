@@ -1,13 +1,13 @@
-# cpe_test v4.5.0 Windows 配置与文档包
+# cpe_test v4.6.0 Windows 配置与文档包
 
-仓库中的 `cpe_test-v4.5.0-windows-config-docs.zip` 是便于从 Git 直接下载的
+仓库中的 `cpe_test-v4.6.0-windows-config-docs.zip` 是便于从 Git 直接下载的
 Windows 配置、说明文档和启动脚本资料包。包内文件由仓库当前版本生成，并由 CI
 逐文件与源码副本比对，避免配置或文档过期。
 
 这个资料包**不包含可执行程序或吞吐工具**：
 
 - 不包含 `cpe_test.exe`；请从 GitHub Release 下载正式
-  `cpe_test-v4.5.0-windows-x86_64.zip`，或自行编译。
+  `cpe_test-v4.6.0-windows-x86_64.zip`，或自行编译。
 - 不包含 `ctsTraffic.exe`；正式 Windows Release ZIP 会捆绑固定并校验过的
   Microsoft ctsTraffic 2.0.4.0 x64。
 - 不包含 `iperf3.exe` 及其 DLL；需要 iperf3 测试时，请放入完整的 Windows
@@ -21,6 +21,17 @@ Windows 配置、说明文档和启动脚本资料包。包内文件由仓库当
 - `config.example.json`（完整字段面）与 `configs/` 下四份可直接选择的具名配置。
 - `start_ui.bat`（图形控制台）、`start_agent.bat`、`start_master.bat`、`start_master_select_config.bat`。
 - iperf3/ctsTraffic 放置说明、MIT 许可证和第三方声明。
+
+## v4.6.0 行为要点
+
+- 掉速判定改判在**原始逐样本序列**上：断流/掉坑必须自己连续够 5 秒才算，报出来的秒数就是真秒数，能直接和 iperf 截图同一时刻对上。不够 5 秒的单点掉拍一律忽略——它和 Wi-Fi 发 probe、信道扫描在网卡计数器上不可区分。
+- 两档形态分开发码：`RX_OUTAGE`（速率基本为 0，真断了）与 `RX_DROPOUT`（掉到门限 80% 以下）。门限带 20% 容差。
+- 合格线只剩「判定窗口的平均速率」一条，P10 退回诊断指标，不再单独否决一行。
+- 采样线程被 OS 抢占产生的周期偏长样本不再当成漏采，不会再把好行误判成 `RATE_WINDOW_COVERAGE_LOW`。
+- 报告按 Ping / 灌包性能·UDP / 灌包性能·TCP 分节，本次没跑的分类整个不显示；ctsTraffic 按协议归到 TCP。
+- 控制台的参数配方可以删除了（此前只有「编辑」，加错一条就再也去不掉），新增/编辑改成就地表单。
+- **`start_ui.bat` / `start_agent.bat` 改成 ANSI(GBK) 编码**：此前是 UTF-8，在中文 Windows 的 cmd 里整片中文都是乱码。`start_ui.bat` 顶部新增 `UI_TOKEN` / `AGENT_TOKEN` / `UI_BIND` 三个变量，默认带口令启动并监听 `0.0.0.0`；改成 `127.0.0.1` 即只允许本机打开。
+- **注意 `--bind-ip` 不是有效参数**，会被静默忽略（控制台仍只监听 127.0.0.1）。让同网段能访问的正确写法是 `--ui-bind 0.0.0.0`，且必须同时给 `--ui-token`。
 
 ## v4.5.0 行为要点
 

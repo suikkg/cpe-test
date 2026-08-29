@@ -20,6 +20,7 @@ mod parser_properties;
 mod ping;
 mod protocol;
 mod rate;
+mod reason;
 mod report;
 mod resource;
 mod screenshot;
@@ -91,6 +92,8 @@ fn real_main(args: Vec<String>) -> i32 {
                 resume: f.contains_key("resume"),
                 no_open: f.contains_key("no-open"),
                 screenshot: f.contains_key("screenshot"),
+                // 命令行直跑没有复核页，不设计划闸。
+                expected_plan_hash: None,
             })
         }
         "scan" => {

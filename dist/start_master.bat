@@ -3,7 +3,7 @@ setlocal
 cd /d "%~dp0"
 
 if not exist "cpe_test.exe" (
-  echo [é”™è¯¯] æœªæ‰¾åˆ° cpe_test.exeã€‚è¯·ç¡®è®¤æœ¬è„šæœ¬ä¸ç¨‹åºåœ¨åŒä¸€ç›®å½•ã€‚
+  echo [´íÎó] Î´ÕÒµ½ cpe_test.exe¡£ÇëÈ·ÈÏ±¾½Å±¾Óë³ÌĞòÔÚÍ¬Ò»Ä¿Â¼¡£
   pause
   exit /b 1
 )
@@ -11,21 +11,21 @@ if not exist "cpe_test.exe" (
 set "CONFIG=%~1"
 if "%CONFIG%"=="" set "CONFIG=configs\config-sgmii.json"
 if not exist "%CONFIG%" (
-  echo [é”™è¯¯] æœªæ‰¾åˆ°é…ç½®æ–‡ä»¶ï¼š%CONFIG%
-  echo ç”¨æ³•ï¼šstart_master.bat configs\config-sgmii.json
+  echo [´íÎó] Î´ÕÒµ½ÅäÖÃÎÄ¼ş£º%CONFIG%
+  echo ÓÃ·¨£ºstart_master.bat configs\config-sgmii.json
   pause
   exit /b 1
 )
 
-set /p AGENT_HOST=è¯·è¾“å…¥è¾…æµ‹æœº IPï¼š
+set /p AGENT_HOST=ÇëÊäÈë¸¨²â»ú IP£º
 if "%AGENT_HOST%"=="" (
-  echo [é”™è¯¯] è¾…æµ‹æœº IP ä¸èƒ½ä¸ºç©ºã€‚
+  echo [´íÎó] ¸¨²â»ú IP ²»ÄÜÎª¿Õ¡£
   pause
   exit /b 1
 )
 
 echo.
-echo ä½¿ç”¨é…ç½®ï¼š%CONFIG%
+echo Ê¹ÓÃÅäÖÃ£º%CONFIG%
 cpe_test.exe master --agent-host %AGENT_HOST% --config "%CONFIG%"
 echo.
 pause

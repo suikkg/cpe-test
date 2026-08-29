@@ -1,0 +1,469 @@
+//! 界面与后端之间的报文形状。
+//!
+//! 全是 serde 结构，没有行为。单独成模块是因为它们同时是**对外契约**：
+//! 前端 webui.html 按这些字段名读写，改一个名字就是一次前后端同时的变更。
+
+use super::*;
+
+/// 界面提交回来的一条配对选择。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct PairSelection {
+    /// `master:NAME=以太网 6`
+    pub(super) src: String,
+    pub(super) dst: String,
+    #[serde(default)]
+    pub(super) directions: Vec<String>,
+    /// 这一对网口在**双向并发**单元里的接收门限，按方向分开填。
+    ///
+    /// 只在勾了「双向」时生效；留空 = 双向也走既有的兜底链。
+    ///
+    /// 为什么按配对而不是按网卡：同一块 RNDIS 口，和 Wi-Fi 组双向、和 SGMII
+    /// 组双向，能收到的速率完全不是一个量级。门限挂在网卡上只能填一个数，
+    /// 必然有一组是错的——受限的是这条链路，不是某一端的网卡。
+    ///
+    /// 两个方向分开是因为半双工链路的两个方向本来就可以差很远
+    /// （同一次运行里见过 1821Mbps 对 17Mbps）。
+    #[serde(default)]
+    pub(super) rx_target_bidir_ab: String,
+    #[serde(default)]
+    pub(super) rx_target_bidir_ba: String,
+    /// 这一行要跑哪几组 UDP 参数。`0` = 默认组，`1..` 指 `RunRequest::udp_groups`
+    /// 里的第 n-1 组。空列表 = 只跑默认组（老页面/手写请求不带这个字段时的行为）。
+    ///
+    /// 用「选组」而不是「逐格覆盖」：覆盖是差量语义，每个留空的格子都要回头
+    /// 推理「这一格空着等于继承谁」，四个格子就是四次推理，而填错了在界面上
+    /// 看不出来。一个组是一份完整定义——选中哪组，跑的就是那组里写着的东西。
+    ///
+    /// 能**多选**是因为「同一对网口既按常规档位跑一遍、又用 1m 单流跑一遍」是
+    /// 一件正经事：矩阵里一对网口只有一行，不能多选就只能分两轮跑、出两份报告。
+    /// 每多选一组就多一批单元。
+    #[serde(default)]
+    pub(super) udp_groups: Vec<usize>,
+    /// 这一行要跑哪几组 TCP 参数。语义和 `udp_groups` 一样：`0` = 默认组
+    /// （执行区的 `tcp_windows` / `tcp_streams`），`1..` 指 `RunRequest::tcp_groups`
+    /// 里的第 n-1 组。空列表 = 只跑默认组。
+    #[serde(default)]
+    pub(super) tcp_groups: Vec<usize>,
+    #[serde(default)]
+    pub(super) transports: Vec<String>,
+    #[serde(default)]
+    pub(super) ip: Vec<String>,
+}
+
+/// 一块网卡在所有配对中共用的判定/负载策略。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub(super) struct NicPolicySelection {
+    /// `master:NAME=以太网 6`
+    pub(super) endpoint: String,
+    /// 这块网卡作为接收端时的 RX 通过门限。
+    ///
+    /// 两种写法共用一个输入框：`1800` = 绝对 1800Mbps，`90%` = 协商速率的
+    /// 90%。分成两个框会逼着人先想清楚用哪种，而这两种本来就是二选一。
+    #[serde(default)]
+    pub(super) rx_target: String,
+    /// 这块网卡作为发送端时的 UDP 单流带宽；留空表示走全局档位。
+    #[serde(default)]
+    pub(super) udp_bandwidth: String,
+    /// 这块网卡作为发送端时的 UDP 报文长度（`-l`）；留空表示走全局档位。
+    #[serde(default)]
+    pub(super) udp_length: String,
+}
+
+/// 一组 UDP 参数。**自成一体，不继承默认组**：`-l` 留空就是不下发 `-l`，
+/// 而不是「跟着执行区那格走」。
+///
+/// 「有几对带 `-l`、另外几对不带」就是靠这一点表达的：需要的那几行选一个填了
+/// `-l` 的组，其余行留在默认组。反过来（默认组填了、某一行想明确不要）在这个
+/// 模型里表达不了，也不需要——把它倒过来写就是了。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct UdpGroup {
+    /// 显示名。空则页面按序号叫「组 2」「组 3」。
+    #[serde(default)]
+    pub(super) name: String,
+    /// 单流带宽档位，逐档各跑一轮。新建的组必须填，否则这组一个单元都生成不出来。
+    #[serde(default)]
+    pub(super) bandwidths: Vec<String>,
+    #[serde(default)]
+    pub(super) lengths: Vec<String>,
+    #[serde(default)]
+    pub(super) windows: Vec<String>,
+    /// 并发流数；0 视作 1（不继承默认组，理由见结构体注释）。
+    #[serde(default)]
+    pub(super) streams: u32,
+}
+
+/// 一组 TCP 参数。和 `UdpGroup` 一样自成一体、不继承默认组：`-w` 留空就是
+/// **不下发 `-w`**（用 iperf3 默认窗口），不是「跟着执行区那格走」。
+///
+/// 两个轴 `-w × -P` 取叉积，各成一个测试单元——这和默认组（执行区的
+/// `tcp_windows` × `tcp_streams`）是同一套展开，只是换了一份档位。没有像
+/// `UdpGroup` 那样的必填项：`-w`、`-P` 都留空就是最朴素的一条 TCP（默认窗口、
+/// 单流），仍是一个合法的组。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct TcpGroup {
+    /// 显示名。空则页面按序号叫「组 2」「组 3」。
+    #[serde(default)]
+    pub(super) name: String,
+    /// socket buffer 档位（`-w`），逐档各跑一轮。空列表 = 不下发 `-w`。
+    #[serde(default)]
+    pub(super) windows: Vec<String>,
+    /// 并发流数档位（`-P`），逐档各跑一轮。空列表按 `[1]` 处理（等价单流，
+    /// 和默认组 `tcp_streams` 留空时一致）。
+    #[serde(default)]
+    pub(super) streams: Vec<u32>,
+}
+
+// ---------------------------------------------------------------------------
+// Quick-plan (suite) request model
+// ---------------------------------------------------------------------------
+// The legacy matrix request above remains supported.  These DTOs model the
+// lower-dimensional planner: concrete endpoint pairs are grouped into link
+// sets, protocol tasks live in suites, and bindings assign suites to sets.
+
+/// A scalar-or-array integer accepted by recipe JSON.  A scalar is convenient
+/// for a single fixed profile; an array denotes a scan axis.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub(super) enum UiU32Values {
+    One(u32),
+    Many(Vec<u32>),
+}
+
+impl UiU32Values {
+    pub(super) fn values(&self) -> Vec<u32> {
+        match self {
+            Self::One(value) => vec![*value],
+            Self::Many(values) => values.clone(),
+        }
+    }
+}
+
+/// One complete TCP/UDP recipe profile.  Irrelevant fields are ignored for a
+/// given protocol.  `streams` can be scalar or array for fixed/scan recipes.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub(super) struct UiRecipeProfile {
+    pub(super) window: Option<String>,
+    pub(super) length: Option<String>,
+    pub(super) bandwidth: Option<String>,
+    pub(super) streams: UiU32Values,
+    pub(super) tcp_streams: Option<UiU32Values>,
+    pub(super) udp_streams: Option<UiU32Values>,
+}
+
+/// A recipe may use complete `profiles`, or the axis fields below.  The
+/// compiler expands axes explicitly and never crosses TCP with UDP.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub(super) struct UiRecipe {
+    pub(super) id: String,
+    pub(super) name: String,
+    pub(super) mode: String,
+    pub(super) profiles: Vec<UiRecipeProfile>,
+    pub(super) tcp_windows: Vec<String>,
+    pub(super) tcp_streams: Vec<u32>,
+    pub(super) bandwidths: Vec<String>,
+    pub(super) lengths: Vec<String>,
+    pub(super) windows: Vec<String>,
+    pub(super) udp_streams: Vec<u32>,
+    pub(super) udp_profiles: Vec<UdpProfile>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub(super) struct UiRecipes {
+    pub(super) tcp: Vec<UiRecipe>,
+    pub(super) udp: Vec<UiRecipe>,
+    #[serde(alias = "pings")]
+    pub(super) ping: Vec<UiRecipe>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub(super) struct UiPairRef {
+    pub(super) id: String,
+    pub(super) src: String,
+    pub(super) dst: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub(super) struct UiLinkSet {
+    pub(super) id: String,
+    pub(super) name: String,
+    #[serde(alias = "pairs")]
+    pub(super) pair_refs: Vec<UiPairRef>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub(super) struct UiTask {
+    pub(super) id: String,
+    pub(super) name: String,
+    pub(super) protocol: String,
+    #[serde(alias = "transport")]
+    pub(super) transports: Vec<String>,
+    pub(super) directions: Vec<String>,
+    pub(super) ip: Vec<String>,
+    #[serde(alias = "recipe_ids", alias = "recipes")]
+    pub(super) recipe_ids: Vec<String>,
+    pub(super) rx_target_bidir_ab: String,
+    pub(super) rx_target_bidir_ba: String,
+    pub(super) rate_targets_mbps: Option<crate::config::RateTargets>,
+    pub(super) rate_mode: Option<crate::config::RateMode>,
+    pub(super) duration: Option<u64>,
+    pub(super) ping_count: Option<u32>,
+    pub(super) ping_payload_sizes: Option<Vec<u32>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub(super) struct UiSuite {
+    pub(super) id: String,
+    pub(super) name: String,
+    #[serde(default)]
+    pub(super) note: String,
+    pub(super) execution: String,
+    #[serde(alias = "lane_order", alias = "task_order")]
+    pub(super) order: Vec<String>,
+    #[serde(alias = "lanes")]
+    pub(super) tasks: Vec<UiTask>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub(super) struct UiBinding {
+    pub(super) id: String,
+    pub(super) link_set_id: String,
+    pub(super) suite_id: String,
+    pub(super) mode: String,
+    pub(super) order: i64,
+    #[serde(alias = "pair_ids", alias = "pair_ref_ids")]
+    pub(super) pair_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub(super) struct UiPlan {
+    #[serde(alias = "version")]
+    pub(super) ui_plan_version: u32,
+    pub(super) link_sets: Vec<UiLinkSet>,
+    pub(super) recipes: UiRecipes,
+    pub(super) suites: Vec<UiSuite>,
+    pub(super) bindings: Vec<UiBinding>,
+    /// Hash returned by `/api/plan`; excluded while calculating a fresh hash.
+    pub(super) plan_hash: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct RunRequest {
+    #[serde(default)]
+    pub(super) pairs: Vec<PairSelection>,
+    #[serde(default)]
+    pub(super) nic_policies: Vec<NicPolicySelection>,
+    #[serde(default = "default_duration")]
+    pub(super) duration: u64,
+    /// TCP socket buffer 档位，逐档各跑一轮（`-w`）。
+    #[serde(default)]
+    pub(super) tcp_windows: Vec<String>,
+    /// TCP 并发流数档位，逐档各跑一轮（`-P`）。
+    #[serde(default)]
+    pub(super) tcp_streams: Vec<u32>,
+    /// UDP 单流带宽档位，逐档各跑一轮（`-b`）。
+    #[serde(default)]
+    pub(super) udp_bandwidths: Vec<String>,
+    /// UDP 报文长度档位（`-l`）。空列表表示不下发 `-l`，用 iperf3 默认。
+    #[serde(default)]
+    pub(super) udp_lengths: Vec<String>,
+    /// UDP socket buffer 档位（`-w`）。空列表表示不下发 `-w`。
+    ///
+    /// 和 TCP 的 `-w` 是两个独立的输入：UDP 的 `-w` 挂在每个 udp_profile 上，
+    /// TCP 的挂在 `iperf.tcp_windows` 上，共用一个框会让两边互相污染。
+    #[serde(default)]
+    pub(super) udp_windows: Vec<String>,
+    #[serde(default = "default_streams")]
+    pub(super) udp_streams: u32,
+    /// 默认组之外的 UDP 参数组。矩阵里 `udp_group = 1` 指的是这里的第 0 项。
+    ///
+    /// 默认组不放进这个列表：它就是执行区那几个输入框，页面上一直都在，
+    /// 单独存一份只会多一处要保持同步的地方。
+    #[serde(default)]
+    pub(super) udp_groups: Vec<UdpGroup>,
+    /// 默认组之外的 TCP 参数组。矩阵里 `tcp_group = 1` 指的是这里的第 0 项。
+    ///
+    /// 默认组不放进这个列表：它就是 `tcp_windows` / `tcp_streams` 那两个框，
+    /// 和 UDP 默认组同理，单独存一份只会多一处要保持同步的地方。
+    #[serde(default)]
+    pub(super) tcp_groups: Vec<TcpGroup>,
+    /// ping 次数；0 = 沿用配置里的 `ping.count`。
+    #[serde(default)]
+    pub(super) ping_count: u32,
+    /// ping 包长档位（每个档位单独成一个测试单元）；空 = 沿用 `ping.payload_sizes`。
+    #[serde(default)]
+    pub(super) ping_payload_sizes: Vec<u32>,
+    /// 是否按整条路径的可信上限裁剪 UDP `-b`。
+    ///
+    /// 界面默认关：控制台上填多少就发多少，超额灌包本来就是要看的场景之一。
+    /// 配置文件里的 `limit_udp_by_link_speed` 只作用于命令行路径，不回填到这里，
+    /// 否则同一个勾选框在不同机器上含义不同。
+    #[serde(default)]
+    pub(super) limit_udp_by_link_speed: bool,
+    /// 24 小时内已有正式 PASS 的单元直接跳过。
+    ///
+    /// 和 `limit_udp_by_link_speed` 一样由界面覆盖配置文件：同一个勾选框
+    /// 在不同机器上必须是同一个意思。
+    #[serde(default)]
+    pub(super) resume: bool,
+    #[serde(default)]
+    pub(super) screenshot: bool,
+    /// New suite-plan request.  It is mutually exclusive with legacy `pairs`.
+    #[serde(default)]
+    pub(super) ui_plan: Option<UiPlan>,
+    /// Optional hash returned by `/api/plan`; checked by `/api/run`.
+    #[serde(default)]
+    pub(super) plan_hash: Option<String>,
+}
+
+pub(super) fn default_duration() -> u64 {
+    180
+}
+
+pub(super) fn default_streams() -> u32 {
+    1
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct ConnectOut {
+    pub(super) health: HealthOut,
+    pub(super) master: HostInfo,
+    pub(super) agent: HostInfo,
+    pub(super) nic_policies: Vec<NicPolicySelection>,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct BootstrapOut {
+    pub(super) agent_host: String,
+    pub(super) agent_port: u16,
+    pub(super) token_configured: bool,
+    pub(super) ipv4_prefixes: Vec<String>,
+    pub(super) duration: u64,
+    pub(super) tcp_windows: Vec<String>,
+    pub(super) tcp_streams: Vec<u32>,
+    pub(super) udp_bandwidths: Vec<String>,
+    pub(super) udp_lengths: Vec<String>,
+    pub(super) udp_windows: Vec<String>,
+    pub(super) udp_streams: u32,
+    pub(super) ping_count: u32,
+    pub(super) ping_payload_sizes: Vec<u32>,
+    pub(super) screenshot: bool,
+    /// Feature flag for pages that can send the suite-oriented `ui_plan` DTO.
+    pub(super) ui_plan_supported: bool,
+}
+
+/// 本机信息。**不需要连上辅测机**——这是控制台打开就能给出的东西。
+#[derive(Debug, Serialize)]
+pub(super) struct LocalOut {
+    pub(super) host: HostInfo,
+    pub(super) iperf3: Option<String>,
+    pub(super) version: String,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct PlannedUnit {
+    pub(super) seq: usize,
+    pub(super) title: String,
+    pub(super) est_secs: u64,
+    /// 本轮开了 resume，且这个单元在 24 小时内已有 PASS——会被跳过。
+    pub(super) resumed: bool,
+    /// 这个单元每条腿**最终**下发的参数。
+    ///
+    /// 「网口固定值 > 参数组 > 默认组」这条优先级，与其让人背下来，不如在跑
+    /// 之前把每条腿的最终数字摆出来：填错了当场看得见，比任何校验都直接。
+    /// 而且这里是裁剪之后的值——勾了「按链路上限裁剪」时 `-b` 和流数都可能
+    /// 和填进去的不一样。
+    pub(super) load: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct PlanOut {
+    pub(super) units: Vec<PlannedUnit>,
+    /// 预计跳过的都真跳过时的耗时。
+    pub(super) est_total_secs: u64,
+    /// 一个都不跳时的耗时。开着 resume 时页面按区间显示，理由见 `api_plan`。
+    pub(super) est_full_secs: u64,
+    pub(super) notices: Vec<String>,
+    /// Hierarchical source information for the quick planner.  Empty for a
+    /// legacy matrix request; the flat `units` field remains the compatibility
+    /// contract used by the original page.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) sections: Vec<PlanSection>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) trace: Vec<PlanTrace>,
+    /// Stable hash of the request, effective config and current topology.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) plan_hash: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) topology_fingerprint: Option<String>,
+    /// Lets newer pages feature-detect the suite planner without probing a
+    /// deliberately invalid request.
+    pub(super) ui_plan_supported: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct PlanTrace {
+    pub(super) seq: usize,
+    pub(super) pair_id: Option<String>,
+    pub(super) link_set_id: Option<String>,
+    pub(super) suite_id: Option<String>,
+    pub(super) task_id: Option<String>,
+    /// Alias used by the initial design terminology; equal to `task_id`.
+    pub(super) lane_id: Option<String>,
+    pub(super) recipe_id: Option<String>,
+    pub(super) protocol: Option<String>,
+    pub(super) direction: Option<String>,
+    pub(super) ip: Option<String>,
+    pub(super) requested_args: Vec<String>,
+    pub(super) effective_args: Vec<String>,
+    pub(super) value_sources: Vec<String>,
+    pub(super) skipped_reason: Option<String>,
+    pub(super) resumed: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub(super) struct PlanSection {
+    pub(super) link_set_id: Option<String>,
+    pub(super) suite_id: Option<String>,
+    pub(super) task_id: Option<String>,
+    pub(super) title: String,
+    pub(super) unit_seqs: Vec<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct UiSource {
+    pub(super) pair_id: String,
+    pub(super) link_set_id: String,
+    pub(super) suite_id: String,
+    pub(super) task_id: String,
+    pub(super) recipe_id: String,
+    pub(super) protocol: String,
+}
+
+pub(super) struct CompiledPlan {
+    pub(super) cfg: Config,
+    pub(super) units: Vec<builder::Unit>,
+    pub(super) notices: Vec<String>,
+    pub(super) resumed: Vec<bool>,
+    pub(super) trace: Vec<PlanTrace>,
+    pub(super) sections: Vec<PlanSection>,
+    pub(super) plan_hash: String,
+    pub(super) topology_fingerprint: String,
+    pub(super) spec_errors: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub(super) struct ProgressOut {
+    pub(super) running: bool,
+    pub(super) from: usize,
+    pub(super) lines: Vec<String>,
+    pub(super) report: String,
+}

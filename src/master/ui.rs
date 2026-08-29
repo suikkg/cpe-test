@@ -11,11 +11,13 @@ use crate::console::{ask, open_path, parse_selection};
 use crate::http_client;
 use crate::master::builder::{self, build_units, Endpoint, LegKind, Side, SpecNorm, Unit};
 use crate::master::executor::{Ctx, IperfPreflightBlock, ResultDb};
+use crate::master::plan::{topology_fingerprint, ExecutionPlan};
 use crate::nic::monitor::MonitorMgr;
 use crate::nic::{format_nic_table, scan_host};
 use crate::protocol::{
     HealthOut, HostInfo, InfoReq, Resp, CTS_TRAFFIC_CAPABILITY, RELIABLE_LIFECYCLE_CAPABILITY,
 };
+use crate::reason::ReasonCode;
 use crate::report::{write_report, ReportMeta};
 use crate::util::{lock_recover, log_to_file, logln, now_compact, now_full};
 use std::collections::HashMap;
@@ -35,6 +37,11 @@ pub struct MasterOpts {
     pub resume: bool,
     pub no_open: bool,
     pub screenshot: bool,
+    /// 调用方在复核页上确认过的执行计划哈希。
+    ///
+    /// 有值时，本次真正推导出的计划必须与它一致才允许开跑——这是「界面上
+    /// 确认的东西 == 实际跑的东西」唯一的强制点。命令行直跑不填，不设闸。
+    pub expected_plan_hash: Option<String>,
 }
 
 const LAST_AGENT_FILE: &str = ".cpe_last_agent";
@@ -53,8 +60,8 @@ fn last_agent_host_at(path: &Path) -> Option<String> {
     let host = host.trim().to_string();
     (!host.is_empty()).then_some(host)
 }
-const IPERF_PREFLIGHT_FAILED: &str = "IPERF_PREFLIGHT_FAILED";
-const CTS_PREFLIGHT_FAILED: &str = "CTSTRAFFIC_PREFLIGHT_FAILED";
+const IPERF_PREFLIGHT_FAILED: ReasonCode = ReasonCode::IperfPreflightFailed;
+const CTS_PREFLIGHT_FAILED: ReasonCode = ReasonCode::CtsPreflightFailed;
 const RUNS_DIR: &str = "runs";
 
 #[derive(Debug, Clone)]
@@ -301,15 +308,35 @@ pub fn run_master(opts: MasterOpts) -> i32 {
 
     // ---- 生成任务单元 ----
     let mut next_port = builder::PORT_BASE;
-    let (mut units, notices) =
+    let (built_units, notices) =
         build_units(&specs, cfg.require_same_subnet_for_iperf, &mut next_port);
-    for n in &notices {
+    let plan = ExecutionPlan::new(
+        &cfg,
+        topology_fingerprint(&master_info, &agent_info),
+        built_units,
+        notices,
+    );
+    for n in plan.notices() {
         logln(&format!("提示: {n}"));
     }
-    if units.is_empty() {
+    if plan.is_empty() {
         logln("没有生成任何任务（可能全部被跳过），退出。");
         return 1;
     }
+    // 复核页确认过什么，就必须跑什么。对不上的唯一可能是两次推导之间出现了
+    // 分叉（配置序列化有损、网口拓扑变了、代码路径不一致）——那都是必须先
+    // 查清楚的事，不能带着跑完再让报告去背锅。
+    // 把计划身份写进日志：事后拿着报告要能回答「这份报告是哪一份计划跑出来的」。
+    logln(&format!(
+        "执行计划 v{} · 计划 {} · 配置 {} · 拓扑 {} · 成型于 {}",
+        plan.version, plan.plan_hash, plan.config_hash, plan.topology_hash, plan.created_at
+    ));
+    if !plan.matches(opts.expected_plan_hash.as_deref()) {
+        logln("!! 执行计划与复核页确认的不一致，已拒绝执行。");
+        logln("   多半是网口拓扑或配置在确认之后发生了变化，请重新预览任务。");
+        return 2;
+    }
+    let mut units = plan.units().to_vec();
 
     // ---- 勾选任务 ----
     if !opts.auto {
@@ -544,7 +571,7 @@ fn iperf_preflight_block(
     }
 
     (!reasons.is_empty()).then(|| IperfPreflightBlock {
-        reason_code: IPERF_PREFLIGHT_FAILED.into(),
+        reason_code: IPERF_PREFLIGHT_FAILED,
         reason_detail: reasons.join("；"),
     })
 }
@@ -601,7 +628,7 @@ fn ctstraffic_preflight_block(
         reasons.push("辅测机未找到 ctsTraffic.exe，请放到 agent 同目录或 PATH".into());
     }
     (!reasons.is_empty()).then(|| IperfPreflightBlock {
-        reason_code: CTS_PREFLIGHT_FAILED.into(),
+        reason_code: CTS_PREFLIGHT_FAILED,
         reason_detail: reasons.join("；"),
     })
 }

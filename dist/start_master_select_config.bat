@@ -3,14 +3,14 @@ setlocal
 cd /d "%~dp0"
 
 echo ========================================
-echo          é€‰æ‹©æœ¬æ¬¡æµ‹è¯•çš„ç½‘å£é…ç½®
+echo          Ñ¡Ôñ±¾´Î²âÊÔµÄÍø¿ÚÅäÖÃ
 echo ========================================
 echo [1] SGMII 1G / 2.5G
 echo [2] Wi-Fi 5G
 echo [3] 10G USB - 10G Ethernet
-echo [4] å…¨éƒ¨å¸¸ç”¨ç½‘å£
+echo [4] È«²¿³£ÓÃÍø¿Ú
 echo.
-set /p CHOICE=è¯·è¾“å…¥ç¼–å·ï¼ˆé»˜è®¤ 1ï¼‰ï¼š
+set /p CHOICE=ÇëÊäÈë±àºÅ£¨Ä¬ÈÏ 1£©£º
 if "%CHOICE%"=="" set "CHOICE=1"
 
 if "%CHOICE%"=="1" set "CONFIG=configs\config-sgmii.json"
@@ -19,7 +19,7 @@ if "%CHOICE%"=="3" set "CONFIG=configs\config-10gusb.json"
 if "%CHOICE%"=="4" set "CONFIG=configs\config-all-common.json"
 
 if not defined CONFIG (
-  echo [é”™è¯¯] æ— æ•ˆç¼–å·ï¼š%CHOICE%
+  echo [´íÎó] ÎÞÐ§±àºÅ£º%CHOICE%
   pause
   exit /b 1
 )
