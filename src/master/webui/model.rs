@@ -466,4 +466,13 @@ pub(super) struct ProgressOut {
     pub(super) from: usize,
     pub(super) lines: Vec<String>,
     pub(super) report: String,
+    /// 结构化运行状态（ADR-2）。
+    ///
+    /// `lines` 保留原样给日志屏——那是**给人看的**，文案可以随便改。
+    /// `run` 是**给机器读的**：单元级进度、计数、失败清单、ETA、报告路径全在
+    /// 这里，前端不必再去解析 `[i/total]` 和「==> 单元结果:」两种日志行。
+    /// 两者同源于 executor 的同一批状态转移点。
+    pub(super) run: RunStatus,
+    /// `run.done` 的游标终点：下一拍拿它当 `units_from` 就只收增量。
+    pub(super) units_from: usize,
 }

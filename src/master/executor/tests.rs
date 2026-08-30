@@ -107,7 +107,7 @@ fn ctstraffic_task(udp: bool) -> CtsTrafficTask {
         status_update_ms: 1_000,
         rate_mode: RateMode::Observe,
         rx_target_mbps: None,
-        offered_mbps: udp.then_some(1_500.0),
+        offered_total_mbps: udp.then_some(1_500.0),
         setup_error: None,
     }
 }
@@ -120,6 +120,7 @@ fn ctstraffic_unit(id: &str, udp: bool) -> Unit {
         } else {
             "CTS TCP test".into()
         },
+        link_group: String::new(),
         bidir: false,
         direction: String::new(),
         legs: vec![Leg {
@@ -164,11 +165,16 @@ fn ctstraffic_attempt(attempt: usize, traffic_established: bool) -> CtsAttemptRu
 }
 
 fn isolated_ctx(agent_port: u16) -> (Ctx, PathBuf) {
+    let seq = RESOURCE_OWNER_SEQ.fetch_add(1, Ordering::SeqCst);
     let db_path = std::env::temp_dir().join(format!(
         "cpe_test_executor_{}_{}.json",
         std::process::id(),
-        RESOURCE_OWNER_SEQ.fetch_add(1, Ordering::SeqCst)
+        seq
     ));
+    // 每个 Ctx 一个独立 run 目录：`persist_new_rows` 会往 run_dir 追加
+    // rows.jsonl，共用一个临时目录会让所有用例往同一个文件里叠加。
+    let run_dir = std::env::temp_dir().join(format!("cpe_test_run_{}_{}", std::process::id(), seq));
+    let _ = std::fs::create_dir_all(&run_dir);
     let ctx = Ctx {
         topology: None,
         agent_host: "127.0.0.1".into(),
@@ -179,12 +185,15 @@ fn isolated_ctx(agent_port: u16) -> (Ctx, PathBuf) {
             ..Default::default()
         },
         outdir: std::env::temp_dir(),
+        run_dir: run_dir.clone(),
         transport: Arc::new(http_client::TcpTransport),
         clock: Arc::new(SystemClock),
         local_servers: IperfServerMgr::new(),
         local_cts_jobs: IperfClientJobMgr::new(),
         local_monitors: MonitorMgr::new(),
         rows: Mutex::new(Vec::new()),
+        observer: None,
+        persisted_rows: Mutex::new(0),
         db: Mutex::new(ResultDb::load(db_path.clone())),
     };
     (ctx, db_path)
@@ -782,7 +791,7 @@ fn udp_plan(
             stream_idx,
             rate_mode: RateMode::Observe,
             rx_target_mbps: None,
-            offered_mbps: Some(500.0),
+            offered_per_stream_mbps: Some(500.0),
         })
         .collect();
     UdpLegPlan {
@@ -807,7 +816,7 @@ fn tcp_task(src: &Endpoint, dst: &Endpoint, port: u16) -> IperfTask {
         stream_idx: 0,
         rate_mode: RateMode::Observe,
         rx_target_mbps: None,
-        offered_mbps: None,
+        offered_per_stream_mbps: None,
     }
 }
 
@@ -1765,7 +1774,7 @@ fn bidir_udp_unit(ab_port: u16, ba_port: u16, streams: usize) -> (Unit, Vec<UdpL
                 stream_idx,
                 rate_mode: RateMode::Observe,
                 rx_target_mbps: None,
-                offered_mbps: Some(500.0),
+                offered_per_stream_mbps: Some(500.0),
             })
             .collect(),
     };
@@ -1773,6 +1782,7 @@ fn bidir_udp_unit(ab_port: u16, ba_port: u16, streams: usize) -> (Unit, Vec<UdpL
     let unit = Unit {
         id: format!("udp-orch-{ab_port}-{ba_port}"),
         title: "★双向 IPERF V4 UDP -b 500m".into(),
+        link_group: String::new(),
         bidir: true,
         direction: String::new(),
         legs: vec![],
@@ -2355,6 +2365,7 @@ fn ctstraffic_builder_setup_error_returns_before_agent_or_cts_start() {
     let unit = Unit {
         id: "cts-builder-setup-error".into(),
         title: "CTS builder setup error".into(),
+        link_group: String::new(),
         bidir: false,
         direction: String::new(),
         legs: Vec::new(),
@@ -3462,6 +3473,7 @@ fn client_tail_failure_after_full_window_keeps_nic_verdict() {
         rx_target_mbps: None,
         rx_stats: &rx,
         tx_stats: &rx,
+        offered_floor: None,
         client_tail: TAIL_HANDSHAKE_ERROR,
         rx_monitor: None,
     });
@@ -3498,6 +3510,7 @@ fn tail_failure_downgrade_never_upgrades_a_failing_rate() {
         rx_target_mbps: Some(900.0),
         rx_stats: &below,
         tx_stats: &below,
+        offered_floor: None,
         client_tail: TAIL_HANDSHAKE_ERROR,
         rx_monitor: None,
     });
@@ -3522,6 +3535,7 @@ fn tail_failure_downgrade_never_upgrades_a_failing_rate() {
         rx_target_mbps: None,
         rx_stats: &dead,
         tx_stats: &dead,
+        offered_floor: None,
         client_tail: TAIL_HANDSHAKE_ERROR,
         rx_monitor: None,
     });
@@ -3624,6 +3638,7 @@ fn an_unusable_window_still_reports_what_the_nic_actually_saw() {
         rx_target_mbps: None,
         rx_stats: &RateStats::default(),
         tx_stats: &RateStats::default(),
+        offered_floor: None,
         client_tail: "",
         rx_monitor: Some(&monitor),
     });
@@ -3652,6 +3667,7 @@ fn an_unusable_window_without_samples_stays_silent() {
         rx_target_mbps: None,
         rx_stats: &RateStats::default(),
         tx_stats: &RateStats::default(),
+        offered_floor: None,
         client_tail: "",
         rx_monitor: None,
     });
@@ -3678,6 +3694,7 @@ fn client_failure_before_a_full_window_is_still_a_setup_error() {
         rx_target_mbps: None,
         rx_stats: &rx,
         tx_stats: &rx,
+        offered_floor: None,
         client_tail: "iperf3: error - unable to connect to server",
         rx_monitor: None,
     });
@@ -4079,11 +4096,12 @@ fn preflight_block_marks_iperf_without_touching_ping_legs() {
         stream_idx: 0,
         rate_mode: RateMode::Observe,
         rx_target_mbps: None,
-        offered_mbps: None,
+        offered_per_stream_mbps: None,
     };
     let unit = Unit {
         id: "blocked".into(),
         title: "blocked".into(),
+        link_group: String::new(),
         bidir: false,
         direction: String::new(),
         legs: vec![Leg {
@@ -4111,6 +4129,7 @@ fn missing_ab_row_is_restored_without_duplicating_existing_ba_row() {
     let unit = Unit {
         id: "partial-bidir-tcp".into(),
         title: "partial bidirectional TCP".into(),
+        link_group: String::new(),
         bidir: true,
         direction: String::new(),
         legs: vec![
@@ -4178,6 +4197,7 @@ fn unit_panic_is_expanded_to_both_direction_rows_without_generic_duplicate() {
     let unit = Unit {
         id: "panic-bidir-tcp".into(),
         title: "panic bidirectional TCP".into(),
+        link_group: String::new(),
         bidir: true,
         direction: String::new(),
         legs: vec![
@@ -4225,6 +4245,7 @@ fn unit_panic_reuses_a_committed_ab_row_and_only_fills_missing_ba() {
     let unit = Unit {
         id: "partial-row-then-panic".into(),
         title: "partial row then unit panic".into(),
+        link_group: String::new(),
         bidir: true,
         direction: String::new(),
         legs: vec![
@@ -4295,6 +4316,7 @@ fn bidirectional_preflight_keeps_both_ab_and_ba_detail_rows() {
     let unit = Unit {
         id: "blocked-bidir-tcp".into(),
         title: "blocked bidirectional TCP".into(),
+        link_group: String::new(),
         bidir: true,
         direction: String::new(),
         legs: vec![
@@ -4422,6 +4444,7 @@ fn ctstraffic_preflight_remains_per_leg_when_only_one_direction_has_args_error()
     let unit = Unit {
         id: "cts-mixed-args-preflight".into(),
         title: "CTS mixed args/preflight".into(),
+        link_group: String::new(),
         bidir: true,
         direction: String::new(),
         legs: vec![
@@ -4485,6 +4508,7 @@ fn ctstraffic_two_invalid_directions_keep_two_detail_rows_under_preflight() {
     let unit = Unit {
         id: "cts-two-invalid-preflight".into(),
         title: "CTS two invalid directions".into(),
+        link_group: String::new(),
         bidir: true,
         direction: String::new(),
         legs: vec![
@@ -4561,6 +4585,7 @@ fn preflight_block_takes_priority_over_resume_pass() {
     let unit = Unit {
         id: "blocked-resume".into(),
         title: "blocked-resume".into(),
+        link_group: String::new(),
         bidir: false,
         direction: String::new(),
         legs: vec![Leg {
@@ -4578,7 +4603,7 @@ fn preflight_block_takes_priority_over_resume_pass() {
                 stream_idx: 0,
                 rate_mode: RateMode::Observe,
                 rx_target_mbps: None,
-                offered_mbps: None,
+                offered_per_stream_mbps: None,
             }),
         }],
         est_secs: 1,
@@ -4601,12 +4626,15 @@ fn preflight_block_takes_priority_over_resume_pass() {
         agent_port: 1,
         cfg,
         outdir: std::env::temp_dir(),
+        run_dir: std::env::temp_dir(),
         transport: Arc::new(http_client::TcpTransport),
         clock: Arc::new(SystemClock),
         local_servers: IperfServerMgr::new(),
         local_cts_jobs: IperfClientJobMgr::new(),
         local_monitors: MonitorMgr::new(),
         rows: Mutex::new(Vec::new()),
+        observer: None,
+        persisted_rows: Mutex::new(0),
         db: Mutex::new(ResultDb::load(db_path.clone())),
     };
     let block = IperfPreflightBlock {
@@ -4658,6 +4686,7 @@ round-trip min/avg/max/stddev = 1.250/2.500/3.750/1.021 ms
     let unit = Unit {
         id: "agent-ping-success".into(),
         title: "PING V4 -l 1400 n=3".into(),
+        link_group: String::new(),
         bidir: false,
         direction: String::new(),
         legs: vec![Leg {
@@ -4725,6 +4754,7 @@ fn missing_gateway_is_not_reported_as_network_packet_loss() {
     let unit = Unit {
         id: "gateway-missing".into(),
         title: "gateway-missing".into(),
+        link_group: String::new(),
         bidir: false,
         direction: String::new(),
         legs: vec![Leg {
@@ -4759,6 +4789,7 @@ fn agent_ping_http_failure_is_setup_error_not_one_hundred_percent_loss() {
     let unit = Unit {
         id: "agent-ping-http-error".into(),
         title: "agent-ping-http-error".into(),
+        link_group: String::new(),
         bidir: false,
         direction: String::new(),
         legs: vec![Leg {
@@ -4793,6 +4824,7 @@ fn mixed_preflight_failure_still_runs_independent_ping_unit() {
     let iperf_unit = Unit {
         id: "mixed-iperf".into(),
         title: "mixed-iperf".into(),
+        link_group: String::new(),
         bidir: false,
         direction: String::new(),
         legs: vec![Leg {
@@ -4810,7 +4842,7 @@ fn mixed_preflight_failure_still_runs_independent_ping_unit() {
                 stream_idx: 0,
                 rate_mode: RateMode::Observe,
                 rx_target_mbps: None,
-                offered_mbps: None,
+                offered_per_stream_mbps: None,
             }),
         }],
         est_secs: 1,
@@ -4818,6 +4850,7 @@ fn mixed_preflight_failure_still_runs_independent_ping_unit() {
     let ping_unit = Unit {
         id: "mixed-ping".into(),
         title: "mixed-ping".into(),
+        link_group: String::new(),
         bidir: false,
         direction: String::new(),
         legs: vec![Leg {
@@ -5057,7 +5090,7 @@ fn raw_iperf_record_contains_both_sides_events_and_error() {
         stream_idx: 0,
         rate_mode: RateMode::Observe,
         rx_target_mbps: None,
-        offered_mbps: None,
+        offered_per_stream_mbps: None,
     };
     let client = IperfClientOut {
         cmd: "iperf3 -c 192.168.1.3".into(),
@@ -5232,21 +5265,21 @@ fn a_dropout_fails_the_same_way_on_both_transports() {
         series: steady.clone(),
         ..healthy_stats(850.0)
     };
-    let (verdict, _, _) = evaluate_nic_rx(RateMode::Verify, Some(target), &pass, &tx);
+    let (verdict, _, _) = evaluate_nic_rx(RateMode::Verify, Some(target), &pass, &tx, None);
     assert_eq!(verdict, Verdict::Pass, "全程稳定应当 PASS");
 
     let fails = RateStats {
         series: dipped.clone(),
         ..healthy_stats(850.0)
     };
-    let (verdict, code, _) = evaluate_nic_rx(RateMode::Verify, Some(target), &fails, &tx);
+    let (verdict, code, _) = evaluate_nic_rx(RateMode::Verify, Some(target), &fails, &tx, None);
     assert_eq!((verdict, code), (Verdict::RateFail, ReasonCode::RxDropout));
 
     let tolerated = RateStats {
         series: blip.clone(),
         ..healthy_stats(850.0)
     };
-    let (verdict, _, _) = evaluate_nic_rx(RateMode::Verify, Some(target), &tolerated, &tx);
+    let (verdict, _, _) = evaluate_nic_rx(RateMode::Verify, Some(target), &tolerated, &tx, None);
     assert_eq!(verdict, Verdict::Pass, "一个采样周期的掉拍不该判 FAIL");
 
     // UDP 路径用的是同一个 rate_excursion 谓词，直接验证它在同样输入上
@@ -5257,4 +5290,69 @@ fn a_dropout_fails_the_same_way_on_both_transports() {
     assert_eq!(excursion.reason_code(), ReasonCode::RxDropout);
     assert_eq!(excursion.longest_ms, 6_000);
     assert_eq!(excursion.extreme_mbps, 120.0);
+}
+
+/// 生产代码里造 `Row` 只能走 `base_row` / `unit_row`，不许再 `..Default::default()`。
+///
+/// 这条守的是 AGENTS.md §3 里那句「改报告列必须联检 executor **全部** Row 构造点，
+/// 漏一个就是空列」。空列不会让任何测试变红——它只是在用户的报告里少一格，
+/// 而那一格恰好是他要拿去验收的那个数。历史上报告加列就是这么漏过的。
+///
+/// `..Default::default()` 正是让「漏填」变得无声的那个语法：新字段自动取零值，
+/// 编译器一句话都不说。改成走构造函数之后，新增身份字段会让 10 个构造点全部
+/// 编译失败——从「运行期空列」变成「编译期错误」。
+///
+/// 照 `verdict_priority_has_exactly_one_definition_in_the_tree` 的样子写：
+/// 扫源码，而不是靠人记得。
+#[test]
+fn every_production_row_is_built_through_the_shared_constructor() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/master");
+    let mut offenders = Vec::new();
+    let mut stack = vec![root];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            // 测试自己可以随便造 Row：它们是被测数据，不是产物。
+            if path.file_name().and_then(|n| n.to_str()) == Some("tests.rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("read source");
+            for (index, _) in text.match_indices("push_row(Row {") {
+                let tail = &text[index..];
+                let mut depth = 0usize;
+                let mut end = tail.len();
+                for (offset, ch) in tail.char_indices() {
+                    match ch {
+                        '{' => depth += 1,
+                        '}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                end = offset;
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let body = &tail[..end];
+                let built_by_constructor =
+                    body.contains("..base_row(") || body.contains("..unit_row(");
+                if !built_by_constructor {
+                    let line = text[..index].matches('\n').count() + 1;
+                    offenders.push(format!("{}:{line}", path.display()));
+                }
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "这些 Row 构造点绕过了 base_row/unit_row，新增报告列时会变成空列：{offenders:#?}"
+    );
 }

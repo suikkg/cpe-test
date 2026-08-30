@@ -475,6 +475,9 @@ fn route(method: &Method, url: &str, body: &str, st: &Arc<AgentState>) -> String
                 Ok(r) => r,
                 Err(e) => return e,
             };
+            if let Err(e) = crate::cmd::iperf::check_client_extra(&req) {
+                return err_json(&e);
+            }
             let Some(bin) = find_iperf3() else {
                 return err_json("辅测机未找到 iperf3，请把 iperf3.exe 放到 agent 程序同目录");
             };
@@ -494,6 +497,11 @@ fn route(method: &Method, url: &str, body: &str, st: &Arc<AgentState>) -> String
                 Ok(r) => r,
                 Err(e) => return e,
             };
+            // 受控参数在**建作业之前**挡下：等到进程起来再发现口径被改了，
+            // 这一腿的测量已经没法用了，还平白占掉一次 owner/lease。
+            if let Err(e) = crate::cmd::iperf::check_client_extra(&req.request) {
+                return err_json(&e);
+            }
             let Some(bin) = find_iperf3() else {
                 return err_json("辅测机未找到 iperf3，请把 iperf3.exe 放到 agent 程序同目录");
             };

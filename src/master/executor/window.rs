@@ -90,7 +90,7 @@ pub(super) fn cts_effective_window(
         end_ms > start_ms
             && end_ms
                 .saturating_sub(start_ms)
-                .saturating_add(CTS_TIMELINE_TOLERANCE_MS)
+                .saturating_add(WINDOW_COMPLETE_TOLERANCE_MS)
                 >= required_ms
     };
 
@@ -108,7 +108,7 @@ pub(super) fn cts_effective_window(
     });
     let available_ms = end_ms.saturating_sub(start_ms);
     let complete = complete_start_ms.is_some()
-        && available_ms.saturating_add(CTS_TIMELINE_TOLERANCE_MS) >= required_ms;
+        && available_ms.saturating_add(WINDOW_COMPLETE_TOLERANCE_MS) >= required_ms;
     let scored_end_ms = if complete {
         start_ms.saturating_add(required_ms).min(end_ms)
     } else {
@@ -294,7 +294,7 @@ pub(super) fn iperf_effective_window(
     };
     let available_ms = end_ms.saturating_sub(start_ms);
     let required_ms = required_secs.saturating_mul(1_000);
-    let complete = available_ms.saturating_add(CTS_TIMELINE_TOLERANCE_MS) >= required_ms;
+    let complete = available_ms.saturating_add(WINDOW_COMPLETE_TOLERANCE_MS) >= required_ms;
     EffectiveWindow {
         start_ms,
         end_ms: if complete {
@@ -423,7 +423,7 @@ pub(super) fn leg_effective_window(
         plan.streams.len(),
         rate_cfg,
         first.rx_target_mbps,
-        first.offered_mbps,
+        first.offered_per_stream_mbps,
     );
     let eligible = |t: u64| -> bool {
         let active = results
@@ -470,7 +470,11 @@ pub(super) fn leg_effective_window(
     let scored_start = best_start.saturating_add(rate_cfg.settle_secs.saturating_mul(1_000));
     let available_ms = best_end.saturating_sub(scored_start);
     let available_secs = available_ms as f64 / 1000.0;
-    let complete = available_ms >= required_secs.saturating_mul(1_000);
+    // 与 iperf/CTS 同一个容差（ADR-12）。此前这里是零容差，于是 179.95 秒的
+    // UDP 腿判 EFFECTIVE_WINDOW_SHORT，而同样的 TCP 腿 PASS——同一件事在两条
+    // 链上两个结论。
+    let complete = available_ms.saturating_add(WINDOW_COMPLETE_TOLERANCE_MS)
+        >= required_secs.saturating_mul(1_000);
     let scored_end = if complete {
         scored_start.saturating_add(required_secs.saturating_mul(1_000))
     } else {

@@ -85,32 +85,11 @@ pub(super) fn zero_udp_stream_verdict(requested: usize, attempts_exhausted: bool
     }
 }
 
-/// 接收端跟得上发送端的判据：收到的至少是发出的这个比例。
-///
-/// 和 `offered_headroom_pct` 无关，也不该跟着它走：那个说的是「要判达标，
-/// 得比门限多灌多少」，这个说的是「这条路径有没有在丢东西」。
-pub(super) const RX_TRACKS_TX_RATIO: f64 = 0.95;
-
-/// 发送端没灌够时，接收端的缺口能不能用「灌得不够」解释。
-///
-/// 能解释才是真的判不了。举两个例子，门限都是 1000：
-///
-/// - 灌 1000 收 990：收到的几乎就是发出的全部，被测设备还能不能再多送 10
-///   是未知数——必须把发送量补到门限+余量再测一次，这时 `OFFERED_LOAD_LOW`
-///   是对的。
-/// - 灌 1000 收 580：路径已经丢掉 42%，而发送端的缺口只有 50。把发送量补到
-///   1050 也补不出这 420，**FAIL 在这一轮就已经成立**。此时还报「判不了」
-///   等于把一个确凿的不达标藏起来。
-///
-/// 少一边数据时保守返回 true（维持判不了）：没有对照就没有结论。
-pub(super) fn offered_shortfall_explains_rx(rx_avg: Option<f64>, tx_p10: Option<f64>) -> bool {
-    match (rx_avg, tx_p10) {
-        (Some(rx), Some(tx)) if tx.is_finite() && tx > 0.0 && rx.is_finite() => {
-            rx >= tx * RX_TRACKS_TX_RATIO
-        }
-        _ => true,
-    }
-}
+// 「灌够了没有」的口径现在是全仓共享的（ADR-12(c)）：定义搬到了
+// `rate_window`，连同 `RX_TRACKS_TX_RATIO`（接收端跟得上发送端的比例，
+// 与 `offered_headroom_pct` 无关，也不该跟着它走）。以前它们只存在于这里，
+// 而 `evaluate_nic_rx` 只查 TX 覆盖率不查 TX 水平，于是 CTS 路径上零防护。
+pub(super) use crate::master::rate_window::offered_shortfall_explains_rx;
 
 pub(super) fn required_udp_streams(
     requested: usize,
@@ -929,7 +908,7 @@ impl Ctx {
                 n,
                 &self.cfg.iperf.rate_check,
                 first.rx_target_mbps,
-                first.offered_mbps,
+                first.offered_per_stream_mbps,
             );
             let first_active_ms = leg_flows
                 .iter()
@@ -947,9 +926,10 @@ impl Ctx {
                 .map(|out| monitor_rate_stats(out, &effective_window, false, baseline_cutoff_ms))
                 .unwrap_or_default();
             let rx_avg = rx_stats.avg_mbps;
-            let offered_floor = first.rx_target_mbps.map(|target| {
-                target * (1.0 + self.cfg.iperf.rate_check.offered_headroom_pct.max(0.0) / 100.0)
-            });
+            let offered_floor = crate::master::rate_window::offered_floor_mbps(
+                first.rx_target_mbps,
+                self.cfg.iperf.rate_check.offered_headroom_pct,
+            );
             let udp_loss = aggregate_udp_loss(&leg_flows);
             let judgement = udp_leg_verdict(&UdpLegFacts {
                 streams_total: n,
@@ -1045,34 +1025,11 @@ impl Ctx {
                     events: &flow.events,
                     error: &flow.error,
                 });
-                let nic_samples = monitor_sample_files
+                let nic_samples_rx = monitor_sample_files
                     .get(&flow.task.dst.key())
                     .cloned()
                     .unwrap_or_default();
                 self.push_row(Row {
-                    sort_key: (useq, plan.lidx, flow.stream_pos + 1, 0),
-                    time: now_full(),
-                    task_id: md5_hex(&format!("{}|{}|{}", unit.id, plan.tag, flow.stream_pos)),
-                    parent_id: unit.id.clone(),
-                    task: unit.title.clone(),
-                    ip: if flow.task.v6 {
-                        "V6".into()
-                    } else {
-                        "V4".into()
-                    },
-                    transport: "UDP".into(),
-                    param: format!(
-                        "{} (#{}; retry={})",
-                        flow.task.profile_label,
-                        flow.stream_pos + 1,
-                        flow.retries
-                    ),
-                    src_pc: flow.task.src.pc.clone(),
-                    src_iface: flow.task.src.nic.name.clone(),
-                    src_ip: flow.task.src.nic.ipv4.clone(),
-                    dst_pc: flow.task.dst.pc.clone(),
-                    dst_iface: flow.task.dst.nic.name.clone(),
-                    dst_ip: flow.task.dst.nic.ipv4.clone(),
                     verdict: flow_verdict,
                     execution_status: if flow.client.timed_out {
                         ExecutionStatus::TimedOut
@@ -1085,11 +1042,6 @@ impl Ctx {
                     },
                     reason_code: flow_reason_code,
                     reason_detail: flow_reason_detail,
-                    kind_label: if unit.bidir {
-                        format!("★★双向灌包-{}(流明细)", plan.tag)
-                    } else {
-                        "灌包(流明细)".into()
-                    },
                     tx_mbps: flow.parsed.best_sender(),
                     rx_mbps: flow.parsed.best_receiver(),
                     udp_loss: flow.parsed.udp_loss_pct,
@@ -1099,7 +1051,7 @@ impl Ctx {
                     retry_count: flow.retries,
                     command: flow.client.cmd.clone(),
                     raw_log,
-                    nic_samples,
+                    nic_samples_rx,
                     raws: vec![
                         (
                             format!(
@@ -1122,7 +1074,35 @@ impl Ctx {
                             format_flow_events(&flow.events, &flow.error),
                         ),
                     ],
-                    ..Default::default()
+                    ..base_row(RowIdentity {
+                        unit_seq: useq,
+                        leg_index: plan.lidx,
+                        stream_index: flow.stream_pos + 1,
+                        group_flag: 0,
+                        unit,
+                        leg_tag: &plan.tag,
+                        src: &flow.task.src,
+                        dst: &flow.task.dst,
+                        ip: if flow.task.v6 {
+                            "V6".into()
+                        } else {
+                            "V4".into()
+                        },
+                        protocol: RowProtocol::Udp,
+                        backend: RowBackend::Iperf3,
+                        param: format!(
+                            "{} (#{}; retry={})",
+                            flow.task.profile_label,
+                            flow.stream_pos + 1,
+                            flow.retries
+                        ),
+                        kind_label: if unit.bidir {
+                            format!("★★双向灌包-{}(流明细)", plan.tag)
+                        } else {
+                            "灌包(流明细)".into()
+                        },
+                        task_id: md5_hex(&format!("{}|{}|{}", unit.id, plan.tag, flow.stream_pos)),
+                    })
                 });
             }
 
@@ -1135,23 +1115,6 @@ impl Ctx {
                 (String::new(), String::new())
             };
             let idx = self.push_row(Row {
-                sort_key: (useq, plan.lidx, n + 1, 1),
-                time: now_full(),
-                task_id: md5_hex(&format!("{}|{}|grouptotal", unit.id, plan.tag)),
-                parent_id: unit.id.clone(),
-                task: unit.title.clone(),
-                ip: if first.v6 { "V6".into() } else { "V4".into() },
-                transport: "UDP".into(),
-                param: format!(
-                    "★组合计({} 共{}条流，成功{}，要求至少{})",
-                    plan.name, n, success, required
-                ),
-                src_pc: first.src.pc.clone(),
-                src_iface: first.src.nic.name.clone(),
-                src_ip: first.src.nic.ipv4.clone(),
-                dst_pc: first.dst.pc.clone(),
-                dst_iface: first.dst.nic.name.clone(),
-                dst_ip: first.dst.nic.ipv4.clone(),
                 verdict,
                 execution_status: if success == 0 {
                     ExecutionStatus::Error
@@ -1162,11 +1125,6 @@ impl Ctx {
                 },
                 reason_code,
                 reason_detail: reason_detail.clone(),
-                kind_label: if unit.bidir {
-                    format!("★组合计-{}", plan.tag)
-                } else {
-                    "★组合计".into()
-                },
                 rx_avg,
                 requested_streams: n,
                 active_streams: success,
@@ -1195,7 +1153,7 @@ impl Ctx {
                 screenshot_master,
                 screenshot_agent,
                 is_grouptotal: true,
-                nic_samples: monitor_sample_files
+                nic_samples_rx: monitor_sample_files
                     .get(&first.dst.key())
                     .cloned()
                     .unwrap_or_default(),
@@ -1204,7 +1162,30 @@ impl Ctx {
                 } else {
                     vec![("streams_active -> RX 速率".into(), discovery_table)]
                 },
-                ..Default::default()
+                ..base_row(RowIdentity {
+                    unit_seq: useq,
+                    leg_index: plan.lidx,
+                    // 组合计排在同组明细之后：第三位取 n+1，第四位置 1。
+                    stream_index: n + 1,
+                    group_flag: 1,
+                    unit,
+                    leg_tag: &plan.tag,
+                    src: &first.src,
+                    dst: &first.dst,
+                    ip: if first.v6 { "V6".into() } else { "V4".into() },
+                    protocol: RowProtocol::Udp,
+                    backend: RowBackend::Iperf3,
+                    param: format!(
+                        "★组合计({} 共{}条流，成功{}，要求至少{})",
+                        plan.name, n, success, required
+                    ),
+                    kind_label: if unit.bidir {
+                        format!("★组合计-{}", plan.tag)
+                    } else {
+                        "★组合计".into()
+                    },
+                    task_id: md5_hex(&format!("{}|{}|grouptotal", unit.id, plan.tag)),
+                })
             });
             outcomes.push(LegOutcome {
                 judgement: VerdictResult::new(verdict, reason_code, reason_detail),

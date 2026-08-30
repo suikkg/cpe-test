@@ -605,6 +605,18 @@ pub fn now_full() -> String {
     chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
+/// Unix 秒 → 本地时区的 `YYYY-MM-DD HH:MM:SS`。
+///
+/// 与 [`now_full`] 同一个格式：历史运行列表里的时间和报告里的时间要长一个样，
+/// 否则用户得在两种写法之间自己换算。
+pub fn format_unix_seconds(secs: u64) -> String {
+    use chrono::TimeZone;
+    match chrono::Local.timestamp_opt(secs as i64, 0).single() {
+        Some(time) => time.format("%Y-%m-%d %H:%M:%S").to_string(),
+        None => String::new(),
+    }
+}
+
 pub fn now_compact() -> String {
     chrono::Local::now().format("%Y%m%d_%H%M%S").to_string()
 }

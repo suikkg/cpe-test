@@ -85,6 +85,12 @@ pub enum ReasonCode {
     RxOutage,
     RxP10BelowTarget,
     RxTargetMet,
+    /// **已退役，不再产出。** 掉速统一归 `RX_DROPOUT`/`RX_OUTAGE`（判定归
+    /// RATE_FAIL，靠原因码区分严重程度），全仓没有任何发射点。
+    ///
+    /// 变体保留是为了**读**：`from_label` 要能解析历史 `task_results.json` 与
+    /// 老报告里的 `RX_UNSTABLE`，处置建议和报告的交叉核对文案也跟着保留，
+    /// 否则拿旧数据重渲染会掉成「无建议」。找不到它在哪产出是正常的，别去补。
     RxUnstable,
     SampleCoverageLow,
     SingleUdpStreamFailed,
@@ -209,6 +215,21 @@ impl ReasonCode {
             .unwrap_or(reason)
             .trim();
         head.parse().unwrap_or(ReasonCode::None)
+    }
+}
+
+/// serde 表示 = `as_str()`，理由同 `Verdict`（见 verdict.rs 的 `verdict_serde`）。
+/// 认不出的码回落到 `None`：重放历史数据时，一个新码不该让整行读不出来。
+impl serde::Serialize for ReasonCode {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ReasonCode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let label = String::deserialize(deserializer)?;
+        Ok(label.parse().unwrap_or(ReasonCode::None))
     }
 }
 

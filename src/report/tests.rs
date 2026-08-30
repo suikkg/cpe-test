@@ -106,6 +106,110 @@ fn unit_summary(unit: &str, verdict: Verdict) -> Row {
     }
 }
 
+/// 判定用到的样本必须都能从报告里点得到——**包括 TX**。
+///
+/// TX 采样是**否决性**门槛：`rate_window_coverage_sufficient` 要求 TX 滚动覆盖率
+/// ≥0.95 且 `tx.p10` 在，否则整行判 NOT_EVALUATED；`tx_sufficient` 还决定会不会
+/// 报 `OFFERED_LOAD_LOW`。可是 iperf/CTS 两条路径过去**从不落盘 TX 逐样本**
+/// （`save_monitor_samples` 只传 dst/RX），`Row.nic_samples` 也是单字段、装的
+/// 永远是 RX。结果是：一行被判 NOT_EVALUATED，理由是「发送端覆盖率不够」，
+/// 而那份发送端样本谁也拿不到——「报告里的每个结论都要能回到某一行样本」
+/// （`artifact.rs` 模块头自己的话）对 TX 不成立。
+#[test]
+fn both_directions_of_nic_samples_are_reachable_from_the_report() {
+    let mut row = traffic_detail("unit-a", (0, 0, 0, 0));
+    row.raw_log = "raw/iperf.log".into();
+    row.nic_samples_rx = "raw/nic_samples_rx.csv".into();
+    row.nic_samples_tx = "raw/nic_samples_tx.csv".into();
+    let html = render(vec![row, unit_summary("unit-a", Verdict::Pass)]);
+
+    assert!(html.contains("接收端逐样本 CSV"), "RX 样本链接丢了");
+    assert!(html.contains("发送端逐样本 CSV"), "TX 样本链接丢了");
+    assert!(html.contains("nic_samples_tx.csv"), "TX 文件路径没进报告");
+    // 文件计数要把 TX 算进去，否则标题说 2 个而实际给了 3 个链接。
+    assert!(
+        html.contains("3 个原始文件"),
+        "原始文件计数没算上 TX: {}",
+        html.lines()
+            .find(|line| line.contains("个原始文件"))
+            .unwrap_or("<找不到那一行>")
+    );
+}
+
+/// 概览顶部的统计格必须覆盖 `Verdict` 的**每一个**取值。
+///
+/// 这条修的是一个会静默误导人的缺口：NOT_EVALUATED 与 SKIP 过去只出现在脚注的
+/// 一行小字里，顶上没有格子。于是一轮**整轮 NOT_EVALUATED** 的报告（采样不可信、
+/// 一条结论都不能下）顶部五格全是 0，看上去和「什么都没跑」一模一样。
+///
+/// 同一处还有两个自相矛盾：脚注写着「仅统计 PASS、RATE_FAIL、UNSTABLE」，而 8 行
+/// 外的代码算的是 `judged = pass + rate_fail`（UNSTABLE 早就不产出了）；网格声明了
+/// 7 列却只画 6 格。这条断言把「每个 verdict 都有自己的格子」变成结构约束——
+/// 以后再加 verdict，漏了格子就在这里红，而不是等某一轮报告顶部全零才被发现。
+#[test]
+fn the_summary_grid_has_one_cell_for_every_verdict() {
+    let rows = vec![
+        unit_summary_at("unit-pass", Verdict::Pass, 0),
+        unit_summary_at("unit-rate-fail", Verdict::RateFail, 1),
+        unit_summary_at("unit-measured", Verdict::Measured, 2),
+        unit_summary_at("unit-not-evaluated", Verdict::NotEvaluated, 3),
+        unit_summary_at("unit-setup-error", Verdict::SetupError, 4),
+        unit_summary_at("unit-skip", Verdict::Skip, 5),
+    ];
+    let html = render(rows);
+    let start = html.find("<div class=\"summary-grid\">").expect("统计块");
+    let end = html[start..]
+        .find("</div>\n")
+        .map(|o| start + o)
+        .unwrap_or(html.len());
+    let grid = &html[start..end];
+
+    for verdict in [
+        Verdict::Pass,
+        Verdict::RateFail,
+        Verdict::Measured,
+        Verdict::NotEvaluated,
+        Verdict::SetupError,
+        Verdict::Skip,
+    ] {
+        assert!(
+            grid.contains(&format!(
+                "<span class=\"stat-label\">{}</span>",
+                verdict.label()
+            )),
+            "{} 没有统计格：整轮都是这个判定时，顶部会全是 0",
+            verdict.label()
+        );
+    }
+
+    // 声明的列数要和真画出来的格数一致，否则最后一格会独自换行。
+    let cells = grid.matches("<div class=\"stat ").count();
+    let columns = html
+        .find(".summary-grid { display: grid; grid-template-columns: repeat(")
+        .map(|at| {
+            let rest =
+                &html[at + ".summary-grid { display: grid; grid-template-columns: repeat(".len()..];
+            rest[..rest.find(',').expect("列数")]
+                .parse::<usize>()
+                .expect("列数是数字")
+        })
+        .expect("网格列数");
+    assert_eq!(
+        cells, columns,
+        "统计格 {cells} 个，网格却声明了 {columns} 列"
+    );
+
+    // 脚注不许再宣称一个代码里根本不算的分母。
+    assert!(
+        !html.contains("仅统计 PASS、RATE_FAIL、UNSTABLE"),
+        "脚注还在说 UNSTABLE 计入分母，而 judged = pass + rate_fail"
+    );
+    assert!(
+        html.contains("分母只算 PASS 与 RATE_FAIL"),
+        "脚注要说清通过率的分母是什么"
+    );
+}
+
 /// 顶层区块要能折叠，原始输出要有序号，且有一次性全开/全关的入口。
 ///
 /// 一轮 120 个单元的报告，「测试概览 / 逐行明细 / 原始输出」三块摊开是几屏，
@@ -235,7 +339,7 @@ fn the_same_unit_carries_the_same_number_in_every_section() {
 fn report_renders_compact_accessible_structure_and_diagnostics() {
     let mut detail = traffic_detail("unit-a", (0, 0, 0, 0));
     detail.raw_log = "./iperf_outputs/iperf_tcp.log".into();
-    detail.nic_samples = "./iperf_outputs/nic.csv".into();
+    detail.nic_samples_rx = "./iperf_outputs/nic.csv".into();
     detail.screenshot_master = "./iperf_outputs/master.png".into();
     detail.screenshot_agent = "./iperf_outputs/agent.png".into();
     detail.command = "iperf3 -c <target>".into();
@@ -307,7 +411,9 @@ fn report_renders_compact_accessible_structure_and_diagnostics() {
     assert!(html.contains("&lt;output&gt;"));
     assert!(html.contains("iperf3 -c &lt;target&gt;"));
     assert!(html.contains("独立原始记录"));
-    assert!(html.contains("网卡逐样本 CSV"));
+    // RX/TX 两份样本必须能分辨：TX 覆盖率是否决性门槛（不够就整行 NOT_EVALUATED），
+    // 只给一个笼统的「网卡逐样本 CSV」链接，看报告的人分不清判定依据是哪一份。
+    assert!(html.contains("接收端逐样本 CSV"));
     assert!(html.contains("原始输出（1 条执行记录，3 项内容，内嵌文本非空 1 段）"));
     assert!(html.contains("1 段内嵌输出（非空 1） · 2 个原始文件"));
     assert!(html.contains(".raw-section, .row-diagnostics { display: block; }"));

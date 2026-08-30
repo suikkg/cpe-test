@@ -1,6 +1,6 @@
 [package]
 name = "cpe_test"
-version = "4.6.0"
+version = "6.0.0"
 edition = "2021"
 description = "CPE 子网测试工具：双机自动化 ping、iperf3 与 Windows ctsTraffic 吞吐测试"
 license = "MIT"
@@ -19,6 +19,12 @@ chrono = "0.4"
 ctrlc = "3"
 md5 = "0.7"
 png = "0.17"
+rust_xlsxwriter = { version = "0.99.0", default-features = false }
+# 报告目录的打包下载。`default-features = false` 把全部压缩后端（deflate/bzip2/
+# lzma/zstd/aes…）关掉，只留 store 模式——测试数据是文本和 PNG，压不压缩对内网
+# 下载没有意义，而关掉之后不引入任何新的传递依赖：`rust_xlsxwriter` 本来就把
+# 同一个 zip crate 编进来了，这里只是把它变成直接依赖。
+zip = { version = "8.6", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [

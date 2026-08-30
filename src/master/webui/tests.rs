@@ -307,6 +307,191 @@ fn quick_plan_rejects_ping_recipe_references_until_recipe_fields_exist() {
     assert!(error.contains("暂不支持 PING 配置"), "{error}");
 }
 
+/// `UiRecipe.mode` 是死字段，必须被拒绝而不是被静默忽略。
+///
+/// 校验器过去只准 `fixed`/`scan` 两个取值，而 `webui/plan.rs` 从头到尾不读它——
+/// 两个取值产出的是**同一份计划**。用户以为 `fixed` 把档位钉死成一档，实际三条轴
+/// 全展开、耗时三倍。档位本来就由轴的取值个数表达（单值=钉死、多值=扫描），
+/// mode 是冗余开关，所以照 PING 配方的先例拒绝它。详见 ADR-16。
+/// 监控会话 id 在同一毫秒内也必须互不相同。
+///
+/// 旧写法是 `mon-<pid>-<毫秒>`。控制台有 4 个工作线程，两次
+/// `/api/monitor/start` 完全可能落在同一毫秒上；撞了之后会话表的
+/// `HashMap::insert` 会**静默**顶掉前一条——被顶掉的那条再没人能 stop 它
+/// （表里查不到 id），采样线程要一直跑到 90 秒空闲超时，辅测机侧的 monitor
+/// 资源也跟着多占一截。这条把「同毫秒」这个前提直接摆进断言。
+#[test]
+fn monitor_session_ids_stay_unique_within_the_same_millisecond() {
+    let ids: Vec<String> = (0..500).map(|_| next_monitor_session_id()).collect();
+    let unique: std::collections::HashSet<&String> = ids.iter().collect();
+    assert_eq!(unique.len(), ids.len(), "会话 id 撞了: {ids:?}");
+    // 500 次连发几乎必然跨不过 1 毫秒，前缀相同正是这条测试要覆盖的情况。
+    assert!(
+        ids[0].starts_with(&format!("mon-{}-", std::process::id())),
+        "id 形状变了: {}",
+        ids[0]
+    );
+}
+
+/// 界面溯源走 `TestSpec.origin`，不再走 `name` 的 URL 编码侧信道。
+///
+/// 之前每条 spec 的 `name` 是 `ui-plan/<链路集合>/<绑定>/<对>/<套件>/<任务>/<配方>/<协议>`
+/// 七段 URL 编码，`compile_request` 再把它拆回来重建 trace。那是整条计划链路上
+/// 唯一的 stringly 侧信道：靠约定不靠类型，改一处分隔符就悄悄断掉，而且把一个
+/// 本该给人看的字段占成了机器协议——报错里于是全是 `%E5%9F%BA%E7%BA%BF`。
+///
+/// 这条同时钉住：`name` 现在是人能读的，`link_group` 取链路集合的名字。
+#[test]
+fn the_ui_plan_traces_units_through_origin_not_through_the_test_name() {
+    let state = state_with_pair();
+    let req = suite_request();
+    let compiled = compile_request(&state, &req).expect("compile");
+
+    assert!(!compiled.cfg.tests.is_empty());
+    for test in &compiled.cfg.tests {
+        let origin = test
+            .origin
+            .as_ref()
+            .unwrap_or_else(|| panic!("{} 缺少 origin", test.name));
+        assert_eq!(origin.link_set_id, "set-a");
+        assert_eq!(origin.link_set_name, "A");
+        assert_eq!(origin.pair_id, "pair-a");
+        assert_eq!(origin.suite_id, "suite-a");
+        assert!(!origin.binding_id.is_empty(), "binding_id 要填");
+        assert!(!origin.task_id.is_empty(), "task_id 要填");
+
+        // 分组键取链路集合的名字（用户资产），不是主机名。
+        assert_eq!(test.link_group.as_deref(), Some("A"));
+
+        // name 回归纯展示名：不许再有编码痕迹。
+        assert!(
+            !test.name.starts_with("ui-plan/") && !test.name.contains('%'),
+            "name 应该是给人看的，实得 {:?}",
+            test.name
+        );
+        assert!(
+            test.name.contains("TCP UDP"),
+            "展示名里要有套件名，实得 {:?}",
+            test.name
+        );
+    }
+
+    // trace 必须真的从 origin 重建出来，而不是碰巧为空。
+    let seen: Vec<_> = compiled
+        .trace
+        .iter()
+        .map(|t| (t.link_set_id.clone(), t.suite_id.clone(), t.task_id.clone()))
+        .collect();
+    assert!(!seen.is_empty(), "trace 不该为空");
+    for (link_set_id, suite_id, task_id) in &seen {
+        assert_eq!(link_set_id.as_deref(), Some("set-a"));
+        assert_eq!(suite_id.as_deref(), Some("suite-a"));
+        assert!(task_id.is_some(), "task_id 要能溯源");
+    }
+    // 协议不进 origin（transports/kinds 已经说清楚了），但 trace 上仍要有。
+    assert!(
+        compiled.trace.iter().all(|t| matches!(
+            t.protocol.as_deref(),
+            Some("tcp") | Some("udp") | Some("ping")
+        )),
+        "trace 的协议标签丢了: {:?}",
+        compiled
+            .trace
+            .iter()
+            .map(|t| t.protocol.clone())
+            .collect::<Vec<_>>()
+    );
+}
+
+/// 旧版本导出的 `config.json` 仍然能被读懂。
+///
+/// 那些文件的溯源信息只在 `name` 里（`ui-plan/<七段>`），没有 `origin` 字段。
+/// 回落解析必须留着，直到确定没人再拿旧导出来跑——否则用户把去年导出的配置
+/// 拖回界面，复核树会整个塌成一层。
+#[test]
+fn a_config_exported_by_the_old_encoder_still_traces_back() {
+    let mut test = TestSpec {
+        name: "ui-plan/set-x/bind-x/pair-x/suite-x/task-x/recipe-x/udp".into(),
+        src: "master:NAME=以太网 6".into(),
+        dst: "agent:NAME=WLAN 3".into(),
+        direction: OneOrMany::One("A->B".into()),
+        kinds: vec!["iperf".into()],
+        transports: vec!["udp".into()],
+        ip: vec!["v4".into()],
+        streams: 1,
+        tcp_streams: None,
+        udp_streams: None,
+        iperf_duration: None,
+        ping_count: None,
+        ping_payload_sizes: None,
+        tcp_windows: None,
+        udp_profiles: None,
+        rate_mode: None,
+        rate_targets_mbps: None,
+        rate_targets_bidir_mbps: None,
+        link_group: None,
+        origin: None,
+    };
+
+    let source = ui_source_from_spec(&test).expect("旧名字必须还能解析");
+    assert_eq!(source.link_set_id, "set-x");
+    assert_eq!(source.pair_id, "pair-x");
+    assert_eq!(source.suite_id, "suite-x");
+    assert_eq!(source.task_id, "task-x");
+    assert_eq!(source.recipe_id, "recipe-x");
+    assert_eq!(source.protocol, "udp");
+
+    // 有 origin 时以 origin 为准，name 里的旧编码不再参与。
+    test.origin = Some(UiOrigin {
+        pair_id: "pair-new".into(),
+        link_set_id: "set-new".into(),
+        link_set_name: "新集合".into(),
+        binding_id: "bind-new".into(),
+        suite_id: "suite-new".into(),
+        task_id: "task-new".into(),
+        recipe_id: "recipe-new".into(),
+    });
+    let source = ui_source_from_spec(&test).expect("origin 必须被认");
+    assert_eq!(source.link_set_id, "set-new");
+    assert_eq!(source.pair_id, "pair-new");
+    assert_eq!(
+        source.protocol, "udp",
+        "协议从 transports 推，不从 origin 存"
+    );
+
+    // 全空的 origin 等于没有 origin：老配置反序列化出来就是这个形状。
+    test.origin = Some(UiOrigin::default());
+    let source = ui_source_from_spec(&test).expect("空 origin 要回落到 name");
+    assert_eq!(source.link_set_id, "set-x");
+}
+
+#[test]
+fn quick_plan_rejects_the_dead_recipe_mode_field_instead_of_ignoring_it() {
+    let state = state_with_pair();
+    for mode in ["fixed", "scan", "Fixed"] {
+        let mut req = suite_request();
+        req.ui_plan.as_mut().expect("suite plan").recipes.udp[0].mode = mode.into();
+        let error = validate_request(&state, &req)
+            .err()
+            .unwrap_or_else(|| panic!("mode={mode} 必须被拒绝，不能静默忽略"));
+        assert!(error.contains("mode 字段已废弃"), "{error}");
+        assert!(
+            error.contains("删掉"),
+            "报错要告诉用户怎么改，而不是只说不行: {error}"
+        );
+    }
+
+    // 空 mode 是唯一合法取值：老项目文件删掉这一行之后必须照常能跑。
+    let req = suite_request();
+    assert!(
+        req.ui_plan.as_ref().expect("suite plan").recipes.udp[0]
+            .mode
+            .is_empty(),
+        "测试基线自己不该带 mode"
+    );
+    assert!(validate_request(&state, &req).is_ok(), "空 mode 必须放行");
+}
+
 #[test]
 fn quick_plan_rejects_append_binding_mode_without_silent_replace() {
     let state = state_with_pair();
@@ -350,6 +535,71 @@ fn quick_plan_ignores_unbound_empty_link_set_but_rejects_bound_empty_set() {
     assert!(
         validate_request(&state, &req).is_ok(),
         "an existing pair_ids subset should remain executable"
+    );
+}
+
+/// 未绑定的草稿集合里躺着**失效的网口对**，不该挡下另一套可执行分配。
+///
+/// 校验器的注释和 `使用说明.md` 都承诺「未绑定集合里的失效对只是提示」，但端点
+/// 解析过去对所有 link_set 的每个 pair_ref 硬失败——一个没人引用的草稿就能顶掉
+/// 整份请求，报错还指向用户根本没打算跑的集合。原来的测试只摆了个**空**草稿，
+/// 空集合恰好绕过了那个循环，所以这条承诺破了也没人知道。
+#[test]
+fn quick_plan_ignores_stale_pairs_inside_an_unbound_draft_set() {
+    let state = state_with_pair();
+    let mut req = suite_request();
+    {
+        let plan = req.ui_plan.as_mut().expect("suite plan");
+        plan.link_sets.push(UiLinkSet {
+            id: "stale-draft".into(),
+            name: "网卡换过之后剩下的草稿".into(),
+            pair_refs: vec![UiPairRef {
+                id: "pair-gone".into(),
+                // 这两块网口在当前拓扑里都不存在了。
+                src: "master:NAME=已经拔掉的网口".into(),
+                dst: "agent:NAME=也不在了".into(),
+            }],
+        });
+    }
+    let compiled =
+        compile_request(&state, &req).expect("未绑定草稿里的失效对不该挡下可执行的 binding");
+    assert_eq!(compiled.cfg.tests.len(), 2);
+
+    // 但一旦这个集合被绑定，失效对就必须当场报错——静默跑出零单元或者跑到
+    // builder 里才炸，都比在预览阶段说清楚更糟。
+    req.ui_plan.as_mut().expect("suite plan").bindings[0].link_set_id = "stale-draft".into();
+    let error = validate_request(&state, &req).expect_err("被绑定的失效对必须拒绝");
+    assert!(error.contains("已失效"), "{error}");
+
+    // 明确用 pair_ids 选中同一条失效对，走的是另一条分支，也必须拒绝。
+    let mut req = suite_request();
+    {
+        let plan = req.ui_plan.as_mut().expect("suite plan");
+        plan.link_sets[0].pair_refs.push(UiPairRef {
+            id: "pair-gone".into(),
+            src: "master:NAME=已经拔掉的网口".into(),
+            dst: "agent:NAME=也不在了".into(),
+        });
+        plan.bindings[0].pair_ids = vec!["pair-gone".into()];
+    }
+    let error = validate_request(&state, &req).expect_err("被 pair_ids 选中的失效对必须拒绝");
+    assert!(error.contains("已失效"), "{error}");
+
+    // 同一个集合里，没被 pair_ids 选中的那条失效对则应当被放过。
+    let mut req = suite_request();
+    {
+        let plan = req.ui_plan.as_mut().expect("suite plan");
+        let good = plan.link_sets[0].pair_refs[0].id.clone();
+        plan.link_sets[0].pair_refs.push(UiPairRef {
+            id: "pair-gone".into(),
+            src: "master:NAME=已经拔掉的网口".into(),
+            dst: "agent:NAME=也不在了".into(),
+        });
+        plan.bindings[0].pair_ids = vec![good];
+    }
+    assert!(
+        validate_request(&state, &req).is_ok(),
+        "没被选中的失效对不该挡下同集合里被选中的那条"
     );
 }
 
@@ -664,6 +914,7 @@ fn bootstrap_reports_token_presence_without_exposing_the_secret() {
         report: Mutex::new(String::new()),
         ui_token: String::new(),
         monitors: Mutex::new(HashMap::new()),
+        run_status: Arc::new(RunStatusRecorder::new()),
     });
     let value = api_bootstrap(&console).expect("bootstrap");
     assert_eq!(value["token_configured"], true);
@@ -890,6 +1141,7 @@ fn console_with(state: UiState) -> Arc<Console> {
         report: Mutex::new(String::new()),
         ui_token: String::new(),
         monitors: Mutex::new(HashMap::new()),
+        run_status: Arc::new(RunStatusRecorder::new()),
     })
 }
 
@@ -1049,6 +1301,7 @@ fn the_console_token_gate_covers_both_the_page_and_the_api() {
         report: Mutex::new(String::new()),
         ui_token: "unit-secret".into(),
         monitors: Mutex::new(HashMap::new()),
+        run_status: Arc::new(RunStatusRecorder::new()),
     });
     // Server 要留在外面：incoming_requests() 会一直阻塞，只有 unblock()
     // 能让它收场。整个 move 进线程就再也够不着它了，端口和线程会挂到
@@ -2963,169 +3216,21 @@ fn the_plan_hash_changes_when_the_topology_changes() {
     );
 }
 
-/// 参数配置必须能删，而且删的时候要清掉任务上的引用。
+/// 基线套件的出厂 UDP 档位（`-b 2500m` · `-l 14k` · `-w 256m` · 单流）必须真的能过
+/// 服务端校验并编译成一条 UDP 单元。
 ///
-/// 这条守的是一个真实缺口：配置卡片过去只有「编辑」，`#quickrecipes` 的
-/// 点击委派里也**根本没有删除分支**——加错一条配置就再也去不掉，只能重建
-/// 整个项目。页面是 `include_str!` 进来的，这里从源码层面把入口钉住。
+/// 这条测试原本还有前半段：从 `include_str!` 进来的手写页面里 grep 掉网口表的
+/// 「作为发送端：UDP -l」列、`cell('udp_length'` 与 `udpDefault.lengths`，用来钉住
+/// 「`-l` 只有一个来源 = 套件里的参数配置，全局档位不许反向覆写」。产物换成 Vue
+/// bundle 之后，grep 手写 HTML 这种做法不再成立，那半段的义务按
+/// `.ai/PLAN-v5.0-frontend.md` §7.3 转给 Vitest `domain/plan-build.test.ts`：
+/// **由 `UiPlan` 组装出的 `RunRequest` 里，全局 `udp_lengths` 不会被套件里的 `-l`
+/// 反向写回**。留在这里的后半段是纯 DTO 逻辑，与前端形态无关，原样保留。
 #[test]
-fn the_recipe_card_can_be_deleted_and_edited_in_place() {
-    const PAGE_SOURCE: &str = include_str!("../webui.html");
-
-    for marker in [
-        // 卡片上的删除按钮
-        "qrecipe-delete",
-        // 委派里的删除分支
-        "deleteQuickRecipe(el.dataset.protocol, el.dataset.recipe)",
-        // 删除时清理任务上的 recipe_ids 引用
-        "task.recipe_ids = kept.length",
-    ] {
-        assert!(PAGE_SOURCE.contains(marker), "配置删除入口缺了 {marker}");
-    }
-
-    for marker in [
-        // 就地编辑器，取代原来的 window.prompt 链
-        "recipe-editor",
-        "qrecipe-save",
-        "qrecipe-cancel",
-        "function saveRecipeEditor()",
-    ] {
-        assert!(PAGE_SOURCE.contains(marker), "配置就地编辑缺了 {marker}");
-    }
-
-    assert!(
-        !PAGE_SOURCE.contains("editQuickRecipe"),
-        "旧的 prompt 链应当已经删干净，别和就地编辑器两套并存"
-    );
-    // 新建一条 UDP 配置过去要连点 5 个 prompt：名称、-b、-l、-w、流数。
-    // 中途点任何一次「取消」都会留下半套数据，新建时甚至留下一条空配置，
-    // 一直到点预览才报错。配置这一段不许再出现 prompt。
-    let start = PAGE_SOURCE
-        .find("function openRecipeEditor(")
-        .expect("配置编辑器入口");
-    let end = PAGE_SOURCE[start..]
-        .find("function renderQuickAssignments(")
-        .map(|offset| start + offset)
-        .unwrap_or(PAGE_SOURCE.len());
-    let prompts = PAGE_SOURCE[start..end].matches("window.prompt(").count();
-    assert_eq!(prompts, 0, "配置编辑不该再用 window.prompt");
-}
-
-/// 链路集合这一栏的三条硬约束，都是从页面源码层面钉住的。
-///
-/// 1. **默认列出全部组合**。同机两块网口之间也是一条真实链路（走桥接/回环），
-///    把候选默认收窄成跨机，会让「我明明有这条链路，界面上找不到」变成第一
-///    印象。
-/// 2. **筛选和自动分组是同一个口径**。只在渲染处过滤、分组处写死 `pair.cross`
-///    时，「点显示全部 → 再点按角色自动分组」生成的还是原来那批跨机集合，
-///    同机组合一条都不会被勾上——从用户角度就是这个按钮没反应。
-/// 3. **新建的集合当场能编辑**。名称是卡片上的输入框，不是「改名」按钮 +
-///    prompt；新建时顺手把网口对摊开，否则建出来是一张空卡片，没有任何入口。
-#[test]
-fn the_link_set_panel_lists_every_combination_and_stays_editable_in_place() {
-    const PAGE_SOURCE: &str = include_str!("../webui.html");
-
-    // 默认显示全部组合：筛选框不能是 checked。
-    assert!(
-        PAGE_SOURCE.contains(r#"<input type="checkbox" id="qcrossonly">只显示跨机链路"#),
-        "「只显示跨机链路」默认必须是不勾的，否则同机组合一开始就看不见"
-    );
-
-    for marker in [
-        // 筛选口径的唯一来源，渲染和自动分组共用
-        "function qcrossOnly()",
-        "function qcandidatePairs()",
-        // 集合名称就地可改
-        "qset-name",
-        "el.classList.contains('qset-name')",
-    ] {
-        assert!(PAGE_SOURCE.contains(marker), "链路集合面板缺了 {marker}");
-    }
-
-    assert!(
-        !PAGE_SOURCE.contains("qset-rename"),
-        "「改名」按钮应该已经被卡片上的输入框取代，别两套并存"
-    );
-
-    // 自动分组必须走 qcandidatePairs()：写死 cross 就是「没反应」的根因。
-    let start = PAGE_SOURCE
-        .find("function autoLinkSets()")
-        .expect("自动分组入口");
-    let end = PAGE_SOURCE[start..]
-        .find("function syncQuickSets()")
-        .map(|offset| start + offset)
-        .unwrap_or(PAGE_SOURCE.len());
-    let body = &PAGE_SOURCE[start..end];
-    assert!(
-        body.contains("qcandidatePairs()"),
-        "按角色自动分组要跟着筛选走，不能自己再过滤一遍"
-    );
-    assert!(
-        !body.contains("pair.cross"),
-        "自动分组里不该再写死 pair.cross"
-    );
-
-    // 同机与跨机可能落在同一对角色上，角色键必须能把两者分开，否则两类链路
-    // 会被并进同一个自动集合。
-    let start = PAGE_SOURCE.find("function qroleKey(").expect("角色键");
-    let end = PAGE_SOURCE[start..]
-        .find("function qcrossOnly()")
-        .map(|offset| start + offset)
-        .unwrap_or(PAGE_SOURCE.len());
-    assert!(
-        PAGE_SOURCE[start..end].contains("pair.cross"),
-        "角色键要区分同机/跨机，否则两类组合会被并成一个集合"
-    );
-}
-
-/// 分配表要能整列勾选：套件多起来之后，「所有链路都跑这个套件」原本得逐格点。
-#[test]
-fn the_assignment_table_can_toggle_a_whole_suite_column() {
-    const PAGE_SOURCE: &str = include_str!("../webui.html");
-
-    for marker in [
-        // 表头里的整列开关
-        "qbind-colall",
-        // 委派里的整列分支
-        "el.classList.contains('qbind-colall')",
-    ] {
-        assert!(PAGE_SOURCE.contains(marker), "分配表整列开关缺了 {marker}");
-    }
-}
-
-/// `-l` 只有一个来源：套件里的参数配置。
-///
-/// 网口表那一列（占位符写着「走全局档位」）已经去掉，全局档位也不再反向覆写
-/// 套件的默认配置——否则「基线 TCP+UDP」会一直显示出厂 `udp_profiles` 里那条
-/// `-l 64`，而界面上没有任何地方交代是谁改的。
-#[test]
-fn the_udp_datagram_size_is_configured_only_in_the_suite() {
-    const PAGE_SOURCE: &str = include_str!("../webui.html");
-
-    assert!(
-        !PAGE_SOURCE.contains("作为发送端：UDP -l"),
-        "网口表不该再有 UDP -l 这一列"
-    );
-    assert!(
-        !PAGE_SOURCE.contains("cell('udp_length'"),
-        "网口表不该再画 udp_length 输入框"
-    );
-    assert!(
-        !PAGE_SOURCE.contains("udpDefault.lengths"),
-        "全局档位不该再覆写套件里的 UDP 参数配置"
-    );
-
-    // 基线套件的出厂档位：-b 2500m · -l 14k · -w 256m · 单流。
-    assert!(
-        PAGE_SOURCE.contains(
-            "bandwidths: ['2500m'], lengths: ['14k'], windows: ['256m'], udp_streams: [1]"
-        ),
-        "基线 TCP+UDP 的 UDP 配置应为 -b 2500m -l 14k -w 256m"
-    );
-
-    // 页面上写死的那三个档位必须真的能过服务端校验并编译成一条 UDP 单元，
-    // 否则默认套件打开就是红的——这种错只有把同一组值送进真实校验路径才会
-    // 露出来（`-l` 超 65507、`-w` 写法不认，都是在这一步才拦下）。
+fn the_baseline_udp_profile_compiles_through_the_real_validator() {
+    // 出厂套件里写死的那三个档位，必须真的能过服务端校验——否则默认套件一打开
+    // 就是红的。这种错只有把同一组值送进真实校验路径才会露出来（`-l` 超 65507、
+    // `-w` 写法不认，都是在这一步才拦下）。
     let state = state_with_pair();
     let mut req = suite_request();
     let plan = req.ui_plan.as_mut().expect("suite plan");
@@ -3357,4 +3462,563 @@ fn the_plan_gate_rejects_a_plan_that_changed_after_confirmation() {
     // 没走确认流程（命令行直跑）时不设闸。
     assert!(plan.matches(None), "命令行直跑不该被闸门拦");
     assert!(plan.matches(Some("  ")), "空哈希等同于没确认过");
+}
+
+// ---------------------------------------------------------------------------
+// 构建产物的不变量
+//
+// 控制台页面是 `include_str!` 进二进制的 Vite 产物（源码在 `ui/`）。下面四条是
+// 这条构建链**唯一**不需要 Node 就能跑的机器保证：`cargo test` 在本地和 CI 上
+// 都会跑，贡献者不装 Node 也拦得住。
+//
+// 前三条守的是「产物长得对不对」，第四条守的是「产物是不是从当前源码来的」——
+// 缺了第四条，前三条对一份陈旧产物同样全绿。
+// ---------------------------------------------------------------------------
+
+/// 产物里不许有任何需要浏览器另发一次请求去取的子资源。
+///
+/// 这是铁律 3（鉴权先于路由）的直接推论，也是它**唯一**的机器保证：
+/// `webui/http.rs::handle` 的 token 校验在任何分支之前，而浏览器不会给
+/// `<script src>` / `<link href>` / 外链 `<img>` 带自定义头，所以任何外链子资源
+/// 都会被挡成 401——页面会白屏，而且是只在「真的带 token 打开控制台」时才白，
+/// 开发期 vite dev server 上一切正常。
+///
+/// 这条不是风格偏好，是 `ui/vite.config.ts` 里那个 `viteSingleFile` 存在的理由。
+#[test]
+fn the_embedded_page_has_no_external_subresources() {
+    const PAGE: &str = include_str!("../webui.html");
+    for (pattern, why) in [
+        (
+            r#"(?i)<script\b[^>]*\bsrc\s*="#,
+            "页面里有 <script src=...>，会被鉴权挡成 401",
+        ),
+        (
+            r#"(?i)<link\b[^>]*\brel\s*=\s*["']?(stylesheet|modulepreload|preload)"#,
+            "页面里有 <link rel=stylesheet/preload>，同上",
+        ),
+        (
+            r#"(?i)\b(?:src|href)\s*=\s*["'](?:https?:)?//"#,
+            "页面里有指向外部主机的 src/href；运行期是离线内网",
+        ),
+        (
+            r#"(?i)@import\s+(?:url\()?["']?(?:https?:)?//"#,
+            "CSS 里有外部 @import",
+        ),
+        (r#"@font-face"#, "页面里有 @font-face，字体必须是系统字体"),
+    ] {
+        let re = regex::Regex::new(pattern).expect("pattern");
+        assert!(
+            !re.is_match(PAGE),
+            "{why}（命中：{:?}）",
+            re.find(PAGE).map(|m| m.as_str())
+        );
+    }
+}
+
+/// 产物里不许出现 `eval` / `new Function`。
+///
+/// 控制台的 CSP 里没有 `'unsafe-eval'`，而且**不许加**——加了等于把模板字符串
+/// 变成可执行面。只有 Vue 的「完整版（含运行期模板编译器）」需要它，走 SFC
+/// 预编译则不需要。这条挡的是有人不小心把 alias 指回完整版：那种情况下页面在
+/// dev server 上照常工作，只有装进 exe 打开才在控制台里报 CSP 违规、整页不动。
+#[test]
+fn the_embedded_page_never_evals() {
+    const PAGE: &str = include_str!("../webui.html");
+    for (pattern, why) in [
+        (r#"(?:^|[^.\w$])eval\s*\("#, "页面里有 eval("),
+        (r#"new\s+Function\s*\("#, "页面里有 new Function("),
+    ] {
+        let re = regex::Regex::new(pattern).expect("pattern");
+        assert!(
+            !re.is_match(PAGE),
+            "{why}，而 CSP 里没有 unsafe-eval（也不许加）"
+        );
+    }
+}
+
+/// 产物里必须有 Vue 要挂上去的那个根节点。
+///
+/// `main.ts` 是 `createApp(App).mount('#app')`。挂载点没了不会有任何报错，
+/// 页面就是一片空白——这种失败最容易在「改 index.html 顺手清理」时发生。
+#[test]
+fn the_embedded_page_mounts_into_the_expected_root() {
+    const PAGE: &str = include_str!("../webui.html");
+    let re = regex::Regex::new(r#"id\s*=\s*["']app["']"#).expect("pattern");
+    assert!(re.is_match(PAGE), "产物里找不到 id=\"app\" 挂载点");
+}
+
+/// 产物必须是从**当前这份** `ui/` 源码构建出来的。
+///
+/// 上面三条防不住这个仓库最可能犯的日常错误：改了 `ui/src/` 却忘了重新构建。
+/// 陈旧的产物一样没有外链、没有 eval、一样有挂载点，三条全绿，而用户拿到的
+/// 是上一个版本的界面。
+///
+/// 所以 `ui/scripts/emit.mjs` 在写产物时算一枚源码树的 MD5 戳写进产物尾部，
+/// 这里按**逐字相同**的算法重算一遍比对。它只比源码、不比产物字节，因此不受
+/// esbuild 版本或构建机差异影响，也不要求 CI 装 Node——`cargo test` 就够。
+///
+/// 算法（改动要同步改 `emit.mjs` 与 `.ai/PLAN-v5.0-frontend.md` §6.3）：
+///   1. 文件 = `STAMP_ROOTS` 那几份 + `ui/src/` 下全部文件（递归）。
+///   2. 路径取相对 `ui/` 的 POSIX 形式，按字节升序排序（全 ASCII 由
+///      `lint-arch.mjs` 第 7 条保证，所以 Node 的 sort 与 Rust 的 `String` 序一致）。
+///   3. 内容做 CRLF -> LF 归一（Windows 检出必然带 CRLF）。
+///   4. 拼 `path + "\n" + content + "\n"`，整体取 MD5，小写十六进制。
+#[test]
+fn the_embedded_page_was_built_from_the_current_ui_sources() {
+    const PAGE: &str = include_str!("../webui.html");
+    const STAMP_ROOTS: &[&str] = &[
+        "index.html",
+        "package.json",
+        "package-lock.json",
+        "tsconfig.json",
+        "vite.config.ts",
+    ];
+
+    let ui_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("ui");
+
+    /// 测试专用文件不进戳：它们进不了产物。
+    ///
+    /// 算法两端必须**逐字一致**，对应 `emit.mjs` 里的 `isTestOnly`，那边是
+    /// `/\.(test|spec)\.[cm]?[jt]sx?$/`。这里以前只硬写了 `.test.ts` /
+    /// `.spec.ts` / `.test.js` / `.spec.js` 四个后缀，比正则窄——加一个
+    /// `Foo.test.tsx` 或 `.test.mjs`，JS 侧排除、Rust 侧收进戳，两边算出不同的
+    /// 哈希，于是一份刚刚构建好的产物会被这条测试指着说「陈旧」。
+    ///
+    /// 戳本身就是为了防「两份实现漂开」而存在的，它自己更不能有两份实现。
+    /// 所以下面按同一个文法展开，而不是再抄一串后缀。
+    fn is_test_only(rel: &str) -> bool {
+        if rel.contains("__fixtures__/") {
+            return true;
+        }
+        // 尾部：`.` + 可选的 `c`/`m` + `j`/`t` + `s` + 可选的 `x`
+        let rest = rel.strip_suffix('x').unwrap_or(rel);
+        let Some(rest) = rest.strip_suffix('s') else {
+            return false;
+        };
+        let Some(rest) = rest.strip_suffix(['j', 't']) else {
+            return false;
+        };
+        let rest = rest.strip_suffix(['c', 'm']).unwrap_or(rest);
+        // 剩下的必须以 `.test.` 或 `.spec.` 结尾。
+        rest.ends_with(".test.") || rest.ends_with(".spec.")
+    }
+
+    fn walk(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<String>) {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .unwrap_or_else(|e| panic!("读不了 {}: {e}", dir.display()))
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .collect();
+        entries.sort();
+        for path in entries {
+            if path.is_dir() {
+                walk(&path, root, out);
+            } else {
+                let rel = path
+                    .strip_prefix(root)
+                    .expect("在 ui/ 下")
+                    .components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join("/");
+                if !is_test_only(&rel) {
+                    out.push(rel);
+                }
+            }
+        }
+    }
+
+    let mut files: Vec<String> = STAMP_ROOTS.iter().map(|s| (*s).to_string()).collect();
+    walk(&ui_root.join("src"), &ui_root, &mut files);
+    files.sort();
+
+    let mut blob = String::new();
+    for rel in &files {
+        let content = std::fs::read_to_string(ui_root.join(rel))
+            .unwrap_or_else(|e| panic!("读不了 ui/{rel}: {e}"));
+        blob.push_str(rel);
+        blob.push('\n');
+        blob.push_str(&content.replace("\r\n", "\n"));
+        blob.push('\n');
+    }
+    let expected = crate::util::md5_hex(&blob);
+
+    let marker = "<!-- cpe-ui-stamp: ";
+    let at = PAGE.find(marker).unwrap_or_else(|| {
+        panic!(
+            "产物里没有溯源戳。它是 emit.mjs 写的：在 ui/ 下跑 npm ci && npm run build，\
+             并把 src/master/webui.html 一起提交。"
+        )
+    });
+    let rest = &PAGE[at + marker.len()..];
+    let actual = &rest[..rest.find(' ').unwrap_or(rest.len())];
+
+    assert_eq!(
+        actual, expected,
+        "\n\nui/ 的源码改了，但 src/master/webui.html 没有重新构建。\n\
+         去 ui/ 下跑：npm ci && npm run build\n\
+         然后把产物 src/master/webui.html 和源码一起提交。\n\
+         （产物里的戳 {actual}，当前源码算出来是 {expected}）\n"
+    );
+}
+
+/// `/api/progress` 必须同时给出日志文本和结构化状态，且各走各的游标。
+///
+/// 这是 ADR-2 落到端点上的样子：`lines` 给日志屏（**给人看的**，文案随便改），
+/// `run` 给进度页（**给机器读的**）。在此之前只有 `lines`，前端得去解析
+/// `[i/total]` 和「==> 单元结果:」两种日志行才能画出单元级进度——一次 11.5
+/// 小时的测试有三万行日志，刷新一次页面就要全量重放一遍。
+#[test]
+fn the_progress_endpoint_serves_structured_status_next_to_the_log_text() {
+    use crate::master::run_status::{RunObserver, UnitStatus};
+
+    let console = console_with(state_with_pair());
+    console
+        .run_status
+        .run_started("run_demo", "plan-hash", 3, 300);
+    console.run_status.unit_finished(
+        UnitStatus {
+            seq: 1,
+            title: "IPERF V4 TCP".into(),
+            verdict: "PASS".into(),
+            reason_code: "RX_TARGET_MET".into(),
+            reason_detail: "达标".into(),
+            skipped: false,
+            secs: 12,
+            link_group: "SGMII ↔ WLAN".into(),
+        },
+        200,
+    );
+
+    let out = api_progress(&console, "from=0&units_from=0");
+    assert_eq!(out["run"]["run_id"], "run_demo");
+    assert_eq!(out["run"]["plan_hash"], "plan-hash");
+    assert_eq!(out["run"]["total_units"], 3);
+    assert_eq!(out["run"]["counts"]["pass"], 1);
+    assert_eq!(out["run"]["done"][0]["seq"], 1);
+    assert_eq!(out["run"]["done"][0]["verdict"], "PASS");
+    assert_eq!(out["run"]["eta_secs"], 200);
+    // 端点回一个可以直接拿去当下一拍入参的游标。
+    assert_eq!(out["units_from"], 1);
+    // 日志那一路原样保留。
+    assert!(out.get("lines").is_some(), "日志屏还要靠 lines");
+
+    // 带上游标之后不再重传已完成单元。
+    let next = api_progress(&console, "from=0&units_from=1");
+    assert!(
+        next["run"]["done"].as_array().expect("done").is_empty(),
+        "稳态每拍不该重传已完成单元"
+    );
+    assert_eq!(next["run"]["counts"]["pass"], 1, "计数仍是全量");
+    assert_eq!(next["units_from"], 1);
+}
+
+/// 报告路径来自回调，不再从日志里搜「报告已生成: 」。
+///
+/// 那个做法把一句给人看的提示语变成了协议：改个措辞，界面上的「打开报告」
+/// 按钮就永远是灰的，而且没有任何测试会红。
+#[test]
+fn the_report_path_reaches_the_console_without_scraping_the_log() {
+    use crate::master::run_status::RunObserver;
+
+    let console = console_with(state_with_pair());
+    console.run_status.run_started("run_demo", "hash", 1, 10);
+    assert_eq!(api_progress(&console, "from=0")["report"], "");
+
+    console
+        .run_status
+        .report_written("runs/run_demo/report.html");
+    let out = api_progress(&console, "from=0");
+    assert_eq!(out["run"]["report"], "runs/run_demo/report.html");
+    // `/api/open-report` 读的是 console.report，两边必须同步。
+    assert_eq!(out["report"], "runs/run_demo/report.html");
+    assert_eq!(
+        lock_recover(&console.report).clone(),
+        "runs/run_demo/report.html"
+    );
+}
+
+/// 套件计划经由 `config.json` 往返会**丢掉套件**，导入时必须说出来。
+///
+/// A14：`ImportOut` 只回填矩阵态，而 `Config` 根本不承载套件——「工作台搭好
+/// 套件 → 下载 config → 再导回来」会把任务顺序、逐任务时长、验收目标全部降级
+/// 成一张扁平矩阵。此前六条 notice 里一条都没提这件事，用户毫无提示地跑出了
+/// 另一份东西。模块头注释还写着「两边必须互为逆运算」——对套件计划那句话
+/// 从来就不成立。
+#[test]
+fn importing_a_suite_derived_config_warns_that_the_suite_is_lost() {
+    let state = state_with_pair();
+    let req = suite_request();
+    // 先走一遍「工作台 → config.json」这半程。
+    let compiled = compile_request(&state, &req).expect("compile");
+    let file = serde_json::to_string(&compiled.cfg).expect("导出 config");
+
+    let console = console_with(state_with_pair());
+    let out = api_import(&console, &file).expect("导入本身仍然要成功");
+    let notices = out["notices"].as_array().expect("notices");
+    let text = notices
+        .iter()
+        .filter_map(|n| n.as_str())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    assert!(
+        text.contains("套件"),
+        "套件被降级成矩阵这件事必须出现在 notices 里，实得：{text}"
+    );
+    assert!(
+        text.contains("项目文件") || text.contains("cpe-ui-project"),
+        "要告诉用户正路在哪：{text}"
+    );
+
+    // 反面：不是从工作台来的扁平配置，不该出现这条噪声。
+    let plain = Config {
+        tests: vec![TestSpec {
+            name: "手写的".into(),
+            src: "master:NAME=以太网 6".into(),
+            dst: "agent:NAME=WLAN 3".into(),
+            direction: OneOrMany::One("A->B".into()),
+            kinds: vec!["iperf".into()],
+            transports: vec!["tcp".into()],
+            ip: vec!["v4".into()],
+            streams: 1,
+            tcp_streams: None,
+            udp_streams: None,
+            iperf_duration: None,
+            ping_count: None,
+            ping_payload_sizes: None,
+            tcp_windows: None,
+            udp_profiles: None,
+            rate_mode: None,
+            rate_targets_mbps: None,
+            rate_targets_bidir_mbps: None,
+            link_group: None,
+            origin: None,
+        }],
+        ..Config::default()
+    };
+    let console = console_with(state_with_pair());
+    let out = api_import(&console, &serde_json::to_string(&plain).unwrap()).expect("导入");
+    let text = out["notices"]
+        .as_array()
+        .expect("notices")
+        .iter()
+        .filter_map(|n| n.as_str())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    assert!(
+        !text.contains("套件的任务顺序"),
+        "扁平配置不该报套件丢失：{text}"
+    );
+}
+
+/// 把每个对外 DTO 的样例序列化成 JSON 写进 `ui/src/api/__fixtures__/`。
+///
+/// 这是 `ui/src/api/dto.ts` 的**契约测试的 Rust 半边**（DESIGN §7 第 6 条）：
+/// 手写的 TS 类型和 Rust 的 `*Out` 之间没有代码生成，靠这批固定样例对齐。
+/// Rust 侧改了字段名却没改 dto.ts，Vitest 那半边会红；反过来 dto.ts 里凭空
+/// 多出一个字段，也会在 Vitest 里被抓到。
+///
+/// 之所以**写文件**而不是内联比对：固定样例同时也是前端写单测时的输入，
+/// 让两边看同一份 JSON 比让两边各自造假数据可靠。
+///
+/// 这个测试只**产出**，不断言——它不该在 CI 上因为「文件和上次不一样」而红
+/// （那是 `emit --check` 和溯源戳的职责）。它的价值在于：改了 DTO 跑一次
+/// `cargo test`，前端那半边的固定样例就自动跟上了。
+#[test]
+fn dto_fixtures_are_regenerated_for_the_frontend_contract_test() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("ui/src/api/__fixtures__");
+    if std::fs::create_dir_all(&dir).is_err() {
+        // 源码树只读（比如从 tarball 解出来跑测试）时静默跳过：
+        // 这个测试是开发期工具，不是产品不变量。
+        return;
+    }
+
+    let write = |name: &str, value: serde_json::Value| {
+        let text = serde_json::to_string_pretty(&value).expect("样例必须能序列化");
+        let _ = std::fs::write(dir.join(format!("{name}.json")), format!("{text}\n"));
+    };
+
+    // 运行状态：v6.0 新增的结构化进度，前端进度页完全建在它上面。
+    let recorder = crate::master::run_status::RunStatusRecorder::new();
+    {
+        use crate::master::run_status::{CurrentUnit, RunObserver, UnitStatus};
+        recorder.run_started("run_20260830_101112_1234", "plan-hash-abc", 3, 300);
+        recorder.unit_finished(
+            UnitStatus {
+                seq: 1,
+                title: "IPERF V4 TCP -w 4m -P 10 | 主控 eth0 -> 辅测 eth0".into(),
+                verdict: "PASS".into(),
+                reason_code: "RX_TARGET_MET".into(),
+                reason_detail: "网卡 RX 平均 2310.500Mbps 达到目标 2000.000Mbps".into(),
+                skipped: false,
+                secs: 182,
+                link_group: "SGMII ↔ WLAN".into(),
+            },
+            120,
+        );
+        recorder.unit_started(CurrentUnit {
+            seq: 2,
+            title: "IPERF V4 UDP -b 2500m | 主控 eth0 -> 辅测 eth0".into(),
+            est_secs: 180,
+            started_at: "2026-08-30 10:14:20".into(),
+            link_group: "SGMII ↔ WLAN".into(),
+        });
+    }
+    let (_, mut run) = recorder.snapshot(0);
+    // 固定时间戳：`run_started` 填的是 `now_full()`，直接写出去会让每次
+    // `cargo test` 都改动这批文件——`git status` 常年是脏的，而且它们进
+    // 溯源戳的输入集时会让产物每跑一次测试就"过期"一次。
+    run.started_at = "2026-08-30 10:11:12".into();
+    write(
+        "run_status",
+        serde_json::to_value(&run).expect("RunStatus 必须能序列化"),
+    );
+    write(
+        "progress_out",
+        serde_json::to_value(ProgressOut {
+            running: true,
+            from: 1420,
+            lines: vec!["[2/3] IPERF V4 UDP -b 2500m".into()],
+            report: String::new(),
+            units_from: run.done.len(),
+            run,
+        })
+        .expect("ProgressOut 必须能序列化"),
+    );
+
+    // 计划：复核树直接渲染 sections + trace，不许在前端重排。
+    let console = console_with(state_with_pair());
+    if let Ok(plan) = api_plan(&console, &serde_json::to_string(&suite_request()).unwrap()) {
+        write("plan_out", plan);
+    }
+    {
+        let state = lock_recover(&console.state);
+        if let Ok(value) = serde_json::to_value(bootstrap_out(&state)) {
+            write("bootstrap_out", value);
+        }
+    }
+}
+
+/// `runs/<id>/bundle.zip` 的 id 解析是**白名单式**的：只认已经存在的目录名。
+///
+/// 不是「过滤掉危险字符」，而是「只认我自己列出来的那些名字」——前者要穷举
+/// 所有能表示上级目录的写法（`..`、`%2e%2e`、绝对路径、Windows 的 `\`、
+/// 盘符…），后者不存在这个问题面。
+#[test]
+fn the_bundle_id_only_resolves_to_directories_that_actually_exist() {
+    use super::runs::resolve_run_dir;
+
+    for evil in [
+        "..",
+        ".",
+        "../etc",
+        "../../etc/passwd",
+        "runs/../..",
+        "/etc/passwd",
+        "a/b",
+        "a\\b",
+        ".hidden",
+        "",
+        // 盘符：上面那段注释一直把它列为「黑名单要穷举的写法之一」，而实现
+        // 当时恰好漏了它。Windows 上 `Path::new("runs").join("C:")` 会被盘符
+        // 前缀整个替换成 `C:`（= 该盘的当前目录），于是打包的是进程 CWD。
+        // 现在解析按 `runs/` 下的真实目录名精确比对，这些都拿不到目录。
+        "C:",
+        "c:",
+        "C:Windows",
+        r"\\?\C:\Windows",
+        "\\\\server\\share",
+    ] {
+        assert!(resolve_run_dir(evil).is_none(), "{evil:?} 不该解析出目录");
+    }
+    // 不存在的名字也拿不到目录——白名单的另一半。
+    assert!(resolve_run_dir("run_does_not_exist_12345").is_none());
+}
+
+/// 报告包必须是**真的能解开的 zip**，而且解开就是 `run_<id>/…`。
+///
+/// 打包这件事本身现在交给 `zip` crate（此前是手写的，条目数 `u16`、大小与
+/// 偏移 `u32`、没有 zip64，越界时静默产出坏包）。这条测试守的不是 crate 的
+/// 正确性，而是**我们对它的用法**：store 模式、顶层套一层 run 目录、子目录
+/// 用 `/` 分隔。这三条写错时产物看起来仍是个正常文件。
+#[test]
+fn the_report_bundle_is_a_zip_that_really_unpacks() {
+    use super::runs::build_bundle;
+
+    let dir = std::env::temp_dir().join(format!(
+        "cpe_bundle_test_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(dir.join("iperf_outputs")).expect("temp dir");
+    std::fs::write(dir.join("report.html"), "<html>报告正文</html>").expect("report");
+    std::fs::write(dir.join("rows.jsonl"), "{\"a\":1}\n{\"a\":2}\n").expect("rows");
+    std::fs::write(dir.join("iperf_outputs/raw.log"), "iperf3 原始输出").expect("raw");
+
+    let bytes = build_bundle(&dir, "run_demo").expect("打包");
+    assert_eq!(&bytes[..2], b"PK", "不是 zip");
+    // 中央目录结束记录的魔数必须在（很多解压器只认它来定位条目表）。
+    assert!(
+        bytes.windows(4).any(|w| w == 0x0605_4b50u32.to_le_bytes()),
+        "缺少 end-of-central-directory"
+    );
+
+    // 顶层套一层 run 目录：解开是 run_demo/report.html，而不是把文件散进
+    // 用户的下载目录。
+    let text = String::from_utf8_lossy(&bytes);
+    assert!(text.contains("run_demo/report.html"), "顶层目录名不对");
+    assert!(
+        text.contains("run_demo/iperf_outputs/raw.log"),
+        "子目录没进包"
+    );
+    // store 模式：原文应当能在包里直接看到。
+    assert!(text.contains("报告正文"), "store 模式下原文应当原样在包里");
+
+    // 用系统 unzip 真校验一遍——结构写错时产物看起来仍是个文件，只有真解压
+    // 才知道。`unzip` 不支持从 stdin 读，所以先落盘。
+    let zip_path = dir.join("bundle.zip");
+    std::fs::write(&zip_path, &bytes).expect("写 zip");
+    // 机器上没有 unzip（比如精简的 Windows CI 镜像）时跳过这一步，
+    // 上面那几条结构断言仍然生效。
+    if let Ok(result) = std::process::Command::new("unzip")
+        .arg("-t")
+        .arg(&zip_path)
+        .output()
+    {
+        assert!(
+            result.status.success(),
+            "unzip -t 判定这个包坏了：\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `/api/runs` 列出历史运行，新的在前。
+#[test]
+fn the_run_list_puts_the_newest_first() {
+    let value = super::runs::api_runs().expect("列目录不该失败");
+    let entries = value.as_array().expect("数组");
+    // 每一项的形状是前端契约。
+    for entry in entries {
+        for key in [
+            "id",
+            "modified",
+            "has_report",
+            "has_rows",
+            "has_xlsx",
+            "bytes",
+        ] {
+            assert!(entry.get(key).is_some(), "RunEntry 少了字段 {key}");
+        }
+    }
+    // 目录名带时间戳，倒序即最新在前。
+    let ids: Vec<&str> = entries.iter().filter_map(|e| e["id"].as_str()).collect();
+    let mut sorted = ids.clone();
+    sorted.sort_by(|a, b| b.cmp(a));
+    assert_eq!(ids, sorted, "历史运行应当新的在前");
 }

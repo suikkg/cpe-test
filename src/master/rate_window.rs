@@ -286,11 +286,46 @@ pub(crate) fn rate_excursion(series: &[(u64, u64, f64)], target: f64) -> Option<
 /// RX/TX 任一侧完整滚动窗口覆盖率低于 95% 均为 NOT_EVALUATED」——发送端采样
 /// 塌了同样说明这一轮的时间轴不可信，不能拿去给 CPE 定性。没有目标时（observe
 /// / discover / 目标未知）只记录实测能力，不需要双侧门槛。
+/// 接收速率与发送速率「基本相等」的判定比例。
+///
+/// 高于它就认为**接收端已经把发出去的量基本收下了**，缺口出在发送端而不是
+/// 被测设备身上。
+pub(crate) const RX_TRACKS_TX_RATIO: f64 = 0.95;
+
+/// 「RX 不达标」是不是**发送端没灌够**造成的。
+///
+/// 全仓唯一定义（ADR-12(c)）。在此之前它只存在于 UDP 链（`udp.rs` +
+/// `udp_leg_verdict`），`evaluate_nic_rx` 只查 TX 覆盖率、不查 TX 水平——
+/// 于是 **CTS UDP 单流灌不满时 `RX < target` 直接判 `RX_BELOW_TARGET`**，
+/// 正是 UDP 链两个单测拼命要防的「把发送端瓶颈写成 CPE 性能失败」，
+/// 在 CTS 路径上零防护。
+///
+/// 返回 `true` = 接收端基本等于发出的量，**说明不了被测设备的能力**，
+/// 该判 NOT_EVALUATED 让人把负载补足再测，而不是判 CPE 不达标。
+pub(crate) fn offered_shortfall_explains_rx(rx_avg: Option<f64>, tx_p10: Option<f64>) -> bool {
+    match (rx_avg, tx_p10) {
+        (Some(rx), Some(tx)) if tx.is_finite() && tx > 0.0 && rx.is_finite() => {
+            rx >= tx * RX_TRACKS_TX_RATIO
+        }
+        // 缺数据时保守：宁可不下 CPE 失败的结论。
+        _ => true,
+    }
+}
+
+/// 验证目标所需的最低发送负载（目标 + 余量）。
+///
+/// 三条链共用同一个算法，免得「余量」在不同后端上是不同的数。
+pub(crate) fn offered_floor_mbps(target_mbps: Option<f64>, headroom_pct: f64) -> Option<f64> {
+    target_mbps.map(|target| target * (1.0 + headroom_pct.max(0.0) / 100.0))
+}
+
 pub(crate) fn evaluate_nic_rx(
     mode: RateMode,
     target_mbps: Option<f64>,
     stats: &RateStats,
     tx_stats: &RateStats,
+    // 验证目标所需的最低发送负载（目标 + 余量）；`None` = 不做 offered 检查。
+    offered_floor: Option<f64>,
 ) -> (Verdict, ReasonCode, String) {
     // 计数器停滞必须排在最前面：它命中的场景里 avg 通常也是 0，会被
     // NIC_RATE_MISSING 抢先吃掉，而「采到样本但计数器不动」比「没有可用速率」
@@ -330,11 +365,7 @@ pub(crate) fn evaluate_nic_rx(
             ),
         );
     }
-    let target_mbps = if matches!(mode, RateMode::Observe | RateMode::Discover) {
-        None
-    } else {
-        target_mbps.filter(|value| value.is_finite() && *value > 0.0)
-    };
+    let target_mbps = crate::rate::effective_rate_target(mode, target_mbps);
     let Some(target) = target_mbps else {
         return if mode == RateMode::Verify {
             (
@@ -399,11 +430,64 @@ pub(crate) fn evaluate_nic_rx(
     // 差 0.2% 被判 FAIL。而这类用例的本意是横比两块 Wi-Fi 的协商速率差异，
     // 要的就是「平均低于门限才算不达标」。P10 继续算、继续进报告，只当
     // 诊断指标。真正的业务可感故障由下面的连续越界判据负责。
+    // 「灌够了没有」只在 **RX 没达标** 时才有话可说（ADR-12(c)）。
+    //
+    // 发送端自己就没灌到目标+余量、而接收端基本等于发出的量时，这一轮
+    // **说明不了被测设备的能力**——它只说明发送端没送够。判 RATE_FAIL 就是
+    // 把发送端瓶颈写成 CPE 性能失败。这条防护此前只有 UDP 链有，TCP/CTS
+    // 走的这条路只查 TX 覆盖率、不查 TX 水平。
+    //
+    // **但它必须嵌在「RX 低于目标」里面，不能架在外面。** 这个闸的全部理由是
+    // 「解释缺口」；没有缺口时它无话可说。架在外面时，只要 TX-P10 落在
+    // 目标与目标+余量之间（TCP 不限速，链路上限贴着目标时这是常态），
+    // 一条 RX 已经达标的腿就会被判成 NOT_EVALUATED —— 代码上面那段注释
+    // 引用的 run_20260828_162822_17788（上限 2102、目标 2000、余量 5%，
+    // floor 2100）正是这个形状：R6 拆掉了 P10 造成的误判，又在同一场景上
+    // 装回一条新的。回归测试
+    // `a_leg_that_met_its_target_is_never_downgraded_by_the_offered_gate`。
+    let tx_sufficient = offered_floor
+        .map(|floor| tx_stats.p10_mbps.map(|v| v >= floor).unwrap_or(false))
+        .unwrap_or(true);
     if rx_avg < target {
+        if !tx_sufficient && offered_shortfall_explains_rx(Some(rx_avg), tx_stats.p10_mbps) {
+            return (
+                Verdict::NotEvaluated,
+                ReasonCode::OfferedLoadLow,
+                format!(
+                    "TX-P10 {}，验证目标所需负载至少 {}；接收端 {rx_avg:.3}Mbps 基本等于发出的量，\
+                     无法判断被测设备还能不能再多送",
+                    tx_stats
+                        .p10_mbps
+                        .map(|v| format!("{v:.3}Mbps"))
+                        .unwrap_or_else(|| "缺失".into()),
+                    offered_floor
+                        .map(|v| format!("{v:.3}Mbps"))
+                        .unwrap_or_else(|| "缺失".into()),
+                ),
+            );
+        }
+        let offered_note = if tx_sufficient {
+            String::new()
+        } else {
+            // 没灌够却仍判 FAIL 时把理由说全：缺口远大于发送端少灌的部分，
+            // 补足负载也补不回来。不写这一句，读报告的人会拿「TX 没到门限」
+            // 来质疑这个结论。
+            format!(
+                "（发送端 TX-P10 {} 未达目标+余量 {}，但接收端只有 {rx_avg:.3}Mbps，\
+                 缺口远大于发送端少灌的部分，补足负载也补不回来）",
+                tx_stats
+                    .p10_mbps
+                    .map(|v| format!("{v:.3}Mbps"))
+                    .unwrap_or_else(|| "缺失".into()),
+                offered_floor
+                    .map(|v| format!("{v:.3}Mbps"))
+                    .unwrap_or_else(|| "缺失".into()),
+            )
+        };
         return (
             Verdict::RateFail,
             ReasonCode::RxBelowTarget,
-            format!("网卡 RX 平均 {rx_avg:.3}Mbps 低于目标 {target:.3}Mbps"),
+            format!("网卡 RX 平均 {rx_avg:.3}Mbps 低于目标 {target:.3}Mbps{offered_note}"),
         );
     }
     // 平均达标之后，再看判定窗口里有没有**连续够 5 秒**的越界段。
@@ -758,6 +842,184 @@ fn longest_zero_delta_run_ms(out: &MonitorStopOut, window: &EffectiveWindow, rx:
 mod tests {
     use super::*;
 
+    /// 发送端没灌够时，**TCP/CTS 链也不许判 CPE 不达标**。
+    ///
+    /// 行为变更（ADR-12(c)），方向是把误判改回正确。这条防护此前只存在于 UDP
+    /// 链（`udp.rs` 的 `offered_shortfall_explains_rx` + `udp_leg_verdict`），
+    /// 而 `evaluate_nic_rx` 只查 TX **覆盖率**、不查 TX **水平**——于是 CTS UDP
+    /// 单流灌不满时 `RX < target` 直接判 `RX_BELOW_TARGET`，正是 UDP 链两个单测
+    /// 拼命要防的「把发送端瓶颈写成 CPE 性能失败」，在 CTS 路径上零防护。
+    #[test]
+    fn an_underfilled_sender_never_becomes_a_cpe_failure_on_any_chain() {
+        let series: Vec<(u64, u64, f64)> = (1..=180).map(|i| (i * 1_000, 1_000, 500.0)).collect();
+        let stats = |avg: f64| RateStats {
+            avg_mbps: Some(avg),
+            p10_mbps: Some(avg),
+            coverage: 1.0,
+            rolling_coverage: 1.0,
+            series: series.iter().map(|(t, d, _)| (*t, *d, avg)).collect(),
+            ..Default::default()
+        };
+        // 发送端只灌了 500，目标 1000、门槛 1050：接收端收到 495，
+        // 基本等于发出的量——这一轮说明不了被测设备的能力。
+        let rx = stats(495.0);
+        let tx = stats(500.0);
+
+        let (verdict, code, detail) =
+            evaluate_nic_rx(RateMode::Verify, Some(1_000.0), &rx, &tx, Some(1_050.0));
+        assert_eq!(
+            verdict,
+            Verdict::NotEvaluated,
+            "没灌够就不能下 CPE 结论，实得 {verdict:?}/{code}"
+        );
+        assert_eq!(code, ReasonCode::OfferedLoadLow);
+        assert!(
+            detail.contains("无法判断"),
+            "报错要说清为什么不下结论: {detail}"
+        );
+
+        // 反面：发送端灌足了、接收端仍然差得远，这才是真的 CPE 不达标。
+        let tx_full = stats(1_100.0);
+        let rx_low = stats(400.0);
+        let (verdict, code, _) = evaluate_nic_rx(
+            RateMode::Verify,
+            Some(1_000.0),
+            &rx_low,
+            &tx_full,
+            Some(1_050.0),
+        );
+        assert_eq!(verdict, Verdict::RateFail, "灌足了还不达标必须判 FAIL");
+        assert_eq!(code, ReasonCode::RxBelowTarget);
+
+        // 不传 floor 时行为与从前一致：这条路径上没有 offered 信息可用。
+        let (verdict, _, _) = evaluate_nic_rx(RateMode::Verify, Some(1_000.0), &rx, &tx, None);
+        assert_eq!(verdict, Verdict::RateFail, "没有 floor 就退回原来的口径");
+    }
+
+    /// **RX 已经达标的腿，永远不许被 offered 闸降级。**
+    ///
+    /// offered 闸的全部理由是「解释缺口」。R6 最初把它架在 `rx_avg < target`
+    /// **外面**，于是它在没有缺口时也开火：TCP 不限速，链路上限贴着目标时
+    /// TX-P10 落在「目标 ~ 目标+余量」之间是常态，一条 RX 达标的腿就被判成
+    /// NOT_EVALUATED / OFFERED_LOAD_LOW。
+    ///
+    /// 下面这组数就是 `evaluate_nic_rx` 自己注释里引用的那次 run：主控 WLAN
+    /// 全场上限 2102、目标 2000、余量 5%（floor 2100）。R6 拆掉了 P10 在这个
+    /// 场景上造成的误判，又在同一个场景上装回了一条新的——所以这条测试用
+    /// 同一组数守着，防止再装回去。
+    #[test]
+    fn a_leg_that_met_its_target_is_never_downgraded_by_the_offered_gate() {
+        let stats = |avg: f64| RateStats {
+            avg_mbps: Some(avg),
+            p10_mbps: Some(avg),
+            coverage: 1.0,
+            rolling_coverage: 1.0,
+            series: (1..=180).map(|i| (i * 1_000, 1_000, avg)).collect(),
+            ..Default::default()
+        };
+        // TX-P10 2005 < floor 2100（没灌到目标+余量），但 RX 平均 2014 ≥ 目标 2000。
+        let (verdict, code, detail) = evaluate_nic_rx(
+            RateMode::Verify,
+            Some(2_000.0),
+            &stats(2_014.0),
+            &stats(2_005.0),
+            Some(2_100.0),
+        );
+        assert_eq!(
+            verdict,
+            Verdict::Pass,
+            "RX 达标就没有缺口要解释，offered 闸不该开火，实得 {verdict:?}/{code}：{detail}"
+        );
+        assert_ne!(code, ReasonCode::OfferedLoadLow);
+
+        // 边界：RX 正好等于目标也算达标（合格线是 `rx_avg < target` 才失败）。
+        let (verdict, _, _) = evaluate_nic_rx(
+            RateMode::Verify,
+            Some(2_000.0),
+            &stats(2_000.0),
+            &stats(2_005.0),
+            Some(2_100.0),
+        );
+        assert_eq!(verdict, Verdict::Pass, "RX 正好等于目标仍是达标");
+    }
+
+    /// 结构断言：装配层的三条契约各只能有一处定义（ADR-12）。
+    ///
+    /// 铁律 2 说「速率判定口径只有一份实现 = `master::rate_window`」，字面上一直
+    /// 成立——但 `rate_window` **之上**还有一层「腿级装配」：把窗口、覆盖率、
+    /// 目标、offered 负载、丢包组合成一条腿的结论。那一层曾经有三份实现
+    /// （`udp_leg_verdict` / `iperf_flow_verdict` / CTS 的内联 if-else），
+    /// 并且已经对同一事实给出过不同结论：
+    ///
+    /// - Observe/Discover 下 UDP 链拿目标判 FAIL，TCP/CTS 链不会；
+    /// - 「灌够了没有」的防误判口径**只有 UDP 链有**。
+    ///
+    /// 这与历史上两次静默错判同型：语义重复靠普通测试发现不了，两份实现各自
+    /// 都能通过自己的用例。所以照 `verdict_priority_has_exactly_one_definition_in_the_tree`
+    /// 的样子，在源码层面把门关上。
+    #[test]
+    fn the_leg_assembly_contracts_have_exactly_one_definition_in_the_tree() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut offenders = Vec::new();
+        let mut stack = vec![root];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read src dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                // 定义就在本文件里。四个标记分居两处：`effective_rate_target`
+                // 在 `rate.rs`（连同它清目标的那条 `Observe | Discover` 匹配），
+                // offered 那两条在本文件。这两个文件是**唯一**允许出现它们的
+                // 地方——扫描按文件名跳过，粒度到文件为止，不再细分哪个标记
+                // 属于哪个文件：真正要挡的是**第三处**实现，而不是这两处互相
+                // 串门。
+                if matches!(
+                    path.file_name().and_then(|n| n.to_str()),
+                    Some("rate_window.rs") | Some("rate.rs")
+                ) {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).expect("read source");
+                // 只看生产代码：测试可以自由构造这些场景。
+                let production = text
+                    .split_once("#[cfg(test)]")
+                    .map(|(head, _)| head)
+                    .unwrap_or(&text);
+                for (marker, why) in [
+                    (
+                        "RateMode::Observe | RateMode::Discover",
+                        "「Observe/Discover 不比目标」只能定义在 rate::effective_rate_target",
+                    ),
+                    (
+                        "RX_TRACKS_TX_RATIO: f64",
+                        "「RX 是否基本等于 TX」的比例只能定义在 rate_window",
+                    ),
+                    (
+                        "fn offered_shortfall_explains_rx",
+                        "offered 防误判谓词只能定义在 rate_window",
+                    ),
+                    (
+                        "fn effective_rate_target",
+                        "生效目标的推导只能定义在 rate（rate_window 调它，不自带一份）",
+                    ),
+                ] {
+                    if production.contains(marker) {
+                        offenders.push(format!("{}: {marker} —— {why}", path.display()));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "腿级判定装配层出现了第二份实现，这正是历史上两次静默错判的形状：{offenders:#?}"
+        );
+    }
+
     fn sample(elapsed_ms: u64, rx_delta_bytes: u64) -> MonitorSample {
         MonitorSample {
             elapsed_ms,
@@ -803,7 +1065,7 @@ mod tests {
         );
 
         let (verdict, code, detail) =
-            evaluate_nic_rx(RateMode::Observe, None, &stats, &RateStats::default());
+            evaluate_nic_rx(RateMode::Observe, None, &stats, &RateStats::default(), None);
         assert_eq!(verdict, Verdict::NotEvaluated);
         assert_eq!(
             code,
@@ -835,7 +1097,7 @@ mod tests {
         let stats = monitor_rate_stats(&out, &window, true, 0);
         assert!(stats.stalled_ratio < 0.05, "{}", stats.stalled_ratio);
         let (verdict, _, _) =
-            evaluate_nic_rx(RateMode::Observe, None, &stats, &RateStats::default());
+            evaluate_nic_rx(RateMode::Observe, None, &stats, &RateStats::default(), None);
         assert_eq!(verdict, Verdict::Measured);
     }
 
@@ -889,7 +1151,7 @@ mod tests {
 
         // 基线：两侧都完好 → 正常给出 PASS。
         assert_eq!(
-            evaluate_nic_rx(RateMode::Verify, target, &healthy, &healthy).0,
+            evaluate_nic_rx(RateMode::Verify, target, &healthy, &healthy, None).0,
             Verdict::Pass
         );
 
@@ -899,7 +1161,7 @@ mod tests {
             ..healthy.clone()
         };
         let (verdict, code, detail) =
-            evaluate_nic_rx(RateMode::Verify, target, &healthy, &tx_low_coverage);
+            evaluate_nic_rx(RateMode::Verify, target, &healthy, &tx_low_coverage, None);
         assert_eq!(
             (verdict, code),
             (Verdict::NotEvaluated, ReasonCode::SampleCoverageLow)
@@ -912,20 +1174,32 @@ mod tests {
             ..healthy.clone()
         };
         let (verdict, code, _) =
-            evaluate_nic_rx(RateMode::Verify, target, &healthy, &tx_low_rolling);
+            evaluate_nic_rx(RateMode::Verify, target, &healthy, &tx_low_rolling, None);
         assert_eq!(
             (verdict, code),
             (Verdict::NotEvaluated, ReasonCode::RateWindowCoverageLow)
         );
 
         // 发送端根本没采到样本。
-        let (verdict, _, _) =
-            evaluate_nic_rx(RateMode::Verify, target, &healthy, &RateStats::default());
+        let (verdict, _, _) = evaluate_nic_rx(
+            RateMode::Verify,
+            target,
+            &healthy,
+            &RateStats::default(),
+            None,
+        );
         assert_eq!(verdict, Verdict::NotEvaluated);
 
         // 目标未知时不做双侧要求：只记录实测能力。
         assert_eq!(
-            evaluate_nic_rx(RateMode::Observe, None, &healthy, &RateStats::default()).0,
+            evaluate_nic_rx(
+                RateMode::Observe,
+                None,
+                &healthy,
+                &RateStats::default(),
+                None
+            )
+            .0,
             Verdict::Measured
         );
     }
@@ -957,7 +1231,7 @@ mod tests {
                     let udp_trusts_sampling = rate_sample_coverage_sufficient(&rx, &tx, true)
                         && rate_window_coverage_sufficient(&rx, &tx, true);
                     let (verdict, code, _) =
-                        evaluate_nic_rx(RateMode::Verify, Some(target), &rx, &tx);
+                        evaluate_nic_rx(RateMode::Verify, Some(target), &rx, &tx, None);
 
                     if !udp_trusts_sampling {
                         assert_eq!(
@@ -1000,7 +1274,7 @@ mod tests {
             ..Default::default()
         };
         let decision = |mode, target, stats: &RateStats| {
-            let (verdict, code, _) = evaluate_nic_rx(mode, target, stats, &healthy_tx);
+            let (verdict, code, _) = evaluate_nic_rx(mode, target, stats, &healthy_tx, None);
             (verdict, code)
         };
 
@@ -1142,7 +1416,7 @@ mod tests {
             ..complete.clone()
         };
         let (verdict, code, detail) =
-            evaluate_nic_rx(RateMode::Verify, Some(800.0), &dropout, &healthy_tx);
+            evaluate_nic_rx(RateMode::Verify, Some(800.0), &dropout, &healthy_tx, None);
         assert_eq!((verdict, code), (Verdict::RateFail, ReasonCode::RxDropout));
         assert!(detail.contains("掉坑"), "{detail}");
         assert!(detail.contains("连续 6.0 秒"), "秒数必须是真秒数: {detail}");
@@ -1154,7 +1428,7 @@ mod tests {
             ..complete.clone()
         };
         let (verdict, code, detail) =
-            evaluate_nic_rx(RateMode::Verify, Some(800.0), &outage, &healthy_tx);
+            evaluate_nic_rx(RateMode::Verify, Some(800.0), &outage, &healthy_tx, None);
         assert_eq!((verdict, code), (Verdict::RateFail, ReasonCode::RxOutage));
         assert!(detail.contains("断流"), "{detail}");
 

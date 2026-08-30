@@ -1,0 +1,21 @@
+437618ef51fae02b2b0fe9ddb38adeeb|IPERF V4 TCP -w 64k -P 10 | 主控 eth0(192.168.1.2, 2500Mbps) -> 辅测 eth0(192.168.1.3, 2500Mbps)|bidir=false|dir=ab|est=20|legs=:56000
+223cfe9506303cbf4f1b19c0be2bf5fa|IPERF V4 TCP -w 4m -P 10 | 主控 eth0(192.168.1.2, 2500Mbps) -> 辅测 eth0(192.168.1.3, 2500Mbps)|bidir=false|dir=ab|est=20|legs=:56001
+8ffe4728daa5639bb41cf741173e63bd|IPERF V6 TCP -w 64k -P 10 | 主控 eth0(192.168.1.2, 2500Mbps) -> 辅测 eth0(192.168.1.3, 2500Mbps)|bidir=false|dir=ab|est=20|legs=:56002
+f11f532a6ca8b86ddc9126f1efa32f07|IPERF V6 TCP -w 4m -P 10 | 主控 eth0(192.168.1.2, 2500Mbps) -> 辅测 eth0(192.168.1.3, 2500Mbps)|bidir=false|dir=ab|est=20|legs=:56003
+371835a76f82c6a1ba4b2919164d625e|IPERF V4 TCP -w 64k -P 10 | 辅测 eth0(192.168.1.3, 2500Mbps) -> 主控 eth0(192.168.1.2, 2500Mbps)|bidir=false|dir=ba|est=20|legs=:56004
+85e31ab0ef926853725076e036c196d0|IPERF V4 TCP -w 4m -P 10 | 辅测 eth0(192.168.1.3, 2500Mbps) -> 主控 eth0(192.168.1.2, 2500Mbps)|bidir=false|dir=ba|est=20|legs=:56005
+eed4eb313bd36f1dbdf25c090e18c994|IPERF V6 TCP -w 64k -P 10 | 辅测 eth0(192.168.1.3, 2500Mbps) -> 主控 eth0(192.168.1.2, 2500Mbps)|bidir=false|dir=ba|est=20|legs=:56006
+70874a847713a72a860988bb572e37fd|IPERF V6 TCP -w 4m -P 10 | 辅测 eth0(192.168.1.3, 2500Mbps) -> 主控 eth0(192.168.1.2, 2500Mbps)|bidir=false|dir=ba|est=20|legs=:56007
+d15050592939d5d0486eb8f74236a544|★★双向 IPERF V4 TCP -w 64k -P 10 | 主控 eth0(192.168.1.2, 2500Mbps) <-> 辅测 eth0(192.168.1.3, 2500Mbps)|bidir=true|dir=bidir|est=20|legs=ab:56008,ba:56009
+4cf164270a86b8043bab5b16db168fa3|★★双向 IPERF V4 TCP -w 4m -P 10 | 主控 eth0(192.168.1.2, 2500Mbps) <-> 辅测 eth0(192.168.1.3, 2500Mbps)|bidir=true|dir=bidir|est=20|legs=ab:56010,ba:56011
+fa057ac632c1017e8a8e3c806a80a5ba|★★双向 IPERF V6 TCP -w 64k -P 10 | 主控 eth0(192.168.1.2, 2500Mbps) <-> 辅测 eth0(192.168.1.3, 2500Mbps)|bidir=true|dir=bidir|est=20|legs=ab:56012,ba:56013
+3e6914900f6efd2d7a494587464e5436|★★双向 IPERF V6 TCP -w 4m -P 10 | 主控 eth0(192.168.1.2, 2500Mbps) <-> 辅测 eth0(192.168.1.3, 2500Mbps)|bidir=true|dir=bidir|est=20|legs=ab:56014,ba:56015
+2bb399e9ea13295fbff2a9ac0ea32fb4|IPERF V4 UDP -b 1000m -l 14k -w 256m ×2流 | 主控 eth0(192.168.1.2, 2500Mbps) -> 辅测 eth0(192.168.1.3, 2500Mbps)|bidir=false|dir=ab|est=39|legs=:56016+56017
+2044f9ca8d133070fff15c5ee0c76747|IPERF V4 UDP -b 2500m | 主控 eth0(192.168.1.2, 2500Mbps) -> 辅测 eth0(192.168.1.3, 2500Mbps)|bidir=false|dir=ab|est=38|legs=:56018
+fb3c970359d6f04e3f0799566ffee0e6|★★双向 IPERF V4 UDP -b 1000m -l 14k -w 256m ×2流 | 主控 eth0(192.168.1.2, 2500Mbps) <-> 辅测 eth0(192.168.1.3, 2500Mbps)|bidir=true|dir=bidir|est=39|legs=ab:56019+56020,ba:56021+56022
+ea4fd000c1ceb4733620e20d798ad944|★★双向 IPERF V4 UDP -b 2500m | 主控 eth0(192.168.1.2, 2500Mbps) <-> 辅测 eth0(192.168.1.3, 2500Mbps)|bidir=true|dir=bidir|est=38|legs=ab:56023,ba:56024
+67e1240c314e050797fb021335d4ce2e|PING V4 -l 32 n=4 | 主控 eth0(192.168.1.2, 2500Mbps) -> 辅测 eth0(192.168.1.3, 2500Mbps)|bidir=false|dir=ab|est=16|legs=:-
+8691b97363f8433cd8ed88d10a2d22dd|PING V4 -l 1400 n=4 | 主控 eth0(192.168.1.2, 2500Mbps) -> 辅测 eth0(192.168.1.3, 2500Mbps)|bidir=false|dir=ab|est=16|legs=:-
+a72082e58df4636f8d5cf7e6d9116f72|PING V4 -l 32 n=4 | 辅测 eth0(192.168.1.3, 2500Mbps) -> 主控 eth0(192.168.1.2, 2500Mbps)|bidir=false|dir=ba|est=16|legs=:-
+92477395bb2f0a5f61d217def4bbdef8|PING V4 -l 1400 n=4 | 辅测 eth0(192.168.1.3, 2500Mbps) -> 主控 eth0(192.168.1.2, 2500Mbps)|bidir=false|dir=ba|est=16|legs=:-
+--- next_port=56025

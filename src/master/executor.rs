@@ -9,19 +9,19 @@ use crate::cmd::tools::{find_ctstraffic, find_iperf3};
 use crate::config::{Config, RateCheckCfg, RateMode};
 use crate::http_client;
 use crate::master::builder::{
-    v6_addrs, CtsTrafficTask, IperfTask, Leg, LegKind, PingPurpose, PingTask, Side, Unit,
-    SINGLE_UDP_MIN_ATTEMPTS,
+    v6_addrs, CtsTrafficTask, Endpoint, IperfTask, Leg, LegKind, PingPurpose, PingTask, Side, Unit,
 };
 use crate::master::rate_window::{
     evaluate_nic_rx, monitor_rate_stats, nearest_valid_sample, percentile, rate_excursion,
     rate_sample_coverage_sufficient, rate_window_coverage_sufficient, EffectiveWindow, RateStats,
     MIN_RATE_SAMPLE_COVERAGE, MIN_VALID_RX_MBPS,
 };
+use crate::master::run_status::{CurrentUnit, RunObserver, UnitStatus};
 use crate::nic::monitor::MonitorMgr;
 use crate::ping;
 use crate::protocol::*;
 use crate::reason::ReasonCode;
-use crate::report::{report_endpoint, report_reason, DirectionSummary, Row, StreamCounts};
+use crate::report::{report_reason, DirectionSummary, Row, RowBackend, RowProtocol, StreamCounts};
 use crate::util::{lock_recover, logln, md5_hex, now_compact, now_full, sanitize};
 use crate::verdict::{aggregate_verdict, ExecutionStatus, Verdict, VerdictResult};
 use base64::Engine;
@@ -34,9 +34,23 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// 单流 UDP 是基础连通性硬门槛：初次尝试加至少两次重试。
+///
+/// 归在执行器而不是 builder：它描述的是**执行期的重试预算**，不是计划的形状。
+/// 放在 builder 里会让人以为它参与单元展开或 resume identity（都不参与）。
+const SINGLE_UDP_MIN_ATTEMPTS: u64 = 3;
 const UDP_SERVER_START_RETRIES: usize = 1;
+/// 认定「这条流还活着」时允许的事件间隔。与窗口完整性无关，别混用。
 const FLOW_TIMELINE_TOLERANCE_MS: u64 = 2_000;
-const CTS_TIMELINE_TOLERANCE_MS: u64 = 100;
+/// **有效窗口是否算完整**时允许的收尾误差，三条链共用（ADR-12）。
+///
+/// 名字里没有后端：它以前叫 `CTS_TIMELINE_TOLERANCE_MS`，而 iperf 路径也在用
+/// 它——「iperf 用着一个名叫 CTS 的常量」本身就是这层已经分叉的症状。
+///
+/// 更要紧的是 UDP 路径**根本没用它**（零容差）：一条跑了 179.95 秒、要求 180 秒
+/// 的 UDP 腿判 `EFFECTIVE_WINDOW_SHORT`，而同样的 TCP 腿 PASS。50 毫秒的收尾
+/// 差异不是测量事实的差异，是三条链各自决定容差的结果。
+const WINDOW_COMPLETE_TOLERANCE_MS: u64 = 100;
 const RESOURCE_LEASE_GRACE_SECS: u64 = 300;
 const RELIABLE_HTTP_ATTEMPTS: usize = 3;
 const RELIABLE_HTTP_RETRY_DELAY: Duration = Duration::from_millis(250);
@@ -59,6 +73,12 @@ pub struct Ctx {
     pub agent_port: u16,
     pub cfg: Config,
     pub outdir: PathBuf,
+    /// 本次运行目录（`runs/run_...`）。`outdir` 是它下面的 `iperf_outputs/`。
+    ///
+    /// 结果落盘走这里而不是 `outdir`：`rows.jsonl` / `meta.json` 是**整个 run 的**
+    /// 数据，和报告 HTML 平级；`iperf_outputs/` 装的是逐条工具输出与样本 CSV。
+    /// `cpe_test report <run 目录>` 的入参就是这个目录。
+    pub run_dir: PathBuf,
     /// 每个单元开始前重新拉取双端网卡；`None` 表示沿用计划时的快照。
     pub topology: Option<Arc<dyn TopologySource>>,
     /// Agent RPC transport. Production uses TCP; tests can inject a scripted
@@ -70,6 +90,16 @@ pub struct Ctx {
     pub local_monitors: MonitorMgr,
     pub rows: Mutex<Vec<Row>>,
     pub db: Mutex<ResultDb>,
+    /// 结构化运行状态的汇报口（ADR-2）。
+    ///
+    /// `None` = 没人要听（命令行直跑）。回调点全部挂在**既有的** `logln` 处，
+    /// 所以这里不引入任何新状态机；`None` 时行为与加这个字段之前逐字节相同。
+    pub observer: Option<Arc<dyn RunObserver>>,
+    /// 已经追加进 `rows.jsonl` 的行数（ADR-3）。
+    ///
+    /// `rows` 只增不删，所以一个游标就够：每个单元结束时把 `rows[cursor..]`
+    /// 追加落盘，再把游标推到末尾。
+    pub persisted_rows: Mutex<usize>,
 }
 
 struct UnitResourceGuard<'a> {
@@ -368,6 +398,29 @@ where
 impl Ctx {
     // ---------------- agent HTTP ----------------
 
+    /// 把上一次落盘之后新增的行追加进 `runs/<run>/rows.jsonl`。
+    ///
+    /// 在每个单元结束时调用（与 `db.save()` 同一时机、同一个理由）。
+    /// **失败只告警不中断**：收尾动作不许弄死测试——磁盘满的时候，正在跑的
+    /// 那一轮还有价值，不该因为写不了副本而中止。
+    fn persist_new_rows(&self) {
+        let (pending, next_cursor) = {
+            let rows = lock_recover(&self.rows);
+            let cursor = *lock_recover(&self.persisted_rows);
+            if cursor >= rows.len() {
+                return;
+            }
+            (rows[cursor..].to_vec(), rows.len())
+        };
+        match crate::report::store::append_rows(&self.run_dir, &pending) {
+            Ok(()) => *lock_recover(&self.persisted_rows) = next_cursor,
+            Err(error) => {
+                // 游标**不推进**：下个单元会把这一批一起重试。
+                logln(&format!("  (结果增量落盘失败，本轮继续: {error})"));
+            }
+        }
+    }
+
     fn push_row(&self, row: Row) -> usize {
         let mut g = lock_recover(&self.rows);
         g.push(row);
@@ -404,6 +457,31 @@ impl Ctx {
         self.run_all_internal(units, 0, Some(blocks))
     }
 
+    /// 有 observer 就调它，没有就什么都不做。
+    ///
+    /// 回调里 panic 不该弄死测试——这是「收尾/旁路动作不许弄死测试」这条既有
+    /// 纪律的延续（Excel 生成失败、rows.jsonl 追加写失败都是同样的处理）。
+    fn notify(&self, call: impl FnOnce(&dyn RunObserver)) {
+        let Some(observer) = self.observer.as_ref() else {
+            return;
+        };
+        if catch_unwind(AssertUnwindSafe(|| call(observer.as_ref()))).is_err() {
+            logln("  (进度回调 panic，已忽略；测试继续)");
+        }
+    }
+
+    /// 从第 `next_index` 个单元起，剩下的估算耗时之和。
+    ///
+    /// `est_secs` 的唯一实现在 builder，这里只做求和——前端不复算，免得出现
+    /// 「界面说还剩 2 小时、日志说还剩 3 小时」这种两边各算一份的经典问题。
+    fn remaining_est_secs(units: &[Unit], next_index: usize) -> u64 {
+        units
+            .iter()
+            .skip(next_index)
+            .map(|unit| unit.est_secs)
+            .sum()
+    }
+
     fn run_all_internal(
         &self,
         units: &[Unit],
@@ -430,6 +508,7 @@ impl Ctx {
                     total.saturating_sub(i)
                 ));
                 sum.aborted_at_unit = Some(i);
+                self.notify(|observer| observer.run_aborted(i));
                 break;
             }
             let useq = sequence_offset + i;
@@ -439,6 +518,18 @@ impl Ctx {
             }
             let blocked = preflight_blocks.and_then(|blocks| blocks.get(&unit.id));
             logln(&format!("\n[{}/{}] {}", i + 1, total, unit.title));
+            // 结构化事件挂在这条 logln 旁边——同一个状态转移点，两个出口：
+            // 文本给人看，`RunStatus` 给机器读。日志文案因此可以自由改。
+            let unit_started_at = self.clock.now();
+            self.notify(|observer| {
+                observer.unit_started(CurrentUnit {
+                    seq: useq + 1,
+                    title: unit.title.clone(),
+                    est_secs: unit.est_secs,
+                    started_at: now_full(),
+                    link_group: unit.link_group.clone(),
+                })
+            });
 
             // 用最新一次双端扫描刷新本单元的网卡信息。拉不到就沿用计划时的
             // 快照继续跑——一次 RPC 抖动不该废掉整轮测试。
@@ -473,18 +564,35 @@ impl Ctx {
                                     sum.max_dead_traffic_streak.max(dead_streak);
                             }
                             self.push_row(Row {
-                                sort_key: (useq, 0, 0, 0),
-                                time: now_full(),
-                                task_id: unit.id.clone(),
-                                parent_id: unit.id.clone(),
-                                task: unit.title.clone(),
                                 verdict: Verdict::SetupError,
                                 execution_status: ExecutionStatus::Error,
                                 reason_code: ReasonCode::NicDisappeared,
                                 reason_detail: detail,
-                                kind_label: "跳过(网卡已消失)".into(),
-                                is_unit_summary: true,
-                                ..Default::default()
+                                ..unit_row(
+                                    unit,
+                                    useq,
+                                    "跳过(网卡已消失)",
+                                    RowProtocol::None,
+                                    RowBackend::None,
+                                )
+                            });
+                            // 同上：这条 `continue` 也绕过了 unit_finished。
+                            self.notify(|observer| {
+                                observer.unit_finished(
+                                    UnitStatus {
+                                        seq: useq + 1,
+                                        title: unit.title.clone(),
+                                        verdict: Verdict::SetupError.label().to_string(),
+                                        reason_code: ReasonCode::NicDisappeared
+                                            .as_str()
+                                            .to_string(),
+                                        reason_detail: gone.describe(),
+                                        skipped: false,
+                                        secs: 0,
+                                        link_group: unit.link_group.clone(),
+                                    },
+                                    Self::remaining_est_secs(units, i + 1),
+                                )
                             });
                             continue;
                         }
@@ -509,20 +617,36 @@ impl Ctx {
                         sum.traffic_usable_units += 1;
                     }
                     self.push_row(Row {
-                        sort_key: (useq, 0, 0, 0),
-                        time: now_full(),
-                        task_id: unit.id.clone(),
-                        parent_id: unit.id.clone(),
-                        task: unit.title.clone(),
                         verdict: Verdict::Skip,
                         execution_status: ExecutionStatus::Skipped,
                         reason_code: ReasonCode::ResumeFreshPass,
                         reason_detail: format!(
                             "复用 {t} 的正式 PASS；本轮启用 resume，且结果未超过 {RESUME_MAX_AGE_HOURS} 小时，因此跳过执行"
                         ),
-                        kind_label: format!("跳过(上次PASS: {t})"),
-                        is_unit_summary: true,
-                        ..Default::default()
+                        ..unit_row(
+                            unit,
+                            useq,
+                            format!("跳过(上次PASS: {t})"),
+                            RowProtocol::None,
+                            RowBackend::None,
+                        )
+                    });
+                    // 这条路径 `continue` 掉了，不会走到下面那个 unit_finished，
+                    // 所以在这里补一次——进度页上「跳过」也是一个已完成单元。
+                    self.notify(|observer| {
+                        observer.unit_finished(
+                            UnitStatus {
+                                seq: useq + 1,
+                                title: unit.title.clone(),
+                                verdict: Verdict::Skip.label().to_string(),
+                                reason_code: ReasonCode::ResumeFreshPass.as_str().to_string(),
+                                reason_detail: format!("复用 {t} 的正式 PASS"),
+                                skipped: true,
+                                secs: 0,
+                                link_group: unit.link_group.clone(),
+                            },
+                            Self::remaining_est_secs(units, i + 1),
+                        )
                     });
                     continue;
                 }
@@ -682,11 +806,8 @@ impl Ctx {
             let stream_counts = aggregate_direction_streams(&direction_summaries);
             logln(&format!("  ==> 单元结果: {}", unit_verdict.label()));
             self.push_row(Row {
+                // 单元汇总行永远排在本单元所有明细之后。
                 sort_key: (useq, usize::MAX, usize::MAX, u8::MAX),
-                time: now_full(),
-                task_id: unit.id.clone(),
-                parent_id: unit.id.clone(),
-                task: unit.title.clone(),
                 verdict: unit_verdict,
                 execution_status: match unit_verdict {
                     Verdict::SetupError => ExecutionStatus::Error,
@@ -697,11 +818,6 @@ impl Ctx {
                     .map(|outcome| outcome.reason_code())
                     .unwrap_or_default(),
                 reason_detail: reasons.join(" | "),
-                kind_label: if unit.bidir {
-                    "测试单元汇总(双向)".into()
-                } else {
-                    "测试单元汇总".into()
-                },
                 requested_streams: stream_counts.map_or(0, |counts| counts.requested),
                 active_streams: stream_counts.map_or(0, |counts| counts.active),
                 required_streams: stream_counts.map_or(0, |counts| counts.required),
@@ -715,14 +831,47 @@ impl Ctx {
                 ping_avg: single_direction.and_then(|direction| direction.ping_avg),
                 ping_max: single_direction.and_then(|direction| direction.ping_max),
                 direction_summaries,
-                is_unit_summary: true,
-                ..Default::default()
+                ..unit_row(
+                    unit,
+                    useq,
+                    if unit.bidir {
+                        "测试单元汇总(双向)"
+                    } else {
+                        "测试单元汇总"
+                    },
+                    RowProtocol::None,
+                    RowBackend::None,
+                )
             });
             {
                 let mut db = lock_recover(&self.db);
                 db.set(&unit.id, unit_ok, &unit.title);
                 db.save();
             }
+            // 结果增量落盘：与 `db.save()` 同一时机。频率是分钟级、体量是 KB 级，
+            // 对正在灌线速的机器没有可测量的影响；换来的是「崩溃 = 只损失未完成
+            // 的单元」而不是「崩溃 = 整轮全损」。
+            self.persist_new_rows();
+            // 与 `db.set` 同一个转移点：单元有结论了。
+            self.notify(|observer| {
+                observer.unit_finished(
+                    UnitStatus {
+                        seq: useq + 1,
+                        title: unit.title.clone(),
+                        verdict: unit_verdict.label().to_string(),
+                        reason_code: unit_reason
+                            .map(|outcome| outcome.reason_code().as_str().to_string())
+                            .unwrap_or_default(),
+                        // 失败清单一行一条，多腿的原因用 " | " 连起来的整串
+                        // 太长；这里只留第一段，完整的在报告里。
+                        reason_detail: reasons.first().cloned().unwrap_or_default(),
+                        skipped: false,
+                        secs: self.clock.now().duration_since(unit_started_at).as_secs(),
+                        link_group: unit.link_group.clone(),
+                    },
+                    Self::remaining_est_secs(units, i + 1),
+                )
+            });
             if blocked.is_none() && is_traffic_unit {
                 std::thread::sleep(Duration::from_secs(1));
             }
@@ -756,39 +905,20 @@ impl Ctx {
                             + u8::from(row.rx_avg.is_some()) * 2
                             + u8::from(row.sample_coverage.is_some())
                     })?;
-                let streams = (row.requested_streams > 0
-                    || row.active_streams > 0
-                    || row.required_streams > 0)
-                    .then_some(StreamCounts {
-                        requested: row.requested_streams,
-                        active: row.active_streams,
-                        required: row.required_streams,
-                    });
-                Some(DirectionSummary {
-                    tag: if outcome.tag.is_empty() {
-                        "单向".into()
-                    } else {
-                        outcome.tag.to_ascii_uppercase()
-                    },
-                    src: report_endpoint(&row.src_pc, &row.src_iface, &row.src_ip),
-                    dst: report_endpoint(&row.dst_pc, &row.dst_iface, &row.dst_ip),
-                    verdict: outcome.verdict(),
-                    reason_code: outcome.reason_code(),
-                    reason_detail: outcome.reason_detail().to_string(),
-                    reason: report_reason(outcome.reason_code(), outcome.reason_detail()),
-                    streams,
-                    rx_avg: row.rx_avg,
-                    rx_p10: row.rx_p10,
-                    target_mbps: row.target_mbps,
-                    sample_coverage: row.sample_coverage,
-                    udp_loss: row.udp_loss,
-                    ping_loss: row.ping_loss,
-                    ping_min: row.ping_min,
-                    ping_avg: row.ping_avg,
-                    ping_max: row.ping_max,
-                    screenshot_master: row.screenshot_master.clone(),
-                    screenshot_agent: row.screenshot_agent.clone(),
-                })
+                // 指标部分只有一份实现：`Row::direction_summary()`。这里只覆盖
+                // 那四项执行侧更权威的字段——腿的判定结果比从行里反推准确
+                // （行可能是组合计，也可能因为重试有多条）。
+                let mut summary = row.direction_summary();
+                summary.tag = if outcome.tag.is_empty() {
+                    "单向".into()
+                } else {
+                    outcome.tag.to_ascii_uppercase()
+                };
+                summary.verdict = outcome.verdict();
+                summary.reason_code = outcome.reason_code();
+                summary.reason_detail = outcome.reason_detail().to_string();
+                summary.reason = report_reason(outcome.reason_code(), outcome.reason_detail());
+                Some(summary)
             })
             .collect()
     }
@@ -921,105 +1051,86 @@ impl Ctx {
         reason_code: ReasonCode,
         reason_detail: &str,
     ) -> Option<usize> {
-        let (
-            backend,
-            ip,
-            transport,
-            param,
-            src_pc,
-            src_iface,
-            src_ip,
-            dst_pc,
-            dst_iface,
-            dst_ip,
-            requested_streams,
-        ) = match &leg.kind {
-            LegKind::IperfSingle(task) => (
-                "iperf",
-                if task.v6 { "V6" } else { "V4" }.to_string(),
-                if task.udp { "UDP" } else { "TCP" }.to_string(),
-                task.profile_label.clone(),
-                task.src.pc.clone(),
-                task.src.nic.name.clone(),
-                task.src.nic.ipv4.clone(),
-                task.dst.pc.clone(),
-                task.dst.nic.name.clone(),
-                task.dst.nic.ipv4.clone(),
-                if task.udp {
-                    1
-                } else {
-                    tcp_parallel_streams(&task.extra)
-                },
-            ),
-            LegKind::IperfGroup { name, streams } => {
-                if let Some(task) = streams.first() {
-                    (
-                        "iperf",
-                        if task.v6 { "V6" } else { "V4" }.to_string(),
-                        "UDP".into(),
-                        name.clone(),
-                        task.src.pc.clone(),
-                        task.src.nic.name.clone(),
-                        task.src.nic.ipv4.clone(),
-                        task.dst.pc.clone(),
-                        task.dst.nic.name.clone(),
-                        task.dst.nic.ipv4.clone(),
-                        streams.len(),
-                    )
-                } else {
-                    (
-                        "iperf",
-                        String::new(),
-                        "UDP".into(),
-                        name.clone(),
-                        String::new(),
-                        String::new(),
-                        String::new(),
-                        String::new(),
-                        String::new(),
-                        String::new(),
-                        0,
-                    )
-                }
+        // 端点不再从这里手抄成 6 个字符串：`base_row` 从 `Endpoint` 一次填齐，
+        // 顺带把类型化的 `src_side`/`dst_side`/`link_group` 也带上。
+        // 唯一取不到端点的情况是空的 UDP 组（理论上不该有），那时回落到单元的腿。
+        let (backend, backend_kind, ip, transport, protocol, param, requested_streams) =
+            match &leg.kind {
+                LegKind::IperfSingle(task) => (
+                    "iperf",
+                    RowBackend::Iperf3,
+                    if task.v6 { "V6" } else { "V4" }.to_string(),
+                    if task.udp { "UDP" } else { "TCP" }.to_string(),
+                    if task.udp {
+                        RowProtocol::Udp
+                    } else {
+                        RowProtocol::Tcp
+                    },
+                    task.profile_label.clone(),
+                    if task.udp {
+                        1
+                    } else {
+                        tcp_parallel_streams(&task.extra)
+                    },
+                ),
+                LegKind::IperfGroup { name, streams } => (
+                    "iperf",
+                    RowBackend::Iperf3,
+                    match streams.first() {
+                        Some(task) if task.v6 => "V6".to_string(),
+                        Some(_) => "V4".to_string(),
+                        None => String::new(),
+                    },
+                    "UDP".into(),
+                    RowProtocol::Udp,
+                    name.clone(),
+                    streams.len(),
+                ),
+                LegKind::CtsTraffic(task) => (
+                    "ctstraffic",
+                    RowBackend::CtsTraffic,
+                    if task.v6 { "V6" } else { "V4" }.to_string(),
+                    if task.udp { "CTS/UDP" } else { "CTS/TCP" }.to_string(),
+                    if task.udp {
+                        RowProtocol::Udp
+                    } else {
+                        RowProtocol::Tcp
+                    },
+                    task.profile_label.clone(),
+                    task.streams as usize,
+                ),
+                LegKind::Ping(_) => return None,
+            };
+        let endpoints = match &leg.kind {
+            LegKind::IperfSingle(task) => Some((&task.src, &task.dst)),
+            LegKind::IperfGroup { streams, .. } => {
+                streams.first().map(|task| (&task.src, &task.dst))
             }
-            LegKind::CtsTraffic(task) => (
-                "ctstraffic",
-                if task.v6 { "V6" } else { "V4" }.to_string(),
-                if task.udp { "CTS/UDP" } else { "CTS/TCP" }.to_string(),
-                task.profile_label.clone(),
-                task.src.pc.clone(),
-                task.src.nic.name.clone(),
-                task.src.nic.ipv4.clone(),
-                task.dst.pc.clone(),
-                task.dst.nic.name.clone(),
-                task.dst.nic.ipv4.clone(),
-                task.streams as usize,
-            ),
+            LegKind::CtsTraffic(task) => Some((&task.src, &task.dst)),
             LegKind::Ping(_) => return None,
+        };
+        let Some((src, dst)) = endpoints else {
+            // 空的 UDP 组没有端点可言，这一行也就没有可展示的链路。
+            return None;
         };
         let tag = if leg.tag.is_empty() {
             "单向"
         } else {
             leg.tag.as_str()
         };
+        let kind_label = if unit.bidir && backend == "ctstraffic" {
+            format!("★★双向 CTS Traffic-{tag}")
+        } else if unit.bidir {
+            format!("★★双向灌包-{tag}")
+        } else if backend == "ctstraffic" {
+            "CTS Traffic 灌包".into()
+        } else {
+            "灌包".to_string()
+        };
         Some(self.push_row(Row {
-            sort_key: (useq, lidx, 0, 0),
-            time: now_full(),
-            task_id: md5_hex(&format!(
-                "{}|{}|{}|direction-result",
-                unit.id, leg.tag, backend
-            )),
-            parent_id: unit.id.clone(),
-            task: unit.title.clone(),
-            ip,
+            // CTS 的可见 transport 列写成 `CTS/TCP`，后端信息在里面；
+            // 类型化之后后端进了 `backend`，可见列保持不变。
             transport,
-            param,
-            src_pc,
-            src_iface,
-            src_ip,
-            dst_pc,
-            dst_iface,
-            dst_ip,
             verdict,
             execution_status: match verdict {
                 Verdict::SetupError => ExecutionStatus::Error,
@@ -1028,21 +1139,30 @@ impl Ctx {
             },
             reason_code,
             reason_detail: reason_detail.into(),
-            kind_label: if unit.bidir && backend == "ctstraffic" {
-                format!("★★双向 CTS Traffic-{tag}")
-            } else if unit.bidir {
-                format!("★★双向灌包-{tag}")
-            } else if backend == "ctstraffic" {
-                "CTS Traffic 灌包".into()
-            } else {
-                "灌包".into()
-            },
             requested_streams,
             raws: vec![(
                 format!("{tag} 方向执行诊断"),
                 format!("[{reason_code}] {reason_detail}"),
             )],
-            ..Default::default()
+            ..base_row(RowIdentity {
+                unit_seq: useq,
+                leg_index: lidx,
+                stream_index: 0,
+                group_flag: 0,
+                unit,
+                leg_tag: &leg.tag,
+                src,
+                dst,
+                ip,
+                protocol,
+                backend: backend_kind,
+                param,
+                kind_label,
+                task_id: md5_hex(&format!(
+                    "{}|{}|{}|direction-result",
+                    unit.id, leg.tag, backend
+                )),
+            })
         }))
     }
 
@@ -1107,6 +1227,9 @@ mod format;
 mod iperf_leg;
 mod ping_leg;
 mod progress;
+mod row;
+
+use row::{base_row, unit_row, RowIdentity};
 mod udp;
 mod verdict_assembly;
 mod window;

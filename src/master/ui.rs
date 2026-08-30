@@ -42,6 +42,74 @@ pub struct MasterOpts {
     /// 有值时，本次真正推导出的计划必须与它一致才允许开跑——这是「界面上
     /// 确认的东西 == 实际跑的东西」唯一的强制点。命令行直跑不填，不设闸。
     pub expected_plan_hash: Option<String>,
+    /// 结构化运行状态的接收方（ADR-2）。控制台传一个记录器，命令行传 `None`。
+    ///
+    /// `None` 时执行路径与加这个字段之前逐字节相同：所有回调点都是既有的
+    /// `logln` 处，没有新状态机、没有新分支语义。
+    pub observer: Option<Arc<dyn crate::master::run_status::RunObserver>>,
+}
+
+/// 从一个已有的 run 目录重放报告（ADR-3）。
+///
+/// 读 `rows.jsonl` + `meta.json`，重新渲染 HTML。这是「崩溃后结果不丢」这条
+/// 目标的兑现处：主控在第 10 小时死掉，那十小时的测量数据、原因码、方向明细
+/// 都还在 rows.jsonl 里，这条命令把它们变回一份能看的报告。
+///
+/// 崩溃恢复的完整语义（ADR-14）：**结果不丢，但运行本身不续跑**。重跑时开
+/// `resume` 会跳过 24 小时内已 PASS 的单元，失败/未完成的重新跑出干净结论——
+/// 对灌包验收来说这恰好是对的，续跑反而要处理「半个单元的测量算不算数」。
+pub fn replay_report(dir: &Path) -> i32 {
+    use crate::report::store;
+
+    if !dir.is_dir() {
+        eprintln!("找不到运行目录: {}", dir.display());
+        return 2;
+    }
+    let (mut rows, skipped) = match store::load_rows(dir) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            eprintln!(
+                "读不到 {}: {error}\n（这个目录是 v6.0 之前跑出来的吗？那时结果还没有增量落盘。）",
+                store::rows_path(dir).display()
+            );
+            return 2;
+        }
+    };
+    if rows.is_empty() {
+        eprintln!("{} 里没有结果行", store::rows_path(dir).display());
+        return 2;
+    }
+    if skipped > 0 {
+        // 崩溃留下的文件最后一行常常是半截 JSON。说清楚跳过了几行，
+        // 免得有人拿重放报告和原始报告对数量时以为丢了数据。
+        eprintln!("提示: 跳过了 {skipped} 行无法解析的记录（通常是崩溃时写了一半的最后一行）");
+    }
+
+    // meta.json 缺失不算致命：行数据才是主体，抬头信息缺了报告照样能看。
+    let meta = match store::load_meta(dir) {
+        Ok(meta) => meta,
+        Err(error) => {
+            eprintln!("提示: 读不到 meta.json（{error}），报告抬头信息将为空");
+            store::RunMeta::default()
+        }
+    };
+    let report_meta: crate::report::ReportMeta = meta.report.clone().into();
+    let out = dir.join("report.html");
+    match write_report(&out, &mut rows, &report_meta) {
+        Ok(()) => {
+            println!("已从 {} 行结果重放报告: {}", rows.len(), out.display());
+            let xlsx_path = dir.join("summary.xlsx");
+            match crate::report::xlsx::write_xlsx(&xlsx_path, &rows, &report_meta) {
+                Ok(()) => println!("Excel 汇总: {}", xlsx_path.display()),
+                Err(error) => eprintln!("(Excel 汇总生成失败，不影响报告: {error})"),
+            }
+            0
+        }
+        Err(error) => {
+            eprintln!("报告写入失败: {error}");
+            1
+        }
+    }
 }
 
 const LAST_AGENT_FILE: &str = ".cpe_last_agent";
@@ -421,6 +489,21 @@ pub fn run_master(opts: MasterOpts) -> i32 {
     // ---- 执行 ----
     let started = now_full();
     let t0 = Instant::now();
+    // 结构化运行状态的起点。run_id 用运行目录名——它同时也是 `runs/` 下的
+    // 目录名和后续 `cpe_test report <run>` 的入参，三处是同一个标识。
+    if let Some(observer) = opts.observer.as_ref() {
+        let run_id = run_paths
+            .dir
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        observer.run_started(
+            &run_id,
+            &plan.plan_hash,
+            units.len(),
+            units.iter().map(|unit| unit.est_secs).sum(),
+        );
+    }
 
     // ---- 注册 Ctrl+C 处理器（Windows 上阻止 cmd.exe 弹出提示，非 Windows 用 ctrlc crate）
     crate::cancel::setup_cancel_handler();
@@ -430,6 +513,7 @@ pub fn run_master(opts: MasterOpts) -> i32 {
         agent_port: cfg.agent_port,
         cfg: cfg.clone(),
         outdir: run_paths.outdir.clone(),
+        run_dir: run_paths.dir.clone(),
         topology: Some(Arc::new(LiveTopology {
             agent_host: agent_host.clone(),
             agent_port: cfg.agent_port,
@@ -443,6 +527,8 @@ pub fn run_master(opts: MasterOpts) -> i32 {
         local_monitors: MonitorMgr::new(),
         rows: Mutex::new(Vec::new()),
         db: Mutex::new(ResultDb::load(PathBuf::from("task_results.json"))),
+        observer: opts.observer.clone(),
+        persisted_rows: Mutex::new(0),
     };
     let mut sum = ctx.run_all_with_preflight_blocks(&units, &preflight_blocks);
     if sum.needs_traffic_failure_diagnostics() {
@@ -495,10 +581,45 @@ pub fn run_master(opts: MasterOpts) -> i32 {
         // 写报告是最后一次取这把锁：即使前面某个单元 panic 毒化了它，也必须
         // 把已经跑完的结果落盘，而不是连整份报告一起丢掉。
         let mut rows = lock_recover(&ctx.rows);
+        // meta.json 先写：它是重放的入口，rows.jsonl 已经在每个单元结束时
+        // 增量落盘了。崩溃在这之前的话，run 目录里有行数据但没有元信息——
+        // `cpe_test report` 仍能重放，只是抬头信息缺一块（见 `load_meta` 的
+        // 回落）。反过来（有元信息没行数据）才是真的没东西可放。
+        let run_meta = crate::report::store::RunMeta {
+            schema_version: crate::report::store::SCHEMA_VERSION,
+            run_id: run_paths
+                .dir
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            plan_hash: plan.plan_hash.clone(),
+            report: (&meta).into(),
+            total_units: units.len(),
+        };
+        if let Err(error) = crate::report::store::write_meta(&run_paths.dir, &run_meta) {
+            logln(&format!("!! meta.json 写入失败（不影响本轮报告）: {error}"));
+        }
         match write_report(&run_paths.report, &mut rows, &meta) {
-            Ok(_) => logln(&format!("\n报告已生成: {}", run_paths.report.display())),
+            Ok(_) => {
+                logln(&format!("\n报告已生成: {}", run_paths.report.display()));
+                // 报告路径直接由回调送出去。`/api/progress` 从此不必再在日志里
+                // 搜「报告已生成: 」这个字符串——那让一句提示语变成了协议。
+                if let Some(observer) = opts.observer.as_ref() {
+                    observer.report_written(&run_paths.report.display().to_string());
+                }
+            }
             Err(e) => logln(&format!("!! 报告写入失败: {e}")),
         }
+        // Excel 是第二个出口，**生成失败一律降级为警告**：一份跑完的测试
+        // 不该因为写不出 xlsx 而被判定为失败（既有纪律，与截图失败同处理）。
+        let xlsx_path = run_paths.dir.join("summary.xlsx");
+        match crate::report::xlsx::write_xlsx(&xlsx_path, &rows, &meta) {
+            Ok(()) => logln(&format!("Excel 汇总: {}", xlsx_path.display())),
+            Err(error) => logln(&format!("(Excel 汇总生成失败，不影响报告: {error})")),
+        }
+    }
+    if let Some(observer) = opts.observer.as_ref() {
+        observer.run_finished();
     }
 
     logln(&format!(
@@ -940,6 +1061,8 @@ fn generate_specs_from_pairs(
 
         out.push(SpecNorm {
             name: format!("{}<->{}", p.master, p.agent),
+            // 交互式配对没有链路集合的概念，报表回落到物理网口对。
+            link_group: String::new(),
             src,
             dst,
             directions,
@@ -1166,6 +1289,8 @@ fn spec_from_params(
 ) -> SpecNorm {
     SpecNorm {
         name: name.to_string(),
+        // `pairs` 预设路径同上：没有链路集合，报表按物理网口对分组。
+        link_group: String::new(),
         src,
         dst,
         directions: p.directions.clone(),
@@ -1321,6 +1446,88 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 崩溃恢复的端到端保证：run 目录里有 rows.jsonl，就能放出一份完整报告。
+    ///
+    /// 这是 ADR-3 存在的全部理由。在此之前，主控在第 10 小时被 kill 掉，
+    /// 剩下的只有 `task_results.json` 里的单元级 PASS 布尔——十小时的测量值、
+    /// 原因码、方向明细全部蒸发。这条测试把「模拟崩溃 → 重放」整条路走一遍。
+    #[test]
+    fn a_run_directory_with_rows_can_be_replayed_into_a_report() {
+        use crate::report::store;
+        use crate::report::Row;
+        use crate::verdict::Verdict;
+
+        let dir = std::env::temp_dir().join(format!(
+            "cpe_replay_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("temp run dir");
+
+        // 模拟「跑了两个单元之后进程没了」：两批增量落盘，没有最终报告。
+        for seq in 0..2usize {
+            let detail = Row {
+                sort_key: (seq, 0, 0, 0),
+                task_id: format!("t{seq}"),
+                parent_id: format!("unit-{seq}"),
+                task: format!("IPERF V4 TCP #{seq}"),
+                kind_label: "灌包".into(),
+                verdict: Verdict::Pass,
+                unit_seq: seq,
+                rx_avg: Some(930.0),
+                target_mbps: Some(850.0),
+                ..Default::default()
+            };
+            let summary = Row {
+                sort_key: (seq, usize::MAX, usize::MAX, u8::MAX),
+                is_unit_summary: true,
+                ..detail.clone()
+            };
+            store::append_rows(&dir, &[detail, summary]).expect("append");
+        }
+        store::write_meta(
+            &dir,
+            &store::RunMeta {
+                schema_version: store::SCHEMA_VERSION,
+                run_id: "run_crashed".into(),
+                plan_hash: "hash".into(),
+                report: store::ReportMetaRecord {
+                    master_pc: "MASTER".into(),
+                    agent_pc: "AGENT".into(),
+                    ..Default::default()
+                },
+                total_units: 10,
+            },
+        )
+        .expect("meta");
+
+        assert!(!dir.join("report.html").exists(), "崩溃时还没有报告");
+        assert_eq!(replay_report(&dir), 0, "重放应当成功");
+
+        let html = std::fs::read_to_string(dir.join("report.html")).expect("重放出的报告");
+        assert!(html.contains("IPERF V4 TCP #0"), "第一个单元要在报告里");
+        assert!(html.contains("IPERF V4 TCP #1"), "第二个单元要在报告里");
+        // 抬头信息来自 meta.json。
+        assert!(html.contains("MASTER"), "meta.json 里的主控名要进报告");
+        // Excel 也一并重放。
+        assert!(dir.join("summary.xlsx").exists(), "重放要顺带出 Excel");
+
+        // 没有 rows.jsonl 的目录要给出可操作的报错，而不是 panic。
+        let empty = dir.join("empty");
+        std::fs::create_dir_all(&empty).expect("empty dir");
+        assert_eq!(replay_report(&empty), 2, "没有结果文件应当返回错误码");
+        assert_eq!(
+            replay_report(&dir.join("does-not-exist")),
+            2,
+            "目录不存在应当返回错误码"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn run_paths_keep_report_log_and_artifacts_in_one_unique_directory() {
         let root = std::env::temp_dir().join(format!(
@@ -1361,6 +1568,7 @@ mod tests {
         Unit {
             id: "ping-only".into(),
             title: "ping-only".into(),
+            link_group: String::new(),
             bidir: false,
             direction: String::new(),
             est_secs: 1,
@@ -1384,6 +1592,7 @@ mod tests {
         Unit {
             id: "iperf".into(),
             title: "iperf".into(),
+            link_group: String::new(),
             bidir: false,
             direction: String::new(),
             est_secs: 1,
@@ -1402,7 +1611,7 @@ mod tests {
                     stream_idx: 0,
                     rate_mode: RateMode::Auto,
                     rx_target_mbps: None,
-                    offered_mbps: None,
+                    offered_per_stream_mbps: None,
                 }),
             }],
         }
@@ -1414,6 +1623,7 @@ mod tests {
         Unit {
             id: "ctstraffic".into(),
             title: "ctstraffic".into(),
+            link_group: String::new(),
             bidir: false,
             direction: String::new(),
             est_secs: 1,
@@ -1437,7 +1647,7 @@ mod tests {
                     status_update_ms: 1_000,
                     rate_mode: RateMode::Observe,
                     rx_target_mbps: None,
-                    offered_mbps: Some(1_500.0),
+                    offered_total_mbps: Some(1_500.0),
                     setup_error: None,
                 }),
             }],

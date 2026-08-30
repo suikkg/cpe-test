@@ -1,0 +1,12 @@
+# 控制台产物与前端源码一律 LF。
+#
+# 两个地方会因为 CRLF 出事，而且都只在 Windows 上出（这里的主战场恰好是 Windows）：
+#
+#   1. `ui/scripts/emit.mjs --check` 是拿构建出来的字符串和工作区里的
+#      `src/master/webui.html` 直接比。emit 永远写 LF，而 Windows 检出默认
+#      `core.autocrlf=true` 会把工作区文件变成 CRLF —— 于是 `npm run verify`
+#      在 Windows 上必然失败，且报错说的是「产物与仓库不同步」，指向完全错误的方向。
+#   2. 溯源戳把源码内容做 CRLF -> LF 归一之后再算 MD5，所以它本身不受影响；
+#      但把源码固定成 LF，两端读到的就是同一份字节，少一层「归一化对不对」的疑问。
+src/master/webui.html text eol=lf
+ui/** text eol=lf

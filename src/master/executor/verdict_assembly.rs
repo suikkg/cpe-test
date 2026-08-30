@@ -172,6 +172,12 @@ pub(crate) struct IperfFlowVerdictIn<'a> {
     pub rx_target_mbps: Option<f64>,
     pub rx_stats: &'a RateStats,
     pub tx_stats: &'a RateStats,
+    /// 验证目标所需的最低发送负载（目标 + 余量）；`None` = 不做 offered 检查。
+    ///
+    /// 与 UDP 链的 `UdpLegFacts::offered_floor` 是同一个概念、同一个算法
+    /// （`rate_window::offered_floor_mbps`）——三条链共用，免得「余量」在不同
+    /// 后端上变成不同的数（ADR-12）。
+    pub offered_floor: Option<f64>,
     /// client 输出的最后一行，用作 setup 错误的可读细节。
     pub client_tail: &'a str,
     /// 接收端 monitor 的完整采样输出，仅用于窗口不足时给一个定位数字。
@@ -224,6 +230,7 @@ pub(crate) fn iperf_flow_verdict(input: IperfFlowVerdictIn<'_>) -> (Verdict, Rea
         rx_target_mbps,
         rx_stats,
         tx_stats,
+        offered_floor,
         client_tail,
         rx_monitor,
     } = input;
@@ -238,10 +245,26 @@ pub(crate) fn iperf_flow_verdict(input: IperfFlowVerdictIn<'_>) -> (Verdict, Rea
         );
     }
     if !measurement {
+        // 「工具没产生吞吐测量」= **执行环境的事实**，不是被测设备的性能结论。
+        //
+        // 三条链此前对同一件事给了三个 verdict（ADR-12(b)）：
+        //   iperf 单腿 → RATE_FAIL / NO_VALID_MEASUREMENT
+        //   UDP 组     → SETUP_ERROR / NO_STREAM_STARTED
+        //   CTS        → SETUP_ERROR / CTS_NO_MEASUREMENT
+        // 而 SETUP_ERROR 与 RATE_FAIL 在聚合优先级、处置建议、RunSummary
+        // 计数器上都不同——这不是措辞差异。
+        //
+        // 统一到 SETUP_ERROR（三分之二本来就是它），方向也是对的：iperf3 干净
+        // 退出却没有 rate/bytes，分不清「链路真的一个字节没过」和「结果交换失败
+        // 没读到」。判 RATE_FAIL 等于在分不清的时候声称是 CPE 的错——正是这套
+        // 判定一直在防的误判方向。速率的权威口径本来也是网卡计数器，不是
+        // iperf3 的自报值。
         return (
-            Verdict::RateFail,
+            Verdict::SetupError,
             ReasonCode::NoValidMeasurement,
-            "iperf3 已结束，但没有 rate/bytes 吞吐测量".into(),
+            "iperf3 已结束，但没有 rate/bytes 吞吐测量；无法判断这一轮是链路没过流量\
+             还是结果交换失败，因此不下 CPE 性能结论"
+                .into(),
         );
     }
     if !effective_window.complete {
@@ -257,7 +280,8 @@ pub(crate) fn iperf_flow_verdict(input: IperfFlowVerdictIn<'_>) -> (Verdict, Rea
         );
     }
 
-    let (verdict, code, detail) = evaluate_nic_rx(rate_mode, rx_target_mbps, rx_stats, tx_stats);
+    let (verdict, code, detail) =
+        evaluate_nic_rx(rate_mode, rx_target_mbps, rx_stats, tx_stats, offered_floor);
     if !summary_lost_after_full_run {
         return (verdict, code, detail);
     }
@@ -384,6 +408,17 @@ pub(super) fn udp_leg_verdict(facts: &UdpLegFacts<'_>) -> VerdictResult {
         rx_lifecycle_hint,
     } = facts;
 
+    // 「这一腿到底有没有目标要比」只有一处定义（ADR-12）。
+    //
+    // 这里以前是直接用 `rx_target_mbps` 的：全函数不出现 Observe/Discover，
+    // 于是显式配 `observe` 又能解析出目标时，同一台设备的 UDP 腿判 RATE_FAIL、
+    // 而 TCP/CTS 腿判 MEASURED。Discover 更糟——它本来就是**故意分阶梯灌不满**
+    // 的模式，拿目标判它的 FAIL 是结构性误判。
+    let rx_target_mbps = crate::rate::effective_rate_target(rate_mode, rx_target_mbps);
+    // 目标没了，「需要灌到多少才算数」也就无从谈起：offered 门槛只在有目标
+    // 时才有意义，否则会拿一个不存在的门限去判 OFFERED_LOAD_LOW。
+    let offered_floor = rx_target_mbps.and(offered_floor);
+
     let rate_present = rx_stats
         .avg_mbps
         .map(|v| v > MIN_VALID_RX_MBPS)
@@ -496,8 +531,14 @@ pub(super) fn udp_leg_verdict(facts: &UdpLegFacts<'_>) -> VerdictResult {
             ReasonCode::UdpLossDataMissing,
             "已配置 UDP 丢包门槛，但 iperf3 输出缺少 lost/total 数据".to_string(),
         )
-    } else if !tx_sufficient && offered_shortfall_explains_rx(rx_stats.avg_mbps, tx_stats.p10_mbps)
+    } else if !rx_meets_target
+        && !tx_sufficient
+        && offered_shortfall_explains_rx(rx_stats.avg_mbps, tx_stats.p10_mbps)
     {
+        // `!rx_meets_target` 是后补上的，与 `evaluate_nic_rx` 同口径：这个闸的
+        // 全部理由是「解释缺口」，RX 已经达标时它无话可说。少了这一条，只要
+        // TX-P10 落在目标与目标+余量之间，一条达标的腿就会被判成
+        // NOT_EVALUATED / OFFERED_LOAD_LOW。
         VerdictResult::not_evaluated(
             ReasonCode::OfferedLoadLow,
             format!(
@@ -594,6 +635,188 @@ mod tests {
             series: (1..=180).map(|i| (i * 1_000, 1_000, avg)).collect(),
             ..Default::default()
         }
+    }
+
+    /// 「工具没产生吞吐测量」在三条链上必须是**同一个** verdict。
+    ///
+    /// 行为变更（ADR-12(b)）：iperf 单腿从 `RATE_FAIL/NO_VALID_MEASUREMENT`
+    /// 改为 `SETUP_ERROR/NO_VALID_MEASUREMENT`，与 UDP 组
+    /// （`SETUP_ERROR/NO_STREAM_STARTED`）和 CTS（`SETUP_ERROR/CTS_NO_MEASUREMENT`）
+    /// 对齐。SETUP_ERROR 与 RATE_FAIL 在聚合优先级、处置建议、`RunSummary`
+    /// 计数器上都不同——这不是措辞差异，是同一件事被记成了两类结论。
+    ///
+    /// 方向也是对的：iperf3 干净退出却没有 rate/bytes，分不清「链路真的一个
+    /// 字节没过」和「结果交换失败没读到」；在分不清的时候声称是 CPE 的错，
+    /// 正是这套判定一直在防的误判方向。
+    #[test]
+    fn no_measurement_is_a_setup_error_on_every_chain() {
+        let window = full_window();
+        let rx = healthy(0.0);
+        let tx = healthy(0.0);
+
+        // iperf 单腿：跑完了、没有自报测量。
+        let (verdict, code, detail) = iperf_flow_verdict(IperfFlowVerdictIn {
+            raw_ok: true,
+            measurement: false,
+            effective_window: &window,
+            required_secs: 180,
+            rate_mode: RateMode::Verify,
+            rx_target_mbps: Some(1_000.0),
+            rx_stats: &rx,
+            tx_stats: &tx,
+            offered_floor: None,
+            client_tail: "",
+            rx_monitor: None,
+        });
+        assert_eq!(
+            verdict,
+            Verdict::SetupError,
+            "没有测量是执行环境的事实，不是 CPE 的性能结论"
+        );
+        assert_eq!(code, ReasonCode::NoValidMeasurement);
+        assert!(
+            detail.contains("不下 CPE 性能结论"),
+            "报错要说清为什么不判 FAIL: {detail}"
+        );
+
+        // UDP 组：一条流都没成，且不是「单流必须灌通」那种情况。
+        let udp = udp_leg_verdict(&UdpLegFacts {
+            streams_total: 4,
+            streams_success: 0,
+            single_stream_exhausted: false,
+            ..facts(&rx, &tx, &window)
+        });
+        assert_eq!(udp.verdict, Verdict::SetupError);
+        assert_eq!(udp.code, ReasonCode::NoStreamStarted);
+
+        // 三条链的 verdict 必须相同——这才是「收敛」的意思。
+        assert_eq!(
+            verdict, udp.verdict,
+            "iperf 链与 UDP 链对「没有测量」给出了不同 verdict"
+        );
+
+        // 例外保持不变：单流 UDP 用尽重试仍不通，是「该方向必须灌通」的
+        // 契约被破坏，判 RATE_FAIL 是有意的，不在这次统一范围内。
+        let single = udp_leg_verdict(&UdpLegFacts {
+            streams_total: 1,
+            streams_success: 0,
+            single_stream_exhausted: true,
+            ..facts(&rx, &tx, &window)
+        });
+        assert_eq!(single.verdict, Verdict::RateFail);
+        assert_eq!(single.code, ReasonCode::SingleUdpStreamFailed);
+    }
+
+    /// Observe / Discover 下，**三条链都不许拿目标判 FAIL**。
+    ///
+    /// 行为变更（ADR-12(a)），方向是把误判改回正确：在此之前 UDP 腿自己内联了
+    /// 一条等价判定链，全函数不出现 Observe/Discover，直接拿 target 比。可达性
+    /// 是实打实的——`rate::effective_mode` 只折叠 `Auto`、不清目标，所以显式配
+    /// `observe` 又能解析出目标时，**同一台设备的 UDP 腿判 RATE_FAIL、
+    /// TCP/CTS 腿判 MEASURED**。
+    ///
+    /// `Discover` 尤其严重：它的语义就是**故意分阶梯灌不满**去找拐点，拿目标
+    /// 判它的 FAIL 是结构性误判，而且方向是「把配置意图写成 CPE 性能失败」。
+    #[test]
+    fn observe_and_discover_never_fail_a_leg_against_a_target() {
+        let window = full_window();
+        // 发送端灌足了（TX-P10 高于 offered_floor），接收端只有目标的一半——
+        // 这才是干净的「CPE 没接住」，verify 下必须判 RATE_FAIL。
+        // TX 也不够的话会先命中 OFFERED_LOAD_LOW（那条防的是「把发送端瓶颈
+        // 写成 CPE 失败」），就验不到这里想验的东西了。
+        let rx = healthy(500.0);
+        let tx = healthy(1_100.0);
+
+        let verify = udp_leg_verdict(&UdpLegFacts {
+            rate_mode: RateMode::Verify,
+            ..facts(&rx, &tx, &window)
+        });
+        assert_eq!(
+            verify.verdict,
+            Verdict::RateFail,
+            "verify 下低于目标仍应判 FAIL，否则这条测试什么都没证明"
+        );
+
+        for mode in [RateMode::Observe, RateMode::Discover] {
+            let result = udp_leg_verdict(&UdpLegFacts {
+                rate_mode: mode,
+                // 目标仍然配着（这正是可达的那个场景）。
+                rx_target_mbps: Some(1_000.0),
+                ..facts(&rx, &tx, &window)
+            });
+            assert_eq!(
+                result.verdict,
+                Verdict::Measured,
+                "{mode:?} 只记录能力，不许拿目标判 FAIL；实得 {:?}/{}",
+                result.verdict,
+                result.code
+            );
+            assert_eq!(result.code, ReasonCode::TargetUnknown);
+
+            // 同一份事实喂给 TCP/CTS 那条链，结论必须一致——这才是「收敛」
+            // 的意思：两条链对同一件事不能给出不同答案。
+            let (nic_verdict, nic_reason, _) =
+                crate::master::rate_window::evaluate_nic_rx(mode, Some(1_000.0), &rx, &tx, None);
+            assert_eq!(
+                nic_verdict, result.verdict,
+                "UDP 链与 TCP/CTS 链在 {mode:?} 下判定不一致"
+            );
+            assert_eq!(nic_reason, result.code);
+        }
+    }
+
+    /// 目标被模式清掉之后，offered 门槛也必须跟着失效。
+    ///
+    /// 否则会出现「没有目标可比，却因为 TX 没到某个不存在的门限+余量而判
+    /// OFFERED_LOAD_LOW」——一个自相矛盾的结论。
+    #[test]
+    fn clearing_the_target_also_clears_the_offered_floor() {
+        let window = full_window();
+        // TX 远低于 offered_floor，verify 下会命中 OFFERED_LOAD_LOW。
+        let rx = healthy(300.0);
+        let tx = healthy(300.0);
+        let observed = udp_leg_verdict(&UdpLegFacts {
+            rate_mode: RateMode::Observe,
+            rx_target_mbps: Some(1_000.0),
+            offered_floor: Some(1_050.0),
+            ..facts(&rx, &tx, &window)
+        });
+        assert_eq!(observed.verdict, Verdict::Measured);
+        assert_ne!(
+            observed.code,
+            ReasonCode::OfferedLoadLow,
+            "没有目标时不该拿一个不存在的门限判 offered 不足"
+        );
+    }
+
+    /// **RX 已经达标的腿，永远不许被 offered 闸降级。**
+    ///
+    /// 与 `rate_window` 的同名测试是一对：offered 闸的全部理由是「解释缺口」，
+    /// 没有缺口时它无话可说。这一条以前是破的——闸架在 `!rx_meets_target`
+    /// **前面**，于是 TX-P10 落在「目标 ~ 目标+余量」之间（TCP 不限速、链路
+    /// 上限贴着目标时是常态）就足以把一条达标的腿判成 NOT_EVALUATED。
+    #[test]
+    fn a_leg_that_met_its_target_is_never_downgraded_by_the_offered_gate() {
+        let window = full_window();
+        // 目标 1000 / floor 1050：TX-P10 1010 没到 floor，但 RX 平均 1005 达标。
+        let rx = healthy(1_005.0);
+        let tx = healthy(1_010.0);
+        let judgement = udp_leg_verdict(&facts(&rx, &tx, &window));
+        assert_eq!(
+            judgement.verdict,
+            Verdict::Pass,
+            "RX 达标就没有缺口要解释：{judgement:?}"
+        );
+        assert_ne!(judgement.code, ReasonCode::OfferedLoadLow);
+
+        // 三条链同口径：同样的输入喂给 evaluate_nic_rx 必须得到同一个结论。
+        let (nic_verdict, nic_code, _) =
+            evaluate_nic_rx(RateMode::Verify, Some(1_000.0), &rx, &tx, Some(1_050.0));
+        assert_eq!(
+            (nic_verdict, nic_code),
+            (judgement.verdict, judgement.code),
+            "UDP 链与 TCP/CTS 链在 offered 闸上又分叉了"
+        );
     }
 
     fn full_window() -> EffectiveWindow {

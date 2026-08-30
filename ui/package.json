@@ -1,0 +1,25 @@
+{
+  "name": "cpe-test-console",
+  "private": true,
+  "version": "5.0.0",
+  "type": "module",
+  "description": "CPE 子网测试控制台前端。构建产物是全内联的单个 HTML，提交进仓库供 include_str! 使用。",
+  "scripts": {
+    "dev": "vite",
+    "typecheck": "vue-tsc --noEmit",
+    "test": "vitest run",
+    "build": "vue-tsc --noEmit && node scripts/lint-arch.mjs && vite build && node scripts/emit.mjs",
+    "verify": "node scripts/lint-arch.mjs && node scripts/emit.mjs --check"
+  },
+  "dependencies": {
+    "vue": "^3.5.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.2.0",
+    "typescript": "^5.7.0",
+    "vite": "^6.0.0",
+    "vite-plugin-singlefile": "^2.1.0",
+    "vue-tsc": "^2.2.0",
+    "vitest": "^4.1.0"
+  }
+}

@@ -40,6 +40,24 @@ impl Verdict {
         }
     }
 
+    /// `label()` 的逆。
+    ///
+    /// 存在的理由：`RunStatus` 和 rows.jsonl 里判定是按 **label 字符串**序列化的
+    /// （那是既有的对外兼容面，不能为了内部方便改成数字），读回来时需要一条
+    /// 唯一的反向映射。写第二份 `match` 就是又一个会漂的口径。
+    /// 由 `every_verdict_label_round_trips` 钉住与 `label()` 的一一对应。
+    pub fn from_label(label: &str) -> Option<Verdict> {
+        Some(match label {
+            "PASS" => Verdict::Pass,
+            "RATE_FAIL" => Verdict::RateFail,
+            "MEASURED" => Verdict::Measured,
+            "NOT_EVALUATED" => Verdict::NotEvaluated,
+            "SETUP_ERROR" => Verdict::SetupError,
+            "SKIP" => Verdict::Skip,
+            _ => return None,
+        })
+    }
+
     pub fn css(self) -> &'static str {
         match self {
             Verdict::Pass => "pass",
@@ -70,6 +88,19 @@ pub enum ExecutionStatus {
 }
 
 impl ExecutionStatus {
+    /// `label()` 的逆；见 `Verdict::from_label` 的理由。
+    pub fn from_label(label: &str) -> Option<ExecutionStatus> {
+        Some(match label {
+            "COMPLETED" => ExecutionStatus::Completed,
+            "PARTIAL" => ExecutionStatus::Partial,
+            "ERROR" => ExecutionStatus::Error,
+            "TIMEOUT" => ExecutionStatus::TimedOut,
+            "CANCELLED" => ExecutionStatus::Cancelled,
+            "SKIPPED" => ExecutionStatus::Skipped,
+            _ => return None,
+        })
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             ExecutionStatus::Completed => "COMPLETED",
@@ -78,6 +109,47 @@ impl ExecutionStatus {
             ExecutionStatus::TimedOut => "TIMEOUT",
             ExecutionStatus::Cancelled => "CANCELLED",
             ExecutionStatus::Skipped => "SKIPPED",
+        }
+    }
+}
+
+/// `Verdict` / `ExecutionStatus` 的 serde 表示 = **它们的 label 字符串**。
+///
+/// 不用 serde 的默认 derive（那会把变体名写成 `RateFail` 这种驼峰），理由是
+/// 这两个类型的字符串形态**已经是对外兼容面**了：报告 HTML、`task_results.json`、
+/// `/api/progress` 里的判定全是 `RATE_FAIL` 这种大写下划线串。rows.jsonl 再引入
+/// 第二种拼法，等于让同一个概念在同一个产品里有两个名字。
+///
+/// 反序列化认不出来的串一律回落到 `Default`（`NotEvaluated` / `Completed`）而不是
+/// 报错：重放器要容忍未来版本写出的新取值——宁可把一行显示成「未评估」，也不要
+/// 因为一个不认识的枚举值让整份历史报告读不出来。
+mod verdict_serde {
+    use super::{ExecutionStatus, Verdict};
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    impl Serialize for Verdict {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            self.label().serialize(serializer)
+        }
+    }
+
+    impl<'de> Deserialize<'de> for Verdict {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            let label = String::deserialize(deserializer)?;
+            Ok(Verdict::from_label(&label).unwrap_or_default())
+        }
+    }
+
+    impl Serialize for ExecutionStatus {
+        fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            self.label().serialize(serializer)
+        }
+    }
+
+    impl<'de> Deserialize<'de> for ExecutionStatus {
+        fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            let label = String::deserialize(deserializer)?;
+            Ok(ExecutionStatus::from_label(&label).unwrap_or_default())
         }
     }
 }
@@ -438,6 +510,32 @@ mod tests {
 
     fn v(verdict: Verdict) -> (Verdict, ReasonCode) {
         (verdict, ReasonCode::None)
+    }
+
+    /// `label()` 与 `from_label()` 必须是一一对应的。
+    ///
+    /// 判定按 label 字符串走对外通道（`RunStatus`、rows.jsonl、报告 HTML），
+    /// 两个方向各写一份 `match` 就是又一处会悄悄漂的口径：加一个 verdict 只改
+    /// 了 `label()` 的话，读回来是 `None`，进度页上那个单元就凭空消失。
+    #[test]
+    fn every_verdict_label_round_trips() {
+        for verdict in [
+            Verdict::Pass,
+            Verdict::RateFail,
+            Verdict::Measured,
+            Verdict::NotEvaluated,
+            Verdict::SetupError,
+            Verdict::Skip,
+        ] {
+            assert_eq!(
+                Verdict::from_label(verdict.label()),
+                Some(verdict),
+                "{} 读不回来",
+                verdict.label()
+            );
+        }
+        assert_eq!(Verdict::from_label("PASSED"), None, "不认的串要返回 None");
+        assert_eq!(Verdict::from_label(""), None);
     }
 
     /// 结构断言：判定优先级只能有一处定义。

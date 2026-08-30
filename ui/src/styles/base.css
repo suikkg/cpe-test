@@ -1,0 +1,115 @@
+/* ── 外壳基础样式 ──────────────────────────────────────────────────────
+   只放跨组件的骨架与通用控件。组件自己的样式写在各自 SFC 的 <style scoped> 里。
+   约束沿用旧页：这台机器同时在灌包，任何持续动画/重绘都可能压到峰值速率，
+   所以除了一次开机淡入，界面零持续动画、零 backdrop-filter。
+   ──────────────────────────────────────────────────────────────────── */
+
+/* 应用外壳：左侧常驻导航 + 右侧单区域填满视口、内部滚动。
+   旧页是一条长滚动条 + .hidden 显隐，焦点和滚动位置反复出问题。 */
+.app {
+  display: grid;
+  grid-template-rows: auto 1fr;
+  grid-template-columns: minmax(0, 1fr);
+  height: 100vh;
+  width: min(100%, 1600px);
+  margin: 0 auto;
+  background: var(--surface);
+  border-inline: 1px solid var(--line);
+  overflow: hidden;
+}
+.app-body {
+  display: grid;
+  grid-template-columns: 200px minmax(0, 1fr);
+  min-height: 0;
+}
+@media (max-width: 860px) {
+  .app-body { grid-template-columns: minmax(0, 1fr); }
+}
+
+/* 主区域自己滚，外壳不滚 —— 这样切换区域不会丢掉别处的滚动位置。 */
+.app-main {
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  padding: 20px 24px 40px;
+}
+
+/* 通用控件 */
+button {
+  font: inherit;
+  color: var(--on-accent);
+  background: var(--accent);
+  border: 1px solid transparent;
+  border-radius: 5px;
+  padding: 7px 14px;
+  cursor: pointer;
+}
+button:hover:not(:disabled) { background: var(--accent-hover); }
+button:disabled { opacity: .5; cursor: not-allowed; }
+button.ghost {
+  color: var(--ink);
+  background: var(--panel-2);
+  border-color: var(--line);
+}
+button.ghost:hover:not(:disabled) { background: var(--head); }
+:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+
+.hint { color: var(--muted); font-size: 12.5px; }
+.mono { font-family: var(--fm); font-variant-numeric: tabular-nums; }
+
+.sr-only {
+  position: absolute; width: 1px; height: 1px;
+  padding: 0; margin: -1px; overflow: hidden;
+  clip-path: inset(50%); white-space: nowrap;
+}
+
+/* 数据屏：明暗主题下都不变，屏永远是屏。 */
+.screen {
+  position: relative;
+  background: var(--screen-bg);
+  color: var(--screen-ink);
+  border: 1px solid var(--bezel);
+  border-radius: 6px;
+  box-shadow: inset 0 0 0 1px var(--bezel-hi);
+  font: 12.5px/1.55 var(--fm);
+  padding: 26px 14px 12px;
+}
+.screen::before {
+  content: attr(data-label);
+  position: absolute; top: 7px; left: 12px;
+  font: 600 10px/1 var(--fm); letter-spacing: .2em;
+  color: var(--screen-dim);
+}
+
+/* ── 视图外壳 ───────────────────────────────────────────────────────── */
+.app-main { padding: 18px 24px 32px; overflow-y: auto; }
+.view { max-width: 1100px; }
+.view-head { margin: 0 0 18px; }
+.view-head h2 { margin: 0 0 4px; font-size: 18px; }
+.view-head p { margin: 0; font-size: 13px; }
+.view h3 { margin: 22px 0 8px; font-size: 14px; }
+.muted { color: var(--muted); }
+/* 数据屏：全站唯一「张扬」之处，其余一律克制。 */
+.screen {
+  position: relative;
+  padding: 18px 20px 16px;
+  border: 1px solid var(--bezel);
+  border-radius: 6px;
+  background: var(--screen-bg);
+  color: var(--screen-ink);
+  font: 13px/1.7 var(--fm);
+  box-shadow: inset 0 0 0 1px var(--bezel-hi);
+}
+.screen::before {
+  content: attr(data-label);
+  position: absolute;
+  top: -9px;
+  left: 14px;
+  padding: 0 6px;
+  background: var(--screen-bg);
+  color: var(--screen-dim);
+  font-size: 10.5px;
+  letter-spacing: 0.18em;
+}
+.screen .dim { color: var(--screen-dim); }
+.screen code { color: var(--signal); }

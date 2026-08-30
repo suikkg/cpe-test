@@ -17,8 +17,14 @@
 |---|---|
 | 单文件分发 | 控制台页面必须 `include_str!` 进二进制，不能有外部 JS/CSS/字体/图片 |
 | 运行期离线 | 报告必须自包含；页面不许连 CDN；CSP 里没有任何外部源 |
-| 主战场是 Windows | 任何改动都要过 `x86_64-pc-windows-msvc` 的 clippy 与测试 |
+| 主战场是 Windows | 任何改动都要过 `x86_64-pc-windows-msvc` 的 clippy 与测试；**内置预设按 Windows 调参** |
 | 跑测试时机器正在灌线速 | 界面**零持续动画**、零 `backdrop-filter`；轮询频率不许加码 |
+
+> **不要「修」内置预设里在 Linux/macOS 上报错的参数。** 例如基线 UDP 的 `-w 256m`
+> 在 Linux/macOS 上必然失败（`iperf3: error - socket buffer size not set correctly`，
+> 被 macOS `kern.ipc.maxsockbuf` 8 MiB / Linux `net.core.wmem_max` 4 MiB 夹住），
+> 而 Windows 不这么夹，所以这是**预期行为**。把它调小等于在没人注意的情况下
+> 削弱 Windows 上的基线。跨平台跑只用于开发自测，不是支持的使用场景。
 
 ---
 
@@ -36,7 +42,7 @@ cargo clippy --locked --all-targets --target x86_64-pc-windows-msvc -- -D warnin
 动了 `dist/` 下的配置或文档，再加一条（CI 会逐条目字节比对）：
 
 ```bash
-python3 dist/build_config_docs_bundle.py <版本号>   # 例：4.6.0
+python3 dist/build_config_docs_bundle.py <版本号>   # 例：6.0.0
 shasum -a 256 dist/cpe_test-v<版本号>-windows-config-docs.zip   # 必须等于同名 .sha256 里的值
 ```
 
@@ -81,20 +87,28 @@ shasum -a 256 dist/cpe_test-v<版本号>-windows-config-docs.zip   # 必须等�
 | 配置字段 / 默认值 | `config.rs` | `config.example.json`、`config.minimal.json`、`dist/configs/*.json`（4+1 份）、README、`使用说明.md`，以及钉住默认值的那几个测试 |
 | HTTP DTO / 端点 | `protocol.rs` 或 `agent/server.rs` | `http_client.rs`、`master/executor.rs`、agent 侧解析与错误包装测试 |
 | 任务数量 / 顺序 / ID / 端口 | `master/builder.rs` | executor 的 `sort_key` 构造、`report.rs` 的排序与组合计、**历史 RESUME 会不再命中** |
-| 报告列 / HTML | `report.rs` | `executor.rs` 里**全部** `Row` 构造点（漏一个就是空列） |
+| 报告列 / HTML | `report.rs` | 身份类字段走 `executor/row.rs` 的 `RowIdentity`/`base_row`（加字段会让 10 个构造点全部编译失败，这是有意的）；测量类字段仍要逐个构造点看 |
 
 补两条本仓库特有的：
 
 - **对外 JSON 字段即使当前没有本地消费者，也是兼容面。** 删名字/改名字要同步所有端点。
 - **`Leg.tag` 对单向单元是空串**（`dir_pairs()` 对 `ab`/`ba` 就给空，执行侧靠这个空串表示
   「单向」）。要展示方向请用 `Unit.direction`（只读展示字段），**不要去填 `Leg.tag`**。
+- **报告行不许再靠字符串推断结构。** 方向/协议/后端/两端在 `Row` 上都是类型化字段
+  （`RowDirection`/`RowProtocol`/`RowBackend`/`RowSide`）。`infer_direction_tag`、
+  `group_is_udp` 里那套「搜标题含不含 UDP」只作**历史数据兜底**，新代码一律读类型化
+  字段——HTML/Excel/API 三个出口同源，字符串推断复制三份就是三份各自会漂的 bug。
+- **界面溯源走 `TestSpec.origin`**，不再把七段 URL 编码塞进 `TestSpec.name`；
+  `name` 是纯展示名。旧导出的 config 由 `ui_source_from_test_name` 兜一版。
 
 ---
 
 ## 4. 前端构建链
 
 > 状态：`feat/webui-vue` 分支上正在把 `src/master/webui.html`（手写 3519 行）
-> 换成 Vue 3 + Vite 构建产物。方案见 `.ai/DESIGN-v5.0-webui.md`。
+> 换成 Vue 3 + Vite 构建产物。选型与分层见 `.ai/DESIGN-v5.0-webui.md` +
+> `.ai/PLAN-v5.0-frontend.md`，全系统的目标架构与分期见
+> `.ai/DESIGN-v6.0-architecture.md`（前端选型被它确认，进度/结果的消费方式被它修订）。
 > **在该分支合入 main 之前，本节描述的是目标形态；main 上仍是手写单文件。**
 
 ### 目标形态
@@ -102,12 +116,23 @@ shasum -a 256 dist/cpe_test-v<版本号>-windows-config-docs.zip   # 必须等�
 ```
 ui/                      # Vite 项目，只有开发期需要 Node
   src/**/*.vue|ts        # 手写源码 —— 审阅和测试都盯这里
+  src/domain/**          # 纯函数，Vitest 的主要目标（不许 import vue）
+  scripts/emit.mjs       # 产物闸门 + 写产物 + 溯源戳
+  scripts/lint-arch.mjs  # 分层规则与全局禁令的静态检查
   package-lock.json      # 锁死，CI 用 npm ci
-npm run build            # → 全内联的单个 HTML
+npm run build            # vue-tsc → lint-arch → vite build → emit
 src/master/webui.html    # 构建产物，**提交进仓库**
 ```
 
-三条规矩：
+改了前端要跑（在 `ui/` 下）：
+
+```bash
+npm ci && npm run test && npm run build && npm run verify
+```
+
+然后**把产物 `src/master/webui.html` 和源码一起提交**，再跑一遍 §1 的四件事。
+
+四条规矩：
 
 1. **`cargo build` 永远不跑 Node。** 产物是提交进仓库的，克隆下来就能编。
    贡献者不装 Node 也能改 Rust。
@@ -115,8 +140,36 @@ src/master/webui.html    # 构建产物，**提交进仓库**
    直接手改 `src/master/webui.html` 会在下次构建时被覆盖，且 CI 会因为
    产物与源码对不上而失败。
 3. **产物必须全内联。** 不是审美偏好，是 §2 铁律 3 的推论：任何
-   `<script src>` / `<link href>` 都会被鉴权挡成 401。CI 有一条测试直接
-   在产物里搜外部引用，搜到就红。
+   `<script src>` / `<link href>` 都会被鉴权挡成 401。
+4. **产物里带一枚源码树的溯源戳**（`<!-- cpe-ui-stamp: <md5> -->`）。
+   `emit.mjs` 写入，Rust 侧 `the_embedded_page_was_built_from_the_current_ui_sources`
+   按逐字相同的算法重算比对。改了算法要**两端一起改**（还有
+   `.ai/PLAN-v5.0-frontend.md` §6.3）。
+
+第 4 条防的是这个仓库最可能犯的日常错误：**改了 `ui/src` 忘了重新构建**。
+前三条对一份陈旧产物同样全绿——它一样没有外链、没有 eval、一样有挂载点，
+测试全过而用户拿到的是上个版本的界面。戳只比源码不比产物字节，所以不受
+esbuild 版本和构建机差异影响，也不要求 CI 装 Node，`cargo test` 本地就会红。
+
+守在 `cargo test` 里的四条产物不变量（都在 `src/master/webui/tests.rs`）：
+`the_embedded_page_has_no_external_subresources`（铁律 3 唯一的机器保证）、
+`the_embedded_page_never_evals`、`the_embedded_page_mounts_into_the_expected_root`、
+`the_embedded_page_was_built_from_the_current_ui_sources`。
+
+### 前端的分层与禁令
+
+`scripts/lint-arch.mjs` 是静态检查，`npm run build` 和 `npm run verify` 都会跑：
+
+- `domain/**` 不许 import `vue`/`state`/`api/client` —— 历史上出过的 UI bug
+  **全是纯逻辑 bug**，赶进一个没有响应式、没有 DOM、没有网络的目录才好测。
+- `components/**` 不许 import `state/**` 或 `api/client`（props in / emits out）。
+- 全局禁：`v-html`、`eval`/`new Function`/动态 `import()`、
+  `prompt`/`confirm`/`alert`、`setInterval`、`@keyframes`、`backdrop-filter`、
+  `@font-face` 与任何外部 URL。
+- 文件名必须全 ASCII（溯源戳要求两端排序一致）。
+
+轮询一律用「响应落地后再排下一次」的 `setTimeout` 链，不用 `setInterval`：
+机器一忙请求就会叠着发。这是重写要**修掉**的，不是要照搬的。
 
 ### CSP
 

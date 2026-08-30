@@ -11,6 +11,37 @@
 > 错误指引"比没有指引更危险：读者会直接跳到错误位置并据此判断。
 > 需要定位时请用 `grep -n "fn <符号名>" <文件>`。
 
+## 0.5 v6.0 的新模块与新不变量（本次架构变更索引）
+
+> 下面这些是 v6.0 引入的，改动它们之前先读 `.ai/DESIGN-v6.0-architecture.md`
+> 对应的 ADR，以及 `.ai/CHANGES-v6.0-verdict.md`（判定行为变更逐条说明）。
+
+| 新模块 | 干什么 | 为什么存在（ADR） |
+|---|---|---|
+| `master/run_status.rs` | `RunStatus` / `UnitStatus` / `RunObserver` | 进度从「日志文本」变成结构化数据。executor 依赖 trait 不依赖 webui；CLI 传 `None` 行为零变化（ADR-2） |
+| `master/executor/row.rs` | `RowIdentity` / `base_row` / `unit_row` | 报告行的**唯一**构造入口。加身份字段会让 10 个构造点全部编译失败——从「运行期空列」变成编译期错误（ADR-7） |
+| `master/builder/{identity,policy,diagnostics}.rs` | resume identity、速率目标/链路策略、诊断单元 | 从 4359 行的 `builder.rs` 里按**改动的理由**分出来。`identity` 那份是 RESUME 承重面，不许「顺手清理」（R4） |
+| `report/store.rs` | `rows.jsonl` + `meta.json` 读写 | 每单元增量落盘，报告可重放。崩溃损失从「整轮」变成「未完成的单元」（ADR-3） |
+| `report/xlsx.rs` | `summary.xlsx` 四张表 | 第二个结果出口。**只吃类型化字段**，不许解析展示串（有结构断言）（ADR-7） |
+| `master/webui/runs.rs` | `/api/runs` + 手写 store 模式 zip | 远程访问者取回报告的唯一通道；报告的相对路径子资源撞「鉴权先于路由」，不能当静态站点服务（ADR-15、§13.3） |
+| `ui/` | Vue 3 单文件产物 | 见 AGENTS.md §4 |
+
+**v6.0 新增的结构断言**（都在 CI 的 `cargo test` 里）：
+
+| 断言 | 守什么 |
+|---|---|
+| `every_production_row_is_built_through_the_shared_constructor` | 生产代码造 `Row` 只能走 `base_row`/`unit_row`，不许 `..Default::default()` |
+| `the_leg_assembly_contracts_have_exactly_one_definition_in_the_tree` | 腿级判定装配的四个契约只能定义在 `rate.rs` / `rate_window.rs`（ADR-12） |
+| `the_full_unit_expansion_is_byte_stable` | 稳定 ID / 端口顺序 / 单元展开的全量快照——**它红了先问「我是不是改了不该改的」** |
+| `the_embedded_page_was_built_from_the_current_ui_sources` | 溯源戳：产物是不是从当前 `ui/` 源码构建的 |
+| `every_verdict_label_round_trips` | `Verdict::label()` 与 `from_label()` 一一对应 |
+| `the_summary_grid_has_one_cell_for_every_verdict` | 报告概览的统计格覆盖全部六个 verdict |
+
+**判定层的三条新单源**（ADR-12，改之前读变更说明）：
+`rate::effective_rate_target`（Observe/Discover 不比目标）、
+`rate_window::offered_shortfall_explains_rx` + `offered_floor_mbps`（发送端没灌够的防误判）、
+`WINDOW_COMPLETE_TOLERANCE_MS`（有效窗口容差，三条链共用）。
+
 ## 0. AI 阅读规则
 
 1. 先从 `src/main.rs` 确认 CLI 模式，再沿调用链进入 `master/ui` 或 `agent/server`。
@@ -22,9 +53,9 @@
 
 ## 1. 项目定位与构建
 
-- 包名、版本、Rust edition 和描述在 `Cargo.toml:1-5`：crate `cpe_test`，版本 `3.0.0`，Rust 2021。
-- 通用依赖在 `Cargo.toml:7-18`：Serde/JSON、tiny_http、wait-timeout、regex、GBK 解码、Base64、chrono、Ctrl-C、MD5 和 PNG。
-- Windows API 依赖在 `Cargo.toml:20-28`：GetIfTable2、GDI 截图、控制台、DPI；release 的 LTO/strip 在 `Cargo.toml:30-32`。
+- 包名、版本、Rust edition 和描述在 `Cargo.toml`：crate `cpe_test`，Rust 2021。版本以 `Cargo.toml` 为准，不在本文重复。
+- 通用依赖在 `Cargo.toml`：Serde/JSON、tiny_http、wait-timeout、regex、GBK 解码、Base64、chrono、Ctrl-C、MD5、PNG，以及 v6.0 新增的 `rust_xlsxwriter`（Excel 出口）。
+- Windows API 依赖在 `Cargo.toml`：GetIfTable2、GDI 截图、控制台、DPI；release 开 LTO/strip。
 - 顶层模块声明在 `src/main.rs`：`agent`、`cancel`、`clock`、`cmd`、`config`、`http_client`、`master`、`nic`、`parser_properties`、`ping`、`protocol`、`rate`、`report`、`resource`、`screenshot`、`util`、`verdict`、`console`。
 - **`verdict` 是判定词汇表的唯一定义处**（v4.2.6 之后）：`Verdict`、`ExecutionStatus`、
   `HARD_SINGLE_UDP_FAILURE_CODES`、`aggregate_verdict`。`master::executor` 的
@@ -52,13 +83,23 @@ main
 ├── agent::server ── cmd::iperf / nic / ping / protocol / screenshot / util
 ├── master::ui ── config / http_client / nic / builder / executor / report / util
 │   ├── master::builder ── config / protocol / util
+│   │   └── builder::{identity, policy, diagnostics}
+│   ├── master::run_status ── verdict（RunObserver trait；webui 提供实现）
 │   └── master::executor ── builder / cmd::iperf / http_client / monitor / ping /
-│                           protocol / report / screenshot / util
+│                           protocol / report / report::store / run_status /
+│                           screenshot / util
 ├── nic ── classify / monitor / (scan_windows | scan_macos) / cmd parsers
 └── protocol（双机 JSON DTO 边界）
 ```
 
 `cmd` 只负责系统命令封装和文本解析；`util` 提供进程、编码、日志、时间、文件名、选择和网段工具；`report` 只消费 `Row`，不执行网络操作。
+
+**executor → run_status 是单向的**：executor 依赖 `RunObserver` 这个 trait，
+webui 提供实现。加这条边**没有**让 executor 依赖 webui——这是 ADR-2 特意保住的
+依赖方向。
+
+**`report::store` 的位置**：它和 `report::html`/`report::xlsx` 平级，都是
+`report::model` 的消费端。executor 只依赖 `model` + `store`。
 
 ## 2. CLI 与主流程
 
@@ -137,7 +178,25 @@ main
 - `load_config` `src/config.rs`：显式 `--config` > 当前目录 `config.json` > 可执行文件目录 `config.json` > 默认；只有找不到文件时读取兼容环境变量 `AUTOTEST_IPV4_PREFIXES`、`AUTOTEST_AGENT_HOST`。
 - 文件读取和 UTF-8 BOM 容忍：。
 - `#[serde(default)]` 允许缺省字段；没有 `deny_unknown_fields`，未知字段静默忽略。
-- 根目录 `config.example.json:1-51` 是当前有效配置示例。README/未跟踪 smoke 配置里的 `pairs`、`universal_params`、`agent_token`、`rate_check`、`ctstraffic`、`rate_mode` 等不在 `Config` 中，不能写成已实现功能。
+- 根目录 `config.example.json` 是当前有效配置示例。
+
+> **更正（v6.0 核查）**：上一版这里写着 `pairs`、`universal_params`、`agent_token`、
+> `rate_check`、`ctstraffic`、`rate_mode`「不在 `Config` 中，不能写成已实现功能」。
+> **这六个字段现在全都在 `Config` 里**（`grep -n "pub pairs" src/config.rs` 即可核实），
+> 而且 `pairs` 是**全部 6 份出厂配置的主通路**。按旧描述去判断会得出完全相反的结论。
+
+### 3.1.1 测试来源有三种，各服务一类用户
+
+`Config.tests[]` 不是唯一入口。三条来源并存是**有意的**，不是历史包袱：
+
+| 来源 | 长什么样 | 谁在用 | v6.0 的处置 |
+|---|---|---|---|
+| `tests[]` 显式列举 | 每条测试一个 `TestSpec` | 界面导出的 config、手写精调 | 不动 |
+| `pairs` + `universal_params` 自动配对 | 给一批网口 + 一组通用参数，由 `generate_specs_from_pairs` 展开 | **全部 6 份出厂预设**（`config.example.json` + `dist/configs/*.json`）；无人值守/批量回归的主通路 | **零改动**（ADR-13 明确保护） |
+| 交互式构建 | `master/ui.rs` 的菜单现场问出来 | 命令行手动跑一次 | 不动 |
+
+界面（快速工作台 + 项目文件）产出的是第一种。**改配置解析时三条路都要过一遍**——
+它们共用 `spec_from_config` 之后的全部管线，但入口的默认值填充各不相同。
 
 ## 4. HTTP 协议
 

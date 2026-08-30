@@ -585,6 +585,58 @@ pub struct TestSpec {
     /// 老配置行为不变。
     #[serde(default)]
     pub rate_targets_bidir_mbps: Option<RateTargets>,
+
+    /// 报表分组键：这条测试属于哪一组链路。
+    ///
+    /// 取值优先级（界面填的那一份）：链路集合名 → 物理网口对 → `role_a ↔ role_b`。
+    /// **永不用主机名**——Arch 机自报 `UNKNOWN-PC`，拿它当分组键会把一整批链路
+    /// 并成一组。空表示没有分组信息，报表回落到按端点显示。
+    #[serde(default)]
+    pub link_group: Option<String>,
+
+    /// 界面计划的溯源标注。
+    ///
+    /// 只进 trace 与报表分组，**不进 resume identity、不进判定**。
+    /// 在此之前这些信息是 URL 编码进 `name` 的（`ui-plan/set/binding/...` 七段），
+    /// 那是整条计划链路上唯一的 stringly 侧信道，靠约定不靠类型。
+    #[serde(default)]
+    pub origin: Option<UiOrigin>,
+}
+
+/// 界面计划的溯源标注。见 `TestSpec::origin`。
+///
+/// 字段全部是稳定 id：界面重排卡片、改名字都不影响它们，所以拿它做 trace
+/// 重建和报表分组都不会在用户改个名字之后错位。`link_set_name` 是例外——
+/// 它是给人看的（也是 `link_group` 的来源），会跟着用户改名走。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UiOrigin {
+    #[serde(default)]
+    pub pair_id: String,
+    #[serde(default)]
+    pub link_set_id: String,
+    #[serde(default)]
+    pub link_set_name: String,
+    #[serde(default)]
+    pub binding_id: String,
+    #[serde(default)]
+    pub suite_id: String,
+    #[serde(default)]
+    pub task_id: String,
+    #[serde(default)]
+    pub recipe_id: String,
+}
+
+impl UiOrigin {
+    /// 七个字段全空 = 这条 spec 不是从界面来的（命令行 / pairs 预设）。
+    pub fn is_empty(&self) -> bool {
+        self.pair_id.is_empty()
+            && self.link_set_id.is_empty()
+            && self.link_set_name.is_empty()
+            && self.binding_id.is_empty()
+            && self.suite_id.is_empty()
+            && self.task_id.is_empty()
+            && self.recipe_id.is_empty()
+    }
 }
 
 fn default_direction() -> OneOrMany {

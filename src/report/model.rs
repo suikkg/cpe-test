@@ -5,15 +5,16 @@
 //! 它不产出任何 HTML——渲染在 `html` 里，判定在 [`crate::verdict`] 里。
 
 use super::*;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct StreamCounts {
     pub requested: usize,
     pub active: usize,
     pub required: usize,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DirectionSummary {
     pub tag: String,
     pub src: String,
@@ -38,7 +39,134 @@ pub struct DirectionSummary {
     pub screenshot_agent: String,
 }
 
-#[derive(Debug, Clone, Default)]
+/// 这一行测的是**哪个方向**。
+///
+/// 报告过去是从 `kind_label` 里搜 `-ab`/`-ba` 反推的（`infer_direction_tag`）。
+/// 那个 label 是给人看的展示串，一旦改文案（比如把「灌包-ab」换成「灌包 A→B」）
+/// 方向就会集体退化成「单向」，而没有任何测试会红。Excel 出口一旦上线，
+/// 同一份脆弱推断就要被复制第二遍——所以在那之前先把它变成类型。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RowDirection {
+    /// 单向单元。执行侧的 `Leg.tag` 对它是**空串**（见 `builder::dir_pairs`），
+    /// 那个空串在执行侧有语义，不能为了显示去动它。
+    #[default]
+    Single,
+    Ab,
+    Ba,
+}
+
+impl RowDirection {
+    pub fn from_leg_tag(tag: &str) -> Self {
+        if tag.eq_ignore_ascii_case("ab") {
+            RowDirection::Ab
+        } else if tag.eq_ignore_ascii_case("ba") {
+            RowDirection::Ba
+        } else {
+            RowDirection::Single
+        }
+    }
+
+    /// 报告里显示的方向标签。与 `normalized_direction_tag` 的取值一致。
+    pub fn label(self) -> &'static str {
+        match self {
+            RowDirection::Single => "单向",
+            RowDirection::Ab => "AB",
+            RowDirection::Ba => "BA",
+        }
+    }
+}
+
+/// 这一行跑的是哪种传输协议。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RowProtocol {
+    /// 诊断行、单元汇总行这类不绑定协议的行。
+    #[default]
+    None,
+    Tcp,
+    Udp,
+    Icmp,
+}
+
+impl RowProtocol {
+    pub fn label(self) -> &'static str {
+        match self {
+            RowProtocol::None => "",
+            RowProtocol::Tcp => "TCP",
+            RowProtocol::Udp => "UDP",
+            RowProtocol::Icmp => "ICMP",
+        }
+    }
+}
+
+/// 这一行是哪个工具跑出来的。
+///
+/// 报告过去靠标题里含不含 "PING"/"UDP" 猜（`group_is_ping`/`group_is_udp`）——
+/// 一条名字里带 "UDP" 的 TCP 测试就能把整组带偏。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RowBackend {
+    #[default]
+    None,
+    Iperf3,
+    CtsTraffic,
+    Ping,
+}
+
+impl RowBackend {
+    /// 目前没有本地消费者：HTML 把后端信息混在 `transport` 列里（`CTS/TCP`）。
+    /// Excel 出口（R3）会用它——那正是 ADR-7 要求「赶在第二个消费者之前类型化」
+    /// 的原因，所以这里先把口径定下来。
+    #[allow(dead_code)]
+    pub fn label(self) -> &'static str {
+        match self {
+            RowBackend::None => "",
+            RowBackend::Iperf3 => "iperf3",
+            RowBackend::CtsTraffic => "ctsTraffic",
+            RowBackend::Ping => "ping",
+        }
+    }
+}
+
+/// 端点在哪一台机器上。
+///
+/// 与 `builder::Side` 同构，但**不复用它**：`report` 是纯消费端，让它反过来依赖
+/// `master::builder` 会把「报告只读结果」这条边弄脏。转换发生在 executor 侧
+/// （那里两个类型都在手边）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RowSide {
+    #[default]
+    Unknown,
+    Master,
+    Agent,
+}
+
+impl RowSide {
+    /// 同 [`RowBackend::label`]：留给 Excel 出口（R3）的「端」列。
+    #[allow(dead_code)]
+    pub fn label(self) -> &'static str {
+        match self {
+            RowSide::Unknown => "",
+            RowSide::Master => "主控",
+            RowSide::Agent => "辅测",
+        }
+    }
+}
+
+/// 一行结果。**这是全仓唯一的结果模型**（ADR-7）。
+///
+/// serde 派生是给 `runs/<run>/rows.jsonl` 用的（ADR-3）：每个单元跑完就把该
+/// 单元新增的行追加落盘，报告因此可以从落盘数据**重放**出来。在此之前结果一直
+/// 活在 `Ctx.rows` 这个内存 `Vec` 里、直到整轮结束才写报告——主控在第 10 小时
+/// 崩溃/断电/被 kill，十小时的测量数据、原因码、方向明细全部蒸发，只剩
+/// `task_results.json` 里的单元级 PASS 布尔。
+///
+/// **落盘形状因此成为兼容面**：字段名进了文件，改名字等于让旧 run 目录读不回来。
+/// 版本号写在 `meta.json` 里，重放器容忍未知字段（`#[serde(default)]` 靠 Default）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Row {
     /// (unit序, leg序, 流序, 组合计标记) 用于稳定排序
     pub sort_key: (usize, usize, usize, u8),
@@ -76,8 +204,18 @@ pub struct Row {
     pub command: String,
     /// 独立落盘的 iperf client/server/事件原始记录。
     pub raw_log: String,
-    /// 独立落盘的 OS 网卡累计计数器逐样本 CSV。
-    pub nic_samples: String,
+    /// 接收端网卡累计计数器的逐样本 CSV（独立落盘）。
+    pub nic_samples_rx: String,
+    /// **发送端**网卡的逐样本 CSV。
+    ///
+    /// TX 采样是否决性门槛：`rate_window_coverage_sufficient` 要求 TX 滚动覆盖率
+    /// ≥0.95 且 `tx.p10` 在，否则整行判 NOT_EVALUATED；`tx_sufficient` 还决定
+    /// 会不会报 `OFFERED_LOAD_LOW`。可是在此之前 iperf/CTS 两条路径**从不落盘
+    /// TX 逐样本**——`save_monitor_samples` 只传 dst/RX。于是
+    /// 「报告里的每个结论都要能回到某一行样本」（`artifact.rs` 模块头自己的话）
+    /// 对 TX 不成立：判 NOT_EVALUATED 的理由是 TX 覆盖率不够，而那份 TX 样本
+    /// 谁也拿不到。
+    pub nic_samples_tx: String,
     /// (标题, 原始输出)
     pub raws: Vec<(String, String)>,
     pub is_grouptotal: bool,
@@ -110,6 +248,30 @@ pub struct Row {
     pub rolling_coverage: Option<f64>,
     /// 每个测试方向的判定指标；报告概览优先使用该字段。
     pub direction_summaries: Vec<DirectionSummary>,
+
+    // ---- 类型化的结构字段（ADR-7）----
+    //
+    // 下面这些以前全靠从展示串里推断：方向搜 `kind_label` 里的 `-ab`/`-ba`、
+    // ping 看标题含不含 "PING"、UDP 看标题含不含 "UDP"。HTML、Excel、API 三个
+    // 出口即将并存，字符串推断会被复制三份，所以在第二个消费者落地之前先类型化。
+    // 推断函数降级为**兜底**：只有历史数据（没有这些字段的 rows.jsonl）才走它们。
+    /// 单元序号，与日志里的 `[i/total]` 和报告里的 `#N` 同源。
+    pub unit_seq: usize,
+    // 下面三个字段目前只被**写入**：它们是给 rows.jsonl 落盘、Excel 出口和
+    // `/api` 的运行状态用的（R3）。ADR-7 要求赶在第二个消费者落地**之前**
+    // 把它们类型化，否则 `group_is_udp` 那类字符串推断会被复制第二遍——
+    // 所以先有字段、后有消费者是这里刻意的顺序，不是遗留。
+    pub direction: RowDirection,
+    pub protocol: RowProtocol,
+    pub backend: RowBackend,
+    /// 报表分组键。来源优先级：链路集合名 → 物理网口对 → `role_a ↔ role_b`。
+    /// **永不用主机名**（Arch 机自报 `UNKNOWN-PC`）。
+    #[allow(dead_code)]
+    pub link_group: String,
+    #[allow(dead_code)]
+    pub src_side: RowSide,
+    #[allow(dead_code)]
+    pub dst_side: RowSide,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -143,7 +305,8 @@ pub(super) fn row_unit_key(row: &Row) -> String {
     } else if row.is_unit_summary && !row.task_id.is_empty() {
         row.task_id.clone()
     } else {
-        format!("unit-{}", row.sort_key.0)
+        // 单元序号有 `sort_key.0` 和 `unit_seq` 两处表示，取类型化的那个。
+        format!("unit-{}", row.unit_seq)
     }
 }
 
@@ -221,6 +384,22 @@ pub(super) fn group_title<'a>(group: &'a UnitGroup<'_>) -> &'a str {
         .unwrap_or("未命名测试单元")
 }
 
+/// 这一行的方向标签。**先看类型化字段，推断只是兜底。**
+///
+/// `RowDirection::Single` 既是「真的单向」，也是历史数据（rows.jsonl 里没有
+/// 类型化字段的老行）反序列化出来的默认值。这两种情况可以共用兜底而不冲突：
+/// 真单向的 `kind_label` 里本来就没有 `-ab`/`-ba`，推断出来还是「单向」。
+pub(super) fn direction_tag(row: &Row) -> String {
+    match row.direction {
+        RowDirection::Ab | RowDirection::Ba => row.direction.label().to_string(),
+        RowDirection::Single => infer_direction_tag(row),
+    }
+}
+
+/// 从展示串里猜方向。**只作兜底**，见 [`direction_tag`]。
+///
+/// 它读的是 `kind_label`——一个给人看的字符串。把「灌包-ab」改成「灌包 A→B」
+/// 之类的文案调整，会让这里集体退化成「单向」，而没有任何测试会红。
 pub(super) fn infer_direction_tag(row: &Row) -> String {
     let label = row.kind_label.to_ascii_lowercase();
     if label.contains("-ab") {
@@ -245,7 +424,10 @@ pub(super) fn normalized_direction_tag(tag: &str) -> String {
 }
 
 pub(super) fn row_is_ping(row: &Row) -> bool {
-    row.ping_loss.is_some()
+    // 类型化字段优先；下面那串是历史数据的兜底（标题里含 "PING" 的 TCP 测试
+    // 会被它误判，这正是 ADR-7 要把它降级的原因）。
+    row.backend == RowBackend::Ping
+        || row.ping_loss.is_some()
         || row.ping_min.is_some()
         || row.ping_avg.is_some()
         || row.ping_max.is_some()
@@ -267,32 +449,48 @@ pub(super) fn stream_counts(row: &Row) -> Option<StreamCounts> {
     )
 }
 
-pub(super) fn direction_from_row(row: &Row) -> DirectionSummary {
-    DirectionSummary {
-        tag: infer_direction_tag(row),
-        src: report_endpoint(&row.src_pc, &row.src_iface, &row.src_ip),
-        dst: report_endpoint(&row.dst_pc, &row.dst_iface, &row.dst_ip),
-        verdict: row.verdict,
-        reason_code: row.reason_code,
-        reason_detail: row.reason_detail.clone(),
-        reason: if row.reason_code.is_empty() && row.reason_detail.is_empty() {
-            String::new()
-        } else {
-            report_reason(row.reason_code, &row.reason_detail)
-        },
-        streams: stream_counts(row),
-        rx_avg: row.rx_avg,
-        rx_p10: row.rx_p10,
-        target_mbps: row.target_mbps,
-        sample_coverage: row.sample_coverage,
-        udp_loss: row.udp_loss,
-        ping_loss: row.ping_loss,
-        ping_min: row.ping_min,
-        ping_avg: row.ping_avg,
-        ping_max: row.ping_max,
-        screenshot_master: row.screenshot_master.clone(),
-        screenshot_agent: row.screenshot_agent.clone(),
+impl Row {
+    /// 把这一行折成一个方向摘要。
+    ///
+    /// **这是 `Row` → `DirectionSummary` 的唯一映射。** 在此之前它有两份逐字段
+    /// 手抄的实现（`report::model::direction_from_row` 与
+    /// `executor::direction_summaries`），互相之间没有任何同步机制——两边各搬了
+    /// 14 个字段，谁也不保证搬的是同一批。合并之后，概览想多显示一个指标就是
+    /// 「`DirectionSummary` 加一个字段、这里填一次」，而不是「记得两处都改」。
+    ///
+    /// 执行侧的调用点在此基础上覆盖 `tag`/`verdict`/`reason_*` 四项：那四项它有
+    /// 更权威的来源（腿的判定结果），其余指标一律共用这里这一份。
+    pub fn direction_summary(&self) -> DirectionSummary {
+        DirectionSummary {
+            tag: direction_tag(self),
+            src: report_endpoint(&self.src_pc, &self.src_iface, &self.src_ip),
+            dst: report_endpoint(&self.dst_pc, &self.dst_iface, &self.dst_ip),
+            verdict: self.verdict,
+            reason_code: self.reason_code,
+            reason_detail: self.reason_detail.clone(),
+            reason: if self.reason_code.is_empty() && self.reason_detail.is_empty() {
+                String::new()
+            } else {
+                report_reason(self.reason_code, &self.reason_detail)
+            },
+            streams: stream_counts(self),
+            rx_avg: self.rx_avg,
+            rx_p10: self.rx_p10,
+            target_mbps: self.target_mbps,
+            sample_coverage: self.sample_coverage,
+            udp_loss: self.udp_loss,
+            ping_loss: self.ping_loss,
+            ping_min: self.ping_min,
+            ping_avg: self.ping_avg,
+            ping_max: self.ping_max,
+            screenshot_master: self.screenshot_master.clone(),
+            screenshot_agent: self.screenshot_agent.clone(),
+        }
     }
+}
+
+pub(super) fn direction_from_row(row: &Row) -> DirectionSummary {
+    row.direction_summary()
 }
 
 pub(super) fn direction_row_score(row: &Row) -> u8 {
@@ -410,7 +608,16 @@ pub(super) fn group_direction_summaries(group: &UnitGroup<'_>) -> Vec<DirectionS
 }
 
 pub(super) fn group_is_udp(group: &UnitGroup<'_>) -> bool {
-    group_title(group).to_ascii_uppercase().contains("UDP")
+    // 类型化字段优先。标题匹配是历史数据的兜底：一条名字里带 "UDP" 的 TCP
+    // 测试就能把整组带偏，而报表上看不出来是带偏了。
+    group
+        .summary
+        .is_some_and(|row| row.protocol == RowProtocol::Udp)
+        || group
+            .details
+            .iter()
+            .any(|row| row.protocol == RowProtocol::Udp)
+        || group_title(group).to_ascii_uppercase().contains("UDP")
         || group.summary.is_some_and(|row| {
             row.transport.eq_ignore_ascii_case("UDP")
                 || row.task.to_ascii_uppercase().contains("UDP")

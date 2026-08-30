@@ -26,6 +26,12 @@ pub(super) struct Console {
     /// 速率监控会话。**不受 `running` 约束**：监控和一轮测试是正交的两件事，
     /// 边跑边看正是它最有用的场景。
     pub(super) monitors: Mutex<HashMap<String, MonitorSession>>,
+    /// 结构化运行状态（ADR-2）。
+    ///
+    /// 与 `report` 那个字段的关系：报告路径现在由 executor 的回调直接写进这里，
+    /// `report` 保留是为了兼容——`/api/open-report` 和旧前端都还在读它，
+    /// 两边由 `api_progress` 保持同步。
+    pub(super) run_status: Arc<RunStatusRecorder>,
 }
 
 /// 环形缓冲上限：1 秒一个点约等于 2 小时。再长就该用 `cpe_test monitor --csv`，

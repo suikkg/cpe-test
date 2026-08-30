@@ -270,6 +270,7 @@ impl Ctx {
             result
         });
         let rx_origin_offset_ms = mon_id.as_ref().map(|(_, offset)| *offset).unwrap_or(0);
+        let tx_origin_offset_ms = tx_mon_id.as_ref().map(|(_, offset)| *offset).unwrap_or(0);
         let mon_out =
             mon_id.and_then(
                 |(id, start_offset_ms)| match self.mon_stop(t.dst.side, &id) {
@@ -314,7 +315,7 @@ impl Ctx {
             .map(|output| monitor_rate_stats(output, &effective_window, false, baseline_cutoff_ms))
             .unwrap_or_default();
         let rx_avg = rx_stats.avg_mbps;
-        let nic_samples = mon_out
+        let nic_samples_rx = mon_out
             .as_ref()
             .map(|out| {
                 self.save_monitor_samples(
@@ -323,6 +324,22 @@ impl Ctx {
                     &t.dst.nic.name,
                     &t.dst.key(),
                     rx_origin_offset_ms,
+                    out,
+                )
+            })
+            .unwrap_or_default();
+        // TX 逐样本也必须落盘：它是否决性门槛（覆盖率不够整行判 NOT_EVALUATED），
+        // 而在此之前没有任何人能拿到那份样本去核对。同网卡的情况不重复落盘——
+        // 那时 TX/RX 本来就是同一份样本，只是读另一个计数器方向。
+        let nic_samples_tx = tx_mon_out
+            .as_ref()
+            .map(|out| {
+                self.save_monitor_samples(
+                    lifecycle.owner_id,
+                    t.src.side,
+                    &t.src.nic.name,
+                    &t.src.key(),
+                    tx_origin_offset_ms,
                     out,
                 )
             })
@@ -338,6 +355,10 @@ impl Ctx {
             rx_target_mbps: t.rx_target_mbps,
             rx_stats: &rx_stats,
             tx_stats: &tx_stats,
+            offered_floor: crate::master::rate_window::offered_floor_mbps(
+                t.rx_target_mbps,
+                self.cfg.iperf.rate_check.offered_headroom_pct,
+            ),
             client_tail: client.output.lines().last().unwrap_or_default(),
             rx_monitor: mon_out.as_ref(),
         });
@@ -381,20 +402,7 @@ impl Ctx {
             "灌包".into()
         };
         let idx = self.push_row(Row {
-            sort_key: (useq, lidx, 0, 0),
             time,
-            task_id: md5_hex(&format!("{}|{}|{}", unit.id, tag, t.stream_idx)),
-            parent_id: unit.id.clone(),
-            task: unit.title.clone(),
-            ip: if t.v6 { "V6".into() } else { "V4".into() },
-            transport: if t.udp { "UDP".into() } else { "TCP".into() },
-            param: t.profile_label.clone(),
-            src_pc: t.src.pc.clone(),
-            src_iface: t.src.nic.name.clone(),
-            src_ip: t.src.nic.ipv4.clone(),
-            dst_pc: t.dst.pc.clone(),
-            dst_iface: t.dst.nic.name.clone(),
-            dst_ip: t.dst.nic.ipv4.clone(),
             verdict,
             execution_status: if client.timed_out {
                 ExecutionStatus::TimedOut
@@ -409,7 +417,6 @@ impl Ctx {
             },
             reason_code,
             reason_detail: reason_detail.clone(),
-            kind_label,
             rx_avg,
             tx_mbps: parsed.best_sender(),
             rx_mbps: parsed.best_receiver(),
@@ -418,7 +425,8 @@ impl Ctx {
             screenshot_agent,
             command: client.cmd.clone(),
             raw_log,
-            nic_samples,
+            nic_samples_rx,
+            nic_samples_tx,
             requested_streams: parallel_streams,
             active_streams: if parsed.has_measurement() {
                 parallel_streams
@@ -452,7 +460,26 @@ impl Ctx {
                     format_flow_events(&events, &raw_error),
                 ),
             ],
-            ..Default::default()
+            ..base_row(RowIdentity {
+                unit_seq: useq,
+                leg_index: lidx,
+                stream_index: t.stream_idx,
+                group_flag: 0,
+                unit,
+                leg_tag: tag,
+                src: &t.src,
+                dst: &t.dst,
+                ip: if t.v6 { "V6".into() } else { "V4".into() },
+                protocol: if t.udp {
+                    RowProtocol::Udp
+                } else {
+                    RowProtocol::Tcp
+                },
+                backend: RowBackend::Iperf3,
+                param: t.profile_label.clone(),
+                kind_label,
+                task_id: md5_hex(&format!("{}|{}|{}", unit.id, tag, t.stream_idx)),
+            })
         });
         LegOutcome {
             judgement: VerdictResult::new(verdict, reason_code, reason_detail),

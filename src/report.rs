@@ -493,6 +493,11 @@ pub fn write_report(path: &Path, rows: &mut [Row], meta: &ReportMeta) -> std::io
     // UNSTABLE 已经不再产出（掉速统一归 RATE_FAIL，靠原因码区分严重程度），
     // 概览里那格恒为 0 的统计块跟着一起删了——一格永远是 0 的指标会被读成
     // 「这轮没有不稳定的」，而实际上是「这个分类已经不存在了」。
+    //
+    // 反过来，NOT_EVALUATED 与 SKIP 是**真的会有值**的分类，过去只出现在脚注的
+    // 一行小字里、没有统计格。整轮 NOT_EVALUATED 的报告因此顶部五格全是 0，
+    // 看上去像「什么都没跑」，而实际上是「跑了但采样不可信、一条都不能下结论」。
+    // 这两格补上之后，八格加起来正好覆盖 Verdict 的全部六个取值。
     let judged = pass + rate_fail;
     let rate = if judged > 0 {
         pass as f64 * 100.0 / judged as f64
@@ -519,7 +524,7 @@ h2 { margin: 28px 0 10px; font-size: 17px; line-height: 1.3; }
 .meta-item { min-width: 0; padding: 9px 12px; background: var(--surface); }
 .meta-label { display: block; color: var(--muted); font-size: 11px; }
 .meta-value { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
-.summary-grid { display: grid; grid-template-columns: repeat(7, minmax(100px, 1fr)); gap: 8px; margin: 0 0 8px; }
+.summary-grid { display: grid; grid-template-columns: repeat(8, minmax(96px, 1fr)); gap: 8px; margin: 0 0 8px; }
 .stat { min-height: 70px; padding: 9px 11px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); }
 .stat-label { display: block; color: var(--muted); font-size: 11px; }
 .stat-value { display: block; margin-top: 3px; font-size: 20px; font-weight: 700; line-height: 1.1; }
@@ -530,7 +535,6 @@ h2 { margin: 28px 0 10px; font-size: 17px; line-height: 1.3; }
 .summary-note { margin: 8px 0 0; color: var(--muted); }
 .summary-note strong { color: var(--ink); }
 .status { font-weight: 700; white-space: nowrap; }
-.status.warn { color: #8a5200; }
 .status.not-evaluated { color: #7542a8; }
 .status.error { color: #a42121; }
 .status.skip { color: #59636c; }
@@ -587,7 +591,6 @@ h2 { margin: 28px 0 10px; font-size: 17px; line-height: 1.3; }
 .overview-table th:nth-child(4), .overview-table tr:not(.reason-row) > td:nth-child(4) { left: 414px; box-shadow: 2px 0 0 rgba(23, 32, 42, .08); }
 .overview-table td.num, .results-table td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .overview-table tr:last-child td, .results-table tr:last-child td { border-bottom: 0; }
-.reason-cell { color: var(--muted); overflow-wrap: anywhere; }
 .unit-list { display: grid; gap: 8px; }
 /* 分节标题：比 h2 轻，但要能一眼把 Ping / UDP / TCP 三块切开。 */
 .section-heading { margin: 18px 0 8px; padding-left: 9px; border-left: 3px solid #1769aa; font-size: 15px; line-height: 1.3; }
@@ -656,7 +659,7 @@ details.top-section > summary.top-toggle::marker { color: #1769aa; }
 .tools-hint { color: var(--muted); font-size: 12px; }
 .raw-seq { color: var(--muted); font-variant-numeric: tabular-nums; margin-right: 8px; }
 .raw-dir { display: inline-block; margin-right: 8px; padding: 0 6px; border-radius: 3px;
-    background: var(--panel-2); color: var(--muted); font-size: 11px; font-weight: 400; white-space: nowrap; }
+    background: var(--head); color: var(--muted); font-size: 11px; font-weight: 400; white-space: nowrap; }
 details.raw-section { margin: 8px 0; }
 details.raw-section > summary { cursor: pointer; font-weight: 700; overflow-wrap: anywhere; }
 .sampling-caveat { margin: 8px 0 0; padding: 8px 10px; border-left: 3px solid #8a5200; background: #fff8e6; color: #5e430b; }
@@ -736,17 +739,15 @@ summary:focus-visible, a:focus-visible, .table-scroll:focus-visible, .overview-s
         esc(&meta.finished)
     ));
     h.push_str(&format!(
-        "<div class=\"summary-grid\"><div class=\"stat neutral\"><span class=\"stat-label\">测试单元</span><strong class=\"stat-value\">{total}</strong></div><div class=\"stat pass\"><span class=\"stat-label\">PASS</span><strong class=\"stat-value\">{pass}</strong></div><div class=\"stat fail\"><span class=\"stat-label\">RATE_FAIL</span><strong class=\"stat-value\">{rate_fail}</strong></div><div class=\"stat measured\"><span class=\"stat-label\">MEASURED</span><strong class=\"stat-value\">{measured}</strong></div><div class=\"stat neutral\"><span class=\"stat-label\">SETUP_ERROR</span><strong class=\"stat-value\">{setup_error}</strong></div><div class=\"stat neutral\"><span class=\"stat-label\">耗时</span><strong class=\"stat-value\">{}</strong></div></div>\n",
+        "<div class=\"summary-grid\"><div class=\"stat neutral\"><span class=\"stat-label\">测试单元</span><strong class=\"stat-value\">{total}</strong></div><div class=\"stat pass\"><span class=\"stat-label\">PASS</span><strong class=\"stat-value\">{pass}</strong></div><div class=\"stat fail\"><span class=\"stat-label\">RATE_FAIL</span><strong class=\"stat-value\">{rate_fail}</strong></div><div class=\"stat measured\"><span class=\"stat-label\">MEASURED</span><strong class=\"stat-value\">{measured}</strong></div><div class=\"stat neutral\"><span class=\"stat-label\">NOT_EVALUATED</span><strong class=\"stat-value\">{not_evaluated}</strong></div><div class=\"stat neutral\"><span class=\"stat-label\">SETUP_ERROR</span><strong class=\"stat-value\">{setup_error}</strong></div><div class=\"stat neutral\"><span class=\"stat-label\">SKIP</span><strong class=\"stat-value\">{skipped}</strong></div><div class=\"stat neutral\"><span class=\"stat-label\">耗时</span><strong class=\"stat-value\">{}</strong></div></div>\n",
         esc(&meta.elapsed)
     ));
     h.push_str(&format!(
-        "<p class=\"summary-note\">测试单元: {total}（不含 SKIP） · 判定通过率: <strong>{pass}/{judged} = {rate:.1}%</strong>（仅统计 PASS、RATE_FAIL、UNSTABLE）；NOT_EVALUATED: {not_evaluated}，SKIP: {skipped}</p>\n",
+        "<p class=\"summary-note\">测试单元: {total}（不含 SKIP） · 判定通过率: <strong>{pass}/{judged} = {rate:.1}%</strong>。分母只算 PASS 与 RATE_FAIL——MEASURED 没有验收目标可比，NOT_EVALUATED 是采样不可信不能下结论，SETUP_ERROR 没跑成，SKIP 是上一轮已经过了。</p>\n",
         total = total,
         pass = pass,
         judged = judged,
         rate = rate,
-        not_evaluated = not_evaluated,
-        skipped = skipped,
     ));
 
     if !meta.run_health.is_empty() {
@@ -775,7 +776,10 @@ summary:focus-visible, a:focus-visible, .table-scroll:focus-visible, .overview-s
         .iter()
         .filter(|row| {
             !row.is_unit_summary
-                && (!row.raws.is_empty() || !row.raw_log.is_empty() || !row.nic_samples.is_empty())
+                && (!row.raws.is_empty()
+                    || !row.raw_log.is_empty()
+                    || !row.nic_samples_rx.is_empty()
+                    || !row.nic_samples_tx.is_empty())
         })
         .collect::<Vec<_>>();
     let raw_item_count: usize = raw_rows
@@ -783,7 +787,8 @@ summary:focus-visible, a:focus-visible, .table-scroll:focus-visible, .overview-s
         .map(|row| {
             row.raws.len()
                 + usize::from(!row.raw_log.is_empty())
-                + usize::from(!row.nic_samples.is_empty())
+                + usize::from(!row.nic_samples_rx.is_empty())
+                + usize::from(!row.nic_samples_tx.is_empty())
         })
         .sum();
     let raw_nonempty_count: usize = raw_rows.iter().map(|row| nonempty_raw_count(row)).sum();
@@ -800,8 +805,9 @@ summary:focus-visible, a:focus-visible, .table-scroll:focus-visible, .overview-s
         );
     }
     for r in &raw_rows {
-        let file_count =
-            usize::from(!r.raw_log.is_empty()) + usize::from(!r.nic_samples.is_empty());
+        let file_count = usize::from(!r.raw_log.is_empty())
+            + usize::from(!r.nic_samples_rx.is_empty())
+            + usize::from(!r.nic_samples_tx.is_empty());
         // 序号必须是**单元执行序号**，和「测试概览」「逐行明细」的 `#N` 以及
         // 控制台的 `[N/总数]` 是同一个数（都来自 `sort_key.0 + 1`）。
         //
@@ -830,10 +836,13 @@ summary:focus-visible, a:focus-visible, .table-scroll:focus-visible, .overview-s
             r.raws.len(),
             nonempty_raw_count(r),
         ));
-        if !r.raw_log.is_empty() || !r.nic_samples.is_empty() {
+        if !r.raw_log.is_empty() || !r.nic_samples_rx.is_empty() || !r.nic_samples_tx.is_empty() {
+            // RX 与 TX 分开给：TX 覆盖率是否决性门槛（不够就整行 NOT_EVALUATED），
+            // 判定的理由必须能回到具体某一行样本。
             let links = [
                 artifact_link(&r.raw_log, "独立原始记录"),
-                artifact_link(&r.nic_samples, "网卡逐样本 CSV"),
+                artifact_link(&r.nic_samples_rx, "接收端逐样本 CSV"),
+                artifact_link(&r.nic_samples_tx, "发送端逐样本 CSV"),
             ]
             .into_iter()
             .filter(|link| !link.is_empty())
@@ -861,10 +870,14 @@ mod diagnostics;
 mod format;
 mod model;
 mod reason;
+pub mod store;
+pub mod xlsx;
 
 // 对外只露报告的数据模型和两个组装文本的入口；其余是渲染内部的事。
 pub use format::report_endpoint;
-pub use model::{DirectionSummary, ReportMeta, Row, StreamCounts};
+pub use model::{
+    DirectionSummary, ReportMeta, Row, RowBackend, RowDirection, RowProtocol, RowSide, StreamCounts,
+};
 pub use reason::report_reason;
 
 use diagnostics::*;

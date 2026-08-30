@@ -14,11 +14,19 @@ use crate::rate;
 use crate::util::md5_hex;
 use std::collections::{BTreeMap, HashSet};
 
+mod diagnostics;
+mod identity;
+mod policy;
+
+#[cfg(test)]
+pub use diagnostics::build_iperf_failure_diagnostics;
+pub use diagnostics::build_traffic_failure_diagnostics;
+use identity::*;
+use policy::*;
+
 pub const PORT_BASE: u16 = 56000;
 pub const DIAGNOSTIC_PING_COUNT: u32 = 3;
 pub const DIAGNOSTIC_SUBNET_PAYLOAD: u32 = 32;
-/// 单流 UDP 是基础连通性硬门槛：初次尝试加至少两次重试。
-pub const SINGLE_UDP_MIN_ATTEMPTS: u64 = 3;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Side {
@@ -55,6 +63,9 @@ impl Endpoint {
 #[derive(Clone, Debug)]
 pub struct SpecNorm {
     pub name: String,
+    /// 报表分组键，来自 `TestSpec.link_group`（界面填的链路集合名）。
+    /// 空表示没有分组信息，报表回落到物理网口对。
+    pub link_group: String,
     pub src: Endpoint,
     pub dst: Endpoint,
     /// ab / ba / bidir
@@ -150,7 +161,12 @@ pub struct IperfTask {
     pub stream_idx: usize,
     pub rate_mode: RateMode,
     pub rx_target_mbps: Option<f64>,
-    pub offered_mbps: Option<f64>,
+    /// **每条流**下发的目标负载（`-b`）。
+    ///
+    /// 与 `CtsTrafficTask::offered_total_mbps` 语义**相反**：那边是整条腿的总量。
+    /// 两个字段以前都叫 `offered_per_stream_mbps`，把 4 条流 × 500Mbps 当成 500Mbps 总量
+    /// （或反过来）编译器一句话都不会说。名字带上口径，让类型拦住误用。
+    pub offered_per_stream_mbps: Option<f64>,
 }
 
 #[derive(Clone, Debug)]
@@ -173,7 +189,10 @@ pub struct CtsTrafficTask {
     pub status_update_ms: u32,
     pub rate_mode: RateMode,
     pub rx_target_mbps: Option<f64>,
-    pub offered_mbps: Option<f64>,
+    /// 整条腿下发的目标负载**总量**。
+    ///
+    /// 与 `IperfTask::offered_per_stream_mbps` 语义**相反**：那边是每条流。
+    pub offered_total_mbps: Option<f64>,
     /// builder 已识别的非法 CTS 配置；执行器不得启动进程，必须直接报告
     /// SETUP_ERROR / CTSTRAFFIC_ARGS_INVALID。
     pub setup_error: Option<String>,
@@ -221,6 +240,9 @@ pub struct Leg {
 pub struct Unit {
     pub id: String,
     pub title: String,
+    /// 报表分组键（`SpecNorm.link_group`）。**不进 resume identity、不进判定**，
+    /// 纯粹是「这一批单元在报表里归到哪一组」。
+    pub link_group: String,
     pub bidir: bool,
     /// 规范方向：`ab` / `ba` / `bidir`；诊断类单元为空。
     ///
@@ -346,169 +368,6 @@ pub fn refresh_unit_endpoints(
         ep.nic = fresh.clone();
     });
     drifts
-}
-
-fn subnet_ping_key(src: &Endpoint, dst: &Endpoint, payload: u32) -> String {
-    format!("{}|{}|{payload}", src.key(), dst.key())
-}
-
-/// 当本轮所有吞吐后端都没有产生有效测量时，按失败任务涉及的方向和网卡
-/// 构造一组短时、去重的诊断任务：
-///
-/// - 每个唯一 IPv4 方向固定使用 32 字节短 Ping；
-/// - 每块涉及网卡绑定自己的 IPv4 源地址 Ping 自己的 IPv4 网关；
-/// - 已经在本轮选择中的同方向 32 字节常规 Ping 不重复执行；
-/// - 网关为空也保留诊断单元，由执行器报告 GATEWAY_NOT_FOUND，而不是伪装成丢包。
-pub fn build_traffic_failure_diagnostics(selected_units: &[Unit]) -> Vec<Unit> {
-    let mut traffic_pairs: Vec<(Endpoint, Endpoint)> = Vec::new();
-    let mut existing_subnet_pings = HashSet::new();
-    for unit in selected_units {
-        for leg in &unit.legs {
-            match &leg.kind {
-                LegKind::IperfSingle(task) => {
-                    traffic_pairs.push((task.src.clone(), task.dst.clone()))
-                }
-                LegKind::IperfGroup { streams, .. } => {
-                    traffic_pairs.extend(
-                        streams
-                            .iter()
-                            .map(|task| (task.src.clone(), task.dst.clone())),
-                    );
-                }
-                LegKind::CtsTraffic(task) => {
-                    traffic_pairs.push((task.src.clone(), task.dst.clone()))
-                }
-                LegKind::Ping(task)
-                    if !task.v6 && task.purpose != PingPurpose::GatewayDiagnostic =>
-                {
-                    existing_subnet_pings.insert(subnet_ping_key(
-                        &task.src,
-                        &task.dst,
-                        task.payload,
-                    ));
-                }
-                LegKind::Ping(_) => {}
-            }
-        }
-    }
-    if traffic_pairs.is_empty() {
-        return Vec::new();
-    }
-
-    let mut directions: BTreeMap<String, (Endpoint, Endpoint)> = BTreeMap::new();
-    let mut endpoints: BTreeMap<String, Endpoint> = BTreeMap::new();
-    for (src, dst) in traffic_pairs {
-        if !src.nic.ipv4.is_empty() && !dst.nic.ipv4.is_empty() {
-            let direction_key = format!("{}|{}", src.key(), dst.key());
-            directions
-                .entry(direction_key)
-                .or_insert_with(|| (src.clone(), dst.clone()));
-        }
-        for endpoint in [&src, &dst] {
-            if !endpoint.nic.ipv4.is_empty() {
-                endpoints
-                    .entry(endpoint.key())
-                    .or_insert_with(|| endpoint.clone());
-            }
-        }
-    }
-
-    let mut diagnostics = Vec::new();
-    for (src, dst) in directions.into_values() {
-        if existing_subnet_pings.contains(&subnet_ping_key(&src, &dst, DIAGNOSTIC_SUBNET_PAYLOAD)) {
-            continue;
-        }
-        let title = format!(
-            "[故障诊断] 子网 PING V4 -l {} n={} | {} -> {}",
-            DIAGNOSTIC_SUBNET_PAYLOAD,
-            DIAGNOSTIC_PING_COUNT,
-            src.brief(),
-            dst.brief()
-        );
-        let id = md5_hex(&format!(
-            "iperf_failure_subnet_ping_v1|{}|{}|{}",
-            src.key(),
-            dst.key(),
-            DIAGNOSTIC_SUBNET_PAYLOAD
-        ));
-        diagnostics.push(Unit {
-            id,
-            title,
-            bidir: false,
-            // 诊断单元不是用户勾出来的方向，留空即可（展示层会跳过）。
-            direction: String::new(),
-            legs: vec![Leg {
-                tag: "subnet-diagnostic".into(),
-                kind: LegKind::Ping(PingTask {
-                    v6: false,
-                    src,
-                    dst,
-                    count: DIAGNOSTIC_PING_COUNT,
-                    payload: DIAGNOSTIC_SUBNET_PAYLOAD,
-                    purpose: PingPurpose::SubnetDiagnostic,
-                }),
-            }],
-            est_secs: ping_estimated_secs(DIAGNOSTIC_PING_COUNT),
-        });
-    }
-
-    for endpoint in endpoints.into_values() {
-        let gateway = endpoint.nic.gateway_v4.trim().to_string();
-        let gateway_label = if gateway.is_empty() {
-            "未发现 IPv4 网关".to_string()
-        } else {
-            gateway.clone()
-        };
-        let gateway_endpoint = Endpoint {
-            side: endpoint.side,
-            pc: endpoint.pc.clone(),
-            nic: NicInfo {
-                name: format!("{} 的 IPv4 网关", endpoint.nic.name),
-                description: "IPv4 默认网关".into(),
-                role: "GATEWAY".into(),
-                ipv4: gateway.clone(),
-                ..Default::default()
-            },
-        };
-        let title = format!(
-            "[故障诊断] 网卡/载体 PING 网关 V4 -l 32 n={} | {} -> {}",
-            DIAGNOSTIC_PING_COUNT,
-            endpoint.brief(),
-            gateway_label
-        );
-        let id = md5_hex(&format!(
-            "iperf_failure_gateway_ping_v1|{}|{}",
-            endpoint.key(),
-            gateway
-        ));
-        diagnostics.push(Unit {
-            id,
-            title,
-            bidir: false,
-            // 诊断单元不是用户勾出来的方向，留空即可（展示层会跳过）。
-            direction: String::new(),
-            legs: vec![Leg {
-                tag: "gateway-diagnostic".into(),
-                kind: LegKind::Ping(PingTask {
-                    v6: false,
-                    src: endpoint,
-                    dst: gateway_endpoint,
-                    count: DIAGNOSTIC_PING_COUNT,
-                    payload: 32,
-                    purpose: PingPurpose::GatewayDiagnostic,
-                }),
-            }],
-            est_secs: ping_estimated_secs(DIAGNOSTIC_PING_COUNT),
-        });
-    }
-
-    diagnostics
-}
-
-/// 兼容旧测试/调用名称；诊断范围现已覆盖 iperf3 与 ctsTraffic。
-#[cfg(test)]
-pub fn build_iperf_failure_diagnostics(selected_units: &[Unit]) -> Vec<Unit> {
-    build_traffic_failure_diagnostics(selected_units)
 }
 
 /// v6 地址三元组（client 绑定 / client 目标 / server 绑定），link-local 自动带 zone
@@ -637,6 +496,7 @@ pub fn spec_from_config(
         } else {
             t.name.clone()
         },
+        link_group: t.link_group.clone().unwrap_or_default(),
         src,
         dst,
         directions: t.direction.directions(),
@@ -810,596 +670,6 @@ fn ep_id(e: &Endpoint) -> String {
     format!("{}|{}|{}", e.pc, e.nic.name, e.nic.ipv4)
 }
 
-/// 向 resume 语义串写入一个长度编码字段。
-///
-/// 不能只用 `|` 拼接：主机名、接口名等外部字符串本身可能包含分隔符，进而让两组
-/// 不同参数得到同一个待哈希字符串。字段名固定、值带字节长度后，编码可以无歧义解析。
-fn push_resume_field(identity: &mut String, name: &str, value: &str) {
-    identity.push('|');
-    identity.push_str(name);
-    identity.push('=');
-    identity.push_str(&value.len().to_string());
-    identity.push(':');
-    identity.push_str(value);
-}
-
-fn rate_mode_identity(mode: RateMode) -> &'static str {
-    match mode {
-        RateMode::Auto => "auto",
-        RateMode::Verify => "verify",
-        RateMode::Observe => "observe",
-        RateMode::Discover => "discover",
-    }
-}
-
-/// 使用 IEEE-754 位模式记录浮点配置，避免显示精度或 locale 改变 resume ID。
-fn f64_identity(value: f64) -> String {
-    format!("{:016x}", value.to_bits())
-}
-
-fn option_f64_identity(value: Option<f64>) -> String {
-    value
-        .map(f64_identity)
-        .unwrap_or_else(|| "none".to_string())
-}
-
-fn option_str_identity(value: Option<&str>) -> String {
-    value
-        .map(|text| format!("some:{}:{text}", text.len()))
-        .unwrap_or_else(|| "none".to_string())
-}
-
-fn push_rate_targets_identity(identity: &mut String, prefix: &str, targets: &RateTargets) {
-    push_resume_field(
-        identity,
-        &format!("{prefix}.forward"),
-        &option_f64_identity(targets.forward),
-    );
-    push_resume_field(
-        identity,
-        &format!("{prefix}.ab"),
-        &option_f64_identity(targets.ab),
-    );
-    push_resume_field(
-        identity,
-        &format!("{prefix}.ba"),
-        &option_f64_identity(targets.ba),
-    );
-}
-
-/// 记录所有会改变 UDP 执行或正式 verdict 的全局参数。
-///
-/// 这里有意记录原始配置而不是只记录最终目标：例如 `offered_headroom_pct` 同时改变
-/// 最低发送负载和所需成功流数，`sample_interval_ms`/`settle_secs` 会改变可判定窗口，
-/// `max_udp_loss_pct` 会直接改变 PASS/FAIL。新验收字段加入 RateCheckCfg 时也应同步加入。
-///
-/// **两个 WiFi 上限有意不在这里。** 它们影响执行的唯一通路是裁剪后的 `-b` 和流数，
-/// 而这两样已经分别经由 `task.extra` 和 `stream_count` 进了 identity；`udp_limit`
-/// 关掉时它们对执行更是毫无影响。再记一遍不会多拦住任何一次错误复用，却会让
-/// iperf / tcp / ctstraffic 三条 schema 的哈希同时改变，把所有人的 resume 缓存
-/// 白白清空一次。哪天它们开始参与 RX 门限或 verdict（而不只是裁 `-b`），
-/// 就必须补进来并同步升 schema 版本。
-/// 覆盖由 `the_24g_ceiling_reaches_resume_identity_through_the_clipped_load` 钉住。
-fn push_rate_check_identity(identity: &mut String, cfg: &RateCheckCfg) {
-    push_resume_field(identity, "rate_check.mode", rate_mode_identity(cfg.mode));
-    push_rate_targets_identity(identity, "rate_check.targets", &cfg.targets_mbps);
-    for (name, value) in [
-        ("sample_interval_ms", cfg.sample_interval_ms),
-        ("background_secs", cfg.background_secs),
-        ("startup_timeout_secs", cfg.startup_timeout_secs),
-        ("settle_secs", cfg.settle_secs),
-        ("launch_interval_ms", cfg.launch_interval_ms),
-        ("min_concurrent_streams", cfg.min_concurrent_streams as u64),
-        ("flow_retries", cfg.flow_retries as u64),
-        ("discovery_step_secs", cfg.discovery_step_secs),
-    ] {
-        push_resume_field(identity, &format!("rate_check.{name}"), &value.to_string());
-    }
-    for (name, value) in [
-        ("min_active_ratio", cfg.min_active_ratio),
-        ("offered_headroom_pct", cfg.offered_headroom_pct),
-        ("evb_usb_to_eth_target_mbps", cfg.evb_usb_to_eth_target_mbps),
-        ("evb_eth_to_usb_target_mbps", cfg.evb_eth_to_usb_target_mbps),
-        ("cpe_path_ceiling_mbps", cfg.cpe_path_ceiling_mbps),
-    ] {
-        push_resume_field(
-            identity,
-            &format!("rate_check.{name}"),
-            &f64_identity(value),
-        );
-    }
-    push_resume_field(
-        identity,
-        "rate_check.max_udp_loss_pct",
-        &option_f64_identity(cfg.max_udp_loss_pct),
-    );
-}
-
-fn push_endpoint_identity(identity: &mut String, prefix: &str, endpoint: &Endpoint) {
-    let side = match endpoint.side {
-        Side::Master => "master",
-        Side::Agent => "agent",
-    };
-    for (name, value) in [
-        ("side", side),
-        ("pc", endpoint.pc.as_str()),
-        ("name", endpoint.nic.name.as_str()),
-        ("role", endpoint.nic.role.as_str()),
-        ("ipv4", endpoint.nic.ipv4.as_str()),
-        ("ipv6_ll", endpoint.nic.ipv6_ll.as_str()),
-        ("ipv6_global", endpoint.nic.ipv6_global.as_str()),
-    ] {
-        push_resume_field(identity, &format!("{prefix}.{name}"), value);
-    }
-    push_resume_field(
-        identity,
-        &format!("{prefix}.speed_mbps"),
-        &endpoint.nic.speed_mbps.to_string(),
-    );
-}
-
-fn push_iperf_task_identity(identity: &mut String, prefix: &str, task: &IperfTask) {
-    push_resume_field(
-        identity,
-        &format!("{prefix}.v6"),
-        if task.v6 { "true" } else { "false" },
-    );
-    push_resume_field(
-        identity,
-        &format!("{prefix}.udp"),
-        if task.udp { "true" } else { "false" },
-    );
-    push_resume_field(identity, &format!("{prefix}.profile"), &task.profile_name);
-    push_endpoint_identity(identity, &format!("{prefix}.src"), &task.src);
-    push_endpoint_identity(identity, &format!("{prefix}.dst"), &task.dst);
-    push_resume_field(
-        identity,
-        &format!("{prefix}.duration"),
-        &task.duration.to_string(),
-    );
-    push_resume_field(
-        identity,
-        &format!("{prefix}.stream_idx"),
-        &task.stream_idx.to_string(),
-    );
-    push_resume_field(
-        identity,
-        &format!("{prefix}.rate_mode"),
-        rate_mode_identity(task.rate_mode),
-    );
-    push_resume_field(
-        identity,
-        &format!("{prefix}.rx_target_mbps"),
-        &option_f64_identity(task.rx_target_mbps),
-    );
-    push_resume_field(
-        identity,
-        &format!("{prefix}.offered_mbps"),
-        &option_f64_identity(task.offered_mbps),
-    );
-    push_resume_field(
-        identity,
-        &format!("{prefix}.extra_count"),
-        &task.extra.len().to_string(),
-    );
-    for (idx, arg) in task.extra.iter().enumerate() {
-        push_resume_field(identity, &format!("{prefix}.extra.{idx}"), arg);
-    }
-    // `port` 是构建顺序决定的临时资源，不属于测试/验收语义，不能写入 resume ID。
-}
-
-fn udp_resume_unit_id_with_schema(
-    schema: &str,
-    include_profile_window: bool,
-    spec: &SpecNorm,
-    ip_tag: &str,
-    direction: &str,
-    profile: &UdpProfile,
-    legs: &[Leg],
-) -> String {
-    let mut identity = schema.to_string();
-    push_resume_field(&mut identity, "transport", "udp");
-    push_resume_field(&mut identity, "ip", ip_tag);
-    push_resume_field(&mut identity, "direction", direction);
-    push_resume_field(&mut identity, "duration", &spec.duration.to_string());
-    push_resume_field(
-        &mut identity,
-        "requested_streams",
-        &spec.requested_streams(true).to_string(),
-    );
-    push_resume_field(
-        &mut identity,
-        "udp_limit",
-        if spec.udp_limit { "true" } else { "false" },
-    );
-    push_resume_field(&mut identity, "profile.bandwidth", &profile.bandwidth);
-    push_resume_field(
-        &mut identity,
-        "profile.length",
-        &option_str_identity(profile.length.as_deref()),
-    );
-    if include_profile_window {
-        push_resume_field(
-            &mut identity,
-            "profile.window",
-            &option_str_identity(profile.window.as_deref()),
-        );
-    }
-    push_resume_field(
-        &mut identity,
-        "configured_rate_mode",
-        rate_mode_identity(spec.rate_mode),
-    );
-    push_rate_targets_identity(&mut identity, "scenario_targets", &spec.rate_targets);
-    push_rate_check_identity(&mut identity, &spec.rate_check);
-    push_endpoint_identity(&mut identity, "spec.src", &spec.src);
-    push_endpoint_identity(&mut identity, "spec.dst", &spec.dst);
-    push_resume_field(&mut identity, "leg_count", &legs.len().to_string());
-
-    for (leg_idx, leg) in legs.iter().enumerate() {
-        let prefix = format!("leg.{leg_idx}");
-        push_resume_field(&mut identity, &format!("{prefix}.tag"), &leg.tag);
-        match &leg.kind {
-            LegKind::IperfSingle(task) => {
-                push_resume_field(&mut identity, &format!("{prefix}.kind"), "single");
-                push_resume_field(&mut identity, &format!("{prefix}.stream_count"), "1");
-                push_iperf_task_identity(&mut identity, &format!("{prefix}.stream.0"), task);
-            }
-            LegKind::IperfGroup { streams, .. } => {
-                push_resume_field(&mut identity, &format!("{prefix}.kind"), "group");
-                push_resume_field(
-                    &mut identity,
-                    &format!("{prefix}.stream_count"),
-                    &streams.len().to_string(),
-                );
-                for (stream_idx, task) in streams.iter().enumerate() {
-                    push_iperf_task_identity(
-                        &mut identity,
-                        &format!("{prefix}.stream.{stream_idx}"),
-                        task,
-                    );
-                }
-            }
-            LegKind::CtsTraffic(_) => {
-                push_resume_field(&mut identity, &format!("{prefix}.kind"), "cts-invalid");
-            }
-            LegKind::Ping(_) => {
-                // 本函数仅由 UDP 构建分支调用；保留类型标记可防未来误用时发生碰撞。
-                push_resume_field(&mut identity, &format!("{prefix}.kind"), "ping-invalid");
-            }
-        }
-    }
-
-    md5_hex(&identity)
-}
-
-/// UDP resume ID schema v4：除覆盖实际 offered load、裁剪后的流数、方向目标、模式、
-/// socket buffer 和全部验收阈值外，也隔离使用旧流量窗口作为背景截止点的 v3 结果。
-fn udp_resume_unit_id_v4(
-    spec: &SpecNorm,
-    ip_tag: &str,
-    direction: &str,
-    profile: &UdpProfile,
-    legs: &[Leg],
-) -> String {
-    udp_resume_unit_id_with_schema("iperf_v4", true, spec, ip_tag, direction, profile, legs)
-}
-
-/// TCP resume identity includes the resolved RX target and rate policy.  The
-/// v1 identity predates NIC-RX validation, so reusing it could silently skip
-/// a result produced under the old, tool-only PASS rule.
-///
-/// v3 隔离 v2：v2 时代的 PASS 只校验了接收端网卡采样，发送端根本没采。现在
-/// 有明确目标时 RX/TX 双侧的采样与 5 秒滚动窗口覆盖率都必须达标，PASS 变严了，
-/// 因此 v2 缓存的 PASS 不能跨语义复用——否则会静默跳过一个在新规则下未必
-/// 通得过的测试。
-fn tcp_resume_unit_id_v2(
-    spec: &SpecNorm,
-    ip_tag: &str,
-    direction: &str,
-    profile: &str,
-    legs: &[Leg],
-) -> String {
-    let mut identity = "iperf_tcp_v3".to_string();
-    push_resume_field(&mut identity, "transport", "tcp");
-    push_resume_field(&mut identity, "ip", ip_tag);
-    push_resume_field(&mut identity, "direction", direction);
-    push_resume_field(&mut identity, "duration", &spec.duration.to_string());
-    push_resume_field(&mut identity, "profile", profile);
-    push_resume_field(
-        &mut identity,
-        "configured_rate_mode",
-        rate_mode_identity(spec.rate_mode),
-    );
-    push_rate_targets_identity(&mut identity, "scenario_targets", &spec.rate_targets);
-    push_rate_check_identity(&mut identity, &spec.rate_check);
-    push_endpoint_identity(&mut identity, "spec.src", &spec.src);
-    push_endpoint_identity(&mut identity, "spec.dst", &spec.dst);
-    push_resume_field(&mut identity, "leg_count", &legs.len().to_string());
-    for (leg_idx, leg) in legs.iter().enumerate() {
-        let prefix = format!("leg.{leg_idx}");
-        push_resume_field(&mut identity, &format!("{prefix}.tag"), &leg.tag);
-        match &leg.kind {
-            LegKind::IperfSingle(task) => {
-                push_resume_field(&mut identity, &format!("{prefix}.kind"), "single");
-                push_iperf_task_identity(&mut identity, &format!("{prefix}.stream.0"), task);
-            }
-            LegKind::IperfGroup { streams, .. } => {
-                push_resume_field(&mut identity, &format!("{prefix}.kind"), "group");
-                for (stream_idx, task) in streams.iter().enumerate() {
-                    push_iperf_task_identity(
-                        &mut identity,
-                        &format!("{prefix}.stream.{stream_idx}"),
-                        task,
-                    );
-                }
-            }
-            _ => push_resume_field(&mut identity, &format!("{prefix}.kind"), "invalid"),
-        }
-    }
-    md5_hex(&identity)
-}
-
-fn cts_window_bytes(value: &str) -> Result<Option<u32>, String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty()
-        || trimmed.eq_ignore_ascii_case("auto")
-        || trimmed.eq_ignore_ascii_case("default")
-    {
-        Ok(None)
-    } else {
-        parse_size_bytes(trimmed).map(Some)
-    }
-}
-
-/// 配置里 `by_nic.host` 用的主机键。
-fn host_key(side: Side) -> &'static str {
-    match side {
-        Side::Master => "master",
-        Side::Agent => "agent",
-    }
-}
-
-/// 解析这条 (src -> dst) 的两层链路策略。
-///
-/// 单独包一层是为了把 `Side -> 配置里的 host 字符串` 这个映射收在一处：
-/// 四个任务分支都要解析策略，映射写错一次就会静默地让整类覆盖失效。
-fn link_policy(spec: &SpecNorm, src: &Endpoint, dst: &Endpoint) -> rate::LinkPolicy {
-    rate::resolve_link_policy(
-        &spec.link_profiles,
-        host_key(src.side),
-        &src.nic,
-        host_key(dst.side),
-        &dst.nic,
-    )
-}
-
-/// 门限来自协商速率百分比时，把算式作为计划提示说出来（每条算式只说一次）。
-///
-/// 不说的话，同一份配置在 Wi-Fi 重新协商后跑出不同门限，报告上看不出为什么。
-fn note_rx_target(
-    notices: &mut Vec<String>,
-    seen: &mut HashSet<String>,
-    spec_name: &str,
-    policy: &rate::LinkPolicy,
-) {
-    if let Some(note) = &policy.rx_target_note {
-        let line = format!("{spec_name}：{note}");
-        if seen.insert(line.clone()) {
-            notices.push(line);
-        }
-    }
-}
-
-/// 这条腿要用的 RX 门限。
-///
-/// 顺序：**双向配对门限 → 单口覆盖 → 场景 targets → 内置推导**。
-///
-/// 双向配对门限排在最前，因为它是唯一一个知道「这条腿属于哪一对网口、
-/// 而且两个方向正在同时灌」的来源。半双工介质上这两件事缺一不可：
-/// 同一块 RNDIS 口，和 Wi-Fi 组双向、和 SGMII 组双向，能收到的速率
-/// 完全不是一个量级——挂在网卡上的那个数没法同时对这两组成立。
-///
-/// 只在 `bidir` 为真时参与，所以单向单元的判定一个字节都没变。
-#[allow(clippy::too_many_arguments)]
-fn leg_rx_target(
-    spec: &SpecNorm,
-    policy: &rate::LinkPolicy,
-    flow_direction: &str,
-    bidir: bool,
-    src: &NicInfo,
-    dst: &NicInfo,
-) -> Option<f64> {
-    if bidir {
-        if let Some(target) = spec.rate_targets_bidir.for_direction(flow_direction) {
-            return Some(target);
-        }
-    }
-    policy.rx_target_mbps.or_else(|| {
-        rate::resolve_target_mbps(
-            spec.rate_mode,
-            &spec.rate_targets,
-            flow_direction,
-            src,
-            dst,
-            &spec.rate_check,
-        )
-    })
-}
-
-/// `-w × 流数` 大到这条链路要花多少秒才排空；超过它就提示。
-///
-/// 2 秒是个够宽松的界：正常的 BDP 档位（64k~4m × 10 流）在 1G 上只有几十
-/// 毫秒，而一旦到了「几秒钟的链路时间」，socket 缓冲本身就变成了测量对象。
-const SOCKET_BUFFER_DRAIN_WARN_SECS: f64 = 2.0;
-
-/// `-w` 开得过大时给一条提示。
-///
-/// iperf3 的 `-w` 是 socket 缓冲，被塞进去的字节算进「发送」但可能一个都没
-/// 上线。run_20260825_215915_7684 用的是 `-w 256m -P 10`，等于 2.56GB 的
-/// 发送缓冲；65 条 TCP 记录的「发 − 收」差值稳定在 118.92 ± 1.90 Mbps，
-/// 而 `2.56GB ÷ 180s = 119.3Mbps`——那个差值整个就是缓冲，不是链路。
-/// 首秒打出的 `22271Mbps` 同样来自这里（见 .ai/DESIGN-v4.3.0.md D5）。
-///
-/// 只提示不改写：`-w` 是用户明确填的参数，工具不该背着人改测试条件。
-#[allow(clippy::too_many_arguments)]
-fn oversized_socket_buffer_notice(
-    spec_name: &str,
-    profile_label: &str,
-    window: &str,
-    streams: u32,
-    duration_secs: u64,
-    sender: &Endpoint,
-    receiver: &Endpoint,
-    rate_cfg: &RateCheckCfg,
-) -> Option<String> {
-    let window_bytes = cts_window_bytes(window).ok().flatten()? as f64;
-    let ceiling_mbps = rate::path_payload_ceiling_mbps(&sender.nic, &receiver.nic, rate_cfg)?;
-    if ceiling_mbps <= 0.0 {
-        return None;
-    }
-    let total_bytes = window_bytes * streams.max(1) as f64;
-    let drain_secs = total_bytes * 8.0 / (ceiling_mbps * 1_000_000.0);
-    if drain_secs <= SOCKET_BUFFER_DRAIN_WARN_SECS {
-        return None;
-    }
-    // 虚高幅度必须按本次实际时长折算。写死 180 的话，同一段文字里的
-    // 「总缓冲 X GB」「排空 Y 秒」和这个 Mbps 会自相矛盾；报告里的
-    // `in_flight_buffer_estimate` 用的是 required_seconds，两处也会对不上。
-    let inflation_mbps = total_bytes * 8.0 / 1e6 / duration_secs.max(1) as f64;
-    Some(format!(
-        "{spec_name} {profile_label}：-w {window} × {streams} 流 = {:.2}GB socket 缓冲，\
-         相当于这条链路 {drain_secs:.1} 秒的流量。这些字节会被算进「工具自报发送」但未必上线，\
-         使 {duration_secs}s 的测试里「发送−接收」出现约 {inflation_mbps:.0}Mbps 的恒定虚高；\
-         判定用的接收端网卡口径不受影响。",
-        total_bytes / 1e9,
-    ))
-}
-
-fn cts_task_config_errors(spec: &SpecNorm, udp: bool) -> Vec<String> {
-    let mut errors = spec
-        .ctstraffic_config_error
-        .iter()
-        .cloned()
-        .collect::<Vec<_>>();
-    if let Some(error) = spec.stream_config_error(udp) {
-        errors.push(error);
-    }
-    if !(100..=60_000).contains(&spec.ctstraffic.status_update_ms) {
-        errors.push(format!(
-            "ctsTraffic status_update_ms 必须在 100..=60000，当前为 {}",
-            spec.ctstraffic.status_update_ms
-        ));
-    }
-    if udp {
-        if spec.ctstraffic.udp_frame_rate == 0 {
-            errors.push("ctsTraffic udp_frame_rate 必须大于 0，当前为 0".into());
-        }
-        if spec.ctstraffic.udp_buffer_depth_secs == 0 {
-            errors.push("ctsTraffic udp_buffer_depth_secs 必须大于 0，当前为 0".into());
-        }
-    }
-    errors
-}
-
-fn cts_udp_bandwidth(profile: &UdpProfile) -> Result<ParsedBandwidth, String> {
-    profile.parsed_bandwidth()
-}
-
-fn cts_datagram_bytes(profile: &UdpProfile) -> Result<Option<u32>, String> {
-    profile
-        .length
-        .as_deref()
-        .map(parse_size_bytes)
-        .transpose()
-        .and_then(|value| {
-            if value.is_some_and(|size| size > 65_507) {
-                Err("ctsTraffic UDP datagram 必须不大于 65507 字节".into())
-            } else {
-                Ok(value)
-            }
-        })
-}
-
-fn cts_task_identity(identity: &mut String, prefix: &str, task: &CtsTrafficTask) {
-    for (name, value) in [
-        ("v6", if task.v6 { "true" } else { "false" }.to_string()),
-        ("udp", if task.udp { "true" } else { "false" }.to_string()),
-        ("profile", task.profile_name.clone()),
-        ("duration", task.duration.to_string()),
-        ("streams", task.streams.to_string()),
-        (
-            "window_bytes",
-            task.window_bytes
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "none".into()),
-        ),
-        (
-            "bits_per_second",
-            task.bits_per_second
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "none".into()),
-        ),
-        (
-            "datagram_bytes",
-            task.datagram_bytes
-                .map(|value| value.to_string())
-                .unwrap_or_else(|| "none".into()),
-        ),
-        ("frame_rate", task.frame_rate.to_string()),
-        ("buffer_depth_secs", task.buffer_depth_secs.to_string()),
-        ("status_update_ms", task.status_update_ms.to_string()),
-        ("rate_mode", rate_mode_identity(task.rate_mode).to_string()),
-        ("rx_target_mbps", option_f64_identity(task.rx_target_mbps)),
-        ("offered_mbps", option_f64_identity(task.offered_mbps)),
-        (
-            "setup_error",
-            task.setup_error.clone().unwrap_or_else(|| "none".into()),
-        ),
-    ] {
-        push_resume_field(identity, &format!("{prefix}.{name}"), &value);
-    }
-    push_endpoint_identity(identity, &format!("{prefix}.src"), &task.src);
-    push_endpoint_identity(identity, &format!("{prefix}.dst"), &task.dst);
-    // port 是临时资源，故意不进入 resume ID。
-}
-
-fn cts_resume_unit_id_with_schema(
-    schema: &str,
-    spec: &SpecNorm,
-    ip_tag: &str,
-    direction: &str,
-    legs: &[Leg],
-) -> String {
-    let mut identity = schema.to_string();
-    push_resume_field(&mut identity, "ip", ip_tag);
-    push_resume_field(&mut identity, "direction", direction);
-    push_resume_field(
-        &mut identity,
-        "configured_rate_mode",
-        rate_mode_identity(spec.rate_mode),
-    );
-    push_rate_targets_identity(&mut identity, "scenario_targets", &spec.rate_targets);
-    push_rate_check_identity(&mut identity, &spec.rate_check);
-    push_resume_field(&mut identity, "leg_count", &legs.len().to_string());
-    for (index, leg) in legs.iter().enumerate() {
-        let prefix = format!("leg.{index}");
-        push_resume_field(&mut identity, &format!("{prefix}.tag"), &leg.tag);
-        match &leg.kind {
-            LegKind::CtsTraffic(task) => cts_task_identity(&mut identity, &prefix, task),
-            _ => push_resume_field(&mut identity, &format!("{prefix}.kind"), "invalid"),
-        }
-    }
-    md5_hex(&identity)
-}
-
-fn cts_resume_unit_id(spec: &SpecNorm, ip_tag: &str, direction: &str, legs: &[Leg]) -> String {
-    // v3 吸收共享 RX-P10/rolling coverage 判定；v2 结果不能跨判定语义复用。
-    // v4 再加一道：有目标时发送端网卡的采样与滚动覆盖率同样要达标（此前 CTS
-    // 压根不采发送端）。PASS 条件变严，v3 缓存同样不能复用。
-    cts_resume_unit_id_with_schema("ctstraffic_v4", spec, ip_tag, direction, legs)
-}
-
 /// 生成全部任务单元。返回 (units, 提示信息列表)
 pub fn build_units(
     specs: &[SpecNorm],
@@ -1534,7 +804,7 @@ pub fn build_units(
                                             stream_idx: 0,
                                             rate_mode: effective_mode,
                                             rx_target_mbps: target,
-                                            offered_mbps: None,
+                                            offered_per_stream_mbps: None,
                                         };
                                         legs.push(Leg {
                                             tag: tag.to_string(),
@@ -1553,6 +823,7 @@ pub fn build_units(
                                     units.push(Unit {
                                         id,
                                         title,
+                                        link_group: spec.link_group.clone(),
                                         bidir,
                                         direction: dir.to_string(),
                                         legs,
@@ -1697,7 +968,7 @@ pub fn build_units(
                                             rate::effective_mode(spec.rate_mode, target);
                                         // offered 必须跟着实际下发的 -b 走，否则
                                         // 报表里的「请求负载」和命令行对不上。
-                                        let offered_mbps = Some(load.mbps);
+                                        let offered_per_stream_mbps = Some(load.mbps);
                                         let mk = |idx: usize, port: u16| IperfTask {
                                             v6,
                                             udp: true,
@@ -1711,7 +982,7 @@ pub fn build_units(
                                             stream_idx: idx,
                                             rate_mode: effective_mode,
                                             rx_target_mbps: target,
-                                            offered_mbps,
+                                            offered_per_stream_mbps,
                                         };
                                         let kind = if n <= 1 {
                                             LegKind::IperfSingle(mk(0, alloc_port(next_port)))
@@ -1811,6 +1082,7 @@ pub fn build_units(
                                     units.push(Unit {
                                         id,
                                         title,
+                                        link_group: spec.link_group.clone(),
                                         bidir,
                                         direction: dir.to_string(),
                                         legs,
@@ -1927,7 +1199,7 @@ pub fn build_units(
                                             status_update_ms: spec.ctstraffic.status_update_ms,
                                             rate_mode: effective_mode,
                                             rx_target_mbps: target,
-                                            offered_mbps: None,
+                                            offered_total_mbps: None,
                                             setup_error: setup_error.clone(),
                                         }),
                                     });
@@ -1942,6 +1214,7 @@ pub fn build_units(
                                 units.push(Unit {
                                     id: cts_resume_unit_id(spec, ip_tag, dir, &legs),
                                     title,
+                                    link_group: spec.link_group.clone(),
                                     bidir,
                                     direction: dir.to_string(),
                                     legs,
@@ -2043,7 +1316,9 @@ pub fn build_units(
                                     );
                                     let effective_mode =
                                         rate::effective_mode(spec.rate_mode, target);
-                                    let offered_mbps =
+                                    // 每流带宽 × 流数 = 整条腿的总量。CTS 侧的
+                                    // 字段是**总量**口径，与 iperf 的每流口径相反。
+                                    let offered_total_mbps =
                                         bandwidth.map(|value| value.mbps * streams as f64);
                                     let profile_label = format!(
                                         "CTS UDP {} ×{}流 (每流)",
@@ -2077,7 +1352,7 @@ pub fn build_units(
                                             status_update_ms: spec.ctstraffic.status_update_ms,
                                             rate_mode: effective_mode,
                                             rx_target_mbps: target,
-                                            offered_mbps,
+                                            offered_total_mbps,
                                             setup_error: setup_error.clone(),
                                         }),
                                     });
@@ -2096,6 +1371,7 @@ pub fn build_units(
                                 units.push(Unit {
                                     id: cts_resume_unit_id(spec, ip_tag, dir, &legs),
                                     title,
+                                    link_group: spec.link_group.clone(),
                                     bidir,
                                     direction: dir.to_string(),
                                     legs,
@@ -2147,6 +1423,7 @@ pub fn build_units(
                         units.push(Unit {
                             id,
                             title,
+                            link_group: spec.link_group.clone(),
                             bidir,
                             direction: dir.to_string(),
                             legs,
@@ -2226,6 +1503,7 @@ mod tests {
     fn base_spec() -> SpecNorm {
         SpecNorm {
             name: "t".into(),
+            link_group: String::new(),
             src: ep(Side::Master, "eth0", "SGMII2.5G", "192.168.1.2", 2500),
             dst: ep(Side::Agent, "eth0", "SGMII2.5G", "192.168.1.3", 2500),
             directions: vec!["ab".into()],
@@ -2249,6 +1527,184 @@ mod tests {
             ctstraffic: CtsTrafficCfg::default(),
             ctstraffic_config_error: None,
         }
+    }
+
+    /// builder 永远不该把「受控参数」拼进 `IperfTask.extra`。
+    ///
+    /// `cmd::iperf::client_args` 把 `extra` 原样接在自己拼好的参数后面，而 iperf3
+    /// 对重复参数是**后者覆盖前者**。真出现一个 `-f M`/`-t 30`，解析器和有效窗口
+    /// 会各自走进另一条分支，而输出看起来一切正常——这类错只会表现为「速率莫名
+    /// 低了 4.6%」。今天 builder 只从有类型的配置字段拼 `-w`/`-P`/`-b`/`-l`，
+    /// 所以这条断言现在是免费的；它挡的是以后有人往 extra 里加透传口子。
+    /// agent 侧另有 `check_client_extra` 在请求边界上挡同一件事。
+    #[test]
+    fn the_builder_never_emits_iperf_flags_that_would_change_the_measurement() {
+        fn collect(unit: &Unit, into: &mut Vec<(String, Vec<String>)>) {
+            for leg in &unit.legs {
+                match &leg.kind {
+                    LegKind::IperfSingle(task) => {
+                        into.push((unit.id.clone(), task.extra.clone()));
+                    }
+                    LegKind::IperfGroup { streams, .. } => {
+                        for task in streams {
+                            into.push((unit.id.clone(), task.extra.clone()));
+                        }
+                    }
+                    LegKind::CtsTraffic(_) | LegKind::Ping(_) => {}
+                }
+            }
+        }
+
+        let mut specs = Vec::new();
+        // TCP：多档窗口 × 多流，双向。
+        let mut tcp = base_spec();
+        tcp.directions = vec!["ab".into(), "ba".into(), "bidir".into()];
+        tcp.transports = vec!["tcp".into()];
+        tcp.tcp_windows = vec!["64k".into(), "4m".into()];
+        tcp.streams = 10;
+        tcp.ipvers = vec!["v4".into(), "v6".into()];
+        specs.push(tcp);
+        // UDP：三条轴都有值、多流（走 IperfGroup）、开按链路上限裁剪。
+        let mut udp = base_spec();
+        udp.directions = vec!["ab".into(), "ba".into(), "bidir".into()];
+        udp.transports = vec!["udp".into()];
+        udp.udp_profiles = vec![
+            UdpProfile {
+                bandwidth: "1000m".into(),
+                length: Some("14k".into()),
+                window: Some("256m".into()),
+            },
+            UdpProfile {
+                bandwidth: "2500m".into(),
+                length: Some("64".into()),
+                window: Some("4m".into()),
+            },
+        ];
+        udp.udp_streams = 4;
+        udp.streams = 4;
+        udp.udp_limit = true;
+        specs.push(udp);
+
+        let mut port = 45000u16;
+        let (units, _notices) = build_units(&specs, true, &mut port);
+        assert!(!units.is_empty(), "这组 spec 应当展开出单元");
+
+        let mut tasks = Vec::new();
+        for unit in &units {
+            collect(unit, &mut tasks);
+        }
+        assert!(!tasks.is_empty(), "应当有 iperf 腿");
+        for (unit_id, extra) in &tasks {
+            let hits = crate::cmd::iperf::reserved_flags_in_extra(extra);
+            assert!(
+                hits.is_empty(),
+                "单元 {unit_id} 的 extra 里出现了受控参数 {hits:?}（extra={extra:?}）"
+            );
+        }
+    }
+
+    /// **稳定 ID / 端口顺序 / 单元展开的全量快照。**
+    ///
+    /// 这条测试守的是这个仓库里最贵的一条不变量：`Unit.id` 是 RESUME 的
+    /// identity。它变了，用户所有的历史 PASS 记录当场全部失效——24 小时内本该
+    /// 跳过的单元会全部重跑，一次 11.5 小时的验收变成两次，而且**没有任何报错**，
+    /// 只是「怎么又从头跑了」。端口顺序同理：它进 identity，也决定并发资源分配。
+    ///
+    /// 快照是**内联的字面量**而不是外部文件：拆分 `builder.rs`（R4）时，任何
+    /// 一处顺序、拼接、命名的手滑都会让这里逐字段报出差异，而不是等到用户
+    /// 现场发现 resume 不命中。
+    ///
+    /// 如果这条测试红了，先问「我是不是改了不该改的东西」，而不是更新快照。
+    /// 真要改 identity 模板，那是一次**需要说明的兼容性事件**（会清空所有人的
+    /// resume 缓存），不是顺手改一行。
+    #[test]
+    fn the_full_unit_expansion_is_byte_stable() {
+        // 一份把主要维度都摊开的 spec：双向 + 单向、V4+V6、TCP 多窗口多流、
+        // UDP 多档位多流。拆文件之前之后必须逐字节一致。
+        let mut tcp = base_spec();
+        tcp.name = "snapshot-tcp".into();
+        tcp.directions = vec!["ab".into(), "ba".into(), "bidir".into()];
+        tcp.transports = vec!["tcp".into()];
+        tcp.ipvers = vec!["v4".into(), "v6".into()];
+        tcp.tcp_windows = vec!["64k".into(), "4m".into()];
+        tcp.streams = 10;
+
+        let mut udp = base_spec();
+        udp.name = "snapshot-udp".into();
+        udp.directions = vec!["ab".into(), "bidir".into()];
+        udp.transports = vec!["udp".into()];
+        udp.ipvers = vec!["v4".into()];
+        udp.udp_profiles = vec![
+            UdpProfile {
+                bandwidth: "1000m".into(),
+                length: Some("14k".into()),
+                window: Some("256m".into()),
+            },
+            UdpProfile {
+                bandwidth: "2500m".into(),
+                length: None,
+                window: None,
+            },
+        ];
+        udp.udp_streams = 4;
+        udp.streams = 4;
+
+        let mut ping = base_spec();
+        ping.name = "snapshot-ping".into();
+        ping.kinds = vec!["ping".into()];
+        ping.transports = Vec::new();
+        ping.directions = vec!["ab".into(), "ba".into()];
+        ping.payload_sizes = vec![32, 1400];
+
+        let mut port = PORT_BASE;
+        let (units, _notices) = build_units(&[tcp, udp, ping], true, &mut port);
+
+        // 指纹里放进所有会影响 resume 命中与执行顺序的东西。
+        let fingerprint: Vec<String> = units
+            .iter()
+            .map(|unit| {
+                let legs: Vec<String> = unit
+                    .legs
+                    .iter()
+                    .map(|leg| {
+                        let ports: Vec<String> = match &leg.kind {
+                            LegKind::IperfSingle(task) => vec![task.port.to_string()],
+                            LegKind::IperfGroup { streams, .. } => {
+                                streams.iter().map(|task| task.port.to_string()).collect()
+                            }
+                            LegKind::CtsTraffic(task) => vec![task.port.to_string()],
+                            LegKind::Ping(_) => vec!["-".into()],
+                        };
+                        format!("{}:{}", leg.tag, ports.join("+"))
+                    })
+                    .collect();
+                format!(
+                    "{}|{}|bidir={}|dir={}|est={}|legs={}",
+                    unit.id,
+                    unit.title,
+                    unit.bidir,
+                    unit.direction,
+                    unit.est_secs,
+                    legs.join(",")
+                )
+            })
+            .collect();
+
+        // 端口分配器的终点也钉住：它是全局递增的，顺序变了就是资源分配变了。
+        let snapshot = format!("{}\n--- next_port={port}", fingerprint.join("\n"));
+
+        // 首次运行时用下面这行把实际值打出来再粘回来；平时它必须原样通过。
+        //   println!("{snapshot}");
+        let expected = include_str!("builder_snapshot.txt").trim_end();
+        assert_eq!(
+            snapshot.trim_end(),
+            expected,
+            "\n单元展开发生了变化。\n\
+             如果这是 builder 拆文件（R4）过程中出现的，说明搬运没有保持等价，\
+             **不要更新快照**——去找搬错的那一处。\n\
+             如果是有意改 identity 模板，那会清空所有用户的 resume 缓存，\
+             属于需要单独说明的兼容性事件。\n"
+        );
     }
 
     fn cts_spec(transport: &str) -> SpecNorm {
@@ -2807,7 +2263,7 @@ mod tests {
             task.streams, 1,
             "2500 Mbps 路径只能承载一条 1500 Mbps CTS 流"
         );
-        assert_eq!(task.offered_mbps, Some(1_500.0));
+        assert_eq!(task.offered_total_mbps, Some(1_500.0));
         assert_eq!(task.setup_error, None);
     }
 
@@ -2829,7 +2285,7 @@ mod tests {
             task.streams, 3,
             "2500 Mbps 路径应按真实取整后的 833333333 bps 承载三条流"
         );
-        let offered = task.offered_mbps.unwrap();
+        let offered = task.offered_total_mbps.unwrap();
         assert!((offered - 2_499.999_999).abs() < 1e-9);
     }
 
@@ -3193,7 +2649,7 @@ mod tests {
                 panic!("expect single UDP task");
             };
             assert_eq!(task.extra, vec!["-b", "2800000000"]);
-            assert_eq!(task.offered_mbps, Some(2800.0));
+            assert_eq!(task.offered_per_stream_mbps, Some(2800.0));
             assert!(task.profile_name.contains(configured));
             assert!(task.profile_label.contains(configured));
         }
@@ -3486,7 +2942,7 @@ mod tests {
             let pos = task.extra.iter().position(|arg| arg == "-b").unwrap();
             assert_eq!(task.extra[pos + 1], "1000000000", "腿 {} 未裁剪", leg.tag);
             assert_eq!(
-                task.offered_mbps,
+                task.offered_per_stream_mbps,
                 Some(1000.0),
                 "offered 必须跟着实际 -b 走"
             );

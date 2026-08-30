@@ -94,7 +94,28 @@ fn real_main(args: Vec<String>) -> i32 {
                 screenshot: f.contains_key("screenshot"),
                 // 命令行直跑没有复核页，不设计划闸。
                 expected_plan_hash: None,
+                // 命令行没有进度页要伺候，日志就是全部输出。
+                observer: None,
             })
+        }
+        // 从一个已有的 run 目录重新出报告。
+        //
+        // 用途按重要性排：①**崩溃恢复**——主控在第 10 小时死掉，run 目录里
+        // 有增量落盘的 rows.jsonl，用它把已完成部分的完整报告放出来；
+        // ②改了报告模板之后拿历史数据重渲染；③排查报告问题时在本地复现
+        // 用户的那一份数据。
+        "report" => {
+            let f = parse_flags(&args[1..]);
+            let dir = args[1..]
+                .iter()
+                .find(|arg| !arg.starts_with("--"))
+                .cloned()
+                .or_else(|| flag_value(&f, "dir"));
+            let Some(dir) = dir else {
+                eprintln!("用法: cpe_test report <runs/run_目录>");
+                return 2;
+            };
+            master::replay_report(std::path::Path::new(&dir))
         }
         "scan" => {
             let f = parse_flags(&args[1..]);
@@ -324,6 +345,9 @@ fn print_help() {
       --resume                24小时内已 PASS 的任务跳过
       --no-open               结束后不自动打开报告
       --prefix A.,B.          临时指定 IPv4 前缀过滤
+   cpe_test report <run目录>    从已有运行目录重放报告
+       用途: 主控崩溃后把已完成部分的完整报告放出来（结果每个单元都已落盘），
+             或改了报告模板后拿历史数据重渲染。例: cpe_test report runs/run_20260830_101112_1234
    cpe_test scan               查看本机网卡识别结果
        --prefix A.,B.
    cpe_test monitor            独立网卡速率监控 (按 Ctrl+C 停止)
@@ -337,6 +361,8 @@ fn print_help() {
   runs/run_<时间>_<进程号>/    每次运行的报告、主控日志和全部附件
     report.html               测试报告
     master.log                主控运行进度、摘要和错误
+    rows.jsonl                每个单元跑完即追加的结果明细（崩溃后靠它重放报告）
+    meta.json                 本次运行的元信息（报告抬头、计划哈希）
     iperf_outputs/            iperf3/ctsTraffic 原文、NIC CSV、截图
   task_results.json           跨运行结果库（RESUME 用）
 "#,

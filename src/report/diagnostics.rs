@@ -64,8 +64,11 @@ pub(super) fn diagnostic_availability(row: &Row) -> String {
     if !row.raw_log.is_empty() {
         available.push("原始记录".into());
     }
-    if !row.nic_samples.is_empty() {
-        available.push("网卡样本".into());
+    if !row.nic_samples_rx.is_empty() {
+        available.push("接收端网卡样本".into());
+    }
+    if !row.nic_samples_tx.is_empty() {
+        available.push("发送端网卡样本".into());
     }
     if !row.raws.is_empty() {
         available.push(format!(
@@ -188,7 +191,8 @@ pub(super) fn push_row_diagnostics(h: &mut String, row: &Row, is_ping: bool, ari
 
     let artifacts = [
         artifact_link(&row.raw_log, "独立原始记录（raw_log）"),
-        artifact_link(&row.nic_samples, "网卡逐样本 CSV"),
+        artifact_link(&row.nic_samples_rx, "接收端逐样本 CSV"),
+        artifact_link(&row.nic_samples_tx, "发送端逐样本 CSV"),
     ]
     .into_iter()
     .filter(|link| !link.is_empty())

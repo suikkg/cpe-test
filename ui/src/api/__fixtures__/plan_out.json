@@ -1,0 +1,108 @@
+{
+  "est_full_secs": 158,
+  "est_total_secs": 158,
+  "notices": [],
+  "plan_hash": "7d0926be1bddc934c303d7f606c198d0",
+  "sections": [
+    {
+      "link_set_id": "set-a",
+      "suite_id": "suite-a",
+      "task_id": "task-tcp",
+      "title": "IPERF V4 TCP -w 4m -P 10 | 主控 以太网 6(192.168.0.101, 2500Mbps) -> 辅测 WLAN 3(192.168.0.104, 2500Mbps)",
+      "unit_seqs": [
+        1
+      ]
+    },
+    {
+      "link_set_id": "set-a",
+      "suite_id": "suite-a",
+      "task_id": "task-udp",
+      "title": "IPERF V4 UDP -b 100m -l 1200 | 辅测 WLAN 3(192.168.0.104, 2500Mbps) -> 主控 以太网 6(192.168.0.101, 2500Mbps)",
+      "unit_seqs": [
+        2
+      ]
+    }
+  ],
+  "topology_fingerprint": "3351dfd16b090cb6e319ee9c72342eef",
+  "trace": [
+    {
+      "direction": "ab",
+      "effective_args": [
+        "-w",
+        "4m",
+        "-P",
+        "10"
+      ],
+      "ip": "v4",
+      "lane_id": "task-tcp",
+      "link_set_id": "set-a",
+      "pair_id": "pair-a",
+      "protocol": "tcp",
+      "recipe_id": "tcp-r",
+      "requested_args": [
+        "-w",
+        "4m",
+        "-P",
+        "10"
+      ],
+      "resumed": false,
+      "seq": 1,
+      "skipped_reason": null,
+      "suite_id": "suite-a",
+      "task_id": "task-tcp",
+      "value_sources": [
+        "suite recipe（网口策略/链路裁剪由 builder 最终决定）"
+      ]
+    },
+    {
+      "direction": "ba",
+      "effective_args": [
+        "-b",
+        "100000000",
+        "-l",
+        "1200"
+      ],
+      "ip": "v4",
+      "lane_id": "task-udp",
+      "link_set_id": "set-a",
+      "pair_id": "pair-a",
+      "protocol": "udp",
+      "recipe_id": "udp-r",
+      "requested_args": [
+        "-b",
+        "100000000",
+        "-l",
+        "1200"
+      ],
+      "resumed": false,
+      "seq": 2,
+      "skipped_reason": null,
+      "suite_id": "suite-a",
+      "task_id": "task-udp",
+      "value_sources": [
+        "suite recipe（网口策略/链路裁剪由 builder 最终决定）"
+      ]
+    }
+  ],
+  "ui_plan_supported": true,
+  "units": [
+    {
+      "est_secs": 70,
+      "load": [
+        "A→B -w 4m -P 10"
+      ],
+      "resumed": false,
+      "seq": 1,
+      "title": "IPERF V4 TCP -w 4m -P 10 | 主控 以太网 6(192.168.0.101, 2500Mbps) -> 辅测 WLAN 3(192.168.0.104, 2500Mbps)"
+    },
+    {
+      "est_secs": 88,
+      "load": [
+        "B→A -b 100 Mbps -l 1200"
+      ],
+      "resumed": false,
+      "seq": 2,
+      "title": "IPERF V4 UDP -b 100m -l 1200 | 辅测 WLAN 3(192.168.0.104, 2500Mbps) -> 主控 以太网 6(192.168.0.101, 2500Mbps)"
+    }
+  ]
+}

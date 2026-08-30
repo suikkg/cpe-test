@@ -498,6 +498,61 @@ pub(super) fn ui_task_targets(task: &UiTask) -> Option<crate::config::RateTarget
     })
 }
 
+/// 报表分组键的第一优先来源：链路集合的**名字**。
+///
+/// 名字是用户资产（他自己起的「SGMII 直连」「Wi-Fi 5G」），比任何自动推导都贴近
+/// 他心里的分组。留空时报表回落到物理网口对、再回落到角色对——**永远不用主机名**，
+/// Arch 机自报 `UNKNOWN-PC`，拿它当键会把一整批链路并成一组。
+pub(super) fn ui_link_group(link_set: &UiLinkSet) -> Option<String> {
+    let name = link_set.name.trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
+
+/// 这条 spec 是从界面计划的哪个格子来的。
+///
+/// 取代原来把七段 URL 编码塞进 `TestSpec.name` 的做法（`ui-plan/set/binding/...`）：
+/// 那是整条计划链路上唯一的 stringly 侧信道，靠约定不靠类型，而且把一个给人看的
+/// 字段占成了机器读的协议——报错信息里于是全是 `%E5%9F%BA%E7%BA%BF` 这种东西。
+pub(super) fn ui_origin_for(
+    link_set: &UiLinkSet,
+    binding_id: &str,
+    pair: &UiPairRef,
+    suite: &UiSuite,
+    task: &UiTask,
+    recipe_id: &str,
+) -> UiOrigin {
+    UiOrigin {
+        pair_id: pair.id.clone(),
+        link_set_id: link_set.id.clone(),
+        link_set_name: link_set.name.clone(),
+        binding_id: binding_id.to_string(),
+        suite_id: suite.id.clone(),
+        task_id: task.id.clone(),
+        recipe_id: recipe_id.to_string(),
+    }
+}
+
+/// `TestSpec.name` 现在只是**给人看的名字**。
+///
+/// 它会出现在 notices（「跳过 X: 原因」）、spec 错误和导出的 `config.json` 里。
+/// 之前那份 URL 编码的名字在这三处都是噪声。
+pub(super) fn ui_display_name(suite: &UiSuite, task: &UiTask, label: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    if !suite.name.trim().is_empty() {
+        parts.push(suite.name.trim());
+    }
+    if !task.name.trim().is_empty() {
+        parts.push(task.name.trim());
+    }
+    if !label.is_empty() {
+        parts.push(label);
+    }
+    if parts.is_empty() {
+        return "ui-plan".into();
+    }
+    parts.join(" · ")
+}
+
 pub(super) fn ui_task_base_spec(
     name: String,
     pair: &UiPairRef,
@@ -534,6 +589,9 @@ pub(super) fn ui_task_base_spec(
         rate_mode: task.rate_mode,
         rate_targets_mbps: task.rate_targets_mbps.clone(),
         rate_targets_bidir_mbps: ui_task_targets(task),
+        // 溯源与分组由调用方按每条 spec 填：recipe_id 逐 spec 不同。
+        link_group: None,
+        origin: None,
     }
 }
 
@@ -546,7 +604,7 @@ pub(super) fn ui_specs_for_task(
     req: &RunRequest,
     cfg: &Config,
     binding_id: &str,
-    link_set_id: &str,
+    link_set: &UiLinkSet,
 ) -> Vec<TestSpec> {
     let Some(protocol) = ui_task_protocol(task) else {
         return Vec::new();
@@ -585,17 +643,8 @@ pub(super) fn ui_specs_for_task(
             };
             for recipe in recipes {
                 for profile in recipe_tcp_profiles(recipe, &fallback_streams) {
-                    let suffix = format!(
-                        "{}/{}/{}/{}/{}/{}",
-                        ui_name_segment(link_set_id),
-                        ui_name_segment(binding_id),
-                        ui_name_segment(&pair.id),
-                        ui_name_segment(&suite.id),
-                        ui_name_segment(&task.id),
-                        ui_name_segment(&profile.recipe_id)
-                    );
                     let mut spec = ui_task_base_spec(
-                        format!("ui-plan/{suffix}/tcp-P{}", profile.streams),
+                        ui_display_name(suite, task, &format!("TCP -P {}", profile.streams)),
                         pair,
                         task,
                         "tcp",
@@ -603,6 +652,15 @@ pub(super) fn ui_specs_for_task(
                         &ips,
                         req.duration,
                     );
+                    spec.origin = Some(ui_origin_for(
+                        link_set,
+                        binding_id,
+                        pair,
+                        suite,
+                        task,
+                        &profile.recipe_id,
+                    ));
+                    spec.link_group = ui_link_group(link_set);
                     spec.tcp_streams = Some(profile.streams);
                     spec.tcp_windows = Some(profile.window.into_iter().collect());
                     out.push(spec);
@@ -672,15 +730,8 @@ pub(super) fn ui_specs_for_task(
                     };
                     let (pinned, swept): (Vec<String>, Vec<String>) =
                         directions.iter().cloned().partition(pinned_direction);
-                    let suffix = format!(
-                        "{}/{}/{}/{}/{}/{}",
-                        ui_name_segment(link_set_id),
-                        ui_name_segment(binding_id),
-                        ui_name_segment(&pair.id),
-                        ui_name_segment(&suite.id),
-                        ui_name_segment(&task.id),
-                        ui_name_segment(&profile.recipe_id)
-                    );
+                    let origin =
+                        ui_origin_for(link_set, binding_id, pair, suite, task, &profile.recipe_id);
                     if !pinned.is_empty() {
                         let pinned_key = format!(
                             "{:?}|{:?}|{}",
@@ -692,7 +743,7 @@ pub(super) fn ui_specs_for_task(
                             // every profile and are handled below.
                         } else {
                             let mut spec = ui_task_base_spec(
-                                format!("ui-plan/{suffix}/udp-pinned"),
+                                ui_display_name(suite, task, "UDP（按网口策略钉死）"),
                                 pair,
                                 task,
                                 "udp",
@@ -700,6 +751,8 @@ pub(super) fn ui_specs_for_task(
                                 &ips,
                                 req.duration,
                             );
+                            spec.origin = Some(origin.clone());
+                            spec.link_group = ui_link_group(link_set);
                             let placeholder = req
                                 .nic_policies
                                 .iter()
@@ -718,7 +771,7 @@ pub(super) fn ui_specs_for_task(
                     }
                     if !swept.is_empty() {
                         let mut spec = ui_task_base_spec(
-                            format!("ui-plan/{suffix}/udp"),
+                            ui_display_name(suite, task, "UDP"),
                             pair,
                             task,
                             "udp",
@@ -726,6 +779,8 @@ pub(super) fn ui_specs_for_task(
                             &ips,
                             req.duration,
                         );
+                        spec.origin = Some(origin.clone());
+                        spec.link_group = ui_link_group(link_set);
                         spec.udp_streams = Some(profile.streams);
                         spec.udp_profiles = Some(vec![profile.profile.clone()]);
                         out.push(spec);
@@ -740,24 +795,20 @@ pub(super) fn ui_specs_for_task(
                 task.recipe_ids.clone()
             };
             for recipe_id in selected {
-                let suffix = format!(
-                    "{}/{}/{}/{}/{}/{}",
-                    ui_name_segment(link_set_id),
-                    ui_name_segment(binding_id),
-                    ui_name_segment(&pair.id),
-                    ui_name_segment(&suite.id),
-                    ui_name_segment(&task.id),
-                    ui_name_segment(&recipe_id)
-                );
-                out.push(ui_task_base_spec(
-                    format!("ui-plan/{suffix}/ping"),
+                let mut spec = ui_task_base_spec(
+                    ui_display_name(suite, task, "PING"),
                     pair,
                     task,
                     "ping",
                     &directions,
                     &ips,
                     req.duration,
+                );
+                spec.origin = Some(ui_origin_for(
+                    link_set, binding_id, pair, suite, task, &recipe_id,
                 ));
+                spec.link_group = ui_link_group(link_set);
+                out.push(spec);
             }
         }
         _ => {}
@@ -821,7 +872,7 @@ pub(super) fn config_from_ui_plan(state: &UiState, req: &RunRequest, plan: &UiPl
                     req,
                     &cfg,
                     &binding.id,
-                    &set.id,
+                    set,
                 ));
             }
         }
@@ -918,6 +969,10 @@ pub(super) fn specs_for_pair(
         udp_profiles: None,
         rate_mode: None,
         rate_targets_mbps: None,
+        // 高级矩阵路径没有链路集合/套件的概念，溯源与分组自然为空；
+        // 报表会回落到物理网口对。
+        link_group: None,
+        origin: None,
     };
 
     // TCP 每个 -P 档位独立成一份 TestSpec：`tcp_streams` 在配置模型里是标量，
@@ -1221,16 +1276,50 @@ pub(super) fn readable_args(extra: &[String]) -> String {
 /// field and makes the preview point at the wrong suite/task.  Percent-escape
 /// every byte outside the URI unreserved set so the transform is reversible
 /// for UTF-8 as well as punctuation.
-pub(super) fn ui_name_segment(raw: &str) -> String {
-    urlencode(raw)
-}
-
+/// 只剩解码方向：编码那半边随 `TestSpec.origin` 一起退役了（ADR-8）。
+/// 这里留着是为了还能读懂**旧版本导出的** `config.json`。
 pub(super) fn ui_name_segment_decode(raw: &str) -> String {
     urldecode(raw)
 }
 
 pub(super) fn topology_fingerprint(state: &UiState) -> String {
     crate::master::plan::topology_fingerprint(&state.master, &state.agent)
+}
+
+/// 这条 spec 的界面溯源：**优先读 `TestSpec.origin`**，读不到再退回解析 `name`。
+///
+/// 回落分支只服务一种输入：用旧版本导出的 `config.json`——它的溯源信息是 URL
+/// 编码进 `name` 的（`ui-plan/<七段>`）。新导出的配置带 `origin`，走不到那里。
+/// 等到不再需要兼容旧导出，`ui_source_from_test_name` 连同 `ui_name_segment*`
+/// 一起删掉即可（ADR-8）。
+pub(super) fn ui_source_from_spec(test: &TestSpec) -> Option<UiSource> {
+    if let Some(origin) = test.origin.as_ref().filter(|origin| !origin.is_empty()) {
+        return Some(UiSource {
+            pair_id: origin.pair_id.clone(),
+            link_set_id: origin.link_set_id.clone(),
+            suite_id: origin.suite_id.clone(),
+            task_id: origin.task_id.clone(),
+            recipe_id: origin.recipe_id.clone(),
+            // 协议不进 origin：它已经被 `transports`/`kinds` 说清楚了，
+            // 再存一份就是第二个事实源。
+            protocol: spec_protocol(test).unwrap_or_default(),
+        });
+    }
+    ui_source_from_test_name(&test.name)
+}
+
+/// 一条 spec 的协议标签，取自它自己的 `kinds`/`transports`。
+pub(super) fn spec_protocol(test: &TestSpec) -> Option<String> {
+    if test
+        .kinds
+        .iter()
+        .any(|kind| kind.eq_ignore_ascii_case("ping"))
+    {
+        return Some("ping".into());
+    }
+    test.transports
+        .first()
+        .map(|transport| transport.to_ascii_lowercase())
 }
 
 pub(super) fn ui_source_from_test_name(name: &str) -> Option<UiSource> {
@@ -1357,7 +1446,7 @@ pub(super) fn compile_request(state: &UiState, req: &RunRequest) -> Result<Compi
                         &mut port,
                     );
                     notices.extend(build_notices);
-                    let source = ui_source_from_test_name(&test.name);
+                    let source = ui_source_from_spec(test);
                     // `Leg::tag` is intentionally empty for one-way units, so
                     // retain the concrete A→B/B→A direction while the named
                     // source spec is still available.  Bidirectional units
@@ -1462,6 +1551,7 @@ pub(super) fn compile_request(state: &UiState, req: &RunRequest) -> Result<Compi
         let protocol = source
             .as_ref()
             .map(|source| source.protocol.clone())
+            .filter(|protocol| !protocol.is_empty())
             .or_else(|| unit_protocol(unit));
         let direction = source_directions.get(index).cloned().flatten().or_else(|| {
             (!unit.legs.is_empty()).then(|| {

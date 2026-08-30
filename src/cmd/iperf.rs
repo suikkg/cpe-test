@@ -98,6 +98,77 @@ pub fn server_args(req: &IperfServerStartReq) -> Vec<String> {
     a
 }
 
+/// `extra` 里不许出现的 iperf3 参数，以及它们为什么是承重的。
+///
+/// `client_args` 把 `extra` 原样接在自己拼好的参数后面，而 iperf3 对重复参数是
+/// **后者覆盖前者**——也就是说 `extra` 能悄悄改掉下面这些位，而调用方拿到的
+/// 输出看起来一切正常：
+///
+/// - `-f`：解析器按 `-f m` 的输出形状读速率。换成 `-f M`（Byte）会走进另一条
+///   进制分支，`-f k`/`-f g` 则直接换了量级。
+/// - `-t`：执行侧的有效窗口、覆盖率门槛、`est_secs` 全按下发的 duration 算。
+/// - `-i`：1 秒一行是逐样本时间线（`raws`、截图对齐）的前提。
+/// - `-p` / `-B`：端口与绑定地址是资源租约和端点身份的一部分，改了它们，
+///   agent 侧记的那份 owner/lease 就对不上真实进程了。
+/// - `-c` / `-u` / `-4` / `-6`：直接改的是「这次测的到底是什么」。
+///
+/// 今天没有任何调用方会送这些进来（`master/builder.rs` 只从有类型的配置字段拼出
+/// `-w`/`-P`/`-b`/`-l`，配置里没有原样透传参数的口子），所以这条约束是**免费**的；
+/// 它挡的是以后有人加一个「自定义参数」输入框，或者直接调 agent 的
+/// `/iperf/client` 接口时，把测量口径改掉却毫无提示。照 ADR-10 的先例记为协议
+/// 不变量。详见 .ai/DESIGN-v6.0-architecture.md §4.3 R-a。
+pub const RESERVED_CLIENT_FLAGS: &[(&str, &str)] = &[
+    ("-c", "--client"),
+    ("-B", "--bind"),
+    ("-p", "--port"),
+    ("-t", "--time"),
+    ("-i", "--interval"),
+    ("-f", "--format"),
+    ("-u", "--udp"),
+    ("-4", "--version4"),
+    ("-6", "--version6"),
+];
+
+/// 找出 `extra` 里踩了 [`RESERVED_CLIENT_FLAGS`] 的参数。
+///
+/// 三种写法都要认，否则黑名单只是个摆设：分开写（`-t 5`）、粘着写（`-t5`）、
+/// 长参数带等号（`--time=5`）。大小写不折叠——iperf3 的 `-b`（速率）和 `-B`
+/// （绑定地址）是两个不同的参数，折叠了会把合法的 `-b` 一起挡掉。
+pub fn reserved_flags_in_extra(extra: &[String]) -> Vec<String> {
+    let mut hits = Vec::new();
+    for arg in extra {
+        let arg = arg.trim();
+        for (short, long) in RESERVED_CLIENT_FLAGS {
+            let glued_short = arg.len() > short.len()
+                && arg.starts_with(short)
+                && !arg[short.len()..].starts_with('-');
+            let hit = arg == *short
+                || arg == *long
+                || glued_short
+                || arg.starts_with(&format!("{long}="));
+            if hit {
+                hits.push(format!("{arg}（覆盖了 {short}/{long}）"));
+                break;
+            }
+        }
+    }
+    hits
+}
+
+/// 请求里的 `extra` 是否安全。不安全时给出可以直接回给调用方的报错。
+pub fn check_client_extra(req: &IperfClientReq) -> Result<(), String> {
+    let hits = reserved_flags_in_extra(&req.extra);
+    if hits.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "iperf3 client 的 extra 覆盖了受控参数：{}。\
+         这些位决定了输出格式、时长、采样间隔与端点身份，测量口径要靠它们；\
+         请改用请求里的 duration/port/bind_ip/udp/v6 字段，不要从 extra 绕过去。",
+        hits.join("、")
+    ))
+}
+
 pub fn client_args(req: &IperfClientReq) -> Vec<String> {
     let mut a: Vec<String> = vec![
         "-c".into(),
@@ -1835,8 +1906,95 @@ mod tests {
     ///
     /// **今天走不到这条分支**：`extra` 由 builder 从 `-w`/`-P`/`-b`/`-l`
     /// 这些有类型的配置字段拼出来，配置里没有任何「原样透传参数」的口子，
-    /// 所以下发的永远是 `-f m`。唯一能换格式的路径是直接调 agent 的
-    /// `/iperf/client` 接口。留着这条用例是因为解析器不该依赖调用方的自觉。
+    /// 所以下发的永远是 `-f m`；直接调 agent 的 `/iperf/client` 接口这条路
+    /// 现在也被 `check_client_extra` 挡住了（`-f` 在受控参数黑名单里）。
+    /// 留着这条用例是因为解析器不该依赖调用方的自觉——黑名单是请求边界上的
+    /// 约束，解析器自己也得站得住。
+    /// `extra` 不许覆盖决定测量口径的那几个参数——三种写法都要认出来。
+    ///
+    /// iperf3 对重复参数是后者覆盖前者，所以 `extra` 里一个 `-f M` 就能让解析器
+    /// 走进另一条进制分支，而调用方拿到的输出看起来一切正常。分开写、粘着写、
+    /// 长参数带等号是同一件事的三种拼法，只认第一种等于没拦。
+    #[test]
+    fn reserved_client_flags_are_caught_in_every_spelling() {
+        for spelling in [
+            "-f",
+            "-fM",
+            "--format",
+            "--format=M",
+            "-t",
+            "-t30",
+            "--time=30",
+            "-i",
+            "-i5",
+            "-p",
+            "-p5201",
+            "-B",
+            "-c",
+            "-u",
+            "-4",
+            "-6",
+            "--bind",
+            "--udp",
+        ] {
+            let hits = reserved_flags_in_extra(&[spelling.to_string()]);
+            assert_eq!(hits.len(), 1, "{spelling} 应当被挡下，实得 {hits:?}");
+        }
+    }
+
+    /// 合法的档位参数一个都不许被误伤。
+    ///
+    /// 这里最容易踩的是大小写：iperf3 的 `-b`（速率）和 `-B`（绑定地址）是两个
+    /// 不同的参数，黑名单折叠大小写就会把 builder 天天在用的 `-b` 一起挡掉。
+    #[test]
+    fn legitimate_profile_flags_are_never_mistaken_for_reserved_ones() {
+        let extra: Vec<String> = [
+            "-w",
+            "64k",
+            "-P",
+            "10",
+            "-b",
+            "2500m",
+            "-l",
+            "14k",
+            "-w",
+            "256m",
+            "-b",
+            "1000000000",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert!(
+            reserved_flags_in_extra(&extra).is_empty(),
+            "builder 拼出来的档位参数被误伤了: {:?}",
+            reserved_flags_in_extra(&extra)
+        );
+    }
+
+    /// 报错要说清「被覆盖的是哪个参数」和「该走哪个字段」，否则调用方只会重试。
+    #[test]
+    fn the_reserved_flag_error_names_the_flag_and_the_way_out() {
+        let req = IperfClientReq {
+            dst: "127.0.0.1".into(),
+            bind_ip: "127.0.0.1".into(),
+            port: 5201,
+            duration: 5,
+            udp: false,
+            v6: false,
+            extra: vec!["-f".into(), "M".into()],
+        };
+        let error = check_client_extra(&req).expect_err("-f 必须被挡下");
+        assert!(error.contains("-f"), "{error}");
+        assert!(error.contains("duration"), "报错要指出正路: {error}");
+        // 干净的请求不许被挡。
+        let clean = IperfClientReq {
+            extra: vec!["-w".into(), "4m".into(), "-P".into(), "10".into()],
+            ..req
+        };
+        assert!(check_client_extra(&clean).is_ok());
+    }
+
     #[test]
     fn byte_formatted_rates_use_the_1024_base_iperf3_actually_prints() {
         let bits =

@@ -1,8 +1,22 @@
-//! 把既有配置文件反解成界面上的勾选。
+//! 把既有配置文件反解成界面上的勾选。**已封存（ADR-13）。**
 //!
 //! 方向和 [`super::plan`] 相反：那边是「界面 → 配置」，这边是「配置 → 界面」。
-//! 两边必须互为逆运算——导入一份配置、什么都不改再导出，得到的应该是同一份
-//! 配置。做不到这一点，用户就没法拿一份线上配置当模板改。
+//!
+//! # 封存的含义
+//!
+//! 端点、DTO 和 serde 形状**全部保留**（对外 JSON 字段即兼容面），但 v6.0 的
+//! 控制台界面上**没有入口**。理由见 ADR-13：矩阵界面唯一独占的场景是「老
+//! config 在浏览器里改改再跑」，而这条路对套件计划**从来就是有损且静默的**
+//! ——`Config` 根本不承载套件，往返一次任务顺序、逐任务时长和验收目标全丢。
+//! 重建矩阵 UI 的成本恰好落在旧页 bug 最密的那一块（参数组下标级联重排、
+//! 整列开关、跨面板隐性耦合），而它救不了上面那个损失。
+//!
+//! 下面那句「两边必须互为逆运算」的老注释**对套件计划从来不成立**；
+//! `api_import` 现在会对带 `origin`/`link_group` 的配置明确推一条 notice
+//! 说明这件事，而不是继续静默降级。
+//!
+//! 需要改套件请走项目文件（`cpe-ui-project.json`）；需要跑老 config 请走
+//! 命令行 `cpe_test master --config`——那条路 v6.0 零改动。
 
 use super::*;
 
@@ -104,6 +118,29 @@ pub(super) fn api_import(console: &Arc<Console>, body: &str) -> Result<serde_jso
         state.agent_host = state.cfg.agent_host.trim().to_string();
     }
 
+    // A14 的最低补救：**套件信息在这条路上会被静默丢掉**。
+    //
+    // `ImportOut` 只回填矩阵态，而 `Config` 根本不承载套件——所以「用工作台搭好
+    // 套件 → 下载 config → 再导回来」的往返，会把任务顺序、逐任务时长、验收目标
+    // 全部降级成一张扁平矩阵，而在此之前**六条 notice 里一条都没提**。用户毫无
+    // 提示地跑出了另一份东西。
+    //
+    // 这个模块的头注释还写着「两边必须互为逆运算」——对套件计划来说，那句话
+    // 从来就不成立。`/api/import` 按 ADR-13 已经决定不再重建界面入口，这里
+    // 至少要把损失说出来。
+    if state
+        .cfg
+        .tests
+        .iter()
+        .any(|test| test.origin.is_some() || test.link_group.is_some())
+    {
+        notices.push(
+            "这份配置是从「快速工作台」的套件计划导出来的：套件的任务顺序、逐任务时长和\
+             验收目标在扁平 config.json 里表示不了，导入后只剩一张矩阵。要改套件请回工作台\
+             用项目文件（cpe-ui-project.json），不要走 config.json 往返。"
+                .into(),
+        );
+    }
     if state.cfg.pairs.is_some() || state.cfg.universal_params.is_some() {
         notices.push(
             "文件用的是 pairs/universal_params 自动配对，界面矩阵是逐对勾选的，表示不了；\

@@ -10,7 +10,7 @@ SHA-256。不这样的话每次重打都会换一个校验值，`.sha256` 就失
 
 用法：
     python3 dist/build_config_docs_bundle.py            # 版本号从 Cargo.toml 读
-    python3 dist/build_config_docs_bundle.py 4.6.0      # 或显式指定
+    python3 dist/build_config_docs_bundle.py 6.0.0      # 或显式指定
 """
 
 import hashlib

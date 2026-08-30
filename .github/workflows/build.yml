@@ -81,14 +81,14 @@ jobs:
           from pathlib import Path
           from zipfile import ZipFile
 
-          bundle = Path("dist/cpe_test-v4.6.0-windows-config-docs.zip")
+          bundle = Path("dist/cpe_test-v6.0.0-windows-config-docs.zip")
           checksum = Path(f"{bundle}.sha256")
           expected_hash = checksum.read_text(encoding="utf-8").split()[0]
           actual_hash = sha256(bundle.read_bytes()).hexdigest()
           if actual_hash != expected_hash:
               raise SystemExit(f"bundle SHA-256 mismatch: {actual_hash}")
 
-          prefix = "cpe_test-v4.6.0-windows-config-docs"
+          prefix = "cpe_test-v6.0.0-windows-config-docs"
           source_for = {
               "Windows配置与文档包说明.md": Path("dist/Windows配置与文档包说明.md"),
               "README.md": Path("README.md"),
@@ -139,8 +139,94 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked --all-targets -- -D warnings
 
+  # 前端源码的门槛。产物本身是提交进仓库的，`cargo build` 永远不跑 Node，
+  # 所以这个 job 守的是「ui/ 里那份手写源码本身过得去」：类型检查、分层规则、
+  # 纯逻辑单测、以及产物的四条不变量。
+  #
+  # 「产物是不是从当前源码来的」不在这里守——那条由 quality 里的
+  # `the_embedded_page_was_built_from_the_current_ui_sources` 用溯源戳守着，
+  # 它不需要 Node，本地 `cargo test` 就会红。
+  ui:
+    name: UI (frontend sources)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # 钉大版本。本地不强制同一个小版本：溯源戳只比源码不比产物字节，
+      # 所以 Node 小版本差异不会产生假红。
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Install (locked)
+        working-directory: ui
+        run: npm ci
+
+      - name: Unit tests
+        working-directory: ui
+        run: npm run test
+
+      # build = vue-tsc --noEmit && lint-arch && vite build && emit
+      - name: Build
+        working-directory: ui
+        run: npm run build
+
+      # verify = lint-arch && emit --check。构建刚跑完，这一步实际在复核
+      # 「最终产物仍然满足四条不变量」，顺带保证 verify 这条路本身没坏
+      # （提交前自查用的就是它）。
+      - name: Verify artifact invariants
+        working-directory: ui
+        run: npm run verify
+
+  # 产物字节可复现性的**观察**用 job，不阻塞。
+  #
+  # 「同样的源码在另一台机器上构建出逐字节相同的产物」是个未经验证的假设
+  # （esbuild 跨版本/跨平台的字节确定性没人替我们保证过）。把它直接做成硬门槛，
+  # 第一次红的时候没人分得清是真出了问题还是假设本来就不成立。所以先跑满一个
+  # 发布周期只报告，再决定要不要提级。
+  #
+  # 跑 macOS 而不是 Windows：Windows runner 默认 core.autocrlf=true，工作区
+  # 文件会带 CRLF，字节比对必然假红（.gitattributes 已经把这两处钉成 LF，
+  # 但没必要让这个观察 job 去依赖它）。
+  ui-repro:
+    name: UI reproducibility (report only)
+    runs-on: macos-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: ui/package-lock.json
+
+      - name: Install (locked)
+        working-directory: ui
+        run: npm ci
+
+      - name: Rebuild
+        working-directory: ui
+        run: npm run build
+
+      - name: Report byte differences against the committed artifact
+        shell: bash
+        run: |
+          set -uo pipefail
+          if git diff --quiet -- src/master/webui.html; then
+            echo "产物逐字节可复现：这台 runner 重建的结果与仓库里的完全一致。"
+          else
+            echo "::warning::产物字节与仓库里的不同。这**不是**失败——溯源戳保证的是"
+            echo "::warning::「产物来自当前源码」，不是「跨机器字节一致」。这里只做观察记录。"
+            git diff --stat -- src/master/webui.html
+          fi
+
   build:
-    needs: quality
+    # 发布产物里内嵌的就是 src/master/webui.html。前端源码过不去时不该出包——
+    # ui-repro 只是观察，不进来。
+    needs: [quality, ui]
     strategy:
       fail-fast: false
       matrix:
@@ -542,7 +628,19 @@ jobs:
           body: |
             cpe_test ${{ github.ref_name }} 的已验证跨平台发布包。
 
-            ## v4.6.0 掉速判定回到真实秒数、原因码类型化与执行计划闸门
+            ## v6.0.0 结构化进度、结果落盘可重放、判定装配收敛与 Vue 控制台
+
+            - **结果每个单元跑完就落盘**（`runs/<run>/rows.jsonl`）。此前一轮测试的全部明细活在内存里直到最后一刻才写报告——主控在第 10 小时崩溃/断电/被 kill，十小时的测量数据、原因码、方向明细全部蒸发，只剩 `task_results.json` 里的单元级 PASS 布尔。现在 `cpe_test report runs/<目录>` 能把已完成部分重放成完整的 `report.html` 和 `summary.xlsx`；崩溃的损失从「整轮」变成「未完成的那些单元」。重跑时加 `--resume` 会跳过 24 小时内已 PASS 的。
+            - **进度不再是日志文本**。控制台的单元级进度、计数、失败清单、ETA 过去要靠前端解析 `[i/total]` 和「==> 单元结果:」两种日志行——一次 11.5 小时的测试有三万行日志，刷新一次页面就要全量重放。现在服务端直接吐结构化 `RunStatus`，日志只给人看，文案可以随便改。报告路径也由回调直接送出，不再靠在日志里搜「报告已生成: 」。
+            - **判定装配层收敛，四处行为变更**（详见 `.ai/CHANGES-v6.0-verdict.md`）：腿级判定此前有三份实现并且已经对同一事实给出不同结论。① Observe/Discover 下 UDP 腿不再拿目标判 `RATE_FAIL`——`Discover` 本来就是故意分阶梯灌不满的模式，拿目标判它的 FAIL 是结构性误判；② 「工具没产生吞吐测量」三条链统一为 `SETUP_ERROR`（此前 iperf 单腿判 `RATE_FAIL`）——那是执行环境的事实，不是被测设备的性能结论；③ TCP/CTS 链获得「发送端没灌够」的防误判，此前只有 UDP 链有，CTS UDP 单流灌不满时会把发送端瓶颈写成 CPE 性能失败；④ UDP 有效窗口获得与 iperf/CTS 相同的 100ms 容差，179.95 秒不再判 `EFFECTIVE_WINDOW_SHORT`。**建议上线后首轮与旧版并跑一次比对。**
+            - **Excel 汇总报告**：`summary.xlsx`，概览 / 逐行明细 / 按链路分组 / 失败清单四张表。速率和覆盖率是数值单元格，可以直接排序和做透视表。
+            - **历史运行页与报告打包下载**：`--ui-bind` 之后远程访问者此前**永远拿不到报告**——`打开报告` 只在跑控制台那台机器上调系统程序。现在控制台有「历史运行」页，每轮一个「下载包」，把整个 run 目录（报告 + 截图 + 逐样本 CSV + 原始输出）打成 zip 取回本地。
+            - **发送端逐样本 CSV 现在会落盘**。TX 采样是否决性门槛（覆盖率不够整行判 `NOT_EVALUATED`），可是那份 TX 样本此前谁也拿不到——「报告里的每个结论都要能回到某一行样本」对 TX 不成立。报告里 RX/TX 两个链接现在分开给。
+            - **控制台改用 Vue 重写**：本机 / 辅测机 / 测试计划 / 执行 / 进度 / 监控 / 历史运行七个区。计划复核树直接渲染服务端算好的层级与溯源（旧页把这两份数据丢弃后自己重拼分组）；计划草稿自动存本地，误刷新不再让一份配了半天的计划归零；监控曲线的四条口径问题（X 轴、点数上限、读数窗口、尖峰保留）全部有测试钉住不许回归。
+            - **`UiRecipe.mode` 明确拒绝**：这个字段被校验却从不被计划编译器读取，`fixed` 与 `scan` 产出同一份计划——用户以为钉死一档，实际三条轴全展开、耗时三倍。现在预览会拒绝并说清改法；从界面导入项目文件时会自动抹掉它（那是旧版界面自己写进去的）。
+            - **iperf3 的 `extra` 不再能覆盖受控参数**（`-f`/`-t`/`-i`/`-p`/`-B`/`-c`/`-u`/`-4`/`-6`）。这些位决定输出格式、时长、采样间隔与端点身份，被覆盖后输出看起来一切正常而测量口径已经变了。
+
+            ## v6.0.0 掉速判定回到真实秒数、原因码类型化与执行计划闸门
 
             - **掉速判定改判在原始逐样本序列上**：此前判的是「某个 5 秒滑动平均越过门限」，和注释宣称的「有完整 5 秒掉到门限以下」不是一回事。滑动平均会把一次 1 秒的掉速摊进 5 个相邻窗口，于是一个采样周期的抖动（Wi-Fi 发 probe 就会掉一拍）就足以让整行 `RATE_FAIL`，而且报出来的「最长连续」= 真实秒数 + 4 秒。run_20260828_162822_17788 的 unit-109-110 是最干净的例子：整段 180 秒里只有一秒从 2270 掉到 1499Mbps，报告却写「最长连续 5.0 秒 / 业务上那几秒就是断的」，对着 iperf 截图根本找不到。现在越界必须自己**连续够 5 秒**才算数，报出来的秒数就是真秒数；不够 5 秒的单点抖动一律忽略——它和 probe、信道扫描在网卡计数器上不可区分。
             - **两档形态分开发码**：`RX_OUTAGE`（连续 ≥5 秒速率基本为 0，链路真断了）与 `RX_DROPOUT`（连续 ≥5 秒掉到门限的 80% 以下，没断但不够用），排查方向不同就不该共用一个码。门限带 20% 容差，1973 vs 2000 这种噪声量级不再判 FAIL。

@@ -173,25 +173,17 @@ impl Ctx {
             format!("$ {}\n{}", out.cmd, out.raw)
         };
         let idx = self.push_row(Row {
-            sort_key: (useq, lidx, 0, 0),
             time,
-            task_id: md5_hex(&format!("{}|{}|ping", unit.id, tag)),
-            parent_id: unit.id.clone(),
-            task: unit.title.clone(),
-            ip: if t.v6 { "V6".into() } else { "V4".into() },
+            // 展示用的 transport 列对 ping 一直是空的（协议写在标题里），
+            // 类型化的 `protocol` 才是 ICMP。这里不借类型化顺手改报告的可见列。
             transport: String::new(),
-            param: format!("-l {}", t.payload),
-            src_pc: t.src.pc.clone(),
-            src_iface: t.src.nic.name.clone(),
+            // ping 用的是实际解析出来的地址（v6 带 %zone），不是网卡的 ipv4。
             src_ip: src_addr,
-            dst_pc: t.dst.pc.clone(),
-            dst_iface: t.dst.nic.name.clone(),
             dst_ip: dst_addr,
             verdict,
             execution_status,
             reason_code,
             reason_detail: reason_detail.clone(),
-            kind_label,
             ping_loss: (!gateway_missing && exec_kind.is_none()).then_some(out.loss_pct),
             ping_min: (!gateway_missing && exec_kind.is_none())
                 .then_some(out.rtt_min)
@@ -204,7 +196,22 @@ impl Ctx {
                 .flatten(),
             command: out.cmd.clone(),
             raws: vec![(format!("ping{} 输出", fmt_tag(tag)), raw_text)],
-            ..Default::default()
+            ..base_row(RowIdentity {
+                unit_seq: useq,
+                leg_index: lidx,
+                stream_index: 0,
+                group_flag: 0,
+                unit,
+                leg_tag: tag,
+                src: &t.src,
+                dst: &t.dst,
+                ip: if t.v6 { "V6".into() } else { "V4".into() },
+                protocol: RowProtocol::Icmp,
+                backend: RowBackend::Ping,
+                param: format!("-l {}", t.payload),
+                kind_label,
+                task_id: md5_hex(&format!("{}|{}|ping", unit.id, tag)),
+            })
         });
         LegOutcome {
             judgement: VerdictResult::new(verdict, reason_code, reason_detail),

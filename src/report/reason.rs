@@ -119,6 +119,8 @@ pub(super) fn validate_rate_reason(
             ),
             _ => metric_reason_mismatch(code, "缺少 RX 平均或目标，无法核对该判定"),
         },
+        // 已退役的码：执行侧不再产出，这条分支只服务于「拿历史数据重渲染」。
+        // 详见 `reason::ReasonCode::RxUnstable` 的注释。
         ReasonCode::RxUnstable => match (rx_avg, rx_p10, target_mbps) {
             (Some(rx), Some(rx_p10), Some(target)) if rx >= target && rx_p10 < target => format!(
                 "RX_UNSTABLE: RX 平均 {rx:.3} Mbps >= 目标 {target:.3} Mbps，RX-P10 {rx_p10:.3} Mbps < 目标 {target:.3} Mbps"

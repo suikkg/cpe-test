@@ -55,7 +55,7 @@
   PING `n=180 × 32/1600/65500`）。展开约 210 个单元、预计 11.5 小时。两份文件都有测试
   钉着：具名配置要能过真正的加载与校验路径，项目文件要能在它自己声明的拓扑上编译成计划。
 
-## v4.6.0
+## v6.0.0
 
 - **掉速判定改判在原始逐样本序列上**：此前判的是「某个 5 秒滑动平均越过门限」，
   和它自己注释宣称的「有完整 5 秒掉到门限以下」不是一回事。滑动平均会把一次 1 秒的
@@ -494,7 +494,7 @@ CPE（Customer Premises Equipment）子网测试工具用于在**两台电脑之
 ```
 cpe_test.exe          ← 本工具（单文件）
 iperf3.exe            ← 从 iperf.fr 下载（只测 Ping/ctsTraffic 可不放）
-ctsTraffic.exe        ← v4.6.0 Windows Release 已捆绑（仅 Windows 10+）
+ctsTraffic.exe        ← v6.0.0 Windows Release 已捆绑（仅 Windows 10+）
 start_agent.bat       ← 辅测机双击
 start_ui.bat          ← 主控机双击（图形控制台，推荐）
 start_master.bat      ← 主控机双击（命令行问答式）
@@ -581,6 +581,12 @@ cpe_test master             主控发起测试
     --no-open               结束后不自动打开报告
     --screenshot            每个吞吐任务后截图
     --prefix A.,B.          临时指定 IPv4 前缀过滤
+
+cpe_test report <run目录>    从已有运行目录重放报告
+    用途：主控崩溃/断电后，把已完成部分的完整报告放出来——结果在每个单元跑完
+          时就已经追加落盘到 runs/<run>/rows.jsonl；也可用于改了报告模板后拿
+          历史数据重新渲染。会同时重放 report.html 和 summary.xlsx。
+    例：cpe_test report runs/run_20260830_101112_1234
 
 cpe_test scan               查看本机网卡识别结果
     --prefix A.,B.
@@ -1117,6 +1123,9 @@ UNKNOWN          以上都不匹配
 ```text
 runs/run_日期时间_进程号/
 ├── report.html
+├── summary.xlsx          Excel 汇总（概览 / 逐行明细 / 按链路分组 / 失败清单）
+├── rows.jsonl            每个单元跑完即追加的结果明细
+├── meta.json             本次运行的元信息（报告抬头、计划哈希）
 ├── master.log
 └── iperf_outputs/
     ├── iperf_raw_*.log
@@ -1124,6 +1133,17 @@ runs/run_日期时间_进程号/
     ├── nic_samples_*.csv
     └── screenshot_*.png
 ```
+
+`rows.jsonl` 是**增量落盘**的：每个测试单元跑完就把该单元的结果行追加进去，
+不等整轮结束。所以主控中途崩溃/断电/被 kill 之后，已完成部分的完整测量数据
+（速率、原因码、方向明细、样本文件引用）都还在，用
+
+```bash
+cpe_test report runs/run_日期时间_进程号
+```
+
+就能把它重放成 `report.html` 和 `summary.xlsx`。崩溃的损失因此是「未完成的那些
+单元」，而不是整轮——重跑时加 `--resume` 会跳过 24 小时内已 PASS 的单元。
 
 每个灌包单元完成并回收进程后，会在该 run 目录的 `iperf_outputs/` 保存：
 
@@ -1257,7 +1277,7 @@ cargo build --release --locked
 
 自行编译后，把 `cpe_test.exe`、启动脚本和所需吞吐工具放到两台 Windows 电脑同一目录：
 iperf3 测试需要完整的 iperf3 Windows 发行包；ctsTraffic 测试需要 `ctsTraffic.exe`。
-官方 v4.6.0 Windows Release ZIP 已捆绑固定且校验过的 ctsTraffic 2.0.4.0，但由于发行包差异不内置 iperf3。
+官方 v6.0.0 Windows Release ZIP 已捆绑固定且校验过的 ctsTraffic 2.0.4.0，但由于发行包差异不内置 iperf3。
 
 ### GitHub Actions CI
 
@@ -1280,7 +1300,7 @@ Windows ZIP 包含启动脚本、四份配置、固定 CTS 二进制和第三方
 `tar.gz` 保留 `cpe_test` 可执行位。发布作业会再次核对资产名称、数量、内部结构和哈希。
 
 仓库同时跟踪一份不含可执行程序的
-[`cpe_test-v4.6.0-windows-config-docs.zip`](dist/cpe_test-v4.6.0-windows-config-docs.zip)，
+[`cpe_test-v6.0.0-windows-config-docs.zip`](dist/cpe_test-v6.0.0-windows-config-docs.zip)，
 便于直接从 Git 下载 Windows 配置、文档和启动脚本。其 SHA-256 位于同目录的
 `.zip.sha256` 文件；CI 会逐文件确认压缩包内容与仓库源文件一致。需要开箱即用的程序、
 固定版 ctsTraffic 和许可证全集时，仍应下载上面的正式 Windows Release ZIP。

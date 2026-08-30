@@ -5,6 +5,19 @@
 
 use super::*;
 
+/// 会话 id 的唯一来源。
+///
+/// 这里必须带一个进程内递增的序号：曾经的写法是 `mon-<pid>-<毫秒>`，而
+/// `UI_WORKERS = 4` 意味着两次 `/api/monitor/start` 完全可能落在同一毫秒上。
+/// 撞了之后 `HashMap::insert` 会**静默**顶掉前一条会话——被顶掉的那条再也没人
+/// 能 `stop` 它（表里查不到 id 了），它的采样线程要一直跑到 90 秒空闲超时，
+/// 辅测机侧的 monitor 资源也跟着多占一截。序号让碰撞在结构上不可能。
+pub(super) fn next_monitor_session_id() -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    format!("mon-{}-{}-{}", std::process::id(), now_millis(), seq)
+}
+
 #[derive(Debug, Deserialize)]
 pub(super) struct MonitorStartUiReq {
     /// "master" 或 "agent"。
@@ -85,7 +98,7 @@ pub(super) fn api_monitor_start(
         ..Default::default()
     }));
     let stop = Arc::new(AtomicBool::new(false));
-    let session = format!("mon-{}-{}", std::process::id(), now_millis());
+    let session = next_monitor_session_id();
 
     match req.side.as_str() {
         "master" => spawn_local_monitor(iface.clone(), interval_ms, &stop, &data),

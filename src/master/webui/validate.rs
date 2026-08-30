@@ -266,18 +266,24 @@ pub(super) fn validate_ui_recipe(
     if recipe.id.trim().is_empty() {
         return Err(format!("{protocol} 配置 {} 缺少稳定 id", index + 1));
     }
-    if recipe.mode.trim().is_empty()
-        || matches!(
-            recipe.mode.trim().to_ascii_lowercase().as_str(),
-            "fixed" | "scan"
-        )
-    {
-        // Empty mode is the default fixed mode.  Other modes are rejected
-        // below, but keep this branch explicit for readable diagnostics.
-    } else {
+    // `mode` 是个**死字段**：校验器过去只准 fixed/scan 两个取值，而编译器
+    // （`webui/plan.rs`）从头到尾不读它——`fixed` 和 `scan` 产出的是**同一份计划**。
+    // 用户以为 `fixed` 把档位钉死成一档，实际三条轴全展开、耗时三倍。
+    //
+    // 不实现它、而是拒绝它：fixed/scan 的语义已经由轴的取值个数天然表达
+    // （单值 = 钉死，多值 = 扫描），mode 只是个冗余开关。同一个校验器为 PING
+    // 配方写下过完全一样的判断（「让字段看起来可配置而被静默忽略」正是要拒绝的
+    // 形状），这里跟上那个先例。详见 .ai/DESIGN-v6.0-architecture.md ADR-16。
+    //
+    // serde 字段保留，所以老项目文件仍能被解析——只是会在这里被明确挡下并告诉
+    // 用户怎么改，而不是继续静默地跑出另一份东西。
+    if !recipe.mode.trim().is_empty() {
         return Err(format!(
-            "{protocol} 配置 {} 的 mode 只支持 fixed 或 scan",
-            recipe.id
+            "{protocol} 配置 {} 的 mode 字段已废弃（当前值 {:?}）：档位由轴的取值个数决定，\
+             单值就是钉死、多值就是扫描，mode 从来没有被计划编译器读过。\
+             把这一行从项目文件里删掉即可。",
+            recipe.id,
+            recipe.mode.trim()
         ));
     }
     if protocol == "tcp" {
@@ -487,6 +493,33 @@ pub(super) fn validate_ui_plan(state: &UiState, plan: &UiPlan) -> Result<(), Str
         return Err("ui_plan 至少需要一个 binding".into());
     }
 
+    // 哪些网口对**真的会被跑到**：拓扑相关的检查只对它们硬失败。
+    //
+    // 这一段修的是一处不对称：下面那个循环过去对**所有** link_set 的每个
+    // pair_ref 都做端点存在性与解析，一个没人引用的草稿集合里躺着一条失效的
+    // 网口对，就能把整份请求顶掉，报错还指向用户根本没打算跑的集合。而同一个
+    // 函数的注释、以及 `使用说明.md`，承诺的都是「未绑定集合里的失效对只是提示，
+    // 不会阻止另一套可执行分配」。测试当时只覆盖了「空草稿」，没覆盖「非空但含
+    // 失效对的草稿」，所以这条承诺一直是破的。
+    //
+    // 口径与文档逐字对齐：整组绑定 ⇒ 该集合的全部对；`pair_ids` 明确选中 ⇒ 只有
+    // 被选中的那几条。形状类检查（id 缺失/重复、端点串为空、源目标同一个串）不在
+    // 此列——它们不看拓扑，任何集合里出现都是数据错误，照旧全量检查。
+    let mut referenced_all: HashSet<&str> = HashSet::new();
+    let mut referenced_pairs: HashSet<(&str, &str)> = HashSet::new();
+    for binding in &plan.bindings {
+        if binding.pair_ids.is_empty() {
+            referenced_all.insert(binding.link_set_id.as_str());
+        } else {
+            for pair_id in &binding.pair_ids {
+                referenced_pairs.insert((binding.link_set_id.as_str(), pair_id.as_str()));
+            }
+        }
+    }
+    let is_referenced = |set_id: &str, pair_id: &str| {
+        referenced_all.contains(set_id) || referenced_pairs.contains(&(set_id, pair_id))
+    };
+
     let mut ids = HashSet::new();
     for (index, set) in plan.link_sets.iter().enumerate() {
         if set.id.trim().is_empty() || !ids.insert(set.id.clone()) {
@@ -498,12 +531,21 @@ pub(super) fn validate_ui_plan(state: &UiState, plan: &UiPlan) -> Result<(), Str
             if pair.id.trim().is_empty() || !pair_ids.insert(pair.id.clone()) {
                 return Err(format!("link_set {} 的 pair_ref id 缺失或重复", set.id));
             }
-            if pair.src.trim().is_empty()
-                || pair.dst.trim().is_empty()
-                || pair.src == pair.dst
-                || !ui_endpoint_exists(state, &pair.src)
-                || !ui_endpoint_exists(state, &pair.dst)
-            {
+            if pair.src.trim().is_empty() || pair.dst.trim().is_empty() || pair.src == pair.dst {
+                return Err(format!(
+                    "link_set {} 的 pair_ref {} 端点为空或源目标相同：{} -> {}",
+                    set.id,
+                    pair_index + 1,
+                    pair.src,
+                    pair.dst
+                ));
+            }
+            if !is_referenced(&set.id, &pair.id) {
+                // 未被任何 binding 选中：拓扑对不上只是草稿的事，界面会把它标成
+                // 「端点已消失」，不该挡下别人的可执行分配。
+                continue;
+            }
+            if !ui_endpoint_exists(state, &pair.src) || !ui_endpoint_exists(state, &pair.dst) {
                 return Err(format!(
                     "link_set {} 的 pair_ref {} 已失效：{} -> {}",
                     set.id,
@@ -555,6 +597,7 @@ pub(super) fn validate_ui_plan(state: &UiState, plan: &UiPlan) -> Result<(), Str
         // referenced by a binding is checked below and must still contain at
         // least one pair; keeping the distinction here avoids rejecting an
         // otherwise runnable plan merely because an unused draft is present.
+        // 同理，非空但**未被引用**的草稿里那些失效的网口对，上面已经跳过了。
     }
 
     // Recipe IDs are global across protocol buckets so a binding remains

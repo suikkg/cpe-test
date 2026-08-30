@@ -10,10 +10,11 @@
 //! configs.json 用法、resume 断点续跑全都不动，控制台只是 config 的图形编辑器
 //! 加进度视图——多一条执行路径就多一处会和判定口径分叉的地方。
 
-use crate::config::{load_config, Config, OneOrMany, TestSpec, UdpProfile};
+use crate::config::{load_config, Config, OneOrMany, TestSpec, UdpProfile, UiOrigin};
 use crate::http_client;
 use crate::master::builder::{self, build_units};
 use crate::master::executor::{ResultDb, RESUME_MAX_AGE_HOURS};
+use crate::master::run_status::{RunStatus, RunStatusRecorder};
 use crate::master::ui::{run_master, MasterOpts};
 use crate::protocol::{HealthOut, HostInfo, InfoReq, Resp};
 use crate::util::{clear_log_mirror, lock_recover, log_tail_since};
@@ -21,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tiny_http::{Header, Method, Request, Response, Server};
@@ -76,6 +77,7 @@ pub fn run(opts: UiOpts) -> i32 {
         report: Mutex::new(String::new()),
         ui_token: ui_token.clone(),
         monitors: Mutex::new(HashMap::new()),
+        run_status: Arc::new(RunStatusRecorder::new()),
     });
 
     // 默认仍只监听回环。放开要靠显式的 --ui-bind，且上面已经拦掉了
@@ -152,6 +154,7 @@ mod import;
 mod model;
 mod monitor;
 mod plan;
+mod runs;
 mod state;
 mod validate;
 

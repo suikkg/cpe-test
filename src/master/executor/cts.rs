@@ -1026,6 +1026,7 @@ impl Ctx {
         }
 
         let rx_origin_offset_ms = mon_id.as_ref().map(|(_, offset)| *offset).unwrap_or(0);
+        let tx_origin_offset_ms = tx_mon_id.as_ref().map(|(_, offset)| *offset).unwrap_or(0);
         let mon_out = match mon_id {
             Some((id, start_offset_ms)) => match self.mon_stop(task.dst.side, &id) {
                 Ok(mut output) => {
@@ -1096,7 +1097,7 @@ impl Ctx {
             })
             .unwrap_or_default();
         let rx_avg = rx_stats.avg_mbps;
-        let nic_samples = mon_out
+        let nic_samples_rx = mon_out
             .as_ref()
             .map(|output| {
                 self.save_monitor_samples(
@@ -1105,6 +1106,20 @@ impl Ctx {
                     &task.dst.nic.name,
                     &task.dst.key(),
                     rx_origin_offset_ms,
+                    output,
+                )
+            })
+            .unwrap_or_default();
+        // 同 iperf 路径：TX 采样是否决性门槛，样本必须能被回查。
+        let nic_samples_tx = tx_mon_out
+            .as_ref()
+            .map(|output| {
+                self.save_monitor_samples(
+                    lifecycle.owner_id,
+                    task.src.side,
+                    &task.src.nic.name,
+                    &task.src.key(),
+                    tx_origin_offset_ms,
                     output,
                 )
             })
@@ -1252,7 +1267,19 @@ impl Ctx {
             // 丢帧判定必须排在网卡采样/目标可信度之后，与 iperf3 路径的判定链
             // 一致：采样不足或目标未知时先产出 NOT_EVALUATED / MEASURED，不能
             // 拿一个无法核对的窗口去判 RATE_FAIL。
-            let nic = evaluate_nic_rx(task.rate_mode, task.rx_target_mbps, &rx_stats, &tx_stats);
+            // offered 门槛此前**只有 UDP 链有**：CTS UDP 单流灌不满时
+            // `RX < target` 直接判 RX_BELOW_TARGET，正是 UDP 链两个单测拼命
+            // 要防的「把发送端瓶颈写成 CPE 性能失败」，在这条路上零防护。
+            let nic = evaluate_nic_rx(
+                task.rate_mode,
+                task.rx_target_mbps,
+                &rx_stats,
+                &tx_stats,
+                crate::master::rate_window::offered_floor_mbps(
+                    task.rx_target_mbps,
+                    self.cfg.iperf.rate_check.offered_headroom_pct,
+                ),
+            );
             cts_apply_udp_loss(nic, task.udp, loss_limit, loss)
         };
         let mut raw_diagnostics = Vec::new();
@@ -1302,24 +1329,14 @@ impl Ctx {
             ));
         }
         let idx = self.push_row(Row {
-            sort_key: (useq, lidx, 0, 0),
             time,
-            task_id: md5_hex(&format!("{}|{}|ctstraffic", unit.id, tag)),
-            parent_id: unit.id.clone(),
-            task: unit.title.clone(),
-            ip: if task.v6 { "V6".into() } else { "V4".into() },
+            // CTS 的 transport 列一直写成 `CTS/TCP` / `CTS/UDP`（后端信息混在里面）。
+            // 类型化之后后端进了 `backend`，但可见列保持原样，不借重构改报告。
             transport: if task.udp {
                 "CTS/UDP".into()
             } else {
                 "CTS/TCP".into()
             },
-            param: task.profile_label.clone(),
-            src_pc: task.src.pc.clone(),
-            src_iface: task.src.nic.name.clone(),
-            src_ip: task.src.nic.ipv4.clone(),
-            dst_pc: task.dst.pc.clone(),
-            dst_iface: task.dst.nic.name.clone(),
-            dst_ip: task.dst.nic.ipv4.clone(),
             verdict,
             execution_status: if verdict == Verdict::SetupError {
                 if selected.client.cancelled {
@@ -1336,18 +1353,14 @@ impl Ctx {
             },
             reason_code,
             reason_detail: reason_detail.clone(),
-            kind_label: if unit.bidir {
-                format!("★★双向 CTS Traffic-{tag}")
-            } else {
-                "CTS Traffic 灌包".into()
-            },
             rx_avg,
             tx_mbps: parsed.send_mbps,
             rx_mbps: parsed.recv_mbps,
             udp_loss: loss,
             command: selected.client.cmd.clone(),
             raw_log,
-            nic_samples,
+            nic_samples_rx,
+            nic_samples_tx,
             requested_streams,
             active_streams,
             required_streams,
@@ -1366,7 +1379,30 @@ impl Ctx {
             screenshot_master,
             screenshot_agent,
             raws,
-            ..Default::default()
+            ..base_row(RowIdentity {
+                unit_seq: useq,
+                leg_index: lidx,
+                stream_index: 0,
+                group_flag: 0,
+                unit,
+                leg_tag: tag,
+                src: &task.src,
+                dst: &task.dst,
+                ip: if task.v6 { "V6".into() } else { "V4".into() },
+                protocol: if task.udp {
+                    RowProtocol::Udp
+                } else {
+                    RowProtocol::Tcp
+                },
+                backend: RowBackend::CtsTraffic,
+                param: task.profile_label.clone(),
+                kind_label: if unit.bidir {
+                    format!("★★双向 CTS Traffic-{tag}")
+                } else {
+                    "CTS Traffic 灌包".into()
+                },
+                task_id: md5_hex(&format!("{}|{}|ctstraffic", unit.id, tag)),
+            })
         });
         LegOutcome {
             judgement: VerdictResult::new(verdict, reason_code, reason_detail),
@@ -1389,36 +1425,44 @@ impl Ctx {
         reason_detail: String,
     ) -> LegOutcome {
         let idx = self.push_row(Row {
-            sort_key: (useq, lidx, 0, 0),
             time,
-            task_id: md5_hex(&format!("{}|{}|ctstraffic", unit.id, tag)),
-            parent_id: unit.id.clone(),
-            task: unit.title.clone(),
-            ip: if task.v6 { "V6".into() } else { "V4".into() },
+            // CTS 的 transport 列一直写成 `CTS/TCP` / `CTS/UDP`（后端信息混在里面）。
+            // 类型化之后后端进了 `backend`，但可见列保持原样，不借重构改报告。
             transport: if task.udp {
                 "CTS/UDP".into()
             } else {
                 "CTS/TCP".into()
             },
-            param: task.profile_label.clone(),
-            src_pc: task.src.pc.clone(),
-            src_iface: task.src.nic.name.clone(),
-            src_ip: task.src.nic.ipv4.clone(),
-            dst_pc: task.dst.pc.clone(),
-            dst_iface: task.dst.nic.name.clone(),
-            dst_ip: task.dst.nic.ipv4.clone(),
             verdict: Verdict::SetupError,
             execution_status: ExecutionStatus::Error,
             reason_code,
             reason_detail: reason_detail.clone(),
-            kind_label: if unit.bidir {
-                format!("★★双向 CTS Traffic-{tag}")
-            } else {
-                "CTS Traffic 灌包".into()
-            },
             requested_streams: task.streams as usize,
             raws: vec![("ctsTraffic 启动错误".into(), reason_detail.clone())],
-            ..Default::default()
+            ..base_row(RowIdentity {
+                unit_seq: useq,
+                leg_index: lidx,
+                stream_index: 0,
+                group_flag: 0,
+                unit,
+                leg_tag: tag,
+                src: &task.src,
+                dst: &task.dst,
+                ip: if task.v6 { "V6".into() } else { "V4".into() },
+                protocol: if task.udp {
+                    RowProtocol::Udp
+                } else {
+                    RowProtocol::Tcp
+                },
+                backend: RowBackend::CtsTraffic,
+                param: task.profile_label.clone(),
+                kind_label: if unit.bidir {
+                    format!("★★双向 CTS Traffic-{tag}")
+                } else {
+                    "CTS Traffic 灌包".into()
+                },
+                task_id: md5_hex(&format!("{}|{}|ctstraffic", unit.id, tag)),
+            })
         });
         LegOutcome {
             judgement: VerdictResult::setup_error(reason_code, reason_detail),

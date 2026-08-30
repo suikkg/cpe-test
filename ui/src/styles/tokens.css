@@ -1,0 +1,51 @@
+/* ── 设计令牌 ────────────────────────────────────────────────────────────
+   原样搬自 v4.6.0 的手写 src/master/webui.html。**不要重新配色**：
+   这套皮肤是有据可依的（见下方原注释），重写要改的是布局与流程，不是视觉。
+   ──────────────────────────────────────────────────────────────────── */
+/* ── 灌包测试台 · 仪表面板皮肤 ────────────────────────────────────────
+   设计立意：这是一台双机灌包仪，不是一张 SaaS 仪表盘。机箱（页面外壳、
+   控件、表格）是安静的拉丝钢，跟随明暗主题；而“数据屏”（吞吐示波屏、运行
+   日志、任务预览）永远是刻框暗玻璃 + 磷光信号色——两套主题下都长成一块真
+   正的仪表屏，这是全站唯一的“张扬”之处，其余一律克制。
+   约束：这台机器同时在灌包，任何持续动画/重绘都可能压到峰值速率，所以除
+   了一次开机淡入和一颗合成层的电源灯，界面零持续动画、零 backdrop-filter。 */
+:root {
+  color-scheme:light dark;
+  --fu:"PingFang SC","Microsoft YaHei","Segoe UI",system-ui,-apple-system,sans-serif;
+  --fm:ui-monospace,"Cascadia Mono","SFMono-Regular","JetBrains Mono",Consolas,"Liberation Mono",monospace;
+
+  /* 机箱（浅色 = 白日实验台，冷调拉丝钢） */
+  --canvas:#d3dade; --surface:#f2f5f7; --panel-2:#e9eef1;
+  --ink:#15222b; --muted:#5b6a74; --line:#c1cbd1; --head:#e5ebee;
+  --accent:#0e5a6b; --accent-hover:#0a4553; --on-accent:#eefbfd;
+  --ok:#12783e; --ok-bg:#dff0e6; --bad:#b3242f; --bad-bg:#f9e5e7;
+  --info-bg:#e1ecef; --focus:#c8811a; --edited:#e0f4ef;
+
+  /* 数据屏（明暗主题下都不变——屏永远是屏） */
+  --screen-bg:#081210; --screen-ink:#c9e7dc; --screen-dim:#5f807a;
+  --signal:#37e0bd; --scope-grid:rgba(120,190,175,.12); --scope-axis:#6f9088;
+  --bezel:#040d0b; --bezel-hi:rgba(120,190,175,.13); --glow:rgba(55,224,189,.4);
+}
+@media (prefers-color-scheme:dark) {
+  :root:not([data-theme="light"]) {
+    --canvas:#0a0f12; --surface:#141c20; --panel-2:#101a1e;
+    --ink:#e7f0f1; --muted:#9cafb5; --line:#2a393f; --head:#19242a;
+    --accent:#3fb9ca; --accent-hover:#63cddb; --on-accent:#05161a;
+    --ok:#6ecf95; --ok-bg:#143324; --bad:#ff969b; --bad-bg:#3f2128;
+    --info-bg:#112f38; --focus:#ffc65c; --edited:#113330;
+  }
+}
+:root[data-theme="dark"] {
+  --canvas:#0a0f12; --surface:#141c20; --panel-2:#101a1e;
+  --ink:#e7f0f1; --muted:#9cafb5; --line:#2a393f; --head:#19242a;
+  --accent:#3fb9ca; --accent-hover:#63cddb; --on-accent:#05161a;
+  --ok:#6ecf95; --ok-bg:#143324; --bad:#ff969b; --bad-bg:#3f2128;
+  --info-bg:#112f38; --focus:#ffc65c; --edited:#113330;
+}
+
+* { box-sizing:border-box; }
+html { -webkit-text-size-adjust:100%; }
+body { margin:0; background:var(--canvas); color:var(--ink); font-family:var(--fu);
+  font-size:14px; line-height:1.5; }
+::selection { background:var(--accent); color:var(--on-accent); }
+

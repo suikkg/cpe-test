@@ -222,11 +222,31 @@ pub fn resolve_target_mbps(
     let explicit = targets
         .for_direction(direction)
         .or_else(|| cfg.targets_mbps.for_direction(direction));
-    match mode {
-        RateMode::Observe | RateMode::Discover => None,
-        RateMode::Verify => explicit.or_else(|| auto_evb_target_mbps(src, dst, cfg)),
-        RateMode::Auto => explicit.or_else(|| auto_evb_target_mbps(src, dst, cfg)),
+    // Verify 与 Auto 在这里是同一件事；Observe/Discover 由下面那条唯一规则清掉。
+    let resolved = explicit.or_else(|| auto_evb_target_mbps(src, dst, cfg));
+    effective_rate_target(mode, resolved)
+}
+
+/// 这一腿在**判定时刻**真正生效的目标速率。
+///
+/// **全仓唯一的一处**「Observe/Discover 下不拿目标判 FAIL」。
+///
+/// 这条规则以前只写在 `evaluate_nic_rx` 里，而 UDP 腿有自己内联的一条等价链，
+/// 全函数不出现 `Observe`/`Discover`，直接拿 target 比——于是显式配 `observe`
+/// 又能解析出目标时，**同一台设备的 UDP 腿判 RATE_FAIL、TCP/CTS 腿判 MEASURED**。
+/// `Discover` 更严重：它本来就是**故意分阶梯灌不满**的模式，拿目标去判它的
+/// FAIL 是结构性误判，而且方向恰好是「把配置意图写成 CPE 性能失败」——
+/// 这套判定一直在防的那个方向。
+///
+/// `rate::effective_mode` 只折叠 `Auto`，不清目标，所以那一层拦不住这件事。
+/// 三条链现在都必须经过这里；由
+/// `the_effective_target_rule_has_exactly_one_definition_in_the_tree` 守着。
+pub fn effective_rate_target(mode: RateMode, target_mbps: Option<f64>) -> Option<f64> {
+    if matches!(mode, RateMode::Observe | RateMode::Discover) {
+        // 只记录能力，不比目标。
+        return None;
     }
+    target_mbps.filter(|value| value.is_finite() && *value > 0.0)
 }
 
 pub fn effective_mode(mode: RateMode, target_mbps: Option<f64>) -> RateMode {

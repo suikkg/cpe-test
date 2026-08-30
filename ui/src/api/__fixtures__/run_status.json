@@ -1,0 +1,37 @@
+{
+  "aborted_at_unit": null,
+  "counts": {
+    "fail": 0,
+    "measured": 0,
+    "not_evaluated": 0,
+    "pass": 1,
+    "setup_error": 0,
+    "skip": 0
+  },
+  "current": {
+    "est_secs": 180,
+    "link_group": "SGMII ↔ WLAN",
+    "seq": 2,
+    "started_at": "2026-08-30 10:14:20",
+    "title": "IPERF V4 UDP -b 2500m | 主控 eth0 -> 辅测 eth0"
+  },
+  "done": [
+    {
+      "link_group": "SGMII ↔ WLAN",
+      "reason_code": "RX_TARGET_MET",
+      "reason_detail": "网卡 RX 平均 2310.500Mbps 达到目标 2000.000Mbps",
+      "secs": 182,
+      "seq": 1,
+      "skipped": false,
+      "title": "IPERF V4 TCP -w 4m -P 10 | 主控 eth0 -> 辅测 eth0",
+      "verdict": "PASS"
+    }
+  ],
+  "eta_secs": 120,
+  "finished": false,
+  "plan_hash": "plan-hash-abc",
+  "report": "",
+  "run_id": "run_20260830_101112_1234",
+  "started_at": "2026-08-30 10:11:12",
+  "total_units": 3
+}

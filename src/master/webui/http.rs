@@ -121,6 +121,40 @@ pub(super) fn json_response(body: String) -> Response<std::io::Cursor<Vec<u8>>> 
         .with_header(header(b"X-Content-Type-Options", b"nosniff"))
 }
 
+/// 报告包的下载响应。
+///
+/// `Content-Disposition: attachment` 让浏览器直接落盘而不是尝试渲染——
+/// zip 里是整个 run 目录，解开就是完整可读的报告。
+pub(super) fn bundle_response(run_id: &str, bytes: Vec<u8>) -> Response<std::io::Cursor<Vec<u8>>> {
+    // `run_id` 是 `runs/` 下真实存在的目录名。工具自己建的目录全是
+    // `run_<数字>_<进程号>` 形状，但**目录名是文件系统给的，不是这里能保证的**
+    // ——有人手动建/改过名字，就可能带引号或换行，直接拼进 header 就是注入面。
+    // 所以按白名单转写：只留 ASCII 字母数字、`-`、`_`、`.`，其余换成 `_`。
+    let safe: String = run_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let safe = if safe.is_empty() { "run".into() } else { safe };
+    let disposition = format!("attachment; filename=\"{safe}.zip\"");
+    // tiny_http 会自己按数据长度补 Content-Length，不用手写。
+    let mut response = Response::from_data(bytes)
+        .with_header(header(b"Content-Type", b"application/zip"))
+        .with_header(header(b"Cache-Control", b"no-store"))
+        .with_header(header(b"X-Content-Type-Options", b"nosniff"));
+    if let Ok(value) =
+        tiny_http::Header::from_bytes(&b"Content-Disposition"[..], disposition.as_bytes())
+    {
+        response.add_header(value);
+    }
+    response
+}
+
 pub(super) fn page_response() -> Response<std::io::Cursor<Vec<u8>>> {
     Response::from_string(PAGE)
         .with_header(header(b"Content-Type", b"text/html; charset=utf-8"))
@@ -284,6 +318,43 @@ pub(super) fn handle(mut request: Request, console: &Arc<Console>) {
 
     let is_post = *request.method() == Method::Post;
     let is_get = *request.method() == Method::Get;
+
+    // 报告打包下载。**在 JSON 分支之前拦下**：它回的是二进制流，不是 `Resp`。
+    //
+    // 这是远程访问者取回报告的唯一通道（§13.3）：`/api/open-report` 只在跑
+    // 控制台的那台机器上调系统程序打开，`--ui-bind` 之后远程用户永远拿不到
+    // 报告——而报告是这个工具的产物本身。
+    //
+    // 不把报告目录当静态站点服务出来，是因为报告 HTML 里的截图/CSV 是相对路径
+    // 子资源，浏览器加载它们时不带自定义头——撞的是和控制台页面同一堵
+    // 「鉴权先于路由」的墙（ADR-5 已否决同构方案）。
+    if is_get {
+        if let Some(id) = path
+            .strip_prefix("/api/runs/")
+            .and_then(|rest| rest.strip_suffix("/bundle.zip"))
+        {
+            // 白名单式解析：只认 `runs/` 下已经存在的目录名，不做路径拼接。
+            match runs::resolve_run_dir(id) {
+                Some(dir) => match runs::build_bundle(&dir, id) {
+                    Ok(bytes) => {
+                        let _ = request.respond(bundle_response(id, bytes));
+                        return;
+                    }
+                    Err(error) => {
+                        let message = format!("打包失败: {error}");
+                        let _ = request.respond(json_response(crate::protocol::err_json(&message)));
+                        return;
+                    }
+                },
+                None => {
+                    let _ = request.respond(json_response(crate::protocol::err_json(
+                        "找不到这个运行目录",
+                    )));
+                    return;
+                }
+            }
+        }
+    }
     let out = if !trusted_post {
         Err("拒绝跨站请求：缺少 X-CPE-Console 请求头".to_string())
     } else if is_get && path == "/api/bootstrap" {
@@ -306,6 +377,8 @@ pub(super) fn handle(mut request: Request, console: &Arc<Console>) {
         api_open_report(console)
     } else if is_get && path == "/api/progress" {
         Ok(api_progress(console, &query))
+    } else if is_get && path == "/api/runs" {
+        runs::api_runs()
     } else if is_post && path == "/api/monitor/start" {
         api_monitor_start(console, &body)
     } else if is_post && path == "/api/monitor/samples" {

@@ -43,6 +43,23 @@ pub(super) fn api_bootstrap(console: &Arc<Console>) -> Result<serde_json::Value,
 
 /// 顶部参数区的回填值。打开页面（`/api/bootstrap`）和导入 config
 /// （`/api/import`）共用这一份，两条路填出来的输入框必须一模一样。
+/// 打开页面时的回填值。
+///
+/// # 这里的「反推段」是 legacy 通路专用的（R5 的处置）
+///
+/// 下面那几段从 `cfg.tests` **反推**默认档位的代码（TCP `-P`、UDP 流数、
+/// ping 次数与包长）只服务两个调用方：
+///   1. `/api/bootstrap` 里给**旧矩阵界面**回填执行区那几个框；
+///   2. `api_import` 判断「文件里哪些参数和默认组不一样」。
+///
+/// **v6.0 的前端一个都不读。** 默认参数组按 DESIGN §7 第 4 条显式建模在
+/// `ui/src/state/plan.ts` 里——旧页那种「快速工作台的顶层档位悄悄读高级矩阵的
+/// `TCP_GROUPS[0]`」的跨面板隐性耦合（§4.1-A12）在新结构里不存在。
+///
+/// 原计划（R5）是随矩阵退役把这段删掉。核查后没删：`api_import` 仍然依赖它，
+/// 而 ADR-13 明确要求 `/api/import` **只封存不删**（serde/DTO 保持兼容，
+/// 只是界面上没有入口）。删掉反推段等于把那个端点一起废掉，与 ADR-13 冲突。
+/// 真要清理，得先确定不再需要读旧 `config.json`——那是另一次决策。
 pub(super) fn bootstrap_out(state: &UiState) -> BootstrapOut {
     // 默认组的 -P 档位 = **跑默认 -w 档位的那些 TCP test** 的流数集合。
     //
@@ -398,10 +415,16 @@ pub(super) fn api_run(console: &Arc<Console>, body: &str) -> Result<serde_json::
 
     clear_log_mirror();
     lock_recover(&console.report).clear();
+    // 上一轮的结构化状态必须**在这里**就丢掉，不能等 worker 线程里的
+    // `run_started`：那之间要读配置、扫拓扑、建计划，够 1s 轮询打好几拍，
+    // 而那几拍回的是上一轮已完成的全套单元。
+    console.run_status.reset();
     crate::cancel::reset();
     let worker_console = Arc::clone(console);
     let cleanup_path = path.clone();
     let config_path = path.to_string_lossy().to_string();
+    let run_observer: std::sync::Arc<dyn crate::master::run_status::RunObserver> =
+        console.run_status.clone();
     let worker = std::thread::Builder::new()
         .name("cpe-test-webui-run".into())
         .spawn(move || {
@@ -413,6 +436,9 @@ pub(super) fn api_run(console: &Arc<Console>, body: &str) -> Result<serde_json::
                     // 复核页确认过什么就跑什么：执行端会自己再推导一次计划，
                     // 对不上这个哈希就拒绝开跑。
                     expected_plan_hash: confirmed_plan_hash,
+                    // 控制台要结构化进度：executor 会把每个状态转移点回调进来，
+                    // `/api/progress` 直接把它吐给前端，不必再解析日志文本。
+                    observer: Some(run_observer),
                     ..Default::default()
                 })
             }));
@@ -483,18 +509,28 @@ pub(super) fn api_progress(console: &Arc<Console>, query: &str) -> serde_json::V
         .find_map(|kv| kv.strip_prefix("from="))
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(0);
+    // 单元游标独立于日志游标：日志是按行走的，单元是按单元走的，两者的推进
+    // 速度差三个数量级（一个单元几百行日志）。共用一个游标会让「只要有新日志
+    // 就把已跑完的 200 个单元再传一遍」。
+    let units_from = query
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("units_from="))
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0);
     let (total, lines) = log_tail_since(from);
-    // 报告路径从日志里捞：run_master 自己决定运行目录名，界面在点下
-    // 「开始测试」的那一刻还不知道它叫什么。
+    // `units_from` 可能是上一轮留下的越界游标；`snapshot` 会把它自愈成 0 并
+    // 全量重传，所以这里要用**它实际生效的那个值**去算回给前端的下一拍游标，
+    // 不能再用请求里那个。
+    let (units_from, run) = console.run_status.snapshot(units_from);
+    // 报告路径由 executor 的回调直接送来（`RunObserver::report_written`）。
+    //
+    // 在此之前这里是**在日志里搜「报告已生成: 」**捞出来的——那让一句给人看的
+    // 提示语变成了协议：改个措辞，界面上的「打开报告」就永远是灰的。
+    // `console.report` 仍然维护，因为 `/api/open-report` 读它。
     {
         let mut report = lock_recover(&console.report);
-        if report.is_empty() {
-            if let Some(found) = lines
-                .iter()
-                .find_map(|line| line.split_once("报告已生成: ").map(|(_, p)| p.trim()))
-            {
-                *report = found.to_string();
-            }
+        if report.is_empty() && !run.report.is_empty() {
+            *report = run.report.clone();
         }
     }
     serde_json::to_value(ProgressOut {
@@ -502,6 +538,8 @@ pub(super) fn api_progress(console: &Arc<Console>, query: &str) -> serde_json::V
         from: total,
         lines,
         report: lock_recover(&console.report).clone(),
+        units_from: units_from + run.done.len(),
+        run,
     })
     .unwrap_or(serde_json::Value::Null)
 }
