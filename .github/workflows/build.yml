@@ -626,7 +626,7 @@ jobs:
           generate_release_notes: true
           make_latest: true
           body: |
-            cpe_test ${{ github.ref_name }} 的已验证跨平台发布包。
+            cpe_test v6.0.0 的已验证跨平台发布包。
 
             ## v6.0.0 结构化进度、结果落盘可重放、判定装配收敛与 Vue 控制台
 
@@ -734,7 +734,7 @@ jobs:
 
             ## 文档与部署
 
-            本版补充 Microsoft ctsTraffic 2.0.4.0 x64 的 TCP Push/Pull/Duplex、UDP 单向/双向原生双机手工命令。Windows 包继续捆绑固定并校验过的 ctsTraffic 2.0.4.0 x64；iperf3 仍需按包内说明自行放置。主控和 agent 应完整使用同一个 ${{ github.ref_name }} Release 包。
+            本版补充 Microsoft ctsTraffic 2.0.4.0 x64 的 TCP Push/Pull/Duplex、UDP 单向/双向原生双机手工命令。Windows 包继续捆绑固定并校验过的 ctsTraffic 2.0.4.0 x64；iperf3 仍需按包内说明自行放置。主控和 agent 应完整使用同一个 v6.0.0 Release 包。
 
             自动测试和 Windows 交叉编译不能代替真实网卡、驱动、防火墙及 CPE 环境。发布后仍建议在两台真实 Windows 10+ 设备上完成一次 CTS TCP/UDP 双机数据流验收，重点核对 CTS 自报速率、`sample_coverage`、`effective_seconds`、`nic_samples_*.csv` 和 `CTSTRAFFIC_*` 诊断。
 
