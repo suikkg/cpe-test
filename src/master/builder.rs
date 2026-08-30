@@ -1695,10 +1695,12 @@ mod tests {
 
         // 首次运行时用下面这行把实际值打出来再粘回来；平时它必须原样通过。
         //   println!("{snapshot}");
-        let expected = include_str!("builder_snapshot.txt").trim_end();
+        // Windows 工作区可能按 core.autocrlf 检出快照为 CRLF；快照钉的是
+        // 单元内容与顺序，不应把平台换行符差异误报成展开变化。
+        let expected = include_str!("builder_snapshot.txt").replace("\r\n", "\n");
         assert_eq!(
             snapshot.trim_end(),
-            expected,
+            expected.trim_end(),
             "\n单元展开发生了变化。\n\
              如果这是 builder 拆文件（R4）过程中出现的，说明搬运没有保持等价，\
              **不要更新快照**——去找搬错的那一处。\n\
