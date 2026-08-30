@@ -629,8 +629,14 @@ jobs:
           fail_on_unmatched_files: true
           generate_release_notes: true
           make_latest: true
+          # 正文里**绝对不要写 ${{ }}**：只要有一个表达式，整块正文就会被当成
+          # 一个表达式模板去求值，而这份累积的发布说明远超 Actions 的单表达式
+          # 长度上限——后果是工作流在创建任务**之前**就解析失败，run 显示 0 秒
+          # 失败、没有任何 job、也没有注解，看起来像和本次改动无关。
+          # 版本号手写，跟着 release: 提交一起改（见上面 files: 那样短的输入
+          # 才可以用表达式）。
           body: |
-            cpe_test ${{ github.ref_name }} 的已验证跨平台发布包。
+            cpe_test v6.1.0 的已验证跨平台发布包。
 
             ## v6.1.0 发送端 TX 速率进报告与 Excel，四处外围缺陷修复
 
@@ -747,7 +753,7 @@ jobs:
 
             ## 文档与部署
 
-            本版补充 Microsoft ctsTraffic 2.0.4.0 x64 的 TCP Push/Pull/Duplex、UDP 单向/双向原生双机手工命令。Windows 包继续捆绑固定并校验过的 ctsTraffic 2.0.4.0 x64；iperf3 仍需按包内说明自行放置。主控和 agent 应完整使用同一个 v6.0.0 Release 包。
+            本版补充 Microsoft ctsTraffic 2.0.4.0 x64 的 TCP Push/Pull/Duplex、UDP 单向/双向原生双机手工命令。Windows 包继续捆绑固定并校验过的 ctsTraffic 2.0.4.0 x64；iperf3 仍需按包内说明自行放置。主控和 agent 应完整使用同一个 v6.1.0 Release 包。
 
             自动测试和 Windows 交叉编译不能代替真实网卡、驱动、防火墙及 CPE 环境。发布后仍建议在两台真实 Windows 10+ 设备上完成一次 CTS TCP/UDP 双机数据流验收，重点核对 CTS 自报速率、`sample_coverage`、`effective_seconds`、`nic_samples_*.csv` 和 `CTSTRAFFIC_*` 诊断。
 
