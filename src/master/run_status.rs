@@ -128,8 +128,20 @@ impl RunStatus {
     /// 结果是计数格显示新一轮、单元列表和失败清单显示上一轮。
     ///
     /// 这里把越界当成「从头给我」：这是唯一能自愈的解释，代价是一次全量重传。
-    pub fn since(&self, units_from: usize) -> (usize, RunStatus) {
-        let units_from = if units_from > self.done.len() {
+    ///
+    /// # 为什么还要比 `run_id`
+    ///
+    /// 只看越界补不全。第二个标签页攥着上一轮的游标 250，而新一轮此刻已经跑完
+    /// 300 个单元时，`250 <= 300` 根本不触发上面那条自愈，返回的是新一轮的
+    /// `done[250..300]`——那个标签页于是**永久缺**新一轮的 0..249 号单元，而
+    /// 计数格走的是全量 `counts`，两块显示对不上。
+    ///
+    /// 游标只在**一轮之内**有意义，所以让它跟着 `run_id` 一起失效：前端把自己
+    /// 手上那个 `run_id` 一并送来，对不上就从头给。`None` = 调用方不参与这套
+    /// 协议（CLI、老客户端、curl），保持原样只按越界判。
+    pub fn since(&self, units_from: usize, client_run_id: Option<&str>) -> (usize, RunStatus) {
+        let stale_run = client_run_id.is_some_and(|id| id != self.run_id);
+        let units_from = if units_from > self.done.len() || stale_run {
             0
         } else {
             units_from
@@ -188,10 +200,10 @@ impl RunStatusRecorder {
         Self::default()
     }
 
-    /// 返回「实际生效的游标 + 该游标之后的增量」。越界游标的处理见
-    /// [`RunStatus::since`]。
-    pub fn snapshot(&self, units_from: usize) -> (usize, RunStatus) {
-        crate::util::lock_recover(&self.status).since(units_from)
+    /// 返回「实际生效的游标 + 该游标之后的增量」。越界游标与跨轮次游标的
+    /// 处理见 [`RunStatus::since`]。
+    pub fn snapshot(&self, units_from: usize, client_run_id: Option<&str>) -> (usize, RunStatus) {
+        crate::util::lock_recover(&self.status).since(units_from, client_run_id)
     }
 
     /// 丢弃上一轮的状态。
@@ -290,7 +302,7 @@ mod tests {
         {
             recorder.unit_finished(unit(index + 1, verdict), 0);
         }
-        let (_, status) = recorder.snapshot(0);
+        let (_, status) = recorder.snapshot(0, None);
         assert_eq!(status.counts.pass, 1);
         assert_eq!(status.counts.fail, 1);
         assert_eq!(status.counts.measured, 1);
@@ -312,18 +324,18 @@ mod tests {
         recorder.unit_finished(unit(1, Verdict::Pass), 200);
         recorder.unit_finished(unit(2, Verdict::Pass), 100);
 
-        let (_, first) = recorder.snapshot(0);
+        let (_, first) = recorder.snapshot(0, None);
         assert_eq!(first.done.len(), 2);
 
         // 前端把游标推到 2，下一拍应当什么都不收。
-        let (_, idle) = recorder.snapshot(2);
+        let (_, idle) = recorder.snapshot(2, None);
         assert!(idle.done.is_empty(), "稳态每拍不该重传已完成单元");
         // 计数是全量的：它不受游标影响，否则刷新一次页面计数就归零了。
         assert_eq!(idle.counts.pass, 2);
         assert_eq!(idle.total_units, 3);
 
         recorder.unit_finished(unit(3, Verdict::RateFail), 0);
-        let (_, next) = recorder.snapshot(2);
+        let (_, next) = recorder.snapshot(2, None);
         assert_eq!(next.done.len(), 1, "只该收到新完成的那一个");
         assert_eq!(next.done[0].seq, 3);
 
@@ -331,7 +343,7 @@ mod tests {
         // 「从头给我」，所以要拿到全量而不是空列表——返回空的话，新一轮的
         // 单元对那个浏览器永远不存在。生效游标也要跟着退回 0，否则前端
         // 下一拍还会带着越界的那个值回来。
-        let (effective, healed) = recorder.snapshot(99);
+        let (effective, healed) = recorder.snapshot(99, None);
         assert_eq!(effective, 0, "越界游标要自愈成 0");
         assert_eq!(healed.done.len(), 3, "自愈之后必须拿到全量");
     }
@@ -352,13 +364,13 @@ mod tests {
             recorder.unit_finished(unit(seq, Verdict::Pass), 0);
         }
         recorder.run_finished();
-        let (cursor, first) = recorder.snapshot(0);
+        let (cursor, first) = recorder.snapshot(0, None);
         assert_eq!((cursor, first.done.len()), (0, 3));
         let stale_cursor = cursor + first.done.len();
 
         // 「开始测试」被接受的那一刻：计划还没建完，run_started 还没到。
         recorder.reset();
-        let (cursor, between) = recorder.snapshot(stale_cursor);
+        let (cursor, between) = recorder.snapshot(stale_cursor, None);
         assert!(between.done.is_empty(), "重置之后不该还端着上一轮的单元");
         assert_eq!(cursor, 0, "游标要跟着退回去，否则前端下一拍还带着 3 回来");
         assert_eq!(between.counts.pass, 0, "计数也是上一轮的，一起清掉");
@@ -368,7 +380,7 @@ mod tests {
         recorder.run_started("run_second", "hash2", 3, 300);
         recorder.unit_finished(unit(1, Verdict::RateFail), 0);
         recorder.unit_finished(unit(2, Verdict::Pass), 0);
-        let (_, second) = recorder.snapshot(cursor);
+        let (_, second) = recorder.snapshot(cursor, None);
         assert_eq!(second.run_id, "run_second");
         assert_eq!(
             second.done.iter().map(|u| u.seq).collect::<Vec<_>>(),
@@ -376,6 +388,56 @@ mod tests {
             "新一轮的单元必须能收到"
         );
         assert_eq!(second.counts.fail, 1);
+    }
+
+    /// **新一轮已经跑过陈旧游标时，越界判据救不了场——要靠 `run_id`。**
+    ///
+    /// 上一条用例走的是「reset 之后 done 是空的」，越界判据（`游标 > done.len()`）
+    /// 恰好成立。但第二个标签页并不总是那么幸运：它攥着上一轮的游标 3 回来时，
+    /// 新一轮可能**已经跑完 4 个单元**了。这时 `3 <= 4` 不越界，服务端安安静静
+    /// 地回 `done[3..4]`，那个标签页于是永久缺新一轮的 1..3 号单元——而计数格
+    /// 走的是全量 `counts`，两块显示对不上，且都"看起来正常"。
+    ///
+    /// 游标只在一轮之内有意义，所以让它跟着 `run_id` 一起失效。
+    #[test]
+    fn a_cursor_from_the_previous_run_is_dropped_even_when_it_is_in_range() {
+        let recorder = RunStatusRecorder::new();
+        recorder.run_started("run_first", "hash1", 5, 500);
+        for seq in 1..=3 {
+            recorder.unit_finished(unit(seq, Verdict::Pass), 0);
+        }
+        let stale_cursor = recorder.snapshot(0, None).1.done.len();
+        assert_eq!(stale_cursor, 3);
+
+        // 新一轮，而且已经跑得比那个陈旧游标更远——越界判据在这里不成立。
+        recorder.reset();
+        recorder.run_started("run_second", "hash2", 5, 500);
+        for seq in 1..=4 {
+            recorder.unit_finished(unit(seq, Verdict::Pass), 0);
+        }
+
+        // 不带 run_id（老客户端）：维持原状，只按越界判，于是漏掉开头三个。
+        let (legacy_cursor, legacy) = recorder.snapshot(stale_cursor, None);
+        assert_eq!(legacy_cursor, 3);
+        assert_eq!(
+            legacy.done.iter().map(|u| u.seq).collect::<Vec<_>>(),
+            vec![4],
+            "这正是要修的行为：不带 run_id 时只能按越界判"
+        );
+
+        // 带着上一轮的 run_id 回来：整份重发。
+        let (healed_cursor, healed) = recorder.snapshot(stale_cursor, Some("run_first"));
+        assert_eq!(healed_cursor, 0, "跨轮次的游标要自愈成 0");
+        assert_eq!(
+            healed.done.iter().map(|u| u.seq).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4],
+            "自愈之后必须拿到新一轮的全量"
+        );
+
+        // run_id 对得上就照常走增量，不能因为多了这个参数就退化成每拍全量。
+        let (kept_cursor, kept) = recorder.snapshot(stale_cursor, Some("run_second"));
+        assert_eq!(kept_cursor, 3, "同一轮之内游标仍然有效");
+        assert_eq!(kept.done.len(), 1, "同一轮之内只回增量");
     }
 
     /// 刷新页面 = 用 `units_from=0` 再要一次，必须拿回全量快照。
@@ -395,7 +457,7 @@ mod tests {
             link_group: "SGMII ↔ WLAN".into(),
         });
 
-        let (_, full) = recorder.snapshot(0);
+        let (_, full) = recorder.snapshot(0, None);
         assert_eq!(full.run_id, "run_20260830_101112_1234");
         assert_eq!(full.plan_hash, "plan-hash");
         assert_eq!(full.total_units, 10);
@@ -410,10 +472,10 @@ mod tests {
     fn the_report_path_arrives_through_the_callback() {
         let recorder = RunStatusRecorder::new();
         recorder.run_started("run_x", "hash", 1, 10);
-        assert!(recorder.snapshot(0).1.report.is_empty());
+        assert!(recorder.snapshot(0, None).1.report.is_empty());
         recorder.report_written("runs/run_x/report.html");
         recorder.run_finished();
-        let (_, status) = recorder.snapshot(0);
+        let (_, status) = recorder.snapshot(0, None);
         assert_eq!(status.report, "runs/run_x/report.html");
         assert!(status.finished, "整轮结束要能被前端看出来");
         assert_eq!(status.eta_secs, Some(0));
@@ -429,7 +491,7 @@ mod tests {
         let recorder = RunStatusRecorder::new();
         recorder.run_started("run_x", "hash", 2, 20);
         recorder.unit_finished(unit(1, Verdict::RateFail), 10);
-        let json = serde_json::to_value(recorder.snapshot(0).1).expect("序列化");
+        let json = serde_json::to_value(recorder.snapshot(0, None).1).expect("序列化");
 
         for key in [
             "run_id",

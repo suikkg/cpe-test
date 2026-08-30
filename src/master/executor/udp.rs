@@ -1029,6 +1029,10 @@ impl Ctx {
                     .get(&flow.task.dst.key())
                     .cloned()
                     .unwrap_or_default();
+                let nic_samples_tx = monitor_sample_files
+                    .get(&flow.task.src.key())
+                    .cloned()
+                    .unwrap_or_default();
                 self.push_row(Row {
                     verdict: flow_verdict,
                     execution_status: if flow.client.timed_out {
@@ -1052,6 +1056,7 @@ impl Ctx {
                     command: flow.client.cmd.clone(),
                     raw_log,
                     nic_samples_rx,
+                    nic_samples_tx,
                     raws: vec![
                         (
                             format!(
@@ -1155,6 +1160,13 @@ impl Ctx {
                 is_grouptotal: true,
                 nic_samples_rx: monitor_sample_files
                     .get(&first.dst.key())
+                    .cloned()
+                    .unwrap_or_default(),
+                // TX 逐样本同样要能回查：`tx_p10` 决定 OFFERED_LOAD_LOW、TX 滚动
+                // 覆盖率不足会把整行打成 NOT_EVALUATED，两个都是否决性门槛。
+                // iperf 单腿和 CTS 已经挂了这个链接，UDP 组之前漏了。
+                nic_samples_tx: monitor_sample_files
+                    .get(&first.src.key())
                     .cloned()
                     .unwrap_or_default(),
                 raws: if discovery_table.is_empty() {

@@ -3584,6 +3584,67 @@ fn the_abort_gate_runs_before_any_early_continue() {
     );
 }
 
+/// 结构断言：三条灌包路径挂 RX 样本的地方，都要同样挂上 TX 样本。
+///
+/// TX 覆盖率和 `tx_p10` 是**否决性**门槛：覆盖率不够整行判 NOT_EVALUATED，
+/// `tx_p10` 不足则报 OFFERED_LOAD_LOW。判定理由引用的数据，报告里就必须能
+/// 点回到那一行样本——否则「每个结论都要能回到某一行样本」对 TX 不成立。
+///
+/// UDP 组曾经就是这样漏的：iperf 单腿和 CTS 都挂了 `nic_samples_tx`，只有
+/// UDP 那条链忘了，而 TX 样本其实早就落盘了、只是没人链接。三条路径各写各的
+/// `push_row`，漏一条不会有任何用例变红，所以在源码层面数一遍。
+#[test]
+fn every_traffic_path_links_the_tx_samples_next_to_the_rx_ones() {
+    for (name, source) in [
+        ("udp.rs", include_str!("udp.rs")),
+        ("iperf_leg.rs", include_str!("iperf_leg.rs")),
+        ("cts.rs", include_str!("cts.rs")),
+    ] {
+        let rx = source.matches("nic_samples_rx").count();
+        let tx = source.matches("nic_samples_tx").count();
+        assert!(rx > 0, "{name} 应该有接收端样本引用");
+        assert_eq!(
+            rx, tx,
+            "{name} 里 RX 样本被引用 {rx} 次、TX 只有 {tx} 次：两边必须成对出现"
+        );
+    }
+}
+
+/// 结构断言：中止点必须是**全局**序号，不能是循环的局部下标。
+///
+/// 诊断补跑那一趟走的是 `run_all_from(&diagnostics, units.len())`，
+/// `sequence_offset` 等于主队列长度。用局部 `i` 的话，「第 147 个单元后中止」
+/// 会同时在报告横幅和进度页上写成「第 2 个」——两个出口一起指错位置，而且
+/// 因为两边一致，看上去完全正常。
+///
+/// 循环里其余地方一律用 `useq`，普通用例（offset 恒为 0）抓不到这个偏差，
+/// 所以在源码层面钉住。
+#[test]
+fn the_abort_point_is_recorded_in_the_global_sequence() {
+    let source = include_str!("../executor.rs");
+    let loop_start = source
+        .find("for (i, unit) in units.iter().enumerate() {")
+        .expect("单元循环");
+    let loop_end = source[loop_start..]
+        .find("\n    fn ")
+        .map(|offset| loop_start + offset)
+        .unwrap_or(source.len());
+    let loop_body = &source[loop_start..loop_end];
+
+    assert!(
+        !loop_body.contains("aborted_at_unit = Some(i)"),
+        "中止点不能记局部下标，必须叠加 sequence_offset"
+    );
+    assert!(
+        !loop_body.contains("observer.run_aborted(i)"),
+        "进度页拿到的中止点同样必须是全局序号"
+    );
+    assert!(
+        loop_body.contains("let aborted_at = sequence_offset + i;"),
+        "中止点应由 sequence_offset + i 算出，报告与进度页共用同一个数"
+    );
+}
+
 #[test]
 fn run_health_banner_surfaces_a_dead_link_streak() {
     let healthy = RunSummary {

@@ -14,7 +14,11 @@ pub struct StreamCounts {
     pub required: usize,
 }
 
+/// 它嵌在 `Row.direction_summaries` 里一起落进 `rows.jsonl`，所以和 `Row`
+/// 一样是兼容面。`Row` 早就是 `#[serde(default)]`，这里以前不是——只要给
+/// 本结构加一个字段，旧 run 目录就会以 `missing field` 整行读不回来。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DirectionSummary {
     pub tag: String,
     pub src: String,
@@ -27,6 +31,9 @@ pub struct DirectionSummary {
     pub streams: Option<StreamCounts>,
     pub rx_avg: Option<f64>,
     pub rx_p10: Option<f64>,
+    /// 发送端网卡 TX 平均。**不参与判定**——PASS/FAIL 只看接收端 RX。
+    /// 摆在 RX 旁边是为了让「收不到」和「压根没发出去」当场分得开。
+    pub tx_avg: Option<f64>,
     pub target_mbps: Option<f64>,
     pub sample_coverage: Option<f64>,
     pub udp_loss: Option<f64>,
@@ -476,6 +483,7 @@ impl Row {
             streams: stream_counts(self),
             rx_avg: self.rx_avg,
             rx_p10: self.rx_p10,
+            tx_avg: self.tx_avg,
             target_mbps: self.target_mbps,
             sample_coverage: self.sample_coverage,
             udp_loss: self.udp_loss,

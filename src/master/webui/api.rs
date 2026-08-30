@@ -517,11 +517,20 @@ pub(super) fn api_progress(console: &Arc<Console>, query: &str) -> serde_json::V
         .find_map(|kv| kv.strip_prefix("units_from="))
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(0);
+    // 前端手上那个 `run_id`。游标只在一轮之内有意义，对不上就该整份重来——
+    // 光看「越界」补不全：新一轮已经跑过陈旧游标时，越界判据根本不触发。
+    // 缺这个参数（老客户端、curl）时退回只按越界判，行为不变。
+    let client_run_id = query
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("run_id="))
+        .map(urldecode);
     let (total, lines) = log_tail_since(from);
     // `units_from` 可能是上一轮留下的越界游标；`snapshot` 会把它自愈成 0 并
     // 全量重传，所以这里要用**它实际生效的那个值**去算回给前端的下一拍游标，
     // 不能再用请求里那个。
-    let (units_from, run) = console.run_status.snapshot(units_from);
+    let (units_from, run) = console
+        .run_status
+        .snapshot(units_from, client_run_id.as_deref());
     // 报告路径由 executor 的回调直接送来（`RunObserver::report_written`）。
     //
     // 在此之前这里是**在日志里搜「报告已生成: 」**捞出来的——那让一句给人看的

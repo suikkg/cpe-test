@@ -3863,7 +3863,7 @@ fn dto_fixtures_are_regenerated_for_the_frontend_contract_test() {
             link_group: "SGMII ↔ WLAN".into(),
         });
     }
-    let (_, mut run) = recorder.snapshot(0);
+    let (_, mut run) = recorder.snapshot(0, None);
     // 固定时间戳：`run_started` 填的是 `now_full()`，直接写出去会让每次
     // `cargo test` 都改动这批文件——`git status` 常年是脏的，而且它们进
     // 溯源戳的输入集时会让产物每跑一次测试就"过期"一次。
@@ -3957,7 +3957,10 @@ fn the_report_bundle_is_a_zip_that_really_unpacks() {
     std::fs::write(dir.join("rows.jsonl"), "{\"a\":1}\n{\"a\":2}\n").expect("rows");
     std::fs::write(dir.join("iperf_outputs/raw.log"), "iperf3 原始输出").expect("raw");
 
-    let bytes = build_bundle(&dir, "run_demo").expect("打包");
+    // 产物是临时 zip 文件（不再是内存里的 `Vec`）：守卫在，文件就在。
+    let bundle = build_bundle(&dir, "run_demo").expect("打包");
+    assert!(bundle.path.is_file(), "打包产物应当落在临时文件里");
+    let bytes = std::fs::read(&bundle.path).expect("读回打包产物");
     assert_eq!(&bytes[..2], b"PK", "不是 zip");
     // 中央目录结束记录的魔数必须在（很多解压器只认它来定位条目表）。
     assert!(
@@ -3994,6 +3997,12 @@ fn the_report_bundle_is_a_zip_that_really_unpacks() {
             String::from_utf8_lossy(&result.stderr)
         );
     }
+
+    // 守卫析构就要把临时 zip 删掉：它和 run 目录一样大，漏一个就在用户的
+    // 临时目录里堆一份。
+    let temp_zip = bundle.path.clone();
+    drop(bundle);
+    assert!(!temp_zip.exists(), "Bundle 析构后临时 zip 必须消失");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

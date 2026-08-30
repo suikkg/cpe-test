@@ -263,6 +263,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 旧 run 目录里的 `direction_summaries` 缺新字段时，整行仍要读得回来。
+    ///
+    /// `Row` 早就是 `#[serde(default)]`，但嵌在里面的 `DirectionSummary` 以前
+    /// 不是——给它加一个字段，旧文件就会在 `serde` 那里报 `missing field`，
+    /// 而 `load_rows` 把解析失败**静默计进 skipped**。结果不是报错，是重放报告
+    /// 悄悄少了一批行：看起来正常，结论却和崩溃前那份不一样。
+    #[test]
+    fn an_old_direction_summary_without_the_newer_metrics_still_loads() {
+        let dir = temp_dir("compat");
+        // 手写一行「旧版本」记录：方向摘要里没有 tx_avg。
+        let legacy = r#"{"task_id":"legacy-1","verdict":"PASS","rx_avg":930.5,"direction_summaries":[{"tag":"AB","src":"master/eth0","dst":"agent/eth1","rx_avg":930.5,"rx_p10":900.25}]}"#;
+        std::fs::write(rows_path(&dir), format!("{legacy}\n")).expect("write");
+
+        let (rows, skipped) = load_rows(&dir).expect("load");
+        assert_eq!(skipped, 0, "旧行不该被当成坏行丢掉");
+        assert_eq!(rows.len(), 1);
+        let direction = &rows[0].direction_summaries[0];
+        assert_eq!(direction.tag, "AB");
+        assert_eq!(direction.rx_avg, Some(930.5), "旧字段照常读回");
+        assert_eq!(direction.tx_avg, None, "缺的新字段取默认值，不是解析失败");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 判定按 label 字符串落盘，不是按枚举变体名。
     ///
     /// `RATE_FAIL` 这个拼法已经出现在报告 HTML、`task_results.json` 和

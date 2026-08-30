@@ -125,7 +125,7 @@ pub(super) fn json_response(body: String) -> Response<std::io::Cursor<Vec<u8>>> 
 ///
 /// `Content-Disposition: attachment` 让浏览器直接落盘而不是尝试渲染——
 /// zip 里是整个 run 目录，解开就是完整可读的报告。
-pub(super) fn bundle_response(run_id: &str, bytes: Vec<u8>) -> Response<std::io::Cursor<Vec<u8>>> {
+pub(super) fn bundle_response<R: std::io::Read>(run_id: &str, body: Response<R>) -> Response<R> {
     // `run_id` 是 `runs/` 下真实存在的目录名。工具自己建的目录全是
     // `run_<数字>_<进程号>` 形状，但**目录名是文件系统给的，不是这里能保证的**
     // ——有人手动建/改过名字，就可能带引号或换行，直接拼进 header 就是注入面。
@@ -143,7 +143,7 @@ pub(super) fn bundle_response(run_id: &str, bytes: Vec<u8>) -> Response<std::io:
     let safe = if safe.is_empty() { "run".into() } else { safe };
     let disposition = format!("attachment; filename=\"{safe}.zip\"");
     // tiny_http 会自己按数据长度补 Content-Length，不用手写。
-    let mut response = Response::from_data(bytes)
+    let mut response = body
         .with_header(header(b"Content-Type", b"application/zip"))
         .with_header(header(b"Cache-Control", b"no-store"))
         .with_header(header(b"X-Content-Type-Options", b"nosniff"));
@@ -336,8 +336,22 @@ pub(super) fn handle(mut request: Request, console: &Arc<Console>) {
             // 白名单式解析：只认 `runs/` 下已经存在的目录名，不做路径拼接。
             match runs::resolve_run_dir(id) {
                 Some(dir) => match runs::build_bundle(&dir, id) {
-                    Ok(bytes) => {
-                        let _ = request.respond(bundle_response(id, bytes));
+                    // `bundle` 是临时 zip 的 RAII 守卫：`respond` 返回时响应连同
+                    // 它持有的 File 已经析构，这时删才不会在 Windows 上撞
+                    // 「文件正被占用」。所以守卫必须活到 respond 之后。
+                    Ok(bundle) => {
+                        match std::fs::File::open(&bundle.path) {
+                            Ok(file) => {
+                                let _ =
+                                    request.respond(bundle_response(id, Response::from_file(file)));
+                            }
+                            Err(error) => {
+                                let message = format!("打包失败: {error}");
+                                let _ = request
+                                    .respond(json_response(crate::protocol::err_json(&message)));
+                            }
+                        }
+                        drop(bundle);
                         return;
                     }
                     Err(error) => {

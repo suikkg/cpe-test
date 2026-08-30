@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue';
-import { api } from '../../api/client';
+import { onMounted, ref } from 'vue';
+import { api, downloadQuery } from '../../api/client';
 import type { RunEntry } from '../../api/dto';
 
 /**
@@ -49,18 +49,12 @@ function size(bytes: number): string {
  *
  * 真要修的话是走 `api` 拿 `blob` 再 `URL.createObjectURL`——那要给 `client.ts`
  * 开一个非 JSON 出口，并且整个包要先进浏览器内存。留作独立改动。
+ *
+ * 查询串由 `client.ts::downloadQuery()` 拼：口令怎么取只能有一处实现，这里
+ * 以前自己读 `sessionStorage`，把 `TOKEN_KEY` 抄成了第二份。
  */
-const token = computed(() => {
-  try {
-    return sessionStorage.getItem('cpe_ui_token') ?? '';
-  } catch {
-    return '';
-  }
-});
-
 function bundleUrl(id: string): string {
-  const query = token.value ? `?token=${encodeURIComponent(token.value)}` : '';
-  return `/api/runs/${encodeURIComponent(id)}/bundle.zip${query}`;
+  return `/api/runs/${encodeURIComponent(id)}/bundle.zip${downloadQuery()}`;
 }
 
 onMounted(load);

@@ -507,8 +507,12 @@ impl Ctx {
                      !! 请先确认被测设备是否掉线或重启，再重跑剩余项；已完成的部分会照常出报告。",
                     total.saturating_sub(i)
                 ));
-                sum.aborted_at_unit = Some(i);
-                self.notify(|observer| observer.run_aborted(i));
+                // 中止点必须是全局序号：诊断补跑那一趟的 `sequence_offset` 是
+                // 主队列长度，用局部 `i` 会把「第 147 个单元后中止」写成「第 2 个」，
+                // 进度页和报告横幅会一起指错位置。
+                let aborted_at = sequence_offset + i;
+                sum.aborted_at_unit = Some(aborted_at);
+                self.notify(|observer| observer.run_aborted(aborted_at));
                 break;
             }
             let useq = sequence_offset + i;

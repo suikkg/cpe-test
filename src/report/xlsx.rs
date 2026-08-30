@@ -112,6 +112,9 @@ fn write_overview_sheet(
             "目标端",
             "目标网口",
             "RX 平均(Mbps)",
+            // TX 紧挨着 RX：一眼看出「发出去多少 / 收到多少」。判定口径仍然
+            // 只有 RX，TX 是解释性的——RX 不达标时先看这一列是不是压根没发够。
+            "TX 平均(Mbps)",
             "目标(Mbps)",
             "采样覆盖率",
             "UDP 丢包(%)",
@@ -140,11 +143,12 @@ fn write_overview_sheet(
         sheet.write_string(line, 10, side_label(row.dst_side))?;
         sheet.write_string(line, 11, &row.dst_iface)?;
         write_opt_number(sheet, line, 12, row.rx_avg)?;
-        write_opt_number(sheet, line, 13, row.target_mbps)?;
-        write_opt_number(sheet, line, 14, row.sample_coverage)?;
-        write_opt_number(sheet, line, 15, row.udp_loss)?;
-        write_opt_number(sheet, line, 16, row.ping_loss)?;
-        sheet.write_string(line, 17, &row.reason_detail)?;
+        write_opt_number(sheet, line, 13, row.tx_avg)?;
+        write_opt_number(sheet, line, 14, row.target_mbps)?;
+        write_opt_number(sheet, line, 15, row.sample_coverage)?;
+        write_opt_number(sheet, line, 16, row.udp_loss)?;
+        write_opt_number(sheet, line, 17, row.ping_loss)?;
+        sheet.write_string(line, 18, &row.reason_detail)?;
         line += 1;
     }
 
@@ -194,6 +198,11 @@ fn write_detail_sheet(
             "工具接收(Mbps)",
             "RX 平均(Mbps)",
             "RX-P10(Mbps)",
+            // 网卡 TX 侧的两个数。TX-P10 不是摆设：它决定要不要报
+            // OFFERED_LOAD_LOW，TX 滚动覆盖率不足还会把整行打成
+            // NOT_EVALUATED——判定理由里引用的数，表里就得能查到。
+            "TX 平均(Mbps)",
+            "TX-P10(Mbps)",
             "目标(Mbps)",
             "采样覆盖率",
             "滚动覆盖率",
@@ -228,14 +237,16 @@ fn write_detail_sheet(
         write_opt_number(sheet, line, 14, row.rx_mbps)?;
         write_opt_number(sheet, line, 15, row.rx_avg)?;
         write_opt_number(sheet, line, 16, row.rx_p10)?;
-        write_opt_number(sheet, line, 17, row.target_mbps)?;
-        write_opt_number(sheet, line, 18, row.sample_coverage)?;
-        write_opt_number(sheet, line, 19, row.rolling_coverage)?;
-        write_opt_number(sheet, line, 20, row.effective_seconds)?;
-        write_opt_number(sheet, line, 21, row.required_seconds)?;
-        write_opt_number(sheet, line, 22, row.udp_loss)?;
-        sheet.write_string(line, 23, row.execution_status.label())?;
-        sheet.write_string(line, 24, &row.reason_detail)?;
+        write_opt_number(sheet, line, 17, row.tx_avg)?;
+        write_opt_number(sheet, line, 18, row.tx_p10)?;
+        write_opt_number(sheet, line, 19, row.target_mbps)?;
+        write_opt_number(sheet, line, 20, row.sample_coverage)?;
+        write_opt_number(sheet, line, 21, row.rolling_coverage)?;
+        write_opt_number(sheet, line, 22, row.effective_seconds)?;
+        write_opt_number(sheet, line, 23, row.required_seconds)?;
+        write_opt_number(sheet, line, 24, row.udp_loss)?;
+        sheet.write_string(line, 25, row.execution_status.label())?;
+        sheet.write_string(line, 26, &row.reason_detail)?;
         line += 1;
     }
     Ok(())

@@ -164,7 +164,7 @@ pub struct IperfTask {
     /// **每条流**下发的目标负载（`-b`）。
     ///
     /// 与 `CtsTrafficTask::offered_total_mbps` 语义**相反**：那边是整条腿的总量。
-    /// 两个字段以前都叫 `offered_per_stream_mbps`，把 4 条流 × 500Mbps 当成 500Mbps 总量
+    /// 两个字段以前都叫 `offered_mbps`，把 4 条流 × 500Mbps 当成 500Mbps 总量
     /// （或反过来）编译器一句话都不会说。名字带上口径，让类型拦住误用。
     pub offered_per_stream_mbps: Option<f64>,
 }

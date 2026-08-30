@@ -49,6 +49,16 @@ pub(super) fn note_rx_target(
     }
 }
 
+/// 这条腿要用的 RX 门限。
+///
+/// 顺序：**双向配对门限 → 单口覆盖 → 场景 targets → 内置推导**。
+///
+/// 双向配对门限排在最前，因为它是唯一一个知道「这条腿属于哪一对网口、
+/// 而且两个方向正在同时灌」的来源。半双工介质上这两件事缺一不可：
+/// 同一块 RNDIS 口，和 Wi-Fi 组双向、和 SGMII 组双向，能收到的速率
+/// 完全不是一个量级——挂在网卡上的那个数没法同时对这两组成立。
+///
+/// 只在 `bidir` 为真时参与，所以单向单元的判定一个字节都没变。
 #[allow(clippy::too_many_arguments)]
 pub(super) fn leg_rx_target(
     spec: &SpecNorm,
@@ -81,6 +91,15 @@ pub(super) fn leg_rx_target(
 /// 毫秒，而一旦到了「几秒钟的链路时间」，socket 缓冲本身就变成了测量对象。
 pub(super) const SOCKET_BUFFER_DRAIN_WARN_SECS: f64 = 2.0;
 
+/// `-w` 开得过大时给一条提示。
+///
+/// iperf3 的 `-w` 是 socket 缓冲，被塞进去的字节算进「发送」但可能一个都没
+/// 上线。run_20260825_215915_7684 用的是 `-w 256m -P 10`，等于 2.56GB 的
+/// 发送缓冲；65 条 TCP 记录的「发 − 收」差值稳定在 118.92 ± 1.90 Mbps，
+/// 而 `2.56GB ÷ 180s = 119.3Mbps`——那个差值整个就是缓冲，不是链路。
+/// 首秒打出的 `22271Mbps` 同样来自这里（见 .ai/DESIGN-v4.3.0.md D5）。
+///
+/// 只提示不改写：`-w` 是用户明确填的参数，工具不该背着人改测试条件。
 #[allow(clippy::too_many_arguments)]
 pub(super) fn oversized_socket_buffer_notice(
     spec_name: &str,

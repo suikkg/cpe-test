@@ -61,16 +61,16 @@ fn push_overview_table(h: &mut String, groups: &[&UnitGroup<'_>]) {
             !direction.screenshot_master.is_empty() || !direction.screenshot_agent.is_empty()
         })
     });
-    let column_count = if has_shots { 12 } else { 11 };
+    let column_count = if has_shots { 13 } else { 12 };
 
     h.push_str(
-        "<div class=\"overview-scroll\" role=\"region\" aria-labelledby=\"overview-heading\" tabindex=\"0\"><table class=\"overview-table\"><caption class=\"sr-only\">按测试单元和方向展示接收端网卡 RX 判定指标、截图与判定原因</caption><colgroup><col class=\"c-seq\"><col class=\"c-verdict\"><col class=\"c-unit\"><col class=\"c-dir\"><col class=\"c-endpoints\"><col class=\"c-streams\"><col class=\"c-rate\"><col class=\"c-rate\"><col class=\"c-target\">",
+        "<div class=\"overview-scroll\" role=\"region\" aria-labelledby=\"overview-heading\" tabindex=\"0\"><table class=\"overview-table\"><caption class=\"sr-only\">按测试单元和方向展示接收端网卡 RX 判定指标、发送端 TX 参考值、截图与判定原因</caption><colgroup><col class=\"c-seq\"><col class=\"c-verdict\"><col class=\"c-unit\"><col class=\"c-dir\"><col class=\"c-endpoints\"><col class=\"c-streams\"><col class=\"c-rate\"><col class=\"c-rate\"><col class=\"c-rate\"><col class=\"c-target\">",
     );
     if has_shots {
         h.push_str("<col class=\"c-shot\">");
     }
     h.push_str(
-        "<col class=\"c-coverage\"><col class=\"c-quality\"></colgroup><thead><tr><th scope=\"col\">#</th><th scope=\"col\">结果</th><th scope=\"col\">测试单元</th><th scope=\"col\">方向</th><th scope=\"col\">源端 → 接收端</th><th scope=\"col\">请求/活跃/要求流</th><th scope=\"col\">接收端 RX 平均</th><th scope=\"col\">接收端 RX-P10</th><th scope=\"col\">目标</th>",
+        "<col class=\"c-coverage\"><col class=\"c-quality\"></colgroup><thead><tr><th scope=\"col\">#</th><th scope=\"col\">结果</th><th scope=\"col\">测试单元</th><th scope=\"col\">方向</th><th scope=\"col\">源端 → 接收端</th><th scope=\"col\">请求/活跃/要求流</th><th scope=\"col\">接收端 RX 平均</th><th scope=\"col\">接收端 RX-P10</th><th scope=\"col\">发送端 TX 平均</th><th scope=\"col\">目标</th>",
     );
     if has_shots {
         h.push_str("<th scope=\"col\">截图</th>");
@@ -131,7 +131,7 @@ fn push_overview_table(h: &mut String, groups: &[&UnitGroup<'_>]) {
                 String::new()
             };
             h.push_str(&format!(
-                "<tr class=\"{}\" data-unit-id=\"{}\" data-direction=\"{}\"><td class=\"num seq-col\">{}</td><td><strong class=\"status {}\">{}</strong><br><small>{}</small></td><td>{}</td><td><strong>{}</strong></td><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td>{}<td class=\"num\">{}</td><td>{}</td></tr>\n",
+                "<tr class=\"{}\" data-unit-id=\"{}\" data-direction=\"{}\"><td class=\"num seq-col\">{}</td><td><strong class=\"status {}\">{}</strong><br><small>{}</small></td><td>{}</td><td><strong>{}</strong></td><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td>{}<td class=\"num\">{}</td><td>{}</td></tr>\n",
                 if index == 0 { "unit-first" } else { "unit-cont" },
                 esc(&group.key),
                 esc(&tag),
@@ -149,6 +149,7 @@ fn push_overview_table(h: &mut String, groups: &[&UnitGroup<'_>]) {
                 esc(&streams_text(direction.streams)),
                 esc(&rx_avg_text(direction.rx_avg, is_ping)),
                 esc(&rx_p10_text(direction.rx_p10, direction.rx_avg, is_ping)),
+                esc(&tx_avg_text(direction.tx_avg, is_ping)),
                 esc(&target_text(direction.target_mbps)),
                 shot_cell,
                 esc(&coverage_text(direction.sample_coverage, is_ping)),
@@ -258,7 +259,7 @@ fn push_detail_row(h: &mut String, row: &Row, group_title: &str) {
         ""
     };
     h.push_str(&format!(
-        "<tr{row_class} data-detail-row=\"true\"><td><span class=\"status {}\">{}</span></td><td>{}</td><td>{}</td><td><strong>{}</strong><br><small>{}</small></td><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num tool-rate\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td>{}</td><td>",
+        "<tr{row_class} data-detail-row=\"true\"><td><span class=\"status {}\">{}</span></td><td>{}</td><td>{}</td><td><strong>{}</strong><br><small>{}</small></td><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num tool-rate\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td>{}</td><td>",
         row.verdict.css(),
         row.verdict.label(),
         esc(&row.time),
@@ -273,6 +274,7 @@ fn push_detail_row(h: &mut String, row: &Row, group_title: &str) {
             is_ping,
             rx_p10_text(row.rx_p10, row.rx_avg, is_ping),
         )),
+        esc(&nic_cell(row, is_ping, tx_avg_text(row.tx_avg, is_ping))),
         esc(&tool_rate_text(row.tx_mbps, row.rx_mbps)),
         esc(&target_text(row.target_mbps)),
         esc(&nic_cell(
@@ -357,11 +359,12 @@ fn push_bidirectional_direction(
         )
     };
     h.push_str(&format!(
-        "<div class=\"direction-summary-row\"><span class=\"direction-summary-tag\">{}</span><span class=\"direction-summary-endpoints\">{}</span><span>接收端 RX 平均 <strong>{}</strong></span><span>RX-P10 <strong>{}</strong></span><span>目标 <strong>{}</strong></span>{}<span class=\"direction-summary-reason\">判定：{}</span></div>",
+        "<div class=\"direction-summary-row\"><span class=\"direction-summary-tag\">{}</span><span class=\"direction-summary-endpoints\">{}</span><span>接收端 RX 平均 <strong>{}</strong></span><span>RX-P10 <strong>{}</strong></span><span>发送端 TX 平均 <strong>{}</strong></span><span>目标 <strong>{}</strong></span>{}<span class=\"direction-summary-reason\">判定：{}</span></div>",
         esc(&tag),
         esc(&direction_endpoint_text(direction)),
         esc(&rx_avg_text(direction.rx_avg, false)),
         esc(&rx_p10_text(direction.rx_p10, direction.rx_avg, false)),
+        esc(&tx_avg_text(direction.tx_avg, false)),
         esc(&target_text(direction.target_mbps)),
         shots,
         esc(&reason),
@@ -446,7 +449,7 @@ fn push_unit_list(h: &mut String, groups: &[&UnitGroup<'_>]) {
             h.push_str("<p class=\"summary-note\">本次没有执行行；请结合单元状态和原因查看。</p>");
         } else {
             h.push_str(&format!(
-                "<div class=\"table-scroll\" role=\"region\" aria-labelledby=\"unit-toggle-{index}\" tabindex=\"0\"><table class=\"results-table\"><caption class=\"sr-only\">{}的逐行执行明细</caption><thead><tr><th scope=\"col\">结果</th><th scope=\"col\">时间</th><th scope=\"col\">方向</th><th scope=\"col\">类型 / 参数</th><th scope=\"col\">传输</th><th scope=\"col\">请求/活跃/要求流</th><th scope=\"col\">网卡 RX 平均</th><th scope=\"col\">网卡 RX-P10</th><th scope=\"col\">流量工具自报（非判定口径）</th><th scope=\"col\">目标</th><th scope=\"col\">采样覆盖率</th><th scope=\"col\">质量指标</th><th scope=\"col\">诊断详情</th></tr></thead><tbody>\n",
+                "<div class=\"table-scroll\" role=\"region\" aria-labelledby=\"unit-toggle-{index}\" tabindex=\"0\"><table class=\"results-table\"><caption class=\"sr-only\">{}的逐行执行明细</caption><thead><tr><th scope=\"col\">结果</th><th scope=\"col\">时间</th><th scope=\"col\">方向</th><th scope=\"col\">类型 / 参数</th><th scope=\"col\">传输</th><th scope=\"col\">请求/活跃/要求流</th><th scope=\"col\">网卡 RX 平均</th><th scope=\"col\">网卡 RX-P10</th><th scope=\"col\">网卡 TX 平均</th><th scope=\"col\">流量工具自报（非判定口径）</th><th scope=\"col\">目标</th><th scope=\"col\">采样覆盖率</th><th scope=\"col\">质量指标</th><th scope=\"col\">诊断详情</th></tr></thead><tbody>\n",
                 esc(title),
             ));
             for row in &group.details {
@@ -549,19 +552,21 @@ h2 { margin: 28px 0 10px; font-size: 17px; line-height: 1.3; }
    窄屏能等比压缩，而横向真的溢出时（min-width 生效）又正好还原成下面
    冻结列偏移所依赖的 48 / 116 / 250 px。
    c-verdict 必须容得下最长的 NOT_EVALUATED，否则结果列会被裁成 NOT_EVALUATE。 */
-.overview-table { min-width: 1432px; table-layout: fixed; }
-/* 序号列按 48px 折算；其余列等比缩，冻结列偏移随之改为 0/48/164/414。 */
-.overview-table col.c-seq { width: 3.352%; }
-.overview-table col.c-verdict { width: 8.101%; }
-.overview-table col.c-unit { width: 17.459%; }
-.overview-table col.c-dir { width: 3.352%; }
-.overview-table col.c-endpoints { width: 13.268%; }
-.overview-table col.c-streams { width: 6.145%; }
-.overview-table col.c-rate { width: 7.402%; }
-.overview-table col.c-target { width: 6.844%; }
-.overview-table col.c-shot { width: 12.709%; }
-.overview-table col.c-coverage { width: 5.447%; }
-.overview-table col.c-quality { width: 8.520%; }
+.overview-table { min-width: 1538px; table-layout: fixed; }
+/* 序号列按 48px 折算；其余列等比缩，冻结列偏移随之改为 0/48/164/414。
+   百分比 = 该列 px ÷ 1538：48/116/250/48/190/88/106×3/98/182/78/122。
+   c-rate 是三列（RX 平均、RX-P10、TX 平均），总宽从 1432px 加到 1538px。 */
+.overview-table col.c-seq { width: 3.121%; }
+.overview-table col.c-verdict { width: 7.542%; }
+.overview-table col.c-unit { width: 16.255%; }
+.overview-table col.c-dir { width: 3.121%; }
+.overview-table col.c-endpoints { width: 12.354%; }
+.overview-table col.c-streams { width: 5.722%; }
+.overview-table col.c-rate { width: 6.892%; }
+.overview-table col.c-target { width: 6.372%; }
+.overview-table col.c-shot { width: 11.834%; }
+.overview-table col.c-coverage { width: 5.072%; }
+.overview-table col.c-quality { width: 7.932%; }
 /* 序号只写在单元首行，续行留空；加粗让它在长表里可扫。 */
 .overview-table td.seq-col { font-weight: 700; color: var(--muted); }
 .overview-table th, .overview-table td, .results-table th, .results-table td { border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); padding: 6px 8px; text-align: left; vertical-align: top; }
@@ -620,7 +625,7 @@ h2 { margin: 28px 0 10px; font-size: 17px; line-height: 1.3; }
 .shot-mini img { display: block; width: 100%; max-width: 80px; height: auto; aspect-ratio: 40 / 23; border: 1px solid #b8c2cb; border-radius: 3px; background: #eef2f5; object-fit: cover; }
 .shot-mini:hover img, .shot-mini:focus-visible img { border-color: #1769aa; outline: 2px solid #9dc6e8; outline-offset: 1px; }
 .table-scroll { max-width: 100%; max-height: 68vh; overflow: auto; overscroll-behavior: contain; scrollbar-gutter: stable; background: var(--surface); }
-.results-table { min-width: 1480px; }
+.results-table { min-width: 1600px; }
 /* 时间戳不能被 overflow-wrap: anywhere 拆成一列一个字符，那会把行高撑到十几行。 */
 .results-table td:nth-child(2), .results-table th:nth-child(2) { white-space: nowrap; }
 /* 工具自报速率是「流确实建立了」的证据，不是判定口径；弱化显示以免和左边的
@@ -673,7 +678,7 @@ summary:focus-visible, a:focus-visible, .table-scroll:focus-visible, .overview-s
 /* 概览整表需要 1432px。屏幕更窄时不要求用户去找横向滚动条：撤掉 min-width，
    让定宽列按比例压缩、数字换行，一屏内全部看完。滚动条即使限制了容器高度，
    也可能因为上方 meta/统计块把容器底部推到视口之外，所以能不横向滚动最好。 */
-@media (max-width: 1460px) {
+@media (max-width: 1566px) {
     .overview-table { min-width: 0; }
     .overview-table td.num, .overview-table th { white-space: normal; }
     /* 等比压缩后不再横向溢出，冻结列没有意义；而 sticky 的 left 约束即使

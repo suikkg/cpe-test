@@ -63,6 +63,21 @@ export function hasToken(): boolean {
   return token() !== '';
 }
 
+/**
+ * 给**浏览器自己发起的下载**拼查询串（`?token=…`，没有口令时为空串）。
+ *
+ * 浏览器下载不带自定义头，`<a download>` 的相对 URL 也不继承 `fetch` 那套，
+ * 所以这是唯一允许把口令放进 URL 的通道；代价见 `views/runs/RunsView.vue`。
+ *
+ * 存在的理由是「口令怎么取只有一处实现」：调用方以前自己 `sessionStorage
+ * .getItem('cpe_ui_token')`，于是 `TOKEN_KEY` 有了第二份硬编码——改了这里那份
+ * 而漏掉调用方，表现是下载链接静默 401，看起来完全像是服务端的问题。
+ */
+export function downloadQuery(): string {
+  const value = token();
+  return value ? `?token=${encodeURIComponent(value)}` : '';
+}
+
 async function request<T>(method: 'GET' | 'POST', path: string, body?: unknown): Promise<T> {
   const headers: Record<string, string> = { 'X-CPE-Token': token() };
   if (method === 'POST') {

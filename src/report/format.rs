@@ -98,6 +98,12 @@ pub(super) fn rx_avg_text(value: Option<f64>, is_ping: bool) -> String {
     )
 }
 
+/// 发送端 TX 平均，格式规则与 RX 完全相同（ping 无此概念记 N/A，灌包没采到
+/// 记「未采集」）。单独开一个名字只是让调用点读得出这一列是 TX。
+pub(super) fn tx_avg_text(value: Option<f64>, is_ping: bool) -> String {
+    rx_avg_text(value, is_ping)
+}
+
 pub(super) fn rx_p10_text(value: Option<f64>, rx_avg: Option<f64>, is_ping: bool) -> String {
     value.map_or_else(
         || {

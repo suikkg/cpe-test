@@ -79,8 +79,12 @@ function schedule(): void {
 async function tick(): Promise<void> {
   if (!run.polling) return;
   try {
+    // 带上手上这份 `run_id`：单元游标只在一轮之内有意义。服务端对不上就
+    // 从 0 重发，否则「新一轮已经跑过陈旧游标」时这个标签页会永久缺开头
+    // 那一段单元——而计数格走的是全量 counts，两块显示会对不上。
     const out = await api.get<ProgressOut>(
-      `/api/progress?from=${run.logCursor}&units_from=${run.unitCursor}`,
+      `/api/progress?from=${run.logCursor}&units_from=${run.unitCursor}` +
+        `&run_id=${encodeURIComponent(run.status.run_id)}`,
     );
     applyProgress(out);
   } catch {

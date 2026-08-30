@@ -526,13 +526,14 @@ fn overview_keeps_scenario_columns_and_screenshots_reachable_without_page_scroll
     assert!(html.contains(
         ".overview-table th:nth-child(4), .overview-table tr:not(.reason-row) > td:nth-child(4) { left: 414px;"
     ));
-    // 基准 1432px 下 3.352% = 48px、8.101% = 116px、17.459% = 250px。
-    assert!(html.contains(".overview-table { min-width: 1432px; table-layout: fixed; }"));
-    assert!(html.contains(".overview-table col.c-seq { width: 3.352%; }"));
-    assert!(html.contains(".overview-table col.c-verdict { width: 8.101%; }"));
-    assert!(html.contains(".overview-table col.c-unit { width: 17.459%; }"));
+    // 基准 1538px 下 3.121% = 48px、7.542% = 116px、16.255% = 250px。
+    // 这三个 px 是下面冻结列偏移 0/48/164/414 的来源，改列宽必须同步核对。
+    assert!(html.contains(".overview-table { min-width: 1538px; table-layout: fixed; }"));
+    assert!(html.contains(".overview-table col.c-seq { width: 3.121%; }"));
+    assert!(html.contains(".overview-table col.c-verdict { width: 7.542%; }"));
+    assert!(html.contains(".overview-table col.c-unit { width: 16.255%; }"));
     // 屏幕装不下时改为等比压缩，不让用户去页面底部找横向滚动条。
-    assert!(html.contains("@media (max-width: 1460px)"));
+    assert!(html.contains("@media (max-width: 1566px)"));
     // 窄列里最长的结果标签必须能在下划线处折行，不能溢出盖住相邻列。
     assert_eq!(
         status_label_html(Verdict::NotEvaluated),
@@ -550,7 +551,7 @@ fn overview_keeps_scenario_columns_and_screenshots_reachable_without_page_scroll
     // 判定原因独占整行，不再挤在定宽列里被截断。
     assert!(!html.contains("<th scope=\"col\">原因</th>"));
     assert!(html.contains("<tr class=\"reason-row\""));
-    assert!(html.contains("colspan=\"12\""));
+    assert!(html.contains("colspan=\"13\""));
     // 截图列与接收速率同排，不必展开诊断面板。
     assert!(html.contains("<th scope=\"col\">截图</th>"));
     assert!(html.contains("<col class=\"c-shot\">"));
@@ -612,8 +613,66 @@ fn overview_drops_the_screenshot_column_when_nothing_was_captured() {
     assert!(!html.contains("<th scope=\"col\">截图</th>"));
     assert!(!html.contains("<col class=\"c-shot\">"));
     // 序号列让整表多一列，原因行的 colspan 必须跟着走。
-    assert!(html.contains("colspan=\"11\""));
+    assert!(html.contains("colspan=\"12\""));
     assert!(html.contains("TARGET_UNKNOWN: Observe 模式仅记录实际能力"));
+}
+
+/// 发送端 TX 平均要出现在概览和明细两处，但**判定仍然只看接收端 RX**。
+///
+/// 这一列是用来分辨「链路收不到」和「压根没发够」的：RX 不达标时，先看
+/// TX 是不是也塌了。真让 TX 参与判定就变成了自证——发送端自己报的数不能
+/// 用来证明对端收到了。所以这里同时钉住两件事：列在、判定不动。
+#[test]
+fn the_sender_side_tx_rate_is_shown_everywhere_but_never_judges() {
+    let mut summary = unit_summary("unit-tx", Verdict::RateFail);
+    // 双向单元：AB / BA 两条腿都在，方向摘要那一段才会渲染。
+    summary.direction_summaries = vec![
+        DirectionSummary {
+            tag: "AB".into(),
+            src: "master/eth0".into(),
+            dst: "agent/eth1".into(),
+            verdict: Verdict::RateFail,
+            reason_code: ReasonCode::RxBelowTarget,
+            reason_detail: "网卡 RX 平均 120.000Mbps 低于目标 850.000Mbps".into(),
+            rx_avg: Some(120.0),
+            rx_p10: Some(100.0),
+            // 发出去 940、收到 120：TX 正常，问题在链路上而不在发送端。
+            tx_avg: Some(940.5),
+            target_mbps: Some(850.0),
+            ..Default::default()
+        },
+        DirectionSummary {
+            tag: "BA".into(),
+            src: "agent/eth1".into(),
+            dst: "master/eth0".into(),
+            verdict: Verdict::Pass,
+            reason_code: ReasonCode::RxTargetMet,
+            reason_detail: "达标".into(),
+            rx_avg: Some(920.0),
+            rx_p10: Some(900.0),
+            tx_avg: Some(935.0),
+            target_mbps: Some(850.0),
+            ..Default::default()
+        },
+    ];
+    let mut detail = traffic_detail("unit-tx", (0, 0, 0, 0));
+    detail.verdict = Verdict::RateFail;
+    detail.rx_avg = Some(120.0);
+    detail.tx_avg = Some(940.5);
+    let html = render(vec![summary, detail]);
+
+    // 概览表、方向摘要、逐行明细三处都要有这一列。
+    assert!(html.contains("<th scope=\"col\">发送端 TX 平均</th>"));
+    assert!(html.contains("<th scope=\"col\">网卡 TX 平均</th>"));
+    assert!(html.contains("发送端 TX 平均 <strong>940.500 Mbps</strong>"));
+    assert!(html.contains("940.500 Mbps"), "TX 的数值本身要渲染出来");
+
+    // 判定口径没变：TX 高达 940 也救不回 RX 只有 120 的那一行。
+    assert!(html.contains("RX_BELOW_TARGET"), "判定理由仍来自接收端");
+    assert!(
+        !html.contains("TX_BELOW_TARGET"),
+        "不许因为 TX 冒出新的判定分支"
+    );
 }
 
 #[test]
