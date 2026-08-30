@@ -55,6 +55,30 @@
   PING `n=180 × 32/1600/65500`）。展开约 210 个单元、预计 11.5 小时。两份文件都有测试
   钉着：具名配置要能过真正的加载与校验路径，项目文件要能在它自己声明的拓扑上编译成计划。
 
+## v6.1.0
+
+- **报告与 Excel 新增发送端 TX 速率**。判定口径**没有变**：PASS/FAIL 仍然只看接收端
+  网卡 RX，TX 一个字节都不参与判定。加这一列是为了把「链路收不到」和「压根没发够」
+  当场分开——RX 不达标时先看它。概览表、方向摘要、逐行明细三处都有；Excel 的概览与
+  逐行明细同步，明细里连 TX-P10 一起给出（它决定要不要报 `OFFERED_LOAD_LOW`，
+  判定理由引用的数不该在表里查不到）。
+- **UDP 链补上发送端逐样本 CSV 的链接**。TX 样本 v6.0.0 起就落盘了，只是 UDP 那条链的
+  组合计行和流明细行忘了挂链接——而 TX 滚动覆盖率不足会把整行打成 `NOT_EVALUATED`，
+  那份证据必须点得开。iperf 单腿和 ctsTraffic 本来就有，只有 UDP 漏了。
+- **中止点改用全局序号**。诊断补跑那一趟的序号偏移是主队列长度，此前记的是局部下标，
+  于是「第 147 个单元后中止」在报告横幅和进度页上一起被写成「第 2 个」——两个出口
+  指向同一个错位置，因为一致所以看不出来。
+- **进度游标跟着 `run_id` 失效**。此前只按「游标越界」自愈；但第二个标签页攥着上一轮的
+  游标 250 回来时，新一轮若已经跑过 250 个单元就不越界，服务端安静地只回增量——那个
+  页面于是**永久缺**新一轮开头的一段单元，而计数格走的是全量计数，两块显示对不上
+  且都「看起来正常」。
+- **报告打包下载改为流式落盘**。此前整个 zip 在内存里拼，峰值约等于「run 目录大小 +
+  最大单文件」，而 store 模式下 zip 大小就等于目录大小。跑控制台的进程同时正在跑测试，
+  一次下载把它 OOM 掉，赔进去的是整轮测量。
+- **旧 run 目录的重放兼容性**。`DirectionSummary` 嵌在 `rows.jsonl` 里一起落盘却没有
+  `serde(default)`，给它加字段会让旧目录报 `missing field`，而加载器把解析失败
+  **静默计进跳过行数**——重放出来的报告会悄悄少一批行。已补上容错。
+
 ## v6.0.0
 
 - **掉速判定改判在原始逐样本序列上**：此前判的是「某个 5 秒滑动平均越过门限」，
@@ -494,7 +518,7 @@ CPE（Customer Premises Equipment）子网测试工具用于在**两台电脑之
 ```
 cpe_test.exe          ← 本工具（单文件）
 iperf3.exe            ← 从 iperf.fr 下载（只测 Ping/ctsTraffic 可不放）
-ctsTraffic.exe        ← v6.0.0 Windows Release 已捆绑（仅 Windows 10+）
+ctsTraffic.exe        ← v6.1.0 Windows Release 已捆绑（仅 Windows 10+）
 start_agent.bat       ← 辅测机双击
 start_ui.bat          ← 主控机双击（图形控制台，推荐）
 start_master.bat      ← 主控机双击（命令行问答式）
@@ -1277,7 +1301,7 @@ cargo build --release --locked
 
 自行编译后，把 `cpe_test.exe`、启动脚本和所需吞吐工具放到两台 Windows 电脑同一目录：
 iperf3 测试需要完整的 iperf3 Windows 发行包；ctsTraffic 测试需要 `ctsTraffic.exe`。
-官方 v6.0.0 Windows Release ZIP 已捆绑固定且校验过的 ctsTraffic 2.0.4.0，但由于发行包差异不内置 iperf3。
+官方 v6.1.0 Windows Release ZIP 已捆绑固定且校验过的 ctsTraffic 2.0.4.0，但由于发行包差异不内置 iperf3。
 
 ### GitHub Actions CI
 
@@ -1300,7 +1324,7 @@ Windows ZIP 包含启动脚本、四份配置、固定 CTS 二进制和第三方
 `tar.gz` 保留 `cpe_test` 可执行位。发布作业会再次核对资产名称、数量、内部结构和哈希。
 
 仓库同时跟踪一份不含可执行程序的
-[`cpe_test-v6.0.0-windows-config-docs.zip`](dist/cpe_test-v6.0.0-windows-config-docs.zip)，
+[`cpe_test-v6.1.0-windows-config-docs.zip`](dist/cpe_test-v6.1.0-windows-config-docs.zip)，
 便于直接从 Git 下载 Windows 配置、文档和启动脚本。其 SHA-256 位于同目录的
 `.zip.sha256` 文件；CI 会逐文件确认压缩包内容与仓库源文件一致。需要开箱即用的程序、
 固定版 ctsTraffic 和许可证全集时，仍应下载上面的正式 Windows Release ZIP。

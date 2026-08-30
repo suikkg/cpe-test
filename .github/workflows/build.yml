@@ -65,21 +65,28 @@ jobs:
 
       - name: Validate tracked Windows configuration and documentation bundle
         shell: bash
+        # 包名跟着 Cargo 版本走，不写死：写死的话每次发版都要记得同时改这里，
+        # 而忘了改的表现是 CI 去找上一版的 zip、报「文件不存在」——看起来像
+        # 打包脚本坏了，实际是工作流没跟上。
+        env:
+          CRATE_VERSION: ${{ steps.metadata.outputs.crate_version }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
+          import os
           from hashlib import sha256
           from pathlib import Path
           from zipfile import ZipFile
 
-          bundle = Path("dist/cpe_test-v6.0.0-windows-config-docs.zip")
+          version = os.environ["CRATE_VERSION"]
+          bundle = Path(f"dist/cpe_test-v{version}-windows-config-docs.zip")
           checksum = Path(f"{bundle}.sha256")
           expected_hash = checksum.read_text(encoding="utf-8").split()[0]
           actual_hash = sha256(bundle.read_bytes()).hexdigest()
           if actual_hash != expected_hash:
               raise SystemExit(f"bundle SHA-256 mismatch: {actual_hash}")
 
-          prefix = "cpe_test-v6.0.0-windows-config-docs"
+          prefix = f"cpe_test-v{version}-windows-config-docs"
           source_for = {
               "Windows配置与文档包说明.md": Path("dist/Windows配置与文档包说明.md"),
               "README.md": Path("README.md"),
@@ -623,7 +630,16 @@ jobs:
           generate_release_notes: true
           make_latest: true
           body: |
-            cpe_test v6.0.0 的已验证跨平台发布包。
+            cpe_test ${{ github.ref_name }} 的已验证跨平台发布包。
+
+            ## v6.1.0 发送端 TX 速率进报告与 Excel，四处外围缺陷修复
+
+            - **报告与 Excel 新增发送端 TX 速率**。判定口径**没有变**：PASS/FAIL 仍然只看接收端网卡 RX，TX 一个字节都不参与。加它是为了把「链路收不到」和「压根没发够」当场分开——RX 不达标时先看这一列。概览表、方向摘要、逐行明细三处都有；Excel 的概览与逐行明细同步，明细里连 TX-P10 一起给出（它决定要不要报 `OFFERED_LOAD_LOW`，判定理由引用的数不该在表里查不到）。
+            - **UDP 链补上发送端逐样本 CSV 的链接**。TX 样本 v6.0.0 起就落盘了，但 UDP 那条链的组合计行和流明细行忘了挂链接——而 TX 滚动覆盖率不足会把整行打成 `NOT_EVALUATED`，那份证据必须点得开。iperf 单腿和 CTS 本来就有，只有 UDP 漏了。
+            - **中止点改用全局序号**。诊断补跑那一趟的序号偏移是主队列长度，此前记的是局部下标，于是「第 147 个单元后中止」在报告横幅和进度页上一起被写成「第 2 个」——两个出口指向同一个错位置，因为一致所以看不出来。
+            - **进度游标跟着 `run_id` 失效**。此前只按「游标越界」自愈。但第二个标签页攥着上一轮的游标 250 回来时，新一轮若已经跑过 250 个单元就不越界，服务端安静地只回增量——那个页面于是**永久缺**新一轮开头的一段单元，而计数格走的是全量计数，两块显示对不上且都「看起来正常」。
+            - **报告打包下载改为流式落盘**。此前整个 zip 在内存里拼，峰值约等于「run 目录大小 + 最大单文件」，而 store 模式下 zip 大小就等于目录大小。跑控制台的进程同时正在跑测试，一次下载把它 OOM 掉赔进去的是整轮测量。
+            - **旧 run 目录的重放兼容性**。`DirectionSummary` 嵌在 `rows.jsonl` 里一起落盘却没有 `serde(default)`，给它加字段会让旧目录报 `missing field`，而加载器把解析失败**静默计进跳过行数**——重放出来的报告会悄悄少一批行。已补上容错。
 
             ## v6.0.0 结构化进度、结果落盘可重放、判定装配收敛与 Vue 控制台
 
