@@ -102,6 +102,8 @@ jobs:
               "configs/config-wifi5g.json": Path("dist/configs/config-wifi5g.json"),
               "configs/config-10gusb.json": Path("dist/configs/config-10gusb.json"),
               "configs/config-all-common.json": Path("dist/configs/config-all-common.json"),
+              "configs/config-full-tcp-udp-ping.json": Path("dist/configs/config-full-tcp-udp-ping.json"),
+              "projects/cpe-ui-project-full.json": Path("dist/projects/cpe-ui-project-full.json"),
               "start_ui.bat": Path("dist/start_ui.bat"),
               "start_agent.bat": Path("dist/start_agent.bat"),
               "start_master.bat": Path("dist/start_master.bat"),
@@ -333,6 +335,7 @@ jobs:
           Copy-Item 'dist/iperf3-请放到这里.txt' $stage
           Copy-Item 'dist/ctsTraffic-请放到这里.txt' $stage
           Copy-Item 'dist/configs' (Join-Path $stage 'configs') -Recurse
+          Copy-Item 'dist/projects' (Join-Path $stage 'projects') -Recurse
           Copy-Item 'LICENSE' (Join-Path $stage 'LICENSE-cpe_test-MIT.txt')
           Copy-Item 'THIRD_PARTY_NOTICES.md' $stage
           Copy-Item 'third_party/WIL-LICENSE-MIT.txt' (Join-Path $stage 'LICENSE-WIL-MIT.txt')
@@ -353,6 +356,8 @@ jobs:
             'configs/config-wifi5g.json',
             'configs/config-10gusb.json',
             'configs/config-all-common.json',
+            'configs/config-full-tcp-udp-ping.json',
+            'projects/cpe-ui-project-full.json',
             'LICENSE-cpe_test-MIT.txt',
             'LICENSE-ctsTraffic-Apache-2.0.txt',
             'LICENSE-WIL-MIT.txt',

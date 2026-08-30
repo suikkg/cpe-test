@@ -173,7 +173,7 @@ code { font-family:var(--fm); background:var(--panel-2); padding:0 4px; border-r
 
 /* UDP 参数组表 */
 .udp-groups { margin:10px 0 4px; }
-/* 参数配方的就地编辑器：占满一行，和上面的配方 chip 明确分开。 */
+/* 参数配置的就地编辑器：占满一行，和上面的配置 chip 明确分开。 */
 .recipe-editor { flex:1 0 100%; margin-top:8px; padding:10px 12px; border:1px solid var(--line); border-radius:6px; background:var(--head); }
 .recipe-editor .rc-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:9px; }
 .recipe-editor .rc-cell { display:flex; flex-direction:column; gap:3px; min-width:0; }
@@ -269,6 +269,12 @@ pre.hint { font-family:var(--fm); }
 .link-set-card.selected { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent); background:var(--edited); }
 .link-set-card .set-top { display:flex; align-items:center; gap:8px; }
 .link-set-card .set-top strong { flex:1; min-width:0; overflow-wrap:anywhere; }
+/* 集合名称就地可改：默认画得像标题，聚焦时才显出输入框的边。多点一次
+   「改名」按钮再弹 prompt，是新建集合后最先撞上的一堵墙。 */
+.link-set-card .qset-name { flex:1; min-width:0; padding:3px 5px; border:1px solid transparent;
+  border-radius:3px; background:transparent; color:var(--ink); font:700 13px/1.3 inherit; }
+.link-set-card .qset-name:hover { border-color:var(--line); }
+.link-set-card .qset-name:focus { border-color:var(--accent); background:var(--panel-2); outline:none; }
 .link-set-card .set-meta { display:flex; flex-wrap:wrap; gap:4px 9px; margin:5px 0 0 24px; color:var(--muted); font:11px/1.35 var(--fm); }
 .link-set-card .set-actions { display:flex; flex-wrap:wrap; gap:6px; margin:8px 0 0 24px; }
 .link-set-card .pair-list { margin:8px 0 0 24px; padding-top:7px; border-top:1px dashed var(--line); }
@@ -300,6 +306,11 @@ pre.hint { font-family:var(--fm); }
 .assign-table th:not(:first-child), .assign-table td:not(:first-child) { text-align:center; }
 .assign-table td:first-child { min-width:220px; }
 .assign-cell { width:17px; height:17px; }
+/* 表头里的整列开关：和高级矩阵的 .colall 同一个读法——勾一下整列全开，
+   再勾一下整列全关。套件多了以后，逐格点的成本是 集合数 × 套件数。 */
+.assign-table th .colsel { display:flex; justify-content:center; margin-top:4px; }
+.assign-table th .colsel label { display:inline-flex; align-items:center; gap:4px;
+  font-weight:400; color:var(--muted); font-size:11px; }
 .assign-count { color:var(--muted); font:11px/1.3 var(--fm); }
 .review-panel { margin-top:16px; }
 .review-tree { max-height:360px; overflow:auto; }
@@ -400,11 +411,12 @@ pre.hint { font-family:var(--fm); }
     <h2><span class="n">2</span>网口与策略</h2>
     <div class="scroll"><table id="nics"><thead><tr>
       <th>端</th><th>接口名</th><th>角色</th><th>IPv4</th><th>协商速率</th><th>网关</th>
-      <th>作为接收端：RX 门限</th><th>作为发送端：UDP -b</th><th>作为发送端：UDP -l</th>
+      <th>作为接收端：RX 门限</th><th>作为发送端：UDP -b</th>
     </tr></thead><tbody></tbody></table></div>
     <p class="hint">RX 门限两种写法都行：<code>1800</code> = 1800Mbps；<code>90%</code> = 该网卡协商速率的 90%，
     每个单元开跑前按重扫到的协商速率换算，算式会出现在「预览任务」的提示里。
-    这里填的 UDP <code>-b</code> / <code>-l</code> 覆盖执行区的全局档位。</p>
+    这里填的 UDP <code>-b</code> 覆盖档位里的带宽。报文长度 <code>-l</code> 不在这张表里填——
+    它属于流量套件，在第 3 步每条 TCP/UDP 配置里设置。</p>
   </section>
 
   <section id="matrixsec" class="hidden">
@@ -435,11 +447,13 @@ pre.hint { font-family:var(--fm); }
           </div>
           <div class="panel-body">
             <div class="link-filter">
-              <label><input type="checkbox" id="qcrossonly" checked>只显示跨机链路</label>
+              <label><input type="checkbox" id="qcrossonly">只显示跨机链路</label>
               <label><input type="checkbox" id="qshowpairs">展开具体网口对</label>
               <button type="button" class="ghost" id="qnewset">+ 新建链路集合</button>
               <button type="button" class="ghost" id="qautogroup">按角色自动分组</button>
             </div>
+            <p class="hint" style="margin:-4px 0 10px">默认列出全部组合，同机两块网口的组合也算一条链路。
+            勾上「只显示跨机链路」后，候选和自动分组都只剩跨机组合。集合名称直接改，不用另外点按钮。</p>
             <div id="quicksets" class="link-set-list"></div>
             <div id="quicksetempty" class="quick-empty hidden">连接辅测机后会生成可用链路。也可以新建集合并手动选择网口对。</div>
           </div>
@@ -465,7 +479,7 @@ pre.hint { font-family:var(--fm); }
       <div class="quick-panel" style="margin-top:16px">
         <div class="panel-head">
           <h3>3 · 分配</h3>
-          <span class="hint">同一链路可分配多个套件；每个套件内部仍是连续队列</span>
+          <span class="hint">表头的「整列」一次勾满一个套件；同一链路可分配多个套件，每个套件内部仍是连续队列</span>
         </div>
         <div class="panel-body">
           <div class="assign-toolbar">
@@ -546,13 +560,13 @@ pre.hint { font-family:var(--fm); }
   <section id="runsec" class="hidden">
     <h2><span class="n">4</span>执行</h2>
     <p class="hint sweep-note">
-      快速工作台中，TCP 和 UDP 参数写在各自的配方里；高级矩阵中，档位在第 3 步的参数组表里
+      快速工作台中，TCP 和 UDP 参数写在各自的配置里；高级矩阵中，档位在第 3 步的参数组表里
       （组内取组合：TCP 是 -w × -P，UDP 是 -b × -l × -w）。TCP 灌包和 UDP 灌包始终是独立任务，
-      套件只定义它们的连续执行顺序。跑之前用「预览任务」看一眼总数，那里逐单元列着每条腿最终下发的参数。
+      套件只定义它们的连续执行顺序。跑之前用「预览任务」看一眼总数，那里逐单元列着最终下发的参数。
     </p>
     <div class="row run-options">
       <label>时长 <input type="number" id="duration" class="num" value="180" min="1" max="86400"></label>
-      <label>ping 次数 <input type="number" id="pingcount" class="num" value="100" min="1" max="100000"></label>
+      <label>ping 次数 <input type="number" id="pingcount" class="num" value="180" min="1" max="100000"></label>
       <label>ping 包长 <input type="text" id="pingsizes" class="list" value="32 1600 65500" placeholder="32 1600 65500"></label>
       <label><input type="checkbox" id="clip"> 按链路上限裁剪 UDP -b</label>
       <label><input type="checkbox" id="resume"> 跳过 24 小时内已 PASS 的单元（resume）</label>
@@ -640,7 +654,7 @@ let MASTER = null, AGENT = null, PAIRS = [], FROM = 0, TIMER = null, LOCAL_NICS 
 // TestSpec，绝不在浏览器里把 TCP/UDP 拼成混合单元。
 let MODE = 'quick';
 let LINK_SETS = [], RECIPES = { tcp: [], udp: [], ping: [] }, SUITES = [], BINDINGS = [];
-// 正在就地编辑的配方草稿：{ protocol, id | null, draft }。null = 没在编辑。
+// 正在就地编辑的配置草稿：{ protocol, id | null, draft }。null = 没在编辑。
 let RECIPE_EDIT = null;
 let QUICK_SET_SELECTION = new Set(), QUICK_SUITE_SELECTION = '';
 let EDITING_SUITE_ID = null, EDITING_SUITE_DRAFT = null, PENDING_PROJECT = null;
@@ -801,8 +815,24 @@ function qpairCurrentMap() {
   PAIRS.forEach((pair) => map.set(qpairKey(endpointOf(pair.b), endpointOf(pair.a)), pair));
   return map;
 }
+// 自动集合按「这条链路是什么形态 + 两端是什么角色」分组。
+//
+// 前缀不能省：同机组合和跨机组合完全可能落在同一对角色上（主控 SGMII1G ↔
+// 辅测 SGMII2.5G 与 主控 SGMII1G ↔ 主控 SGMII2.5G），不带前缀这两类会被并进
+// 同一个集合，卡片上写的「跨机链路」也就不再是真的。
 function qroleKey(pair) {
-  return (pair.a.nic.role || pair.a.nic.name) + ' ↔ ' + (pair.b.nic.role || pair.b.nic.name);
+  const ends = (pair.a.nic.role || pair.a.nic.name) + ' ↔ ' + (pair.b.nic.role || pair.b.nic.name);
+  return (pair.cross ? '跨机 ' : pair.a.cn + '同机 ') + ends;
+}
+// 「只显示跨机链路」是一个控件、两处生效：卡片里列出的候选网口对，和
+// 「按角色自动分组」生成的集合。只在渲染那一处过滤、分组那一处写死 cross，
+// 就会出现「点了显示全部，再点自动分组毫无反应」——生成的还是原来那批跨机
+// 集合，同机组合一条都没被勾上。
+function qcrossOnly() {
+  return Boolean($('qcrossonly') && $('qcrossonly').checked);
+}
+function qcandidatePairs() {
+  return PAIRS.filter((pair) => !qcrossOnly() || pair.cross);
 }
 function qnewSet(name, pairs) {
   const seed = (name || '链路集合') + '\n' + (pairs || []).map((p) => p.src + '|' + p.dst).join('\n');
@@ -812,7 +842,7 @@ function qnewSet(name, pairs) {
 
 function autoLinkSets() {
   const groups = new Map();
-  PAIRS.filter((pair) => pair.cross).forEach((pair) => {
+  qcandidatePairs().forEach((pair) => {
     const key = qroleKey(pair);
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(qpairRef(pair));
@@ -853,11 +883,15 @@ function syncQuickSets() {
         // 让下一段 PAIRS 扫描重新补回，而不是把自动集合也标成失效从而
         // 阻塞预览。用户手工编辑过的集合已将 _auto 置 false，仍保留警告。
         if (!pair) return set._auto ? null : { ...ref, stale: true };
+        // 自动集合跟着筛选走：勾上「只显示跨机链路」后，同机的对退出自动集合，
+        // 空掉的自动集合在下面被清掉；取消勾选时又会按同一套角色键补回来。
+        // 用户手工编辑过的集合（_auto=false）不受筛选影响。
+        if (set._auto && qcrossOnly() && !pair.cross) return null;
         const fresh = qpairRef(pair); seen.add(qpairKey(fresh.src, fresh.dst)); return fresh;
       }).filter(Boolean);
     });
     // 新扫到的链路加入同角色的自动集合；自定义集合不被悄悄改名或清空。
-    PAIRS.filter((pair) => pair.cross).forEach((pair) => {
+    qcandidatePairs().forEach((pair) => {
       const ref = qpairRef(pair), key = qpairKey(ref.src, ref.dst);
       if (seen.has(key)) return;
       const role = qroleKey(pair);
@@ -888,9 +922,11 @@ function tcpRecipeDefault() {
   return { id: 'recipe-tcp-default', name: '默认 TCP', mode: 'fixed',
     profiles: [{ window: '4m', streams: 10 }] };
 }
+// 基线 UDP 的出厂档位：-b 2500m · -l 14k · -w 256m · 单流。
+// 用轴字段而不是 profiles，「编辑」打开就是这四格填好的样子。
 function udpRecipeDefault() {
-  return { id: 'recipe-udp-default', name: '默认 UDP', mode: 'fixed',
-    profiles: [{ bandwidth: '1000m', length: '1400', streams: 1 }] };
+  return { id: 'recipe-udp-default', name: '默认 UDP', mode: 'fixed', profiles: [],
+    bandwidths: ['2500m'], lengths: ['14k'], windows: ['256m'], udp_streams: [1] };
 }
 function baselineSuite() {
   return { id: 'suite-baseline', name: '基线 TCP+UDP', execution: 'sequential',
@@ -998,15 +1034,36 @@ function renderQuickSets() {
   const box = $('quicksets');
   if (!box) return;
   const showPairs = $('qshowpairs') && $('qshowpairs').checked;
-  const crossOnly = !$('qcrossonly') || $('qcrossonly').checked;
   const current = qpairCurrentMap();
-  const available = PAIRS.filter((pair) => !crossOnly || pair.cross);
+  const candidates = qcandidatePairs();
+  // 下面这三份都只跟当前拓扑和筛选有关，跟具体某个集合无关。放进 map 里算的话，
+  // 每张卡片都要把 PAIRS 重扫一遍并重算一轮 pair id 哈希——20 块口两两组合就是
+  // 几百对，乘上集合数之后，勾一下网口对整块面板会明显卡一下。
+  const candidateSet = new Set(candidates);
+  const outsideFilter = PAIRS.filter((pair) => !candidateSet.has(pair));
+  const refIdOf = new Map(PAIRS.map((pair) => [pair, qpairRef(pair).id]));
   const html = LINK_SETS.map((set) => {
     const pairs = set.pair_refs || [], valid = qsetPairs(set);
+    const chosen = new Set(pairs.filter((ref) => !ref.stale).map((ref) => ref.id));
     const assigned = SUITES.filter((suite) => qassigned(set.id, suite.id));
-    const pairRows = showPairs ? available.map((pair) => {
-      const ref = qpairRef(pair), checked = pairs.some((item) => item.id === ref.id && !item.stale);
-      return '<label class="pair-mini"><input type="checkbox" class="qpair-toggle" data-set="' + esc(set.id) + '" data-src="' + esc(ref.src) + '" data-dst="' + esc(ref.dst) + '"' + (checked ? ' checked' : '') + '>' +
+    // 卡片上的形态计数要按每条链路实际是什么算，不能写死「跨机链路」：
+    // 默认列的是全部组合，同机的对同样会进集合，标签说跨机就是在骗人。
+    let crossCount = 0, sameCount = 0;
+    valid.forEach((ref) => {
+      const pair = current.get(qpairKey(ref.src, ref.dst)) || current.get(qpairKey(ref.dst, ref.src));
+      if (!pair) return;
+      if (pair.cross) crossCount++; else sameCount++;
+    });
+    const shape = [];
+    if (crossCount) shape.push('跨机 ' + crossCount);
+    if (sameCount) shape.push('同机 ' + sameCount);
+    // 已经在集合里的对一定要列出来，哪怕当前筛选把它排除了：勾着却看不见的
+    // 那几条既取消不掉，又照样算进上面的「N 对」和实际执行。
+    const listed = candidates.concat(
+      outsideFilter.filter((pair) => chosen.has(refIdOf.get(pair))));
+    const pairRows = showPairs ? listed.map((pair) => {
+      const ref = qpairRef(pair);
+      return '<label class="pair-mini"><input type="checkbox" class="qpair-toggle" data-set="' + esc(set.id) + '" data-src="' + esc(ref.src) + '" data-dst="' + esc(ref.dst) + '"' + (chosen.has(ref.id) ? ' checked' : '') + '>' +
         '<span class="pair-label">' + esc(pair.label) + '</span></label>';
     }).concat(pairs.filter((ref) => ref.stale).map((ref) =>
       '<div class="pair-mini stale-pair"><span class="pair-label">' + esc(ref.src + ' ↔ ' + ref.dst) + '</span>' +
@@ -1016,12 +1073,16 @@ function renderQuickSets() {
       (ref.stale ? '<span class="chip warn">端点已消失</span>' : '') + '</div>').join('');
     return '<article class="link-set-card' + (QUICK_SET_SELECTION.has(set.id) ? ' selected' : '') + '">' +
       '<div class="set-top"><input type="checkbox" class="qset-select" data-set="' + esc(set.id) + '"' + (QUICK_SET_SELECTION.has(set.id) ? ' checked' : '') + '>' +
-      '<strong>' + esc(set.name || '未命名链路集合') + '</strong><span class="chip ' + (valid.length ? 'ok' : 'warn') + '">' + valid.length + ' 对</span>' +
-      '<button type="button" class="ghost qset-rename" data-set="' + esc(set.id) + '">改名</button>' +
+      // 名称就地可改。原来是「改名」按钮 + window.prompt：新建一个集合后，
+      // 改名要多点两下、选网口对还要先去上面勾「展开具体网口对」，等于新建
+      // 出来的集合当场编辑不了。
+      '<input type="text" class="qset-name" data-set="' + esc(set.id) + '" value="' + esc(set.name || '') + '" placeholder="未命名链路集合" aria-label="链路集合名称">' +
+      '<span class="chip ' + (valid.length ? 'ok' : 'warn') + '">' + valid.length + ' 对</span>' +
       (set._auto ? '' : '<button type="button" class="danger qset-delete" data-set="' + esc(set.id) + '">删除</button>') + '</div>' +
-      '<div class="set-meta"><span>跨机链路</span><span>已分配：' + (assigned.length ? assigned.map((s) => esc(s.name)).join('、') : '未分配') + '</span>' +
+      '<div class="set-meta"><span>' + (shape.length ? shape.join(' · ') : '未选网口对') + '</span><span>已分配：' + (assigned.length ? assigned.map((s) => esc(s.name)).join('、') : '未分配') + '</span>' +
+      (set._auto ? '<span>自动分组</span>' : '') +
       (pairs.some((ref) => ref.stale) ? '<span class="chip warn">含失效端点</span>' : '') + '</div>' +
-      '<div class="set-actions"><button type="button" class="ghost qset-expand" data-set="' + esc(set.id) + '">' + (showPairs ? '收起/隐藏选择' : '展开具体网口对') + '</button></div>' +
+      '<div class="set-actions"><button type="button" class="ghost qset-expand" data-set="' + esc(set.id) + '">' + (showPairs ? '收起网口对' : '展开具体网口对') + '</button></div>' +
       (showPairs ? '<div class="pair-list">' + (pairRows || '<span class="hint">没有符合筛选条件的链路</span>') + '</div>' : '') +
       '</article>';
   }).join('');
@@ -1052,13 +1113,13 @@ function renderQuickSuites() {
     sel.value = QUICK_SUITE_SELECTION;
   }
 }
-// 一个协议至少留一条配方：任务上勾的是配方 id，一条不剩时 ensureQuickDefaults
+// 一个协议至少留一条配置：任务上勾的是配置 id，一条不剩时 ensureQuickDefaults
 // 会悄悄补回一条「默认」，用户会以为自己没删掉。与其那样，不如直接不给删。
 function recipeIsLastOfProtocol(protocol) {
   return (RECIPES[protocol] || []).length <= 1;
 }
 
-// 有哪些任务正勾着这条配方——删之前要说清楚会波及谁。
+// 有哪些任务正勾着这条配置——删之前要说清楚会波及谁。
 function recipeUsage(protocol, id) {
   const users = [];
   SUITES.forEach((suite) => {
@@ -1088,12 +1149,12 @@ function renderQuickRecipes() {
       cards.push('<span class="chip' + (editing ? ' active' : '') + '" title="' + esc(qrecipeSummary(recipe, protocol)) + '">' + label + ' · ' + esc(recipe.name || recipe.id) + edit + del + '</span>');
     });
   });
-  box.innerHTML = (cards.length ? '<span class="hint" style="align-self:center">参数配方：</span>' + cards.join('') : '<span class="hint">暂无参数配方</span>') +
-    '<button type="button" class="ghost qrecipe-new" data-protocol="tcp">+ TCP 配方</button><button type="button" class="ghost qrecipe-new" data-protocol="udp">+ UDP 配方</button>' +
+  box.innerHTML = (cards.length ? '<span class="hint" style="align-self:center">参数配置：</span>' + cards.join('') : '<span class="hint">暂无参数配置</span>') +
+    '<button type="button" class="ghost qrecipe-new" data-protocol="tcp">+ TCP 配置</button><button type="button" class="ghost qrecipe-new" data-protocol="udp">+ UDP 配置</button>' +
     renderRecipeEditor();
 }
 
-// 就地编辑器。此前新建一条 UDP 配方要连点五个 window.prompt，中途取消还会
+// 就地编辑器。此前新建一条 UDP 配置要连点五个 window.prompt，中途取消还会
 // 留下半套数据；而且填完之后根本看不到自己填了什么，只能再点「编辑」重走一遍。
 function renderRecipeEditor() {
   if (!RECIPE_EDIT) return '';
@@ -1110,15 +1171,15 @@ function renderRecipeEditor() {
       field('windows', 'UDP -w 档位', '留空=不下发 -w', '') +
       field('streams', 'UDP 流数', '1', '多个用空格分隔');
   return '<div class="recipe-editor" data-protocol="' + protocol + '">' +
-    '<div class="rc-grid">' + field('name', '配方名称', protocol.toUpperCase() + ' 配方', '') + axes + '</div>' +
+    '<div class="rc-grid">' + field('name', '配置名称', protocol.toUpperCase() + ' 配置', '') + axes + '</div>' +
     '<div class="row" style="gap:7px;margin-top:8px">' +
     '<button type="button" class="ok qrecipe-save">保存</button>' +
     '<button type="button" class="ghost qrecipe-cancel">取消</button>' +
-    (RECIPE_EDIT.id ? '' : '<span class="hint">保存后这条配方才会出现在任务的可选项里</span>') +
+    (RECIPE_EDIT.id ? '' : '<span class="hint">保存后这条配置才会出现在任务的可选项里</span>') +
     '</div></div>';
 }
 // 打开就地编辑器。只动 RECIPE_EDIT 这份草稿，保存前不碰 RECIPES——
-// 此前是边 prompt 边改，中途取消会留下半套配方，新建时甚至留下一条空的，
+// 此前是边 prompt 边改，中途取消会留下半套配置，新建时甚至留下一条空的，
 // 一直到点「预览」才报错。
 function openRecipeEditor(protocol, id) {
   const list = RECIPES[protocol] || [];
@@ -1129,14 +1190,14 @@ function openRecipeEditor(protocol, id) {
     id: id || null,
     draft: original
       ? recipeDraftFrom(original, protocol)
-      : { name: protocol.toUpperCase() + ' 配方', bandwidths: protocol === 'udp' ? '1000m' : '', lengths: '', windows: '', streams: '1' },
+      : { name: protocol.toUpperCase() + ' 配置', bandwidths: protocol === 'udp' ? '1000m' : '', lengths: '', windows: '', streams: '1' },
   };
   renderQuickRecipes();
   const first = document.querySelector('#quickrecipes .rc-field');
   if (first) { first.focus(); first.select(); }
 }
 
-// 旧项目和默认配方常用完整 profiles，新编辑器用的是轴字段。把 profiles
+// 旧项目和默认配置常用完整 profiles，新编辑器用的是轴字段。把 profiles
 // 投影成轴文本，打开「默认 TCP」时才不会把 4m/-P10 显示成空/1。
 function recipeDraftFrom(recipe, protocol) {
   const profileValues = (keys) => {
@@ -1180,7 +1241,7 @@ function saveRecipeEditor() {
   }
   const protocol = RECIPE_EDIT.protocol, draft = RECIPE_EDIT.draft;
   if (protocol === 'udp' && !splitList(draft.bandwidths).length) {
-    alert('UDP 配方必须至少填一个 -b 档位。');
+    alert('UDP 配置必须至少填一个 -b 档位。');
     return;
   }
   const list = RECIPES[protocol] || [];
@@ -1188,7 +1249,7 @@ function saveRecipeEditor() {
   const recipe = index >= 0
     ? JSON.parse(JSON.stringify(list[index]))
     : { id: qid('recipe', protocol + Date.now() + Math.random()), mode: 'fixed' };
-  recipe.name = draft.name.trim() || (protocol.toUpperCase() + ' 配方');
+  recipe.name = draft.name.trim() || (protocol.toUpperCase() + ' 配置');
   // 轴字段是唯一事实来源；profiles 是旧格式，保存时清掉免得两套并存。
   recipe.profiles = [];
   if (protocol === 'tcp') {
@@ -1207,7 +1268,7 @@ function saveRecipeEditor() {
   renderQuickWorkspace();
 }
 
-// 删除：配方 id 被任务勾着，删了不清引用，预览时会变成一个没有任何参数的
+// 删除：配置 id 被任务勾着，删了不清引用，预览时会变成一个没有任何参数的
 // 任务，而人根本看不出是哪一步出的问题。所以先说清波及谁，再连引用一起清。
 function deleteQuickRecipe(protocol, id) {
   if (protocol === 'ping' || recipeIsLastOfProtocol(protocol)) return;
@@ -1216,9 +1277,9 @@ function deleteQuickRecipe(protocol, id) {
   if (!recipe) return;
   const users = recipeUsage(protocol, id);
   const note = users.length
-    ? '\n\n以下 ' + users.length + ' 个任务正在用它，删除后会改用同协议的第一条配方：\n· ' + users.slice(0, 8).join('\n· ') + (users.length > 8 ? '\n· …' : '')
+    ? '\n\n以下 ' + users.length + ' 个任务正在用它，删除后会改用同协议的第一条配置：\n· ' + users.slice(0, 8).join('\n· ') + (users.length > 8 ? '\n· …' : '')
     : '';
-  if (!confirm('删除配方「' + (recipe.name || recipe.id) + '」？' + note)) return;
+  if (!confirm('删除配置「' + (recipe.name || recipe.id) + '」？' + note)) return;
   RECIPES[protocol] = list.filter((item) => item.id !== id);
   const fallback = (RECIPES[protocol][0] || {}).id;
   SUITES.forEach((suite) => {
@@ -1226,7 +1287,7 @@ function deleteQuickRecipe(protocol, id) {
       if (qtaskProtocol(task) !== protocol) return;
       const kept = (task.recipe_ids || []).filter((rid) => rid !== id);
       // 一条都不剩的任务回落到同协议的第一条：留个空的等于这条任务不会跑，
-      // 而用户以为只是删了一条配方。
+      // 而用户以为只是删了一条配置。
       task.recipe_ids = kept.length ? kept : (fallback ? [fallback] : []);
     });
   });
@@ -1255,7 +1316,16 @@ function renderQuickAssignments() {
     $('qsumpairs').textContent = '0';
     return;
   }
-  const head = '<table><thead><tr><th>链路集合</th>' + SUITES.map((s) => '<th>' + esc(s.name || s.id) + '</th>').join('') + '</tr></thead><tbody>';
+  // 表头里带一个整列开关，和高级矩阵的 .colall 同一个读法：勾一下这一列全开、
+  // 再勾一下全关。套件多起来之后，「所有链路都跑这个套件」原本要逐格点
+  // 集合数 × 1 下，而这正是分配表最常见的一种填法。
+  const head = '<table><thead><tr><th>链路集合</th>' + SUITES.map((suite) => {
+    const bound = LINK_SETS.filter((set) => qassigned(set.id, suite.id)).length;
+    const allBound = LINK_SETS.length > 0 && bound === LINK_SETS.length;
+    return '<th>' + esc(suite.name || suite.id) +
+      '<div class="colsel"><label><input type="checkbox" class="qbind-colall" data-suite="' + esc(suite.id) + '"' +
+      (allBound ? ' checked' : '') + '>整列</label></div></th>';
+  }).join('') + '</tr></thead><tbody>';
   const rows = LINK_SETS.map((set) => {
     // pair_ids 是项目文件/ API 的高级子集选择；界面里的集合卡仍显示整组，
     // 但分配表要告诉用户当前真正会被绑定套件执行的物理链路数。
@@ -1291,7 +1361,19 @@ function renderQuickAssignments() {
 // renderQuickAssignments() 会在每次分配变化后重画整张表。
 $('quickassign').addEventListener('change', (ev) => {
   const el = ev.target;
-  if (!el || !el.classList || !el.classList.contains('qbind-toggle')) return;
+  if (!el || !el.classList) return;
+  if (el.classList.contains('qbind-colall')) {
+    const suiteId = el.dataset.suite;
+    if (!suiteId) return;
+    LINK_SETS.forEach((set) => {
+      if (el.checked) qensureBinding(set.id, suiteId);
+      else qremoveBinding(set.id, suiteId);
+    });
+    markQuickDirty();
+    renderQuickWorkspace();
+    return;
+  }
+  if (!el.classList.contains('qbind-toggle')) return;
   const setId = el.dataset.set, suiteId = el.dataset.suite;
   if (!setId || !suiteId) return;
   if (el.checked) qensureBinding(setId, suiteId);
@@ -1305,7 +1387,7 @@ function renderQuickReview(planResult) {
   if (planResult && planResult.units) {
     const units = planResult.units;
     const lines = units.slice(0, 120).map((u) => esc('#' + u.seq + ' ' + (u.resumed ? '[resume] ' : '') + u.title + ((u.load || []).length ? '\n  ' + u.load.join('\n  ') : ''))).join('\n');
-    box.innerHTML = '<div class="review-group"><div class="review-line"><strong>服务端实际计划</strong><span class="num">' + units.length + ' 个单元</span><span>TCP 与 UDP 分开排队</span></div><div class="review-detail">' + lines + (units.length > 120 ? '\n…其余 ' + (units.length - 120) + ' 个单元见完整预览' : '') + '</div></div>';
+    box.innerHTML = '<div class="review-group"><div class="review-line"><strong>服务端实际计划</strong><span class="num">' + units.length + ' 个单元</span></div><div class="review-detail">' + lines + (units.length > 120 ? '\n…其余 ' + (units.length - 120) + ' 个单元见完整预览' : '') + '</div></div>';
     $('quickreviewempty').classList.add('hidden');
     return;
   }
@@ -1466,16 +1548,16 @@ function renderSuiteTaskEditors(suite) {
     const dirs = ['ab', 'ba', 'bidir'].map((dir) => '<label><input type="checkbox" class="edit-dir" data-task="' + esc(task.id) + '" data-dir="' + dir + '"' + (hasDirection(dir) ? ' checked' : '') + '>' + ({ab:'A→B',ba:'B→A',bidir:'双向并发'}[dir]) + '</label>').join('');
     const ips = ['v4', 'v6'].map((ip) => '<label><input type="checkbox" class="edit-ip" data-task="' + esc(task.id) + '" data-ip="' + ip + '"' + ((task.ip || []).includes(ip) ? ' checked' : '') + '>' + ip.toUpperCase() + '</label>').join('');
     const recipeBoxes = protocol === 'ping' ? '<span class="hint">PING 使用执行区的次数和包长</span>' : recipes.map((recipe) => '<label><input type="checkbox" class="edit-recipe" data-task="' + esc(task.id) + '" data-recipe="' + esc(recipe.id) + '"' + ((task.recipe_ids || []).includes(recipe.id) ? ' checked' : '') + '>' + esc(recipe.name || recipe.id) + '<span class="field-note">' + esc(qrecipeSummary(recipe, protocol)) + '</span></label>').join('');
-    // 方向、IP 和参数配方里还要放多个可点击的 <label>。外层必须是普通容器，
+    // 方向、IP 和参数配置里还要放多个可点击的 <label>。外层必须是普通容器，
     // 不能再套一层 <label>（嵌套 label 在浏览器里会导致点击联动，也破坏无障碍
     // 语义）。单值输入仍用 label，保留原来的键盘/点击行为。
-    return '<div class="task-editor" data-task-editor="' + esc(task.id) + '"><h4><span class="chip">' + protocol.toUpperCase() + '</span> ' + esc(task.name || protocol) + '<button type="button" class="danger edit-task-remove" data-task="' + esc(task.id) + '" style="float:right">移除</button></h4><div class="form-grid"><label>任务名称<input type="text" class="edit-task-name" data-task="' + esc(task.id) + '" value="' + esc(task.name || '') + '"></label><label>双向门限（可选）<input type="text" class="edit-target-ab" data-task="' + esc(task.id) + '" value="' + esc(task.rx_target_bidir_ab || '') + '" placeholder="A→B Mbps"></label><label>反向门限（可选）<input type="text" class="edit-target-ba" data-task="' + esc(task.id) + '" value="' + esc(task.rx_target_bidir_ba || '') + '" placeholder="B→A Mbps"></label><div class="form-field wide"><span class="field-title">方向</span><span class="chip-row">' + dirs + '</span></div><div class="form-field wide"><span class="field-title">IP 版本</span><span class="chip-row">' + ips + '</span></div><div class="form-field wide"><span class="field-title">参数配方</span><span class="chip-row">' + (recipeBoxes || '<span class="hint">暂无配方</span>') + '</span></div></div></div>';
+    return '<div class="task-editor" data-task-editor="' + esc(task.id) + '"><h4><span class="chip">' + protocol.toUpperCase() + '</span> ' + esc(task.name || protocol) + '<button type="button" class="danger edit-task-remove" data-task="' + esc(task.id) + '" style="float:right">移除</button></h4><div class="form-grid"><label>任务名称<input type="text" class="edit-task-name" data-task="' + esc(task.id) + '" value="' + esc(task.name || '') + '"></label><label>双向门限（可选）<input type="text" class="edit-target-ab" data-task="' + esc(task.id) + '" value="' + esc(task.rx_target_bidir_ab || '') + '" placeholder="A→B Mbps"></label><label>反向门限（可选）<input type="text" class="edit-target-ba" data-task="' + esc(task.id) + '" value="' + esc(task.rx_target_bidir_ba || '') + '" placeholder="B→A Mbps"></label><div class="form-field wide"><span class="field-title">方向</span><span class="chip-row">' + dirs + '</span></div><div class="form-field wide"><span class="field-title">IP 版本</span><span class="chip-row">' + ips + '</span></div><div class="form-field wide"><span class="field-title">参数配置</span><span class="chip-row">' + (recipeBoxes || '<span class="hint">暂无配置</span>') + '</span></div></div></div>';
   }).join('') + '<div class="row" style="margin-top:10px;gap:7px"><button type="button" class="ghost" id="editor-add-tcp">+ TCP 任务</button><button type="button" class="ghost" id="editor-add-udp">+ UDP 任务</button><button type="button" class="ghost" id="editor-add-ping">+ PING 任务</button></div>';
 }
 
 // 抽屉里的输入框是草稿的 DOM 投影，而不是草稿本身。新增/移除任务会重画
 // 整个编辑区；如果不先把当前控件读回 EDITING_SUITE_DRAFT，用户刚改的名称、
-// 方向或配方就会在点击「+ TCP/UDP/PING」后悄悄丢掉。保存按钮也复用这段同步，
+// 方向或配置就会在点击「+ TCP/UDP/PING」后悄悄丢掉。保存按钮也复用这段同步，
 // 让所有会提交草稿的入口遵循同一套字段映射。
 function syncSuiteDraftFromEditor() {
   const suite = EDITING_SUITE_DRAFT;
@@ -1686,7 +1768,9 @@ function prepareQuickProject(project) {
       // renderNics()/collectNicPolicies() call string methods on these fields.
       // Reject a number/null here instead of letting a malformed project crash
       // halfway through an import (or only when the user next edits the table).
-      ['endpoint', 'rx_target', 'udp_bandwidth', 'udp_length'].forEach((key) => {
+      // `udp_length` is deliberately absent: the NIC table no longer carries it,
+      // so an old project's value is ignored rather than validated.
+      ['endpoint', 'rx_target', 'udp_bandwidth'].forEach((key) => {
         if (policy[key] !== undefined && policy[key] !== null && typeof policy[key] !== 'string') {
           throw new Error('项目 nic_policies[' + index + '].' + key + ' 必须是字符串');
         }
@@ -1737,7 +1821,7 @@ function applyQuickProject(project) {
   // prepareQuickProject(), so a malformed project cannot destroy a valid
   // pending import.
   PENDING_PAIRS = null;
-  // 先回填通用设置，再覆盖计划对象；默认配方同步不会误改项目自定义配方。
+  // 先回填通用设置，再覆盖计划对象；默认配置同步不会误改项目自定义配置。
   if (prepared.settings) applySettings(prepared.settings);
   RECIPES = JSON.parse(JSON.stringify(plan.recipes));
   SUITES = JSON.parse(JSON.stringify(plan.suites));
@@ -1839,16 +1923,34 @@ $('quickmode').onclick = () => setMode('quick');
 $('advancedmode').onclick = () => setMode('advanced');
 $('qcrossonly').onchange = () => renderQuickWorkspace();
 $('qshowpairs').onchange = () => renderQuickWorkspace();
+// 新建的集合要当场能用：名字在卡片上直接改，网口对也直接摊开给人勾。
+// 原来是先弹一个 prompt 问名字，建出来的空集合还得再去上面勾「展开具体网口
+// 对」才看得到候选——新建完第一件事是找不到怎么编辑。
 $('qnewset').onclick = () => {
-  const selected = PAIRS.filter((pair, i) => ROWS[i] && ROWS[i].sel && pair.cross).map(qpairRef);
-  const name = window.prompt('链路集合名称', selected.length ? '已选链路集合' : '新链路集合');
-  if (name === null) return;
-  const set = qnewSet(name.trim() || '新链路集合', selected);
-  LINK_SETS.push(set); QUICK_SET_SELECTION = new Set([set.id]); markQuickDirty(); renderQuickWorkspace();
+  // 高级矩阵里已经勾了几行的话，直接拿它们当种子（同样受筛选约束）；
+  // 快速模式下 ROWS 通常是空的，那就建一个空集合让人在下面自己勾。
+  const seeded = PAIRS
+    .filter((pair, i) => ROWS[i] && ROWS[i].sel && (!qcrossOnly() || pair.cross))
+    .map(qpairRef);
+  const set = qnewSet('新链路集合 ' + (LINK_SETS.length + 1), seeded);
+  LINK_SETS.push(set);
+  QUICK_SET_SELECTION = new Set([set.id]);
+  if ($('qshowpairs')) $('qshowpairs').checked = true;
+  markQuickDirty(); renderQuickWorkspace();
+  // 集合 id 可能来自导入的项目文件，不保证是合法的选择器字面量；按 dataset
+  // 比对比拼一个属性选择器安全。
+  const field = Array.prototype.find.call(
+    document.querySelectorAll('#quicksets .qset-name'), (el) => el.dataset.set === set.id);
+  if (field) { field.focus(); field.select(); }
 };
 $('qautogroup').onclick = () => {
   const generated = autoLinkSets();
-  if (!generated.length) { say($('planstatus'), '当前没有跨机网口对可分组。', 'bad'); return; }
+  if (!generated.length) {
+    say($('planstatus'), qcrossOnly()
+      ? '当前没有跨机网口对可分组。取消「只显示跨机链路」可以把同机组合也算进来。'
+      : '当前没有可分组的网口对——先连接辅测机或刷新网口。', 'bad');
+    return;
+  }
   if (BINDINGS.length && typeof window.confirm === 'function' &&
       !window.confirm('当前已有套件分配。重新按角色分组会更新自动链路集合，但保留仍存在的绑定；继续吗？')) return;
   // 只重建自动集合，保留用户手工创建的集合和仍然有效的绑定。此前这里
@@ -1860,12 +1962,42 @@ $('qautogroup').onclick = () => {
   const validSetIds = new Set(LINK_SETS.map((set) => set.id));
   const validSuiteIds = new Set(SUITES.map((suite) => suite.id));
   BINDINGS = BINDINGS.filter((binding) => validSetIds.has(binding.link_set_id) && validSuiteIds.has(binding.suite_id));
-  QUICK_SET_SELECTION = new Set(Array.from(QUICK_SET_SELECTION).filter((id) => validSetIds.has(id)));
-  if (!QUICK_SET_SELECTION.size) QUICK_SET_SELECTION = new Set(generated.map((s) => s.id));
+  // 分组的结果就是要拿去分配的，全部勾上；只留旧的选中项等于点完还得再
+  // 手工勾一遍，而新生成的那几组正是这次分组的产物。
+  QUICK_SET_SELECTION = new Set(generated.map((item) => item.id));
   markQuickDirty(); renderQuickWorkspace();
+  // 「没反应」是这个按钮最常见的抱怨：集合本来就在、名字也没变时，界面上
+  // 确实什么都没动。把结果说出来，顺带交代同机组合算没算进去。
+  const pairCount = generated.reduce((n, item) => n + (item.pair_refs || []).length, 0);
+  say($('planstatus'), '已按角色重建 ' + generated.length + ' 个自动链路集合，共 ' + pairCount + ' 对' +
+    (qcrossOnly() ? '（只含跨机组合）' : '（含同机组合）') + '。', 'ok');
 };
+// 名称输入框每敲一个字符都会触发，这里**不能**重画 #quicksets——重画会把
+// 输入框连同光标一起换掉，第二个字符就打不进去了。只更新依赖名称的另外几个
+// 区域（分配表的行标题、复核区），它们不含正在编辑的这个控件。
+$('quicksets').addEventListener('input', (ev) => {
+  const el = ev.target;
+  if (!el.classList || !el.classList.contains('qset-name')) return;
+  const set = LINK_SETS.find((item) => item.id === el.dataset.set);
+  if (!set) return;
+  set.name = el.value;
+  // 改过名字就不再是纯自动集合：否则下一次刷新网口时 syncQuickSets 会按角色
+  // 键把名字覆盖回去，人刚敲的名字凭空消失。
+  set._auto = false;
+  markQuickDirty();
+  renderQuickAssignments();
+});
 $('quicksets').addEventListener('change', (ev) => {
   const el = ev.target;
+  if (el.classList.contains('qset-name')) {
+    // 焦点离开时归一化：名字空着就落回占位名，免得分配表和复核区出现一行没有
+    // 标题的集合。这里刻意**不**重画 #quicksets——离开输入框往往是因为正在点
+    // 旁边那个勾选框，重画会在 mouseup 之前把它换掉，那一下点击就丢了。
+    const set = LINK_SETS.find((item) => item.id === el.dataset.set);
+    if (set && !set.name.trim()) { set.name = '未命名链路集合'; el.value = set.name; }
+    renderQuickAssignments();
+    return;
+  }
   if (el.classList.contains('qset-select')) {
     const id = el.dataset.set;
     if (el.checked) QUICK_SET_SELECTION.add(id); else QUICK_SET_SELECTION.delete(id);
@@ -1892,13 +2024,12 @@ $('quicksets').addEventListener('click', (ev) => {
     return;
   }
   const set = LINK_SETS.find((item) => item.id === el.dataset.set); if (!set) return;
-  if (el.classList.contains('qset-rename')) {
-    const name = window.prompt('链路集合名称', set.name || '链路集合');
-    if (name !== null) { set.name = name.trim() || set.name; set._auto = false; markQuickDirty(); renderQuickWorkspace(); }
-  } else if (el.classList.contains('qset-delete')) {
+  if (el.classList.contains('qset-delete')) {
     LINK_SETS = LINK_SETS.filter((item) => item.id !== set.id); BINDINGS = BINDINGS.filter((b) => b.link_set_id !== set.id); QUICK_SET_SELECTION.delete(set.id); markQuickDirty(); renderQuickWorkspace();
   } else if (el.classList.contains('qset-expand')) {
-    $('qshowpairs').checked = true; renderQuickWorkspace();
+    // 按钮上写着「收起网口对」时就该真收起来。原来两种文案都只会把开关拧到
+    // 展开，点「收起」纹丝不动。
+    $('qshowpairs').checked = !$('qshowpairs').checked; renderQuickWorkspace();
   }
 });
 $('quicksuites').addEventListener('change', (ev) => {
@@ -2279,7 +2410,6 @@ function renderNics(policies, keepEdits) {
       endpoint,
       rx_target: policy.rx_target || '',
       udp_bandwidth: policy.udp_bandwidth || '',
-      udp_length: policy.udp_length || '',
     };
     NIC_MEMORY.set(endpoint, row);
     const index = NICROWS.push(row) - 1;
@@ -2291,8 +2421,7 @@ function renderNics(policies, keepEdits) {
       '</td><td>' + esc(nic.ipv4) + '</td><td>' + (nic.speed_mbps || '?') + ' Mbps</td><td>' +
       esc(nic.gateway_v4 || '—') + '</td>' +
       cell('rx_target', '不设门限', '<span class="field-note">1800 或 90%</span>') +
-      cell('udp_bandwidth', '走全局档位') +
-      cell('udp_length', '走全局档位') +
+      cell('udp_bandwidth', '走档位里的 -b') +
       '</tr>');
   };
   MASTER.interfaces.forEach((n) => add('master', '主控', n));
@@ -2421,7 +2550,9 @@ function collectNicPolicies() {
     endpoint: row.endpoint,
     rx_target: row.rx_target.trim(),
     udp_bandwidth: row.udp_bandwidth.trim(),
-    udp_length: row.udp_length.trim(),
+    // -l 已经从这张表里去掉：报文长度只在套件的参数配置里设置。这里固定送空，
+    // 免得界面上看不见的一格还在改实际下发的命令行。
+    udp_length: '',
   }));
 }
 
@@ -2519,16 +2650,6 @@ function applySettings(d) {
       streams: (d.tcp_streams || [10]).join(' '),
     };
     renderTcpGroups();
-    RECIPES.tcp = RECIPES.tcp || [];
-    const tcpDefault = RECIPES.tcp.find((recipe) => recipe.id === 'recipe-tcp-default');
-    if (tcpDefault) {
-      // 用轴字段保存全局配置的全部档位。只取 profiles[0] 会把旧 config
-      // 中的多档 -w/-P 静默截成第一档，切到快速工作台后预计单元数随之变少。
-      // TCP 仍是独立 task；这里只是完整回填它自己的 recipe。
-      tcpDefault.profiles = [];
-      tcpDefault.tcp_windows = (d.tcp_windows || []).slice();
-      tcpDefault.tcp_streams = (d.tcp_streams || [10]).slice();
-    }
     // 默认组是参数表的第一行，不再是几个独立的输入框。
     UDP_GROUPS[0] = {
       name: '默认',
@@ -2538,18 +2659,13 @@ function applySettings(d) {
       streams: String(d.udp_streams || 1),
     };
     renderUdpGroups();
+    // 全局档位到此为止：它只回填高级矩阵的参数组表，**不再覆写套件里的参数
+    // 配置**。套件的 TCP/UDP 配置现在是套件自己的东西（-b/-l/-w/流数都在那儿
+    // 填）；让 config.json 的全局档位反向盖回去，「基线 TCP+UDP」就会一直显示
+    // 出厂 udp_profiles 里那条 -l 64，而界面上没有任何地方交代是谁改的。
+    RECIPES.tcp = RECIPES.tcp || [];
     RECIPES.udp = RECIPES.udp || [];
-    const udpDefault = RECIPES.udp.find((recipe) => recipe.id === 'recipe-udp-default');
-    if (udpDefault) {
-      // 同理保留 UDP 的完整 -b × -l × -w 轴；TCP 与 UDP 各自维护 recipe，
-      // 不会因为回填其中一个协议而产生跨协议笛卡尔积。
-      udpDefault.profiles = [];
-      udpDefault.bandwidths = (d.udp_bandwidths || []).length ? (d.udp_bandwidths || []).slice() : ['1000m'];
-      udpDefault.lengths = (d.udp_lengths || []).slice();
-      udpDefault.windows = (d.udp_windows || []).slice();
-      udpDefault.udp_streams = [Number(d.udp_streams) || 1];
-    }
-    $('pingcount').value = d.ping_count || 100;
+    $('pingcount').value = d.ping_count || 180;
     $('pingsizes').value = (d.ping_payload_sizes || []).join(' ');
     $('shot').checked = Boolean(d.screenshot);
     // This function is also used when the asynchronous bootstrap response

@@ -1152,12 +1152,24 @@ pub(super) fn unit_load_lines(unit: &builder::Unit) -> Vec<String> {
                 _ => return None,
             };
             let mut text = String::new();
-            if !leg.tag.is_empty() {
-                text.push_str(match leg.tag.as_str() {
-                    "ab" => "A→B ",
-                    "ba" => "B→A ",
-                    other => other,
-                });
+            // 方向优先取这条腿自己的 tag（双向单元的两条腿分别是 ab/ba）；
+            // 单向单元的 tag 是空串——那个空串在执行侧有「单向」的语义，不能
+            // 为了显示去改，所以回退到单元自己的规范方向。不这么兜的话，
+            // 预览里双向单元每行带方向、单向单元不带，同一份清单两种样子。
+            let direction = if leg.tag.is_empty() {
+                unit.direction.as_str()
+            } else {
+                leg.tag.as_str()
+            };
+            match direction {
+                "ab" => text.push_str("A→B "),
+                "ba" => text.push_str("B→A "),
+                "bidir" => text.push_str("双向 "),
+                "" => {}
+                other => {
+                    text.push_str(other);
+                    text.push(' ');
+                }
             }
             text.push_str(&readable_args(&task.extra));
             // iperf3 的 `-P` 由它自己开流，UDP 这边是我们逐流起进程，

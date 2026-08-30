@@ -264,7 +264,7 @@ pub(super) fn validate_ui_recipe(
     index: usize,
 ) -> Result<(), String> {
     if recipe.id.trim().is_empty() {
-        return Err(format!("{protocol} 配方 {} 缺少稳定 id", index + 1));
+        return Err(format!("{protocol} 配置 {} 缺少稳定 id", index + 1));
     }
     if recipe.mode.trim().is_empty()
         || matches!(
@@ -276,7 +276,7 @@ pub(super) fn validate_ui_recipe(
         // below, but keep this branch explicit for readable diagnostics.
     } else {
         return Err(format!(
-            "{protocol} 配方 {} 的 mode 只支持 fixed 或 scan",
+            "{protocol} 配置 {} 的 mode 只支持 fixed 或 scan",
             recipe.id
         ));
     }
@@ -288,13 +288,13 @@ pub(super) fn validate_ui_recipe(
             .filter(|v| !v.trim().is_empty())
         {
             crate::cmd::ctstraffic::parse_size_bytes(window.trim())
-                .map_err(|e| format!("TCP 配方 {} 的 -w {:?} 无效：{e}", recipe.id, window))?;
+                .map_err(|e| format!("TCP 配置 {} 的 -w {:?} 无效：{e}", recipe.id, window))?;
         }
         for profile in &recipe.profiles {
             if let Some(window) = profile.window.as_deref().filter(|v| !v.trim().is_empty()) {
                 crate::cmd::ctstraffic::parse_size_bytes(window.trim()).map_err(|e| {
                     format!(
-                        "TCP 配方 {} 的 profile -w {:?} 无效：{e}",
+                        "TCP 配置 {} 的 profile -w {:?} 无效：{e}",
                         recipe.id, window
                     )
                 })?;
@@ -306,27 +306,27 @@ pub(super) fn validate_ui_recipe(
                 .values()
             {
                 if !(1..=32).contains(&streams) {
-                    return Err(format!("TCP 配方 {} 的 -P 必须在 1..=32 之间", recipe.id));
+                    return Err(format!("TCP 配置 {} 的 -P 必须在 1..=32 之间", recipe.id));
                 }
             }
         }
         if recipe.tcp_streams.iter().any(|v| !(1..=32).contains(v)) {
-            return Err(format!("TCP 配方 {} 的 -P 必须在 1..=32 之间", recipe.id));
+            return Err(format!("TCP 配置 {} 的 -P 必须在 1..=32 之间", recipe.id));
         }
     } else if protocol == "udp" {
         for bandwidth in recipe.bandwidths.iter().filter(|v| !v.trim().is_empty()) {
-            check_udp_bandwidth(bandwidth.trim(), &format!("UDP 配方 {}", recipe.id))?;
+            check_udp_bandwidth(bandwidth.trim(), &format!("UDP 配置 {}", recipe.id))?;
         }
         for length in recipe.lengths.iter().filter(|v| !v.trim().is_empty()) {
             let bytes = crate::cmd::ctstraffic::parse_size_bytes(length.trim())
-                .map_err(|e| format!("UDP 配方 {} 的 -l {:?} 无效：{e}", recipe.id, length))?;
+                .map_err(|e| format!("UDP 配置 {} 的 -l {:?} 无效：{e}", recipe.id, length))?;
             if bytes > 65_507 {
-                return Err(format!("UDP 配方 {} 的 -l 超过 65507 字节", recipe.id));
+                return Err(format!("UDP 配置 {} 的 -l 超过 65507 字节", recipe.id));
             }
         }
         for window in recipe.windows.iter().filter(|v| !v.trim().is_empty()) {
             crate::cmd::ctstraffic::parse_size_bytes(window.trim())
-                .map_err(|e| format!("UDP 配方 {} 的 -w {:?} 无效：{e}", recipe.id, window))?;
+                .map_err(|e| format!("UDP 配置 {} 的 -w {:?} 无效：{e}", recipe.id, window))?;
         }
         for profile in &recipe.profiles {
             if let Some(bandwidth) = profile
@@ -334,19 +334,19 @@ pub(super) fn validate_ui_recipe(
                 .as_deref()
                 .filter(|v| !v.trim().is_empty())
             {
-                check_udp_bandwidth(bandwidth.trim(), &format!("UDP 配方 {}", recipe.id))?;
+                check_udp_bandwidth(bandwidth.trim(), &format!("UDP 配置 {}", recipe.id))?;
             }
             if let Some(length) = profile.length.as_deref().filter(|v| !v.trim().is_empty()) {
                 let bytes =
                     crate::cmd::ctstraffic::parse_size_bytes(length.trim()).map_err(|e| {
                         format!(
-                            "UDP 配方 {} 的 profile -l {:?} 无效：{e}",
+                            "UDP 配置 {} 的 profile -l {:?} 无效：{e}",
                             recipe.id, length
                         )
                     })?;
                 if bytes > 65_507 {
                     return Err(format!(
-                        "UDP 配方 {} 的 profile -l 超过 65507 字节",
+                        "UDP 配置 {} 的 profile -l 超过 65507 字节",
                         recipe.id
                     ));
                 }
@@ -354,7 +354,7 @@ pub(super) fn validate_ui_recipe(
             if let Some(window) = profile.window.as_deref().filter(|v| !v.trim().is_empty()) {
                 crate::cmd::ctstraffic::parse_size_bytes(window.trim()).map_err(|e| {
                     format!(
-                        "UDP 配方 {} 的 profile -w {:?} 无效：{e}",
+                        "UDP 配置 {} 的 profile -w {:?} 无效：{e}",
                         recipe.id, window
                     )
                 })?;
@@ -365,25 +365,25 @@ pub(super) fn validate_ui_recipe(
                 .unwrap_or(&profile.streams)
                 .values();
             if streams.iter().any(|v| !(1..=32).contains(v)) {
-                return Err(format!("UDP 配方 {} 的流数必须在 1..=32 之间", recipe.id));
+                return Err(format!("UDP 配置 {} 的流数必须在 1..=32 之间", recipe.id));
             }
         }
         if recipe.udp_streams.iter().any(|v| !(1..=32).contains(v)) {
-            return Err(format!("UDP 配方 {} 的流数必须在 1..=32 之间", recipe.id));
+            return Err(format!("UDP 配置 {} 的流数必须在 1..=32 之间", recipe.id));
         }
         for profile in &recipe.udp_profiles {
-            check_udp_bandwidth(profile.bandwidth.trim(), &format!("UDP 配方 {}", recipe.id))?;
+            check_udp_bandwidth(profile.bandwidth.trim(), &format!("UDP 配置 {}", recipe.id))?;
             if let Some(length) = profile.length.as_deref().filter(|v| !v.trim().is_empty()) {
                 let bytes =
                     crate::cmd::ctstraffic::parse_size_bytes(length.trim()).map_err(|e| {
                         format!(
-                            "UDP 配方 {} 的 profile -l {:?} 无效：{e}",
+                            "UDP 配置 {} 的 profile -l {:?} 无效：{e}",
                             recipe.id, length
                         )
                     })?;
                 if bytes > 65_507 {
                     return Err(format!(
-                        "UDP 配方 {} 的 profile -l 超过 65507 字节",
+                        "UDP 配置 {} 的 profile -l 超过 65507 字节",
                         recipe.id
                     ));
                 }
@@ -391,7 +391,7 @@ pub(super) fn validate_ui_recipe(
             if let Some(window) = profile.window.as_deref().filter(|v| !v.trim().is_empty()) {
                 crate::cmd::ctstraffic::parse_size_bytes(window.trim()).map_err(|e| {
                     format!(
-                        "UDP 配方 {} 的 profile -w {:?} 无效：{e}",
+                        "UDP 配置 {} 的 profile -w {:?} 无效：{e}",
                         recipe.id, window
                     )
                 })?;
@@ -436,7 +436,7 @@ pub(super) fn validate_ui_recipe(
             || !recipe.udp_streams.is_empty();
         if explicitly_configured && !has_bandwidth {
             return Err(format!(
-                "UDP 配方 {} 没有有效的 -b 档位，无法生成测试单元",
+                "UDP 配置 {} 没有有效的 -b 档位，无法生成测试单元",
                 recipe.id
             ));
         }
@@ -571,7 +571,7 @@ pub(super) fn validate_ui_plan(state: &UiState, plan: &UiPlan) -> Result<(), Str
     ] {
         for (index, recipe) in recipes.iter().enumerate() {
             if recipe.id.trim().is_empty() || !recipe_ids.insert(recipe.id.clone()) {
-                return Err(format!("{protocol} 配方 id 缺失或重复：{}", recipe.id));
+                return Err(format!("{protocol} 配置 id 缺失或重复：{}", recipe.id));
             }
             validate_ui_recipe(protocol, recipe, index)?;
         }
@@ -628,7 +628,7 @@ pub(super) fn validate_ui_plan(state: &UiState, plan: &UiPlan) -> Result<(), Str
             // until a recipe schema with explicit ping semantics is added.
             if protocol == "ping" && !recipe_ids.is_empty() {
                 return Err(format!(
-                    "suite {} 的 task {} 暂不支持 PING 配方引用，请直接填写 ping 次数和包长",
+                    "suite {} 的 task {} 暂不支持 PING 配置引用，请直接填写 ping 次数和包长",
                     suite.id, task.id
                 ));
             }
@@ -641,13 +641,13 @@ pub(super) fn validate_ui_plan(state: &UiState, plan: &UiPlan) -> Result<(), Str
             for recipe_id in recipe_ids {
                 if !seen_recipe_ids.insert(recipe_id) {
                     return Err(format!(
-                        "suite {} 的 task {} 重复引用 {} 配方 {}",
+                        "suite {} 的 task {} 重复引用 {} 配置 {}",
                         suite.id, task.id, protocol, recipe_id
                     ));
                 }
                 if !recipes.iter().any(|recipe| recipe.id == *recipe_id) {
                     return Err(format!(
-                        "suite {} 的 task {} 引用了不存在的 {} 配方 {}",
+                        "suite {} 的 task {} 引用了不存在的 {} 配置 {}",
                         suite.id, task.id, protocol, recipe_id
                     ));
                 }

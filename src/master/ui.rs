@@ -1362,6 +1362,7 @@ mod tests {
             id: "ping-only".into(),
             title: "ping-only".into(),
             bidir: false,
+            direction: String::new(),
             est_secs: 1,
             legs: vec![Leg {
                 tag: String::new(),
@@ -1384,6 +1385,7 @@ mod tests {
             id: "iperf".into(),
             title: "iperf".into(),
             bidir: false,
+            direction: String::new(),
             est_secs: 1,
             legs: vec![Leg {
                 tag: String::new(),
@@ -1413,6 +1415,7 @@ mod tests {
             id: "ctstraffic".into(),
             title: "ctstraffic".into(),
             bidir: false,
+            direction: String::new(),
             est_secs: 1,
             legs: vec![Leg {
                 tag: "ab".into(),

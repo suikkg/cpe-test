@@ -19,7 +19,9 @@ const INSUFFICIENT_SAMPLES: &str = "样本不足";
 /// 而不是先扫完 120 行再自己过滤。空分类不出现，见 [`sectioned`]。
 fn push_overview(h: &mut String, groups: &[UnitGroup<'_>]) {
     h.push_str(
-        "<section class=\"overview-section\" aria-labelledby=\"overview-heading\"><h2 id=\"overview-heading\">测试概览</h2>\n",
+        "<section class=\"overview-section\" aria-labelledby=\"overview-heading\">\
+         <details class=\"top-section\" open><summary class=\"top-toggle\">\
+         <h2 id=\"overview-heading\">测试概览</h2></summary>\n",
     );
     for (section, picked) in sectioned(groups) {
         h.push_str(&format!(
@@ -30,7 +32,7 @@ fn push_overview(h: &mut String, groups: &[UnitGroup<'_>]) {
         ));
         push_overview_table(h, &picked);
     }
-    h.push_str("</section>\n");
+    h.push_str("</details></section>\n");
 }
 
 fn push_overview_table(h: &mut String, groups: &[&UnitGroup<'_>]) {
@@ -180,6 +182,26 @@ fn push_overview_table(h: &mut String, groups: &[&UnitGroup<'_>]) {
     }
     h.push_str("</tbody></table></div>\n");
 }
+
+/// 「展开全部 / 收起全部」。
+///
+/// 报告是单文件、离线打开的，所以这段脚本必须内嵌且不依赖任何外部资源。
+/// 折叠本身用的是原生 `<details>`——**脚本挂了也不影响逐块手动开合**，
+/// 这里只是给一次性全开/全关加一个入口：一轮 120 个单元时，逐块点是不可行的。
+const EXPAND_COLLAPSE_SCRIPT: &str = r#"<script>
+(function () {
+  var buttons = document.querySelectorAll('[data-toggle-all]');
+  if (!buttons.length) return;
+  Array.prototype.forEach.call(buttons, function (button) {
+    button.addEventListener('click', function () {
+      var open = button.getAttribute('data-toggle-all') === 'open';
+      var all = document.querySelectorAll('details');
+      Array.prototype.forEach.call(all, function (node) { node.open = open; });
+    });
+  });
+})();
+</script>
+"#;
 
 /// 内嵌进报告的单段原始输出上限（字符）。
 ///
@@ -372,7 +394,9 @@ fn push_bidirectional_summary(h: &mut String, group: &UnitGroup<'_>) {
 fn push_unit_details(h: &mut String, groups: &[UnitGroup<'_>]) {
     let detail_count: usize = groups.iter().map(|group| group.details.len()).sum();
     h.push_str(&format!(
-        "<section class=\"details-section\" aria-labelledby=\"details-heading\"><h2 id=\"details-heading\">逐行明细（{detail_count} 行）</h2>"
+        "<section class=\"details-section\" aria-labelledby=\"details-heading\">\
+         <details class=\"top-section\" open><summary class=\"top-toggle\">\
+         <h2 id=\"details-heading\">逐行明细（{detail_count} 行）</h2></summary>"
     ));
     if report_mixes_traffic_backends(groups) {
         h.push_str(
@@ -388,7 +412,7 @@ fn push_unit_details(h: &mut String, groups: &[UnitGroup<'_>]) {
         ));
         push_unit_list(h, &picked);
     }
-    h.push_str("</section>\n");
+    h.push_str("</details></section>\n");
 }
 
 fn push_unit_list(h: &mut String, groups: &[&UnitGroup<'_>]) {
@@ -620,6 +644,19 @@ h2 { margin: 28px 0 10px; font-size: 17px; line-height: 1.3; }
 .shot img { display: block; width: 120px; height: 68px; border: 1px solid #b8c2cb; border-radius: 4px; background: #eef2f5; object-fit: cover; }
 .shot a:hover img, .shot a:focus-visible img { border-color: #1769aa; outline: 2px solid #9dc6e8; outline-offset: 1px; }
 pre { max-height: 420px; margin: 8px 0 0; padding: 10px; overflow: auto; border-radius: 4px; background: #182027; color: #d7ffd7; font-size: 12px; line-height: 1.4; }
+/* 顶层区块折叠：<summary> 里直接放 <h2>，标题本身就是开关。
+   h2 默认是 block，放进 summary 会把三角标记挤到上一行，所以改成 inline。 */
+details.top-section > summary.top-toggle { cursor: pointer; list-style-position: outside; }
+details.top-section > summary.top-toggle > h2 { display: inline; }
+details.top-section > summary.top-toggle::marker { color: #1769aa; }
+.report-tools { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 14px 0 4px; }
+.report-tools button { padding: 5px 12px; border: 1px solid var(--line); border-radius: 4px;
+    background: var(--surface); color: inherit; font: inherit; font-size: 13px; cursor: pointer; }
+.report-tools button:hover { border-color: #1769aa; color: #145a94; }
+.tools-hint { color: var(--muted); font-size: 12px; }
+.raw-seq { color: var(--muted); font-variant-numeric: tabular-nums; margin-right: 8px; }
+.raw-dir { display: inline-block; margin-right: 8px; padding: 0 6px; border-radius: 3px;
+    background: var(--panel-2); color: var(--muted); font-size: 11px; font-weight: 400; white-space: nowrap; }
 details.raw-section { margin: 8px 0; }
 details.raw-section > summary { cursor: pointer; font-weight: 700; overflow-wrap: anywhere; }
 .sampling-caveat { margin: 8px 0 0; padding: 8px 10px; border-left: 3px solid #8a5200; background: #fff8e6; color: #5e430b; }
@@ -680,6 +717,8 @@ summary:focus-visible, a:focus-visible, .table-scroll:focus-visible, .overview-s
     .overview-table th, .overview-table td, .results-table th, .results-table td { position: static; box-shadow: none; }
     .shot-mini img { display: none; }
     .raw-section, .shot, .row-diagnostics { display: none; }
+    /* 「展开全部/收起全部」是交互控件，纸上没有意义。 */
+    .report-tools { display: none; }
 }
 </style></head><body><main class="report">
 <h1>CPE 子网测试报告</h1>
@@ -724,6 +763,11 @@ summary:focus-visible, a:focus-visible, .table-scroll:focus-visible, .overview-s
         ));
     }
 
+    h.push_str(
+        "<div class=\"report-tools\"><button type=\"button\" data-toggle-all=\"open\">展开全部</button>\
+         <button type=\"button\" data-toggle-all=\"close\">收起全部</button>\
+         <span class=\"tools-hint\">对本页所有可折叠区块生效（测试概览 / 逐行明细 / 每个单元 / 原始输出）</span></div>\n",
+    );
     push_overview(&mut h, &groups);
     push_unit_details(&mut h, &groups);
 
@@ -744,7 +788,10 @@ summary:focus-visible, a:focus-visible, .table-scroll:focus-visible, .overview-s
         .sum();
     let raw_nonempty_count: usize = raw_rows.iter().map(|row| nonempty_raw_count(row)).sum();
     h.push_str(&format!(
-        "<h2 id=\"raw-heading\">原始输出（{} 条执行记录，{raw_item_count} 项内容，内嵌文本非空 {raw_nonempty_count} 段）</h2>\n",
+        "<section class=\"raw-output-section\" aria-labelledby=\"raw-heading\">\
+         <details class=\"top-section\" open><summary class=\"top-toggle\">\
+         <h2 id=\"raw-heading\">原始输出（{} 条执行记录，{raw_item_count} 项内容，内嵌文本非空 {raw_nonempty_count} 段）</h2>\
+         </summary>\n",
         raw_rows.len(),
     ));
     if raw_rows.is_empty() {
@@ -752,12 +799,31 @@ summary:focus-visible, a:focus-visible, .table-scroll:focus-visible, .overview-s
             "<p class=\"raw-empty\">本次报告没有可用的内嵌原始输出、独立原始记录或网卡样本文件。</p>\n",
         );
     }
-    for r in raw_rows {
+    for r in &raw_rows {
         let file_count =
             usize::from(!r.raw_log.is_empty()) + usize::from(!r.nic_samples.is_empty());
+        // 序号必须是**单元执行序号**，和「测试概览」「逐行明细」的 `#N` 以及
+        // 控制台的 `[N/总数]` 是同一个数（都来自 `sort_key.0 + 1`）。
+        //
+        // 不能用「在本段里排第几」：这一段列的是**执行行**不是单元，一个双向
+        // 单元会出两行，于是 5 个单元能排到 #10——三块的编号各说各的，
+        // 而这三块存在的全部意义就是让人拿着一个号在它们之间来回对。
+        //
+        // 同一单元会出多条：双向两条腿，每条腿还分「流明细」和「组合计」。
+        // 用 `kind_label` 当区分标——它就是「逐行明细」那张表里「类型」列的
+        // 同一个串（`灌包-ab(流明细)` / `组合计-ab`），方向也在里面。只标
+        // AB/BA 的话，一个双向单元会出现四条一模一样的标题，只有行尾的
+        // 「N 段内嵌输出 · M 个原始文件」不同——那不是给人扫的。
+        let row_kind = if r.kind_label.is_empty() {
+            infer_direction_tag(r)
+        } else {
+            r.kind_label.clone()
+        };
         h.push_str(&format!(
-            "<details class=\"raw-section\" id=\"{}\"><summary>{} — {} [{}] · {} 段内嵌输出（非空 {}） · {file_count} 个原始文件</summary>\n",
+            "<details class=\"raw-section\" id=\"{}\"><summary><span class=\"raw-seq\">#{}</span><span class=\"raw-dir\">{}</span>{} — {} [{}] · {} 段内嵌输出（非空 {}） · {file_count} 个原始文件</summary>\n",
             raw_anchor(r),
+            r.sort_key.0.saturating_add(1),
+            esc(&row_kind),
             esc(&r.time),
             esc(&r.task),
             r.verdict.label(),
@@ -784,6 +850,8 @@ summary:focus-visible, a:focus-visible, .table-scroll:focus-visible, .overview-s
         }
         h.push_str("</details>\n");
     }
+    h.push_str("</details></section>\n");
+    h.push_str(EXPAND_COLLAPSE_SCRIPT);
     h.push_str("</main></body></html>\n");
 
     std::fs::write(path, h)

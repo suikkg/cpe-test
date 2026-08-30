@@ -75,6 +75,14 @@ JSON 标准不支持注释，不能在一个 JSON 内可靠地“取消注释”
 - `config-wifi5g.json`：Wi-Fi 5G。
 - `config-10gusb.json`：主控 10GUSB、辅测 10GETH。
 - `config-all-common.json`：以上常用网口组合。
+- `config-full-tcp-udp-ping.json`：**全量**。TCP + UDP + PING 一次跑全，覆盖 5 块网口
+  两两组合的全部 10 对（6 跨机 + 4 同机）、A→B / B→A / 双向并发、IPv4 + IPv6。
+  参数照搬一次实测：TCP `-w 64k/4m -P 10`，UDP `-b 1000m/2500m -l 14k -w 256m`，
+  PING `n=180 × 32/1600/65500`。**约 210 个单元、跑一整夜（预计 11.5 小时）**，
+  用之前先把 `tests[]` 里的 `NAME=` 换成你那两台的网卡名。
+
+图形控制台还可以直接导入 `projects/cpe-ui-project-full.json`（「导入测试项目」按钮），
+拿到同一套链路集合、套件和 TCP/UDP 参数配置，不必手工勾 10 对网口。
 
 预置配置为了保持升级前的默认测试量，仍使用 `"kinds": ["iperf", "ping"]`。只跑 CTS：
 

@@ -57,17 +57,35 @@ fn capture_windows() -> Result<Vec<u8>, String> {
         if w <= 0 || h <= 0 {
             return Err("获取屏幕尺寸失败".into());
         }
+        // 缓冲区大小在**申请任何 GDI 句柄之前**算完：这样尺寸不合理时直接返回，
+        // 不存在“已经拿了句柄又要在中途还回去”的清理路径。
+        //
+        // 用 checked_mul 而不是直接乘：一旦回绕，下面 GetDIBits 会照着
+        // BITMAPINFO 里的宽高往一个偏小的缓冲区里写——那是一次真实的越界写，
+        // 而裸指针那一侧没有任何边界检查会拦住它。当前 GetSystemMetrics 的
+        // 取值范围下算不出溢出，但这个前提写在别人的文档里，不写在这段代码里。
+        let Some(buf_len) = (w as usize)
+            .checked_mul(h as usize)
+            .and_then(|pixels| pixels.checked_mul(4))
+        else {
+            return Err(format!("屏幕尺寸 {w}x{h} 过大，无法分配截图缓冲区"));
+        };
         let hdc_screen = GetDC(None);
         if hdc_screen.is_invalid() {
             return Err("GetDC 失败".into());
         }
+        // 这两步失败时**不在这里 return**：从拿到 hdc_screen 到下面那段统一
+        // 清理之间不允许有提前返回，否则每失败一次就漏一个 DC/位图，而控制台
+        // 是常驻进程、截图开关一开就是每个单元一次。句柄无效的后果由
+        // BitBlt/GetDIBits 的返回值兜住（NULL DC 会让它们失败），清理完再按
+        // 哪一级挂了给出具体错误。
         let hdc_mem = CreateCompatibleDC(hdc_screen);
         let hbm = CreateCompatibleBitmap(hdc_screen, w, h);
         let old = SelectObject(hdc_mem, hbm);
 
         let blt = BitBlt(hdc_mem, 0, 0, w, h, hdc_screen, 0, 0, SRCCOPY);
 
-        let mut buf: Vec<u8> = vec![0u8; (w as usize) * (h as usize) * 4];
+        let mut buf: Vec<u8> = vec![0u8; buf_len];
         let mut bi = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
                 biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
@@ -95,8 +113,23 @@ fn capture_windows() -> Result<Vec<u8>, String> {
         let _ = DeleteDC(hdc_mem);
         ReleaseDC(None, hdc_screen);
 
-        if blt.is_err() || got == 0 {
-            return Err("BitBlt/GetDIBits 失败".into());
+        // 句柄和抓取分级报错。原来这里只有一句 "BitBlt/GetDIBits 失败"：
+        // CreateCompatibleDC / CreateCompatibleBitmap 返回 NULL 时也会走到这句，
+        // 于是「内存 DC 建不出来」和「屏幕抓取被拒」在日志里长得一模一样。
+        // 截图是给人排查环境用的，错在哪一级必须说出来。
+        if hdc_mem.is_invalid() {
+            return Err("CreateCompatibleDC 失败：无法创建内存 DC".into());
+        }
+        if hbm.is_invalid() {
+            return Err(format!(
+                "CreateCompatibleBitmap 失败：无法创建 {w}x{h} 位图"
+            ));
+        }
+        if let Err(error) = blt {
+            return Err(format!("BitBlt 失败：{error}"));
+        }
+        if got == 0 {
+            return Err("GetDIBits 失败：未能读出位图像素".into());
         }
         // BGRA -> RGBA
         for px in buf.chunks_exact_mut(4) {

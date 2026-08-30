@@ -1,0 +1,30 @@
+task,status,notes
+梳理当前 UI/API/配置边界，确定兼容 DTO 与编译路径,DONE,保持 TCP 与 UDP 独立且连续执行
+实现 UI 计划 DTO、校验、编译与预览追踪，保留 legacy pairs,DONE,
+实现链路集合/流量套件/分配/复核快速工作台，保留高级矩阵,DONE,已完成主体实现并通过 DOM/交互审查
+加入项目状态导入导出、旧配置兼容和用户文档,DONE,导出/导入闭环已实测（config 导出→导入还原同一批单元）；文档已随 v4.5.0 同步
+补充单元/API/UI 回归测试并运行 cargo 检查,DONE,单元测试 452→490；fmt/clippy/test 在 macOS/Linux/Windows 三个 target 各过一遍；UI 层做了 JS 语法、DOM id、未定义函数静态核对
+最终审查变更、同步清单并交付,DONE,v4.5.0 已发布（tag 与 main 均全绿）；审查修复见下
+审查修复：config.example.json 与 README/使用说明的负载上限已过期,DONE,cpe_path_ceiling 2500→2600、RNDIS 改跟协商速率；新增测试把示例值钉在代码默认值上
+审查修复：Windows CI 口令闸门测试超时预算小于被测端点自身耗时,DONE,5s→60s，端点自己就允许 ipconfig 20s+netsh 10s+iperf3 8s
+UI 反馈：链路集合默认列出全部组合（含同机）,DONE,筛选与「按角色自动分组」改为同一口径；角色键带跨机/同机前缀，避免两类链路并进一个集合
+UI 反馈：新增链路集合当场可编辑,DONE,名称改成卡片上的输入框（去掉「改名」+prompt）；新建时自动展开网口对；「收起网口对」按钮真的会收起
+UI 反馈：分配表支持整列勾选,DONE,表头「整列」勾一下让所有链路都跑该套件、再勾一下全清
+UI 反馈：去掉网口表的全局 UDP -l 列,DONE,-l 只在套件的参数配置里设置；全局档位也不再反向覆写套件默认配置（原来会把 -l 64 盖回去）
+基线 TCP+UDP 的 UDP 档位改为 -b 2500m -l 14k -w 256m,DONE,原来是 -b 1000m -l 1400；已端到端验证预览下发的就是这三个值
+「参数配方」改称「参数配置」,DONE,TCP/UDP 配方同步改称 TCP/UDP 配置；界面、校验报错、文档一起改
+ping 次数默认 180,DONE,界面默认值、config.rs 的 ping.count 默认值、config.example.json 与 dist/configs 四份具名配置同步
+PING 单元预计耗时少算 5 秒,DONE,旧 count+5 漏了收尾等待；实测 count=5/20/40 → 15.0/30.1/50.2 秒（正好 count+10），改为 count+12。Windows 全丢包时实际 count×4，属故障路径不入估算
+新增全量 TCP/UDP/PING 预设,DONE,configs/config-full-tcp-udp-ping.json（命令行）+ projects/cpe-ui-project-full.json（控制台导入）；照搬 run_20260828_162822_17788 的 5 网口/10 对拓扑与参数，约 210 单元 / 11.5 小时
+agent 认证前的内存放大,DONE,认证提到读 body 之前（只看 header）；MAX_BODY 100MiB→1MiB；from_utf8 取代 from_utf8_lossy().into_owned() 省掉第二次拷贝。实测 1.5MiB 请求体在 1048576 字节被截断
+MAX_RESPONSE_BYTES 保持 100MiB 并改掉误导注释,DONE,原注释「和 agent 的 MAX_BODY 对齐」会诱导把响应闸也压到 1MiB，而截图走响应方向（2K/4K base64 可达 7MiB）。新增测试钉住两者数量级差距
+默认口令统一为 cpetest,DONE,config::DEFAULT_TOKEN；agent_token 与 ui_token 默认值、config.example/minimal/full 三份 JSON 同步。此前 .bat 里已是 cpetest，直接跑 exe 却完全不认证
+默认口令的启动提醒,已按要求移除,自用工具不需要每次启动刷两行警告；认证行为不变，判断逻辑（is_default_token）一并删掉避免死代码
+1 MiB 请求上限的余量验证,DONE,实测一轮完整测试 agent 侧最大请求体 191 字节（/iperf/server/start）；新增 protocol.rs 测试对每种 *Req 构造放大最坏值，最大 6355 字节=上限 1/165，并要求 ≥16 倍余量
+UI：复核面板去掉「TCP 与 UDP 分开排队」,DONE,
+UI：执行区提示去掉「每条腿」,DONE,改成「那里逐单元列着最终下发的参数」
+UI：任务预览显示打流方向,DONE,单向单元 Leg.tag 是空串（dir_pairs 对 ab/ba 就给空，执行侧靠这个空串表示「单向」不能动），给 Unit 加只读展示用的 direction 兜底；双向仍走 Leg.tag
+报告：原始输出加序号,DONE,和逐行明细的 #N 同一读法
+报告：顶层区块可折叠 + 展开全部/收起全部,DONE,测试概览/逐行明细/原始输出各包一层 <details open>；全局按钮用内嵌脚本（报告仍是离线单文件，脚本挂了也能逐块手点）；打印时隐藏按钮
+修复：原始输出的序号和概览/明细对不上,DONE,上一轮把它写成「在本段里排第几」，但这一段列的是执行行不是单元（双向单元出 4 行），5 个单元能排到 #10。改成 sort_key.0+1，与 group_seq / 控制台 [N/总数] 同源
+原始输出同单元多行用类型区分,DONE,双向单元每条腿还分「流明细」和「组合计」，只标 AB/BA 会出现 4 条一模一样的标题；改用 kind_label（与逐行明细「类型」列一字不差）

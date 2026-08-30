@@ -1,0 +1,221 @@
+{
+  "project_version": 1,
+  "ui_plan": {
+    "ui_plan_version": 1,
+    "link_sets": [
+      {
+        "id": "linkset-0d2d7e7d",
+        "name": "全网口配对（v4.4 实测拓扑）",
+        "_auto": false,
+        "pair_refs": [
+          {
+            "id": "pair-7690e4ce",
+            "src": "master:NAME=以太网 5",
+            "dst": "master:NAME=WLAN"
+          },
+          {
+            "id": "pair-c72bde84",
+            "src": "master:NAME=以太网 5",
+            "dst": "agent:NAME=以太网 3"
+          },
+          {
+            "id": "pair-d2350525",
+            "src": "master:NAME=以太网 5",
+            "dst": "agent:NAME=以太网"
+          },
+          {
+            "id": "pair-fc1750a6",
+            "src": "master:NAME=以太网 5",
+            "dst": "agent:NAME=WLAN 3"
+          },
+          {
+            "id": "pair-65a1ecbf",
+            "src": "master:NAME=WLAN",
+            "dst": "agent:NAME=以太网 3"
+          },
+          {
+            "id": "pair-97f9a064",
+            "src": "master:NAME=WLAN",
+            "dst": "agent:NAME=以太网"
+          },
+          {
+            "id": "pair-5176a699",
+            "src": "master:NAME=WLAN",
+            "dst": "agent:NAME=WLAN 3"
+          },
+          {
+            "id": "pair-9174a6aa",
+            "src": "agent:NAME=以太网 3",
+            "dst": "agent:NAME=以太网"
+          },
+          {
+            "id": "pair-14d26f97",
+            "src": "agent:NAME=以太网 3",
+            "dst": "agent:NAME=WLAN 3"
+          },
+          {
+            "id": "pair-e7c454ca",
+            "src": "agent:NAME=以太网",
+            "dst": "agent:NAME=WLAN 3"
+          }
+        ]
+      }
+    ],
+    "recipes": {
+      "tcp": [
+        {
+          "id": "recipe-tcp-full",
+          "name": "TCP 全量 -w 64k/4m",
+          "mode": "fixed",
+          "profiles": [],
+          "tcp_windows": [
+            "64k",
+            "4m"
+          ],
+          "tcp_streams": [
+            10
+          ]
+        }
+      ],
+      "udp": [
+        {
+          "id": "recipe-udp-full",
+          "name": "UDP 全量 -b 1000m/2500m",
+          "mode": "fixed",
+          "profiles": [],
+          "bandwidths": [
+            "1000m",
+            "2500m"
+          ],
+          "lengths": [
+            "14k"
+          ],
+          "windows": [
+            "256m"
+          ],
+          "udp_streams": [
+            1
+          ]
+        }
+      ],
+      "ping": []
+    },
+    "suites": [
+      {
+        "id": "suite-full",
+        "name": "全量 TCP+UDP+PING",
+        "note": "照搬 v4.4 实测参数",
+        "execution": "sequential",
+        "order": [
+          "task-full-tcp",
+          "task-full-udp",
+          "task-full-ping"
+        ],
+        "tasks": [
+          {
+            "id": "task-full-tcp",
+            "name": "TCP",
+            "protocol": "tcp",
+            "directions": [
+              "ab",
+              "ba",
+              "bidir"
+            ],
+            "ip": [
+              "v4",
+              "v6"
+            ],
+            "recipe_ids": [
+              "recipe-tcp-full"
+            ],
+            "rx_target_bidir_ab": "",
+            "rx_target_bidir_ba": ""
+          },
+          {
+            "id": "task-full-udp",
+            "name": "UDP",
+            "protocol": "udp",
+            "directions": [
+              "ab",
+              "ba",
+              "bidir"
+            ],
+            "ip": [
+              "v4",
+              "v6"
+            ],
+            "recipe_ids": [
+              "recipe-udp-full"
+            ],
+            "rx_target_bidir_ab": "",
+            "rx_target_bidir_ba": ""
+          },
+          {
+            "id": "task-full-ping",
+            "name": "PING",
+            "protocol": "ping",
+            "directions": [
+              "ab",
+              "ba",
+              "bidir"
+            ],
+            "ip": [
+              "v4",
+              "v6"
+            ],
+            "recipe_ids": [],
+            "rx_target_bidir_ab": "",
+            "rx_target_bidir_ba": ""
+          }
+        ]
+      }
+    ],
+    "bindings": [
+      {
+        "id": "binding-9a316e89",
+        "link_set_id": "linkset-0d2d7e7d",
+        "suite_id": "suite-full",
+        "mode": "replace",
+        "order": 1
+      }
+    ],
+    "plan_hash": null
+  },
+  "settings": {
+    "agent_host": "192.168.0.101",
+    "agent_port": 28801,
+    "ipv4_prefixes": [
+      "192.168."
+    ],
+    "duration": 180,
+    "tcp_windows": [
+      "64k",
+      "4m"
+    ],
+    "tcp_streams": [
+      10
+    ],
+    "udp_bandwidths": [
+      "1000m",
+      "2500m"
+    ],
+    "udp_lengths": [
+      "14k"
+    ],
+    "udp_windows": [
+      "256m"
+    ],
+    "udp_streams": 1,
+    "ping_count": 180,
+    "ping_payload_sizes": [
+      32,
+      1600,
+      65500
+    ],
+    "screenshot": false
+  },
+  "nic_policies": [],
+  "limit_udp_by_link_speed": true,
+  "resume": false,
+  "topology_fingerprint": ""
+}

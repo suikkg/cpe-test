@@ -34,6 +34,8 @@ LAYOUT = {
     "configs/config-wifi5g.json": "dist/configs/config-wifi5g.json",
     "configs/config-10gusb.json": "dist/configs/config-10gusb.json",
     "configs/config-all-common.json": "dist/configs/config-all-common.json",
+    "configs/config-full-tcp-udp-ping.json": "dist/configs/config-full-tcp-udp-ping.json",
+    "projects/cpe-ui-project-full.json": "dist/projects/cpe-ui-project-full.json",
     "start_ui.bat": "dist/start_ui.bat",
     "start_agent.bat": "dist/start_agent.bat",
     "start_master.bat": "dist/start_master.bat",

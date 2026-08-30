@@ -304,7 +304,7 @@ fn quick_plan_rejects_ping_recipe_references_until_recipe_fields_exist() {
 
     let error = validate_request(&state, &req)
         .expect_err("PING recipe references must not be silently ignored");
-    assert!(error.contains("暂不支持 PING 配方"), "{error}");
+    assert!(error.contains("暂不支持 PING 配置"), "{error}");
 }
 
 #[test]
@@ -1443,6 +1443,50 @@ fn the_plan_shows_the_parameters_each_leg_will_actually_use() {
     assert!(lines[0].contains("-b 500 Mbps"), "{lines:?}");
     assert!(lines[0].contains("-l 1200"), "{lines:?}");
     assert!(lines[0].contains("×3 流"), "{lines:?}");
+    // 单向单元也要带方向。这条腿的 tag 是空串（`dir_pairs` 对 ab/ba 就给空），
+    // 所以方向只能来自单元自己的 `direction`；不兜的话预览里双向单元每行带
+    // 方向、单向单元不带，同一份清单两种样子。
+    assert!(
+        lines[0].starts_with("A→B "),
+        "单向单元的参数行要带方向：{lines:?}"
+    );
+}
+
+/// 预览里**每一种**方向都要看得见，不能只有双向单元带方向标。
+#[test]
+fn the_preview_labels_the_direction_of_every_unit() {
+    let state = state_with_pair();
+    let mut req = request();
+    req.udp_bandwidths = vec!["500m".into()];
+    req.udp_streams = 1;
+    req.pairs[0].transports = vec!["udp".into()];
+
+    for (direction, expected) in [("ab", "A→B "), ("ba", "B→A "), ("bidir", "")] {
+        req.pairs[0].directions = vec![direction.into()];
+        let cfg = validated_config_from_request(&state, &req).unwrap();
+        let specs: Vec<_> = cfg
+            .tests
+            .iter()
+            .map(|test| builder::spec_from_config(test, &cfg, &state.master, &state.agent).unwrap())
+            .collect();
+        let mut port = builder::PORT_BASE;
+        let (units, _) = build_units(&specs, cfg.require_same_subnet_for_iperf, &mut port);
+        let lines = unit_load_lines(&units[0]);
+        assert!(!lines.is_empty(), "{direction} 应当有参数行");
+        if direction == "bidir" {
+            // 双向单元两条腿各自带 ab/ba，靠 Leg.tag 就够。
+            assert!(
+                lines.iter().any(|line| line.starts_with("A→B "))
+                    && lines.iter().any(|line| line.starts_with("B→A ")),
+                "双向单元两条腿要分别标出方向：{lines:?}"
+            );
+        } else {
+            assert!(
+                lines.iter().all(|line| line.starts_with(expected)),
+                "{direction} 的参数行要以 {expected:?} 开头：{lines:?}"
+            );
+        }
+    }
 }
 
 /// 每一行选哪一组 UDP 参数，就跑那一组里写着的东西。
@@ -2238,7 +2282,10 @@ fn importing_a_file_without_a_token_keeps_the_loaded_one() {
     state.cfg.agent_token = "loaded-secret".into();
     let console = console_with(state);
 
-    let cfg = config_from_request(&state_with_pair(), &request());
+    let mut cfg = config_from_request(&state_with_pair(), &request());
+    // 显式清空：Config::default() 现在带着出厂默认口令，不清掉的话这里测的
+    // 就变成「文件里有令牌」，跟本用例要守的「文件里没有令牌」正好相反。
+    cfg.agent_token = String::new();
     let out = api_import(&console, &serde_json::to_string(&cfg).unwrap()).unwrap();
     assert_eq!(out["settings"]["token_configured"], true);
     assert_eq!(
@@ -2255,7 +2302,6 @@ fn importing_a_file_without_a_token_keeps_the_loaded_one() {
     );
 
     // 文件里带着令牌时以文件为准：那才是这份配置连得上的那台。
-    let mut cfg = cfg;
     cfg.agent_token = "from-file".into();
     api_import(&console, &serde_json::to_string(&cfg).unwrap()).unwrap();
     assert_eq!(lock_recover(&console.state).cfg.agent_token, "from-file");
@@ -2917,10 +2963,10 @@ fn the_plan_hash_changes_when_the_topology_changes() {
     );
 }
 
-/// 参数配方必须能删，而且删的时候要清掉任务上的引用。
+/// 参数配置必须能删，而且删的时候要清掉任务上的引用。
 ///
-/// 这条守的是一个真实缺口：配方卡片过去只有「编辑」，`#quickrecipes` 的
-/// 点击委派里也**根本没有删除分支**——加错一条配方就再也去不掉，只能重建
+/// 这条守的是一个真实缺口：配置卡片过去只有「编辑」，`#quickrecipes` 的
+/// 点击委派里也**根本没有删除分支**——加错一条配置就再也去不掉，只能重建
 /// 整个项目。页面是 `include_str!` 进来的，这里从源码层面把入口钉住。
 #[test]
 fn the_recipe_card_can_be_deleted_and_edited_in_place() {
@@ -2934,7 +2980,7 @@ fn the_recipe_card_can_be_deleted_and_edited_in_place() {
         // 删除时清理任务上的 recipe_ids 引用
         "task.recipe_ids = kept.length",
     ] {
-        assert!(PAGE_SOURCE.contains(marker), "配方删除入口缺了 {marker}");
+        assert!(PAGE_SOURCE.contains(marker), "配置删除入口缺了 {marker}");
     }
 
     for marker in [
@@ -2944,27 +2990,302 @@ fn the_recipe_card_can_be_deleted_and_edited_in_place() {
         "qrecipe-cancel",
         "function saveRecipeEditor()",
     ] {
-        assert!(PAGE_SOURCE.contains(marker), "配方就地编辑缺了 {marker}");
+        assert!(PAGE_SOURCE.contains(marker), "配置就地编辑缺了 {marker}");
     }
 
     assert!(
         !PAGE_SOURCE.contains("editQuickRecipe"),
         "旧的 prompt 链应当已经删干净，别和就地编辑器两套并存"
     );
-    // 新建一条 UDP 配方过去要连点 5 个 prompt：名称、-b、-l、-w、流数。
-    // 中途点任何一次「取消」都会留下半套数据，新建时甚至留下一条空配方，
-    // 一直到点预览才报错。配方这一段不许再出现 prompt。
-    //
-    // （链路集合改名仍用 prompt，那是单个字段的重命名，不在此列。）
+    // 新建一条 UDP 配置过去要连点 5 个 prompt：名称、-b、-l、-w、流数。
+    // 中途点任何一次「取消」都会留下半套数据，新建时甚至留下一条空配置，
+    // 一直到点预览才报错。配置这一段不许再出现 prompt。
     let start = PAGE_SOURCE
         .find("function openRecipeEditor(")
-        .expect("配方编辑器入口");
+        .expect("配置编辑器入口");
     let end = PAGE_SOURCE[start..]
         .find("function renderQuickAssignments(")
         .map(|offset| start + offset)
         .unwrap_or(PAGE_SOURCE.len());
     let prompts = PAGE_SOURCE[start..end].matches("window.prompt(").count();
-    assert_eq!(prompts, 0, "配方编辑不该再用 window.prompt");
+    assert_eq!(prompts, 0, "配置编辑不该再用 window.prompt");
+}
+
+/// 链路集合这一栏的三条硬约束，都是从页面源码层面钉住的。
+///
+/// 1. **默认列出全部组合**。同机两块网口之间也是一条真实链路（走桥接/回环），
+///    把候选默认收窄成跨机，会让「我明明有这条链路，界面上找不到」变成第一
+///    印象。
+/// 2. **筛选和自动分组是同一个口径**。只在渲染处过滤、分组处写死 `pair.cross`
+///    时，「点显示全部 → 再点按角色自动分组」生成的还是原来那批跨机集合，
+///    同机组合一条都不会被勾上——从用户角度就是这个按钮没反应。
+/// 3. **新建的集合当场能编辑**。名称是卡片上的输入框，不是「改名」按钮 +
+///    prompt；新建时顺手把网口对摊开，否则建出来是一张空卡片，没有任何入口。
+#[test]
+fn the_link_set_panel_lists_every_combination_and_stays_editable_in_place() {
+    const PAGE_SOURCE: &str = include_str!("../webui.html");
+
+    // 默认显示全部组合：筛选框不能是 checked。
+    assert!(
+        PAGE_SOURCE.contains(r#"<input type="checkbox" id="qcrossonly">只显示跨机链路"#),
+        "「只显示跨机链路」默认必须是不勾的，否则同机组合一开始就看不见"
+    );
+
+    for marker in [
+        // 筛选口径的唯一来源，渲染和自动分组共用
+        "function qcrossOnly()",
+        "function qcandidatePairs()",
+        // 集合名称就地可改
+        "qset-name",
+        "el.classList.contains('qset-name')",
+    ] {
+        assert!(PAGE_SOURCE.contains(marker), "链路集合面板缺了 {marker}");
+    }
+
+    assert!(
+        !PAGE_SOURCE.contains("qset-rename"),
+        "「改名」按钮应该已经被卡片上的输入框取代，别两套并存"
+    );
+
+    // 自动分组必须走 qcandidatePairs()：写死 cross 就是「没反应」的根因。
+    let start = PAGE_SOURCE
+        .find("function autoLinkSets()")
+        .expect("自动分组入口");
+    let end = PAGE_SOURCE[start..]
+        .find("function syncQuickSets()")
+        .map(|offset| start + offset)
+        .unwrap_or(PAGE_SOURCE.len());
+    let body = &PAGE_SOURCE[start..end];
+    assert!(
+        body.contains("qcandidatePairs()"),
+        "按角色自动分组要跟着筛选走，不能自己再过滤一遍"
+    );
+    assert!(
+        !body.contains("pair.cross"),
+        "自动分组里不该再写死 pair.cross"
+    );
+
+    // 同机与跨机可能落在同一对角色上，角色键必须能把两者分开，否则两类链路
+    // 会被并进同一个自动集合。
+    let start = PAGE_SOURCE.find("function qroleKey(").expect("角色键");
+    let end = PAGE_SOURCE[start..]
+        .find("function qcrossOnly()")
+        .map(|offset| start + offset)
+        .unwrap_or(PAGE_SOURCE.len());
+    assert!(
+        PAGE_SOURCE[start..end].contains("pair.cross"),
+        "角色键要区分同机/跨机，否则两类组合会被并成一个集合"
+    );
+}
+
+/// 分配表要能整列勾选：套件多起来之后，「所有链路都跑这个套件」原本得逐格点。
+#[test]
+fn the_assignment_table_can_toggle_a_whole_suite_column() {
+    const PAGE_SOURCE: &str = include_str!("../webui.html");
+
+    for marker in [
+        // 表头里的整列开关
+        "qbind-colall",
+        // 委派里的整列分支
+        "el.classList.contains('qbind-colall')",
+    ] {
+        assert!(PAGE_SOURCE.contains(marker), "分配表整列开关缺了 {marker}");
+    }
+}
+
+/// `-l` 只有一个来源：套件里的参数配置。
+///
+/// 网口表那一列（占位符写着「走全局档位」）已经去掉，全局档位也不再反向覆写
+/// 套件的默认配置——否则「基线 TCP+UDP」会一直显示出厂 `udp_profiles` 里那条
+/// `-l 64`，而界面上没有任何地方交代是谁改的。
+#[test]
+fn the_udp_datagram_size_is_configured_only_in_the_suite() {
+    const PAGE_SOURCE: &str = include_str!("../webui.html");
+
+    assert!(
+        !PAGE_SOURCE.contains("作为发送端：UDP -l"),
+        "网口表不该再有 UDP -l 这一列"
+    );
+    assert!(
+        !PAGE_SOURCE.contains("cell('udp_length'"),
+        "网口表不该再画 udp_length 输入框"
+    );
+    assert!(
+        !PAGE_SOURCE.contains("udpDefault.lengths"),
+        "全局档位不该再覆写套件里的 UDP 参数配置"
+    );
+
+    // 基线套件的出厂档位：-b 2500m · -l 14k · -w 256m · 单流。
+    assert!(
+        PAGE_SOURCE.contains(
+            "bandwidths: ['2500m'], lengths: ['14k'], windows: ['256m'], udp_streams: [1]"
+        ),
+        "基线 TCP+UDP 的 UDP 配置应为 -b 2500m -l 14k -w 256m"
+    );
+
+    // 页面上写死的那三个档位必须真的能过服务端校验并编译成一条 UDP 单元，
+    // 否则默认套件打开就是红的——这种错只有把同一组值送进真实校验路径才会
+    // 露出来（`-l` 超 65507、`-w` 写法不认，都是在这一步才拦下）。
+    let state = state_with_pair();
+    let mut req = suite_request();
+    let plan = req.ui_plan.as_mut().expect("suite plan");
+    plan.recipes.udp[0].profiles.clear();
+    plan.recipes.udp[0].bandwidths = vec!["2500m".into()];
+    plan.recipes.udp[0].lengths = vec!["14k".into()];
+    plan.recipes.udp[0].windows = vec!["256m".into()];
+    plan.recipes.udp[0].udp_streams = vec![1];
+    let cfg =
+        validated_config_from_request(&state, &req).expect("基线 TCP+UDP 的出厂档位必须能过校验");
+    let udp = cfg
+        .tests
+        .iter()
+        .find(|test| test.transports.iter().any(|t| t == "udp"))
+        .expect("应当编译出一条 UDP test");
+    let profiles = udp.udp_profiles.as_ref().expect("UDP 档位");
+    assert_eq!(profiles.len(), 1, "三条轴各一个值，只该展开成一档");
+    assert_eq!(profiles[0].bandwidth, "2500m");
+    assert_eq!(profiles[0].length.as_deref(), Some("14k"));
+    assert_eq!(profiles[0].window.as_deref(), Some("256m"));
+}
+
+/// 随包发布的测试项目（`dist/projects/cpe-ui-project-full.json`）必须在它**自己
+/// 声明的那套拓扑**上真的能编译成执行计划。
+///
+/// 这份文件是手写生成的，不是从界面导出来的——端点名拼错一个字、任务里给 PING
+/// 挂了 `recipe_ids`、绑定指向不存在的套件，任何一处都要等用户在现场导入、点
+/// 预览才会红。这里把 v4.4 那次实测的 5 块网口摆出来，让后端校验器自己说话。
+#[test]
+fn the_shipped_full_project_compiles_against_the_topology_it_declares() {
+    let project: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("dist/projects/cpe-ui-project-full.json"),
+        )
+        .expect("全量测试项目必须存在"),
+    )
+    .expect("测试项目必须是合法 JSON");
+
+    let plan: UiPlan =
+        serde_json::from_value(project["ui_plan"].clone()).expect("ui_plan 必须能被后端 DTO 接受");
+    assert_eq!(plan.link_sets.len(), 1);
+    assert_eq!(
+        plan.link_sets[0].pair_refs.len(),
+        10,
+        "5 块网口两两组合 = 10 对"
+    );
+
+    // run_20260828_162822_17788 里的那 5 个端点。
+    let nic = |name: &str, speed: u64| NicInfo {
+        name: name.into(),
+        role: String::new(),
+        ipv4: String::new(),
+        speed_mbps: speed,
+        ..Default::default()
+    };
+    let mut state = state_with_pair();
+    state.master.interfaces = vec![nic("以太网 5", 3750), nic("WLAN", 2402)];
+    state.agent.interfaces = vec![
+        nic("以太网 3", 2500),
+        nic("以太网", 1000),
+        nic("WLAN 3", 2882),
+    ];
+    for (index, iface) in state.master.interfaces.iter_mut().enumerate() {
+        iface.ipv4 = format!("192.168.0.{}", 100 + index * 4);
+    }
+    for (index, iface) in state.agent.interfaces.iter_mut().enumerate() {
+        iface.ipv4 = format!("192.168.0.{}", 101 + index);
+    }
+
+    let settings = &project["settings"];
+    let mut req = suite_request();
+    req.ui_plan = Some(plan);
+    req.pairs.clear();
+    req.nic_policies.clear();
+    req.duration = settings["duration"].as_u64().unwrap();
+    req.ping_count = settings["ping_count"].as_u64().unwrap() as u32;
+    req.ping_payload_sizes = settings["ping_payload_sizes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_u64().unwrap() as u32)
+        .collect();
+
+    let cfg = validated_config_from_request(&state, &req)
+        .expect("全量测试项目必须能在它声明的拓扑上编译成计划");
+
+    // TCP / UDP / PING 三种任务各自独立成 spec，一条都不能被吞掉。
+    let count = |kind: &str, transport: &str| {
+        cfg.tests
+            .iter()
+            .filter(|t| {
+                t.kinds.iter().any(|k| k == kind)
+                    && (transport.is_empty() || t.transports.iter().any(|x| x == transport))
+            })
+            .count()
+    };
+    assert!(count("iperf", "tcp") > 0, "少了 TCP");
+    assert!(count("iperf", "udp") > 0, "少了 UDP");
+    assert!(count("ping", "") > 0, "少了 PING");
+
+    // 参数照搬 v4.4：TCP -w 64k/4m，UDP -b 1000m/2500m -l 14k -w 256m。
+    // 编译器把每一档 `-w` 展开成独立的 spec（一档一个单元），所以这里比的是
+    // 所有 TCP spec 合起来覆盖的档位集合，而不是某一条 spec 里有几档。
+    let tcp_windows: HashSet<String> = cfg
+        .tests
+        .iter()
+        .filter(|t| t.transports.iter().any(|x| x == "tcp"))
+        .flat_map(|t| t.tcp_windows.clone().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        tcp_windows,
+        HashSet::from(["64k".to_string(), "4m".to_string()]),
+        "TCP 档位应当覆盖 -w 64k 和 -w 4m"
+    );
+    let udp_profiles: Vec<_> = cfg
+        .tests
+        .iter()
+        .filter(|t| t.transports.iter().any(|x| x == "udp"))
+        .flat_map(|t| t.udp_profiles.clone().unwrap_or_default())
+        .collect();
+    assert!(!udp_profiles.is_empty(), "UDP 档位");
+    let bandwidths: HashSet<String> = udp_profiles.iter().map(|p| p.bandwidth.clone()).collect();
+    assert_eq!(
+        bandwidths,
+        HashSet::from(["1000m".to_string(), "2500m".to_string()]),
+        "UDP 档位应当覆盖 -b 1000m 和 -b 2500m"
+    );
+    for profile in &udp_profiles {
+        assert_eq!(profile.length.as_deref(), Some("14k"));
+        assert_eq!(profile.window.as_deref(), Some("256m"));
+    }
+    assert_eq!(cfg.ping.count, 180);
+
+    // 同机组合（桥接/回环）必须活着走到 cfg：这正是「默认列出全部组合」要覆盖的
+    // 那一类链路，被静默丢掉的话这份项目就名不副实。
+    let same_host = cfg
+        .tests
+        .iter()
+        .filter(|t| t.src.split(':').next() == t.dst.split(':').next())
+        .count();
+    assert!(same_host > 0, "同机组合被丢掉了");
+
+    // 这份预设有多大，是用户点「开始测试」之前最该知道的一个数：
+    // 10 对 × 3 方向 × 2 IP × (TCP 2 档 + UDP 2 档 + PING 3 档包长) = 210 个单元，
+    // 预计 11 小时 26 分。钉住它既给文档一个可信来源，也让「改了某个参数导致
+    // 单元数翻倍」当场可见——这份预设本来就贴着「跑一整夜」的量级，多一维就过夜跑不完。
+    let units = canonical_plan_units(&cfg, &state);
+    let est: u64 = units.iter().map(|u| u.est_secs).sum();
+    assert_eq!(
+        units.len(),
+        210,
+        "全量预设的单元数变了（预计耗时 {} 小时 {} 分）——文档里的数字要一起改",
+        est / 3600,
+        (est % 3600) / 60
+    );
+    assert!(
+        (11 * 3600..13 * 3600).contains(&est),
+        "全量预设预计耗时 {est} 秒，偏离「跑一整夜」的量级"
+    );
 }
 
 /// 端到端走一遍控制台真实的执行路径，确认计划闸门放行。

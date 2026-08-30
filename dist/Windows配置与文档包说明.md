@@ -18,7 +18,10 @@ Windows 配置、说明文档和启动脚本资料包。包内文件由仓库当
 - Windows 快速开始、完整 README、使用说明、NIC 说明和 UDP 验收场景。
 - `config.minimal.json`（最小可用：首次跑通只需改 `agent_host`、`agent_token`、
   `iperf.duration` 三项，其余走内置默认值）。
-- `config.example.json`（完整字段面）与 `configs/` 下四份可直接选择的具名配置。
+- `config.example.json`（完整字段面）与 `configs/` 下五份可直接选择的具名配置，
+  其中 `config-full-tcp-udp-ping.json` 是 TCP+UDP+PING 全量预设（约 210 个单元）。
+- `projects/cpe-ui-project-full.json`：图形控制台的「导入测试项目」文件，内含全网口
+  配对的链路集合、TCP/UDP 参数配置和 TCP→UDP→PING 套件。
 - `start_ui.bat`（图形控制台）、`start_agent.bat`、`start_master.bat`、`start_master_select_config.bat`。
 - iperf3/ctsTraffic 放置说明、MIT 许可证和第三方声明。
 

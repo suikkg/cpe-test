@@ -1,7 +1,7 @@
 {
   "agent_host": "10.228.46.50",
   "agent_port": 28801,
-  "agent_token": "",
+  "agent_token": "cpetest",
   "agent_bind": "0.0.0.0",
   "ipv4_prefixes": ["192.168."],
   "require_same_subnet_for_iperf": true,
@@ -89,7 +89,7 @@
   },
 
   "ping": {
-    "count": 100,
+    "count": 180,
     "payload_sizes": [32, 1600, 65500]
   },
 
@@ -119,7 +119,7 @@
       "ab": null,
       "ba": null
     },
-    "ping_count": 100,
+    "ping_count": 180,
     "ping_payload_sizes": [32, 1600, 65500]
   },
 

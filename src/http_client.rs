@@ -20,13 +20,23 @@ use std::time::{Duration, Instant};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// 一次响应最多读多少字节。
+/// 一次**响应**最多读多少字节。
 ///
-/// 和 agent 的 `MAX_BODY` 对齐。**服务端两侧本来都有这道闸，客户端一侧一个都没有**：
-/// `Content-Length` 出来的 `usize` 被直接拿去 `Vec::resize`，对端说 1TB 就申请 1TB。
+/// **和 agent 的 `MAX_BODY` 管的是相反方向，两个数故意不相等，不要"对齐"。**
+/// `MAX_BODY` 限的是进 agent 的请求（KB 级 JSON 控制消息）；这里限的是 agent
+/// 回给主控的响应，而大数据全在这个方向上：
+///
+/// - `/screenshot` 回 `ScreenshotOut.image_b64`——PNG 再 base64 膨胀 4/3。
+///   实测 1080p 桌面约 0.4 MiB PNG → 0.53 MiB base64；2K/4K 桌面到 5 MiB PNG
+///   很常见，base64 后可达 7 MiB。把这个数压到 1 MiB 会让高分屏机器的截图
+///   静默失败，而且报出来的是「读响应超限」，根本指不到截图上。
+/// - `/iperf/client/status` 回整段 iperf 输出，`/monitor/stop` 回全部网卡样本。
+///
+/// 这道闸本身是必需的：**服务端两侧本来都有，客户端一侧一个都没有**。
+/// `Content-Length` 出来的 `usize` 被直接拿去 `Vec::resize`，对端说 1TB 就申请 1TB；
 /// 而辅测机 IP 是人手敲进去的——敲到一台跑着别的服务的机器上，现在的表现是进程
 /// 被 OOM 掉，而不是一句「这不是 agent」。
-const MAX_RESPONSE_BYTES: usize = 100 * 1024 * 1024;
+pub(crate) const MAX_RESPONSE_BYTES: usize = 100 * 1024 * 1024;
 
 /// 一次请求从连上到读完的总时限。
 ///
@@ -1041,11 +1051,35 @@ fn parse_status(line: &str) -> Result<u16, String> {
 mod tests {
     use super::*;
 
+    /// 请求闸和响应闸管的是相反方向，必须保持数量级差距。
+    ///
+    /// 这条钉的是一个具体的返工风险：`MAX_RESPONSE_BYTES` 的注释曾经写着
+    /// 「和 agent 的 MAX_BODY 对齐」。把请求闸收紧到 1 MiB 之后，谁照着那句
+    /// 去「恢复对齐」，就会把响应闸也压到 1 MiB —— 而截图正是走响应方向的：
+    /// 1080p 桌面实测 0.4 MiB PNG → base64 0.53 MiB，2K/4K 到 5 MiB PNG、
+    /// base64 7 MiB 很常见。压下去的后果是高分屏机器截图静默失败，
+    /// 报出来的还是「读响应超限」，根本指不到截图上。
+    #[test]
+    fn the_response_cap_must_stay_far_above_the_request_cap() {
+        let request_cap = crate::agent::server::MAX_BODY as usize;
+        let response_cap = MAX_RESPONSE_BYTES;
+        assert!(
+            response_cap >= request_cap * 16,
+            "响应闸 {response_cap} 必须显著大于请求闸 {request_cap}：两者方向相反，不是一对该对齐的数"
+        );
+        // 4K 截图 base64 的实测量级；响应闸低于它就会静默砍掉截图。
+        const WORST_CASE_SCREENSHOT_B64: usize = 8 * 1024 * 1024;
+        assert!(
+            response_cap >= WORST_CASE_SCREENSHOT_B64,
+            "响应闸 {response_cap} 装不下一张 4K 截图的 base64（约 {WORST_CASE_SCREENSHOT_B64} 字节）"
+        );
+    }
+
     /// 对端说多大就申请多大，是这个客户端唯一能把进程直接打死的地方。
     ///
     /// 辅测机 IP 是人手敲进去的。敲到一台跑着别的服务的机器上时，正确的表现是
     /// 一句可读的错误，而不是 `Vec::resize` 照着对端声明的长度申请并写满、
-    /// 然后被 OOM killer 带走。服务端两侧本来就都有 MAX_BODY，客户端这侧
+    /// 然后被 OOM killer 带走。服务端两侧本来就都有请求闸，客户端这侧
     /// 一个 cap 都没有。
     #[test]
     fn an_absurd_content_length_is_refused_before_anything_is_allocated() {

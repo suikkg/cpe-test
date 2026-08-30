@@ -665,4 +665,152 @@ mod tests {
         assert_eq!(decoded.process_started, Some(true));
         assert_eq!(decoded.cleanup_confirmed, Some(true));
     }
+
+    /// 每一种发往 agent 的请求，**最坏情况**都必须远小于 `agent::server::MAX_BODY`。
+    ///
+    /// 这条是发布稳定性的闸：请求体上限从 100 MiB 收到 1 MiB 之后，
+    /// 「哪天谁往某个 `*Req` 里塞了一个 `Vec<String>` 日志字段」就会变成
+    /// 现场才暴露的截断——表现是一句 `请求 JSON 解析失败`，而不是「体积超了」，
+    /// 排查方向会被带偏。
+    ///
+    /// 这里用的都是**放大过的**最坏值：IPv6 link-local 带 zone 的最长写法、
+    /// 160 字节上限的 request_id/owner_id（`validate_lifecycle_id` 的硬上限）、
+    /// 以及比实际多一倍的 iperf3 参数。真实值见同目录的实测：一次完整运行里
+    /// 最大的请求体是 `/iperf/server/start` 的 191 字节。
+    #[test]
+    fn every_agent_request_stays_far_below_the_body_cap() {
+        const CAP: usize = crate::agent::server::MAX_BODY as usize;
+        // 160 是 validate_lifecycle_id 允许的最长 id。
+        let long_id = "a".repeat(160);
+        // 带 zone 的 IPv6 link-local，接口名再放宽到 64 字节。
+        let long_addr = format!("fe80::1234:5678:9abc:def0%{}", "e".repeat(64));
+
+        let client_req = IperfClientReq {
+            dst: long_addr.clone(),
+            bind_ip: long_addr.clone(),
+            port: 65535,
+            duration: 86_400,
+            udp: true,
+            v6: true,
+            // 实际最多 6 项（-b/-l/-w 各一对）；这里给 12 项，每项再放长。
+            extra: (0..12).map(|_| "-b 2500000000".repeat(4)).collect(),
+        };
+
+        let mut sizes: Vec<(&str, usize)> = Vec::new();
+        let mut record = |name: &'static str, json: String| sizes.push((name, json.len()));
+
+        record(
+            "/info",
+            serde_json::to_string(&InfoReq {
+                // 前缀是用户配置，给 64 条超长的
+                ipv4_prefixes: (0..64).map(|_| "192.168.100.".repeat(8)).collect(),
+            })
+            .unwrap(),
+        );
+        record(
+            "/ping",
+            serde_json::to_string(&PingReq {
+                dst: long_addr.clone(),
+                src: long_addr.clone(),
+                count: 100_000,
+                payload: 65_500,
+                v6: true,
+            })
+            .unwrap(),
+        );
+        record(
+            "/iperf/server/start",
+            serde_json::to_string(&IperfServerStartReq {
+                bind_ip: long_addr.clone(),
+                port: 65535,
+                v6: true,
+                request_id: long_id.clone(),
+                owner_id: long_id.clone(),
+                lease_secs: 86_400,
+            })
+            .unwrap(),
+        );
+        record(
+            "/iperf/client/start",
+            serde_json::to_string(&IperfClientStartReq {
+                request: client_req.clone(),
+                request_id: long_id.clone(),
+                owner_id: long_id.clone(),
+                lease_secs: 86_400,
+            })
+            .unwrap(),
+        );
+        record(
+            "/iperf/client/run",
+            serde_json::to_string(&client_req).unwrap(),
+        );
+        record(
+            "/ctstraffic/start",
+            serde_json::to_string(&CtsTrafficStartReq {
+                request: CtsTrafficReq {
+                    role: CtsTrafficRole::Client,
+                    protocol: CtsTrafficProtocol::Udp,
+                    bind_ip: long_addr.clone(),
+                    target_ip: long_addr.clone(),
+                    port: 65535,
+                    duration_secs: 86_400,
+                    streams: 32,
+                    window_bytes: Some(u32::MAX),
+                    bits_per_second: Some(u64::MAX),
+                    datagram_bytes: Some(u32::MAX),
+                    frame_rate: u32::MAX,
+                    buffer_depth_secs: u32::MAX,
+                    status_update_ms: u32::MAX,
+                },
+                request_id: long_id.clone(),
+                owner_id: long_id.clone(),
+                lease_secs: 86_400,
+            })
+            .unwrap(),
+        );
+        record(
+            "/monitor/start",
+            serde_json::to_string(&MonitorStartReq {
+                iface: "x".repeat(256),
+                interval_ms: 60_000,
+                owner_id: long_id.clone(),
+                lease_secs: 86_400,
+            })
+            .unwrap(),
+        );
+        record(
+            "/resources/cleanup",
+            serde_json::to_string(&ResourceCleanupReq {
+                owner_id: long_id.clone(),
+                wait_secs: 3600,
+            })
+            .unwrap(),
+        );
+        record(
+            "/screenshot",
+            serde_json::to_string(&ScreenshotReq {
+                label: "l".repeat(4096),
+            })
+            .unwrap(),
+        );
+
+        let worst = sizes.iter().max_by_key(|(_, n)| *n).expect("有请求");
+        eprintln!("[请求体最坏值] 上限 {CAP} 字节");
+        let mut sorted = sizes.clone();
+        sorted.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+        for (name, n) in &sorted {
+            eprintln!(
+                "  {name:<22} {n:>7} 字节   余量 {:.0}x",
+                CAP as f64 / *n as f64
+            );
+        }
+        // 留 16 倍余量：低于这个说明某个请求已经不再是「控制消息」量级了。
+        assert!(
+            worst.1 * 16 < CAP,
+            "最坏请求 {} = {} 字节，距离上限 {CAP} 的余量不足 16 倍。\\n\
+             要么这个字段不该走请求体，要么 MAX_BODY 要重新评估。全部：{sizes:?}",
+            worst.0,
+            worst.1
+        );
+    }
 }

@@ -80,6 +80,14 @@ fn traffic_detail(unit: &str, sort_key: (usize, usize, usize, u8)) -> Row {
     }
 }
 
+/// 指定单元序号的汇总行；默认的 `unit_summary` 恒为第 0 个单元。
+fn unit_summary_at(unit: &str, verdict: Verdict, seq: usize) -> Row {
+    Row {
+        sort_key: (seq, usize::MAX, usize::MAX, u8::MAX),
+        ..unit_summary(unit, verdict)
+    }
+}
+
 fn unit_summary(unit: &str, verdict: Verdict) -> Row {
     Row {
         sort_key: (0, usize::MAX, usize::MAX, u8::MAX),
@@ -96,6 +104,131 @@ fn unit_summary(unit: &str, verdict: Verdict) -> Row {
         is_unit_summary: true,
         ..Default::default()
     }
+}
+
+/// 顶层区块要能折叠，原始输出要有序号，且有一次性全开/全关的入口。
+///
+/// 一轮 120 个单元的报告，「测试概览 / 逐行明细 / 原始输出」三块摊开是几屏，
+/// 想只看结论就得一路滚。折叠用原生 `<details>`——脚本挂了也还能逐块手点，
+/// 全局按钮只是省去点 120 次。
+#[test]
+fn report_sections_collapse_and_raw_outputs_are_numbered() {
+    let mut first = traffic_detail("unit-a", (0, 0, 0, 0));
+    first.raws = vec![("client".into(), "<output a>".into())];
+    // 第二个单元的 sort_key.0 必须是 1：原始输出的 #N 是**单元序号**，
+    // 两个 fixture 都留在 0 的话它们本来就该同号（见
+    // `the_same_unit_carries_the_same_number_in_every_section`）。
+    let mut second = traffic_detail("unit-b", (1, 0, 0, 0));
+    second.raws = vec![("client".into(), "<output b>".into())];
+    let html = render(vec![
+        first,
+        unit_summary_at("unit-a", Verdict::Pass, 0),
+        second,
+        unit_summary_at("unit-b", Verdict::Pass, 1),
+    ]);
+
+    // 三块顶层区块都包在可折叠的 <details> 里，标题本身就是开关。
+    for heading in ["overview-heading", "details-heading", "raw-heading"] {
+        let marker = format!("<h2 id=\"{heading}\"");
+        let at = html.find(&marker).unwrap_or_else(|| panic!("缺 {heading}"));
+        let before = &html[..at];
+        assert!(
+            before.rfind("<summary class=\"top-toggle\">").unwrap_or(0)
+                > before.rfind("</summary>").unwrap_or(0),
+            "{heading} 必须在 <summary class=\"top-toggle\"> 里，否则点标题不能折叠"
+        );
+    }
+    // 默认展开：折叠是给「已经看过一遍、只想找某一块」的人用的，
+    // 第一次打开就是收起状态会让人以为报告是空的。
+    assert_eq!(
+        html.matches("<details class=\"top-section\" open>").count(),
+        3,
+        "三块顶层区块都要默认展开"
+    );
+
+    // 原始输出逐条有序号，和「逐行明细」的 #N 是同一个读法。
+    assert!(
+        html.contains("<span class=\"raw-seq\">#1</span>"),
+        "原始输出缺 #1"
+    );
+    assert!(
+        html.contains("<span class=\"raw-seq\">#2</span>"),
+        "原始输出缺 #2"
+    );
+
+    // 全局开关：两个按钮 + 一段不依赖外部资源的内嵌脚本。
+    assert!(html.contains("data-toggle-all=\"open\">展开全部"));
+    assert!(html.contains("data-toggle-all=\"close\">收起全部"));
+    assert!(
+        html.contains("<script>"),
+        "报告要能离线单文件使用，脚本必须内嵌"
+    );
+    assert!(
+        !html.contains("<script src="),
+        "不能引外部脚本：报告是拷走整个目录离线看的"
+    );
+    // 交互控件不该出现在打印稿上。
+    assert!(html.contains(".report-tools { display: none; }"));
+}
+
+/// 三块区块的 `#N` 必须是**同一个数**：单元执行序号（= 控制台的 `[N/总数]`）。
+///
+/// 这条守的是一个已经犯过的错：原始输出那一段列的是**执行行**不是单元，
+/// 一个双向单元出两行，按「本段里排第几」编号的话，5 个单元能排到 #10——
+/// 概览说 #4、明细说 #4、原始输出说 #7，指的却是同一件事。而这三块存在的
+/// 全部意义，就是让人拿着一个号在它们之间来回对（还要对控制台和文件名）。
+#[test]
+fn the_same_unit_carries_the_same_number_in_every_section() {
+    // 三个单元，其中第二个是双向（两条腿 → 原始输出会出两条）。
+    let mut u1 = traffic_detail("unit-a", (0, 0, 0, 0));
+    u1.raws = vec![("client".into(), "<a>".into())];
+    let mut u2ab = traffic_detail("unit-b", (1, 0, 0, 0));
+    u2ab.kind_label = "灌包-ab".into();
+    u2ab.raws = vec![("client".into(), "<b-ab>".into())];
+    let mut u2ba = traffic_detail("unit-b", (1, 1, 0, 0));
+    u2ba.kind_label = "灌包-ba".into();
+    u2ba.raws = vec![("client".into(), "<b-ba>".into())];
+    let mut u3 = traffic_detail("unit-c", (2, 0, 0, 0));
+    u3.raws = vec![("client".into(), "<c>".into())];
+
+    let html = render(vec![
+        u1,
+        unit_summary_at("unit-a", Verdict::Pass, 0),
+        u2ab,
+        u2ba,
+        unit_summary_at("unit-b", Verdict::Pass, 1),
+        u3,
+        unit_summary_at("unit-c", Verdict::Pass, 2),
+    ]);
+
+    // 第 3 个单元在「逐行明细」和「原始输出」里都是 #3。
+    assert!(
+        html.contains("<span class=\"unit-seq\">#3</span>"),
+        "逐行明细里第三个单元应当是 #3"
+    );
+    assert!(
+        html.contains("<span class=\"raw-seq\">#3</span>"),
+        "原始输出里第三个单元也应当是 #3，而不是按本段位置排到 #4"
+    );
+    // 双向单元的两条腿共用 #2，靠方向区分。
+    assert_eq!(
+        html.matches("<span class=\"raw-seq\">#2</span>").count(),
+        2,
+        "双向单元两条腿共用单元号"
+    );
+    // 区分标是 `kind_label`——和「逐行明细」那张表「类型」列一字不差。
+    // 一个双向单元每条腿还会分「流明细」和「组合计」，光标 AB/BA 会出现
+    // 四条一模一样的标题。
+    assert!(
+        html.contains("<span class=\"raw-dir\">灌包-ab</span>"),
+        "{html:.0}"
+    );
+    assert!(html.contains("<span class=\"raw-dir\">灌包-ba</span>"));
+    // 原始输出一共 4 条执行行，但最大号只能到 3（单元数），不能到 4。
+    assert!(
+        !html.contains("<span class=\"raw-seq\">#4</span>"),
+        "原始输出的号是单元号，不是行号"
+    );
 }
 
 #[test]

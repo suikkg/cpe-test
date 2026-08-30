@@ -3,15 +3,35 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// 出厂默认口令，agent 认证与控制台访问共用。
+///
+/// 默认从「完全不认证」改成「一个固定口令」，挡的是**误连**不是攻击：
+/// 同一段测试网里两套设备互相连错、扫描器顺手把 agent 点起来跑一轮，
+/// 这类事故靠一个口令就能挡掉。
+///
+/// 它挡不住任何知道本工具的人——这个值写在源码、文档和发布包里，是公开的。
+/// 本工具面向隔离测试网自用，按此取舍；要暴露到别的网段就用 `--token` /
+/// `--ui-token` 换掉。
+///
+/// 和发布包里 `start_ui.bat` / `start_agent.bat` 的 `UI_TOKEN` / `AGENT_TOKEN`
+/// 是同一个值：此前只有 .bat 带口令，直接跑 exe 完全不认证，同一个发布包里
+/// 两条启动路径行为不一致。
+pub const DEFAULT_TOKEN: &str = "cpetest";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     /// 辅测机管理口 IP（留空则交互询问）
     pub agent_host: String,
     pub agent_port: u16,
-    /// 与辅测 agent 之间的共享访问令牌。空表示不启用认证（仅建议隔离测试网使用）；
+    /// 与辅测 agent 之间的共享访问令牌。默认 [`DEFAULT_TOKEN`]。
+    ///
     /// 非空时 agent 要求所有请求携带 `Authorization: Bearer <token>`，
     /// 未认证请求返回 401 且不会创建任何资源。
+    ///
+    /// 显式写成空串才会关闭认证（仅建议完全隔离的测试网）。注意 serde 的
+    /// `default` 只在**字段缺失**时生效：配置文件里写了 `"agent_token": ""`
+    /// 就是明确要求关闭认证，不会回落到默认口令。
     #[serde(default)]
     pub agent_token: String,
     /// agent 监听地址；默认 0.0.0.0。可设为 127.0.0.1 或测试网卡 IP 收紧暴露面。
@@ -127,7 +147,7 @@ impl Default for Config {
         Config {
             agent_host: String::new(),
             agent_port: 28801,
-            agent_token: String::new(),
+            agent_token: DEFAULT_TOKEN.into(),
             agent_bind: default_agent_bind(),
             ipv4_prefixes: vec!["192.168.".into()],
             require_same_subnet_for_iperf: true,
@@ -502,7 +522,7 @@ pub struct PingCfg {
 impl Default for PingCfg {
     fn default() -> Self {
         PingCfg {
-            count: 100,
+            count: 180,
             payload_sizes: vec![32, 1600, 65500],
         }
     }
@@ -829,6 +849,83 @@ mod tests {
                 "config.example.json 里的 {label} 落后于代码默认值，改默认值时要一起改这份参考件"
             );
         }
+
+        // ping 次数同理：这份文件里写的数就是用户以为的默认值，而它直接决定
+        // 每个 PING 单元跑多久。
+        assert_eq!(
+            cfg.ping.count,
+            PingCfg::default().count,
+            "config.example.json 里的 ping.count 落后于代码默认值"
+        );
+
+        // agent_token 必须显式写成默认口令，不能留空串。
+        //
+        // serde 的 `default` 只在字段**缺失**时生效：这份文件里写着
+        // `"agent_token": ""` 的话，照抄走的人拿到的是「显式关闭认证」，
+        // 而不是默认口令——正好和他以为的相反，而且 agent 那边不会有任何提示。
+        assert_eq!(
+            cfg.agent_token, DEFAULT_TOKEN,
+            "config.example.json 的 agent_token 必须写成默认口令，空串等于关掉认证"
+        );
+    }
+
+    /// 随包发布的具名配置（`dist/configs/*.json`）也必须能被真正的加载路径解析
+    /// 并通过校验。
+    ///
+    /// CI 只对它们做了 `json.load` —— 那只证明是合法 JSON，证明不了字段名没写错、
+    /// `-l` 没超上限、`duration` 不是 0。用户是把这些文件当模板整份抄走的，
+    /// 一个字段拼错要等到他真跑起来才发现。
+    #[test]
+    fn every_shipped_named_config_parses_and_validates() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("dist/configs");
+        let mut paths: Vec<_> = std::fs::read_dir(&dir)
+            .expect("dist/configs 必须存在")
+            .filter_map(|entry| entry.ok().map(|e| e.path()))
+            .filter(|path| path.extension().is_some_and(|ext| ext == "json"))
+            .collect();
+        paths.sort();
+        assert!(!paths.is_empty(), "dist/configs 下没有具名配置");
+
+        for path in &paths {
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let cfg = load_from(path).unwrap_or_else(|e| panic!("{name} 解析失败: {e}"));
+            let warnings = cfg.validate();
+            assert!(warnings.is_empty(), "{name} 触发校验告警: {warnings:?}");
+        }
+
+        // 全量预设是「照着 v4.4 那次实测拓扑抄的模板」，它的形状本身就是文档：
+        // 5 块网口两两组合 = 10 对，TCP/UDP/PING 一次跑全，V4+V6 都在。
+        // 少了任何一维，这份预设就不再是「全量」，而用户是照它改的。
+        let full = load_from(&dir.join("config-full-tcp-udp-ping.json"))
+            .expect("全量预设必须存在且可解析");
+        assert_eq!(full.tests.len(), 10, "5 块网口两两组合应当是 10 对");
+        for test in &full.tests {
+            assert_eq!(test.direction.directions(), vec!["ab", "ba", "bidir"]);
+            assert_eq!(test.transports, vec!["tcp", "udp"]);
+            assert_eq!(test.ip, vec!["v4", "v6"]);
+            assert!(
+                test.kinds.iter().any(|k| k == "ping"),
+                "{} 少了 ping",
+                test.name
+            );
+            assert_eq!(test.ping_count, Some(full.ping.count));
+            let profiles = test.udp_profiles.as_ref().expect("UDP 档位");
+            assert!(
+                profiles
+                    .iter()
+                    .all(|p| p.length.as_deref() == Some("14k")
+                        && p.window.as_deref() == Some("256m")),
+                "{} 的 UDP 档位应当是 -l 14k -w 256m",
+                test.name
+            );
+        }
+        // 同机组合（桥接/回环）也要在里面：v4.4 那次跑的就有 4 对同机。
+        let same_host = full
+            .tests
+            .iter()
+            .filter(|t| t.src.split(':').next() == t.dst.split(':').next())
+            .count();
+        assert_eq!(same_host, 4, "应当有 4 对同机组合（主控 1 对 + 辅测 3 对）");
     }
 
     #[test]
@@ -891,7 +988,12 @@ mod tests {
         assert_eq!(c.iperf.tcp_windows, vec!["64k", "1m", "4m"]);
         assert_eq!(c.iperf.udp_profiles.len(), 5);
         assert!(c.iperf.udp_profiles.iter().all(|p| p.window.is_none()));
-        assert_eq!(c.ping.count, 100);
+        assert_eq!(c.ping.count, 180);
+        // 默认口令：从「不认证」改成一个固定值，挡的是误连不是攻击。
+        // 钉住它是因为它同时是 agent 认证和控制台访问的出厂值，改动会同时
+        // 影响两端能否互通。
+        assert_eq!(c.agent_token, DEFAULT_TOKEN);
+        assert_eq!(DEFAULT_TOKEN, "cpetest");
         assert_eq!(c.ping.payload_sizes, vec![32, 1600, 65500]);
         assert_eq!(c.iperf.rate_check.mode, RateMode::Auto);
         assert_eq!(c.iperf.rate_check.evb_usb_to_eth_target_mbps, 6400.0);

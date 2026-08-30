@@ -133,7 +133,7 @@ fn real_main(args: Vec<String>) -> i32 {
             // 看得到，所以两个都支持环境变量。
             let ui_token = flag_value(&f, "ui-token")
                 .or_else(|| std::env::var("CPE_UI_TOKEN").ok())
-                .unwrap_or_default();
+                .unwrap_or_else(|| config::DEFAULT_TOKEN.to_string());
             master::webui::run(master::webui::UiOpts {
                 bind: flag_value(&f, "ui-bind").unwrap_or_else(|| "127.0.0.1".into()),
                 port,
@@ -190,7 +190,8 @@ fn real_main(args: Vec<String>) -> i32 {
                     port: DEFAULT_UI_PORT,
                     config_path: None,
                     agent_token: std::env::var("CPE_AGENT_TOKEN").ok(),
-                    ui_token: std::env::var("CPE_UI_TOKEN").unwrap_or_default(),
+                    ui_token: std::env::var("CPE_UI_TOKEN")
+                        .unwrap_or_else(|_| config::DEFAULT_TOKEN.to_string()),
                 }),
             }
         }

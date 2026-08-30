@@ -1,0 +1,531 @@
+{
+  "_说明": "全量预设：TCP + UDP + PING 各跑一遍，覆盖 5 块网口两两组合的全部 10 对（6 跨机 + 4 同机）、A→B / B→A / 双向并发、IPv4 + IPv6。拓扑和参数照搬 run_20260828_162822_17788（v4.4 实测）。换机器时把 tests[] 里的 NAME= 改成你那两台的网卡名即可。",
+  "agent_host": "192.168.0.101",
+  "agent_port": 28801,
+  "agent_token": "cpetest",
+  "ipv4_prefixes": [
+    "192.168."
+  ],
+  "require_same_subnet_for_iperf": true,
+  "limit_udp_by_link_speed": true,
+  "screenshot": false,
+  "resume": false,
+  "open_report": true,
+  "iperf": {
+    "duration": 180,
+    "tcp_windows": [
+      "64k",
+      "4m"
+    ],
+    "udp_profiles": [
+      {
+        "bandwidth": "1000m",
+        "length": "14k",
+        "window": "256m"
+      },
+      {
+        "bandwidth": "2500m",
+        "length": "14k",
+        "window": "256m"
+      }
+    ],
+    "rate_check": {
+      "mode": "auto",
+      "sample_interval_ms": 1000,
+      "background_secs": 3,
+      "startup_timeout_secs": 15,
+      "settle_secs": 5,
+      "launch_interval_ms": 50,
+      "min_concurrent_streams": 2,
+      "min_active_ratio": 0.9,
+      "offered_headroom_pct": 5,
+      "flow_retries": 1
+    }
+  },
+  "ctstraffic": {
+    "udp_frame_rate": 100,
+    "udp_buffer_depth_secs": 1,
+    "status_update_ms": 1000
+  },
+  "ping": {
+    "count": 180,
+    "payload_sizes": [
+      32,
+      1600,
+      65500
+    ]
+  },
+  "pairs": [],
+  "tests": [
+    {
+      "name": "同机 以太网 5 <-> WLAN",
+      "src": "master:NAME=以太网 5",
+      "dst": "master:NAME=WLAN",
+      "direction": [
+        "A->B",
+        "B->A",
+        "bidir"
+      ],
+      "kinds": [
+        "iperf",
+        "ping"
+      ],
+      "transports": [
+        "tcp",
+        "udp"
+      ],
+      "ip": [
+        "v4",
+        "v6"
+      ],
+      "tcp_streams": 10,
+      "udp_streams": 1,
+      "iperf_duration": 180,
+      "tcp_windows": [
+        "64k",
+        "4m"
+      ],
+      "udp_profiles": [
+        {
+          "bandwidth": "1000m",
+          "length": "14k",
+          "window": "256m"
+        },
+        {
+          "bandwidth": "2500m",
+          "length": "14k",
+          "window": "256m"
+        }
+      ],
+      "ping_count": 180,
+      "ping_payload_sizes": [
+        32,
+        1600,
+        65500
+      ]
+    },
+    {
+      "name": "跨机 以太网 5 <-> 以太网 3",
+      "src": "master:NAME=以太网 5",
+      "dst": "agent:NAME=以太网 3",
+      "direction": [
+        "A->B",
+        "B->A",
+        "bidir"
+      ],
+      "kinds": [
+        "iperf",
+        "ping"
+      ],
+      "transports": [
+        "tcp",
+        "udp"
+      ],
+      "ip": [
+        "v4",
+        "v6"
+      ],
+      "tcp_streams": 10,
+      "udp_streams": 1,
+      "iperf_duration": 180,
+      "tcp_windows": [
+        "64k",
+        "4m"
+      ],
+      "udp_profiles": [
+        {
+          "bandwidth": "1000m",
+          "length": "14k",
+          "window": "256m"
+        },
+        {
+          "bandwidth": "2500m",
+          "length": "14k",
+          "window": "256m"
+        }
+      ],
+      "ping_count": 180,
+      "ping_payload_sizes": [
+        32,
+        1600,
+        65500
+      ]
+    },
+    {
+      "name": "跨机 以太网 5 <-> 以太网",
+      "src": "master:NAME=以太网 5",
+      "dst": "agent:NAME=以太网",
+      "direction": [
+        "A->B",
+        "B->A",
+        "bidir"
+      ],
+      "kinds": [
+        "iperf",
+        "ping"
+      ],
+      "transports": [
+        "tcp",
+        "udp"
+      ],
+      "ip": [
+        "v4",
+        "v6"
+      ],
+      "tcp_streams": 10,
+      "udp_streams": 1,
+      "iperf_duration": 180,
+      "tcp_windows": [
+        "64k",
+        "4m"
+      ],
+      "udp_profiles": [
+        {
+          "bandwidth": "1000m",
+          "length": "14k",
+          "window": "256m"
+        },
+        {
+          "bandwidth": "2500m",
+          "length": "14k",
+          "window": "256m"
+        }
+      ],
+      "ping_count": 180,
+      "ping_payload_sizes": [
+        32,
+        1600,
+        65500
+      ]
+    },
+    {
+      "name": "跨机 以太网 5 <-> WLAN 3",
+      "src": "master:NAME=以太网 5",
+      "dst": "agent:NAME=WLAN 3",
+      "direction": [
+        "A->B",
+        "B->A",
+        "bidir"
+      ],
+      "kinds": [
+        "iperf",
+        "ping"
+      ],
+      "transports": [
+        "tcp",
+        "udp"
+      ],
+      "ip": [
+        "v4",
+        "v6"
+      ],
+      "tcp_streams": 10,
+      "udp_streams": 1,
+      "iperf_duration": 180,
+      "tcp_windows": [
+        "64k",
+        "4m"
+      ],
+      "udp_profiles": [
+        {
+          "bandwidth": "1000m",
+          "length": "14k",
+          "window": "256m"
+        },
+        {
+          "bandwidth": "2500m",
+          "length": "14k",
+          "window": "256m"
+        }
+      ],
+      "ping_count": 180,
+      "ping_payload_sizes": [
+        32,
+        1600,
+        65500
+      ]
+    },
+    {
+      "name": "跨机 WLAN <-> 以太网 3",
+      "src": "master:NAME=WLAN",
+      "dst": "agent:NAME=以太网 3",
+      "direction": [
+        "A->B",
+        "B->A",
+        "bidir"
+      ],
+      "kinds": [
+        "iperf",
+        "ping"
+      ],
+      "transports": [
+        "tcp",
+        "udp"
+      ],
+      "ip": [
+        "v4",
+        "v6"
+      ],
+      "tcp_streams": 10,
+      "udp_streams": 1,
+      "iperf_duration": 180,
+      "tcp_windows": [
+        "64k",
+        "4m"
+      ],
+      "udp_profiles": [
+        {
+          "bandwidth": "1000m",
+          "length": "14k",
+          "window": "256m"
+        },
+        {
+          "bandwidth": "2500m",
+          "length": "14k",
+          "window": "256m"
+        }
+      ],
+      "ping_count": 180,
+      "ping_payload_sizes": [
+        32,
+        1600,
+        65500
+      ]
+    },
+    {
+      "name": "跨机 WLAN <-> 以太网",
+      "src": "master:NAME=WLAN",
+      "dst": "agent:NAME=以太网",
+      "direction": [
+        "A->B",
+        "B->A",
+        "bidir"
+      ],
+      "kinds": [
+        "iperf",
+        "ping"
+      ],
+      "transports": [
+        "tcp",
+        "udp"
+      ],
+      "ip": [
+        "v4",
+        "v6"
+      ],
+      "tcp_streams": 10,
+      "udp_streams": 1,
+      "iperf_duration": 180,
+      "tcp_windows": [
+        "64k",
+        "4m"
+      ],
+      "udp_profiles": [
+        {
+          "bandwidth": "1000m",
+          "length": "14k",
+          "window": "256m"
+        },
+        {
+          "bandwidth": "2500m",
+          "length": "14k",
+          "window": "256m"
+        }
+      ],
+      "ping_count": 180,
+      "ping_payload_sizes": [
+        32,
+        1600,
+        65500
+      ]
+    },
+    {
+      "name": "跨机 WLAN <-> WLAN 3",
+      "src": "master:NAME=WLAN",
+      "dst": "agent:NAME=WLAN 3",
+      "direction": [
+        "A->B",
+        "B->A",
+        "bidir"
+      ],
+      "kinds": [
+        "iperf",
+        "ping"
+      ],
+      "transports": [
+        "tcp",
+        "udp"
+      ],
+      "ip": [
+        "v4",
+        "v6"
+      ],
+      "tcp_streams": 10,
+      "udp_streams": 1,
+      "iperf_duration": 180,
+      "tcp_windows": [
+        "64k",
+        "4m"
+      ],
+      "udp_profiles": [
+        {
+          "bandwidth": "1000m",
+          "length": "14k",
+          "window": "256m"
+        },
+        {
+          "bandwidth": "2500m",
+          "length": "14k",
+          "window": "256m"
+        }
+      ],
+      "ping_count": 180,
+      "ping_payload_sizes": [
+        32,
+        1600,
+        65500
+      ]
+    },
+    {
+      "name": "同机 以太网 3 <-> 以太网",
+      "src": "agent:NAME=以太网 3",
+      "dst": "agent:NAME=以太网",
+      "direction": [
+        "A->B",
+        "B->A",
+        "bidir"
+      ],
+      "kinds": [
+        "iperf",
+        "ping"
+      ],
+      "transports": [
+        "tcp",
+        "udp"
+      ],
+      "ip": [
+        "v4",
+        "v6"
+      ],
+      "tcp_streams": 10,
+      "udp_streams": 1,
+      "iperf_duration": 180,
+      "tcp_windows": [
+        "64k",
+        "4m"
+      ],
+      "udp_profiles": [
+        {
+          "bandwidth": "1000m",
+          "length": "14k",
+          "window": "256m"
+        },
+        {
+          "bandwidth": "2500m",
+          "length": "14k",
+          "window": "256m"
+        }
+      ],
+      "ping_count": 180,
+      "ping_payload_sizes": [
+        32,
+        1600,
+        65500
+      ]
+    },
+    {
+      "name": "同机 以太网 3 <-> WLAN 3",
+      "src": "agent:NAME=以太网 3",
+      "dst": "agent:NAME=WLAN 3",
+      "direction": [
+        "A->B",
+        "B->A",
+        "bidir"
+      ],
+      "kinds": [
+        "iperf",
+        "ping"
+      ],
+      "transports": [
+        "tcp",
+        "udp"
+      ],
+      "ip": [
+        "v4",
+        "v6"
+      ],
+      "tcp_streams": 10,
+      "udp_streams": 1,
+      "iperf_duration": 180,
+      "tcp_windows": [
+        "64k",
+        "4m"
+      ],
+      "udp_profiles": [
+        {
+          "bandwidth": "1000m",
+          "length": "14k",
+          "window": "256m"
+        },
+        {
+          "bandwidth": "2500m",
+          "length": "14k",
+          "window": "256m"
+        }
+      ],
+      "ping_count": 180,
+      "ping_payload_sizes": [
+        32,
+        1600,
+        65500
+      ]
+    },
+    {
+      "name": "同机 以太网 <-> WLAN 3",
+      "src": "agent:NAME=以太网",
+      "dst": "agent:NAME=WLAN 3",
+      "direction": [
+        "A->B",
+        "B->A",
+        "bidir"
+      ],
+      "kinds": [
+        "iperf",
+        "ping"
+      ],
+      "transports": [
+        "tcp",
+        "udp"
+      ],
+      "ip": [
+        "v4",
+        "v6"
+      ],
+      "tcp_streams": 10,
+      "udp_streams": 1,
+      "iperf_duration": 180,
+      "tcp_windows": [
+        "64k",
+        "4m"
+      ],
+      "udp_profiles": [
+        {
+          "bandwidth": "1000m",
+          "length": "14k",
+          "window": "256m"
+        },
+        {
+          "bandwidth": "2500m",
+          "length": "14k",
+          "window": "256m"
+        }
+      ],
+      "ping_count": 180,
+      "ping_payload_sizes": [
+        32,
+        1600,
+        65500
+      ]
+    }
+  ]
+}

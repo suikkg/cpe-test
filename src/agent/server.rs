@@ -30,7 +30,16 @@ use std::time::{Duration, Instant};
 use tiny_http::{Header, Method, Request, Response, Server};
 
 const WORKERS: usize = 16;
-const MAX_BODY: u64 = 100 * 1024 * 1024;
+/// 单次**请求体**上限。
+///
+/// 只管「进 agent」这个方向。agent 的每个端点收的都是 KB 级 JSON 控制消息
+/// （id / IP / 端口 / 开关），最大的 `IperfClientReq.extra` 也就是一串 iperf3
+/// 参数；截图、iperf 输出、网卡样本全在**响应**里，走的是主控侧的
+/// `http_client::MAX_RESPONSE_BYTES`，和这个数没有关系。
+///
+/// 原值 100 MiB 没有任何用途上的理由，却让未认证的同网段主机能逼着 agent
+/// 分配 `WORKERS × 100 MiB` 的内存。1 MiB 已是最大合法请求的上千倍。
+pub(crate) const MAX_BODY: u64 = 1024 * 1024;
 /// 每 200ms 轮询取消标志（P0: Ctrl+C 到资源归零 ≤5 秒）；租约清扫每 30 秒一次
 const SWEEP_INTERVAL: Duration = Duration::from_millis(200);
 const SWEEP_EVERY_TICKS: u64 = 150; // 200ms × 150 = 30s
@@ -209,7 +218,7 @@ pub fn run(port: u16, cfg: &Config, ui_port: Option<u16>, ui_bind: &str) {
             "已启用共享令牌认证：主控需在 config.json 配置相同 agent_token 才能连接。"
         ),
         None => println!(
-            "!! 未配置 agent_token：任何能访问该端口的主机都能控制本 agent。\n!! 生产/非隔离网络请用 --token 或 config.json 的 agent_token 开启认证。"
+            "!! agent_token 被显式设成空串：任何能访问该端口的主机都能控制本 agent。\n!! 生产/非隔离网络请用 --token 或 config.json 的 agent_token 开启认证。"
         ),
     }
     println!("等待主控连接...（保持本窗口开着，不要关闭；首次运行请允许防火墙放行）\n");
@@ -294,15 +303,11 @@ fn handle(mut rq: Request, st: &Arc<AgentState>) {
         .map(|a| a.to_string())
         .unwrap_or_else(|| "?".into());
 
-    let body = {
-        let mut limited = rq.as_reader().take(MAX_BODY);
-        let mut bytes = Vec::new();
-        let _ = limited.read_to_end(&mut bytes);
-        String::from_utf8_lossy(&bytes).into_owned()
-    };
     println!("[{}] {} {} 来自 {}", now_hms(), method, url, peer);
 
-    // 认证在路由之前完成：未认证请求必须返回 401 且不创建任何资源。
+    // 认证在**读请求体之前**完成：`request_authorized` 只看 Authorization 头，
+    // 不需要 body。先读后认证的话，未认证的同网段主机就能让每个 worker 各分配
+    // 一份 MAX_BODY，认证形同虚设的那部分开销照付不误。
     if !st.token.is_empty() && !request_authorized(&rq, &st.token) {
         let header = Header::from_bytes(
             &b"Content-Type"[..],
@@ -319,6 +324,19 @@ fn handle(mut rq: Request, st: &Arc<AgentState>) {
         let _ = rq.respond(resp);
         return;
     }
+
+    // 到这里请求已认证，才把请求体读进来。
+    //
+    // 用 `String::from_utf8` 而不是 `from_utf8_lossy(..).into_owned()`：后者在
+    // 合法 UTF-8 时返回 Cow::Borrowed，`into_owned()` 必然再拷一份，等于每个
+    // 请求体都在内存里存在两份。非法 UTF-8 才退回 lossy。
+    let body = {
+        let mut limited = rq.as_reader().take(MAX_BODY);
+        let mut bytes = Vec::new();
+        let _ = limited.read_to_end(&mut bytes);
+        String::from_utf8(bytes)
+            .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned())
+    };
 
     // handler panic 不能弄崩 server
     let resp_body = std::panic::catch_unwind(AssertUnwindSafe(|| route(&method, &url, &body, st)))

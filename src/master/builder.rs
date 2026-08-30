@@ -222,6 +222,13 @@ pub struct Unit {
     pub id: String,
     pub title: String,
     pub bidir: bool,
+    /// 规范方向：`ab` / `ba` / `bidir`；诊断类单元为空。
+    ///
+    /// **只用于展示**，判定和 resume 都不读它。存在的理由是单向单元的
+    /// `Leg.tag` 是空串（见 `dir_pairs`）——那个空串在执行侧有语义（「单向」），
+    /// 不能为了显示去动它；于是预览里单向单元的参数行就没有方向，而双向单元
+    /// 有，同一份清单两种样子。方向本身是用户在套件里勾的，理应逐行看得见。
+    pub direction: String,
     pub legs: Vec<Leg>,
     pub est_secs: u64,
 }
@@ -428,6 +435,8 @@ pub fn build_traffic_failure_diagnostics(selected_units: &[Unit]) -> Vec<Unit> {
             id,
             title,
             bidir: false,
+            // 诊断单元不是用户勾出来的方向，留空即可（展示层会跳过）。
+            direction: String::new(),
             legs: vec![Leg {
                 tag: "subnet-diagnostic".into(),
                 kind: LegKind::Ping(PingTask {
@@ -439,7 +448,7 @@ pub fn build_traffic_failure_diagnostics(selected_units: &[Unit]) -> Vec<Unit> {
                     purpose: PingPurpose::SubnetDiagnostic,
                 }),
             }],
-            est_secs: DIAGNOSTIC_PING_COUNT as u64 + 5,
+            est_secs: ping_estimated_secs(DIAGNOSTIC_PING_COUNT),
         });
     }
 
@@ -476,6 +485,8 @@ pub fn build_traffic_failure_diagnostics(selected_units: &[Unit]) -> Vec<Unit> {
             id,
             title,
             bidir: false,
+            // 诊断单元不是用户勾出来的方向，留空即可（展示层会跳过）。
+            direction: String::new(),
             legs: vec![Leg {
                 tag: "gateway-diagnostic".into(),
                 kind: LegKind::Ping(PingTask {
@@ -487,7 +498,7 @@ pub fn build_traffic_failure_diagnostics(selected_units: &[Unit]) -> Vec<Unit> {
                     purpose: PingPurpose::GatewayDiagnostic,
                 }),
             }],
-            est_secs: DIAGNOSTIC_PING_COUNT as u64 + 5,
+            est_secs: ping_estimated_secs(DIAGNOSTIC_PING_COUNT),
         });
     }
 
@@ -1543,6 +1554,7 @@ pub fn build_units(
                                         id,
                                         title,
                                         bidir,
+                                        direction: dir.to_string(),
                                         legs,
                                         est_secs: spec.duration + 10,
                                     });
@@ -1800,6 +1812,7 @@ pub fn build_units(
                                         id,
                                         title,
                                         bidir,
+                                        direction: dir.to_string(),
                                         legs,
                                         est_secs: udp_estimated_secs(
                                             spec.duration,
@@ -1930,6 +1943,7 @@ pub fn build_units(
                                     id: cts_resume_unit_id(spec, ip_tag, dir, &legs),
                                     title,
                                     bidir,
+                                    direction: dir.to_string(),
                                     legs,
                                     est_secs: if setup_error.is_some() {
                                         1
@@ -2083,6 +2097,7 @@ pub fn build_units(
                                     id: cts_resume_unit_id(spec, ip_tag, dir, &legs),
                                     title,
                                     bidir,
+                                    direction: dir.to_string(),
                                     legs,
                                     est_secs: if setup_error.is_some() {
                                         1
@@ -2133,8 +2148,9 @@ pub fn build_units(
                             id,
                             title,
                             bidir,
+                            direction: dir.to_string(),
                             legs,
-                            est_secs: spec.ping_count as u64 + 5,
+                            est_secs: ping_estimated_secs(spec.ping_count),
                         });
                     }
                 }
@@ -2142,6 +2158,30 @@ pub fn build_units(
         }
     }
     (units, notices)
+}
+
+/// 一个 PING 单元的预计墙钟秒数。
+///
+/// `ping` 每秒发一个包，主体就是 `count - 1` 个间隔。原来的 `count + 5` 漏的是
+/// **收尾等待**：最后一个包没回来时，BSD ping 还要再等约 10 秒才收摊。实测
+/// （macOS，65500 字节打网关，全程无回包）：
+///
+/// | count | 实测 | 旧公式 `count+5` |
+/// |-------|------|------------------|
+/// | 5     | 15.0s| 10s              |
+/// | 20    | 30.1s| 25s              |
+/// | 40    | 50.2s| 45s              |
+///
+/// 三档都正好是 `count + 10`，即旧公式稳定少算 5 秒。这里取 `+12`，多出的 2 秒
+/// 留给进程启动和一次 RPC 往返。包能正常回来时实际约 `count - 1` 秒，估算偏
+/// 保守——预计耗时宁可报多不报少。
+///
+/// 这条估算只覆盖「包基本能回来」和「最后一个包丢了」两种形态。Windows 的
+/// `ping` 对**每一个**没回来的包都要等满 `-w` 的 4 秒，一个 100% 丢包的单元实际
+/// 会跑到 `count × 4` 秒。那是故障路径、事前无法预测，估算里不假装知道；执行侧
+/// 的超时预算（`count * 5 + 60`）本来就按这个上限留的，不会被误杀。
+fn ping_estimated_secs(count: u32) -> u64 {
+    count as u64 + 12
 }
 
 fn alloc_port(next: &mut u16) -> u16 {
@@ -3594,6 +3634,45 @@ mod tests {
             }
             _ => panic!("expect group"),
         }
+    }
+
+    /// PING 单元的预计耗时按「每秒一个包 + 收尾等待」算，且必须随 count 走。
+    ///
+    /// 这条钉的是一个实测出来的缺口：旧公式 `count + 5` 在最后一个包丢了的时候
+    /// 稳定少算 5 秒（实测 count=5/20/40 分别是 15.0/30.1/50.2 秒，正好 count+10）。
+    /// ping 次数默认从 100 提到 180 之后，估算漏的绝对值也跟着放大。
+    #[test]
+    fn the_ping_estimate_covers_the_trailing_wait_and_scales_with_the_count() {
+        // 实测形态：count + 10 是下限，估算不能比它还小。
+        for count in [3_u32, 5, 20, 40, 100, 180] {
+            let measured_floor = count as u64 + 10;
+            assert!(
+                ping_estimated_secs(count) >= measured_floor,
+                "count={count} 的估算 {} 低于实测的 {measured_floor} 秒",
+                ping_estimated_secs(count)
+            );
+        }
+        // 但也不能离谱地虚高：包正常回来时实际约 count - 1 秒。
+        assert!(ping_estimated_secs(180) < 180 + 30);
+
+        // 单元里真的用上了它，而且随 ping_count 变化。
+        let unit_est = |count: u32| {
+            let mut spec = base_spec();
+            spec.kinds = vec!["ping".into()];
+            spec.transports = vec![];
+            spec.directions = vec!["ab".into()];
+            spec.ping_count = count;
+            spec.payload_sizes = vec![32];
+            let mut port = PORT_BASE;
+            let (units, _) = build_units(&[spec], true, &mut port);
+            assert_eq!(units.len(), 1, "count={count} 应当只有一个 PING 单元");
+            units[0].est_secs
+        };
+        assert_eq!(unit_est(180), ping_estimated_secs(180));
+        assert!(
+            unit_est(180) > unit_est(100),
+            "ping 次数翻倍，预计耗时必须跟着涨"
+        );
     }
 
     #[test]

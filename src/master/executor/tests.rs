@@ -121,6 +121,7 @@ fn ctstraffic_unit(id: &str, udp: bool) -> Unit {
             "CTS TCP test".into()
         },
         bidir: false,
+        direction: String::new(),
         legs: vec![Leg {
             tag: "ab".into(),
             kind: LegKind::CtsTraffic(ctstraffic_task(udp)),
@@ -1773,6 +1774,7 @@ fn bidir_udp_unit(ab_port: u16, ba_port: u16, streams: usize) -> (Unit, Vec<UdpL
         id: format!("udp-orch-{ab_port}-{ba_port}"),
         title: "★双向 IPERF V4 UDP -b 500m".into(),
         bidir: true,
+        direction: String::new(),
         legs: vec![],
         est_secs: 60,
     };
@@ -2354,6 +2356,7 @@ fn ctstraffic_builder_setup_error_returns_before_agent_or_cts_start() {
         id: "cts-builder-setup-error".into(),
         title: "CTS builder setup error".into(),
         bidir: false,
+        direction: String::new(),
         legs: Vec::new(),
         est_secs: 1,
     };
@@ -4082,6 +4085,7 @@ fn preflight_block_marks_iperf_without_touching_ping_legs() {
         id: "blocked".into(),
         title: "blocked".into(),
         bidir: false,
+        direction: String::new(),
         legs: vec![Leg {
             tag: "ab".into(),
             kind: LegKind::IperfSingle(iperf),
@@ -4108,6 +4112,7 @@ fn missing_ab_row_is_restored_without_duplicating_existing_ba_row() {
         id: "partial-bidir-tcp".into(),
         title: "partial bidirectional TCP".into(),
         bidir: true,
+        direction: String::new(),
         legs: vec![
             Leg {
                 tag: "ab".into(),
@@ -4174,6 +4179,7 @@ fn unit_panic_is_expanded_to_both_direction_rows_without_generic_duplicate() {
         id: "panic-bidir-tcp".into(),
         title: "panic bidirectional TCP".into(),
         bidir: true,
+        direction: String::new(),
         legs: vec![
             Leg {
                 tag: "ab".into(),
@@ -4220,6 +4226,7 @@ fn unit_panic_reuses_a_committed_ab_row_and_only_fills_missing_ba() {
         id: "partial-row-then-panic".into(),
         title: "partial row then unit panic".into(),
         bidir: true,
+        direction: String::new(),
         legs: vec![
             Leg {
                 tag: "ab".into(),
@@ -4289,6 +4296,7 @@ fn bidirectional_preflight_keeps_both_ab_and_ba_detail_rows() {
         id: "blocked-bidir-tcp".into(),
         title: "blocked bidirectional TCP".into(),
         bidir: true,
+        direction: String::new(),
         legs: vec![
             Leg {
                 tag: "ab".into(),
@@ -4415,6 +4423,7 @@ fn ctstraffic_preflight_remains_per_leg_when_only_one_direction_has_args_error()
         id: "cts-mixed-args-preflight".into(),
         title: "CTS mixed args/preflight".into(),
         bidir: true,
+        direction: String::new(),
         legs: vec![
             Leg {
                 tag: "ab".into(),
@@ -4477,6 +4486,7 @@ fn ctstraffic_two_invalid_directions_keep_two_detail_rows_under_preflight() {
         id: "cts-two-invalid-preflight".into(),
         title: "CTS two invalid directions".into(),
         bidir: true,
+        direction: String::new(),
         legs: vec![
             Leg {
                 tag: "ab".into(),
@@ -4552,6 +4562,7 @@ fn preflight_block_takes_priority_over_resume_pass() {
         id: "blocked-resume".into(),
         title: "blocked-resume".into(),
         bidir: false,
+        direction: String::new(),
         legs: vec![Leg {
             tag: String::new(),
             kind: LegKind::IperfSingle(IperfTask {
@@ -4648,6 +4659,7 @@ round-trip min/avg/max/stddev = 1.250/2.500/3.750/1.021 ms
         id: "agent-ping-success".into(),
         title: "PING V4 -l 1400 n=3".into(),
         bidir: false,
+        direction: String::new(),
         legs: vec![Leg {
             tag: String::new(),
             kind: LegKind::Ping(PingTask {
@@ -4714,6 +4726,7 @@ fn missing_gateway_is_not_reported_as_network_packet_loss() {
         id: "gateway-missing".into(),
         title: "gateway-missing".into(),
         bidir: false,
+        direction: String::new(),
         legs: vec![Leg {
             tag: "gateway-diagnostic".into(),
             kind: LegKind::Ping(PingTask {
@@ -4747,6 +4760,7 @@ fn agent_ping_http_failure_is_setup_error_not_one_hundred_percent_loss() {
         id: "agent-ping-http-error".into(),
         title: "agent-ping-http-error".into(),
         bidir: false,
+        direction: String::new(),
         legs: vec![Leg {
             tag: String::new(),
             kind: LegKind::Ping(PingTask {
@@ -4780,6 +4794,7 @@ fn mixed_preflight_failure_still_runs_independent_ping_unit() {
         id: "mixed-iperf".into(),
         title: "mixed-iperf".into(),
         bidir: false,
+        direction: String::new(),
         legs: vec![Leg {
             tag: String::new(),
             kind: LegKind::IperfSingle(IperfTask {
@@ -4804,6 +4819,7 @@ fn mixed_preflight_failure_still_runs_independent_ping_unit() {
         id: "mixed-ping".into(),
         title: "mixed-ping".into(),
         bidir: false,
+        direction: String::new(),
         legs: vec![Leg {
             tag: "gateway-diagnostic".into(),
             kind: LegKind::Ping(PingTask {
