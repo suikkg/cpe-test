@@ -208,7 +208,8 @@ form-action 'none'; frame-ancestors 'none'
 
 - 提交信息用中文，首行 `<type>: <做了什么>`，正文按模块分段说**为什么**，不是罗列 diff。
 - 版本号只在 `release:` 提交里动，同时改 `Cargo.toml` 和 `dist/` 里带版本号的文件名。
-- CI 会校验 tag 与 `Cargo.toml` 版本一致、且 tag 指向 main。
+- CI 会校验 tag 与 `Cargo.toml` 版本一致、且 tag 指向某个已推送远端分支的 HEAD；
+  发布不锁定 `main`，可以直接从当前发布分支打 tag。
 - **不要在没被要求时提交或推送。**
 
 ---

@@ -52,19 +52,10 @@ jobs:
             exit 1
           fi
 
-      - name: Verify release tag points to main
+      - name: Verify release tag points to a pushed branch head
         if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
-        run: |
-          set -euo pipefail
-          git fetch --no-tags origin main
-          main_sha="$(git rev-parse 'origin/main^{commit}')"
-          tag_sha="$(git rev-parse '${{ github.sha }}^{commit}')"
-          if [[ "${tag_sha}" != "${main_sha}" ]]; then
-            echo "release tag ${GITHUB_REF_NAME} points to ${tag_sha}, but origin/main points to ${main_sha}" >&2
-            echo "formal releases must be tagged from the current main branch HEAD" >&2
-            exit 1
-          fi
+        run: bash .github/scripts/verify_release_branch_head.sh '${{ github.sha }}' "${GITHUB_REF_NAME}"
 
       - name: Validate JSON configuration files
         shell: bash
@@ -516,6 +507,8 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
     steps:
+      - uses: actions/checkout@v7
+
       - uses: actions/download-artifact@v8
         with:
           path: release-assets
@@ -618,6 +611,10 @@ jobs:
             sha256sum "${expected[@]}" > SHA256SUMS
             sha256sum -c SHA256SUMS
           )
+
+      - name: Recheck release tag still points to a pushed branch head
+        shell: bash
+        run: bash .github/scripts/verify_release_branch_head.sh '${{ github.sha }}' "${GITHUB_REF_NAME}"
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v3
