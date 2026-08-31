@@ -2,8 +2,10 @@
 import { computed } from 'vue';
 import type { PlannedUnit } from '../../api/dto';
 import { humanDuration } from '../../domain/progress';
-import { plan, preview } from '../../state/plan';
+import { plan, preview, previewIsCurrent } from '../../state/plan';
 import { run, start, stop } from '../../state/run';
+import GlobalDefaults from './GlobalDefaults.vue';
+import NicPolicyTable from './NicPolicyTable.vue';
 
 /**
  * 「执行」：计划复核树 + 执行区。
@@ -45,7 +47,10 @@ const estimate = computed(() => {
 });
 
 const resumedCount = computed(() => units.value.filter((u) => u.resumed).length);
-const canStart = computed(() => !!out.value?.plan_hash && !run.running && !run.starting);
+const stale = computed(() => !!out.value && !previewIsCurrent());
+const canStart = computed(
+  () => !!out.value?.plan_hash && !stale.value && !run.running && !run.starting,
+);
 </script>
 
 <template>
@@ -68,8 +73,16 @@ const canStart = computed(() => !!out.value?.plan_hash && !run.running && !run.s
         <input v-model="plan.screenshot" type="checkbox" />
         <span>每个吞吐单元后截图</span>
       </label>
+      <label class="switch">
+        <input v-model="plan.limitUdpByLinkSpeed" type="checkbox" />
+        <span
+          title="勾上后 UDP 的 -b 会被整条路径的可信上限压下来；预览里「最终下发参数」显示的就是裁剪后的值。"
+        >
+          按链路上限裁剪 UDP 发送速率
+        </span>
+      </label>
       <button type="button" class="ghost" :disabled="plan.previewing" @click="preview">
-        {{ plan.previewing ? '预览中…' : '预览' }}
+        {{ plan.previewing ? '预览中…' : stale ? '重新预览' : '预览' }}
       </button>
       <button type="button" class="primary" :disabled="!canStart" @click="start">
         {{ run.starting ? '启动中…' : '开始测试' }}
@@ -77,8 +90,14 @@ const canStart = computed(() => !!out.value?.plan_hash && !run.running && !run.s
       <button v-if="run.running" type="button" class="ghost" @click="stop">停止</button>
     </div>
 
+    <GlobalDefaults />
+    <NicPolicyTable />
+
     <p v-if="plan.previewError" class="bad" role="alert">{{ plan.previewError }}</p>
     <p v-if="run.startError" class="bad" role="alert">{{ run.startError }}</p>
+    <p v-if="stale" class="warn" role="status">
+      计划或运行参数已在上次预览后改变。请重新预览，确认新的单元数和耗时后再开始。
+    </p>
 
     <div v-if="!out" class="empty">还没预览。点「预览」让服务端算一遍要跑什么。</div>
     <template v-else>
@@ -187,4 +206,6 @@ input[type='number'] {
 .warn { margin: 0 0 8px; padding: 8px 11px; border-left: 3px solid var(--focus); background: var(--info-bg); }
 .bad { margin: 0 0 12px; padding: 9px 12px; border-left: 3px solid var(--bad); background: var(--bad-bg); }
 .mono { font-family: var(--fm); }
+.hint { margin: -6px 0 14px; font-size: 12px; }
+.muted { color: var(--muted); }
 </style>

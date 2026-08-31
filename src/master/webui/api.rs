@@ -421,6 +421,7 @@ pub(super) fn api_run(console: &Arc<Console>, body: &str) -> Result<serde_json::
     console.run_status.reset();
     crate::cancel::reset();
     let worker_console = Arc::clone(console);
+    let request_snapshot = body.to_string();
     let cleanup_path = path.clone();
     let config_path = path.to_string_lossy().to_string();
     let run_observer: std::sync::Arc<dyn crate::master::run_status::RunObserver> =
@@ -439,6 +440,9 @@ pub(super) fn api_run(console: &Arc<Console>, body: &str) -> Result<serde_json::
                     // 控制台要结构化进度：executor 会把每个状态转移点回调进来，
                     // `/api/progress` 直接把它吐给前端，不必再解析日志文本。
                     observer: Some(run_observer),
+                    // 计划原文随 run 目录落盘，「重新执行这一轮」才有得可读。
+                    // 里面没有任何口令（`RunRequest` 不含 agent_token）。
+                    console_request: Some(request_snapshot),
                     ..Default::default()
                 })
             }));

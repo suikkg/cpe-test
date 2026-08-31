@@ -164,3 +164,50 @@ export function axisMax(peak: number): number {
   const step = magnitude / 10;
   return Math.ceil(withMargin / step) * step;
 }
+
+/**
+ * Y 轴刻度值，从上界到 0，共 `divisions + 1` 个。
+ *
+ * 和 `RateChart` 里那几条水平网格线是**同一套分割**：网格线画在 1/4、2/4、3/4，
+ * 刻度就必须落在 0、1/4、2/4、3/4、4/4。两边各写一份的话，改了分割数就会出现
+ * 「线在这里、数字标在那里」——而那种图比没有刻度更糟，它会让人读错量级。
+ */
+export function valueTicks(max: number, divisions = 4): number[] {
+  if (!(max > 0) || divisions < 1) return [];
+  const out: number[] = [];
+  for (let i = divisions; i >= 0; i -= 1) out.push((max * i) / divisions);
+  return out;
+}
+
+/**
+ * X 轴刻度：会话开始后的秒数，从 `t0` 到 `t1`。
+ *
+ * 用 `point.t` 而不是数组下标——采样有丢有补，下标当时间会让曲线在丢样的地方
+ * 被悄悄压扁（本模块开头第 1 条）。刻度当然要和曲线用同一个坐标。
+ */
+export function timeTicks(t0: number, t1: number, divisions = 4): number[] {
+  if (divisions < 1) return [];
+  const span = t1 - t0;
+  const out: number[] = [];
+  for (let i = 0; i <= divisions; i += 1) out.push(t0 + (span * i) / divisions);
+  return out;
+}
+
+/** 速率读数：上千就换 Gbps，免得轴上全是五位数。 */
+export function formatRate(mbps: number): string {
+  if (!Number.isFinite(mbps)) return '—';
+  if (mbps >= 1000) return `${(mbps / 1000).toFixed(mbps >= 10000 ? 0 : 2)}G`;
+  if (mbps >= 100) return mbps.toFixed(0);
+  if (mbps >= 10) return mbps.toFixed(1);
+  return mbps.toFixed(2);
+}
+
+/** 相对时间读数。**相对而不是绝对**：两端的系统时钟不保证同步。 */
+export function formatElapsed(secs: number): string {
+  if (!Number.isFinite(secs) || secs < 0) return '0s';
+  const total = Math.round(secs);
+  if (total < 60) return `${total}s`;
+  const minutes = Math.floor(total / 60);
+  if (minutes < 60) return `${minutes}m${String(total % 60).padStart(2, '0')}s`;
+  return `${Math.floor(minutes / 60)}h${String(minutes % 60).padStart(2, '0')}m`;
+}

@@ -155,8 +155,39 @@ pub(super) fn bundle_response<R: std::io::Read>(run_id: &str, body: Response<R>)
     response
 }
 
-pub(super) fn page_response() -> Response<std::io::Cursor<Vec<u8>>> {
-    Response::from_string(PAGE)
+/// 控制台会话 cookie 的名字。前端 `api/client.ts` 按同一个名字读。
+pub(super) const SESSION_COOKIE: &str = "cpe_ui_session";
+
+/// 交付页面时同时把口令发成一枚会话 cookie。
+///
+/// # 补的是哪个洞
+///
+/// 前端拿到口令后会把地址栏的 `?token=` 抹掉（那是有意的：地址栏里的口令会进
+/// 浏览器历史、会被截图带走、会在复制链接给同事时一起发出去）。但这样一来，
+/// **F5 刷新发出的 `GET /` 就什么凭据都不带了**——鉴权在路由之前，于是刷新
+/// 直接撞 401，页面变成一句「未认证」的 JSON。口令明明还在，只是那一次导航
+/// 请求带不上它：浏览器不会给地址栏导航加自定义头。
+///
+/// # 为什么这不违反「鉴权先于路由」
+///
+/// cookie 只是**文档请求**的第三种凭据形式，页面依然要先认证才发得出去。
+/// 而且它**只对 `GET /` 生效**：任何 `/api/*` 都仍然只认 `X-CPE-Token` /
+/// `Authorization: Bearer` / `?token=`，光有 cookie 一律 401。CSRF 那道门因此
+/// 原样保留——别的站点能让浏览器去导航 `GET /`，但拿不到响应（CORS 挡读、
+/// `frame-ancestors 'none'` 挡框），更发不出任何一个会执行动作的 API 调用。
+/// `SameSite=Strict` 让它连跨站导航都不发。
+///
+/// # 为什么不加 HttpOnly
+///
+/// 页面要能读它：sessionStorage 是**按标签页**的，把控制台地址复制到新标签打开
+/// 时那里是空的。没有可读的 cookie，新标签会「页面打开了、每个 API 都 401」——
+/// 比刷新报错更难懂。代价是页面脚本能读到口令，但页面脚本本来就在用这个口令
+/// 调 API，拿不到 cookie 也照样能发请求，所以这里没有新增可达的能力。
+///
+/// 不设 `Secure`：控制台是明文 HTTP（§13 已登记，口令在同网段本来就是明文往返）。
+/// 不设 `Max-Age`：会话 cookie，关掉浏览器就没了，与 sessionStorage 的预期一致。
+pub(super) fn page_response(ui_token: &str) -> Response<std::io::Cursor<Vec<u8>>> {
+    let mut response = Response::from_string(PAGE)
         .with_header(header(b"Content-Type", b"text/html; charset=utf-8"))
         .with_header(header(b"Cache-Control", b"no-store"))
         .with_header(header(b"X-Content-Type-Options", b"nosniff"))
@@ -164,7 +195,28 @@ pub(super) fn page_response() -> Response<std::io::Cursor<Vec<u8>>> {
         .with_header(header(
             b"Content-Security-Policy",
             b"default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
-        ))
+        ));
+    if !ui_token.is_empty() {
+        // 值走 urlencode：口令是命令行给的任意字符串，原样塞进 cookie 会被
+        // `;` 或空格截断，表现是「刷新有时候好使有时候不好使」。
+        let cookie = format!(
+            "{SESSION_COOKIE}={}; Path=/; SameSite=Strict",
+            urlencode(ui_token)
+        );
+        if let Ok(value) = Header::from_bytes(&b"Set-Cookie"[..], cookie.as_bytes()) {
+            response.add_header(value);
+        }
+    }
+    response
+}
+
+/// 从 `Cookie` 头里取控制台会话口令。
+pub(super) fn cookie_token(request: &Request) -> Option<String> {
+    let raw = header_value(request, "Cookie")?;
+    raw.split(';').find_map(|pair| {
+        let (name, value) = pair.split_once('=')?;
+        (name.trim() == SESSION_COOKIE).then(|| urldecode(value.trim()))
+    })
 }
 
 /// 自定义头会让跨站 fetch 先触发 CORS 预检；本服务不开放 CORS，因此网页不能
@@ -219,6 +271,21 @@ pub(crate) fn request_is_authorized(
         .split('&')
         .filter_map(|kv| kv.strip_prefix("token="))
         .any(|value| secret_eq(&urldecode(value), token))
+}
+
+/// 文档请求（`GET /`）的鉴权：在三种带法之外**额外**认会话 cookie。
+///
+/// 只有页面这一条路径认它。API 走 [`request_is_authorized`]，光带 cookie 一律
+/// 401——CSRF 那道门就是靠这个分岔保住的，理由写在 [`page_response`] 上。
+pub(crate) fn page_request_is_authorized(
+    token: &str,
+    query: &str,
+    header_token: Option<&str>,
+    bearer: Option<&str>,
+    cookie: Option<&str>,
+) -> bool {
+    request_is_authorized(token, query, header_token, bearer)
+        || (!token.is_empty() && cookie.is_some_and(|value| secret_eq(value, token)))
 }
 
 /// 口令比较，不因第一个不同的字节提前返回。
@@ -298,12 +365,27 @@ pub(super) fn handle(mut request: Request, console: &Arc<Console>) {
             .strip_prefix("Bearer ")
             .map(|token| token.trim().to_string())
     });
-    if !request_is_authorized(
-        &console.ui_token,
-        &query,
-        header_token.as_deref(),
-        bearer.as_deref(),
-    ) {
+    // 页面（文档请求）额外认会话 cookie：抹掉地址栏 `?token=` 之后，F5 发出的
+    // 导航请求什么凭据都带不上，撞 401 的是**刷新**这个最普通的动作。
+    // API 不认 cookie，见 `page_request_is_authorized` / `page_response`。
+    let is_page = path == "/" || path == "/index.html";
+    let authorized = if is_page {
+        page_request_is_authorized(
+            &console.ui_token,
+            &query,
+            header_token.as_deref(),
+            bearer.as_deref(),
+            cookie_token(&request).as_deref(),
+        )
+    } else {
+        request_is_authorized(
+            &console.ui_token,
+            &query,
+            header_token.as_deref(),
+            bearer.as_deref(),
+        )
+    };
+    if !authorized {
         let body = crate::protocol::err_json(
             "未认证：控制台已启用访问口令，请用启动时打印的完整地址（带 ?token=）打开",
         );
@@ -311,8 +393,8 @@ pub(super) fn handle(mut request: Request, console: &Arc<Console>) {
         return;
     }
 
-    if path == "/" || path == "/index.html" {
-        let _ = request.respond(page_response());
+    if is_page {
+        let _ = request.respond(page_response(&console.ui_token));
         return;
     }
 
@@ -393,6 +475,10 @@ pub(super) fn handle(mut request: Request, console: &Arc<Console>) {
         Ok(api_progress(console, &query))
     } else if is_get && path == "/api/runs" {
         runs::api_runs()
+    } else if is_post && path == "/api/runs/request" {
+        runs::api_run_request(&body)
+    } else if is_post && path == "/api/runs/report" {
+        runs::api_run_replay(console, &body)
     } else if is_post && path == "/api/monitor/start" {
         api_monitor_start(console, &body)
     } else if is_post && path == "/api/monitor/samples" {

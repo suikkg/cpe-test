@@ -2,7 +2,7 @@ import { computed, reactive } from 'vue';
 import { api } from '../api/client';
 import type { ProgressOut, RunStatus, UnitStatus } from '../api/dto';
 import { mergeUnits, progressView } from '../domain/progress';
-import { buildRunRequest, plan } from './plan';
+import { buildRunRequest, plan, previewIsCurrent } from './plan';
 
 /**
  * 运行资源：起跑/停止 + 进度轮询。
@@ -144,6 +144,9 @@ export async function start(): Promise<void> {
     const hash = plan.preview?.plan_hash;
     if (!hash) {
       throw new Error('先点「预览」——没有复核过的计划哈希，执行端会拒绝开跑');
+    }
+    if (!previewIsCurrent()) {
+      throw new Error('计划或运行参数在预览后有改动，请重新预览再开始');
     }
     await api.post('/api/run', { ...buildRunRequest(), plan_hash: hash });
     // 起跑成功就把上一轮的残留清掉，但**保留轮询**。

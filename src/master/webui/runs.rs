@@ -43,6 +43,11 @@ pub(super) struct RunEntry {
     /// 有 rows.jsonl 就能重放报告，即使 report.html 没写出来（崩溃场景）。
     pub(super) has_rows: bool,
     pub(super) has_xlsx: bool,
+    /// 有 `request.json` 就能把这一轮的计划装载回控制台再跑一遍。
+    ///
+    /// 命令行跑出来的目录没有它（那条路的输入就是 `config.json` 本身），
+    /// 界面上「重新执行」因此按目录逐个决定显不显示，而不是一律给个会报错的按钮。
+    pub(super) has_request: bool,
     /// 整个目录的字节数——下载前让人知道要拉多大。
     pub(super) bytes: u64,
 }
@@ -124,6 +129,7 @@ pub(super) fn api_runs() -> Result<serde_json::Value, String> {
                 has_report: dir.join("report.html").is_file(),
                 has_rows: dir.join(crate::report::store::ROWS_FILE).is_file(),
                 has_xlsx: dir.join("summary.xlsx").is_file(),
+                has_request: crate::report::store::request_path(&dir).is_file(),
                 bytes: dir_size(&dir),
             }
         })
@@ -131,6 +137,62 @@ pub(super) fn api_runs() -> Result<serde_json::Value, String> {
     // 新的在前：隔夜回来找报告是常态。
     entries.sort_by(|a, b| b.id.cmp(&a.id));
     serde_json::to_value(entries).map_err(|e| e.to_string())
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct RunIdReq {
+    pub(super) id: String,
+}
+
+/// 取回某一轮的计划原文，供「重新执行」把它装载回控制台。
+///
+/// **只回计划，不直接开跑**：真正开跑仍然要走 `/api/run` 的 `plan_hash` 闸门
+/// （「界面上确认的东西 == 实际跑的东西」唯一的强制点）。隔了一夜的网口拓扑
+/// 可能已经变了，老计划里的端点未必还存在——那时该看到的是复核页上的差异，
+/// 而不是一轮悄悄少跑了几条链路的测试。
+pub(super) fn api_run_request(body: &str) -> Result<serde_json::Value, String> {
+    let req: RunIdReq = serde_json::from_str(body).map_err(|e| format!("参数解析失败: {e}"))?;
+    let Some(dir) = resolve_run_dir(req.id.trim()) else {
+        return Err("找不到这个运行目录".into());
+    };
+    let Some(text) = crate::report::store::load_console_request(&dir) else {
+        return Err("这一轮没有留下计划原文（多半是命令行跑的，或者是升级前的旧目录）".into());
+    };
+    let request: serde_json::Value =
+        serde_json::from_str(&text).map_err(|error| format!("request.json 解析失败: {error}"))?;
+    Ok(serde_json::json!({ "id": req.id, "request": request }))
+}
+
+/// 从 `rows.jsonl` 重放报告与 Excel。
+///
+/// **不要求「必须没有报告才能恢复」**：崩溃留下的 report.html 可能是上一次写到
+/// 一半的，或者是补跑之前的旧版本；「已经有报告」恰恰是最需要用新数据盖掉它的
+/// 情形之一。重放本身是幂等的——同一批行放几次都是同一份报告。
+///
+/// 唯一挡住的是**正在跑的那一轮**：它的 rows.jsonl 还在被追加、report.html 还
+/// 会被收尾流程写一次，这时插一脚只会产出一份谁也说不清是哪个时刻的报告。
+pub(super) fn api_run_replay(
+    console: &Arc<Console>,
+    body: &str,
+) -> Result<serde_json::Value, String> {
+    let req: RunIdReq = serde_json::from_str(body).map_err(|e| format!("参数解析失败: {e}"))?;
+    let id = req.id.trim().to_string();
+    let Some(dir) = resolve_run_dir(&id) else {
+        return Err("找不到这个运行目录".into());
+    };
+    if console.running.load(Ordering::SeqCst) && console.run_status.snapshot(0, None).1.run_id == id
+    {
+        return Err("这一轮正在跑，等它结束会自动出报告；现在重放只会得到一份半截的".into());
+    }
+    let outcome = crate::master::ui::replay_report_into(&dir)?;
+    Ok(serde_json::json!({
+        "id": id,
+        "report": outcome.report.display().to_string(),
+        "xlsx": outcome.xlsx.map(|path| path.display().to_string()),
+        "rows": outcome.rows,
+        "skipped": outcome.skipped,
+        "warnings": outcome.warnings,
+    }))
 }
 
 // ---------------------------------------------------------------------------

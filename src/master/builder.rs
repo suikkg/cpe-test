@@ -3599,6 +3599,45 @@ mod tests {
         assert!(gateways.contains(&("192.168.1.3".into(), "192.168.1.254".into())));
     }
 
+    /// 诊断单元要能说出自己在替**哪条链路**做体检。
+    ///
+    /// 它们过去一律 `link_group: ""`，于是 Excel 的「按链路分组」把全部诊断挤进
+    /// 「(未分组)」一行——链路组一多就分不出这条诊断说的是哪条链路，而诊断存在
+    /// 的全部意义就是指认「哪条链路断了」。命名空间前缀同时保证它们**不会**
+    /// 混进用户的真实链路组去污染那一组的通过率。
+    #[test]
+    fn failure_diagnostics_name_the_link_they_are_diagnosing() {
+        let mut spec = base_spec();
+        spec.link_group = "SGMII ↔ WLAN".into();
+        spec.src.nic.gateway_v4 = "192.168.1.1".into();
+        spec.dst.nic.gateway_v4 = "192.168.1.254".into();
+        let mut port = PORT_BASE;
+        let (units, _) = build_units(&[spec], true, &mut port);
+        let diagnostics = build_traffic_failure_diagnostics(&units);
+
+        assert!(!diagnostics.is_empty());
+        for unit in &diagnostics {
+            assert_eq!(
+                unit.link_group, "[故障诊断] SGMII ↔ WLAN",
+                "诊断单元要带上源链路组，且带命名空间前缀"
+            );
+            assert_ne!(
+                unit.link_group, "SGMII ↔ WLAN",
+                "诊断单元不许混进用户的真实链路组"
+            );
+        }
+
+        // 源单元没有链路组名（矩阵/命令行路径）时退到物理网口对，仍然带前缀。
+        let mut plain = base_spec();
+        plain.src.nic.gateway_v4 = "192.168.1.1".into();
+        plain.dst.nic.gateway_v4 = "192.168.1.254".into();
+        let mut port = PORT_BASE;
+        let (units, _) = build_units(&[plain], true, &mut port);
+        for unit in build_traffic_failure_diagnostics(&units) {
+            assert_eq!(unit.link_group, "[故障诊断] eth0 ↔ eth0");
+        }
+    }
+
     #[test]
     fn ctstraffic_failure_diagnostics_collects_data_endpoints_and_gateways() {
         let mut spec = cts_spec("udp");

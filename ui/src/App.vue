@@ -3,7 +3,7 @@ import { computed, onMounted } from 'vue';
 import { REGIONS, ui, goto, setTheme, applyTheme } from './state/ui';
 import type { RegionId } from './state/ui';
 import { agentNics, masterNics } from './state/inventory';
-import { plan } from './state/plan';
+import { applyBootstrapDefaults, loadDraft, plan } from './state/plan';
 import { run, view as runView } from './state/run';
 import { load, session } from './state/session';
 import LocalView from './views/local/LocalView.vue';
@@ -27,6 +27,17 @@ const badges = computed<Partial<Record<RegionId, string>>>(() => ({
 
 /** 口令失效是**全局终态**：没有口令时点什么都是 401，不该让人逐页去撞。 */
 const unauthorized = computed(() => session.phase === 'unauthorized');
+const connectionLabel = computed(() => {
+  if (session.phase === 'connecting') return '连接中';
+  if (session.phase === 'connected') return `已连 ${session.host || '辅测机'}`;
+  if (session.phase === 'failed') return '辅测机未连接';
+  return '待连接辅测机';
+});
+const runLabel = computed(() => {
+  if (run.running) return `运行中 ${runView.value.done}/${runView.value.total}`;
+  if (runView.value.finished) return '本轮已结束';
+  return '空闲';
+});
 
 const flowRegions = computed(() => REGIONS.filter((r) => r.group === 'flow'));
 const toolRegions = computed(() => REGIONS.filter((r) => r.group === 'tool'));
@@ -41,7 +52,14 @@ function cycleTheme(): void {
 
 onMounted(() => {
   applyTheme();
-  void load();
+  // **草稿在这里恢复，不在「测试计划」页。** 它以前挂在 PlanView 的 onMounted
+  // 上，于是不路过那一页就永远不恢复：刷新之后直接点「执行」，看到的是一份
+  // 出厂默认计划，而右边导航的角标还显示着上次的分配数。
+  loadDraft();
+  void load().then(() => {
+    // 没有草稿时，执行区的标量默认取自主控 config.json；有草稿则让路。
+    if (session.bootstrap) applyBootstrapDefaults(session.bootstrap);
+  });
 });
 </script>
 
@@ -53,7 +71,8 @@ onMounted(() => {
         <h1>CPE 子网测试控制台</h1>
       </div>
       <div class="header-status">
-        <span class="version">LOCAL · 127.0.0.1</span>
+        <span class="version"><i :class="{ live: session.phase === 'connected' }"></i>{{ connectionLabel }}</span>
+        <span class="version"><i :class="{ live: run.running }"></i>{{ runLabel }}</span>
         <button type="button" class="ghost" @click="cycleTheme">主题：{{ themeLabel }}</button>
       </div>
     </header>
@@ -141,6 +160,10 @@ h1 { margin: 0; font-size: 21px; font-weight: 700; line-height: 1.2; letter-spac
   font-variant-numeric: tabular-nums;
   box-shadow: inset 0 0 0 1px var(--bezel-hi);
 }
+.version i {
+  width: 7px; height: 7px; border-radius: 50%; background: var(--screen-dim);
+}
+.version i.live { background: var(--signal); box-shadow: 0 0 0 2px var(--bezel-hi); }
 
 .rail {
   display: flex;

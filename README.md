@@ -2,7 +2,7 @@
 
 > 两台电脑间自动化 ping + iperf3 / Microsoft ctsTraffic 灌包测试，零 Python/零 PowerShell
 
-## 未发布
+## v6.2.0
 
 - **链路集合默认列出全部组合**：同机两块网口之间也是一条真实链路（走桥接/回环），
   此前候选和「按角色自动分组」都写死只取跨机对，于是「点了显示全部、再点自动分组」
@@ -122,9 +122,14 @@
   适合一次配置 20 对以上网口。套件中的 TCP、UDP、PING 是协议独立的任务；“TCP+UDP”
   只表示按 `TCP → UDP` 队列连续执行，不表示混合并发。执行粒度是每个具体网口对：同一链路对
   先完成套件内的 TCP、UDP、PING，再继续集合里的下一对；多个绑定按 `order` 依次处理。每个任务
-  可分别配置方向、IP 和参数配方，因而可以直接表达 TCP A→B、UDP B→A。高级矩阵仍保留用于逐行兼容编辑。
-- **项目与执行配置分离**：快速工作台可导出/导入 `cpe-ui-project.json`，保存链路集合、套件、
-  稳定 ID 和绑定关系；“下载 config.json”仍输出可交给 `master --auto` 的扁平执行配置，项目文件不含 token。
+  可分别配置方向、IP 和参数配置，因而可以直接表达 TCP A→B、UDP B→A。
+  套件、任务和 TCP/UDP 配置都在「测试计划」页直接增删改，两者都是左右分栏（左列选，右侧编辑），
+  配置卡片会列出「改它会同时影响哪几个任务」；跨套件生效的全局档位
+  （UDP `-b` / `-l` / `-w`、TCP `-w` / `-P`、Ping 次数与包长）和按网口门限与负载在「执行」页。
+  全局档位出厂即 UDP `-b 2500m`、TCP `-w 4m`、`-l` 留空（不下发），
+  其余空格子沿用 `config.json`，当前生效值以灰字写在框里。
+- **项目与执行配置分离**：可导出/导入 `cpe-ui-project.json`，保存链路集合、套件、
+  稳定 ID 和绑定关系；`/api/config` 仍输出可交给 `master --auto` 的扁平执行配置，项目文件不含 token。
 - **项目文件的边界是明确的**：绑定目前只支持 `mode: "replace"`，手写或导入
   `append` 会在预览前直接提示“append 尚未支持”，不会悄悄按替换执行。PING 任务的次数和包长
   来自任务级或执行区控件；当前 `UiRecipe` 没有 PING 配方字段，非空 `recipe_ids` 会被拒绝，
@@ -518,7 +523,7 @@ CPE（Customer Premises Equipment）子网测试工具用于在**两台电脑之
 ```
 cpe_test.exe          ← 本工具（单文件）
 iperf3.exe            ← 从 iperf.fr 下载（只测 Ping/ctsTraffic 可不放）
-ctsTraffic.exe        ← v6.1.0 Windows Release 已捆绑（仅 Windows 10+）
+ctsTraffic.exe        ← v6.2.0 Windows Release 已捆绑（仅 Windows 10+）
 start_agent.bat       ← 辅测机双击
 start_ui.bat          ← 主控机双击（图形控制台，推荐）
 start_master.bat      ← 主控机双击（命令行问答式）
@@ -1148,6 +1153,10 @@ UNKNOWN          以上都不匹配
 runs/run_日期时间_进程号/
 ├── report.html
 ├── summary.xlsx          Excel 汇总（概览 / 逐行明细 / 按链路分组 / 失败清单）
+│                         「按链路分组」按 链路组 × 协议 × 接收方向 分行：TCP 与 UDP 的达标线
+│                         不是一个量级，而一条双向链路的两块接收网卡各有各的 RX 最小值
+├── request.json          控制台发起这一轮时的计划原文（「历史运行」页的「重新执行」读它）
+│                         命令行跑的运行目录没有这个文件；它不含任何口令
 ├── rows.jsonl            每个单元跑完即追加的结果明细
 ├── meta.json             本次运行的元信息（报告抬头、计划哈希）
 ├── master.log
@@ -1301,7 +1310,7 @@ cargo build --release --locked
 
 自行编译后，把 `cpe_test.exe`、启动脚本和所需吞吐工具放到两台 Windows 电脑同一目录：
 iperf3 测试需要完整的 iperf3 Windows 发行包；ctsTraffic 测试需要 `ctsTraffic.exe`。
-官方 v6.1.0 Windows Release ZIP 已捆绑固定且校验过的 ctsTraffic 2.0.4.0，但由于发行包差异不内置 iperf3。
+官方 v6.2.0 Windows Release ZIP 已捆绑固定且校验过的 ctsTraffic 2.0.4.0，但由于发行包差异不内置 iperf3。
 
 ### GitHub Actions CI
 
@@ -1324,7 +1333,7 @@ Windows ZIP 包含启动脚本、四份配置、固定 CTS 二进制和第三方
 `tar.gz` 保留 `cpe_test` 可执行位。发布作业会再次核对资产名称、数量、内部结构和哈希。
 
 仓库同时跟踪一份不含可执行程序的
-[`cpe_test-v6.1.0-windows-config-docs.zip`](dist/cpe_test-v6.1.0-windows-config-docs.zip)，
+[`cpe_test-v6.2.0-windows-config-docs.zip`](dist/cpe_test-v6.2.0-windows-config-docs.zip)，
 便于直接从 Git 下载 Windows 配置、文档和启动脚本。其 SHA-256 位于同目录的
 `.zip.sha256` 文件；CI 会逐文件确认压缩包内容与仓库源文件一致。需要开箱即用的程序、
 固定版 ctsTraffic 和许可证全集时，仍应下载上面的正式 Windows Release ZIP。

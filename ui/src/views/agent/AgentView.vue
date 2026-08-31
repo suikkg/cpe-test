@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue';
 import NicTable from '../../components/NicTable.vue';
-import { agentHostname, agentNics, topologyReady } from '../../state/inventory';
-import { connect, session } from '../../state/session';
+import { agentHostname, agentNics, masterNics } from '../../state/inventory';
+import { connect, rescan, session } from '../../state/session';
 
 /**
  * 「辅测机」：连接对端，拿到它的网卡表。
@@ -12,6 +12,28 @@ import { connect, session } from '../../state/session';
  */
 const prefixText = ref('');
 const busy = computed(() => session.phase === 'connecting');
+const connected = computed(() => session.phase === 'connected');
+
+/**
+ * 「连上了但对端一块网卡都没有」必须说成**辅测机**的问题。
+ *
+ * 这一页以前只有一句 `!topologyReady` 的提示，而 `topologyReady` 是「两端都
+ * 有网卡」——对端为空时它同样为假，于是页面显示的是「本机这边一块网卡都没扫
+ * 到」。人照着去查本机，本机好好的。空表的提示也一直停在「还没连上辅测机」，
+ * 明明已经连上了。两处都在把责任指向错误的一端。
+ */
+const agentEmpty = computed(() => connected.value && agentNics.value.length === 0);
+const masterEmpty = computed(() => connected.value && masterNics.value.length === 0);
+
+const prefixHint = computed(() =>
+  session.prefixes.length ? session.prefixes.join('、') : '（当前没有设前缀）',
+);
+
+const agentEmptyHint = computed(() =>
+  connected.value
+    ? '辅测机无对应网卡：对端已连上，但它没有一块网卡的 IPv4 落在当前前缀过滤里。'
+    : '还没连上辅测机。填好地址和令牌点「连接」。',
+);
 
 function syncPrefixes(): void {
   session.prefixes = prefixText.value
@@ -71,19 +93,37 @@ if (prefixText.value === '' && session.prefixes.length > 0) {
     <p v-else-if="session.phase === 'failed' && session.error" class="bad" role="alert">
       {{ session.error }}
     </p>
-    <p v-else-if="session.phase === 'connected'" class="ok">
+    <p v-else-if="connected && !agentEmpty" class="ok">
       已连上 <strong>{{ agentHostname || session.host }}</strong
       >，扫到 {{ agentNics.length }} 块网卡。
     </p>
 
-    <h3>对端网卡</h3>
-    <NicTable
-      :nics="agentNics"
-      empty-hint="还没连上辅测机。填好地址和令牌点「连接」。"
-    />
+    <p v-if="agentEmpty" class="warn" role="alert">
+      已连上 <strong>{{ agentHostname || session.host }}</strong>，但<strong>辅测机无对应网卡</strong>：
+      它没有一块网卡的 IPv4 落在当前前缀过滤 <code>{{ prefixHint }}</code> 里。
+      对端在 10.x / 172.x 这类网段时，把上面的「IPv4 前缀过滤」改掉再连一次。
+    </p>
 
-    <p v-if="session.phase === 'connected' && !topologyReady" class="warn" role="alert">
-      对端连上了，但本机这边一块网卡都没扫到——前缀过滤可能把它们全滤掉了。
+    <div class="bar">
+      <h3>对端网卡</h3>
+      <button
+        type="button"
+        class="ghost"
+        :disabled="session.scanning || busy"
+        title="沿用上面的地址、令牌和前缀，把两端的网卡重扫一遍"
+        @click="rescan"
+      >
+        {{ session.scanning ? '扫描中…' : '重新扫描' }}
+      </button>
+      <span v-if="session.scanMessage" class="scan" :class="session.scanKind">
+        {{ session.scanMessage }}
+      </span>
+    </div>
+    <NicTable :nics="agentNics" :empty-hint="agentEmptyHint" />
+
+    <p v-if="masterEmpty" class="warn" role="alert">
+      对端连上了，但<strong>本机</strong>这边一块网卡都没扫到——同一份前缀过滤
+      <code>{{ prefixHint }}</code> 也作用在本机上。
     </p>
   </section>
 </template>
@@ -161,5 +201,39 @@ input:focus-visible {
 }
 code {
   font-family: var(--fm);
+}
+.bar {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin: 0 0 8px;
+}
+.bar h3 {
+  margin: 0;
+}
+.ghost {
+  padding: 5px 13px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--surface);
+  color: var(--ink);
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+.ghost:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+.scan {
+  font-size: 12px;
+  color: var(--muted);
+}
+.scan.ok {
+  color: var(--ok);
+}
+.scan.bad {
+  color: var(--bad);
 }
 </style>

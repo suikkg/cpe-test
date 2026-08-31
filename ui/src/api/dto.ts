@@ -71,7 +71,19 @@ export interface ConnectReq {
   host: string;
   port: number;
   token: string;
-  prefixes: string[];
+  /**
+   * 网卡列表的 IPv4 前缀过滤。
+   *
+   * 字段名必须是 `ipv4_prefixes`——这一条曾经写成 `prefixes`，而 serde 现在没有
+   * `deny_unknown_fields`，于是服务端**静默忽略**它：界面上改了前缀点「连接」，
+   * 请求发出去了、200 回来了、网卡表一点没变。在 10.x / 172.x 的实验网里，
+   * 表现就是「辅测机一块网卡都没有，而且怎么改都没用」——而这个输入框存在的
+   * 全部意义就是让人不必回去手改 config.json。
+   *
+   * 空数组是**有意义的取值**（= 列出全部网卡），服务端用 `Option` 区分
+   * 「没提交这个字段」和「提交了空列表」，所以这里总是把它发出去。
+   */
+  ipv4_prefixes: string[];
 }
 
 export interface HealthOut {
@@ -245,5 +257,24 @@ export interface RunEntry {
   /** 有 rows.jsonl 就能重放报告，即使 report.html 没写出来（崩溃场景） */
   has_rows: boolean;
   has_xlsx: boolean;
+  /** 有 request.json 就能把这一轮的计划装载回控制台再跑一遍 */
+  has_request: boolean;
   bytes: number;
+}
+
+/** `POST /api/runs/report` 的回包（Rust: `webui/runs.rs::api_run_replay`）。 */
+export interface ReplayOut {
+  id: string;
+  report: string;
+  xlsx: string | null;
+  rows: number;
+  /** 跳过的坏行数；崩溃留下的文件最后一行常常是半截 JSON */
+  skipped: number;
+  warnings: string[];
+}
+
+/** `POST /api/runs/request` 的回包。 */
+export interface RunRequestOut {
+  id: string;
+  request: unknown;
 }

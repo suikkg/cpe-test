@@ -21,9 +21,9 @@
 | `master/run_status.rs` | `RunStatus` / `UnitStatus` / `RunObserver` | 进度从「日志文本」变成结构化数据。executor 依赖 trait 不依赖 webui；CLI 传 `None` 行为零变化（ADR-2） |
 | `master/executor/row.rs` | `RowIdentity` / `base_row` / `unit_row` | 报告行的**唯一**构造入口。加身份字段会让 10 个构造点全部编译失败——从「运行期空列」变成编译期错误（ADR-7） |
 | `master/builder/{identity,policy,diagnostics}.rs` | resume identity、速率目标/链路策略、诊断单元 | 从 4359 行的 `builder.rs` 里按**改动的理由**分出来。`identity` 那份是 RESUME 承重面，不许「顺手清理」（R4） |
-| `report/store.rs` | `rows.jsonl` + `meta.json` 读写 | 每单元增量落盘，报告可重放。崩溃损失从「整轮」变成「未完成的单元」（ADR-3） |
+| `report/store.rs` | `rows.jsonl` + `meta.json` + `request.json` 读写 | 每单元增量落盘，报告可重放。崩溃损失从「整轮」变成「未完成的单元」（ADR-3）。`request.json` 是控制台发起这一轮时的 `RunRequest` 原文，「重新执行这一轮」唯一的输入（`meta.json` 里只有 `plan_hash`，那是摘要、反推不出计划）；命令行路径不写它 |
 | `report/xlsx.rs` | `summary.xlsx` 四张表 | 第二个结果出口。**只吃类型化字段**，不许解析展示串（有结构断言）（ADR-7） |
-| `master/webui/runs.rs` | `/api/runs` + 手写 store 模式 zip | 远程访问者取回报告的唯一通道；报告的相对路径子资源撞「鉴权先于路由」，不能当静态站点服务（ADR-15、§13.3） |
+| `master/webui/runs.rs` | `/api/runs`、`/api/runs/{id}/bundle.zip`、`/api/runs/report`、`/api/runs/request` | 远程访问者取回报告的唯一通道；报告的相对路径子资源撞「鉴权先于路由」，不能当静态站点服务（ADR-15、§13.3）。`report` 从 `rows.jsonl` 重放（**不要求先没有报告**——崩溃留下的那份可能是半截的；只挡正在跑的那一轮），`request` 回这一轮的计划原文供「重新执行」装载回控制台 |
 | `ui/` | Vue 3 单文件产物 | 见 AGENTS.md §4 |
 
 **v6.0 新增的结构断言**（都在 CI 的 `cargo test` 里）：

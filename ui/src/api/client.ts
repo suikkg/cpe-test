@@ -24,6 +24,8 @@ export class UnauthorizedError extends Error {
 }
 
 const TOKEN_KEY = 'cpe_ui_token';
+/** 服务端交付页面时下发的会话 cookie；名字与 `webui/http.rs::SESSION_COOKIE` 同源。 */
+const SESSION_COOKIE = 'cpe_ui_session';
 
 /**
  * 从 URL 取出口令、存进 sessionStorage，然后**把 query 从地址栏抹掉**。
@@ -47,6 +49,31 @@ export function adoptTokenFromUrl(): void {
   } catch {
     // 隐私模式下 sessionStorage 会抛。抹地址栏这一步已经尽力了，
     // 请求仍会带上内存里的空口令并得到 401——那是正确的可见失败。
+  }
+}
+
+/**
+ * 从服务端下发的会话 cookie 里补一份口令。
+ *
+ * sessionStorage 是**按标签页**的：把控制台地址复制到新标签打开时那里是空的，
+ * 而页面本身能打开（服务端认那枚 cookie）。没有这一步，新标签的表现是
+ * 「界面出来了、每一个 API 都 401」——比刷新报错更难懂。
+ *
+ * 只在 sessionStorage 里没有时才用它：地址栏刚给过的口令是**更新**的那一份，
+ * 换口令重启主控之后，旧 cookie 还可能挂在浏览器上。
+ */
+export function adoptTokenFromCookie(): void {
+  try {
+    if (sessionStorage.getItem(TOKEN_KEY)) return;
+    const found = document.cookie
+      .split(';')
+      .map((pair) => pair.trim())
+      .find((pair) => pair.startsWith(`${SESSION_COOKIE}=`));
+    if (!found) return;
+    const value = decodeURIComponent(found.slice(SESSION_COOKIE.length + 1));
+    if (value) sessionStorage.setItem(TOKEN_KEY, value);
+  } catch {
+    // cookie 被禁 / 隐私模式：退回「地址栏必须带 ?token=」那条路，是可见的失败。
   }
 }
 

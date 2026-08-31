@@ -52,7 +52,7 @@ pub struct DirectionSummary {
 /// 那个 label 是给人看的展示串，一旦改文案（比如把「灌包-ab」换成「灌包 A→B」）
 /// 方向就会集体退化成「单向」，而没有任何测试会红。Excel 出口一旦上线，
 /// 同一份脆弱推断就要被复制第二遍——所以在那之前先把它变成类型。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RowDirection {
     /// 单向单元。执行侧的 `Leg.tag` 对它是**空串**（见 `builder::dir_pairs`），
@@ -85,7 +85,7 @@ impl RowDirection {
 }
 
 /// 这一行跑的是哪种传输协议。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RowProtocol {
     /// 诊断行、单元汇总行这类不绑定协议的行。
@@ -111,7 +111,7 @@ impl RowProtocol {
 ///
 /// 报告过去靠标题里含不含 "PING"/"UDP" 猜（`group_is_ping`/`group_is_udp`）——
 /// 一条名字里带 "UDP" 的 TCP 测试就能把整组带偏。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RowBackend {
     #[default]

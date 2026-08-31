@@ -275,6 +275,71 @@ fn report_sections_collapse_and_raw_outputs_are_numbered() {
     assert!(html.contains(".report-tools { display: none; }"));
 }
 
+/// 折叠粒度要到**分节**和**单段原始输出**，不能只停在最外面那三块。
+///
+/// 只有顶层能收起时，「我只想看 TCP 那节」得先滚过整段 UDP；展开一条执行记录
+/// 又会把 iperf3 的 client/server/流事件三段上千行文本一起摊出来。两处都是
+/// 「折叠粒度停在最外层等于没有粒度」，所以在这里各钉一条。
+#[test]
+fn protocol_sections_and_each_raw_chunk_fold_on_their_own() {
+    let mut udp = traffic_detail("unit-udp", (0, 0, 0, 0));
+    udp.protocol = crate::report::RowProtocol::Udp;
+    udp.raws = vec![
+        ("iperf3 client".into(), "<client 输出>".into()),
+        ("流事件".into(), "<events>".into()),
+    ];
+    let mut tcp = traffic_detail("unit-tcp", (1, 0, 0, 0));
+    tcp.protocol = crate::report::RowProtocol::Tcp;
+    let html = render(vec![
+        udp,
+        unit_summary_at("unit-udp", Verdict::Pass, 0),
+        tcp,
+        unit_summary_at("unit-tcp", Verdict::Pass, 1),
+    ]);
+
+    // 每个分节标题都必须落在自己的 <summary class="proto-toggle"> 里。
+    for anchor in ["overview-udp", "overview-tcp", "details-udp", "details-tcp"] {
+        let marker = format!("<h3 class=\"section-heading\" id=\"{anchor}\"");
+        let at = html
+            .find(&marker)
+            .unwrap_or_else(|| panic!("缺分节标题 {anchor}"));
+        let before = &html[..at];
+        assert!(
+            before
+                .rfind("<summary class=\"proto-toggle\">")
+                .unwrap_or(0)
+                > before.rfind("</summary>").unwrap_or(0),
+            "{anchor} 必须在 <summary class=\"proto-toggle\"> 里，否则这一节收不起来"
+        );
+    }
+    // 分节默认展开：收起状态开局会让人以为这一节没跑。
+    assert_eq!(
+        html.matches("<details class=\"proto-section\" open>")
+            .count(),
+        4,
+        "概览与明细各两节，四节都要默认展开"
+    );
+
+    // 单段原始输出各自成一个 details，且**默认收起**——展开父级记录时给的应当是
+    // 一张可挑选的段落清单，不是三段文本一起砸下来。
+    assert_eq!(
+        html.matches("<details class=\"raw-chunk\">").count(),
+        2,
+        "两段原始输出要各自可折叠"
+    );
+    assert!(
+        !html.contains("<details class=\"raw-chunk\" open>"),
+        "原始输出分段默认收起"
+    );
+    assert!(
+        html.contains("<span class=\"raw-chunk-title\">iperf3 client</span>")
+            && html.contains("<span class=\"raw-chunk-title\">流事件</span>"),
+        "段落标题要留在 summary 上，收起时也看得见这段是什么"
+    );
+    // 收起时也要能判断值不值得展开，所以 summary 上带字符数（空段写「空」）。
+    assert!(html.contains("字符</small>"), "段落 summary 缺体量提示");
+}
+
 /// 三块区块的 `#N` 必须是**同一个数**：单元执行序号（= 控制台的 `[N/总数]`）。
 ///
 /// 这条守的是一个已经犯过的错：原始输出那一段列的是**执行行**不是单元，

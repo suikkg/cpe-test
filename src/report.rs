@@ -13,6 +13,23 @@ const NIC_ON_GROUPTOTAL: &str = "—（按方向统计，见组合计行）";
 const NOT_COLLECTED: &str = "未采集";
 const INSUFFICIENT_SAMPLES: &str = "样本不足";
 
+/// 分节标题本身就是折叠开关。
+///
+/// 顶层的「测试概览 / 逐行明细 / 原始输出」早就能收起，但里面的 Ping / UDP /
+/// TCP 三节一直是平铺的 `<h3>`——一轮既跑 UDP 又跑 TCP 时，想只看 TCP 那节就
+/// 得连着滚过整段 UDP。折叠粒度停在最外层等于没有粒度。
+///
+/// 锚点 id 留在 `<h3>` 上（`#overview-udp` 这类链接是既有约定），而 `<h3>` 在
+/// `<summary>` 里恒可见，所以收起状态下锚点跳转照样落得准。
+fn push_protocol_section_open(h: &mut String, prefix: &str, section: &ReportSection, units: usize) {
+    h.push_str(&format!(
+        "<details class=\"proto-section\" open><summary class=\"proto-toggle\">\
+         <h3 class=\"section-heading\" id=\"{prefix}-{}\">{}（{units} 个单元）</h3></summary>\n",
+        section.anchor(),
+        esc(section.title()),
+    ));
+}
+
 /// 概览按 Ping / 灌包性能(UDP、TCP) 分节，每节一张表。
 ///
 /// 分节而不是加一列「协议」：读报告的人是按「这次 UDP 怎么样」来找的，
@@ -24,13 +41,9 @@ fn push_overview(h: &mut String, groups: &[UnitGroup<'_>]) {
          <h2 id=\"overview-heading\">测试概览</h2></summary>\n",
     );
     for (section, picked) in sectioned(groups) {
-        h.push_str(&format!(
-            "<h3 class=\"section-heading\" id=\"overview-{}\">{}（{} 个单元）</h3>\n",
-            section.anchor(),
-            esc(section.title()),
-            picked.len()
-        ));
+        push_protocol_section_open(h, "overview", &section, picked.len());
         push_overview_table(h, &picked);
+        h.push_str("</details>\n");
     }
     h.push_str("</details></section>\n");
 }
@@ -407,13 +420,9 @@ fn push_unit_details(h: &mut String, groups: &[UnitGroup<'_>]) {
         );
     }
     for (section, picked) in sectioned(groups) {
-        h.push_str(&format!(
-            "<h3 class=\"section-heading\" id=\"details-{}\">{}（{} 个单元）</h3>\n",
-            section.anchor(),
-            esc(section.title()),
-            picked.len()
-        ));
+        push_protocol_section_open(h, "details", &section, picked.len());
         push_unit_list(h, &picked);
+        h.push_str("</details>\n");
     }
     h.push_str("</details></section>\n");
 }
@@ -600,6 +609,14 @@ h2 { margin: 28px 0 10px; font-size: 17px; line-height: 1.3; }
 /* 分节标题：比 h2 轻，但要能一眼把 Ping / UDP / TCP 三块切开。 */
 .section-heading { margin: 18px 0 8px; padding-left: 9px; border-left: 3px solid #1769aa; font-size: 15px; line-height: 1.3; }
 .section-heading:first-of-type { margin-top: 10px; }
+/* 分节折叠：和顶层 top-section 同一套做法，标题本身是开关。h3 在 summary 里
+   必须转成 inline，否则块级元素会把三角标记挤到上一行；纵向间距因此改挂在
+   details 上。 */
+details.proto-section { margin: 18px 0 8px; }
+details.proto-section:first-of-type { margin-top: 10px; }
+details.proto-section > summary.proto-toggle { cursor: pointer; list-style-position: outside; }
+details.proto-section > summary.proto-toggle > h3.section-heading { display: inline; margin: 0; }
+details.proto-section > summary.proto-toggle::marker { color: #1769aa; }
 .unit-section { min-width: 0; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); }
 .unit-toggle { display: grid; grid-template-columns: auto auto minmax(0, 1fr) auto; align-items: start; gap: 10px; padding: 9px 11px; cursor: pointer; font-weight: 700; }
 /* 明细区的序号与概览首列是同一个数，两个区之间靠它对应。 */
@@ -667,6 +684,12 @@ details.top-section > summary.top-toggle::marker { color: #1769aa; }
     background: var(--head); color: var(--muted); font-size: 11px; font-weight: 400; white-space: nowrap; }
 details.raw-section { margin: 8px 0; }
 details.raw-section > summary { cursor: pointer; font-weight: 700; overflow-wrap: anywhere; }
+/* 单段原始输出（iperf3 client/server、流事件……）各自折叠，默认收起。 */
+details.raw-chunk { margin: 6px 0 0; padding-left: 14px; }
+details.raw-chunk > summary { cursor: pointer; overflow-wrap: anywhere; }
+details.raw-chunk > summary::marker { color: #1769aa; }
+.raw-chunk-title { font-weight: 700; }
+.raw-chunk-meta { margin-left: 8px; color: var(--muted); font-weight: 400; }
 .sampling-caveat { margin: 8px 0 0; padding: 8px 10px; border-left: 3px solid #8a5200; background: #fff8e6; color: #5e430b; }
 /* 链路失联这类横跨一整段单元的事实必须比逐行原因更显眼，用 fail 色而不是警告色。 */
 .run-health { margin: 8px 0 0; padding: 8px 10px; border-left: 3px solid #bd2c2c; background: #fdecec; color: #7d1d1d; font-weight: 600; }
@@ -772,7 +795,7 @@ summary:focus-visible, a:focus-visible, .table-scroll:focus-visible, .overview-s
     h.push_str(
         "<div class=\"report-tools\"><button type=\"button\" data-toggle-all=\"open\">展开全部</button>\
          <button type=\"button\" data-toggle-all=\"close\">收起全部</button>\
-         <span class=\"tools-hint\">对本页所有可折叠区块生效（测试概览 / 逐行明细 / 每个单元 / 原始输出）</span></div>\n",
+         <span class=\"tools-hint\">对本页所有可折叠区块生效（测试概览 / 逐行明细 / 原始输出，各自的 Ping·UDP·TCP 分节、每个单元、每段原始输出）</span></div>\n",
     );
     push_overview(&mut h, &groups);
     push_unit_details(&mut h, &groups);
@@ -855,11 +878,24 @@ summary:focus-visible, a:focus-visible, .table-scroll:focus-visible, .overview-s
             .join(" · ");
             h.push_str(&format!("<p class=\"raw-links\">{links}</p>\n"));
         }
+        // 每段单独折叠，默认收起。
+        //
+        // 一条 `-P 8 -i 1 -t 180` 的 iperf3 腿会打出 client + server 两大段，
+        // 再加上流事件；展开一个执行记录就等于把三段上千行的文本一起摊在页面上，
+        // 而人当时要看的通常只是其中一段。父级 `raw-section` 能收起并不解决这件
+        // 事——它的粒度是「这条执行记录」，不是「这段输出」。
         for (title, text) in &r.raws {
+            let body = embedded_raw(text);
+            let meta = if body.trim().is_empty() {
+                "空".to_string()
+            } else {
+                format!("{} 字符", body.chars().count())
+            };
             h.push_str(&format!(
-                "<h3>{}</h3><pre>{}</pre>\n",
+                "<details class=\"raw-chunk\"><summary><span class=\"raw-chunk-title\">{}</span><small class=\"raw-chunk-meta\">{}</small></summary><pre>{}</pre></details>\n",
                 esc(title),
-                esc(&embedded_raw(text))
+                esc(&meta),
+                esc(&body)
             ));
         }
         h.push_str("</details>\n");

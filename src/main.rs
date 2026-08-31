@@ -96,6 +96,8 @@ fn real_main(args: Vec<String>) -> i32 {
                 expected_plan_hash: None,
                 // 命令行没有进度页要伺候，日志就是全部输出。
                 observer: None,
+                // 命令行这条路的输入就是 config.json 本身，不必再存一份计划原文。
+                console_request: None,
             })
         }
         // 从一个已有的 run 目录重新出报告。

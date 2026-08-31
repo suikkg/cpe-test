@@ -47,6 +47,16 @@ pub struct MasterOpts {
     /// `None` 时执行路径与加这个字段之前逐字节相同：所有回调点都是既有的
     /// `logln` 处，没有新状态机、没有新分支语义。
     pub observer: Option<Arc<dyn crate::master::run_status::RunObserver>>,
+    /// 控制台发过来的那份 `RunRequest` 原文，落进 `runs/<run>/request.json`。
+    ///
+    /// 存在的理由是「重新执行这一轮」：`meta.json` 只记了 `plan_hash`，那是一个
+    /// 摘要，反推不出计划。没有这份原文，历史运行就只能看、不能再跑一遍——而
+    /// 「同一份计划隔天复测」是这个工具最日常的用法之一。
+    ///
+    /// **它不含任何口令**：`RunRequest` 里没有 agent_token，也没有控制台口令。
+    /// 落盘的是用户的计划意图，和「导出项目」给出的是同一类东西。
+    /// 命令行路径传 `None`，那时目录里就没有这个文件，界面上「重新执行」也不出现。
+    pub console_request: Option<String>,
 }
 
 /// 从一个已有的 run 目录重放报告（ADR-3）。
@@ -58,56 +68,107 @@ pub struct MasterOpts {
 /// 崩溃恢复的完整语义（ADR-14）：**结果不丢，但运行本身不续跑**。重跑时开
 /// `resume` 会跳过 24 小时内已 PASS 的单元，失败/未完成的重新跑出干净结论——
 /// 对灌包验收来说这恰好是对的，续跑反而要处理「半个单元的测量算不算数」。
-pub fn replay_report(dir: &Path) -> i32 {
+/// 一次重放的产物与提示。
+pub struct ReplayOutcome {
+    pub report: PathBuf,
+    pub xlsx: Option<PathBuf>,
+    pub rows: usize,
+    /// 跳过的坏行数。崩溃留下的文件最后一行常常是半截 JSON。
+    pub skipped: usize,
+    /// 不致命但要让人看见的提示（缺 meta.json、xlsx 没写出来……）。
+    pub warnings: Vec<String>,
+}
+
+/// 重放的**唯一**实现。命令行与控制台都调它。
+///
+/// 拆出来是因为控制台也要能重放（`/api/runs/report`）：崩溃之后人手边只有浏览器，
+/// 让他去命令行敲 `cpe_test report runs/<目录>` 等于没有恢复入口。两条路各写一份
+/// 的话，「重放出来的报告和原报告口径一致」这条保证就有两个实现要维护。
+pub fn replay_report_into(dir: &Path) -> Result<ReplayOutcome, String> {
     use crate::report::store;
 
     if !dir.is_dir() {
-        eprintln!("找不到运行目录: {}", dir.display());
-        return 2;
+        return Err(format!("找不到运行目录: {}", dir.display()));
     }
-    let (mut rows, skipped) = match store::load_rows(dir) {
-        Ok(loaded) => loaded,
-        Err(error) => {
-            eprintln!(
-                "读不到 {}: {error}\n（这个目录是 v6.0 之前跑出来的吗？那时结果还没有增量落盘。）",
-                store::rows_path(dir).display()
-            );
-            return 2;
-        }
-    };
+    let (mut rows, skipped) = store::load_rows(dir).map_err(|error| {
+        format!(
+            "读不到 {}: {error}\n（这个目录是 v6.0 之前跑出来的吗？那时结果还没有增量落盘。）",
+            store::rows_path(dir).display()
+        )
+    })?;
     if rows.is_empty() {
-        eprintln!("{} 里没有结果行", store::rows_path(dir).display());
-        return 2;
-    }
-    if skipped > 0 {
-        // 崩溃留下的文件最后一行常常是半截 JSON。说清楚跳过了几行，
-        // 免得有人拿重放报告和原始报告对数量时以为丢了数据。
-        eprintln!("提示: 跳过了 {skipped} 行无法解析的记录（通常是崩溃时写了一半的最后一行）");
+        return Err(format!("{} 里没有结果行", store::rows_path(dir).display()));
     }
 
+    let mut warnings = Vec::new();
     // meta.json 缺失不算致命：行数据才是主体，抬头信息缺了报告照样能看。
     let meta = match store::load_meta(dir) {
         Ok(meta) => meta,
         Err(error) => {
-            eprintln!("提示: 读不到 meta.json（{error}），报告抬头信息将为空");
+            warnings.push(format!("读不到 meta.json（{error}），报告抬头信息将为空"));
             store::RunMeta::default()
         }
     };
     let report_meta: crate::report::ReportMeta = meta.report.clone().into();
     let out = dir.join("report.html");
-    match write_report(&out, &mut rows, &report_meta) {
-        Ok(()) => {
-            println!("已从 {} 行结果重放报告: {}", rows.len(), out.display());
-            let xlsx_path = dir.join("summary.xlsx");
-            match crate::report::xlsx::write_xlsx(&xlsx_path, &rows, &report_meta) {
-                Ok(()) => println!("Excel 汇总: {}", xlsx_path.display()),
-                Err(error) => eprintln!("(Excel 汇总生成失败，不影响报告: {error})"),
+    write_report(&out, &mut rows, &report_meta)
+        .map_err(|error| format!("报告写入失败: {error}"))?;
+
+    // Excel 是第二个出口，生成失败一律降级为警告（与正常收尾同处理）。
+    let xlsx_path = dir.join("summary.xlsx");
+    let xlsx = match crate::report::xlsx::write_xlsx(&xlsx_path, &rows, &report_meta) {
+        Ok(()) => Some(xlsx_path),
+        Err(error) => {
+            warnings.push(format!("Excel 汇总生成失败，不影响报告: {error}"));
+            None
+        }
+    };
+
+    Ok(ReplayOutcome {
+        report: out,
+        xlsx,
+        rows: rows.len(),
+        skipped,
+        warnings,
+    })
+}
+
+/// 从一个已有的 run 目录重放报告（ADR-3）——命令行入口。
+///
+/// 读 `rows.jsonl` + `meta.json`，重新渲染 HTML。这是「崩溃后结果不丢」这条
+/// 目标的兑现处：主控在第 10 小时死掉，那十小时的测量数据、原因码、方向明细
+/// 都还在 rows.jsonl 里，这条命令把它们变回一份能看的报告。
+///
+/// 崩溃恢复的完整语义（ADR-14）：**结果不丢，但运行本身不续跑**。重跑时开
+/// `resume` 会跳过 24 小时内已 PASS 的单元，失败/未完成的重新跑出干净结论——
+/// 对灌包验收来说这恰好是对的，续跑反而要处理「半个单元的测量算不算数」。
+pub fn replay_report(dir: &Path) -> i32 {
+    match replay_report_into(dir) {
+        Ok(outcome) => {
+            if outcome.skipped > 0 {
+                // 说清楚跳过了几行，免得有人拿重放报告和原始报告对数量时
+                // 以为丢了数据。
+                eprintln!(
+                    "提示: 跳过了 {} 行无法解析的记录（通常是崩溃时写了一半的最后一行）",
+                    outcome.skipped
+                );
+            }
+            for warning in &outcome.warnings {
+                eprintln!("提示: {warning}");
+            }
+            println!(
+                "已从 {} 行结果重放报告: {}",
+                outcome.rows,
+                outcome.report.display()
+            );
+            if let Some(xlsx) = &outcome.xlsx {
+                println!("Excel 汇总: {}", xlsx.display());
             }
             0
         }
         Err(error) => {
-            eprintln!("报告写入失败: {error}");
-            1
+            eprintln!("{error}");
+            2
         }
     }
 }
@@ -209,6 +270,13 @@ pub fn run_master(opts: MasterOpts) -> i32 {
         }
     };
     log_to_file(&run_paths.log);
+    // 计划原文**先落盘**，和 rows.jsonl 的增量落盘同一个理由：崩在半路时，
+    // 「这一轮跑的是什么」不该跟着进程一起消失。
+    if let Some(request) = opts.console_request.as_deref() {
+        if let Err(error) = crate::report::store::write_console_request(&run_paths.dir, request) {
+            eprintln!("!! request.json 写入失败（不影响本轮执行）：{error}");
+        }
+    }
 
     logln("==============================================");
     logln(&format!(
@@ -1523,6 +1591,21 @@ mod tests {
             replay_report(&dir.join("does-not-exist")),
             2,
             "目录不存在应当返回错误码"
+        );
+
+        // **已经有报告也要能重放。**
+        //
+        // 崩溃留下的 report.html 可能是写到一半的，也可能是补跑之前的旧版本；
+        // 「已经有报告」恰恰是最需要用新数据盖掉它的情形之一。重放是幂等的，
+        // 所以这里不该有任何「先删掉报告」之类的前置条件。
+        std::fs::write(dir.join("report.html"), "陈旧的半截报告").expect("覆盖成旧报告");
+        let again = replay_report_into(&dir).expect("有报告时也要能重放");
+        assert_eq!(again.rows, 4, "两个单元各一条明细一条汇总");
+        assert_eq!(again.skipped, 0);
+        let html = std::fs::read_to_string(dir.join("report.html")).expect("重放出的报告");
+        assert!(
+            !html.contains("陈旧的半截报告") && html.contains("IPERF V4 TCP #1"),
+            "重放必须盖掉旧报告"
         );
 
         let _ = std::fs::remove_dir_all(&dir);

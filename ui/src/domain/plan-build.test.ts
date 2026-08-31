@@ -142,7 +142,11 @@ describe('出厂默认', () => {
   });
 
   it('基线 TCP 档位逐字保持：-w 4m · 10 流', () => {
-    expect(defaultTcpRecipe().profiles).toEqual([{ window: '4m', streams: 10 }]);
+    expect(defaultTcpRecipe()).toMatchObject({
+      profiles: [],
+      tcp_windows: ['4m'],
+      tcp_streams: [10],
+    });
   });
 
   it('基线套件是 TCP + UDP 两个任务，双向分开执行', () => {
@@ -153,7 +157,7 @@ describe('出厂默认', () => {
     expect(suite.tasks.map((t) => t.protocol)).toEqual(['tcp', 'udp']);
     for (const task of suite.tasks) {
       expect(task.directions).toEqual(['ab', 'ba']);
-      expect(task.ip).toEqual(['v4']);
+      expect(task.ip).toEqual(['v4', 'v6']);
     }
   });
 

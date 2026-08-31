@@ -8,6 +8,10 @@ import {
   readings,
   reducePoints,
   timeSpan,
+  formatElapsed,
+  formatRate,
+  timeTicks,
+  valueTicks,
 } from './monitor-chart';
 
 function pts(values: Array<[number, number]>): MonitorPoint[] {
@@ -146,5 +150,44 @@ describe('环形缓冲', () => {
   it('未超上限时全部保留', () => {
     const merged = appendPoints(pts([[0, 1]]), pts([[1, 2]]));
     expect(merged).toHaveLength(2);
+  });
+});
+
+/**
+ * 坐标轴刻度。
+ *
+ * 图上一直有网格线，却从来没有数字——纵轴不知道是 100Mbps 还是 1Gbps，横轴不知道
+ * 这一屏是十秒还是十分钟。刻度必须和网格线用**同一套分割**，否则「线在这里、
+ * 数字标在那里」比没有刻度更糟：它会让人读错量级。
+ */
+describe('坐标轴刻度', () => {
+  it('纵轴从上界到 0，段数与网格线同源', () => {
+    expect(valueTicks(1000, 4)).toEqual([1000, 750, 500, 250, 0]);
+    expect(valueTicks(1000, 4)).toHaveLength(5);
+  });
+
+  it('没有数据时不给刻度——标一排 0 会让人以为测到了 0', () => {
+    expect(valueTicks(0)).toEqual([]);
+    expect(valueTicks(-1)).toEqual([]);
+  });
+
+  it('横轴用 point.t 的区间，不是数组下标', () => {
+    expect(timeTicks(10, 50, 4)).toEqual([10, 20, 30, 40, 50]);
+    // 还没有第二个点时首尾相同，五个刻度都是同一个时刻——这是正确的「零跨度」。
+    expect(timeTicks(7, 7, 4)).toEqual([7, 7, 7, 7, 7]);
+  });
+
+  it('速率读数上千换 G，免得轴上全是五位数', () => {
+    expect(formatRate(2500)).toBe('2.50G');
+    expect(formatRate(940)).toBe('940');
+    expect(formatRate(12.3)).toBe('12.3');
+    expect(formatRate(0.5)).toBe('0.50');
+  });
+
+  it('时间读数按分秒进位', () => {
+    expect(formatElapsed(0)).toBe('0s');
+    expect(formatElapsed(59.4)).toBe('59s');
+    expect(formatElapsed(95)).toBe('1m35s');
+    expect(formatElapsed(3725)).toBe('1h02m');
   });
 });

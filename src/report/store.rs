@@ -37,6 +37,14 @@ pub const SCHEMA_VERSION: u32 = 1;
 
 pub const ROWS_FILE: &str = "rows.jsonl";
 pub const META_FILE: &str = "meta.json";
+/// 控制台发起这一轮时用的 `RunRequest` 原文。
+///
+/// `meta.json` 里只有 `plan_hash`——那是摘要，反推不出计划。存原文是为了让
+/// 「把这一轮再跑一遍」成立：没有它，历史运行只能看不能复现，而「同一份计划
+/// 隔天复测」是这个工具最日常的用法之一。
+///
+/// 命令行路径不写这个文件（那条路的输入就是 `config.json` 本身，本来就在手上）。
+pub const REQUEST_FILE: &str = "request.json";
 
 /// 一次运行的元信息。报告重放需要的全部「非行数据」都在这里。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -105,6 +113,20 @@ pub fn rows_path(dir: &Path) -> PathBuf {
 
 pub fn meta_path(dir: &Path) -> PathBuf {
     dir.join(META_FILE)
+}
+
+pub fn request_path(dir: &Path) -> PathBuf {
+    dir.join(REQUEST_FILE)
+}
+
+/// 落一份控制台请求原文。**调用方把失败降级成警告**：写不出它不该弄死测试。
+pub fn write_console_request(dir: &Path, body: &str) -> std::io::Result<()> {
+    std::fs::write(request_path(dir), body)
+}
+
+/// 读回控制台请求原文；没有这个文件时返回 `None`（命令行跑出来的目录就是这样）。
+pub fn load_console_request(dir: &Path) -> Option<String> {
+    std::fs::read_to_string(request_path(dir)).ok()
 }
 
 /// 把若干行追加进 `rows.jsonl`。
@@ -348,6 +370,24 @@ mod tests {
         );
         // 空批次不该创建文件也不该报错。
         append_rows(&dir, &[]).expect("empty append");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 计划原文的往返，以及「命令行跑出来的目录没有它」这一档。
+    ///
+    /// 这份文件是「重新执行这一轮」唯一的输入：`meta.json` 里只有 `plan_hash`，
+    /// 那是摘要，反推不出计划。读不出来时必须是一个明确的 `None`，让界面能
+    /// 决定「这一行不显示重新执行」，而不是给个点了才报错的按钮。
+    #[test]
+    fn the_console_request_round_trips_and_is_absent_for_cli_runs() {
+        let dir = temp_dir("request");
+        assert!(
+            load_console_request(&dir).is_none(),
+            "还没写过就该是 None（命令行跑出来的目录就是这样）"
+        );
+        let body = r#"{"duration":180,"ui_plan":{"suites":[]}}"#;
+        write_console_request(&dir, body).expect("写 request.json");
+        assert_eq!(load_console_request(&dir).as_deref(), Some(body));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

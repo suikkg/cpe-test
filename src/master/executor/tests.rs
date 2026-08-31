@@ -131,6 +131,59 @@ fn ctstraffic_unit(id: &str, udp: bool) -> Unit {
     }
 }
 
+/// 单元汇总行的「协议」「后端」两列不许再是空的。
+///
+/// 三处 `unit_row` 调用点以前一律传 `RowProtocol::None, RowBackend::None`，
+/// 而 Excel「概览」表的粒度就是单元、数据源就是汇总行——那两列于是**每一行
+/// 都空着**。空列不会让任何测试变红，只是在用户拿去验收的表里少两格。
+/// 现在协议/后端由 `unit_protocol_and_backend` 从腿的类型推导，调用方传不了。
+#[test]
+fn a_unit_summary_row_carries_the_protocol_and_backend_of_its_legs() {
+    use crate::master::executor::row::unit_protocol_and_backend;
+
+    assert_eq!(
+        unit_protocol_and_backend(&ctstraffic_unit("cts-udp", true)),
+        (RowProtocol::Udp, RowBackend::CtsTraffic)
+    );
+    assert_eq!(
+        unit_protocol_and_backend(&ctstraffic_unit("cts-tcp", false)),
+        (RowProtocol::Tcp, RowBackend::CtsTraffic)
+    );
+
+    let ping = Unit {
+        id: "ping".into(),
+        title: "PING".into(),
+        link_group: String::new(),
+        bidir: false,
+        direction: String::new(),
+        legs: vec![Leg {
+            tag: String::new(),
+            kind: LegKind::Ping(PingTask {
+                v6: false,
+                src: endpoint(Side::Master, "master0", "192.168.1.2"),
+                dst: endpoint(Side::Agent, "agent0", "192.168.1.3"),
+                count: 4,
+                payload: 32,
+                purpose: PingPurpose::SubnetTest,
+            }),
+        }],
+        est_secs: 5,
+    };
+    assert_eq!(
+        unit_protocol_and_backend(&ping),
+        (RowProtocol::Icmp, RowBackend::Ping)
+    );
+
+    // 汇总行本身也要带上，这是 Excel 概览那两列唯一的数据源。
+    let row = crate::master::executor::row::unit_row(
+        &ctstraffic_unit("cts-udp", true),
+        0,
+        "测试单元汇总",
+    );
+    assert_eq!(row.protocol, RowProtocol::Udp);
+    assert_eq!(row.backend, RowBackend::CtsTraffic);
+}
+
 fn ctstraffic_attempt(attempt: usize, traffic_established: bool) -> CtsAttemptRun {
     CtsAttemptRun {
         attempt,

@@ -121,19 +121,58 @@ pub(super) fn unit_endpoints(unit: &Unit) -> Option<(&Endpoint, &Endpoint)> {
     })
 }
 
+/// 单元级行的协议与后端：从**腿的类型**推，一个字符串都不看。
+///
+/// 三处 `unit_row` 调用点以前一律传 `RowProtocol::None, RowBackend::None`，
+/// 于是 Excel「概览」表的「协议」「后端」两列**每一行都是空的**——那张表的
+/// 粒度就是单元，汇总行是它唯一的数据源。空列不会让任何测试变红，只是在用户
+/// 拿去验收的表里少两格。
+///
+/// 推导走 `LegKind` 与 `IperfTask::udp` / `CtsTrafficTask::udp` 这些类型化字段，
+/// 不去搜标题里有没有 "UDP"——那正是 ADR-7 要消灭的东西（一条名字里带 "UDP"
+/// 的 TCP 测试就能把整组带偏），而 Excel 出口有一条测试专门扫这类推断。
+///
+/// 各腿不一致时退回 `None`：单元是「一个任务 × 一组参数 × 一个方向对」，
+/// 两条腿本来就该同协议；真出现混合时留空比随便挑一条腿更诚实。
+pub(super) fn unit_protocol_and_backend(unit: &Unit) -> (RowProtocol, RowBackend) {
+    fn traffic_protocol(udp: bool) -> RowProtocol {
+        if udp {
+            RowProtocol::Udp
+        } else {
+            RowProtocol::Tcp
+        }
+    }
+    let mut seen: Option<(RowProtocol, RowBackend)> = None;
+    for leg in &unit.legs {
+        let current = match &leg.kind {
+            LegKind::Ping(_) => (RowProtocol::Icmp, RowBackend::Ping),
+            LegKind::IperfSingle(task) => (traffic_protocol(task.udp), RowBackend::Iperf3),
+            LegKind::IperfGroup { streams, .. } => match streams.first() {
+                Some(task) => (traffic_protocol(task.udp), RowBackend::Iperf3),
+                None => continue,
+            },
+            LegKind::CtsTraffic(task) => (traffic_protocol(task.udp), RowBackend::CtsTraffic),
+        };
+        match seen {
+            None => seen = Some(current),
+            Some(previous) if previous == current => {}
+            Some(_) => return (RowProtocol::None, RowBackend::None),
+        }
+    }
+    seen.unwrap_or((RowProtocol::None, RowBackend::None))
+}
+
 /// 单元级行（汇总 / resume 跳过 / 网卡消失）的身份。
 ///
-/// 与 [`base_row`] 的区别只有一处：端点从单元的第一条腿上取，取不到就留空。
+/// 与 [`base_row`] 的区别有两处：端点从单元的第一条腿上取，取不到就留空；
+/// 协议/后端由 [`unit_protocol_and_backend`] 从腿的类型推，不接受调用方传入。
 /// 其余身份字段（分组键、单元序号、标题）走同一条路径，所以单元级行和明细行
 /// 在报表里能落进同一个链路分组。
-pub(super) fn unit_row(
-    unit: &Unit,
-    unit_seq: usize,
-    kind_label: impl Into<String>,
-    protocol: RowProtocol,
-    backend: RowBackend,
-) -> Row {
+pub(super) fn unit_row(unit: &Unit, unit_seq: usize, kind_label: impl Into<String>) -> Row {
     let kind_label = kind_label.into();
+    // 协议/后端**不由调用方传**：三处调用点历史上一律传 None，把 Excel 概览的
+    // 两列全填成了空。收进来之后「忘了填」在结构上不可能。
+    let (protocol, backend) = unit_protocol_and_backend(unit);
     match unit_endpoints(unit) {
         Some((src, dst)) => Row {
             // 单元级行的 transport 列一直是空的（协议写在标题里），保持原样。

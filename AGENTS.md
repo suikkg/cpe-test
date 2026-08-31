@@ -73,6 +73,18 @@ shasum -a 256 dist/cpe_test-v<版本号>-windows-config-docs.zip   # 必须等�
    `<img src>` 指向本站路径都会 401，因为浏览器不会给它们带自定义头）。
    这条是 §4 「前端必须打成单文件」的根因，不是风格偏好。
 
+   **唯一的凭据例外：文档请求额外认一枚会话 cookie**（`SESSION_COOKIE`，
+   由 `page_response()` 在交付页面时下发，`page_request_is_authorized()` 认）。
+   前端拿到口令后会把地址栏的 `?token=` 抹掉，于是 F5 发出的 `GET /` 什么凭据都
+   带不上——撞 401 的是**刷新**这个最普通的动作。
+   **它只对 `GET /` 生效**：任何 `/api/*` 都仍然只认 `X-CPE-Token` /
+   `Authorization: Bearer` / `?token=`，光有 cookie 一律 401。CSRF 那道门因此原样
+   保留（别的站点能让浏览器去导航 `GET /`，但拿不到响应，更发不出会执行动作的
+   API 调用）。加 `SameSite=Strict`，不加 `HttpOnly`（页面要读它，否则「复制地址
+   到新标签打开」会变成「界面出来了、每个 API 都 401」）。
+   由 `refreshing_the_console_page_keeps_the_session_but_the_api_still_needs_the_header`
+   守着那个「只」字。
+
 其余不变量（端口分配、稳定 ID 模板、RESUME 命中窗口、同 /24 门禁、bidir 两腿……）
 见 `.ai/PROJECT_ARCHITECTURE.md` §11.1。**改之前先读那一节**。
 

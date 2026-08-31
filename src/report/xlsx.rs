@@ -152,6 +152,14 @@ fn write_overview_sheet(
         line += 1;
     }
 
+    // 「运行健康」在 HTML 报告里是一条红色横幅，正常时**不出现**——横幅缺席
+    // 本身就是「一切正常」。表格里没有这个语义：一个写着标题、值却是空的格子，
+    // 读起来是「这项没算出来」而不是「这项没问题」。所以这里显式写出正常态。
+    let run_health = if meta.run_health.trim().is_empty() {
+        "正常：本轮没有出现连续多个灌包单元一条测量都没产生的情况".to_string()
+    } else {
+        meta.run_health.clone()
+    };
     // 抬头信息放在数据右边，不占用可筛选的列区。
     let info = [
         ("主控", meta.master_pc.as_str()),
@@ -160,7 +168,7 @@ fn write_overview_sheet(
         ("开始", meta.started.as_str()),
         ("结束", meta.finished.as_str()),
         ("耗时", meta.elapsed.as_str()),
-        ("运行健康", meta.run_health.as_str()),
+        ("运行健康", run_health.as_str()),
     ];
     let format = header_format();
     for (offset, (label, value)) in info.iter().enumerate() {
@@ -252,11 +260,93 @@ fn write_detail_sheet(
     Ok(())
 }
 
-/// 表三：按**链路组**汇总。
+/// 一条「某个方向、某块接收网卡」的观测。
+///
+/// 表三的聚合粒度就是它。**不是**「一个单元一条」：一个双向灌包单元有两个方向、
+/// 两块接收网卡，两边的可达速率可以差一个数量级（同一次运行里见过 1821Mbps 对
+/// 17Mbps）。把它们压成一行，那一行的「RX 平均最小值」就是两条链路里更差的那条，
+/// 而表上看不出它说的是哪一条——另一条的数字则整个消失。
+struct LinkObservation<'a> {
+    protocol: RowProtocol,
+    backend: RowBackend,
+    direction: RowDirection,
+    /// 接收端网口。判定口径只看接收端 RX，所以聚合键取的是**收的那一块**。
+    receiver: &'a str,
+    sender: &'a str,
+    verdict: Verdict,
+    rx_avg: Option<f64>,
+}
+
+/// 一条明细行作为「某方向代表行」的可取程度。
+///
+/// 与执行侧 `direction_summaries` 挑主行的口径同源：组合计行优先（UDP 的方向
+/// 结论在组合计上，逐流行的 RX 列本来就是空的），其次看指标齐不齐。
+fn direction_row_score(row: &Row) -> u8 {
+    u8::from(row.is_grouptotal) * 4
+        + u8::from(row.rx_p10.is_some()) * 2
+        + u8::from(row.rx_avg.is_some())
+}
+
+/// 把一个单元摊成若干条方向观测。
+///
+/// 单向单元只有一条，此时判定用**单元判定**（`group_verdict` → `aggregate_verdict`，
+/// 判定优先级全仓唯一的那一份），而不是代表行自己的 verdict——单元结论可能来自
+/// 多条行的聚合。双向单元每个方向各一条，判定取该方向的行，这与 HTML 报告的
+/// 「双向方向汇总（每个方向各自按接收端 RX 判定）」是同一个读法。
+fn link_observations<'a>(group: &UnitGroup<'a>) -> Vec<LinkObservation<'a>> {
+    let mut picked: Vec<(RowDirection, &'a Row)> = Vec::new();
+    for row in &group.details {
+        match picked.iter_mut().find(|(dir, _)| *dir == row.direction) {
+            None => picked.push((row.direction, row)),
+            Some((_, best)) => {
+                if direction_row_score(row) > direction_row_score(best) {
+                    *best = row;
+                }
+            }
+        }
+    }
+    let unit_verdict = group_verdict(group);
+    if picked.is_empty() {
+        // 没有明细行的单元（resume 跳过、网卡消失、启动失败）仍然要进表：
+        // 「这条链路这次一个单元都没跑成」也是验收结论的一部分。
+        let Some(row) = group.summary else {
+            return Vec::new();
+        };
+        return vec![LinkObservation {
+            protocol: row.protocol,
+            backend: row.backend,
+            direction: row.direction,
+            receiver: row.dst_iface.as_str(),
+            sender: row.src_iface.as_str(),
+            verdict: unit_verdict,
+            rx_avg: row.rx_avg,
+        }];
+    }
+    let single = picked.len() == 1;
+    picked
+        .into_iter()
+        .map(|(direction, row)| LinkObservation {
+            protocol: row.protocol,
+            backend: row.backend,
+            direction,
+            receiver: row.dst_iface.as_str(),
+            sender: row.src_iface.as_str(),
+            verdict: if single { unit_verdict } else { row.verdict },
+            rx_avg: row.rx_avg,
+        })
+        .collect()
+}
+
+/// 表三：按**链路 × 协议 × 接收方向**汇总。
 ///
 /// 这是 `link_group` 存在的理由：验收要回答的是「这条链路行不行」，
 /// 而不是「第 137 号单元行不行」。分组键的来源优先级在 `executor/row.rs`
 /// 里定死（链路集合名 → 物理网口对 → 角色对，**永不用主机名**）。
+///
+/// 键上除了链路组还带协议与接收端，理由是这张表以前只有链路组一维，于是：
+/// TCP 和 UDP 的结果被并成一行（两者的达标线本来就不是一个量级），
+/// 而一条双向链路两块接收网卡只留下一个「RX 平均最小值」——更差的那块把另一块
+/// 盖掉了，表上还看不出被盖掉的是谁。
 fn write_link_group_sheet(
     workbook: &mut Workbook,
     groups: &[UnitGroup<'_>],
@@ -267,7 +357,14 @@ fn write_link_group_sheet(
         sheet,
         &[
             "链路组",
-            "单元数",
+            "协议",
+            "后端",
+            "方向",
+            "发送端网口",
+            "接收端网口",
+            // 双向单元在这张表里占两行（每个方向各自判定），所以计的是
+            // 「方向」不是「单元」——列名必须说清楚，否则总数对不上概览页。
+            "方向执行数",
             "PASS",
             "RATE_FAIL",
             "MEASURED",
@@ -276,55 +373,91 @@ fn write_link_group_sheet(
             "SKIP",
             "通过率",
             "RX 平均最小值(Mbps)",
+            "RX 平均最大值(Mbps)",
         ],
     )?;
 
-    // 保序聚合：链路组按第一次出现的顺序排，和报告里的顺序一致。
-    let mut order: Vec<String> = Vec::new();
-    let mut stats: std::collections::HashMap<String, ([usize; 6], Option<f64>)> =
-        std::collections::HashMap::new();
+    type Key = (
+        String,
+        RowProtocol,
+        RowBackend,
+        RowDirection,
+        String,
+        String,
+    );
+    struct Stats {
+        counts: [usize; 6],
+        rx_min: Option<f64>,
+        rx_max: Option<f64>,
+    }
+
+    // 保序聚合：按第一次出现的顺序排，和报告里的顺序一致。
+    let mut order: Vec<Key> = Vec::new();
+    let mut stats: std::collections::HashMap<Key, Stats> = std::collections::HashMap::new();
     for group in groups {
-        let Some(row) = group.summary.or_else(|| group.details.first().copied()) else {
-            continue;
-        };
-        let key = if row.link_group.is_empty() {
-            "(未分组)".to_string()
-        } else {
-            row.link_group.clone()
-        };
-        if !stats.contains_key(&key) {
-            order.push(key.clone());
-        }
-        let entry = stats.entry(key).or_insert(([0; 6], None));
-        let index = match group_verdict(group) {
-            Verdict::Pass => 0,
-            Verdict::RateFail => 1,
-            Verdict::Measured => 2,
-            Verdict::NotEvaluated => 3,
-            Verdict::SetupError => 4,
-            Verdict::Skip => 5,
-        };
-        entry.0[index] += 1;
-        if let Some(rx) = row.rx_avg {
-            entry.1 = Some(entry.1.map_or(rx, |current: f64| current.min(rx)));
+        for observation in link_observations(group) {
+            let link_group = group
+                .summary
+                .or_else(|| group.details.first().copied())
+                .map(|row| row.link_group.clone())
+                .unwrap_or_default();
+            let key: Key = (
+                if link_group.is_empty() {
+                    "(未分组)".to_string()
+                } else {
+                    link_group
+                },
+                observation.protocol,
+                observation.backend,
+                observation.direction,
+                observation.sender.to_string(),
+                observation.receiver.to_string(),
+            );
+            if !stats.contains_key(&key) {
+                order.push(key.clone());
+            }
+            let entry = stats.entry(key).or_insert(Stats {
+                counts: [0; 6],
+                rx_min: None,
+                rx_max: None,
+            });
+            let index = match observation.verdict {
+                Verdict::Pass => 0,
+                Verdict::RateFail => 1,
+                Verdict::Measured => 2,
+                Verdict::NotEvaluated => 3,
+                Verdict::SetupError => 4,
+                Verdict::Skip => 5,
+            };
+            entry.counts[index] += 1;
+            if let Some(rx) = observation.rx_avg {
+                entry.rx_min = Some(entry.rx_min.map_or(rx, |current: f64| current.min(rx)));
+                entry.rx_max = Some(entry.rx_max.map_or(rx, |current: f64| current.max(rx)));
+            }
         }
     }
 
     for (line, key) in order.iter().enumerate() {
         let line = line as u32 + 1;
-        let (counts, worst_rx) = &stats[key];
-        let total: usize = counts.iter().sum();
-        sheet.write_string(line, 0, key)?;
-        sheet.write_number(line, 1, total as f64)?;
-        for (offset, count) in counts.iter().enumerate() {
-            sheet.write_number(line, 2 + offset as u16, *count as f64)?;
+        let entry = &stats[key];
+        let total: usize = entry.counts.iter().sum();
+        sheet.write_string(line, 0, &key.0)?;
+        sheet.write_string(line, 1, protocol_label(key.1))?;
+        sheet.write_string(line, 2, backend_label(key.2))?;
+        sheet.write_string(line, 3, direction_label(key.3))?;
+        sheet.write_string(line, 4, &key.4)?;
+        sheet.write_string(line, 5, &key.5)?;
+        sheet.write_number(line, 6, total as f64)?;
+        for (offset, count) in entry.counts.iter().enumerate() {
+            sheet.write_number(line, 7 + offset as u16, *count as f64)?;
         }
         // 通过率的分母与 HTML 报告一致：只算 PASS 与 RATE_FAIL。
-        let judged = counts[0] + counts[1];
+        let judged = entry.counts[0] + entry.counts[1];
         if judged > 0 {
-            sheet.write_number(line, 8, counts[0] as f64 / judged as f64)?;
+            sheet.write_number(line, 13, entry.counts[0] as f64 / judged as f64)?;
         }
-        write_opt_number(sheet, line, 9, *worst_rx)?;
+        write_opt_number(sheet, line, 14, entry.rx_min)?;
+        write_opt_number(sheet, line, 15, entry.rx_max)?;
     }
     Ok(())
 }
@@ -540,6 +673,71 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// 双向单元在「按链路分组」里必须一个接收网口一行。
+    ///
+    /// 这张表以前只按 `link_group` 一维聚合：一条双向链路的两块接收网卡被压成
+    /// 一行，「RX 平均最小值」于是只剩两者里更差的那个，而表上看不出它说的是哪
+    /// 一块——另一块的数字整个消失。半双工链路两个方向差一个数量级是常态
+    /// （同一次运行里见过 1821Mbps 对 17Mbps），压成一行等于把结论抹平。
+    #[test]
+    fn a_bidirectional_unit_gets_one_row_per_receiving_nic() {
+        let mut ab = detail(0, Verdict::Pass, "SGMII ↔ WLAN");
+        ab.direction = RowDirection::Ab;
+        ab.is_grouptotal = true;
+        ab.rx_avg = Some(1821.0);
+        let mut ba = Row {
+            sort_key: (0, 1, 0, 0),
+            direction: RowDirection::Ba,
+            is_grouptotal: true,
+            rx_avg: Some(17.0),
+            src_iface: "eth1".into(),
+            dst_iface: "eth0".into(),
+            verdict: Verdict::RateFail,
+            ..detail(0, Verdict::RateFail, "SGMII ↔ WLAN")
+        };
+        ba.src_iface = "eth1".into();
+        ba.dst_iface = "eth0".into();
+        let rows = vec![ab, ba, summary(0, Verdict::RateFail, "SGMII ↔ WLAN")];
+        let groups = group_rows(&rows);
+        let observations = link_observations(&groups[0]);
+
+        assert_eq!(observations.len(), 2, "两个方向要各成一条观测");
+        let mut seen: Vec<(&str, Option<f64>, Verdict)> = observations
+            .iter()
+            .map(|o| (o.receiver, o.rx_avg, o.verdict))
+            .collect();
+        seen.sort_by(|a, b| a.0.cmp(b.0));
+        assert_eq!(seen[0], ("eth0", Some(17.0), Verdict::RateFail));
+        assert_eq!(seen[1], ("eth1", Some(1821.0), Verdict::Pass));
+    }
+
+    /// 单向单元的判定要用**单元判定**，不是代表行自己的 verdict。
+    ///
+    /// 判定优先级全仓只有一份实现（`verdict::aggregate_verdict`，由
+    /// `group_verdict` 转调）。这里若图省事直接读行，就是第二份聚合。
+    #[test]
+    fn a_single_direction_unit_reports_the_unit_verdict() {
+        let mut row = detail(0, Verdict::Measured, "A");
+        row.direction = RowDirection::Single;
+        let rows = vec![row, summary(0, Verdict::RateFail, "A")];
+        let groups = group_rows(&rows);
+        let observations = link_observations(&groups[0]);
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].verdict, Verdict::RateFail);
+    }
+
+    /// 没有明细行的单元（resume 跳过、网卡消失）也要出现在链路表里。
+    ///
+    /// 「这条链路这次一个单元都没跑成」同样是验收结论，掉出表外等于悄悄变好看。
+    #[test]
+    fn a_unit_without_detail_rows_still_lands_in_the_link_table() {
+        let rows = vec![summary(0, Verdict::Skip, "A")];
+        let groups = group_rows(&rows);
+        let observations = link_observations(&groups[0]);
+        assert_eq!(observations.len(), 1);
+        assert_eq!(observations[0].verdict, Verdict::Skip);
     }
 
     /// 没有测量就留空，不许填 0。

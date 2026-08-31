@@ -2,7 +2,7 @@
 import { computed } from 'vue';
 import NicTable from '../../components/NicTable.vue';
 import { masterHostname, masterNics } from '../../state/inventory';
-import { session } from '../../state/session';
+import { rescan, session } from '../../state/session';
 
 /**
  * 「本机」：控制台打开就能看的东西，**不需要连上辅测机**。
@@ -41,7 +41,19 @@ const version = computed(() => session.local?.version ?? '');
       找不到它时所有灌包单元都会直接判 SETUP_ERROR。
     </p>
 
-    <h3>网卡</h3>
+    <div class="bar">
+      <h3>网卡</h3>
+      <button type="button" class="ghost" :disabled="session.scanning" @click="rescan">
+        {{ session.scanning ? '扫描中…' : '重新扫描' }}
+      </button>
+      <span v-if="session.scanMessage" class="scan" :class="session.scanKind">
+        {{ session.scanMessage }}
+      </span>
+    </div>
+    <p class="muted hint">
+      插拔网线、开关 Wi-Fi、改完 IP 之后点它。连上辅测机时会「两端一起」重扫——
+      连上之后这张表显示的就是那次连接扫到的（按 IPv4 前缀过滤过的）那一份。
+    </p>
     <NicTable :nics="masterNics" empty-hint="没有扫到网卡。检查网线/Wi-Fi 是否连接，或到「辅测机」页调整 IPv4 前缀过滤。" />
   </section>
 </template>
@@ -80,6 +92,24 @@ const version = computed(() => session.local?.version ?? '');
   border-left: 3px solid var(--focus);
   background: var(--info-bg);
 }
+.bar { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; margin: 0 0 4px; }
+.bar h3 { margin: 0; }
+.ghost {
+  padding: 5px 13px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--surface);
+  color: var(--ink);
+  font: inherit;
+  font-size: 12.5px;
+  cursor: pointer;
+}
+.ghost:disabled { opacity: .55; cursor: default; }
+.scan { font-size: 12px; color: var(--muted); }
+.scan.ok { color: var(--ok); }
+.scan.bad { color: var(--bad); }
+.hint { margin: 0 0 10px; font-size: 12px; }
+.muted { color: var(--muted); }
 code {
   font-family: var(--fm);
 }

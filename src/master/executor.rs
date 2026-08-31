@@ -572,13 +572,7 @@ impl Ctx {
                                 execution_status: ExecutionStatus::Error,
                                 reason_code: ReasonCode::NicDisappeared,
                                 reason_detail: detail,
-                                ..unit_row(
-                                    unit,
-                                    useq,
-                                    "跳过(网卡已消失)",
-                                    RowProtocol::None,
-                                    RowBackend::None,
-                                )
+                                ..unit_row(unit, useq, "跳过(网卡已消失)")
                             });
                             // 同上：这条 `continue` 也绕过了 unit_finished。
                             self.notify(|observer| {
@@ -627,13 +621,7 @@ impl Ctx {
                         reason_detail: format!(
                             "复用 {t} 的正式 PASS；本轮启用 resume，且结果未超过 {RESUME_MAX_AGE_HOURS} 小时，因此跳过执行"
                         ),
-                        ..unit_row(
-                            unit,
-                            useq,
-                            format!("跳过(上次PASS: {t})"),
-                            RowProtocol::None,
-                            RowBackend::None,
-                        )
+                        ..unit_row(unit, useq, format!("跳过(上次PASS: {t})"))
                     });
                     // 这条路径 `continue` 掉了，不会走到下面那个 unit_finished，
                     // 所以在这里补一次——进度页上「跳过」也是一个已完成单元。
@@ -843,8 +831,6 @@ impl Ctx {
                     } else {
                         "测试单元汇总"
                     },
-                    RowProtocol::None,
-                    RowBackend::None,
                 )
             });
             {

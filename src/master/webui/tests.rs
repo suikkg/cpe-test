@@ -1347,6 +1347,89 @@ fn the_console_token_gate_covers_both_the_page_and_the_api() {
     thread.join().expect("请求线程正常收场");
 }
 
+/// 裸 HTTP GET：`http_client` 不支持自定义 header，而这里要的正是 `Cookie`。
+fn raw_get(port: u16, path: &str, headers: &[(&str, &str)]) -> (u16, String) {
+    use std::io::{Read, Write};
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("连上控制台");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(60)))
+        .expect("读超时");
+    let mut request = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n");
+    for (name, value) in headers {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    request.push_str("\r\n");
+    stream.write_all(request.as_bytes()).expect("发请求");
+    let mut bytes = Vec::new();
+    let _ = stream.read_to_end(&mut bytes);
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    let status = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .unwrap_or(0);
+    (status, text)
+}
+
+/// **刷新页面不许把人踢回未认证。**
+///
+/// 前端拿到口令后会把地址栏的 `?token=` 抹掉（防止口令进浏览器历史/截图/
+/// 复制出去的链接）。于是 F5 发出的 `GET /` 什么凭据都不带——鉴权在路由之前，
+/// 刷新直接撞 401，页面变成一句「未认证」的 JSON，而口令明明还在。
+///
+/// 修法是交付页面时同时下发一枚会话 cookie，**只对文档请求生效**。这条测试
+/// 同时钉住那个「只」字：光带 cookie 调 API 必须仍然 401，否则 CSRF 那道门
+/// 就被这次修复顺手拆了。
+#[test]
+fn refreshing_the_console_page_keeps_the_session_but_the_api_still_needs_the_header() {
+    let console = Arc::new(Console {
+        state: Mutex::new(state_with_pair()),
+        running: AtomicBool::new(false),
+        report: Mutex::new(String::new()),
+        ui_token: "unit-secret".into(),
+        monitors: Mutex::new(HashMap::new()),
+        run_status: Arc::new(RunStatusRecorder::new()),
+    });
+    let server = Arc::new(Server::http("127.0.0.1:0").unwrap());
+    let port = server.server_addr().to_ip().unwrap().port();
+    let worker = Arc::clone(&console);
+    let worker_server = Arc::clone(&server);
+    let thread = std::thread::spawn(move || {
+        for request in worker_server.incoming_requests() {
+            handle(request, &worker);
+        }
+    });
+
+    // 第一次打开：地址栏带口令，页面放行，并回一枚会话 cookie。
+    let (status, response) = raw_get(port, "/?token=unit-secret", &[]);
+    assert_eq!(status, 200, "带对口令的首次打开必须放行");
+    let cookie = response
+        .lines()
+        .find_map(|line| line.strip_prefix("Set-Cookie: "))
+        .map(|line| line.split(';').next().unwrap_or("").trim().to_string())
+        .expect("页面响应必须下发会话 cookie");
+    assert!(cookie.starts_with("cpe_ui_session="), "{cookie}");
+    assert!(
+        response.contains("SameSite=Strict"),
+        "会话 cookie 必须 SameSite=Strict，否则跨站导航也会带上它"
+    );
+
+    // F5：只有 cookie，没有查询串、没有自定义头。这一发以前是 401。
+    let (status, _) = raw_get(port, "/", &[("Cookie", &cookie)]);
+    assert_eq!(status, 200, "刷新必须还能打开页面");
+
+    // 但 API 不认 cookie——CSRF 门靠的就是「浏览器不会替别人带上自定义头」。
+    let (status, _) = raw_get(port, "/api/local", &[("Cookie", &cookie)]);
+    assert_eq!(status, 401, "光带 cookie 的 API 调用必须 401");
+
+    // 拿着别人的 cookie 也进不来。
+    let (status, _) = raw_get(port, "/", &[("Cookie", "cpe_ui_session=wrong")]);
+    assert_eq!(status, 401, "cookie 里口令不对必须 401");
+
+    server.unblock();
+    thread.join().expect("请求线程正常收场");
+}
+
 /// Ctrl+C 之后要不要退，取决于「这一刻有没有测试在跑」。
 ///
 /// 跑着的时候退掉就是把报告扔了：那次 Ctrl+C 的语义是「优雅结束当前单元
