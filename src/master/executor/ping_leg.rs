@@ -1,9 +1,15 @@
 //! Ping 腿的执行。
 //!
-//! 和灌包腿共用编排，但判定口径完全不同：Ping 看的是通不通和 RTT 分布，
+//! 和灌包腿共用编排，但判定口径完全不同：Ping 看的是丢包与 RTT，
 //! 没有速率目标，也就没有窗口和越界那一整套。
 
 use super::*;
+
+/// 子网 Ping 的默认 RTT 上限。
+///
+/// 这里测的是 CPE 本地链路，不是公网时延。PASS 必须同时满足零丢包和最大 RTT
+/// 不超过该值；用最大值而不是平均值，避免偶发的严重抖动被平均数掩盖。
+const PING_MAX_RTT_MS: f64 = 20.0;
 
 impl Ctx {
     pub(super) fn run_ping_leg(
@@ -86,11 +92,21 @@ impl Ctx {
             ping::execution_error_kind(&out)
         };
         let exec_detail = transport_error.or_else(|| ping::execution_error(&out));
+
+        // `PingOut.ok` 仍只表达 agent 是否收到了至少一个 Echo Reply，保持 RPC
+        // 协议兼容。正式验收在主控这里收紧：必须全部收到，并且最大 RTT 达标。
+        let packet_loss_ok = out.sent > 0 && out.received == out.sent;
+        let rtt_ok = out
+            .rtt_max
+            .map(|rtt| rtt.is_finite() && rtt <= PING_MAX_RTT_MS)
+            .unwrap_or(false);
+        let acceptance_ok = out.ok && packet_loss_ok && rtt_ok;
+
         let verdict = if gateway_missing {
             Verdict::NotEvaluated
         } else if exec_kind.is_some() {
             Verdict::SetupError
-        } else if out.ok {
+        } else if acceptance_ok {
             Verdict::Pass
         } else {
             Verdict::RateFail
@@ -110,7 +126,7 @@ impl Ctx {
             ReasonCode::PingTimeout
         } else if exec_kind.is_some() {
             ReasonCode::PingExecError
-        } else if out.ok {
+        } else if acceptance_ok {
             ReasonCode::PingOk
         } else {
             match t.purpose {
@@ -126,20 +142,40 @@ impl Ctx {
             )
         } else if let Some(detail) = exec_detail {
             detail
-        } else if out.ok {
+        } else if !out.ok {
             format!(
-                "Ping 连通：发送/接收={}/{}，丢包率 {:.1}%，RTT 最小/平均/最大={}/{}/{} ms",
-                out.sent,
-                out.received,
-                out.loss_pct,
+                "Ping 命令正常完成，但未收到目标 Echo Reply（收/发={}/{}，丢包率 {:.1}%）",
+                out.received, out.sent, out.loss_pct
+            )
+        } else if !packet_loss_ok {
+            format!(
+                "Ping 丢包不达标：要求 0% 丢包，实际收/发={}/{}, 丢包率 {:.1}%",
+                out.received, out.sent, out.loss_pct
+            )
+        } else if out.rtt_max.is_none() {
+            format!(
+                "Ping RTT 数据缺失：收/发={}/{}, 无法按最大 RTT <= {:.1} ms 验收",
+                out.received, out.sent, PING_MAX_RTT_MS
+            )
+        } else if !rtt_ok {
+            format!(
+                "Ping RTT 超限：最大 RTT={} ms，要求 <= {:.1} ms（最小/平均/最大={}/{}/{} ms）",
+                format_ping_rtt(out.rtt_max),
+                PING_MAX_RTT_MS,
                 format_ping_rtt(out.rtt_min),
                 format_ping_rtt(out.rtt_avg),
                 format_ping_rtt(out.rtt_max)
             )
         } else {
             format!(
-                "Ping 命令正常完成，但未收到目标 Echo Reply（收/发={}/{}，丢包率 {:.1}%）",
-                out.received, out.sent, out.loss_pct
+                "Ping 达标：发送/接收={}/{}，丢包率 {:.1}%，RTT 最小/平均/最大={}/{}/{} ms，最大 RTT 门限 {:.1} ms",
+                out.sent,
+                out.received,
+                out.loss_pct,
+                format_ping_rtt(out.rtt_min),
+                format_ping_rtt(out.rtt_avg),
+                format_ping_rtt(out.rtt_max),
+                PING_MAX_RTT_MS
             )
         };
         logln(&format!(
@@ -163,7 +199,7 @@ impl Ctx {
         ));
         let kind_label = match t.purpose {
             PingPurpose::SubnetTest if unit.bidir => format!("★双向子网PING-{tag}"),
-            PingPurpose::SubnetTest => "子网PING（收到至少一个 Echo Reply 即连通）".into(),
+            PingPurpose::SubnetTest => format!("子网PING（0% 丢包且最大 RTT <= {PING_MAX_RTT_MS:.0}ms）"),
             PingPurpose::SubnetDiagnostic => "故障诊断-子网PING".into(),
             PingPurpose::GatewayDiagnostic => "故障诊断-网卡到网关PING".into(),
         };
