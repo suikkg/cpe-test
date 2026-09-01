@@ -1,4 +1,4 @@
-name: Dispatch v6.2.2 Once
+name: Finalize v6.2.2 Release Once
 
 on:
   push:
@@ -6,41 +6,35 @@ on:
 
 permissions:
   contents: write
-  actions: write
 
 jobs:
-  dispatch:
+  finalize:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: feat/webui-vue
-          fetch-depth: 0
-
-      - name: Verify release metadata
-        shell: bash
-        run: |
-          set -euo pipefail
-          grep -q '^version = "6.2.2"$' Cargo.toml
-          grep -q 'name = "cpe_test"' Cargo.lock
-          grep -q 'version = "6.2.2"' Cargo.lock
-          grep -q '"version": "6.2.2"' ui/package.json
-          test -f dist/cpe_test-v6.2.2-windows-config-docs.zip
-          test -f dist/cpe_test-v6.2.2-windows-config-docs.zip.sha256
-
-      - name: Point tag at final branch head
-        shell: bash
-        run: |
-          set -euo pipefail
-          git config user.name github-actions[bot]
-          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git tag -fa v6.2.2 -m 'Release v6.2.2' HEAD
-          git push --force origin refs/tags/v6.2.2
-
-      - name: Dispatch release workflow on tag
+      - name: Update GitHub Release notes
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          gh workflow run build.yml --ref v6.2.2
+          cat > /tmp/v622-notes.md <<'EOF'
+          cpe_test v6.2.2 的已验证跨平台发布包。
+
+          ## v6.2.2 Ping 验收策略与 WebUI 阈值入口
+
+          - **Ping PASS 改为严格验收**：必须 0% 丢包，并且平均 RTT 与最大 RTT 同时达标；不再把“收到过 Echo Reply”视为最终 PASS。
+          - **自动按链路类型 × payload 档位选门限**：有线 small/medium/large 默认 Avg/Max 分别为 `10/30`、`20/50`、`50/100 ms`；Wi-Fi 分别为 `30/80`、`50/100`、`100/200 ms`。
+          - **任意 Ping 包长均可分类**：small `<=128` 字节，medium `<=2000` 字节，其余为 large，不再依赖固定的 `32/1600/65500` 三个包长。
+          - **WebUI 保留“Ping 高级阈值”入口**：默认折叠；需要时可临时修改 small/medium 分界，以及有线/Wi-Fi 六档 Avg/Max 门限；留空继续沿用主控 `config.json`。
+          - **报告显示实际使用的判据**：达标或超限详情都会写明有线/Wi-Fi、payload 档位以及实际 Avg/Max 门限，方便后续收紧有线时延标准。
+          - **兼容旧配置**：新增 Ping 策略字段均有默认值，旧配置文件无需迁移即可继续加载。
+
+          ## 验证与发布
+
+          - 前端 Vitest：140/140 通过。
+          - Rust：595/595 通过，`cargo fmt` 与 Clippy 全通过。
+          - Windows x86_64、macOS arm64、Linux x86_64 三个平台均完成 release build、架构/启动 smoke test 与归档校验。
+          - Windows 发布包继续校验固定的 Microsoft ctsTraffic 2.0.4.0 x64。
+          - 三个平台归档 SHA-256 请见 `SHA256SUMS`。
+          EOF
+          gh release edit v6.2.2 --repo suikkg/cpe-test --title 'v6.2.2' --notes-file /tmp/v622-notes.md --latest
