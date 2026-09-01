@@ -10,31 +10,6 @@ import {
 import { plan } from '../../state/plan';
 import { session } from '../../state/session';
 
-/**
- * 「全局默认档位」：套件里没写死参数时用哪一组。
- *
- * 对应 `RunRequest` 的顶层字段（`tcp_windows` / `udp_bandwidths` / …）。
- *
- * # 为什么常驻可见，且不折叠
- *
- * UDP 的 `-b` 是这套工具里被改得最多的一个数。它一度被放进一个默认收起的
- * 折叠块里，于是「全局带宽在哪」成了一个要先找到才能回答的问题——最常用的旋钮
- * 藏得最深，比旧页面还退了一步。折叠留给下面那张按网卡的大表，它才是偶尔才用的。
- *
- * # 为什么留空、却仍然看得见生效值
- *
- * 后端的口径是 `non_empty(请求, 配置)`：只有请求里非空才覆盖配置。所以这里
- * **一律不预填**——把配置里那份可能有意不成叉积的 `udp_profiles` 回填进三个框
- * 再发回去，就会被展成叉积，单元数悄悄变多。
- *
- * 但「留空」不该等于「不知道现在跑的是什么」。所以当前生效的那份值走
- * **placeholder**（灰字）显示：看得见、改得动、不会被误发回去。这一份来自
- * `/api/bootstrap`，即主控 `config.json` 里的值。
- *
- * 档位串一律逗号分隔，逐档各跑一轮（这是后端的展开语义，不是这里的约定）。
- */
-
-/** 逗号串 ↔ 数组的双向绑定。写在一处，几个框共用。 */
 function tokens(key: 'tcp_windows' | 'udp_bandwidths' | 'udp_lengths' | 'udp_windows') {
   return computed({
     get: () => formatTokenList(plan.globals[key]),
@@ -53,13 +28,6 @@ function numbers(key: 'tcp_streams' | 'ping_payload_sizes') {
   });
 }
 
-/**
- * 标量档位（并发流 / ping 次数）的绑定。
- *
- * **不能用 `v-model.number`**：0 在模型里是「不覆盖」，而数字输入框会把它渲染成
- * 一个真真切切的 `0`，placeholder 永远不出现——于是「不覆盖」在屏幕上长得像
- * 「我把并发流设成了 0」。空串才是「不覆盖」该有的样子。
- */
 function scalar(key: 'udp_streams' | 'ping_count') {
   return computed({
     get: () => (plan.globals[key] > 0 ? String(plan.globals[key]) : ''),
@@ -70,8 +38,20 @@ function scalar(key: 'udp_streams' | 'ping_count') {
   });
 }
 
+/** RTT 允许小数毫秒，不能复用上面会 Math.trunc 的整数绑定。 */
+function positiveDecimal(key: 'ping_max_rtt_ms') {
+  return computed({
+    get: () => (plan.globals[key] > 0 ? String(plan.globals[key]) : ''),
+    set: (raw: string) => {
+      const value = Number(raw.trim());
+      plan.globals[key] = Number.isFinite(value) && value > 0 ? value : 0;
+    },
+  });
+}
+
 const udpStreams = scalar('udp_streams');
 const pingCount = scalar('ping_count');
+const pingMaxRtt = positiveDecimal('ping_max_rtt_ms');
 const tcpWindows = tokens('tcp_windows');
 const tcpStreams = numbers('tcp_streams');
 const udpBandwidths = tokens('udp_bandwidths');
@@ -79,14 +59,6 @@ const udpLengths = tokens('udp_lengths');
 const udpWindows = tokens('udp_windows');
 const pingSizes = numbers('ping_payload_sizes');
 
-/**
- * 主控 `config.json` 里当前的值，用作 placeholder。
- *
- * 只用来**显示**，永远不会被当成用户的输入发回去。注意 `tcp_streams` /
- * `udp_streams` / `ping_*` 这几项在服务端是从 `cfg.tests` 反推的
- * （`webui/api.rs::bootstrap_out` 的「反推段」），所以它们是**指示性**的：
- * 配置里那几项本来就分散在各个 test 上，没有唯一答案。
- */
 const configured = computed(() => session.bootstrap);
 
 function hint(values: readonly string[] | readonly number[] | undefined, fallback: string): string {
@@ -94,17 +66,6 @@ function hint(values: readonly string[] | readonly number[] | undefined, fallbac
   return `沿用配置：${values.join(', ')}`;
 }
 
-/**
- * UDP 的 `-l` / `-w` 的提示，**取决于 `-b` 填没填**。
- *
- * 后端不是逐字段回落的：只要 `udp_bandwidths` 非空，它就用这三个框
- * **整体重建** `cfg.iperf.udp_profiles`（`ui_request_base_config`）——这时 `-l`
- * 留空就是真的不下发 `-l`，配置文件里那个值根本不参与。
- *
- * 所以 `-b` 有值时还显示「沿用配置：64」是**错的**：它会让人以为不填就会跑
- * `-l 64`，而实际一个 `-l` 都不下发。这正是「界面说的和实际跑的不一样」那一类，
- * 比没有提示更糟。
- */
 function udpProfileHint(values: readonly string[] | undefined, flag: string): string {
   if (plan.globals.udp_bandwidths.length > 0) return `留空 = 不下发 ${flag}`;
   return hint(values, `留空 = 不下发 ${flag}`);
@@ -205,10 +166,22 @@ const untouched = computed(() => globalsAreEmpty(plan.globals));
           autocomplete="off"
         />
       </label>
+      <label>
+        <span>Ping 最大 RTT（ms）</span>
+        <input
+          v-model="pingMaxRtt"
+          type="text"
+          inputmode="decimal"
+          :placeholder="scalarHint(configured?.ping_max_rtt_ms, '留空 = 不覆盖')"
+          autocomplete="off"
+        />
+      </label>
     </div>
 
     <p class="muted hint">
       套件里选中的配置优先；这里填的是「套件没选配置时用哪一组」。填多个用逗号分隔，逐档各跑一轮。
+      <br />
+      <strong>Ping PASS = 0% 丢包 + 最大 RTT 不超过门限</strong>；RTT 数据缺失同样不通过。
       <br />
       <strong>UDP 那四格是一整组</strong>：只要 <code>-b</code> 填了，
       <code>-l</code> / <code>-w</code> 留空就是<strong>真的不下发</strong>这两个参数（用 iperf3 默认），
@@ -232,7 +205,6 @@ const untouched = computed(() => globalsAreEmpty(plan.globals));
   gap: 10px;
   margin: 10px 0 0;
 }
-/* `-b` 是被改得最多的一个数，给它两格宽，档位串写长了也不用横向滚。 */
 .wide { grid-column: span 2; }
 @media (max-width: 700px) { .wide { grid-column: auto; } }
 label { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
