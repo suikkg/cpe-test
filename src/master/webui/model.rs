@@ -284,15 +284,9 @@ pub(super) struct RunRequest {
     #[serde(default = "default_streams")]
     pub(super) udp_streams: u32,
     /// 默认组之外的 UDP 参数组。矩阵里 `udp_group = 1` 指的是这里的第 0 项。
-    ///
-    /// 默认组不放进这个列表：它就是执行区那几个输入框，页面上一直都在，
-    /// 单独存一份只会多一处要保持同步的地方。
     #[serde(default)]
     pub(super) udp_groups: Vec<UdpGroup>,
     /// 默认组之外的 TCP 参数组。矩阵里 `tcp_group = 1` 指的是这里的第 0 项。
-    ///
-    /// 默认组不放进这个列表：它就是 `tcp_windows` / `tcp_streams` 那两个框，
-    /// 和 UDP 默认组同理，单独存一份只会多一处要保持同步的地方。
     #[serde(default)]
     pub(super) tcp_groups: Vec<TcpGroup>,
     /// ping 次数；0 = 沿用配置里的 `ping.count`。
@@ -301,17 +295,13 @@ pub(super) struct RunRequest {
     /// ping 包长档位（每个档位单独成一个测试单元）；空 = 沿用 `ping.payload_sizes`。
     #[serde(default)]
     pub(super) ping_payload_sizes: Vec<u32>,
+    /// Ping 最大 RTT 门限（ms）；0/缺省 = 沿用配置里的 `ping.max_rtt_ms`。
+    #[serde(default)]
+    pub(super) ping_max_rtt_ms: f64,
     /// 是否按整条路径的可信上限裁剪 UDP `-b`。
-    ///
-    /// 界面默认关：控制台上填多少就发多少，超额灌包本来就是要看的场景之一。
-    /// 配置文件里的 `limit_udp_by_link_speed` 只作用于命令行路径，不回填到这里，
-    /// 否则同一个勾选框在不同机器上含义不同。
     #[serde(default)]
     pub(super) limit_udp_by_link_speed: bool,
     /// 24 小时内已有正式 PASS 的单元直接跳过。
-    ///
-    /// 和 `limit_udp_by_link_speed` 一样由界面覆盖配置文件：同一个勾选框
-    /// 在不同机器上必须是同一个意思。
     #[serde(default)]
     pub(super) resume: bool,
     #[serde(default)]
@@ -355,6 +345,7 @@ pub(super) struct BootstrapOut {
     pub(super) udp_streams: u32,
     pub(super) ping_count: u32,
     pub(super) ping_payload_sizes: Vec<u32>,
+    pub(super) ping_max_rtt_ms: f64,
     pub(super) screenshot: bool,
     /// Feature flag for pages that can send the suite-oriented `ui_plan` DTO.
     pub(super) ui_plan_supported: bool,
@@ -376,36 +367,23 @@ pub(super) struct PlannedUnit {
     /// 本轮开了 resume，且这个单元在 24 小时内已有 PASS——会被跳过。
     pub(super) resumed: bool,
     /// 这个单元每条腿**最终**下发的参数。
-    ///
-    /// 「网口固定值 > 参数组 > 默认组」这条优先级，与其让人背下来，不如在跑
-    /// 之前把每条腿的最终数字摆出来：填错了当场看得见，比任何校验都直接。
-    /// 而且这里是裁剪之后的值——勾了「按链路上限裁剪」时 `-b` 和流数都可能
-    /// 和填进去的不一样。
     pub(super) load: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub(super) struct PlanOut {
     pub(super) units: Vec<PlannedUnit>,
-    /// 预计跳过的都真跳过时的耗时。
     pub(super) est_total_secs: u64,
-    /// 一个都不跳时的耗时。开着 resume 时页面按区间显示，理由见 `api_plan`。
     pub(super) est_full_secs: u64,
     pub(super) notices: Vec<String>,
-    /// Hierarchical source information for the quick planner.  Empty for a
-    /// legacy matrix request; the flat `units` field remains the compatibility
-    /// contract used by the original page.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(super) sections: Vec<PlanSection>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(super) trace: Vec<PlanTrace>,
-    /// Stable hash of the request, effective config and current topology.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) plan_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) topology_fingerprint: Option<String>,
-    /// Lets newer pages feature-detect the suite planner without probing a
-    /// deliberately invalid request.
     pub(super) ui_plan_supported: bool,
 }
 
@@ -416,7 +394,6 @@ pub(super) struct PlanTrace {
     pub(super) link_set_id: Option<String>,
     pub(super) suite_id: Option<String>,
     pub(super) task_id: Option<String>,
-    /// Alias used by the initial design terminology; equal to `task_id`.
     pub(super) lane_id: Option<String>,
     pub(super) recipe_id: Option<String>,
     pub(super) protocol: Option<String>,
@@ -466,13 +443,6 @@ pub(super) struct ProgressOut {
     pub(super) from: usize,
     pub(super) lines: Vec<String>,
     pub(super) report: String,
-    /// 结构化运行状态（ADR-2）。
-    ///
-    /// `lines` 保留原样给日志屏——那是**给人看的**，文案可以随便改。
-    /// `run` 是**给机器读的**：单元级进度、计数、失败清单、ETA、报告路径全在
-    /// 这里，前端不必再去解析 `[i/total]` 和「==> 单元结果:」两种日志行。
-    /// 两者同源于 executor 的同一批状态转移点。
     pub(super) run: RunStatus,
-    /// `run.done` 的游标终点：下一拍拿它当 `units_from` 就只收增量。
     pub(super) units_from: usize,
 }
