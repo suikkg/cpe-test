@@ -1,0 +1,35 @@
+name: Finalize Ping Policy Once
+
+on:
+  push:
+    branches:
+      - feat/webui-vue
+
+permissions:
+  contents: write
+
+jobs:
+  finalize:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: feat/webui-vue
+          fetch-depth: 0
+      - name: Finalize staged policy change
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event.head_commit.message }}" != "chore: stage ping policy finalizer" ]; then
+            exit 0
+          fi
+          cargo fmt -- src/master/executor/ping_leg.rs
+          cd ui
+          npm ci
+          npm run build
+          cd ..
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/master/executor/ping_leg.rs src/master/webui.html
+          git commit -m 'build: finalize wifi-aware ping policy'
+          git push origin HEAD:feat/webui-vue
