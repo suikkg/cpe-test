@@ -13,20 +13,10 @@ pub(super) struct ConnectReq {
     pub(super) port: u16,
     #[serde(default)]
     pub(super) token: String,
-    /// 网卡列表的 IPv4 前缀过滤；空列表 = 列出全部网卡。
-    ///
-    /// 必须能在界面上改：默认只放行 `192.168.`，在 10.x / 172.x 的实验网里
-    /// 会把整张网卡表过滤成空，而控制台存在的意义就是让人不必回去手改
-    /// config.json。
     #[serde(default)]
     pub(super) ipv4_prefixes: Option<Vec<String>>,
 }
 
-/// 本机网卡与工具链。连接辅测机之前就可用。
-///
-/// 有意**不按 `ipv4_prefixes` 过滤**，理由和辅测机状态页那份一样：要填给对面的
-/// 那个地址常常就在被过滤掉的管理网段上，过滤过的表在这里等于把答案藏起来。
-/// 「网口与策略」那张表才是按前缀筛过的测试口列表，两者用途不同。
 pub(super) fn api_local() -> Result<serde_json::Value, String> {
     serde_json::to_value(LocalOut {
         host: crate::nic::scan_host(&[]),
@@ -41,32 +31,7 @@ pub(super) fn api_bootstrap(console: &Arc<Console>) -> Result<serde_json::Value,
     serde_json::to_value(bootstrap_out(&state)).map_err(|error| error.to_string())
 }
 
-/// 顶部参数区的回填值。打开页面（`/api/bootstrap`）和导入 config
-/// （`/api/import`）共用这一份，两条路填出来的输入框必须一模一样。
-/// 打开页面时的回填值。
-///
-/// # 这里的「反推段」是 legacy 通路专用的（R5 的处置）
-///
-/// 下面那几段从 `cfg.tests` **反推**默认档位的代码（TCP `-P`、UDP 流数、
-/// ping 次数与包长）只服务两个调用方：
-///   1. `/api/bootstrap` 里给**旧矩阵界面**回填执行区那几个框；
-///   2. `api_import` 判断「文件里哪些参数和默认组不一样」。
-///
-/// **v6.0 的前端一个都不读。** 默认参数组按 DESIGN §7 第 4 条显式建模在
-/// `ui/src/state/plan.ts` 里——旧页那种「快速工作台的顶层档位悄悄读高级矩阵的
-/// `TCP_GROUPS[0]`」的跨面板隐性耦合（§4.1-A12）在新结构里不存在。
-///
-/// 原计划（R5）是随矩阵退役把这段删掉。核查后没删：`api_import` 仍然依赖它，
-/// 而 ADR-13 明确要求 `/api/import` **只封存不删**（serde/DTO 保持兼容，
-/// 只是界面上没有入口）。删掉反推段等于把那个端点一起废掉，与 ADR-13 冲突。
-/// 真要清理，得先确定不再需要读旧 `config.json`——那是另一次决策。
 pub(super) fn bootstrap_out(state: &UiState) -> BootstrapOut {
-    // 默认组的 -P 档位 = **跑默认 -w 档位的那些 TCP test** 的流数集合。
-    //
-    // 和下面 udp_streams 同一个坑：不能把所有 TCP test 的流数并起来。矩阵里选了
-    // 别的 TCP 参数组的行，它们的流数排在前面，会被当成默认组的填进执行区那一格
-    // ——于是导进来的默认组变成另一份东西，而它管着所有没选组的行。默认组的
-    // -w 存在 `iperf.tcp_windows` 里（附加组各带各的 tcp_windows），按它筛。
     let default_windows = &state.cfg.iperf.tcp_windows;
     let mut tcp_streams: Vec<u32> = state
         .cfg
@@ -86,11 +51,6 @@ pub(super) fn bootstrap_out(state: &UiState) -> BootstrapOut {
     if tcp_streams.is_empty() {
         tcp_streams.push(10);
     }
-    // 默认组的流数 = **跑默认档位的那条 UDP test** 的流数。
-    //
-    // 不能只取「第一条带 udp_streams 的 test」：矩阵里某一行选了别的参数组时，
-    // 它的 test 排在前面，那个组的流数会被当成默认组的填进执行区那一格——
-    // 于是导进来的默认组变成另一份东西，而它管着所有没选组的行。
     let udp_tests = state
         .cfg
         .tests
@@ -108,10 +68,6 @@ pub(super) fn bootstrap_out(state: &UiState) -> BootstrapOut {
         .and_then(|test| test.udp_streams)
         .filter(|value| *value > 0)
         .unwrap_or(1);
-    // ping 的次数和包长和 tcp_streams 一样只落在 tests[] 上（界面就是这么写下去
-    // 的），只读 cfg.ping 的话，一份「ping 50 次 × 64 字节」的配置回填出来是
-    // 默认的「100 次 × 32/1600/65500」——三倍的单元数，而人看着框里的数字
-    // 以为就是文件里的那份。
     let ping_count = state
         .cfg
         .tests
@@ -134,8 +90,6 @@ pub(super) fn bootstrap_out(state: &UiState) -> BootstrapOut {
         duration: state.cfg.iperf.duration,
         tcp_windows: state.cfg.iperf.tcp_windows.clone(),
         tcp_streams,
-        // 和 -l / -w 一样要去重：一档 `-b` 会因为 `-l`/`-w` 的每个档位各生成
-        // 一份 profile，照抄进输入框的话，「下载 → 导入」每走一轮档位就翻一倍。
         udp_bandwidths: distinct(
             state
                 .cfg
@@ -163,12 +117,12 @@ pub(super) fn bootstrap_out(state: &UiState) -> BootstrapOut {
         udp_streams,
         ping_count,
         ping_payload_sizes,
+        ping_max_rtt_ms: state.cfg.ping.max_rtt_ms,
         screenshot: state.cfg.screenshot,
         ui_plan_supported: true,
     }
 }
 
-/// 回显成用户当初的写法：绝对值回显数字，百分比回显 `90%`。
 pub(super) fn rx_target_text(mbps: Option<f64>, percent: Option<f64>) -> String {
     match (mbps, percent) {
         (Some(mbps), _) => format!("{mbps}"),
@@ -193,7 +147,6 @@ pub(super) fn configured_nic_policies(
             {
                 policies.push(NicPolicySelection {
                     endpoint: format!("{host}:NAME={}", nic.name),
-                    // 回显成用户当初的写法：绝对值回显数字，百分比回显 `90%`。
                     rx_target: rx_target_text(profile.rx_target_mbps, profile.rx_target_percent),
                     udp_bandwidth: profile.udp_bandwidth.clone().unwrap_or_default(),
                     udp_length: profile.udp_length.clone().unwrap_or_default(),
@@ -213,12 +166,9 @@ pub(super) fn api_connect(console: &Arc<Console>, body: &str) -> Result<serde_js
     if req.port > 0 {
         state.cfg.agent_port = req.port;
     }
-    // 页面不回显配置文件里的 token；输入留空时沿用已加载值，手工填写时覆盖。
     if !req.token.is_empty() {
         state.cfg.agent_token = req.token.clone();
     }
-    // 前缀框清空是一个有意义的选择（= 列出全部网卡），所以用 Option 区分
-    // 「没提交这个字段」和「提交了一个空列表」，不能用 is_empty 兜。
     if let Some(prefixes) = &req.ipv4_prefixes {
         state.cfg.ipv4_prefixes = cleaned_list(prefixes);
     }
@@ -272,7 +222,6 @@ pub(super) fn api_plan(console: &Arc<Console>, body: &str) -> Result<serde_json:
         return Err("还没连上辅测机，先点「连接」".into());
     }
     let mut compiled = compile_request(&state, &req)?;
-    // resume 开着时提示并扣除预判会跳过的单元；executor 运行时仍会再判一次。
     let skip_count = compiled.resumed.iter().filter(|skipped| **skipped).count();
     if compiled.cfg.resume {
         compiled.notices.push(if skip_count == 0 {
@@ -341,11 +290,8 @@ pub(super) fn api_run(console: &Arc<Console>, body: &str) -> Result<serde_json::
     if console.running.swap(true, Ordering::SeqCst) {
         return Err("已经有一轮测试在跑了".into());
     }
-    // 必须和 running 的占位动作绑定：停止请求不能插在这里之后、reset 之前，
-    // 否则它会被新一轮清掉，表现成“点击停止偶尔不生效”。
     crate::cancel::reset();
     drop(run_gate);
-    // 复核页确认过的执行计划哈希，随 run_master 一路带到真正开跑之前再核一次。
     let confirmed_plan_hash;
     let cfg = {
         let state = lock_recover(&console.state);
@@ -406,8 +352,6 @@ pub(super) fn api_run(console: &Arc<Console>, body: &str) -> Result<serde_json::
         return Err("一个测试项都没勾".into());
     }
 
-    // 界面状态先落成一份真实的临时 config，作为 run_master 的统一入口；
-    // 需要长期保留的副本由 /api/config 下载，工作线程结束后会删除这里的文件。
     let path = std::env::temp_dir().join(format!("cpe_test_ui_{}.json", std::process::id()));
     let json = match serde_json::to_string_pretty(&cfg) {
         Ok(json) => json,
@@ -423,9 +367,6 @@ pub(super) fn api_run(console: &Arc<Console>, body: &str) -> Result<serde_json::
 
     clear_log_mirror();
     lock_recover(&console.report).clear();
-    // 上一轮的结构化状态必须**在这里**就丢掉，不能等 worker 线程里的
-    // `run_started`：那之间要读配置、扫拓扑、建计划，够 1s 轮询打好几拍，
-    // 而那几拍回的是上一轮已完成的全套单元。
     console.run_status.reset();
     let worker_console = Arc::clone(console);
     let request_snapshot = body.to_string();
@@ -441,14 +382,8 @@ pub(super) fn api_run(console: &Arc<Console>, body: &str) -> Result<serde_json::
                     config_path: Some(config_path),
                     auto: true,
                     no_open: true,
-                    // 复核页确认过什么就跑什么：执行端会自己再推导一次计划，
-                    // 对不上这个哈希就拒绝开跑。
                     expected_plan_hash: confirmed_plan_hash,
-                    // 控制台要结构化进度：executor 会把每个状态转移点回调进来，
-                    // `/api/progress` 直接把它吐给前端，不必再解析日志文本。
                     observer: Some(run_observer),
-                    // 计划原文随 run 目录落盘，「重新执行这一轮」才有得可读。
-                    // 里面没有任何口令（`RunRequest` 不含 agent_token）。
                     console_request: Some(request_snapshot),
                     ..Default::default()
                 })
@@ -469,18 +404,8 @@ pub(super) fn api_run(console: &Arc<Console>, body: &str) -> Result<serde_json::
     Ok(serde_json::json!({ "started": true }))
 }
 
-/// 把临时 config 写成只有本人可读的文件。
-///
-/// 这份 config 里带着 `agent_token`，而 `std::env::temp_dir()` 在 Linux/macOS 上
-/// 就是全局可读的 /tmp、`fs::write` 建出来的是 0644——同机的任何账号都能在这一轮
-/// 测试期间把它 cat 出来。命令行那边特意支持用环境变量传 token，就是为了不让它
-/// 落进 shell 历史和 ps 里给同机的人看见；这里不能又原样漏回去。
-///
-/// Windows 上 temp 目录本就是每个用户各一份，按默认 ACL 建文件即可。
 pub(super) fn write_private_config(path: &Path, contents: &str) -> std::io::Result<()> {
     use std::io::Write;
-    // `mode()` 只在**创建**那一刻生效。同 pid 的上一轮如果留下过一个 0644 的
-    // 残file，truncate 会沿用它原来的权限，所以先删干净再 create_new。
     let _ = std::fs::remove_file(path);
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -521,33 +446,19 @@ pub(super) fn api_progress(console: &Arc<Console>, query: &str) -> serde_json::V
         .find_map(|kv| kv.strip_prefix("from="))
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(0);
-    // 单元游标独立于日志游标：日志是按行走的，单元是按单元走的，两者的推进
-    // 速度差三个数量级（一个单元几百行日志）。共用一个游标会让「只要有新日志
-    // 就把已跑完的 200 个单元再传一遍」。
     let units_from = query
         .split('&')
         .find_map(|kv| kv.strip_prefix("units_from="))
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(0);
-    // 前端手上那个 `run_id`。游标只在一轮之内有意义，对不上就该整份重来——
-    // 光看「越界」补不全：新一轮已经跑过陈旧游标时，越界判据根本不触发。
-    // 缺这个参数（老客户端、curl）时退回只按越界判，行为不变。
     let client_run_id = query
         .split('&')
         .find_map(|kv| kv.strip_prefix("run_id="))
         .map(urldecode);
     let (total, lines) = log_tail_since(from);
-    // `units_from` 可能是上一轮留下的越界游标；`snapshot` 会把它自愈成 0 并
-    // 全量重传，所以这里要用**它实际生效的那个值**去算回给前端的下一拍游标，
-    // 不能再用请求里那个。
     let (units_from, run) = console
         .run_status
         .snapshot(units_from, client_run_id.as_deref());
-    // 报告路径由 executor 的回调直接送来（`RunObserver::report_written`）。
-    //
-    // 在此之前这里是**在日志里搜「报告已生成: 」**捞出来的——那让一句给人看的
-    // 提示语变成了协议：改个措辞，界面上的「打开报告」就永远是灰的。
-    // `console.report` 仍然维护，因为 `/api/open-report` 读它。
     {
         let mut report = lock_recover(&console.report);
         if report.is_empty() && !run.report.is_empty() {
