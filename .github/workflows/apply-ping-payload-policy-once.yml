@@ -16,7 +16,9 @@ jobs:
           ref: feat/webui-vue
           fetch-depth: 0
       - name: Apply migration
-        run: python3 .github/scripts/apply_ping_payload_policy.py
+        run: |
+          python3 .github/scripts/apply_ping_payload_policy.py
+          python3 .github/scripts/fix_ping_policy_test_fixtures.py
       - name: Format and validate Rust
         run: |
           cargo fmt
