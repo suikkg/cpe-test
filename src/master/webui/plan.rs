@@ -23,32 +23,20 @@ pub(super) fn validated_config_from_request(
     }
 }
 
-/// 一轮里所有配对共用的档位。
-///
-/// 逐对覆盖只在这几项上做减法（某一行自己的 `-b`、自己的流数），所以把它们收成
-/// 一个东西传给 `specs_for_pair`，而不是把七八个列表一路传参——那样每加一档
-/// 扫描维度就要改三处签名。
 pub(super) struct Sweeps {
-    /// 第 0 项是默认组（执行区的 `-w` / `-P` 两个框），其余是附加组。
     pub(super) tcp_groups: Vec<ResolvedTcpGroup>,
-    /// 第 0 项是默认组（执行区那几个框），其余是附加组。
     pub(super) udp_groups: Vec<ResolvedUdpGroup>,
     pub(super) ping_sizes: Vec<u32>,
     pub(super) duration: u64,
-    /// 在「网口与策略」里单独指定了 UDP `-b` 的网口。
     pub(super) pinned_senders: HashSet<String>,
 }
 
-/// 一组 UDP 参数展开成「跑什么」。
 #[derive(Debug, Clone, Default)]
 pub(super) struct ResolvedUdpGroup {
     pub(super) bandwidths: Vec<String>,
     pub(super) lengths: Vec<String>,
     pub(super) windows: Vec<String>,
     pub(super) streams: u32,
-    /// 只有默认组会用到：执行区的 `-b` 留空时，沿用配置文件里那份 profile
-    /// **原样**。那份不一定是整齐的叉积（可以是 `1m/64` + `500m/1400`），
-    /// 拆成三个轴再乘回去会把它变成另一组档位。
     pub(super) verbatim: Option<Vec<UdpProfile>>,
 }
 
@@ -64,18 +52,13 @@ impl ResolvedUdpGroup {
     }
 }
 
-/// 一组 TCP 参数展开成「跑什么」：`-w × -P` 两个轴。第 0 组是默认组。
 #[derive(Debug, Clone, Default)]
 pub(super) struct ResolvedTcpGroup {
-    /// socket buffer 档位。默认组经过 `non_empty` 兜底不会为空；附加组留空
-    /// 表示这一维不下发 `-w`（builder 见到空列表跑一条不带 `-w` 的）。
     pub(super) windows: Vec<String>,
-    /// 并发流数档位；空按 `[1]`（builder 那边 -P 恒发，和 UDP 流数同理）。
     pub(super) stream_steps: Vec<u32>,
 }
 
 impl Sweeps {
-    /// 选中的那一组。越界回落到默认组——校验已经挡过一次，这里不该再 panic。
     pub(super) fn udp_group(&self, index: usize) -> &ResolvedUdpGroup {
         self.udp_groups.get(index).unwrap_or(&self.udp_groups[0])
     }
@@ -84,8 +67,6 @@ impl Sweeps {
     }
 }
 
-/// 把界面状态翻译成一份 config。规划和执行都走这一个函数，
-/// 保证「预计耗时」和真正跑的是同一份东西。
 pub(super) fn config_from_request(state: &UiState, req: &RunRequest) -> Config {
     if let Some(plan) = req.ui_plan.as_ref() {
         return config_from_ui_plan(state, req, plan);
@@ -99,6 +80,9 @@ pub(super) fn config_from_request(state: &UiState, req: &RunRequest) -> Config {
     cfg.pairs = None;
     cfg.universal_params = None;
     cfg.link_profiles.by_nic.clear();
+    if req.ping_max_rtt_ms != 0.0 {
+        cfg.ping.max_rtt_ms = req.ping_max_rtt_ms;
+    }
 
     let windows = non_empty(&req.tcp_windows, &cfg.iperf.tcp_windows);
     let stream_steps: Vec<u32> = {
@@ -111,10 +95,6 @@ pub(super) fn config_from_request(state: &UiState, req: &RunRequest) -> Config {
     };
     let lengths = cleaned_list(&req.udp_lengths);
     let udp_windows = cleaned_list(&req.udp_windows);
-    // 保序去重。`dedup()` 只合并相邻项，「32 1600 32」会留下两个 32——两个单元
-    // 标题和 resume id 完全一样，在 task_results.json 里互相覆盖（后写的那条
-    // 赢），resume 于是可能跳过一个其实 FAIL 了的单元，还白跑一遍全程。
-    // 也不能先排序：档位顺序是用户自己排的，跑的顺序就该照他写的来。
     let mut seen_sizes = HashSet::new();
     let ping_sizes: Vec<u32> = req
         .ping_payload_sizes
@@ -122,8 +102,6 @@ pub(super) fn config_from_request(state: &UiState, req: &RunRequest) -> Config {
         .copied()
         .filter(|size| *size > 0 && seen_sizes.insert(*size))
         .collect();
-    // 默认组的档位同时写回 `iperf.udp_profiles`：下载出来的 config 交给
-    // `master --auto` 跑时，没有「组」这个概念，读的就是这一份。
     let global_udp: Vec<UdpProfile> = req
         .udp_bandwidths
         .iter()
@@ -141,7 +119,6 @@ pub(super) fn config_from_request(state: &UiState, req: &RunRequest) -> Config {
         }
     }
 
-    // 默认组 = 执行区那几个框；`-b` 留空时沿用配置文件里那份 profile 原样。
     let bandwidths = cleaned_list(&req.udp_bandwidths);
     let mut udp_groups = vec![ResolvedUdpGroup {
         verbatim: bandwidths
@@ -160,13 +137,10 @@ pub(super) fn config_from_request(state: &UiState, req: &RunRequest) -> Config {
         verbatim: None,
     }));
 
-    // 默认 TCP 组 = 执行区的 `-w` / `-P`。`windows` 已经过 `non_empty` 兜底
-    // （空则回落到配置里的 tcp_windows），`stream_steps` 空则是 `[1]`。
     let mut tcp_groups = vec![ResolvedTcpGroup {
         windows: windows.clone(),
         stream_steps: stream_steps.clone(),
     }];
-    // 附加组不兜底：`-w` 留空就是那一维不下发 `-w`；`-P` 留空按 `[1]`。
     tcp_groups.extend(req.tcp_groups.iter().map(|group| {
         let steps: Vec<u32> = group.streams.iter().copied().filter(|n| *n > 0).collect();
         ResolvedTcpGroup {
@@ -191,9 +165,6 @@ pub(super) fn config_from_request(state: &UiState, req: &RunRequest) -> Config {
     cfg
 }
 
-/// Apply the request-wide settings shared by legacy and suite requests.  The
-/// suite compiler calls this directly so it does not have to manufacture a
-/// `PairSelection` (which would re-introduce the old shared TCP/UDP fields).
 pub(super) fn ui_request_base_config(state: &UiState, req: &RunRequest) -> Config {
     let mut cfg = state.cfg.clone();
     cfg.agent_host = state.agent_host.clone();
@@ -205,12 +176,6 @@ pub(super) fn ui_request_base_config(state: &UiState, req: &RunRequest) -> Confi
     cfg.universal_params = None;
     cfg.link_profiles.by_nic.clear();
 
-    // Quick-plan tasks intentionally keep protocol-specific knobs on the
-    // task, but PING's convenient default controls still live at the request
-    // level (the same controls used by the legacy matrix).  Carry them into
-    // the compiled config before a task falls back to cfg.ping; otherwise a
-    // user changing "5 次 / 64 字节" in the quick workbench would silently
-    // execute the values from the loaded config instead.
     if req.ping_count > 0 {
         cfg.ping.count = req.ping_count;
     }
@@ -222,6 +187,9 @@ pub(super) fn ui_request_base_config(state: &UiState, req: &RunRequest) -> Confi
             .copied()
             .filter(|size| *size > 0 && seen.insert(*size))
             .collect();
+    }
+    if req.ping_max_rtt_ms != 0.0 {
+        cfg.ping.max_rtt_ms = req.ping_max_rtt_ms;
     }
 
     let tcp_windows = non_empty(&req.tcp_windows, &cfg.iperf.tcp_windows);
@@ -322,8 +290,6 @@ pub(super) fn recipe_tcp_profiles(
             });
         }
     }
-    // An entirely empty recipe is a valid fixed recipe: one TCP stream and no
-    // explicit socket window.
     if out.is_empty() {
         out.push(UiTcpProfile {
             recipe_id: recipe.id.clone(),
@@ -498,21 +464,11 @@ pub(super) fn ui_task_targets(task: &UiTask) -> Option<crate::config::RateTarget
     })
 }
 
-/// 报表分组键的第一优先来源：链路集合的**名字**。
-///
-/// 名字是用户资产（他自己起的「SGMII 直连」「Wi-Fi 5G」），比任何自动推导都贴近
-/// 他心里的分组。留空时报表回落到物理网口对、再回落到角色对——**永远不用主机名**，
-/// Arch 机自报 `UNKNOWN-PC`，拿它当键会把一整批链路并成一组。
 pub(super) fn ui_link_group(link_set: &UiLinkSet) -> Option<String> {
     let name = link_set.name.trim();
     (!name.is_empty()).then(|| name.to_string())
 }
 
-/// 这条 spec 是从界面计划的哪个格子来的。
-///
-/// 取代原来把七段 URL 编码塞进 `TestSpec.name` 的做法（`ui-plan/set/binding/...`）：
-/// 那是整条计划链路上唯一的 stringly 侧信道，靠约定不靠类型，而且把一个给人看的
-/// 字段占成了机器读的协议——报错信息里于是全是 `%E5%9F%BA%E7%BA%BF` 这种东西。
 pub(super) fn ui_origin_for(
     link_set: &UiLinkSet,
     binding_id: &str,
@@ -532,10 +488,6 @@ pub(super) fn ui_origin_for(
     }
 }
 
-/// `TestSpec.name` 现在只是**给人看的名字**。
-///
-/// 它会出现在 notices（「跳过 X: 原因」）、spec 错误和导出的 `config.json` 里。
-/// 之前那份 URL 编码的名字在这三处都是噪声。
 pub(super) fn ui_display_name(suite: &UiSuite, task: &UiTask, label: &str) -> String {
     let mut parts: Vec<&str> = Vec::new();
     if !suite.name.trim().is_empty() {
@@ -589,7 +541,6 @@ pub(super) fn ui_task_base_spec(
         rate_mode: task.rate_mode,
         rate_targets_mbps: task.rate_targets_mbps.clone(),
         rate_targets_bidir_mbps: ui_task_targets(task),
-        // 溯源与分组由调用方按每条 spec 填：recipe_id 逐 spec 不同。
         link_group: None,
         origin: None,
     }
@@ -694,9 +645,6 @@ pub(super) fn ui_specs_for_task(
                 udp_streams: vec![req.udp_streams.max(1)],
                 ..Default::default()
             };
-            // With no suite recipe and no request-wide UDP axes, preserve the
-            // configured profile list verbatim (it may be intentionally
-            // non-Cartesian) instead of reconstructing it from bandwidths.
             if req.udp_bandwidths.is_empty()
                 && req.udp_lengths.is_empty()
                 && req.udp_windows.is_empty()
@@ -714,11 +662,6 @@ pub(super) fn ui_specs_for_task(
             let dst_pinned = req.nic_policies.iter().any(|policy| {
                 policy.endpoint == pair.dst && !policy.udp_bandwidth.trim().is_empty()
             });
-            // A pinned sending leg does not depend on the recipe bandwidth.
-            // Collapse such profiles by their remaining dimensions so a scan
-            // over 1G/2G/3G does not run the exact same pinned command three
-            // times.  Keep stream count in the key because it is an actual
-            // execution dimension even when `-b` is overridden.
             let mut pinned_profiles_seen: HashSet<String> = HashSet::new();
             for recipe in recipes {
                 for profile in recipe_udp_profiles(recipe, &fallback_bandwidths, req.udp_streams) {
@@ -737,11 +680,7 @@ pub(super) fn ui_specs_for_task(
                             "{:?}|{:?}|{}",
                             profile.profile.length, profile.profile.window, profile.streams
                         );
-                        if !pinned_profiles_seen.insert(pinned_key) {
-                            // The same pinned profile was already emitted for
-                            // this task/recipe.  Swept directions still need
-                            // every profile and are handled below.
-                        } else {
+                        if pinned_profiles_seen.insert(pinned_key) {
                             let mut spec = ui_task_base_spec(
                                 ui_display_name(suite, task, "UDP（按网口策略钉死）"),
                                 pair,
@@ -854,8 +793,6 @@ pub(super) fn config_from_ui_plan(state: &UiState, req: &RunRequest, plan: &UiPl
                     tasks.push(task);
                 }
             }
-            // Validation permits a partial order for forward compatibility;
-            // append unmentioned tasks in declaration order.
             for task in &suite.tasks {
                 if !suite.order.iter().any(|id| id == &task.id) {
                     tasks.push(task);
@@ -881,10 +818,6 @@ pub(super) fn config_from_ui_plan(state: &UiState, req: &RunRequest, plan: &UiPl
     cfg
 }
 
-/// 这一行要跑哪几组：去重保序，空列表按「只跑默认组」解读。
-///
-/// 去重是必须的：同一组选两次会生成两批同名单元，resume 里互相覆盖，
-/// 后写的那条赢——于是可能跳过一个其实 FAIL 了的单元。
 pub(super) fn selected_udp_groups(pair: &PairSelection) -> Vec<usize> {
     if pair.udp_groups.is_empty() {
         return vec![0];
@@ -897,7 +830,6 @@ pub(super) fn selected_udp_groups(pair: &PairSelection) -> Vec<usize> {
         .collect()
 }
 
-/// TCP 版的同一件事：去重保序，空列表按「只跑默认组」解读。
 pub(super) fn selected_tcp_groups(pair: &PairSelection) -> Vec<usize> {
     if pair.tcp_groups.is_empty() {
         return vec![0];
@@ -910,10 +842,6 @@ pub(super) fn selected_tcp_groups(pair: &PairSelection) -> Vec<usize> {
         .collect()
 }
 
-/// 矩阵里的一行 -> 若干条 TestSpec。
-///
-/// 一行会被拆开是因为配置模型里 `tcp_streams` 是标量、ping 挂在 `kinds` 上、
-/// 而 UDP 的「被网口钉死的方向」和「还要扫档位的方向」用的是两份不同的档位。
 pub(super) fn specs_for_pair(
     idx: usize,
     pair: &PairSelection,
@@ -925,13 +853,8 @@ pub(super) fn specs_for_pair(
     let ip = pair.ip.clone();
     let wants = |t: &str| pair.transports.iter().any(|x| x == t);
     let (want_tcp, want_udp) = (wants("tcp"), wants("udp"));
-    // ping 在配置模型里是 `kinds` 而不是 `transports`——界面把它和 TCP/UDP
-    // 并排放在「协议」列只是给人看的，落到 config 上必须分开：ping 单元
-    // 不带 transport，走 builder 里那条独立分支。
     let want_ping = wants("ping");
 
-    // 双向门限只有勾了「双向」才有意义；没勾时不写进 config，
-    // 免得它出现在下载下来的 config.json 里让人以为在生效。
     let bidir_targets = directions
         .iter()
         .any(|d| d == "bidir")
@@ -959,8 +882,6 @@ pub(super) fn specs_for_pair(
         ip: ip.clone(),
         streams: 1,
         tcp_streams: None,
-        // UDP 流数只写在 UDP 单元上。写在 TCP/ping 单元上既没有意义，又会让
-        // 回填时分不清「默认组的流数」是哪一个（那边是按 tests[] 反推的）。
         udp_streams: None,
         iperf_duration: Some(sweeps.duration),
         ping_count: None,
@@ -969,23 +890,13 @@ pub(super) fn specs_for_pair(
         udp_profiles: None,
         rate_mode: None,
         rate_targets_mbps: None,
-        // 高级矩阵路径没有链路集合/套件的概念，溯源与分组自然为空；
-        // 报表会回落到物理网口对。
         link_group: None,
         origin: None,
     };
 
-    // TCP 每个 -P 档位独立成一份 TestSpec：`tcp_streams` 在配置模型里是标量，
-    // 而 -w 本来就是数组，由 builder 自己展开。TCP/UDP 也必须拆开，否则
-    // 「3 个 -P 档位」会把与 -P 无关的 UDP 单元复制三遍。
-    // 选中的每一组各生成一批 TCP 单元（`-w × -P`）。同一行选两组 = 这一对
-    // 跑两遍，参数各按各的组来——和 UDP 的多组展开一模一样。
     if want_tcp {
         for group_index in selected_tcp_groups(pair) {
             let tcp = sweeps.tcp_group(group_index);
-            // 默认组沿用原来的单元名（`ui-N-tcp-P{P}`），改名会改掉 resume id
-            // ——虽然 TCP 的 resume id 只认 profile（-w/-P），不认 spec.name，
-            // 这里保持一致仍是对的。别的组各带一个后缀。
             let suffix = if group_index == 0 {
                 String::new()
             } else {
@@ -997,23 +908,17 @@ pub(super) fn specs_for_pair(
                     vec!["tcp".into()],
                 );
                 spec.tcp_streams = Some(*streams);
-                // 空列表原样传给 builder：它把「没有 -w 档位」跑成一条不带 -w
-                // 的 TCP。默认组经过 non_empty 兜底不会走到这一支。
                 spec.tcp_windows = Some(tcp.windows.clone());
                 tests.push(spec);
             }
         }
     }
-    // 选中的每一组各生成一批 UDP 单元。同一行选两组 = 这一对跑两遍，
-    // 参数各按各的组来。
     for group_index in selected_udp_groups(pair) {
         if !want_udp {
             break;
         }
         let udp = sweeps.udp_group(group_index);
         let udp_streams = udp.streams;
-        // 第 0 组沿用原来的单元名：改名会改掉 resume id，让历史 PASS 全部失效。
-        // 别的组各带一个后缀，否则同一对的两批单元同名、resume 里互相覆盖。
         let suffix = if group_index == 0 {
             String::new()
         } else {
@@ -1021,11 +926,6 @@ pub(super) fn specs_for_pair(
         };
         let src_pinned = sweeps.pinned_senders.contains(&pair.src);
         let dst_pinned = sweeps.pinned_senders.contains(&pair.dst);
-        // 一个方向的每条发送腿都有按网口覆盖时，全局 -b 档位对它不起作用：
-        // builder 会把每一档都替换回那个覆盖值，扫 N 档就得到 N 个完全相同
-        // 的单元。必须**逐方向**判断而不是整对判断——「ab 被发送端钉死、
-        // 反向 ba 仍要扫档位」是最常见的组合，按整对判断时那三个 ab 单元
-        // 会一模一样地各跑一遍全程。
         let pinned_direction = |d: &String| match d.as_str() {
             "ab" => src_pinned,
             "ba" => dst_pinned,
@@ -1036,8 +936,6 @@ pub(super) fn specs_for_pair(
             directions.iter().cloned().partition(pinned_direction);
 
         if !pinned.is_empty() {
-            // 占位值：builder 会按腿替换成各自的精确覆盖值，这里填什么都行，
-            // 取一个真实值只是为了万一覆盖项被后续校验剔除时不至于离谱。
             let placeholder = req
                 .nic_policies
                 .iter()
@@ -1053,13 +951,10 @@ pub(super) fn specs_for_pair(
             );
             spec.direction = OneOrMany::Many(pinned);
             spec.udp_streams = Some(udp_streams);
-            // -b 被网口钉死，但 -l 档位仍要逐档跑：钉住的是带宽，不是报文长度。
             spec.udp_profiles = Some(udp_profiles_for(placeholder, &udp.lengths, &udp.windows));
             tests.push(spec);
         }
         if !swept.is_empty() {
-            // 还有腿没被覆盖的方向照常逐档扫描；已覆盖的那条腿在每个单元里
-            // 保持固定值（双向单元里一钉一扫就是这种情况）。
             let mut spec = base(format!("ui-{}-udp{suffix}", idx + 1), vec!["udp".into()]);
             spec.direction = OneOrMany::Many(swept);
             spec.udp_streams = Some(udp_streams);
@@ -1068,10 +963,6 @@ pub(super) fn specs_for_pair(
         }
     }
     if want_ping {
-        // 每个包长档位在 builder 里各成一个单元，所以这里必须让界面把
-        // 次数和包长填全：不填就回落到 ping.count=100 × 三档包长，
-        // 每个配对每个方向平白多出三个各一百多秒的单元，而这件事要到
-        // 「预览任务」才看得见，太晚了。
         let mut spec = base(format!("ui-{}-ping", idx + 1), Vec::new());
         spec.kinds = vec!["ping".into()];
         spec.ping_count = (req.ping_count > 0).then_some(req.ping_count);
@@ -1083,10 +974,6 @@ pub(super) fn specs_for_pair(
     tests
 }
 
-/// 去空白、丢空项。手抄进来的参数列表和网段前缀共用这一份清洗。
-///
-/// 只清洗，不替换成默认值：清洗后剩下空列表在两处都是有意义的选择
-/// （前缀清空 = 列出全部网口，`-l` 清空 = 不下发 `-l`）。
 pub(super) fn cleaned_list(raw: &[String]) -> Vec<String> {
     raw.iter()
         .map(|value| value.trim().to_string())
@@ -1094,11 +981,6 @@ pub(super) fn cleaned_list(raw: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// 一个 `-b` 档位 × 全部 `-l` 档位 × 全部 `-w` 档位。
-///
-/// 某一项留空就在那一维退化成一档、且**完全不下发该参数**——不能拿 iperf3 的
-/// 默认值写死进命令，那会把「没指定」变成「指定了某个具体值」，两者在报告里
-/// 读起来完全不同。
 pub(super) fn udp_profiles_for(
     bandwidth: &str,
     lengths: &[String],
@@ -1128,14 +1010,11 @@ pub(super) fn udp_profiles_for(
     out
 }
 
-/// 保序去重。配置文件里同一个 `-l` / `-w` 常在多个档位上重复出现，
-/// 回填到界面时得压成一份，否则一打开页面档位就自己翻倍。
 pub(super) fn distinct(values: impl Iterator<Item = String>) -> Vec<String> {
     let mut seen = HashSet::new();
     values.filter(|value| seen.insert(value.clone())).collect()
 }
 
-/// 界面没填就退回配置文件里的既有值，不要用空列表把它清掉。
 pub(super) fn non_empty(picked: &[String], fallback: &[String]) -> Vec<String> {
     let cleaned: Vec<String> = picked
         .iter()
@@ -1149,12 +1028,6 @@ pub(super) fn non_empty(picked: &[String], fallback: &[String]) -> Vec<String> {
     }
 }
 
-/// 配对门限只收绝对 Mbps。
-///
-/// 百分比要拿接收端网卡的协商速率来换算，而这个值每个单元开跑前才重扫；
-/// 配对门限是「这两块口凑在一起、并发时的能力」，跟单独一块口的协商速率
-/// 不成比例——`WIFI5G 2882Mbps × 50%` 和「和 RNDIS 组双向时能收到多少」
-/// 没有关系。收百分比只会给出一个看着有依据、其实是瞎算的数。
 pub(super) fn rx_target_mbps(target: RxTarget) -> Option<f64> {
     match target {
         RxTarget::Mbps(value) => Some(value),
@@ -1162,7 +1035,6 @@ pub(super) fn rx_target_mbps(target: RxTarget) -> Option<f64> {
     }
 }
 
-/// `master:NAME=以太网 6` -> 一条 by_nic 覆盖。三项全空就不生成覆盖项。
 pub(super) fn nic_profile(policy: &NicPolicySelection) -> Option<crate::config::NicProfile> {
     let target = parse_rx_target(&policy.rx_target).ok().flatten();
     let bandwidth = policy.udp_bandwidth.trim();
@@ -1191,11 +1063,6 @@ pub(super) fn nic_profile(policy: &NicPolicySelection) -> Option<crate::config::
     })
 }
 
-/// 一个单元里每条腿最终下发的参数，一行一条腿。
-///
-/// 直接读 `IperfTask.extra`——那就是要交给 iperf3 的东西，不是这里再算一遍。
-/// 再算一遍就会有第二份口径，两份迟早对不上，而这行字存在的意义正是「所见即
-/// 所跑」。
 pub(super) fn unit_load_lines(unit: &builder::Unit) -> Vec<String> {
     unit.legs
         .iter()
@@ -1203,14 +1070,9 @@ pub(super) fn unit_load_lines(unit: &builder::Unit) -> Vec<String> {
             let (task, streams) = match &leg.kind {
                 builder::LegKind::IperfSingle(task) => (task, 1),
                 builder::LegKind::IperfGroup { streams, .. } => (streams.first()?, streams.len()),
-                // ctsTraffic 和 ping 的参数不在这套 -b/-l/-w 里，标题已经说清了。
                 _ => return None,
             };
             let mut text = String::new();
-            // 方向优先取这条腿自己的 tag（双向单元的两条腿分别是 ab/ba）；
-            // 单向单元的 tag 是空串——那个空串在执行侧有「单向」的语义，不能
-            // 为了显示去改，所以回退到单元自己的规范方向。不这么兜的话，
-            // 预览里双向单元每行带方向、单向单元不带，同一份清单两种样子。
             let direction = if leg.tag.is_empty() {
                 unit.direction.as_str()
             } else {
@@ -1227,8 +1089,6 @@ pub(super) fn unit_load_lines(unit: &builder::Unit) -> Vec<String> {
                 }
             }
             text.push_str(&readable_args(&task.extra));
-            // iperf3 的 `-P` 由它自己开流，UDP 这边是我们逐流起进程，
-            // 两种「流数」在命令里长得不一样，所以只给后者补一句。
             if task.udp && streams > 1 {
                 text.push_str(&format!(" ×{streams} 流"));
             }
@@ -1237,15 +1097,6 @@ pub(super) fn unit_load_lines(unit: &builder::Unit) -> Vec<String> {
         .collect()
 }
 
-/// 命令参数照抄，只把 `-b` 那个数换成 Mbps 写法。
-///
-/// 下发的 `-b` 是精确的 bit/s 整数（`UdpLoad::iperf_arg`，为的是不依赖 iperf3
-/// 对 `Gbps` 这类长后缀的非文档行为）。原样打印出来是 `-b 1000000000`——十个零
-/// 要一个个数，而这一行存在的意义是"跟你填的那个数对得上"。换算成 Mbps 是同一个
-/// 数字换个写法，不是重算，所以"所见即所跑"没有被破坏。
-///
-/// 顺带避免一个真实的坑：把 `1000000000` 抄回 `-b` 输入框，那里的裸数字按 **Mbps**
-/// 算（见 `UdpProfile::parsed_bandwidth`），于是变成 10^9 Mbps。
 pub(super) fn readable_args(extra: &[String]) -> String {
     let mut out: Vec<String> = Vec::with_capacity(extra.len());
     let mut iter = extra.iter().peekable();
@@ -1269,15 +1120,6 @@ pub(super) fn readable_args(extra: &[String]) -> String {
     out.join(" ")
 }
 
-/// Encode an arbitrary user/project ID before embedding it in the internal
-/// slash-delimited TestSpec name.  UI IDs are normally generated as hex, but
-/// the HTTP API and imported project files are allowed to carry human IDs such
-/// as `wifi/a`; letting those raw slashes through shifts every following trace
-/// field and makes the preview point at the wrong suite/task.  Percent-escape
-/// every byte outside the URI unreserved set so the transform is reversible
-/// for UTF-8 as well as punctuation.
-/// 只剩解码方向：编码那半边随 `TestSpec.origin` 一起退役了（ADR-8）。
-/// 这里留着是为了还能读懂**旧版本导出的** `config.json`。
 pub(super) fn ui_name_segment_decode(raw: &str) -> String {
     urldecode(raw)
 }
@@ -1286,12 +1128,6 @@ pub(super) fn topology_fingerprint(state: &UiState) -> String {
     crate::master::plan::topology_fingerprint(&state.master, &state.agent)
 }
 
-/// 这条 spec 的界面溯源：**优先读 `TestSpec.origin`**，读不到再退回解析 `name`。
-///
-/// 回落分支只服务一种输入：用旧版本导出的 `config.json`——它的溯源信息是 URL
-/// 编码进 `name` 的（`ui-plan/<七段>`）。新导出的配置带 `origin`，走不到那里。
-/// 等到不再需要兼容旧导出，`ui_source_from_test_name` 连同 `ui_name_segment*`
-/// 一起删掉即可（ADR-8）。
 pub(super) fn ui_source_from_spec(test: &TestSpec) -> Option<UiSource> {
     if let Some(origin) = test.origin.as_ref().filter(|origin| !origin.is_empty()) {
         return Some(UiSource {
@@ -1300,15 +1136,12 @@ pub(super) fn ui_source_from_spec(test: &TestSpec) -> Option<UiSource> {
             suite_id: origin.suite_id.clone(),
             task_id: origin.task_id.clone(),
             recipe_id: origin.recipe_id.clone(),
-            // 协议不进 origin：它已经被 `transports`/`kinds` 说清楚了，
-            // 再存一份就是第二个事实源。
             protocol: spec_protocol(test).unwrap_or_default(),
         });
     }
     ui_source_from_test_name(&test.name)
 }
 
-/// 一条 spec 的协议标签，取自它自己的 `kinds`/`transports`。
 pub(super) fn spec_protocol(test: &TestSpec) -> Option<String> {
     if test
         .kinds
@@ -1380,13 +1213,6 @@ pub(super) fn unit_effective_args(unit: &builder::Unit) -> Vec<String> {
         .collect()
 }
 
-/// Return the concrete endpoints carried by a unit's first leg.
-///
-/// `builder::Leg::tag` is intentionally empty for a one-way leg (the tag is
-/// reserved for the two legs inside a bidirectional unit), so it cannot be
-/// used as the direction source for the quick-plan trace.  Looking at the
-/// resolved endpoints keeps the trace correct for both A→B and B→A without
-/// changing the executor/reporting semantics of `Leg::tag`.
 pub(super) fn leg_endpoints(
     leg: &builder::Leg,
 ) -> Option<(&builder::Endpoint, &builder::Endpoint)> {
@@ -1400,9 +1226,6 @@ pub(super) fn leg_endpoints(
     }
 }
 
-/// Resolve the direction represented by a built unit relative to its source
-/// `TestSpec`.  Bidirectional units are one concurrent unit with two legs;
-/// one-way units have an empty leg tag, so compare endpoint keys instead.
 pub(super) fn unit_direction_for_spec(
     unit: &builder::Unit,
     spec: &builder::SpecNorm,
@@ -1435,8 +1258,6 @@ pub(super) fn compile_request(state: &UiState, req: &RunRequest) -> Result<Compi
     let mut port = builder::PORT_BASE;
 
     if req.ui_plan.is_some() {
-        // Build each spec separately so every generated unit can be traced back
-        // to its suite task.  Port allocation remains global and deterministic.
         for test in &cfg.tests {
             match builder::spec_from_config(test, &cfg, &state.master, &state.agent) {
                 Ok(spec) => {
@@ -1447,10 +1268,6 @@ pub(super) fn compile_request(state: &UiState, req: &RunRequest) -> Result<Compi
                     );
                     notices.extend(build_notices);
                     let source = ui_source_from_spec(test);
-                    // `Leg::tag` is intentionally empty for one-way units, so
-                    // retain the concrete A→B/B→A direction while the named
-                    // source spec is still available.  Bidirectional units
-                    // are represented by a single unit and remain `bidir`.
                     for unit in &built {
                         sources.push(source.clone());
                         source_directions.push(unit_direction_for_spec(unit, &spec));
@@ -1483,9 +1300,6 @@ pub(super) fn compile_request(state: &UiState, req: &RunRequest) -> Result<Compi
     }
 
     if req.ui_plan.is_some() {
-        // Stable builder IDs include the effective protocol/profile/endpoint
-        // shape.  If two bindings accidentally describe that same shape, keep
-        // one execution unit and make the reduction visible to the caller.
         let mut seen_ids = HashSet::new();
         let mut unique_units = Vec::with_capacity(units.len());
         let mut unique_sources = Vec::with_capacity(sources.len());
@@ -1517,13 +1331,6 @@ pub(super) fn compile_request(state: &UiState, req: &RunRequest) -> Result<Compi
     } else {
         vec![false; units.len()]
     };
-    // 哈希必须算在**执行端真正会推导出来的那批单元**上。
-    //
-    // 这里展示用的 `units` 是逐 spec 单独构建的（为了把每个单元追溯回它的
-    // 套件任务），而 `run_master` 是把所有 spec 一次性交给 `build_units`。
-    // 两条路径本该等价——`canonical_plan_units` 就是按执行端的方式再走一遍，
-    // 拿它算哈希，闸门两边比的才是同一件东西。等价性由
-    // `the_preview_and_execution_paths_build_the_same_units` 守着。
     let topology_fingerprint = topology_fingerprint(state);
     let execution_plan = ExecutionPlan::new(
         &cfg,
@@ -1617,8 +1424,6 @@ pub(super) fn compile_request(state: &UiState, req: &RunRequest) -> Result<Compi
         }
     }
     if req.ui_plan.is_none() {
-        // Keep the legacy response compact and backwards-compatible; hierarchy
-        // is only meaningful for the suite planner.
         trace.clear();
         sections.clear();
     }
@@ -1657,9 +1462,6 @@ pub(super) fn ensure_config_builds_units(cfg: &Config, state: &UiState) -> Resul
     Ok(())
 }
 
-/// 按**执行端的方式**推导单元：所有 spec 一次性交给 `build_units`。
-///
-/// 与 `run_master` 里那段保持一字不差的等价，是计划闸门能成立的前提。
 pub(super) fn canonical_plan_units(cfg: &Config, state: &UiState) -> Vec<builder::Unit> {
     let mut specs = Vec::new();
     for test in &cfg.tests {
