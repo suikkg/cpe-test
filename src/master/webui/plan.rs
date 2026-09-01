@@ -67,6 +67,56 @@ impl Sweeps {
     }
 }
 
+fn apply_ping_policy_overrides(cfg: &mut crate::config::PingCfg, req: &RunRequest) {
+    if req.ping_small_max_bytes > 0 {
+        cfg.small_max_bytes = req.ping_small_max_bytes;
+    }
+    if req.ping_medium_max_bytes > 0 {
+        cfg.medium_max_bytes = req.ping_medium_max_bytes;
+    }
+    if req.ping_wired_small_avg_rtt_ms > 0.0 {
+        cfg.wired_small_avg_rtt_ms = req.ping_wired_small_avg_rtt_ms;
+    }
+    let wired_small_max = if req.ping_wired_small_max_rtt_ms > 0.0 {
+        req.ping_wired_small_max_rtt_ms
+    } else {
+        req.ping_max_rtt_ms
+    };
+    if wired_small_max > 0.0 {
+        cfg.max_rtt_ms = wired_small_max;
+    }
+    if req.ping_wired_medium_avg_rtt_ms > 0.0 {
+        cfg.wired_medium_avg_rtt_ms = req.ping_wired_medium_avg_rtt_ms;
+    }
+    if req.ping_wired_medium_max_rtt_ms > 0.0 {
+        cfg.wired_medium_max_rtt_ms = req.ping_wired_medium_max_rtt_ms;
+    }
+    if req.ping_wired_large_avg_rtt_ms > 0.0 {
+        cfg.wired_large_avg_rtt_ms = req.ping_wired_large_avg_rtt_ms;
+    }
+    if req.ping_wired_large_max_rtt_ms > 0.0 {
+        cfg.wired_large_max_rtt_ms = req.ping_wired_large_max_rtt_ms;
+    }
+    if req.ping_wifi_small_avg_rtt_ms > 0.0 {
+        cfg.wifi_small_avg_rtt_ms = req.ping_wifi_small_avg_rtt_ms;
+    }
+    if req.ping_wifi_small_max_rtt_ms > 0.0 {
+        cfg.wifi_small_max_rtt_ms = req.ping_wifi_small_max_rtt_ms;
+    }
+    if req.ping_wifi_medium_avg_rtt_ms > 0.0 {
+        cfg.wifi_medium_avg_rtt_ms = req.ping_wifi_medium_avg_rtt_ms;
+    }
+    if req.ping_wifi_medium_max_rtt_ms > 0.0 {
+        cfg.wifi_medium_max_rtt_ms = req.ping_wifi_medium_max_rtt_ms;
+    }
+    if req.ping_wifi_large_avg_rtt_ms > 0.0 {
+        cfg.wifi_large_avg_rtt_ms = req.ping_wifi_large_avg_rtt_ms;
+    }
+    if req.ping_wifi_large_max_rtt_ms > 0.0 {
+        cfg.wifi_large_max_rtt_ms = req.ping_wifi_large_max_rtt_ms;
+    }
+}
+
 pub(super) fn config_from_request(state: &UiState, req: &RunRequest) -> Config {
     if let Some(plan) = req.ui_plan.as_ref() {
         return config_from_ui_plan(state, req, plan);
@@ -80,9 +130,7 @@ pub(super) fn config_from_request(state: &UiState, req: &RunRequest) -> Config {
     cfg.pairs = None;
     cfg.universal_params = None;
     cfg.link_profiles.by_nic.clear();
-    if req.ping_max_rtt_ms != 0.0 {
-        cfg.ping.max_rtt_ms = req.ping_max_rtt_ms;
-    }
+    apply_ping_policy_overrides(&mut cfg.ping, req);
 
     let windows = non_empty(&req.tcp_windows, &cfg.iperf.tcp_windows);
     let stream_steps: Vec<u32> = {
@@ -188,9 +236,7 @@ pub(super) fn ui_request_base_config(state: &UiState, req: &RunRequest) -> Confi
             .filter(|size| *size > 0 && seen.insert(*size))
             .collect();
     }
-    if req.ping_max_rtt_ms != 0.0 {
-        cfg.ping.max_rtt_ms = req.ping_max_rtt_ms;
-    }
+    apply_ping_policy_overrides(&mut cfg.ping, req);
 
     let tcp_windows = non_empty(&req.tcp_windows, &cfg.iperf.tcp_windows);
     cfg.iperf.tcp_windows = tcp_windows;

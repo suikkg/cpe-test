@@ -42,6 +42,20 @@ export interface BootstrapOut {
   ping_count: number;
   ping_payload_sizes: number[];
   ping_max_rtt_ms: number;
+  ping_small_max_bytes: number,
+  ping_medium_max_bytes: number,
+  ping_wired_small_avg_rtt_ms: number,
+  ping_wired_small_max_rtt_ms: number,
+  ping_wired_medium_avg_rtt_ms: number,
+  ping_wired_medium_max_rtt_ms: number,
+  ping_wired_large_avg_rtt_ms: number,
+  ping_wired_large_max_rtt_ms: number,
+  ping_wifi_small_avg_rtt_ms: number,
+  ping_wifi_small_max_rtt_ms: number,
+  ping_wifi_medium_avg_rtt_ms: number,
+  ping_wifi_medium_max_rtt_ms: number,
+  ping_wifi_large_avg_rtt_ms: number,
+  ping_wifi_large_max_rtt_ms: number,
   screenshot: boolean;
   ui_plan_supported: boolean;
 }

@@ -517,8 +517,23 @@ impl UdpProfile {
 pub struct PingCfg {
     pub count: u32,
     pub payload_sizes: Vec<u32>,
-    /// PASS 的最大 RTT 门限（ms）。Ping 还必须同时满足 0% 丢包。
+    /// payload <= 此值时归为 small。
+    pub small_max_bytes: u32,
+    /// payload <= 此值时归为 medium；再大归为 large。
+    pub medium_max_bytes: u32,
+    /// 兼容旧配置字段；现在表示“纯有线 + small”档最大 RTT。
     pub max_rtt_ms: f64,
+    pub wired_small_avg_rtt_ms: f64,
+    pub wired_medium_avg_rtt_ms: f64,
+    pub wired_medium_max_rtt_ms: f64,
+    pub wired_large_avg_rtt_ms: f64,
+    pub wired_large_max_rtt_ms: f64,
+    pub wifi_small_avg_rtt_ms: f64,
+    pub wifi_small_max_rtt_ms: f64,
+    pub wifi_medium_avg_rtt_ms: f64,
+    pub wifi_medium_max_rtt_ms: f64,
+    pub wifi_large_avg_rtt_ms: f64,
+    pub wifi_large_max_rtt_ms: f64,
 }
 
 impl Default for PingCfg {
@@ -526,7 +541,20 @@ impl Default for PingCfg {
         PingCfg {
             count: 180,
             payload_sizes: vec![32, 1600, 65500],
-            max_rtt_ms: 20.0,
+            small_max_bytes: 128,
+            medium_max_bytes: 2000,
+            max_rtt_ms: 30.0,
+            wired_small_avg_rtt_ms: 10.0,
+            wired_medium_avg_rtt_ms: 20.0,
+            wired_medium_max_rtt_ms: 50.0,
+            wired_large_avg_rtt_ms: 50.0,
+            wired_large_max_rtt_ms: 100.0,
+            wifi_small_avg_rtt_ms: 30.0,
+            wifi_small_max_rtt_ms: 80.0,
+            wifi_medium_avg_rtt_ms: 50.0,
+            wifi_medium_max_rtt_ms: 100.0,
+            wifi_large_avg_rtt_ms: 100.0,
+            wifi_large_max_rtt_ms: 200.0,
         }
     }
 }
@@ -768,11 +796,62 @@ impl Config {
                 ));
             }
         }
-        if !self.ping.max_rtt_ms.is_finite() || self.ping.max_rtt_ms <= 0.0 {
+        if self.ping.small_max_bytes == 0 {
+            problems.push("ping.small_max_bytes 必须大于 0".into());
+        }
+        if self.ping.medium_max_bytes <= self.ping.small_max_bytes {
             problems.push(format!(
-                "ping.max_rtt_ms={} 必须是大于 0 的有限值",
-                self.ping.max_rtt_ms
+                "ping.medium_max_bytes={} 必须大于 ping.small_max_bytes={}",
+                self.ping.medium_max_bytes, self.ping.small_max_bytes
             ));
+        }
+        for (name, avg, max) in [
+            (
+                "wired.small",
+                self.ping.wired_small_avg_rtt_ms,
+                self.ping.max_rtt_ms,
+            ),
+            (
+                "wired.medium",
+                self.ping.wired_medium_avg_rtt_ms,
+                self.ping.wired_medium_max_rtt_ms,
+            ),
+            (
+                "wired.large",
+                self.ping.wired_large_avg_rtt_ms,
+                self.ping.wired_large_max_rtt_ms,
+            ),
+            (
+                "wifi.small",
+                self.ping.wifi_small_avg_rtt_ms,
+                self.ping.wifi_small_max_rtt_ms,
+            ),
+            (
+                "wifi.medium",
+                self.ping.wifi_medium_avg_rtt_ms,
+                self.ping.wifi_medium_max_rtt_ms,
+            ),
+            (
+                "wifi.large",
+                self.ping.wifi_large_avg_rtt_ms,
+                self.ping.wifi_large_max_rtt_ms,
+            ),
+        ] {
+            if !avg.is_finite() || avg <= 0.0 {
+                problems.push(format!(
+                    "ping.{name}.avg_rtt_ms={avg} 必须是大于 0 的有限值"
+                ));
+            }
+            if !max.is_finite() || max <= 0.0 {
+                problems.push(format!(
+                    "ping.{name}.max_rtt_ms={max} 必须是大于 0 的有限值"
+                ));
+            }
+            if avg > max {
+                problems.push(format!(
+                    "ping.{name}.avg_rtt_ms={avg} 不能大于 max_rtt_ms={max}"
+                ));
+            }
         }
         problems
     }
@@ -1037,7 +1116,7 @@ mod tests {
         assert!(ping_rtt
             .validate()
             .iter()
-            .any(|p| p.contains("ping.max_rtt_ms")));
+            .any(|p| p.contains("wired.small") || p.contains("ping.max_rtt_ms")));
 
         // discover 阶梯排到测试结束之后，最后几档流永远起不来。
         let mut discover = Config::default();
@@ -1065,7 +1144,7 @@ mod tests {
         assert_eq!(c.iperf.udp_profiles.len(), 5);
         assert!(c.iperf.udp_profiles.iter().all(|p| p.window.is_none()));
         assert_eq!(c.ping.count, 180);
-        assert_eq!(c.ping.max_rtt_ms, 20.0);
+        assert_eq!(c.ping.max_rtt_ms, 30.0);
         // 默认口令：从「不认证」改成一个固定值，挡的是误连不是攻击。
         // 钉住它是因为它同时是 agent 认证和控制台访问的出厂值，改动会同时
         // 影响两端能否互通。

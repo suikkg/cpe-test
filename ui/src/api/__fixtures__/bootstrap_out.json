@@ -6,11 +6,26 @@
     "192.168."
   ],
   "ping_count": 180,
+  "ping_max_rtt_ms": 30.0,
+  "ping_medium_max_bytes": 2000,
   "ping_payload_sizes": [
     32,
     1600,
     65500
   ],
+  "ping_small_max_bytes": 128,
+  "ping_wifi_large_avg_rtt_ms": 100.0,
+  "ping_wifi_large_max_rtt_ms": 200.0,
+  "ping_wifi_medium_avg_rtt_ms": 50.0,
+  "ping_wifi_medium_max_rtt_ms": 100.0,
+  "ping_wifi_small_avg_rtt_ms": 30.0,
+  "ping_wifi_small_max_rtt_ms": 80.0,
+  "ping_wired_large_avg_rtt_ms": 50.0,
+  "ping_wired_large_max_rtt_ms": 100.0,
+  "ping_wired_medium_avg_rtt_ms": 20.0,
+  "ping_wired_medium_max_rtt_ms": 50.0,
+  "ping_wired_small_avg_rtt_ms": 10.0,
+  "ping_wired_small_max_rtt_ms": 30.0,
   "screenshot": true,
   "tcp_streams": [
     10

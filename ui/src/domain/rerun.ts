@@ -59,6 +59,20 @@ export function parseRunRequest(raw: unknown): RerunSnapshot | null {
     ping_count: count(request.ping_count, 0),
     ping_payload_sizes: numberList(request.ping_payload_sizes),
     ping_max_rtt_ms: count(request.ping_max_rtt_ms, 0),
+    ping_small_max_bytes: count(request.ping_small_max_bytes, 0),
+    ping_medium_max_bytes: count(request.ping_medium_max_bytes, 0),
+    ping_wired_small_avg_rtt_ms: count(request.ping_wired_small_avg_rtt_ms, 0),
+    ping_wired_small_max_rtt_ms: count(request.ping_wired_small_max_rtt_ms, 0),
+    ping_wired_medium_avg_rtt_ms: count(request.ping_wired_medium_avg_rtt_ms, 0),
+    ping_wired_medium_max_rtt_ms: count(request.ping_wired_medium_max_rtt_ms, 0),
+    ping_wired_large_avg_rtt_ms: count(request.ping_wired_large_avg_rtt_ms, 0),
+    ping_wired_large_max_rtt_ms: count(request.ping_wired_large_max_rtt_ms, 0),
+    ping_wifi_small_avg_rtt_ms: count(request.ping_wifi_small_avg_rtt_ms, 0),
+    ping_wifi_small_max_rtt_ms: count(request.ping_wifi_small_max_rtt_ms, 0),
+    ping_wifi_medium_avg_rtt_ms: count(request.ping_wifi_medium_avg_rtt_ms, 0),
+    ping_wifi_medium_max_rtt_ms: count(request.ping_wifi_medium_max_rtt_ms, 0),
+    ping_wifi_large_avg_rtt_ms: count(request.ping_wifi_large_avg_rtt_ms, 0),
+    ping_wifi_large_max_rtt_ms: count(request.ping_wifi_large_max_rtt_ms, 0),
   };
 
   const rawPlan = request.ui_plan;

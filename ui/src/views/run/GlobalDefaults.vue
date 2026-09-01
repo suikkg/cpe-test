@@ -39,7 +39,23 @@ function scalar(key: 'udp_streams' | 'ping_count') {
 }
 
 /** RTT 允许小数毫秒，不能复用上面会 Math.trunc 的整数绑定。 */
-function positiveDecimal(key: 'ping_max_rtt_ms') {
+type PingPolicyNumberKey =
+  | 'ping_small_max_bytes'
+  | 'ping_medium_max_bytes'
+  | 'ping_wired_small_avg_rtt_ms'
+  | 'ping_wired_small_max_rtt_ms'
+  | 'ping_wired_medium_avg_rtt_ms'
+  | 'ping_wired_medium_max_rtt_ms'
+  | 'ping_wired_large_avg_rtt_ms'
+  | 'ping_wired_large_max_rtt_ms'
+  | 'ping_wifi_small_avg_rtt_ms'
+  | 'ping_wifi_small_max_rtt_ms'
+  | 'ping_wifi_medium_avg_rtt_ms'
+  | 'ping_wifi_medium_max_rtt_ms'
+  | 'ping_wifi_large_avg_rtt_ms'
+  | 'ping_wifi_large_max_rtt_ms';
+
+function positiveDecimal(key: PingPolicyNumberKey) {
   return computed({
     get: () => (plan.globals[key] > 0 ? String(plan.globals[key]) : ''),
     set: (raw: string) => {
@@ -51,7 +67,24 @@ function positiveDecimal(key: 'ping_max_rtt_ms') {
 
 const udpStreams = scalar('udp_streams');
 const pingCount = scalar('ping_count');
-const pingMaxRtt = positiveDecimal('ping_max_rtt_ms');
+const policyKeys = [
+  'ping_small_max_bytes','ping_medium_max_bytes','ping_wired_small_avg_rtt_ms','ping_wired_small_max_rtt_ms','ping_wired_medium_avg_rtt_ms','ping_wired_medium_max_rtt_ms','ping_wired_large_avg_rtt_ms','ping_wired_large_max_rtt_ms','ping_wifi_small_avg_rtt_ms','ping_wifi_small_max_rtt_ms','ping_wifi_medium_avg_rtt_ms','ping_wifi_medium_max_rtt_ms','ping_wifi_large_avg_rtt_ms','ping_wifi_large_max_rtt_ms',
+] as const;
+const policy = Object.fromEntries(policyKeys.map((key) => [key, positiveDecimal(key)])) as Record<(typeof policyKeys)[number], ReturnType<typeof positiveDecimal>>;
+
+const policyRows: Array<{ label: string; avgKey: PingPolicyNumberKey; maxKey: PingPolicyNumberKey }> = [
+  { label: '有线 small', avgKey: 'ping_wired_small_avg_rtt_ms', maxKey: 'ping_wired_small_max_rtt_ms' },
+  { label: '有线 medium', avgKey: 'ping_wired_medium_avg_rtt_ms', maxKey: 'ping_wired_medium_max_rtt_ms' },
+  { label: '有线 large', avgKey: 'ping_wired_large_avg_rtt_ms', maxKey: 'ping_wired_large_max_rtt_ms' },
+  { label: 'Wi-Fi small', avgKey: 'ping_wifi_small_avg_rtt_ms', maxKey: 'ping_wifi_small_max_rtt_ms' },
+  { label: 'Wi-Fi medium', avgKey: 'ping_wifi_medium_avg_rtt_ms', maxKey: 'ping_wifi_medium_max_rtt_ms' },
+  { label: 'Wi-Fi large', avgKey: 'ping_wifi_large_avg_rtt_ms', maxKey: 'ping_wifi_large_max_rtt_ms' },
+];
+
+function policyPlaceholder(key: PingPolicyNumberKey): string {
+  const value = configured.value?.[key];
+  return typeof value === 'number' && value > 0 ? String(value) : '';
+}
 const tcpWindows = tokens('tcp_windows');
 const tcpStreams = numbers('tcp_streams');
 const udpBandwidths = tokens('udp_bandwidths');
@@ -166,24 +199,26 @@ const untouched = computed(() => globalsAreEmpty(plan.globals));
           autocomplete="off"
         />
       </label>
-      <label>
-        <span>有线 Ping 最大 RTT（ms）</span>
-        <input
-          v-model="pingMaxRtt"
-          type="text"
-          inputmode="decimal"
-          :placeholder="scalarHint(configured?.ping_max_rtt_ms, '留空 = 不覆盖')"
-          autocomplete="off"
-        />
-      </label>
     </div>
+
+    <details class="policy">
+      <summary><strong>Ping 高级阈值</strong> <span class="muted">自动按链路类型 × payload 档位选择；需要时可临时收紧/放宽</span></summary>
+      <div class="policy-grid">
+        <label><span>small 最大字节</span><input v-model="policy.ping_small_max_bytes" :placeholder="String(configured?.ping_small_max_bytes ?? 128)" /></label>
+        <label><span>medium 最大字节</span><input v-model="policy.ping_medium_max_bytes" :placeholder="String(configured?.ping_medium_max_bytes ?? 2000)" /></label>
+        <template v-for="row in policyRows" :key="row.label">
+          <label><span>{{ row.label }} Avg RTT（ms）</span><input v-model="policy[row.avgKey]" :placeholder="policyPlaceholder(row.avgKey)" /></label>
+          <label><span>{{ row.label }} Max RTT（ms）</span><input v-model="policy[row.maxKey]" :placeholder="policyPlaceholder(row.maxKey)" /></label>
+        </template>
+      </div>
+      <p class="muted hint">留空 = 沿用主控 config.json。默认分类：small ≤ 128，medium ≤ 2000，其余为 large；所有档位仍要求 0% 丢包。</p>
+    </details>
 
     <p class="muted hint">
       套件里选中的配置优先；这里填的是「套件没选配置时用哪一组」。填多个用逗号分隔，逐档各跑一轮。
       <br />
-      <strong>Ping 一律要求 0% 丢包</strong>。纯有线链路按上面的最大 RTT 门限验收；
-      任一端是 Wi-Fi 时自动改为<strong>平均 RTT ≤ 30 ms 且最大 RTT ≤ 100 ms</strong>。
-      这样允许空口正常的瞬时抖动，同时不会让一次严重尖峰被平均值掩盖；RTT 数据缺失同样不通过。
+      <strong>Ping 一律要求 0% 丢包</strong>，RTT 按“有线/Wi‑Fi × small/medium/large”自动选 Avg/Max 门限；
+      <code>-l</code> 可以是任意值，不依赖固定的 32/1600/65500。需要收紧时展开上面的高级阈值。
       <br />
       <strong>UDP 那四格是一整组</strong>：只要 <code>-b</code> 填了，
       <code>-l</code> / <code>-w</code> 留空就是<strong>真的不下发</strong>这两个参数（用 iperf3 默认），
@@ -224,6 +259,9 @@ input {
 input::placeholder { color: var(--muted); opacity: 1; }
 input:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
 .hint { margin: 9px 0 0; font-size: 12px; }
+.policy { margin-top: 10px; border-top: 1px dashed var(--line); padding-top: 9px; }
+.policy summary { cursor: pointer; font-size: 12px; }
+.policy-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 8px; margin-top: 9px; }
 code { font-family: var(--fm); }
 .muted { color: var(--muted); }
 </style>

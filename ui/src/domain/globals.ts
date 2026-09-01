@@ -34,8 +34,22 @@ export interface UiGlobals {
   ping_count: number;
   /** 空 = 沿用配置里的 `ping.payload_sizes`。 */
   ping_payload_sizes: number[];
-  /** 0 = 沿用配置里的 `ping.max_rtt_ms`。 */
+  /** 旧字段兼容：有线 small 最大 RTT。 */
   ping_max_rtt_ms: number;
+  ping_small_max_bytes: number;
+  ping_medium_max_bytes: number;
+  ping_wired_small_avg_rtt_ms: number;
+  ping_wired_small_max_rtt_ms: number;
+  ping_wired_medium_avg_rtt_ms: number;
+  ping_wired_medium_max_rtt_ms: number;
+  ping_wired_large_avg_rtt_ms: number;
+  ping_wired_large_max_rtt_ms: number;
+  ping_wifi_small_avg_rtt_ms: number;
+  ping_wifi_small_max_rtt_ms: number;
+  ping_wifi_medium_avg_rtt_ms: number;
+  ping_wifi_medium_max_rtt_ms: number;
+  ping_wifi_large_avg_rtt_ms: number;
+  ping_wifi_large_max_rtt_ms: number;
 }
 
 export function emptyGlobals(): UiGlobals {
@@ -49,6 +63,20 @@ export function emptyGlobals(): UiGlobals {
     ping_count: 0,
     ping_payload_sizes: [],
     ping_max_rtt_ms: 0,
+    ping_small_max_bytes: 0,
+    ping_medium_max_bytes: 0,
+    ping_wired_small_avg_rtt_ms: 0,
+    ping_wired_small_max_rtt_ms: 0,
+    ping_wired_medium_avg_rtt_ms: 0,
+    ping_wired_medium_max_rtt_ms: 0,
+    ping_wired_large_avg_rtt_ms: 0,
+    ping_wired_large_max_rtt_ms: 0,
+    ping_wifi_small_avg_rtt_ms: 0,
+    ping_wifi_small_max_rtt_ms: 0,
+    ping_wifi_medium_avg_rtt_ms: 0,
+    ping_wifi_medium_max_rtt_ms: 0,
+    ping_wifi_large_avg_rtt_ms: 0,
+    ping_wifi_large_max_rtt_ms: 0,
   };
 }
 
@@ -70,7 +98,21 @@ export function globalsAreEmpty(globals: UiGlobals): boolean {
     globals.udp_streams === 0 &&
     globals.ping_count === 0 &&
     globals.ping_payload_sizes.length === 0 &&
-    globals.ping_max_rtt_ms === 0
+    globals.ping_max_rtt_ms === 0 &&
+    globals.ping_small_max_bytes === 0 &&
+    globals.ping_medium_max_bytes === 0 &&
+    globals.ping_wired_small_avg_rtt_ms === 0 &&
+    globals.ping_wired_small_max_rtt_ms === 0 &&
+    globals.ping_wired_medium_avg_rtt_ms === 0 &&
+    globals.ping_wired_medium_max_rtt_ms === 0 &&
+    globals.ping_wired_large_avg_rtt_ms === 0 &&
+    globals.ping_wired_large_max_rtt_ms === 0 &&
+    globals.ping_wifi_small_avg_rtt_ms === 0 &&
+    globals.ping_wifi_small_max_rtt_ms === 0 &&
+    globals.ping_wifi_medium_avg_rtt_ms === 0 &&
+    globals.ping_wifi_medium_max_rtt_ms === 0 &&
+    globals.ping_wifi_large_avg_rtt_ms === 0 &&
+    globals.ping_wifi_large_max_rtt_ms === 0
   );
 }
 

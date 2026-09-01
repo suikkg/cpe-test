@@ -295,9 +295,37 @@ pub(super) struct RunRequest {
     /// ping 包长档位（每个档位单独成一个测试单元）；空 = 沿用 `ping.payload_sizes`。
     #[serde(default)]
     pub(super) ping_payload_sizes: Vec<u32>,
-    /// Ping 最大 RTT 门限（ms）；0/缺省 = 沿用配置里的 `ping.max_rtt_ms`。
+    /// 兼容旧前端：有线 small 最大 RTT；0 = 沿用配置。
     #[serde(default)]
     pub(super) ping_max_rtt_ms: f64,
+    #[serde(default)]
+    pub(super) ping_small_max_bytes: u32,
+    #[serde(default)]
+    pub(super) ping_medium_max_bytes: u32,
+    #[serde(default)]
+    pub(super) ping_wired_small_avg_rtt_ms: f64,
+    #[serde(default)]
+    pub(super) ping_wired_small_max_rtt_ms: f64,
+    #[serde(default)]
+    pub(super) ping_wired_medium_avg_rtt_ms: f64,
+    #[serde(default)]
+    pub(super) ping_wired_medium_max_rtt_ms: f64,
+    #[serde(default)]
+    pub(super) ping_wired_large_avg_rtt_ms: f64,
+    #[serde(default)]
+    pub(super) ping_wired_large_max_rtt_ms: f64,
+    #[serde(default)]
+    pub(super) ping_wifi_small_avg_rtt_ms: f64,
+    #[serde(default)]
+    pub(super) ping_wifi_small_max_rtt_ms: f64,
+    #[serde(default)]
+    pub(super) ping_wifi_medium_avg_rtt_ms: f64,
+    #[serde(default)]
+    pub(super) ping_wifi_medium_max_rtt_ms: f64,
+    #[serde(default)]
+    pub(super) ping_wifi_large_avg_rtt_ms: f64,
+    #[serde(default)]
+    pub(super) ping_wifi_large_max_rtt_ms: f64,
     /// 是否按整条路径的可信上限裁剪 UDP `-b`。
     #[serde(default)]
     pub(super) limit_udp_by_link_speed: bool,
@@ -346,6 +374,20 @@ pub(super) struct BootstrapOut {
     pub(super) ping_count: u32,
     pub(super) ping_payload_sizes: Vec<u32>,
     pub(super) ping_max_rtt_ms: f64,
+    pub(super) ping_small_max_bytes: u32,
+    pub(super) ping_medium_max_bytes: u32,
+    pub(super) ping_wired_small_avg_rtt_ms: f64,
+    pub(super) ping_wired_small_max_rtt_ms: f64,
+    pub(super) ping_wired_medium_avg_rtt_ms: f64,
+    pub(super) ping_wired_medium_max_rtt_ms: f64,
+    pub(super) ping_wired_large_avg_rtt_ms: f64,
+    pub(super) ping_wired_large_max_rtt_ms: f64,
+    pub(super) ping_wifi_small_avg_rtt_ms: f64,
+    pub(super) ping_wifi_small_max_rtt_ms: f64,
+    pub(super) ping_wifi_medium_avg_rtt_ms: f64,
+    pub(super) ping_wifi_medium_max_rtt_ms: f64,
+    pub(super) ping_wifi_large_avg_rtt_ms: f64,
+    pub(super) ping_wifi_large_max_rtt_ms: f64,
     pub(super) screenshot: bool,
     /// Feature flag for pages that can send the suite-oriented `ui_plan` DTO.
     pub(super) ui_plan_supported: bool,
