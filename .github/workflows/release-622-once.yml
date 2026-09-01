@@ -79,7 +79,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo metadata --no-deps --format-version 1 >/dev/null
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('Cargo.lock')
+          s = p.read_text(encoding='utf-8')
+          old = '[[package]]\nname = "cpe_test"\nversion = "6.2.1"'
+          new = '[[package]]\nname = "cpe_test"\nversion = "6.2.2"'
+          if old not in s:
+              raise SystemExit('Cargo.lock cpe_test entry is not at 6.2.1')
+          p.write_text(s.replace(old, new, 1), encoding='utf-8')
+          PY
           rm -f dist/cpe_test-v6.2.1-windows-config-docs.zip dist/cpe_test-v6.2.1-windows-config-docs.zip.sha256
           python3 dist/build_config_docs_bundle.py
 
@@ -93,6 +102,7 @@ jobs:
           cargo clippy --locked --all-targets -- -D warnings
           git diff --check
           grep -F 'version = "6.2.2"' Cargo.toml
+          grep -F 'version = "6.2.2"' Cargo.lock
           grep -F '"version": "6.2.2"' ui/package.json
           grep -F 'cpe_test v6.2.2 的已验证跨平台发布包' .github/workflows/build.yml
           test -f dist/cpe_test-v6.2.2-windows-config-docs.zip
