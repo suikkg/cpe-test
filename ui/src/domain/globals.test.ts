@@ -34,12 +34,20 @@ describe('档位串', () => {
 
 describe('全局默认档位', () => {
   it('新建的一份是全空的——「留空 = 沿用主控 config.json」', () => {
-    expect(globalsAreEmpty(emptyGlobals())).toBe(true);
+    const globals = emptyGlobals();
+    expect(globals.ping_max_rtt_ms).toBe(0);
+    expect(globalsAreEmpty(globals)).toBe(true);
   });
 
   it('任意一项被填就不再算空', () => {
     const globals = emptyGlobals();
     globals.udp_streams = 4;
+    expect(globalsAreEmpty(globals)).toBe(false);
+  });
+
+  it('Ping RTT 门限也属于有效覆盖项', () => {
+    const globals = emptyGlobals();
+    globals.ping_max_rtt_ms = 12.5;
     expect(globalsAreEmpty(globals)).toBe(false);
   });
 });
