@@ -9,7 +9,6 @@ permissions:
 
 jobs:
   prepare:
-    if: ${{ github.event.head_commit.message == 'chore: fix v6.2.2 release workflow guard' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -17,17 +16,30 @@ jobs:
           ref: feat/webui-vue
           fetch-depth: 0
 
+      - name: Decide whether release bump is needed
+        id: gate
+        shell: bash
+        run: |
+          if grep -q '^version = "6.2.1"$' Cargo.toml; then
+            echo 'run=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'run=false' >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: dtolnay/rust-toolchain@stable
+        if: steps.gate.outputs.run == 'true'
         with:
           components: rustfmt, clippy
 
       - uses: actions/setup-node@v4
+        if: steps.gate.outputs.run == 'true'
         with:
           node-version: '22'
           cache: npm
           cache-dependency-path: ui/package-lock.json
 
       - name: Bump versions and release notes
+        if: steps.gate.outputs.run == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -51,6 +63,7 @@ jobs:
           PY
 
       - name: Bump frontend version and rebuild embedded UI
+        if: steps.gate.outputs.run == 'true'
         working-directory: ui
         shell: bash
         run: |
@@ -62,6 +75,7 @@ jobs:
           npm run verify
 
       - name: Refresh Cargo lock and docs bundle
+        if: steps.gate.outputs.run == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -70,6 +84,7 @@ jobs:
           python3 dist/build_config_docs_bundle.py
 
       - name: Validate release tree
+        if: steps.gate.outputs.run == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -84,6 +99,7 @@ jobs:
           test -f dist/cpe_test-v6.2.2-windows-config-docs.zip.sha256
 
       - name: Commit release bump
+        if: steps.gate.outputs.run == 'true'
         shell: bash
         run: |
           set -euo pipefail
