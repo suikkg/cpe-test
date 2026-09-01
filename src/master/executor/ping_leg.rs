@@ -76,8 +76,7 @@ impl Ctx {
         t: &PingTask,
     ) -> LegOutcome {
         let time = now_full();
-        let latency_policy =
-            ping_latency_policy(&t.src.nic, &t.dst.nic, self.cfg.ping.max_rtt_ms);
+        let latency_policy = ping_latency_policy(&t.src.nic, &t.dst.nic, self.cfg.ping.max_rtt_ms);
         let max_rtt_ms = latency_policy.max_rtt_ms;
         let avg_rtt_ms = latency_policy.avg_rtt_ms;
         let (src_addr, dst_addr) = if t.v6 {
@@ -372,14 +371,8 @@ mod tests {
         let nic = NicInfo::default();
         let policy = ping_latency_policy(&nic, &nic, 20.0);
         assert!(!policy.wifi);
-        assert!(ping_acceptance(
-            &out(180, Some(5.0), Some(20.0)),
-            policy
-        ));
-        assert!(!ping_acceptance(
-            &out(180, Some(5.0), Some(20.1)),
-            policy
-        ));
+        assert!(ping_acceptance(&out(180, Some(5.0), Some(20.0)), policy));
+        assert!(!ping_acceptance(&out(180, Some(5.0), Some(20.1)), policy));
     }
 
     #[test]
@@ -391,22 +384,10 @@ mod tests {
         let wired = NicInfo::default();
         let policy = ping_latency_policy(&wifi, &wired, 20.0);
         assert!(policy.wifi);
-        assert!(ping_acceptance(
-            &out(180, Some(30.0), Some(100.0)),
-            policy
-        ));
-        assert!(!ping_acceptance(
-            &out(179, Some(5.0), Some(10.0)),
-            policy
-        ));
-        assert!(!ping_acceptance(
-            &out(180, Some(30.1), Some(80.0)),
-            policy
-        ));
-        assert!(!ping_acceptance(
-            &out(180, Some(10.0), Some(100.1)),
-            policy
-        ));
+        assert!(ping_acceptance(&out(180, Some(30.0), Some(100.0)), policy));
+        assert!(!ping_acceptance(&out(179, Some(5.0), Some(10.0)), policy));
+        assert!(!ping_acceptance(&out(180, Some(30.1), Some(80.0)), policy));
+        assert!(!ping_acceptance(&out(180, Some(10.0), Some(100.1)), policy));
         assert!(!ping_acceptance(&out(180, None, Some(20.0)), policy));
     }
 
