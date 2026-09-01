@@ -103,7 +103,11 @@ impl Ctx {
         let latency_policy = ping_latency_policy(&t.src.nic, &t.dst.nic, t.payload, &self.cfg.ping);
         let max_rtt_ms = latency_policy.max_rtt_ms;
         let avg_rtt_ms = latency_policy.avg_rtt_ms;
-        let medium = if latency_policy.wifi { "Wi-Fi" } else { "有线" };
+        let medium = if latency_policy.wifi {
+            "Wi-Fi"
+        } else {
+            "有线"
+        };
         let class = latency_policy.class.label();
         let (src_addr, dst_addr) = if t.v6 {
             match v6_addrs(&t.src.nic, &t.dst.nic) {
