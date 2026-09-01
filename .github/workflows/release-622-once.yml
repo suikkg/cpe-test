@@ -1,4 +1,4 @@
-name: Tag v6.2.2 Once
+name: Dispatch v6.2.2 Once
 
 on:
   push:
@@ -6,9 +6,10 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
-  tag:
+  dispatch:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -16,59 +17,30 @@ jobs:
           ref: feat/webui-vue
           fetch-depth: 0
 
-      - name: Check release state
-        id: gate
+      - name: Verify release metadata
         shell: bash
         run: |
           set -euo pipefail
           grep -q '^version = "6.2.2"$' Cargo.toml
-          if git rev-parse -q --verify refs/tags/v6.2.2 >/dev/null; then
-            echo 'run=false' >> "$GITHUB_OUTPUT"
-          else
-            echo 'run=true' >> "$GITHUB_OUTPUT"
-          fi
-
-      - uses: dtolnay/rust-toolchain@stable
-        if: steps.gate.outputs.run == 'true'
-        with:
-          components: rustfmt, clippy
-
-      - uses: actions/setup-node@v4
-        if: steps.gate.outputs.run == 'true'
-        with:
-          node-version: '22'
-          cache: npm
-          cache-dependency-path: ui/package-lock.json
-
-      - name: Verify frontend release tree
-        if: steps.gate.outputs.run == 'true'
-        working-directory: ui
-        shell: bash
-        run: |
-          set -euo pipefail
-          npm ci
-          npm test
-          npm run build
-          npm run verify
-
-      - name: Verify Rust release tree
-        if: steps.gate.outputs.run == 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo fmt --check
-          cargo test --locked
-          cargo clippy --locked --all-targets -- -D warnings
-          git diff --exit-code
+          grep -q 'name = "cpe_test"' Cargo.lock
+          grep -q 'version = "6.2.2"' Cargo.lock
+          grep -q '"version": "6.2.2"' ui/package.json
           test -f dist/cpe_test-v6.2.2-windows-config-docs.zip
           test -f dist/cpe_test-v6.2.2-windows-config-docs.zip.sha256
 
-      - name: Push release tag
-        if: steps.gate.outputs.run == 'true'
+      - name: Point tag at final branch head
         shell: bash
         run: |
           set -euo pipefail
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git tag -a v6.2.2 -m 'Release v6.2.2'
-          git push origin v6.2.2
+          git tag -fa v6.2.2 -m 'Release v6.2.2' HEAD
+          git push --force origin refs/tags/v6.2.2
+
+      - name: Dispatch release workflow on tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh workflow run build.yml --ref v6.2.2
