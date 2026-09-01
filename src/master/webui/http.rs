@@ -99,7 +99,7 @@ pub(super) fn serve(server: &Server, console: &Arc<Console>, shutdown: &AtomicBo
             Ok(Some(request)) => handle(request, console),
             Ok(None) => {
                 if should_shut_down(
-                    crate::cancel::is_cancelled(),
+                    crate::cancel::is_shutdown_requested(),
                     console.running.load(Ordering::SeqCst),
                 ) {
                     shutdown.store(true, Ordering::SeqCst);

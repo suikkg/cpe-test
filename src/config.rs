@@ -704,6 +704,9 @@ impl Config {
         let rc = &self.iperf.rate_check;
         let duration = self.iperf.duration;
 
+        if self.agent_port == 0 {
+            problems.push("agent_port 必须在 1..=65535 之间，不能为 0".into());
+        }
         if duration == 0 {
             problems.push("iperf.duration 为 0：不会产生任何有效测量窗口".into());
         } else if rc.settle_secs >= duration {

@@ -17,6 +17,8 @@ pub(super) struct UiState {
 pub(super) struct Console {
     pub(super) state: Mutex<UiState>,
     pub(super) running: AtomicBool,
+    /// 串行化新一轮的取消状态 reset 与停止请求，避免二者竞态覆盖。
+    pub(super) run_gate: Mutex<()>,
     pub(super) report: Mutex<String>,
     /// 空串 = 不启用认证（只监听回环时的默认）。
     ///

@@ -5,7 +5,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read, Write};
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -13,6 +13,159 @@ use std::sync::mpsc;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use wait_timeout::ChildExt;
+
+/// 给长生命周期外部命令设置“父进程死亡即回收”的边界。
+///
+/// Linux 的 `PR_SET_PDEATHSIG` 覆盖 agent 被 SIGKILL 等方式强杀的场景；
+/// fork/exec 之间再检查一次父 PID，避免刚创建子进程时父线程已经退出却还没
+/// 来得及安装死亡信号。Windows agent 通过 Job Object 在启动阶段绑定整个进程
+/// 树；macOS/其他 Unix 由同包 watchdog 补上父进程死亡后的清理。
+pub fn configure_managed_command(command: &mut Command) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+
+        let expected_parent = std::process::id() as libc::pid_t;
+        // `pre_exec` 只调用 async-signal-safe 的 libc 原语；不要在这里分配、加锁
+        // 或执行 Rust 级别的复杂逻辑，因为闭包运行于 fork 后、exec 前的窗口。
+        unsafe {
+            command.pre_exec(move || {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() != expected_parent {
+                    // 父进程在 fork 与 prctl 之间退出：主动结束这个孤儿。
+                    libc::kill(libc::getpid(), libc::SIGKILL);
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "父进程已退出",
+                    ));
+                }
+                Ok(())
+            });
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = command;
+}
+
+/// macOS/其他 Unix 没有 Linux 的 `PDEATHSIG`，用一个极小的同包 watchdog
+/// 监听父进程持有的 pipe：父进程异常死亡时 pipe EOF，watchdog 杀掉目标工具。
+/// Linux 由内核死亡信号负责，Windows 由 Job Object 负责，因此这两类不额外
+/// 创建 watchdog。
+pub struct ManagedChildWatchdog {
+    process: Child,
+    keepalive: Option<ChildStdin>,
+}
+
+impl ManagedChildWatchdog {
+    /// 关闭父进程存活 pipe，并确认 watchdog 已退出。
+    pub fn stop(&mut self) -> Result<(), String> {
+        self.keepalive.take();
+        match self.process.wait_timeout(Duration::from_secs(1)) {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => {
+                self.process
+                    .kill()
+                    .map_err(|error| format!("停止子进程 watchdog 失败: {error}"))?;
+                self.process
+                    .wait()
+                    .map(|_| ())
+                    .map_err(|error| format!("回收子进程 watchdog 失败: {error}"))
+            }
+            Err(error) => Err(format!("等待子进程 watchdog 失败: {error}")),
+        }
+    }
+}
+
+/// 为目标子进程创建跨平台补偿 watchdog。
+pub fn spawn_managed_watchdog(target_pid: u32) -> std::io::Result<Option<ManagedChildWatchdog>> {
+    #[cfg(all(unix, not(target_os = "linux"), not(test)))]
+    {
+        let exe = std::env::current_exe()?;
+        let mut command = Command::new(exe);
+        command
+            .args(["__cpe-watchdog", &target_pid.to_string()])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut process = command.spawn()?;
+        let Some(keepalive) = process.stdin.take() else {
+            let _ = process.kill();
+            let _ = process.wait();
+            return Err(std::io::Error::other("watchdog stdin pipe 创建失败"));
+        };
+        Ok(Some(ManagedChildWatchdog {
+            process,
+            keepalive: Some(keepalive),
+        }))
+    }
+    #[cfg(any(target_os = "linux", windows, test))]
+    {
+        let _ = target_pid;
+        Ok(None)
+    }
+}
+
+/// 隐藏的 watchdog 子命令入口。正常情况下只会在 macOS/其他 Unix 被调用。
+pub fn run_process_watchdog(target_pid: u32) -> i32 {
+    #[cfg(not(unix))]
+    let _ = target_pid;
+    let mut stdin = std::io::stdin().lock();
+    let mut buf = [0u8; 1];
+    loop {
+        match stdin.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
+    #[cfg(unix)]
+    unsafe {
+        let _ = libc::kill(target_pid as libc::pid_t, libc::SIGKILL);
+    }
+    0
+}
+
+/// 为 agent 进程安装平台级的子进程容器。
+///
+/// Linux 子进程逐个绑定父死亡信号；Windows 则把 agent 自身加入带
+/// `KILL_ON_JOB_CLOSE` 的 Job Object，因此 agent 异常退出时所有受管工具都会
+/// 一起消失。非 Windows 平台没有额外初始化动作。
+pub fn initialize_agent_process_lifetime() -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        use windows::core::PCWSTR;
+        use windows::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+        };
+        use windows::Win32::System::Threading::GetCurrentProcess;
+
+        let job = unsafe {
+            CreateJobObjectW(None, PCWSTR::null())
+                .map_err(|error| format!("创建 agent Job Object 失败: {error}"))?
+        };
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        unsafe {
+            SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+            .map_err(|error| format!("配置 agent Job Object 失败: {error}"))?;
+            AssignProcessToJobObject(job, GetCurrentProcess())
+                .map_err(|error| format!("绑定 agent 到 Job Object 失败: {error}"))?;
+        }
+        // HANDLE 是原始 OS 句柄，离开这个 Rust 变量不会自动 CloseHandle；
+        // 让它一直持有到 agent 进程结束，进程退出时 Windows 会关闭句柄并按
+        // KILL_ON_JOB_CLOSE 回收所有成员。
+        let _ = job;
+    }
+    Ok(())
+}
 
 /// 字节解码：优先 UTF-8，失败按 GBK（中文 Windows cmd 输出）
 pub fn decode_bytes(b: &[u8]) -> String {
@@ -154,6 +307,14 @@ fn append_errors(mut stderr: String, errors: &[String]) -> String {
     stderr
 }
 
+fn stop_watchdog(watchdog: &mut Option<ManagedChildWatchdog>, errors: &mut Vec<String>) {
+    if let Some(mut watchdog) = watchdog.take() {
+        if let Err(error) = watchdog.stop() {
+            errors.push(error);
+        }
+    }
+}
+
 /// 执行命令，等待结束（超时强杀），返回解码后的输出
 fn run_cmd_system(prog: &str, args: &[&str], timeout: Duration) -> CmdOut {
     let mut c = Command::new(prog);
@@ -161,6 +322,7 @@ fn run_cmd_system(prog: &str, args: &[&str], timeout: Duration) -> CmdOut {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    configure_managed_command(&mut c);
     let mut child = match c.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -171,6 +333,19 @@ fn run_cmd_system(prog: &str, args: &[&str], timeout: Duration) -> CmdOut {
                 stdout: String::new(),
                 stderr: format!("启动命令失败: {prog} ({e})"),
             }
+        }
+    };
+    let mut watchdog = match spawn_managed_watchdog(child.id()) {
+        Ok(watchdog) => watchdog,
+        Err(error) => {
+            let cleanup_errors = terminate_and_reap(&mut child);
+            return CmdOut {
+                ok: false,
+                timed_out: false,
+                cancelled: false,
+                stdout: String::new(),
+                stderr: append_errors(format!("创建命令 watchdog 失败: {error}"), &cleanup_errors),
+            };
         }
     };
     let so = child.stdout.take().expect("stdout piped");
@@ -185,7 +360,8 @@ fn run_cmd_system(prog: &str, args: &[&str], timeout: Duration) -> CmdOut {
         }) {
         Ok(handle) => handle,
         Err(error) => {
-            let cleanup_errors = terminate_and_reap(&mut child);
+            let mut cleanup_errors = terminate_and_reap(&mut child);
+            stop_watchdog(&mut watchdog, &mut cleanup_errors);
             return CmdOut {
                 ok: false,
                 timed_out: false,
@@ -208,7 +384,8 @@ fn run_cmd_system(prog: &str, args: &[&str], timeout: Duration) -> CmdOut {
         }) {
         Ok(handle) => handle,
         Err(error) => {
-            let cleanup_errors = terminate_and_reap(&mut child);
+            let mut cleanup_errors = terminate_and_reap(&mut child);
+            stop_watchdog(&mut watchdog, &mut cleanup_errors);
             let stdout = decode_bytes(&th_o.join().unwrap_or_default());
             return CmdOut {
                 ok: false,
@@ -236,6 +413,7 @@ fn run_cmd_system(prog: &str, args: &[&str], timeout: Duration) -> CmdOut {
         }
     };
     let stdout = decode_bytes(&th_o.join().unwrap_or_default());
+    stop_watchdog(&mut watchdog, &mut process_errors);
     let stderr = append_errors(
         decode_bytes(&th_e.join().unwrap_or_default()),
         &process_errors,
@@ -294,6 +472,7 @@ fn run_streaming_system<F: FnMut(&str, Instant)>(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    configure_managed_command(&mut c);
     let mut child = match c.spawn() {
         Ok(c) => c,
         Err(e) => {
@@ -304,6 +483,19 @@ fn run_streaming_system<F: FnMut(&str, Instant)>(
                 stdout: String::new(),
                 stderr: format!("启动命令失败: {prog} ({e})"),
             }
+        }
+    };
+    let mut watchdog = match spawn_managed_watchdog(child.id()) {
+        Ok(watchdog) => watchdog,
+        Err(error) => {
+            let cleanup_errors = terminate_and_reap(&mut child);
+            return CmdOut {
+                ok: false,
+                timed_out: false,
+                cancelled: false,
+                stdout: String::new(),
+                stderr: append_errors(format!("创建命令 watchdog 失败: {error}"), &cleanup_errors),
+            };
         }
     };
     let so = child.stdout.take().expect("stdout piped");
@@ -328,7 +520,8 @@ fn run_streaming_system<F: FnMut(&str, Instant)>(
         }) {
         Ok(handle) => handle,
         Err(error) => {
-            let cleanup_errors = terminate_and_reap(&mut child);
+            let mut cleanup_errors = terminate_and_reap(&mut child);
+            stop_watchdog(&mut watchdog, &mut cleanup_errors);
             return CmdOut {
                 ok: false,
                 timed_out: false,
@@ -351,7 +544,8 @@ fn run_streaming_system<F: FnMut(&str, Instant)>(
         }) {
         Ok(handle) => handle,
         Err(error) => {
-            let cleanup_errors = terminate_and_reap(&mut child);
+            let mut cleanup_errors = terminate_and_reap(&mut child);
+            stop_watchdog(&mut watchdog, &mut cleanup_errors);
             let _ = th_o.join();
             let mut stdout = String::new();
             while let Ok((bytes, _observed_at)) = rx.try_recv() {
@@ -490,6 +684,7 @@ fn run_streaming_system<F: FnMut(&str, Instant)>(
     let ok = status
         .map(|status| status.success() && !timed_out && !cancelled)
         .unwrap_or(false);
+    stop_watchdog(&mut watchdog, &mut process_errors);
     let stderr = append_errors(
         decode_bytes(&th_e.join().unwrap_or_default()),
         &process_errors,
@@ -1150,5 +1345,74 @@ mod tests {
             started.elapsed() < Duration::from_secs(5),
             "回调 panic 后必须立即终止并回收 60 秒 helper，而不是等待自然退出"
         );
+    }
+
+    /// 子进程由另一个测试进程托管；这个 helper 只在父死亡集成测试的子进程中运行。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn helper_spawns_a_parent_bound_child() {
+        if std::env::var("CPE_TEST_PDEATH_HELPER").as_deref() != Ok("1") {
+            return;
+        }
+        let marker = std::env::var("CPE_TEST_PDEATH_MARKER").expect("pdeath marker");
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "exec sleep 60"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        configure_managed_command(&mut command);
+        let child = command.spawn().expect("受管 helper child 必须能启动");
+        std::fs::write(&marker, child.id().to_string()).expect("写 pdeath marker");
+        std::thread::sleep(Duration::from_secs(60));
+    }
+
+    /// Linux agent 被 SIGKILL 时，已启动的外部工具不能留下来继续占端口。
+    /// 这里不依赖 iperf3，用一个真实的 `sleep` 子进程验证同一父死亡边界。
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn managed_child_dies_when_its_parent_process_is_killed() {
+        let marker =
+            std::env::temp_dir().join(format!("cpe_test_pdeath_{}_marker", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+        let mut parent = Command::new(std::env::current_exe().unwrap());
+        parent
+            .args([
+                "--exact",
+                "util::tests::helper_spawns_a_parent_bound_child",
+                "--nocapture",
+            ])
+            .env("CPE_TEST_PDEATH_HELPER", "1")
+            .env("CPE_TEST_PDEATH_MARKER", &marker)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut parent = parent.spawn().expect("pdeath parent helper 必须能启动");
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let child_pid = loop {
+            if let Ok(text) = std::fs::read_to_string(&marker) {
+                if let Ok(pid) = text.trim().parse::<libc::pid_t>() {
+                    break pid;
+                }
+            }
+            assert!(Instant::now() < deadline, "受管 child 未及时启动");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+
+        let result = unsafe { libc::kill(parent.id() as libc::pid_t, libc::SIGKILL) };
+        assert_eq!(result, 0, "必须能强杀 pdeath parent helper");
+        let _ = parent.wait();
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let alive = unsafe { libc::kill(child_pid, 0) } == 0;
+            if !alive {
+                break;
+            }
+            assert!(Instant::now() < deadline, "父进程死亡后 child 仍然存活");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = std::fs::remove_file(marker);
     }
 }

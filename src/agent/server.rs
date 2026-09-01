@@ -17,7 +17,7 @@ use crate::nic::monitor::MonitorMgr;
 use crate::nic::scan_host;
 use crate::protocol::*;
 use crate::resource::{AgentResourceInventory, ResourceInventory};
-use crate::util::{now_hms, os_name};
+use crate::util::{initialize_agent_process_lifetime, now_hms, os_name};
 use crate::{ping, screenshot};
 use base64::Engine;
 use std::collections::hash_map::DefaultHasher;
@@ -147,6 +147,11 @@ pub struct AgentState {
 pub fn run(port: u16, cfg: &Config, ui_port: Option<u16>, ui_bind: &str) {
     // P0: agent 也必须安装 Ctrl+C 处理器，否则无法优雅退出/清理。
     crate::cancel::setup_cancel_handler();
+    if let Err(error) = initialize_agent_process_lifetime() {
+        eprintln!("!! agent 子进程生命周期保护初始化失败: {error}");
+        eprintln!("!! 为避免异常退出后留下流量进程，agent 不继续启动。");
+        std::process::exit(1);
+    }
     println!("==============================================");
     println!(
         "  CPE 子网测试工具 v{} — 辅测 agent",
@@ -265,7 +270,7 @@ pub fn run(port: u16, cfg: &Config, ui_port: Option<u16>, ui_bind: &str) {
     // P0: Ctrl+C 到资源归零 ≤5 秒 —— 200ms 轮询取消标志，退出前停止全部资源。
     let mut tick: u64 = 0;
     loop {
-        if crate::cancel::is_cancelled() {
+        if crate::cancel::is_shutdown_requested() {
             println!("\n辅测 agent 收到 Ctrl+C，正在退出...");
             let started = std::time::Instant::now();
             let inv = AgentResourceInventory::new(&state.clients, &state.servers, &state.monitors);

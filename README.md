@@ -2,6 +2,13 @@
 
 > 两台电脑间自动化 ping + iperf3 / Microsoft ctsTraffic 灌包测试，零 Python/零 PowerShell
 
+## v6.2.1
+
+- **UI“停止”不再关闭 WebUI**：停止按钮只结束当前测试并保留控制台服务；只有进程级退出请求才会关闭监听端口。新一轮启动与停止请求也已串行化，避免取消状态被竞态清除。
+- **Agent 强制退出后自动回收流量进程**：Linux 使用父进程死亡信号，Windows 使用 Job Object，macOS/其他 Unix 使用同包 watchdog，避免 orphan `iperf3`/`ctsTraffic` 继续占用端口。
+- **导入配置拒绝无效端口**：`/api/import` 现在拒绝 `agent_port=0`，端口必须位于 `1..=65535`。
+- **回归验证**：Rust 587/587、前端 Vitest 139/139、Clippy、Linux/Windows 目标编译和 release 构建全部通过。
+
 ## v6.2.0
 
 - **链路集合默认列出全部组合**：同机两块网口之间也是一条真实链路（走桥接/回环），
@@ -523,7 +530,7 @@ CPE（Customer Premises Equipment）子网测试工具用于在**两台电脑之
 ```
 cpe_test.exe          ← 本工具（单文件）
 iperf3.exe            ← 从 iperf.fr 下载（只测 Ping/ctsTraffic 可不放）
-ctsTraffic.exe        ← v6.2.0 Windows Release 已捆绑（仅 Windows 10+）
+ctsTraffic.exe        ← v6.2.1 Windows Release 已捆绑（仅 Windows 10+）
 start_agent.bat       ← 辅测机双击
 start_ui.bat          ← 主控机双击（图形控制台，推荐）
 start_master.bat      ← 主控机双击（命令行问答式）
@@ -901,6 +908,7 @@ UDP 单流、并发组和双向测试现在走同一套调度器：先把所有�
 - 每次业务尝试都完整启动 server/client，结束后同步停止并等待子进程退出、输出线程回收；只有精确 `request_id` 的 server stop 和本轮清理均已确认，才会在同一端口启动下一轮。平台、工具、非法参数、server/client 启动或状态查询失败、显式取消以及停止未确认都属于 `SETUP_ERROR`，不会伪装成性能失败。
 - 是否灌通只认 iperf3 自身 rate、bytes 或 datagrams 等输出证据，背景 NIC 流量不能把失败尝试变成成功。一旦某轮已有工具测量，就按该轮真实运行错误、UDP 丢包和目标速率继续判定，不靠额外重试掩盖真实结果。
 - HTTP 传输重试复用同一个 `request_id`，因此 start 响应丢失不会重复创建进程；测试单元结束、报错或 panic 时还会按唯一 `owner_id` 批量清理 server/client/monitor。动态 lease 是断联后的最后兜底，不会用固定短 TTL 误杀合法长测。
+- agent 启动的长生命周期流量进程受父进程生命周期保护：Linux 使用父死亡信号，Windows 使用 Job Object，macOS/其他 Unix 使用同包 watchdog。agent 被强制终止后，iperf3/ctsTraffic 不应继续占用端口；恢复重跑无需人工 `kill` 残留进程。
 - 2 条流的方向最低要求仍是 2 条。若最终只有 1 条成功，结果是 `NOT_EVALUATED / ACTIVE_STREAMS_LOW`，表示负载搭建不足，不会用单流速率误判 CPE 为 `RATE_FAIL`。
 - 默认 `min_active_ratio=0.9`：5 条流要求至少 4 条，20 条要求至少 18 条；已知目标还会叠加 `ceil(目标 × 1.05 / 单流带宽)` 的 offered-load 要求。
 - 运行中不阻塞等待并提前锁死窗口；结束后统一取满足活跃流条件的最长连续区间，迟到或提前结束只会如实改变该区间边界。
@@ -1310,7 +1318,7 @@ cargo build --release --locked
 
 自行编译后，把 `cpe_test.exe`、启动脚本和所需吞吐工具放到两台 Windows 电脑同一目录：
 iperf3 测试需要完整的 iperf3 Windows 发行包；ctsTraffic 测试需要 `ctsTraffic.exe`。
-官方 v6.2.0 Windows Release ZIP 已捆绑固定且校验过的 ctsTraffic 2.0.4.0，但由于发行包差异不内置 iperf3。
+官方 v6.2.1 Windows Release ZIP 已捆绑固定且校验过的 ctsTraffic 2.0.4.0，但由于发行包差异不内置 iperf3。
 
 ### GitHub Actions CI
 
@@ -1333,7 +1341,7 @@ Windows ZIP 包含启动脚本、四份配置、固定 CTS 二进制和第三方
 `tar.gz` 保留 `cpe_test` 可执行位。发布作业会再次核对资产名称、数量、内部结构和哈希。
 
 仓库同时跟踪一份不含可执行程序的
-[`cpe_test-v6.2.0-windows-config-docs.zip`](dist/cpe_test-v6.2.0-windows-config-docs.zip)，
+[`cpe_test-v6.2.1-windows-config-docs.zip`](dist/cpe_test-v6.2.1-windows-config-docs.zip)，
 便于直接从 Git 下载 Windows 配置、文档和启动脚本。其 SHA-256 位于同目录的
 `.zip.sha256` 文件；CI 会逐文件确认压缩包内容与仓库源文件一致。需要开箱即用的程序、
 固定版 ctsTraffic 和许可证全集时，仍应下载上面的正式 Windows Release ZIP。

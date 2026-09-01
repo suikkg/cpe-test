@@ -911,6 +911,7 @@ fn bootstrap_reports_token_presence_without_exposing_the_secret() {
     let console = Arc::new(Console {
         state: Mutex::new(state),
         running: AtomicBool::new(false),
+        run_gate: Mutex::new(()),
         report: Mutex::new(String::new()),
         ui_token: String::new(),
         monitors: Mutex::new(HashMap::new()),
@@ -1138,6 +1139,7 @@ fn console_with(state: UiState) -> Arc<Console> {
     Arc::new(Console {
         state: Mutex::new(state),
         running: AtomicBool::new(false),
+        run_gate: Mutex::new(()),
         report: Mutex::new(String::new()),
         ui_token: String::new(),
         monitors: Mutex::new(HashMap::new()),
@@ -1298,6 +1300,7 @@ fn the_console_token_gate_covers_both_the_page_and_the_api() {
     let console = Arc::new(Console {
         state: Mutex::new(state_with_pair()),
         running: AtomicBool::new(false),
+        run_gate: Mutex::new(()),
         report: Mutex::new(String::new()),
         ui_token: "unit-secret".into(),
         monitors: Mutex::new(HashMap::new()),
@@ -1385,6 +1388,7 @@ fn refreshing_the_console_page_keeps_the_session_but_the_api_still_needs_the_hea
     let console = Arc::new(Console {
         state: Mutex::new(state_with_pair()),
         running: AtomicBool::new(false),
+        run_gate: Mutex::new(()),
         report: Mutex::new(String::new()),
         ui_token: "unit-secret".into(),
         monitors: Mutex::new(HashMap::new()),
@@ -2659,6 +2663,22 @@ fn importing_rubbish_says_so_instead_of_half_applying_it() {
         lock_recover(&console.state).cfg.iperf.duration,
         Config::default().iperf.duration,
         "被拒的导入不能改动任何现有状态"
+    );
+
+    let invalid_port = Config {
+        agent_port: 0,
+        ..Config::default()
+    };
+    let error = api_import(&console, &serde_json::to_string(&invalid_port).unwrap())
+        .expect_err("agent_port=0 必须在导入阶段拒绝");
+    assert!(
+        error.contains("agent_port") && error.contains("1..=65535"),
+        "{error}"
+    );
+    assert_eq!(
+        lock_recover(&console.state).cfg.agent_port,
+        Config::default().agent_port,
+        "被拒的非法端口不能改动现有状态"
     );
 }
 

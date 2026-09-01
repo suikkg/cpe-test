@@ -636,7 +636,14 @@ jobs:
           # 版本号手写，跟着 release: 提交一起改（见上面 files: 那样短的输入
           # 才可以用表达式）。
           body: |
-            cpe_test v6.2.0 的已验证跨平台发布包。
+            cpe_test v6.2.1 的已验证跨平台发布包。
+
+            ## v6.2.1 WebUI 与 Agent 生命周期缺陷修复
+
+            - **UI“停止”不再关闭 WebUI**：停止按钮只结束当前测试并保留控制台服务；只有进程级退出请求才会关闭监听端口。新一轮启动与停止请求也已串行化，避免取消状态被竞态清除。
+            - **Agent 强制退出后自动回收流量进程**：Linux 使用父进程死亡信号，Windows 使用 Job Object，macOS/其他 Unix 使用同包 watchdog，避免 orphan `iperf3`/`ctsTraffic` 继续占用端口。
+            - **导入配置拒绝无效端口**：`/api/import` 现在拒绝 `agent_port=0`，端口必须位于 `1..=65535`。
+            - **回归验证**：Rust 587/587、前端 Vitest 139/139、Clippy、Linux/Windows 目标编译和 release 构建全部通过。
 
             ## v6.2.0 测试计划工作台、全局参数与监控增强
 

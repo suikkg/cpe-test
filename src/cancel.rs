@@ -13,7 +13,8 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Once;
 
-static CANCELLED: AtomicBool = AtomicBool::new(false);
+static RUN_CANCELLED: AtomicBool = AtomicBool::new(false);
+static PROCESS_SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 static HANDLER_SETUP: Once = Once::new();
 
 #[cfg(windows)]
@@ -21,29 +22,37 @@ use std::sync::atomic::AtomicU32;
 #[cfg(windows)]
 static PRESS_COUNT: AtomicU32 = AtomicU32::new(0);
 
-/// 是否收到了取消信号（Ctrl+C）
+/// 是否请求结束当前测试。
 pub fn is_cancelled() -> bool {
-    CANCELLED.load(Ordering::SeqCst)
+    RUN_CANCELLED.load(Ordering::SeqCst)
 }
 
-/// 返回取消标志的原子引用，供底层受控命令轮询（与全局标志同源）。
+/// 是否请求退出当前常驻进程（Ctrl+C 语义）。
+pub fn is_shutdown_requested() -> bool {
+    PROCESS_SHUTDOWN_REQUESTED.load(Ordering::SeqCst)
+}
+
+/// 返回当前测试取消标志的原子引用，供底层受控命令轮询。
 pub fn cancel_flag() -> &'static AtomicBool {
-    &CANCELLED
+    &RUN_CANCELLED
 }
 
-/// 请求当前测试优雅结束。Web 控制台的“结束并出报告”和 Ctrl+C 共用同一信号。
+/// 请求当前测试优雅结束。Web 控制台的“停止”和 Ctrl+C 共用这一层信号。
 pub fn request_cancel() {
-    CANCELLED.store(true, Ordering::SeqCst);
+    RUN_CANCELLED.store(true, Ordering::SeqCst);
 }
 
-/// 开始新一轮长驻进程内测试前重置取消状态。
+/// 请求常驻进程退出，并先让当前测试完成收尾。
+pub fn request_shutdown() {
+    PROCESS_SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+    request_cancel();
+}
+
+/// 开始新一轮长驻进程内测试前只重置当前测试取消状态。
 ///
-/// 命令行模式一次进程只跑一轮，不需要调用；Web 控制台会在同一进程内连续运行，
-/// 若不重置，上一轮的 Ctrl+C 或页面停止会让下一轮在第一个单元前立刻退出。
+/// 进程退出请求是单向状态，不能被新一轮测试清除。
 pub fn reset() {
-    CANCELLED.store(false, Ordering::SeqCst);
-    #[cfg(windows)]
-    PRESS_COUNT.store(0, Ordering::SeqCst);
+    RUN_CANCELLED.store(false, Ordering::SeqCst);
 }
 
 /// 注册 Ctrl+C 处理器。
@@ -60,7 +69,7 @@ pub fn setup_cancel_handler() {
             unsafe extern "system" fn handler(ctrl_type: u32) -> BOOL {
                 // CTRL_C_EVENT = 0
                 if ctrl_type == 0 {
-                    request_cancel();
+                    request_shutdown();
                     let count = PRESS_COUNT.fetch_add(1, Ordering::SeqCst);
                     if count == 0 {
                         // 第一次：吃掉信号，阻止 cmd.exe 弹出 "Terminate batch job?"
@@ -78,7 +87,31 @@ pub fn setup_cancel_handler() {
 
         #[cfg(not(windows))]
         {
-            let _ = ctrlc::set_handler(request_cancel);
+            let _ = ctrlc::set_handler(request_shutdown);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn run_cancel_and_process_shutdown_are_independent_until_shutdown_is_requested() {
+        RUN_CANCELLED.store(false, Ordering::SeqCst);
+        PROCESS_SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
+
+        request_cancel();
+        assert!(is_cancelled());
+        assert!(!is_shutdown_requested());
+
+        request_shutdown();
+        assert!(is_cancelled());
+        assert!(is_shutdown_requested());
+
+        // 进程退出状态没有公开 reset；测试清理它，避免影响同一测试二进制中的
+        // 其他取消/退出用例。
+        reset();
+        PROCESS_SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
+    }
 }

@@ -74,6 +74,7 @@ pub fn run(opts: UiOpts) -> i32 {
             ..Default::default()
         }),
         running: AtomicBool::new(false),
+        run_gate: Mutex::new(()),
         report: Mutex::new(String::new()),
         ui_token: ui_token.clone(),
         monitors: Mutex::new(HashMap::new()),

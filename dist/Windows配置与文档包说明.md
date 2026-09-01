@@ -1,13 +1,13 @@
-# cpe_test v6.2.0 Windows 配置与文档包
+# cpe_test v6.2.1 Windows 配置与文档包
 
-仓库中的 `cpe_test-v6.2.0-windows-config-docs.zip` 是便于从 Git 直接下载的
+仓库中的 `cpe_test-v6.2.1-windows-config-docs.zip` 是便于从 Git 直接下载的
 Windows 配置、说明文档和启动脚本资料包。包内文件由仓库当前版本生成，并由 CI
 逐文件与源码副本比对，避免配置或文档过期。
 
 这个资料包**不包含可执行程序或吞吐工具**：
 
 - 不包含 `cpe_test.exe`；请从 GitHub Release 下载正式
-  `cpe_test-v6.2.0-windows-x86_64.zip`，或自行编译。
+  `cpe_test-v6.2.1-windows-x86_64.zip`，或自行编译。
 - 不包含 `ctsTraffic.exe`；正式 Windows Release ZIP 会捆绑固定并校验过的
   Microsoft ctsTraffic 2.0.4.0 x64。
 - 不包含 `iperf3.exe` 及其 DLL；需要 iperf3 测试时，请放入完整的 Windows
@@ -25,7 +25,11 @@ Windows 配置、说明文档和启动脚本资料包。包内文件由仓库当
 - `start_ui.bat`（图形控制台）、`start_agent.bat`、`start_master.bat`、`start_master_select_config.bat`。
 - iperf3/ctsTraffic 放置说明、MIT 许可证和第三方声明。
 
-## v6.2.0 行为要点
+## v6.2.1 行为要点
+
+- UI“停止”只结束当前测试，不再关闭 WebUI；只有明确的进程退出请求才会停止监听端口。
+- Agent 被强制终止后，受管的 `iperf3`/`ctsTraffic` 进程会随父进程生命周期自动回收，不应留下占端口的 orphan 进程。
+- `agent_port` 必须在 `1..=65535` 范围内，导入配置会拒绝 `0`。
 
 - 掉速判定改判在**原始逐样本序列**上：断流/掉坑必须自己连续够 5 秒才算，报出来的秒数就是真秒数，能直接和 iperf 截图同一时刻对上。不够 5 秒的单点掉拍一律忽略——它和 Wi-Fi 发 probe、信道扫描在网卡计数器上不可区分。
 - 两档形态分开发码：`RX_OUTAGE`（速率基本为 0，真断了）与 `RX_DROPOUT`（掉到门限 80% 以下）。门限带 20% 容差。

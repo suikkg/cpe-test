@@ -334,9 +334,17 @@ pub(super) fn api_config(console: &Arc<Console>, body: &str) -> Result<serde_jso
 
 pub(super) fn api_run(console: &Arc<Console>, body: &str) -> Result<serde_json::Value, String> {
     let req: RunRequest = serde_json::from_str(body).map_err(|e| format!("参数解析失败: {e}"))?;
+    let run_gate = lock_recover(&console.run_gate);
+    if crate::cancel::is_shutdown_requested() {
+        return Err("控制台正在退出，不能开始新的测试".into());
+    }
     if console.running.swap(true, Ordering::SeqCst) {
         return Err("已经有一轮测试在跑了".into());
     }
+    // 必须和 running 的占位动作绑定：停止请求不能插在这里之后、reset 之前，
+    // 否则它会被新一轮清掉，表现成“点击停止偶尔不生效”。
+    crate::cancel::reset();
+    drop(run_gate);
     // 复核页确认过的执行计划哈希，随 run_master 一路带到真正开跑之前再核一次。
     let confirmed_plan_hash;
     let cfg = {
@@ -419,7 +427,6 @@ pub(super) fn api_run(console: &Arc<Console>, body: &str) -> Result<serde_json::
     // `run_started`：那之间要读配置、扫拓扑、建计划，够 1s 轮询打好几拍，
     // 而那几拍回的是上一轮已完成的全套单元。
     console.run_status.reset();
-    crate::cancel::reset();
     let worker_console = Arc::clone(console);
     let request_snapshot = body.to_string();
     let cleanup_path = path.clone();
@@ -487,6 +494,7 @@ pub(super) fn write_private_config(path: &Path, contents: &str) -> std::io::Resu
 }
 
 pub(super) fn api_stop(console: &Arc<Console>) -> Result<serde_json::Value, String> {
+    let _run_gate = lock_recover(&console.run_gate);
     if !console.running.load(Ordering::SeqCst) {
         return Err("当前没有正在运行的测试".into());
     }

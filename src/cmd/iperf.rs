@@ -9,8 +9,9 @@ use crate::protocol::{
     IperfEventKind, IperfFlowEvent, IperfServerStartReq, IperfServerStopOut,
 };
 use crate::util::{
-    decode_bytes, run_cmd_with_executor, run_streaming_controlled_timed_with, ProcessExecutor,
-    SystemProcessExecutor,
+    configure_managed_command, decode_bytes, run_cmd_with_executor,
+    run_streaming_controlled_timed_with, spawn_managed_watchdog, ManagedChildWatchdog,
+    ProcessExecutor, SystemProcessExecutor,
 };
 use regex::Regex;
 use std::collections::hash_map::DefaultHasher;
@@ -318,6 +319,7 @@ pub fn parse_output(text: &str) -> IperfParsed {
 
 struct SrvEntry {
     child: Child,
+    watchdog: Option<ManagedChildWatchdog>,
     /// 收集到的输出（reader thread 写入）
     output: Arc<Mutex<Vec<u8>>>,
     readers: Vec<std::thread::JoinHandle<()>>,
@@ -504,13 +506,24 @@ impl IperfServerMgr {
 
         let args = server_args(req);
         let cmd_str = cmdline(bin, &args);
-        let child = Command::new(bin)
+        let mut command = Command::new(bin);
+        command
             .args(&args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(Stdio::piped());
+        configure_managed_command(&mut command);
+        let mut child = command
             .spawn()
             .map_err(|e| format!("启动 iperf3 server 失败: {e} (命令: {cmd_str})"))?;
+        let watchdog = match spawn_managed_watchdog(child.id()) {
+            Ok(watchdog) => watchdog,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("启动 iperf3 server watchdog 失败: {error}"));
+            }
+        };
 
         let output_arc: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
         {
@@ -519,6 +532,7 @@ impl IperfServerMgr {
                 req.port,
                 SrvEntry {
                     child,
+                    watchdog,
                     output: Arc::clone(&output_arc),
                     readers: Vec::new(),
                     started: Instant::now(),
@@ -883,6 +897,19 @@ impl IperfServerMgr {
 }
 
 fn terminate_server_process(entry: &mut SrvEntry, wait: Duration) -> Result<(), String> {
+    let process_result = terminate_server_process_inner(entry, wait);
+    let watchdog_result = entry.watchdog.take().map(|mut watchdog| watchdog.stop());
+    match (process_result, watchdog_result) {
+        (Ok(()), None) | (Ok(()), Some(Ok(()))) => Ok(()),
+        (Err(error), None) | (Err(error), Some(Ok(()))) => Err(error),
+        (Ok(()), Some(Err(error))) => Err(error),
+        (Err(process_error), Some(Err(watchdog_error))) => Err(format!(
+            "{process_error}；watchdog 清理失败: {watchdog_error}"
+        )),
+    }
+}
+
+fn terminate_server_process_inner(entry: &mut SrvEntry, wait: Duration) -> Result<(), String> {
     let naturally_exited = if wait > Duration::ZERO {
         match entry.child.wait_timeout(wait) {
             Ok(Some(_)) => true,
@@ -2437,7 +2464,8 @@ iperf Done.
             .expect("helper port")
             .parse()
             .expect("numeric helper port");
-        let _listener = std::net::TcpListener::bind(("127.0.0.1", port))
+        let host = std::env::var("CPE_TEST_LISTENER_HOST").unwrap_or_else(|_| "127.0.0.1".into());
+        let _listener = std::net::TcpListener::bind((host.as_str(), port))
             .expect("helper must bind requested port");
         std::thread::sleep(Duration::from_secs(60));
     }
@@ -2472,6 +2500,7 @@ iperf Done.
             req.port,
             SrvEntry {
                 child,
+                watchdog: None,
                 output: Arc::new(Mutex::new(Vec::new())),
                 readers: Vec::new(),
                 started: Instant::now(),
@@ -2488,7 +2517,10 @@ iperf Done.
 
     #[test]
     fn server_stop_confirms_process_exit_and_releases_port() {
-        let reservation = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        // 其他并行测试大量使用 IPv4 回环随机端口；单独用 IPv6 回环，避免
+        // helper 被杀掉后，恰好被别的测试抢走同一个刚释放的 IPv4 端口。
+        let host = "::1";
+        let reservation = std::net::TcpListener::bind((host, 0)).unwrap();
         let port = reservation.local_addr().unwrap().port();
         drop(reservation);
 
@@ -2500,6 +2532,7 @@ iperf Done.
             ])
             .env("CPE_TEST_LISTENER_HELPER", "1")
             .env("CPE_TEST_LISTENER_PORT", port.to_string())
+            .env("CPE_TEST_LISTENER_HOST", host)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -2507,7 +2540,7 @@ iperf Done.
             .unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(3);
-        while TcpStream::connect(("127.0.0.1", port)).is_err() {
+        while TcpStream::connect((host, port)).is_err() {
             assert!(Instant::now() < deadline, "helper 未及时监听端口 {port}");
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -2517,6 +2550,7 @@ iperf Done.
             port,
             SrvEntry {
                 child,
+                watchdog: None,
                 output: Arc::new(Mutex::new(Vec::new())),
                 readers: Vec::new(),
                 started: Instant::now(),
@@ -2535,7 +2569,7 @@ iperf Done.
             .unwrap();
         assert!(stopped.existed);
         assert!(stopped.terminated);
-        let rebound = std::net::TcpListener::bind(("127.0.0.1", port));
+        let rebound = std::net::TcpListener::bind((host, port));
         assert!(
             rebound.is_ok(),
             "stop 成功返回后端口 {port} 仍不可重新绑定: {:?}",

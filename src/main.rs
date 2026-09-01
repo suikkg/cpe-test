@@ -53,6 +53,12 @@ fn main() {
 fn real_main(args: Vec<String>) -> i32 {
     let mode = args.first().map(|s| s.as_str()).unwrap_or("");
     match mode {
+        "__cpe-watchdog" => {
+            let Some(pid) = args.get(1).and_then(|value| value.parse::<u32>().ok()) else {
+                return 2;
+            };
+            util::run_process_watchdog(pid)
+        }
         "agent" => {
             let f = parse_flags(&args[1..]);
             let config_path = flag_value(&f, "config");
