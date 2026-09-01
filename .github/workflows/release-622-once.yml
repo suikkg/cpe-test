@@ -1,4 +1,4 @@
-name: Prepare v6.2.2 Once
+name: Tag v6.2.2 Once
 
 on:
   push:
@@ -8,7 +8,7 @@ permissions:
   contents: write
 
 jobs:
-  prepare:
+  tag:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -16,14 +16,16 @@ jobs:
           ref: feat/webui-vue
           fetch-depth: 0
 
-      - name: Decide whether release bump is needed
+      - name: Check release state
         id: gate
         shell: bash
         run: |
-          if grep -q '^version = "6.2.1"$' Cargo.toml; then
-            echo 'run=true' >> "$GITHUB_OUTPUT"
-          else
+          set -euo pipefail
+          grep -q '^version = "6.2.2"$' Cargo.toml
+          if git rev-parse -q --verify refs/tags/v6.2.2 >/dev/null; then
             echo 'run=false' >> "$GITHUB_OUTPUT"
+          else
+            echo 'run=true' >> "$GITHUB_OUTPUT"
           fi
 
       - uses: dtolnay/rust-toolchain@stable
@@ -38,73 +40,35 @@ jobs:
           cache: npm
           cache-dependency-path: ui/package-lock.json
 
-      - name: Bump Cargo version
-        if: steps.gate.outputs.run == 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-          p = Path('Cargo.toml')
-          s = p.read_text(encoding='utf-8')
-          old = 'version = "6.2.1"'
-          if old not in s:
-              raise SystemExit('Cargo.toml is not at 6.2.1')
-          p.write_text(s.replace(old, 'version = "6.2.2"', 1), encoding='utf-8')
-          PY
-
-      - name: Bump frontend version and rebuild embedded UI
+      - name: Verify frontend release tree
         if: steps.gate.outputs.run == 'true'
         working-directory: ui
         shell: bash
         run: |
           set -euo pipefail
-          npm version 6.2.2 --no-git-tag-version
           npm ci
           npm test
           npm run build
           npm run verify
 
-      - name: Refresh Cargo lock and docs bundle
+      - name: Verify Rust release tree
         if: steps.gate.outputs.run == 'true'
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-          p = Path('Cargo.lock')
-          s = p.read_text(encoding='utf-8')
-          old = '[[package]]\nname = "cpe_test"\nversion = "6.2.1"'
-          new = '[[package]]\nname = "cpe_test"\nversion = "6.2.2"'
-          if old not in s:
-              raise SystemExit('Cargo.lock cpe_test entry is not at 6.2.1')
-          p.write_text(s.replace(old, new, 1), encoding='utf-8')
-          PY
-          rm -f dist/cpe_test-v6.2.1-windows-config-docs.zip dist/cpe_test-v6.2.1-windows-config-docs.zip.sha256
-          python3 dist/build_config_docs_bundle.py
-
-      - name: Validate release tree
-        if: steps.gate.outputs.run == 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo fmt
+          cargo fmt --check
           cargo test --locked
           cargo clippy --locked --all-targets -- -D warnings
-          git diff --check
-          grep -F 'version = "6.2.2"' Cargo.toml
-          grep -F 'version = "6.2.2"' Cargo.lock
-          grep -F '"version": "6.2.2"' ui/package.json
+          git diff --exit-code
           test -f dist/cpe_test-v6.2.2-windows-config-docs.zip
           test -f dist/cpe_test-v6.2.2-windows-config-docs.zip.sha256
 
-      - name: Commit release bump
+      - name: Push release tag
         if: steps.gate.outputs.run == 'true'
         shell: bash
         run: |
           set -euo pipefail
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add -A
-          git commit -m 'release: v6.2.2'
-          git push origin HEAD:feat/webui-vue
+          git tag -a v6.2.2 -m 'Release v6.2.2'
+          git push origin v6.2.2
