@@ -22,6 +22,7 @@ describe('parseRunRequest', () => {
     udp_streams: 2,
     ping_count: 5,
     ping_payload_sizes: [32],
+    ping_max_rtt_ms: 12.5,
     nic_policies: [
       { endpoint: 'master:NAME=eth0', rx_target: '90%', udp_bandwidth: '', udp_length: '' },
       { rx_target: '1800' },
@@ -45,6 +46,7 @@ describe('parseRunRequest', () => {
     expect(snapshot.globals.tcp_streams).toEqual([1, 10]);
     expect(snapshot.globals.udp_streams).toBe(2);
     expect(snapshot.globals.ping_payload_sizes).toEqual([32]);
+    expect(snapshot.globals.ping_max_rtt_ms).toBe(12.5);
   });
 
   it('丢掉计划里的 plan_hash：复核必须重新走一遍', () => {
@@ -63,6 +65,7 @@ describe('parseRunRequest', () => {
     expect(snapshot.resume).toBe(false);
     expect(snapshot.plan).toBeNull();
     expect(snapshot.globals.tcp_windows).toEqual([]);
+    expect(snapshot.globals.ping_max_rtt_ms).toBe(0);
   });
 
   it('不是对象就读不出来', () => {
