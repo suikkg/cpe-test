@@ -4,31 +4,19 @@
  * **权威在 Rust**（`src/master/webui/model.rs` 与 `src/protocol.rs`），这里是
  * 手写的镜像。每个类型上方注明来源符号名——不写行号：行号会烂，定位用
  * `grep -n "struct <名字>" src/master/webui/model.rs`。
- *
- * 为什么不做代码生成：13 个端点不值得一条构建链，而那条链会把「改 Rust 必须
- * 重跑生成器」加进每个贡献者的工作流。守护改成**契约测试**：Rust 侧把每个
- * `*Out` 的样例序列化成 JSON，Vitest 反序列化断言字段——字段漂移两边都红。
  */
-
-// ---------------------------------------------------------------------------
-// 拓扑（Rust: protocol.rs::NicInfo / HostInfo）
-// ---------------------------------------------------------------------------
 
 export interface NicInfo {
   name: string;
   description: string;
-  /** SGMII1G / SGMII2.5G / RNDIS / WIFI5G / WIFI2.4G / WIFI / UNKNOWN */
   role: string;
   ipv4: string;
   gateway_v4: string;
   ipv6_ll: string;
   ipv6_global: string;
-  /** fe80 的 zone：Windows 是接口索引数字，macOS 是接口名 */
   zone: string;
-  /** 协商速率 Mbps；未知为 0 */
   speed_mbps: number;
   is_wifi: boolean;
-  /** "2.4GHz" / "5GHz" / "6GHz" / "" */
   wifi_band: string;
   ifindex: number;
 }
@@ -38,10 +26,6 @@ export interface HostInfo {
   os: string;
   interfaces: NicInfo[];
 }
-
-// ---------------------------------------------------------------------------
-// 会话（Rust: webui/model.rs::BootstrapOut / ConnectOut, webui/api.rs::ConnectReq）
-// ---------------------------------------------------------------------------
 
 export interface BootstrapOut {
   agent_host: string;
@@ -57,6 +41,7 @@ export interface BootstrapOut {
   udp_streams: number;
   ping_count: number;
   ping_payload_sizes: number[];
+  ping_max_rtt_ms: number;
   screenshot: boolean;
   ui_plan_supported: boolean;
 }
@@ -71,18 +56,6 @@ export interface ConnectReq {
   host: string;
   port: number;
   token: string;
-  /**
-   * 网卡列表的 IPv4 前缀过滤。
-   *
-   * 字段名必须是 `ipv4_prefixes`——这一条曾经写成 `prefixes`，而 serde 现在没有
-   * `deny_unknown_fields`，于是服务端**静默忽略**它：界面上改了前缀点「连接」，
-   * 请求发出去了、200 回来了、网卡表一点没变。在 10.x / 172.x 的实验网里，
-   * 表现就是「辅测机一块网卡都没有，而且怎么改都没用」——而这个输入框存在的
-   * 全部意义就是让人不必回去手改 config.json。
-   *
-   * 空数组是**有意义的取值**（= 列出全部网卡），服务端用 `Option` 区分
-   * 「没提交这个字段」和「提交了空列表」，所以这里总是把它发出去。
-   */
   ipv4_prefixes: string[];
 }
 
@@ -100,17 +73,11 @@ export interface ConnectOut {
   nic_policies: unknown[];
 }
 
-// ---------------------------------------------------------------------------
-// 计划（Rust: webui/model.rs::PlanOut / PlannedUnit / PlanSection / PlanTrace）
-// ---------------------------------------------------------------------------
-
 export interface PlannedUnit {
   seq: number;
   title: string;
   est_secs: number;
-  /** 开了 resume 且 24 小时内已 PASS——会被跳过 */
   resumed: boolean;
-  /** 这个单元每条腿**最终**下发的参数（已含链路裁剪） */
   load: string[];
 }
 
@@ -142,33 +109,19 @@ export interface PlanTrace {
 
 export interface PlanOut {
   units: PlannedUnit[];
-  /** 预计跳过的都真跳过时的耗时 */
   est_total_secs: number;
-  /** 一个都不跳时的耗时；开着 resume 时按区间显示 */
   est_full_secs: number;
   notices: string[];
-  /** 层级信息。**必须直接渲染它**，不要拿平铺的 units 自己重拼分组 */
   sections?: PlanSection[];
   trace?: PlanTrace[];
-  /** 复核页与实跑之间唯一的握手 */
   plan_hash?: string;
   topology_fingerprint?: string;
   ui_plan_supported: boolean;
 }
 
-// ---------------------------------------------------------------------------
-// 运行状态（Rust: master/run_status.rs — ADR-2）
-//
-// 这一组是 v6.0 新增的**结构化进度**。在它之前，单元级进度要靠前端解析
-// `[i/total]` 和「==> 单元结果:」两种日志行；一次 11.5 小时的测试有三万行
-// 日志，刷新一次页面就得全量重放。现在日志只给人看，文案可以随便改。
-// ---------------------------------------------------------------------------
-
 export interface UnitStatus {
-  /** 1-based，与日志的 [i/total] 和报告的 #N 同一个数 */
   seq: number;
   title: string;
-  /** Verdict::label()：PASS / RATE_FAIL / MEASURED / NOT_EVALUATED / SETUP_ERROR / SKIP */
   verdict: string;
   reason_code: string;
   reason_detail: string;
@@ -200,36 +153,24 @@ export interface RunStatus {
   started_at: string;
   total_units: number;
   current: CurrentUnit | null;
-  /** 游标增量：`units_from=N` 只回新完成的 */
   done: UnitStatus[];
   counts: RunCounts;
-  /** 剩余估算秒数。**Rust 算的，前端不复算** */
   eta_secs: number | null;
   aborted_at_unit: number | null;
-  /** 由 executor 回调直接写入，不再从日志里搜「报告已生成: 」 */
   report: string;
   finished: boolean;
 }
 
 export interface ProgressOut {
   running: boolean;
-  /** 日志游标：下一拍该用的 from */
   from: number;
-  /** 给人看的日志文本 */
   lines: string[];
   report: string;
-  /** 给机器读的结构化状态 */
   run: RunStatus;
-  /** 单元游标：下一拍该用的 units_from */
   units_from: number;
 }
 
-// ---------------------------------------------------------------------------
-// 监控（Rust: webui/monitor.rs::MonitorSeriesOut / MonitorPoint）
-// ---------------------------------------------------------------------------
-
 export interface MonitorPoint {
-  /** 会话开始后的秒数。用相对时间：两端系统时钟不保证同步 */
   t: number;
   rx_mbps: number;
   tx_mbps: number;
@@ -245,35 +186,25 @@ export interface MonitorSeriesOut {
   error: string;
 }
 
-// ---------------------------------------------------------------------------
-// 历史运行（Rust: webui/runs.rs::RunEntry — ADR-15）
-// ---------------------------------------------------------------------------
-
 export interface RunEntry {
-  /** 目录名。同时是 bundle.zip 的入参和 `cpe_test report` 的入参 */
   id: string;
   modified: string;
   has_report: boolean;
-  /** 有 rows.jsonl 就能重放报告，即使 report.html 没写出来（崩溃场景） */
   has_rows: boolean;
   has_xlsx: boolean;
-  /** 有 request.json 就能把这一轮的计划装载回控制台再跑一遍 */
   has_request: boolean;
   bytes: number;
 }
 
-/** `POST /api/runs/report` 的回包（Rust: `webui/runs.rs::api_run_replay`）。 */
 export interface ReplayOut {
   id: string;
   report: string;
   xlsx: string | null;
   rows: number;
-  /** 跳过的坏行数；崩溃留下的文件最后一行常常是半截 JSON */
   skipped: number;
   warnings: string[];
 }
 
-/** `POST /api/runs/request` 的回包。 */
 export interface RunRequestOut {
   id: string;
   request: unknown;
