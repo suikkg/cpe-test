@@ -5,12 +5,6 @@
 
 use super::*;
 
-/// 子网 Ping 的默认 RTT 上限。
-///
-/// 这里测的是 CPE 本地链路，不是公网时延。PASS 必须同时满足零丢包和最大 RTT
-/// 不超过该值；用最大值而不是平均值，避免偶发的严重抖动被平均数掩盖。
-const PING_MAX_RTT_MS: f64 = 20.0;
-
 fn ping_acceptance(out: &PingOut, max_rtt_ms: f64) -> bool {
     out.ok
         && out.sent > 0
@@ -30,6 +24,7 @@ impl Ctx {
         t: &PingTask,
     ) -> LegOutcome {
         let time = now_full();
+        let max_rtt_ms = self.cfg.ping.max_rtt_ms;
         let (src_addr, dst_addr) = if t.v6 {
             match v6_addrs(&t.src.nic, &t.dst.nic) {
                 Some(v) => {
@@ -102,14 +97,12 @@ impl Ctx {
         };
         let exec_detail = transport_error.or_else(|| ping::execution_error(&out));
 
-        // `PingOut.ok` 仍只表达 agent 是否收到了至少一个 Echo Reply，保持 RPC
-        // 协议兼容。正式验收在主控这里收紧：必须全部收到，并且最大 RTT 达标。
         let packet_loss_ok = out.sent > 0 && out.received == out.sent;
         let rtt_ok = out
             .rtt_max
-            .map(|rtt| rtt.is_finite() && rtt <= PING_MAX_RTT_MS)
+            .map(|rtt| rtt.is_finite() && rtt <= max_rtt_ms)
             .unwrap_or(false);
-        let acceptance_ok = ping_acceptance(&out, PING_MAX_RTT_MS);
+        let acceptance_ok = ping_acceptance(&out, max_rtt_ms);
 
         let verdict = if gateway_missing {
             Verdict::NotEvaluated
@@ -164,13 +157,13 @@ impl Ctx {
         } else if out.rtt_max.is_none() {
             format!(
                 "Ping RTT 数据缺失：收/发={}/{}, 无法按最大 RTT <= {:.1} ms 验收",
-                out.received, out.sent, PING_MAX_RTT_MS
+                out.received, out.sent, max_rtt_ms
             )
         } else if !rtt_ok {
             format!(
                 "Ping RTT 超限：最大 RTT={} ms，要求 <= {:.1} ms（最小/平均/最大={}/{}/{} ms）",
                 format_ping_rtt(out.rtt_max),
-                PING_MAX_RTT_MS,
+                max_rtt_ms,
                 format_ping_rtt(out.rtt_min),
                 format_ping_rtt(out.rtt_avg),
                 format_ping_rtt(out.rtt_max)
@@ -184,7 +177,7 @@ impl Ctx {
                 format_ping_rtt(out.rtt_min),
                 format_ping_rtt(out.rtt_avg),
                 format_ping_rtt(out.rtt_max),
-                PING_MAX_RTT_MS
+                max_rtt_ms
             )
         };
         logln(&format!(
@@ -208,7 +201,9 @@ impl Ctx {
         ));
         let kind_label = match t.purpose {
             PingPurpose::SubnetTest if unit.bidir => format!("★双向子网PING-{tag}"),
-            PingPurpose::SubnetTest => format!("子网PING（0% 丢包且最大 RTT <= {PING_MAX_RTT_MS:.0}ms）"),
+            PingPurpose::SubnetTest => {
+                format!("子网PING（0% 丢包且最大 RTT <= {max_rtt_ms:.0}ms）")
+            }
             PingPurpose::SubnetDiagnostic => "故障诊断-子网PING".into(),
             PingPurpose::GatewayDiagnostic => "故障诊断-网卡到网关PING".into(),
         };
@@ -219,10 +214,7 @@ impl Ctx {
         };
         let idx = self.push_row(Row {
             time,
-            // 展示用的 transport 列对 ping 一直是空的（协议写在标题里），
-            // 类型化的 `protocol` 才是 ICMP。这里不借类型化顺手改报告的可见列。
             transport: String::new(),
-            // ping 用的是实际解析出来的地址（v6 带 %zone），不是网卡的 ipv4。
             src_ip: src_addr,
             dst_ip: dst_addr,
             verdict,
