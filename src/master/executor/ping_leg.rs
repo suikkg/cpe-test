@@ -103,6 +103,8 @@ impl Ctx {
         let latency_policy = ping_latency_policy(&t.src.nic, &t.dst.nic, t.payload, &self.cfg.ping);
         let max_rtt_ms = latency_policy.max_rtt_ms;
         let avg_rtt_ms = latency_policy.avg_rtt_ms;
+        let medium = if latency_policy.wifi { "Wi-Fi" } else { "有线" };
+        let class = latency_policy.class.label();
         let (src_addr, dst_addr) = if t.v6 {
             match v6_addrs(&t.src.nic, &t.dst.nic) {
                 Some(v) => {
@@ -236,17 +238,17 @@ impl Ctx {
             )
         } else if out.rtt_avg.is_none() {
             format!(
-                "Wi-Fi Ping RTT 平均值缺失：收/发={}/{}, 无法按平均 RTT <= {:.1} ms 验收",
+                "Ping RTT 平均值缺失：{medium}/{class} 档，收/发={}/{}, 无法按平均 RTT <= {:.1} ms 验收",
                 out.received, out.sent, avg_rtt_ms
             )
         } else if out.rtt_max.is_none() {
             format!(
-                "Ping RTT 最大值缺失：收/发={}/{}, 无法按最大 RTT <= {:.1} ms 验收",
+                "Ping RTT 最大值缺失：{medium}/{class} 档，收/发={}/{}, 无法按最大 RTT <= {:.1} ms 验收",
                 out.received, out.sent, max_rtt_ms
             )
         } else if !avg_rtt_ok {
             format!(
-                "Wi-Fi Ping 平均 RTT 超限：平均 RTT={} ms，要求 <= {:.1} ms；最大 RTT={} ms（上限 {:.1} ms）",
+                "Ping 平均 RTT 超限：{medium}/{class} 档，平均 RTT={} ms，要求 <= {:.1} ms；最大 RTT={} ms（上限 {:.1} ms）",
                 format_ping_rtt(out.rtt_avg),
                 avg_rtt_ms,
                 format_ping_rtt(out.rtt_max),
@@ -254,16 +256,16 @@ impl Ctx {
             )
         } else if !max_rtt_ok {
             format!(
-                "Ping RTT 峰值超限：最大 RTT={} ms，要求 <= {:.1} ms（最小/平均/最大={}/{}/{} ms）",
+                "Ping RTT 峰值超限：{medium}/{class} 档，最大 RTT={} ms，要求 <= {:.1} ms（最小/平均/最大={}/{}/{} ms）",
                 format_ping_rtt(out.rtt_max),
                 max_rtt_ms,
                 format_ping_rtt(out.rtt_min),
                 format_ping_rtt(out.rtt_avg),
                 format_ping_rtt(out.rtt_max)
             )
-        } else if latency_policy.wifi {
+        } else {
             format!(
-                "Wi-Fi Ping 达标：发送/接收={}/{}，丢包率 {:.1}%，RTT 最小/平均/最大={}/{}/{} ms；平均 <= {:.1} ms 且最大 <= {:.1} ms",
+                "Ping 达标：{medium}/{class} 档，发送/接收={}/{}，丢包率 {:.1}%，RTT 最小/平均/最大={}/{}/{} ms；平均 <= {:.1} ms 且最大 <= {:.1} ms",
                 out.sent,
                 out.received,
                 out.loss_pct,
@@ -271,17 +273,6 @@ impl Ctx {
                 format_ping_rtt(out.rtt_avg),
                 format_ping_rtt(out.rtt_max),
                 avg_rtt_ms,
-                max_rtt_ms
-            )
-        } else {
-            format!(
-                "有线 Ping 达标：发送/接收={}/{}，丢包率 {:.1}%，RTT 最小/平均/最大={}/{}/{} ms；最大 RTT <= {:.1} ms",
-                out.sent,
-                out.received,
-                out.loss_pct,
-                format_ping_rtt(out.rtt_min),
-                format_ping_rtt(out.rtt_avg),
-                format_ping_rtt(out.rtt_max),
                 max_rtt_ms
             )
         };
@@ -304,16 +295,9 @@ impl Ctx {
                 format!(" ({reason_detail})")
             }
         ));
-        let medium = if latency_policy.wifi {
-            "Wi-Fi"
-        } else {
-            "有线"
-        };
         let criteria = format!(
-            "{medium}/{}：0% 丢包，平均 RTT <= {:.0}ms，最大 RTT <= {:.0}ms",
-            latency_policy.class.label(),
-            avg_rtt_ms,
-            max_rtt_ms
+            "{medium}/{class}：0% 丢包，平均 RTT <= {:.0}ms，最大 RTT <= {:.0}ms",
+            avg_rtt_ms, max_rtt_ms
         );
         let kind_label = match t.purpose {
             PingPurpose::SubnetTest if unit.bidir => format!("★双向子网PING-{tag}（{criteria}）"),
