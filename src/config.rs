@@ -517,6 +517,8 @@ impl UdpProfile {
 pub struct PingCfg {
     pub count: u32,
     pub payload_sizes: Vec<u32>,
+    /// PASS 的最大 RTT 门限（ms）。Ping 还必须同时满足 0% 丢包。
+    pub max_rtt_ms: f64,
 }
 
 impl Default for PingCfg {
@@ -524,6 +526,7 @@ impl Default for PingCfg {
         PingCfg {
             count: 180,
             payload_sizes: vec![32, 1600, 65500],
+            max_rtt_ms: 20.0,
         }
     }
 }
@@ -765,6 +768,12 @@ impl Config {
                 ));
             }
         }
+        if !self.ping.max_rtt_ms.is_finite() || self.ping.max_rtt_ms <= 0.0 {
+            problems.push(format!(
+                "ping.max_rtt_ms={} 必须是大于 0 的有限值",
+                self.ping.max_rtt_ms
+            ));
+        }
         problems
     }
 }
@@ -848,6 +857,7 @@ mod tests {
             cfg.iperf.rate_check.min_active_ratio,
             RateCheckCfg::default().min_active_ratio
         );
+        assert_eq!(cfg.ping.max_rtt_ms, PingCfg::default().max_rtt_ms);
         assert!(
             cfg.validate().is_empty(),
             "最小配置不应触发任何校验告警: {:?}",
@@ -905,12 +915,16 @@ mod tests {
             );
         }
 
-        // ping 次数同理：这份文件里写的数就是用户以为的默认值，而它直接决定
-        // 每个 PING 单元跑多久。
+        // ping 次数和 RTT 门限同理：这份文件里写的数就是用户以为的默认值。
         assert_eq!(
             cfg.ping.count,
             PingCfg::default().count,
             "config.example.json 里的 ping.count 落后于代码默认值"
+        );
+        assert_eq!(
+            cfg.ping.max_rtt_ms,
+            PingCfg::default().max_rtt_ms,
+            "config.example.json 里的 ping.max_rtt_ms 落后于代码默认值"
         );
 
         // agent_token 必须显式写成默认口令，不能留空串。
@@ -1018,6 +1032,13 @@ mod tests {
             .iter()
             .any(|p| p.contains("max_udp_loss_pct")));
 
+        let mut ping_rtt = Config::default();
+        ping_rtt.ping.max_rtt_ms = 0.0;
+        assert!(ping_rtt
+            .validate()
+            .iter()
+            .any(|p| p.contains("ping.max_rtt_ms")));
+
         // discover 阶梯排到测试结束之后，最后几档流永远起不来。
         let mut discover = Config::default();
         discover.iperf.duration = 30;
@@ -1044,6 +1065,7 @@ mod tests {
         assert_eq!(c.iperf.udp_profiles.len(), 5);
         assert!(c.iperf.udp_profiles.iter().all(|p| p.window.is_none()));
         assert_eq!(c.ping.count, 180);
+        assert_eq!(c.ping.max_rtt_ms, 20.0);
         // 默认口令：从「不认证」改成一个固定值，挡的是误连不是攻击。
         // 钉住它是因为它同时是 agent 认证和控制台访问的出厂值，改动会同时
         // 影响两端能否互通。
@@ -1061,7 +1083,7 @@ mod tests {
             "agent_host": "10.228.46.50",
             "ipv4_prefixes": ["192.168.", "10.10."],
             "iperf": {"duration": 60},
-            "ping": {"count": 10, "payload_sizes": [32, 1600, 65500]},
+            "ping": {"count": 10, "payload_sizes": [32, 1600, 65500], "max_rtt_ms": 12.5},
             "tests": [
                 {"name":"t1","src":"master:SGMII2.5G","dst":"agent:SGMII2.5G",
                  "direction":"bidir","kinds":["iperf","ping"],"transports":["tcp","udp"],
@@ -1074,6 +1096,7 @@ mod tests {
         let c: Config = serde_json::from_str(j).unwrap();
         assert_eq!(c.agent_host, "10.228.46.50");
         assert_eq!(c.iperf.duration, 60);
+        assert_eq!(c.ping.max_rtt_ms, 12.5);
         // 未写的字段用默认
         assert_eq!(c.iperf.tcp_windows.len(), 3);
         assert_eq!(c.tests.len(), 2);
