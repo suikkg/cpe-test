@@ -167,7 +167,7 @@ const untouched = computed(() => globalsAreEmpty(plan.globals));
         />
       </label>
       <label>
-        <span>Ping 最大 RTT（ms）</span>
+        <span>有线 Ping 最大 RTT（ms）</span>
         <input
           v-model="pingMaxRtt"
           type="text"
@@ -181,7 +181,9 @@ const untouched = computed(() => globalsAreEmpty(plan.globals));
     <p class="muted hint">
       套件里选中的配置优先；这里填的是「套件没选配置时用哪一组」。填多个用逗号分隔，逐档各跑一轮。
       <br />
-      <strong>Ping PASS = 0% 丢包 + 最大 RTT 不超过门限</strong>；RTT 数据缺失同样不通过。
+      <strong>Ping 一律要求 0% 丢包</strong>。纯有线链路按上面的最大 RTT 门限验收；
+      任一端是 Wi-Fi 时自动改为<strong>平均 RTT ≤ 30 ms 且最大 RTT ≤ 100 ms</strong>。
+      这样允许空口正常的瞬时抖动，同时不会让一次严重尖峰被平均值掩盖；RTT 数据缺失同样不通过。
       <br />
       <strong>UDP 那四格是一整组</strong>：只要 <code>-b</code> 填了，
       <code>-l</code> / <code>-w</code> 留空就是<strong>真的不下发</strong>这两个参数（用 iperf3 默认），
