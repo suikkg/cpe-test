@@ -19,17 +19,17 @@ jobs:
         run: |
           python3 .github/scripts/apply_ping_payload_policy.py
           python3 .github/scripts/fix_ping_policy_test_fixtures.py
-      - name: Format and validate Rust
-        run: |
-          cargo fmt
-          cargo test --locked
-          cargo clippy --locked --all-targets -- -D warnings
-      - name: Validate and build UI
+      - name: Build and validate UI
         run: |
           cd ui
           npm ci
           npm test -- --run
           npm run build
+      - name: Format and validate Rust
+        run: |
+          cargo fmt
+          cargo test --locked
+          cargo clippy --locked --all-targets -- -D warnings
       - name: Commit
         run: |
           git config user.name github-actions[bot]
