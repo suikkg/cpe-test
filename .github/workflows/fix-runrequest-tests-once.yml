@@ -1,0 +1,47 @@
+name: Fix RunRequest Tests Once
+
+on:
+  push:
+    branches:
+      - feat/webui-vue
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: feat/webui-vue
+          fetch-depth: 0
+      - name: Apply fix only for staging commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event.head_commit.message }}" != "chore: stage RunRequest test fix" ]; then
+            exit 0
+          fi
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('src/master/webui/tests.rs')
+          text = p.read_text(encoding='utf-8')
+          a = '        ping_payload_sizes: Vec::new(),\n        limit_udp_by_link_speed: false,'
+          b = '        ping_payload_sizes: Vec::new(),\n        ping_max_rtt_ms: 0.0,\n        limit_udp_by_link_speed: false,'
+          if a not in text:
+              raise SystemExit('first RunRequest literal not found')
+          text = text.replace(a, b, 1)
+          a = '        ping_payload_sizes: numbers(&settings["ping_payload_sizes"]),\n        limit_udp_by_link_speed:'
+          b = '        ping_payload_sizes: numbers(&settings["ping_payload_sizes"]),\n        ping_max_rtt_ms: settings["ping_max_rtt_ms"].as_f64().unwrap_or(0.0),\n        limit_udp_by_link_speed:'
+          if a not in text:
+              raise SystemExit('import RunRequest literal not found')
+          text = text.replace(a, b, 1)
+          p.write_text(text, encoding='utf-8')
+          PY
+          cargo fmt -- src/master/webui/tests.rs
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add src/master/webui/tests.rs
+          git commit -m 'test: complete ping RTT request fixtures'
+          git push origin HEAD:feat/webui-vue
