@@ -5,13 +5,65 @@
 
 use super::*;
 
-fn ping_acceptance(out: &PingOut, max_rtt_ms: f64) -> bool {
+/// Wi-Fi 空口允许正常的竞争/重传抖动，但不能让平均值掩盖严重尖峰。
+/// 纯有线链路仍使用 config.json 的 `ping.max_rtt_ms` 严格峰值门限。
+const WIFI_AVG_RTT_MS: f64 = 30.0;
+const WIFI_MAX_RTT_MS: f64 = 100.0;
+
+#[derive(Debug, Clone, Copy)]
+struct PingLatencyPolicy {
+    wifi: bool,
+    avg_rtt_ms: Option<f64>,
+    max_rtt_ms: f64,
+}
+
+fn nic_looks_wifi(nic: &NicInfo) -> bool {
+    if nic.is_wifi || !nic.wifi_band.trim().is_empty() {
+        return true;
+    }
+    // 兼容旧 agent：旧版协议没有 is_wifi/wifi_band 时 serde 会补默认值，
+    // 继续从角色、接口名和描述识别，避免把旧辅测机的 Wi-Fi 误按有线验收。
+    let role = nic.role.to_ascii_lowercase();
+    let name = nic.name.to_ascii_lowercase();
+    let description = nic.description.to_ascii_lowercase();
+    role.contains("wifi")
+        || name.contains("wi-fi")
+        || name.contains("wifi")
+        || name.contains("wlan")
+        || description.contains("wi-fi")
+        || description.contains("wifi")
+        || description.contains("wireless")
+}
+
+fn ping_latency_policy(src: &NicInfo, dst: &NicInfo, wired_max_rtt_ms: f64) -> PingLatencyPolicy {
+    let wifi = nic_looks_wifi(src) || nic_looks_wifi(dst);
+    if wifi {
+        PingLatencyPolicy {
+            wifi: true,
+            avg_rtt_ms: Some(WIFI_AVG_RTT_MS),
+            max_rtt_ms: WIFI_MAX_RTT_MS,
+        }
+    } else {
+        PingLatencyPolicy {
+            wifi: false,
+            avg_rtt_ms: None,
+            max_rtt_ms: wired_max_rtt_ms,
+        }
+    }
+}
+
+fn ping_acceptance(out: &PingOut, policy: PingLatencyPolicy) -> bool {
+    let avg_ok = policy.avg_rtt_ms.is_none_or(|limit| {
+        out.rtt_avg
+            .is_some_and(|rtt| rtt.is_finite() && rtt <= limit)
+    });
     out.ok
         && out.sent > 0
         && out.received == out.sent
+        && avg_ok
         && out
             .rtt_max
-            .is_some_and(|rtt| rtt.is_finite() && rtt <= max_rtt_ms)
+            .is_some_and(|rtt| rtt.is_finite() && rtt <= policy.max_rtt_ms)
 }
 
 impl Ctx {
@@ -24,7 +76,10 @@ impl Ctx {
         t: &PingTask,
     ) -> LegOutcome {
         let time = now_full();
-        let max_rtt_ms = self.cfg.ping.max_rtt_ms;
+        let latency_policy =
+            ping_latency_policy(&t.src.nic, &t.dst.nic, self.cfg.ping.max_rtt_ms);
+        let max_rtt_ms = latency_policy.max_rtt_ms;
+        let avg_rtt_ms = latency_policy.avg_rtt_ms;
         let (src_addr, dst_addr) = if t.v6 {
             match v6_addrs(&t.src.nic, &t.dst.nic) {
                 Some(v) => {
@@ -98,11 +153,14 @@ impl Ctx {
         let exec_detail = transport_error.or_else(|| ping::execution_error(&out));
 
         let packet_loss_ok = out.sent > 0 && out.received == out.sent;
-        let rtt_ok = out
+        let avg_rtt_ok = avg_rtt_ms.is_none_or(|limit| {
+            out.rtt_avg
+                .is_some_and(|rtt| rtt.is_finite() && rtt <= limit)
+        });
+        let max_rtt_ok = out
             .rtt_max
-            .map(|rtt| rtt.is_finite() && rtt <= max_rtt_ms)
-            .unwrap_or(false);
-        let acceptance_ok = ping_acceptance(&out, max_rtt_ms);
+            .is_some_and(|rtt| rtt.is_finite() && rtt <= max_rtt_ms);
+        let acceptance_ok = ping_acceptance(&out, latency_policy);
 
         let verdict = if gateway_missing {
             Verdict::NotEvaluated
@@ -154,23 +212,50 @@ impl Ctx {
                 "Ping 丢包不达标：要求 0% 丢包，实际收/发={}/{}, 丢包率 {:.1}%",
                 out.received, out.sent, out.loss_pct
             )
+        } else if latency_policy.wifi && out.rtt_avg.is_none() {
+            format!(
+                "Wi-Fi Ping RTT 平均值缺失：收/发={}/{}, 无法按平均 RTT <= {:.1} ms 验收",
+                out.received,
+                out.sent,
+                avg_rtt_ms.unwrap_or_default()
+            )
         } else if out.rtt_max.is_none() {
             format!(
-                "Ping RTT 数据缺失：收/发={}/{}, 无法按最大 RTT <= {:.1} ms 验收",
+                "Ping RTT 最大值缺失：收/发={}/{}, 无法按最大 RTT <= {:.1} ms 验收",
                 out.received, out.sent, max_rtt_ms
             )
-        } else if !rtt_ok {
+        } else if !avg_rtt_ok {
             format!(
-                "Ping RTT 超限：最大 RTT={} ms，要求 <= {:.1} ms（最小/平均/最大={}/{}/{} ms）",
+                "Wi-Fi Ping 平均 RTT 超限：平均 RTT={} ms，要求 <= {:.1} ms；最大 RTT={} ms（上限 {:.1} ms）",
+                format_ping_rtt(out.rtt_avg),
+                avg_rtt_ms.unwrap_or_default(),
+                format_ping_rtt(out.rtt_max),
+                max_rtt_ms
+            )
+        } else if !max_rtt_ok {
+            format!(
+                "Ping RTT 峰值超限：最大 RTT={} ms，要求 <= {:.1} ms（最小/平均/最大={}/{}/{} ms）",
                 format_ping_rtt(out.rtt_max),
                 max_rtt_ms,
                 format_ping_rtt(out.rtt_min),
                 format_ping_rtt(out.rtt_avg),
                 format_ping_rtt(out.rtt_max)
             )
+        } else if latency_policy.wifi {
+            format!(
+                "Wi-Fi Ping 达标：发送/接收={}/{}，丢包率 {:.1}%，RTT 最小/平均/最大={}/{}/{} ms；平均 <= {:.1} ms 且最大 <= {:.1} ms",
+                out.sent,
+                out.received,
+                out.loss_pct,
+                format_ping_rtt(out.rtt_min),
+                format_ping_rtt(out.rtt_avg),
+                format_ping_rtt(out.rtt_max),
+                avg_rtt_ms.unwrap_or_default(),
+                max_rtt_ms
+            )
         } else {
             format!(
-                "Ping 达标：发送/接收={}/{}，丢包率 {:.1}%，RTT 最小/平均/最大={}/{}/{} ms，最大 RTT 门限 {:.1} ms",
+                "有线 Ping 达标：发送/接收={}/{}，丢包率 {:.1}%，RTT 最小/平均/最大={}/{}/{} ms；最大 RTT <= {:.1} ms",
                 out.sent,
                 out.received,
                 out.loss_pct,
@@ -201,8 +286,13 @@ impl Ctx {
         ));
         let kind_label = match t.purpose {
             PingPurpose::SubnetTest if unit.bidir => format!("★双向子网PING-{tag}"),
+            PingPurpose::SubnetTest if latency_policy.wifi => format!(
+                "子网PING（Wi-Fi：0% 丢包，平均 RTT <= {:.0}ms，最大 RTT <= {:.0}ms）",
+                avg_rtt_ms.unwrap_or_default(),
+                max_rtt_ms
+            ),
             PingPurpose::SubnetTest => {
-                format!("子网PING（0% 丢包且最大 RTT <= {max_rtt_ms:.0}ms）")
+                format!("子网PING（有线：0% 丢包且最大 RTT <= {max_rtt_ms:.0}ms）")
             }
             PingPurpose::SubnetDiagnostic => "故障诊断-子网PING".into(),
             PingPurpose::GatewayDiagnostic => "故障诊断-网卡到网关PING".into(),
@@ -257,47 +347,89 @@ impl Ctx {
             tag: tag.to_string(),
         }
     }
-
-    // ---------------- ctsTraffic ----------------
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn ping_out(sent: u32, received: u32, rtt_max: Option<f64>) -> PingOut {
+    fn out(received: u32, avg: Option<f64>, max: Option<f64>) -> PingOut {
         PingOut {
             ok: received > 0,
-            sent,
+            sent: 180,
             received,
-            lost: sent.saturating_sub(received),
-            loss_pct: if sent == 0 {
-                0.0
-            } else {
-                (sent.saturating_sub(received) as f64 / sent as f64) * 100.0
-            },
-            rtt_max,
+            lost: 180 - received,
+            loss_pct: (180 - received) as f64 / 1.8,
+            rtt_min: Some(2.0),
+            rtt_avg: avg,
+            rtt_max: max,
             ..Default::default()
         }
     }
 
     #[test]
-    fn ping_requires_every_echo_reply() {
-        assert!(!ping_acceptance(&ping_out(4, 1, Some(1.0)), 20.0));
-        assert!(!ping_acceptance(&ping_out(4, 3, Some(1.0)), 20.0));
-        assert!(ping_acceptance(&ping_out(4, 4, Some(1.0)), 20.0));
+    fn wired_ping_uses_the_strict_peak_gate() {
+        let nic = NicInfo::default();
+        let policy = ping_latency_policy(&nic, &nic, 20.0);
+        assert!(!policy.wifi);
+        assert!(ping_acceptance(
+            &out(180, Some(5.0), Some(20.0)),
+            policy
+        ));
+        assert!(!ping_acceptance(
+            &out(180, Some(5.0), Some(20.1)),
+            policy
+        ));
     }
 
     #[test]
-    fn ping_requires_max_rtt_within_limit() {
-        assert!(ping_acceptance(&ping_out(4, 4, Some(20.0)), 20.0));
-        assert!(!ping_acceptance(&ping_out(4, 4, Some(20.1)), 20.0));
-        assert!(!ping_acceptance(&ping_out(4, 4, None), 20.0));
-        assert!(!ping_acceptance(&ping_out(4, 4, Some(f64::NAN)), 20.0));
+    fn wifi_ping_requires_zero_loss_good_average_and_a_bounded_spike() {
+        let wifi = NicInfo {
+            is_wifi: true,
+            ..Default::default()
+        };
+        let wired = NicInfo::default();
+        let policy = ping_latency_policy(&wifi, &wired, 20.0);
+        assert!(policy.wifi);
+        assert!(ping_acceptance(
+            &out(180, Some(30.0), Some(100.0)),
+            policy
+        ));
+        assert!(!ping_acceptance(
+            &out(179, Some(5.0), Some(10.0)),
+            policy
+        ));
+        assert!(!ping_acceptance(
+            &out(180, Some(30.1), Some(80.0)),
+            policy
+        ));
+        assert!(!ping_acceptance(
+            &out(180, Some(10.0), Some(100.1)),
+            policy
+        ));
+        assert!(!ping_acceptance(&out(180, None, Some(20.0)), policy));
     }
 
     #[test]
-    fn ping_never_passes_without_packets() {
-        assert!(!ping_acceptance(&ping_out(0, 0, None), 20.0));
+    fn old_agent_wifi_metadata_is_still_recognized() {
+        for nic in [
+            NicInfo {
+                role: "WIFI5G".into(),
+                ..Default::default()
+            },
+            NicInfo {
+                name: "WLAN 3".into(),
+                ..Default::default()
+            },
+            NicInfo {
+                description: "Intel Wireless Adapter".into(),
+                ..Default::default()
+            },
+        ] {
+            assert!(
+                nic_looks_wifi(&nic),
+                "旧 agent 的 Wi-Fi 不该被当成有线: {nic:?}"
+            );
+        }
     }
 }
