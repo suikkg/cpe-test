@@ -1362,9 +1362,10 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         configure_managed_command(&mut command);
-        let child = command.spawn().expect("受管 helper child 必须能启动");
+        let mut child = command.spawn().expect("受管 helper child 必须能启动");
         std::fs::write(&marker, child.id().to_string()).expect("写 pdeath marker");
         std::thread::sleep(Duration::from_secs(60));
+        let _ = child.wait();
     }
 
     /// Linux agent 被 SIGKILL 时，已启动的外部工具不能留下来继续占端口。
