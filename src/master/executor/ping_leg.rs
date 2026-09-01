@@ -11,6 +11,15 @@ use super::*;
 /// 不超过该值；用最大值而不是平均值，避免偶发的严重抖动被平均数掩盖。
 const PING_MAX_RTT_MS: f64 = 20.0;
 
+fn ping_acceptance(out: &PingOut, max_rtt_ms: f64) -> bool {
+    out.ok
+        && out.sent > 0
+        && out.received == out.sent
+        && out
+            .rtt_max
+            .is_some_and(|rtt| rtt.is_finite() && rtt <= max_rtt_ms)
+}
+
 impl Ctx {
     pub(super) fn run_ping_leg(
         &self,
@@ -100,7 +109,7 @@ impl Ctx {
             .rtt_max
             .map(|rtt| rtt.is_finite() && rtt <= PING_MAX_RTT_MS)
             .unwrap_or(false);
-        let acceptance_ok = out.ok && packet_loss_ok && rtt_ok;
+        let acceptance_ok = ping_acceptance(&out, PING_MAX_RTT_MS);
 
         let verdict = if gateway_missing {
             Verdict::NotEvaluated
@@ -258,4 +267,45 @@ impl Ctx {
     }
 
     // ---------------- ctsTraffic ----------------
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ping_out(sent: u32, received: u32, rtt_max: Option<f64>) -> PingOut {
+        PingOut {
+            ok: received > 0,
+            sent,
+            received,
+            lost: sent.saturating_sub(received),
+            loss_pct: if sent == 0 {
+                0.0
+            } else {
+                (sent.saturating_sub(received) as f64 / sent as f64) * 100.0
+            },
+            rtt_max,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn ping_requires_every_echo_reply() {
+        assert!(!ping_acceptance(&ping_out(4, 1, Some(1.0)), 20.0));
+        assert!(!ping_acceptance(&ping_out(4, 3, Some(1.0)), 20.0));
+        assert!(ping_acceptance(&ping_out(4, 4, Some(1.0)), 20.0));
+    }
+
+    #[test]
+    fn ping_requires_max_rtt_within_limit() {
+        assert!(ping_acceptance(&ping_out(4, 4, Some(20.0)), 20.0));
+        assert!(!ping_acceptance(&ping_out(4, 4, Some(20.1)), 20.0));
+        assert!(!ping_acceptance(&ping_out(4, 4, None), 20.0));
+        assert!(!ping_acceptance(&ping_out(4, 4, Some(f64::NAN)), 20.0));
+    }
+
+    #[test]
+    fn ping_never_passes_without_packets() {
+        assert!(!ping_acceptance(&ping_out(0, 0, None), 20.0));
+    }
 }
