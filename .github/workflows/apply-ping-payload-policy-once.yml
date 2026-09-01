@@ -19,6 +19,7 @@ jobs:
         run: |
           python3 .github/scripts/apply_ping_payload_policy.py
           python3 .github/scripts/fix_ping_policy_test_fixtures.py
+          python3 .github/scripts/fix_ping_policy_ui_types.py
       - name: Build and validate UI
         run: |
           cd ui
