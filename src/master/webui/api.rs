@@ -31,6 +31,12 @@ pub(super) fn api_bootstrap(console: &Arc<Console>) -> Result<serde_json::Value,
     serde_json::to_value(bootstrap_out(&state)).map_err(|error| error.to_string())
 }
 
+/// 控制台开局回填的默认值。
+///
+/// 读 `state.cfg`——而它在启动时已经被 `webui::console_baseline_config` 过滤过：
+/// exe 旁边那份 `config.json` 只留下连接信息，判定与档位一律是内置默认值。
+/// 用户**显式**点「导入 config.json」时 `state.cfg` 会被整份替换，那时这里
+/// 回填的就是他自己挑的那份文件——这正是两者该有的区别。
 pub(super) fn bootstrap_out(state: &UiState) -> BootstrapOut {
     let default_windows = &state.cfg.iperf.tcp_windows;
     let mut tcp_streams: Vec<u32> = state
@@ -132,9 +138,7 @@ pub(super) fn bootstrap_out(state: &UiState) -> BootstrapOut {
         ping_wifi_medium_max_rtt_ms: state.cfg.ping.wifi_medium_max_rtt_ms,
         ping_wifi_large_avg_rtt_ms: state.cfg.ping.wifi_large_avg_rtt_ms,
         ping_wifi_large_max_rtt_ms: state.cfg.ping.wifi_large_max_rtt_ms,
-        rate_targets_mbps: state.cfg.iperf.rate_check.targets_mbps.clone(),
-        rate_mode: state.cfg.iperf.rate_check.mode,
-        udp_profiles: state.cfg.iperf.udp_profiles.clone(),
+        master_config: super::plan::master_config_snapshot(&state.cfg),
         screenshot: state.cfg.screenshot,
         ui_plan_supported: true,
     }

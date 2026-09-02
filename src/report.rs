@@ -402,12 +402,24 @@ fn push_bidirectional_summary(h: &mut String, group: &UnitGroup<'_>) {
     let rx_sum = bidirectional_rx_average_sum(group)
         .map(|value| format!("{value:.3} Mbps"))
         .unwrap_or_else(|| "未形成（需两方向都有 RX 平均）".into());
-    h.push_str(
-        &format!(
-            "<div class=\"direction-summary\" role=\"group\" aria-label=\"双向方向汇总\"><strong class=\"direction-summary-title\">双向方向汇总（每个方向各自按接收端 RX 判定） · 双向 RX 平均合计 <span class=\"bidir-rx-sum\">{}</span></strong>",
+    // 配了合计门限时，「每个方向各自按接收端 RX 判定」这句话是**假的**：
+    // 两条腿此时只测量（`leg_rate_plan` 把它们落到 Observe），判定只在合计上
+    // 做一次。双向单元的汇总行只有在配了合计门限时才带 `target_mbps`，用它分流。
+    let bidir_total_target = group.summary.and_then(|summary| summary.target_mbps);
+    let title = match bidir_total_target {
+        Some(target) => format!(
+            "双向方向汇总（本单元按两端 RX 合计判定一次，两条腿只测量） · 双向 RX 平均合计 <span class=\"bidir-rx-sum\">{}</span> / 门限 {:.3} Mbps",
+            esc(&rx_sum),
+            target
+        ),
+        None => format!(
+            "双向方向汇总（未设置合计门限，每个方向各自按接收端 RX 判定） · 双向 RX 平均合计 <span class=\"bidir-rx-sum\">{}</span>",
             esc(&rx_sum)
         ),
-    );
+    };
+    h.push_str(&format!(
+        "<div class=\"direction-summary\" role=\"group\" aria-label=\"双向方向汇总\"><strong class=\"direction-summary-title\">{title}</strong>"
+    ));
     push_bidirectional_direction(h, ab, &fallback_reason);
     push_bidirectional_direction(h, ba, &fallback_reason);
     h.push_str("</div>");

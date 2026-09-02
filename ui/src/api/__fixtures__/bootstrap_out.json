@@ -5,6 +5,97 @@
   "ipv4_prefixes": [
     "192.168."
   ],
+  "master_config": {
+    "ctstraffic": {
+      "status_update_ms": 1000,
+      "udp_buffer_depth_secs": 1,
+      "udp_frame_rate": 100
+    },
+    "iperf": {
+      "duration": 180,
+      "rate_check": {
+        "background_secs": 3,
+        "cpe_path_ceiling_mbps": 2600.0,
+        "discovery_step_secs": 10,
+        "evb_eth_to_usb_target_mbps": 8400.0,
+        "evb_usb_to_eth_target_mbps": 6400.0,
+        "flow_retries": 1,
+        "launch_interval_ms": 50,
+        "max_udp_loss_pct": null,
+        "min_active_ratio": 0.9,
+        "min_concurrent_streams": 2,
+        "mode": "auto",
+        "offered_headroom_pct": 5.0,
+        "sample_interval_ms": 1000,
+        "settle_secs": 5,
+        "startup_timeout_secs": 15,
+        "targets_mbps": {
+          "ab": null,
+          "ba": null,
+          "forward": null
+        },
+        "wifi_24g_payload_ceiling_mbps": 574.0,
+        "wifi_payload_ceiling_mbps": 2882.0
+      },
+      "tcp_windows": [
+        "64k",
+        "1m",
+        "4m"
+      ],
+      "udp_profiles": [
+        {
+          "bandwidth": "1m",
+          "length": null,
+          "window": null
+        },
+        {
+          "bandwidth": "100m",
+          "length": null,
+          "window": null
+        },
+        {
+          "bandwidth": "500m",
+          "length": null,
+          "window": null
+        },
+        {
+          "bandwidth": "1000m",
+          "length": "64",
+          "window": null
+        },
+        {
+          "bandwidth": "2500m",
+          "length": null,
+          "window": null
+        }
+      ]
+    },
+    "link_profiles": {
+      "by_role": []
+    },
+    "ping": {
+      "count": 180,
+      "max_rtt_ms": 30.0,
+      "medium_max_bytes": 2000,
+      "payload_sizes": [
+        32,
+        1600,
+        65500
+      ],
+      "small_max_bytes": 128,
+      "wifi_large_avg_rtt_ms": 100.0,
+      "wifi_large_max_rtt_ms": 200.0,
+      "wifi_medium_avg_rtt_ms": 50.0,
+      "wifi_medium_max_rtt_ms": 100.0,
+      "wifi_small_avg_rtt_ms": 30.0,
+      "wifi_small_max_rtt_ms": 80.0,
+      "wired_large_avg_rtt_ms": 50.0,
+      "wired_large_max_rtt_ms": 100.0,
+      "wired_medium_avg_rtt_ms": 20.0,
+      "wired_medium_max_rtt_ms": 50.0,
+      "wired_small_avg_rtt_ms": 10.0
+    }
+  },
   "ping_count": 180,
   "ping_max_rtt_ms": 30.0,
   "ping_medium_max_bytes": 2000,
@@ -26,12 +117,6 @@
   "ping_wired_medium_max_rtt_ms": 50.0,
   "ping_wired_small_avg_rtt_ms": 10.0,
   "ping_wired_small_max_rtt_ms": 30.0,
-  "rate_mode": "auto",
-  "rate_targets_mbps": {
-    "ab": null,
-    "ba": null,
-    "forward": null
-  },
   "screenshot": true,
   "tcp_streams": [
     10
@@ -51,33 +136,6 @@
   ],
   "udp_lengths": [
     "64"
-  ],
-  "udp_profiles": [
-    {
-      "bandwidth": "1m",
-      "length": null,
-      "window": null
-    },
-    {
-      "bandwidth": "100m",
-      "length": null,
-      "window": null
-    },
-    {
-      "bandwidth": "500m",
-      "length": null,
-      "window": null
-    },
-    {
-      "bandwidth": "1000m",
-      "length": "64",
-      "window": null
-    },
-    {
-      "bandwidth": "2500m",
-      "length": null,
-      "window": null
-    }
   ],
   "udp_streams": 1,
   "udp_windows": [],

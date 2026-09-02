@@ -2913,7 +2913,7 @@ mod tests {
         assert_eq!(
             first_bandwidth_arg(&units[0]),
             "2600000000",
-            "2.6G 在默认 2800 的 WiFi 上限内，不该被协商到的 866/2402 裁掉"
+            "2.6G 在默认 2882 的 WiFi 上限内，不该被协商到的 866/2402 裁掉"
         );
         assert!(notices.is_empty(), "{notices:?}");
 
@@ -3353,7 +3353,7 @@ mod tests {
         assert_eq!(
             targets("bidir"),
             vec![Some(1000.0), Some(800.0)],
-            "双向两条腿各取各的方向门限——半双工链路两个方向本来就能差很远"
+            "双向两条腿各取各的方向门限——双向并发时两个方向本来就能差很远"
         );
     }
 

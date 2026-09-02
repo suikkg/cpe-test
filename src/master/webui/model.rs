@@ -21,7 +21,7 @@ pub(super) struct PairSelection {
     /// 组双向，能收到的速率完全不是一个量级。门限挂在网卡上只能填一个数，
     /// 必然有一组是错的——受限的是这条链路，不是某一端的网卡。
     ///
-    /// 两个方向分开是因为半双工链路的两个方向本来就可以差很远
+    /// 两个方向分开是因为双向并发时两个方向本来就可以差很远
     /// （同一次运行里见过 1821Mbps 对 17Mbps）。
     #[serde(default)]
     pub(super) rx_target_bidir_ab: String,
@@ -400,31 +400,23 @@ pub(super) struct RunRequest {
     /// New suite-plan request.  It is mutually exclusive with legacy `pairs`.
     #[serde(default)]
     pub(super) ui_plan: Option<UiPlan>,
-    /// 项目快照钉住的 UDP 档位**原样列表**。
+    /// 项目快照带来的**解析后主控配置**：判定与灌包参数的完整基线。
     ///
-    /// 为什么不能只钉「带宽/长度/窗口」三条轴：三条轴是**叉乘**语义，而主控
-    /// `config.json` 里的档位是逐条列出来的——内置基线里只有 `1000m` 带 `-l 64`，
-    /// 其余四档不带。把它还原成三条轴再叉乘，会变成五档全带 `-l 64`，
-    /// 灌包条件当场就变了。要「导出真正生效的值」，这里就得是原样列表。
+    /// 只保留 `link_profiles` / `iperf` / `ctstraffic` / `ping` 四块——
+    /// 它们合起来就是「这一轮怎么跑、怎么判」的全部。连接身份（辅测机地址、
+    /// 口令、网段前缀）、本机运行偏好（`resume` / `screenshot` / `open_report`）
+    /// 和命令行的测试矩阵（`tests` / `pairs`）**不在**里面：前者跟着机器走，
+    /// 后者控制台用自己的 `ui_plan`。
     ///
-    /// `None` = 请求没有意见，沿用本机 `config.json`。
+    /// 为什么是整块而不是逐字段：`rate_check` 的负载上限、`link_profiles.by_role`
+    /// 的角色配对门限、`ctstraffic` 的帧率与缓冲深度，界面上**根本没有输入框**，
+    /// 逐字段加通道永远追不完——只要漏一个，同一份项目换台机器就换一套参数，
+    /// 而项目文件里一个字都看不出来。
+    ///
+    /// 合并语义是**深合并**：项目里写了的键覆盖基线，没写的保留基线值。
+    /// 老项目文件缺这一块时行为与从前一致。
     #[serde(default)]
-    pub(super) udp_profiles: Option<Vec<crate::config::UdpProfile>>,
-    /// 项目快照钉住的判定模式（`auto` / `verify` / `observe` / `discover`）。
-    ///
-    /// 它和全局门限是一对：`observe` 只记录实测能力、不判 PASS/FAIL，`verify`
-    /// 没有门限时直接 `TARGET_MISSING`。界面上没有这个开关，但主控
-    /// `config.json` 里配的是哪个，直接决定这一轮出不出 PASS——不带走它，
-    /// 换台机器同一份项目可能整轮都是 MEASURED。
-    #[serde(default)]
-    pub(super) global_rate_mode: Option<crate::config::RateMode>,
-    /// 项目快照钉住的**全局** RX 门限。
-    ///
-    /// `None` = 请求没有意见，沿用本机 `config.json`（老页面、手写请求）。
-    /// `Some(..)` = 项目明确声明过，**包括三个字段全为 null 的「明确没有全局
-    /// 门限」**——那正是「导入后不许回落到目标主控机默认值」这条要求的落点。
-    #[serde(default)]
-    pub(super) global_rate_targets: Option<crate::config::RateTargets>,
+    pub(super) master_config: Option<serde_json::Value>,
     /// Optional hash returned by `/api/plan`; checked by `/api/run`.
     #[serde(default)]
     pub(super) plan_hash: Option<String>,
@@ -476,17 +468,12 @@ pub(super) struct BootstrapOut {
     pub(super) ping_wifi_medium_max_rtt_ms: f64,
     pub(super) ping_wifi_large_avg_rtt_ms: f64,
     pub(super) ping_wifi_large_max_rtt_ms: f64,
-    /// 主控 `config.json` 里当前生效的**全局** RX 门限。
+    /// 主控当前生效的**解析后配置**：判定与灌包参数的完整基线。
     ///
-    /// 界面上没有对应输入框，但它照样参与判定：导出项目时必须把这一份写进
-    /// 快照，否则同一个项目在另一台主控上会改用那台机器的门限，
-    /// 「怎么判定」静默变了（`RunRequest::global_rate_targets`）。
-    pub(super) rate_targets_mbps: crate::config::RateTargets,
-    /// 主控当前生效的判定模式；导出项目时按它固化。
-    pub(super) rate_mode: crate::config::RateMode,
-    /// 主控当前生效的 UDP 档位原样列表；导出项目时按它固化，见
-    /// [`RunRequest::udp_profiles`]。
-    pub(super) udp_profiles: Vec<crate::config::UdpProfile>,
+    /// 导出项目时原样固化（见 [`RunRequest::master_config`]）。只含
+    /// `link_profiles` / `iperf` / `ctstraffic` / `ping` 四块，
+    /// **不含任何连接身份**——这份数据会进项目文件，而项目文件是要传阅的。
+    pub(super) master_config: serde_json::Value,
     pub(super) screenshot: bool,
     /// Feature flag for pages that can send the suite-oriented `ui_plan` DTO.
     pub(super) ui_plan_supported: bool,

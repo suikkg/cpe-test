@@ -1,5 +1,15 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import { buildRunRequest, importProject, plan, previewIsCurrent, reset } from './plan';
+import {
+  buildRunRequest,
+  exportProject,
+  importProject,
+  plan,
+  previewIsCurrent,
+  projectNotices,
+  reset,
+} from './plan';
+import { session } from './session';
+import bootstrapFixture from '../api/__fixtures__/bootstrap_out.json';
 import { emptyPlan, ensureDefaults } from '../domain/plan-build';
 import { serializeProject } from '../domain/project';
 import { emptyGlobals } from '../domain/globals';
@@ -162,17 +172,25 @@ describe('buildRunRequest', () => {
 
   it('v3 项目里明确的空值不会被出厂默认顶掉', () => {
     plan.globals.udp_bandwidths = ['9000m'];
-    // 项目明确声明「不覆盖 UDP 带宽」（走钉住的档位表），导入后必须照办：
-    // 回落到出厂默认 2500m 就等于换一台机器换一套灌包强度。
+    // 项目明确声明「不覆盖 UDP 带宽」（走 master_config 里的档位表），导入后
+    // 必须照办：回落到出厂默认 2500m 就等于换一台机器换一套灌包强度。
+    const masterConfig = {
+      iperf: { udp_profiles: [{ bandwidth: '1000m', length: '64' }] },
+    };
     const project = serializeProject(ensureDefaults(emptyPlan()), {
       duration: 60,
       limit_udp_by_link_speed: false,
-      globals: { ...emptyGlobals(), udp_profiles: [{ bandwidth: '1000m', length: '64' }] },
+      globals: emptyGlobals(),
+      masterConfig,
     });
     expect(importProject(project)).toBe(true);
     expect(plan.globals.udp_bandwidths).toEqual([]);
-    expect(plan.globals.udp_profiles).toEqual([{ bandwidth: '1000m', length: '64' }]);
-    expect(buildRunRequest().udp_profiles).toEqual([{ bandwidth: '1000m', length: '64' }]);
+    expect(plan.masterConfig).toEqual(masterConfig);
+    expect(buildRunRequest().master_config).toEqual(masterConfig);
+  });
+
+  it('没有项目时不发 master_config，后端用自己的基线', () => {
+    expect(buildRunRequest().master_config).toBeUndefined();
   });
 });
 
@@ -186,5 +204,48 @@ describe('previewIsCurrent', () => {
 
     plan.duration += 1;
     expect(previewIsCurrent()).toBe(false);
+  });
+});
+
+/**
+ * 导出这一侧不能自己制造「回落到别人机器的配置」。
+ *
+ * 空的 `master_config` 在后端等价于「没带」（`apply_master_config` 在
+ * `allowed.is_empty()` 上提前返回）。所以导出一个结构完整、`master_config`
+ * 是 `{}` 的文件是最坏的一种失败：文件看着没问题，换台机器导入却静默改判定
+ * 口径。随包发布的示例项目就是这么发出去的。
+ */
+describe('exportProject 的判定基线兜底', () => {
+  beforeEach(() => {
+    reset();
+    plan.masterConfig = null;
+    session.bootstrap = null;
+    projectNotices.error = '';
+  });
+
+  it('拿不到判定基线时拒绝导出，并说清为什么', () => {
+    expect(exportProject()).toBeNull();
+    expect(projectNotices.error).toContain('回落到那台机器的配置');
+  });
+
+  it('bootstrap 回来了就正常导出，并把那一整块写进文件', () => {
+    session.bootstrap = {
+      ...bootstrapFixture,
+      master_config: { iperf: { rate_check: { offered_headroom_pct: 5 } } },
+    } as never;
+
+    const text = exportProject();
+    expect(text).not.toBeNull();
+    expect(JSON.parse(text!).master_config).toEqual({
+      iperf: { rate_check: { offered_headroom_pct: 5 } },
+    });
+    expect(projectNotices.error).toBe('');
+  });
+
+  it('导入过项目就带走项目自己那一份，不换成本机的', () => {
+    session.bootstrap = { ...bootstrapFixture, master_config: { ping: { count: 4 } } } as never;
+    plan.masterConfig = { ping: { count: 99 } };
+
+    expect(JSON.parse(exportProject()!).master_config).toEqual({ ping: { count: 99 } });
   });
 });

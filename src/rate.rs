@@ -23,7 +23,7 @@ pub fn nic_payload_ceiling_mbps(nic: &NicInfo, cfg: &RateCheckCfg) -> Option<f64
         // 单元的灌包强度都不一样。固定档位才能横向比较。
         //
         // 但 2.4G 必须单独一档：那个频段只有 3 个不重叠信道、最多 40MHz，
-        // 和 5G/6G 共用 2800 等于对 2.4G 口根本不裁剪。
+        // 和 5G/6G 共用 2882 等于对 2.4G 口根本不裁剪。
         "WIFI2.4G" => Some(cfg.wifi_24g_payload_ceiling_mbps),
         // 频段没识别出来时按 5G 档，不按 2.4G 档：Windows 上 netsh 正常会报出
         // 频段，落到这里多半是 macOS/Linux 的扫描拿不到；把它压到 2.4G 档会让
@@ -449,7 +449,7 @@ mod tests {
             Some(10_000.0)
         );
         // SGMII2.5G 的上限恰好容得下这类口的常规档位 -b 2.6G，
-        // 和 Wi-Fi 那档 2800 是同一个用意。
+        // 和 Wi-Fi 那档 2882 是同一个用意。
         assert_eq!(
             path_payload_ceiling_mbps(&nic("SGMII2.5G", 2500), &nic("10GETH", 10000), &cfg),
             Some(2600.0)
@@ -557,7 +557,7 @@ mod tests {
         assert_eq!(auto_evb_target_mbps(&usb, &eth, &cfg), None);
     }
 
-    /// 2.4G 和 5G 必须走不同的上限。共用 2800 等于对 2.4G 口完全不裁剪。
+    /// 2.4G 和 5G 必须走不同的上限。共用 2882 等于对 2.4G 口完全不裁剪。
     #[test]
     fn the_24g_band_does_not_borrow_the_5g_ceiling() {
         let cfg = RateCheckCfg::default();
@@ -565,8 +565,8 @@ mod tests {
             nic_payload_ceiling_mbps(&named_nic("wlan", role, "192.168.1.9", speed), &cfg)
         };
 
-        assert_eq!(ceiling("WIFI5G", 2882), Some(2800.0));
-        assert_eq!(ceiling("WIFI6G", 5760), Some(2800.0));
+        assert_eq!(ceiling("WIFI5G", 2882), Some(2882.0));
+        assert_eq!(ceiling("WIFI6G", 5760), Some(2882.0));
         // 协商值特意不取 574：上限恰好等于 802.11ax 2SS 的 PHY 峰值，
         // 若拿 574 当输入，「返回配置的上限」和「返回协商速率」两种实现
         // 都能过这条断言，这个用例就不再有区分力了。
@@ -578,7 +578,7 @@ mod tests {
 
         // 频段没识别出来时按 5G 档：落到 WIFI 的多半是 macOS/Linux 扫不到频段，
         // 把它压到 2.4G 档会让一堆真正的 5G 口被误裁。
-        assert_eq!(ceiling("WIFI", 866), Some(2800.0));
+        assert_eq!(ceiling("WIFI", 866), Some(2882.0));
     }
 
     /// 三个频段的上限都不跟协商速率走——协商值只是 PHY 速率，会来回跳。

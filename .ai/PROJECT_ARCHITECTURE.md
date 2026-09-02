@@ -62,13 +62,25 @@ TCP 和 UDP 两条路径上得到相反的结论。
 
 UDP 丢包、CTS 丢帧、TX 平均/P10/覆盖率、滚动窗口、中途掉速、工具退出状态、
 起流数不足，全部经 `VerdictResult::diagnostics` → `Row::diagnostics` 走展示通道。
+
+**「降级为诊断」不等于「不再告诉任何人」。** 第一版改错了方向：整套越界判据
+（`rate_excursion` / `ExcursionKind` / `RateStats::series`）被 `#[allow(dead_code)]`
+消音，生产代码里一个调用点都没有——一条全程平均 2200Mbps、中间整整断了一分钟
+的链路报出干干净净的 PASS，报告上一个字都看不到。现在它由
+`rx_acceptance_diagnostics` 消费，带原因码进诊断列。守在
+`a_mid_run_outage_still_reaches_the_report_even_though_the_average_passed`。
 `the_leg_assembly_contracts_have_exactly_one_definition_in_the_tree` 现在也守着
 `fn evaluate_rx_acceptance` 与 `fn rx_acceptance_diagnostics` 各自只有一处定义。
 
 ### ADR-18：Wi-Fi 双向按两端 RX 合计判定
 
-Wi-Fi↔Wi-Fi 是半双工共享介质，AB 和 BA 抢同一段空口时间，两个方向怎么分完全
-取决于调度——要求各自达到单向门限的一半是凭空发明的约束。新增
+Wi-Fi↔Wi-Fi 上 AB 和 BA 的吞吐互相影响，不是相互独立的两个数，怎么分取决于
+调度——要求各自达到单向门限的一半是凭空发明的约束。
+
+**刻意不写双工模式**：工具从没探测过链路的双工能力，而这条规则也不需要那个前提。
+「两个方向的吞吐不是相互独立的」是能观测到的事实，不管是传统单射频 Wi-Fi 还是
+Wi-Fi 7 的 MLO 都成立；断言「半双工」会在 MLO/STR 的设备上站不住，断言有线
+「全双工」更是纯推断。同理，界面与报告一律按「是不是 Wi-Fi 互测」分流，不按双工。新增
 `TestSpec::rate_target_bidir_total_mbps` → `SpecNorm::rate_target_bidir_total` →
 `Unit::bidir_total_target_mbps`，判定入口是
 `executor::verdict_assembly::bidir_total_verdict`：
@@ -86,7 +98,7 @@ Wi-Fi↔Wi-Fi 是半双工共享介质，AB 和 BA 抢同一段空口时间，�
 identity（`push_bidir_total_identity`）：腿的 `rx_target_mbps` 是 `None`，
 那条既有的「门限变了 identity 就变」的通路在这里断了。
 
-每方向的 bidir 门限保留：有线↔有线是全双工，按方向判定仍然正确。
+每方向的 bidir 门限保留：非 Wi-Fi 互测按方向判定仍然正确，而且逐方向把关更严——合计只比一次总和，单方向掉速会被另一方向补上。
 
 ## 0. AI 阅读规则
 
@@ -444,7 +456,16 @@ Windows 文本适配器：`src/cmd/ipconfig.rs` 解析中英文 `ipconfig /all`�
 - WebUI 的 Wi-Fi 门限以“主控频段 × 辅测频段”为一组，每组两个单向门限（主控→辅测、辅测→主控）加**一个双向 RX 合计门限**；界面只按当前两端实际频段组合去重显示。旧的两个「每方向双向门限」按两者之和迁移成合计，只填过一个方向的不推导。旧发送频段规则和具体网口覆盖只作 request.json 读取兼容，新项目不再创建。
 - 频段在**存储与比较**上一律是稳定枚举 `wifi_2_4g` / `wifi_5g` / `wifi_6g` / `unknown`（Rust `plan::canonical_wifi_band`，TS `canonicalWifiBand`），界面再渲染成 `2.4G / 5G / 6G`。展示文案是最容易被改的东西，而改完之后频段规则会**静默失效**——找不到规则不报错，只是门限没了。
 - 门限的最终生效值必须能在预览上直接看到（`PlannedUnit::targets`）。`RateTargets::for_direction("ab")` 是 `ab.or(forward)`，所以「`forward` 字段还在」不能证明它还在生效；补兜底门限一律走 `fill_direction_target`，它按 `for_direction` 的结果判断，不看某个字段填没填。
-- 项目文件 `project_version: 3` 是**有效值快照**：导出前经 `resolveEffectiveGlobals` 把留空的格子换算成主控当前真正会用的值，并固化界面上没有输入框却参与判定的两样东西——全局 RX 门限（`RunRequest::global_rate_targets`）和 UDP 档位原样列表（`RunRequest::udp_profiles`）。`Some(全 null)` 的全局门限表示「本项目明确没有全局门限」，与 `None`（没意见，沿用本机）不是一回事。UDP 档位必须按**原样列表**固化，不能拆成三条轴——三条轴是叉乘语义，`1000m` 单独带 `-l 64` 的档位表还原不回来。
+- **控制台的判定基线是内置默认值，不是 `config.json`**（`webui::console_baseline_config`）。隐式加载的那份只留下「这台机器接在哪个网络上」：`agent_host` / `agent_port` / `agent_token` / `ipv4_prefixes` / `require_same_subnet_for_iperf`。`rate_check` 的门限与负载上限、`link_profiles.by_role`、`ctstraffic` 参数以前是从这份文件原样带进每一轮控制台运行的——同一份项目在「exe 旁边放了 config.json」的机器和没放的机器上判定口径不同，而项目文件里看不出来。`--config` 是**显式**选择，整份生效；区别不在文件内容，在于人有没有做这个选择。守在 `an_implicitly_loaded_config_only_contributes_connection_identity`。
+- 项目文件 `project_version: 3` 是**完整有效快照**，分两层：`execution_defaults` / `acceptance` 是界面态（导出前经 `resolveEffectiveGlobals` 把留空的格子换算成真正会用的值），`master_config` 是**解析后的主控配置**（`RunRequest::master_config`）。后者用白名单 `MASTER_CONFIG_KEYS = [link_profiles, iperf, ctstraffic, ping]` 裁出来，在后端经 **深合并** 覆盖基线。
+  - 为什么整块而不是逐字段：界面上没有输入框却决定判定与灌包的参数有几十个（`rate_check` 的负载上限/余量/并发流下限、`link_profiles.by_role` 的角色配对门限、`ctstraffic` 的帧率与缓冲深度），逐字段加通道永远追不完，漏一个就是一次静默的口径漂移。
+  - 为什么白名单而不是黑名单：这份文件要传阅，将来给 `Config` 加一个口令类字段，黑名单会让它悄悄进项目。代价由 `every_config_field_is_either_snapshotted_or_deliberately_local` 兜住——`Config` 顶层加任何字段都会让它红，逼人做一次「参数还是本机身份」的判断。
+  - 必须**深**合并：浅合并时项目里只写了 `iperf.rate_check.targets_mbps` 就会把整个 `iperf` 块换成 serde 默认值，比不合并还糟。
+  - UDP 档位按**原样列表**走 `master_config.iperf.udp_profiles`，不拆成三条轴——三条轴是叉乘语义，`1000m` 单独带 `-l 64` 的档位表还原不回来。
+  - 白名单块**内部**仍按本机身份剔除：`MASTER_CONFIG_LOCAL_PATHS` 目前是 `link_profiles.by_nic`。它的键是 `host + 接口名 + ipv4`，是「这台机器上这块网卡」的身份，不是判定参数。剔除必须导出、导入两侧都做——只在导出侧做，历史项目文件里已经带着的那份照样会生效。它跟着项目走会造成一个极隐蔽的故障：`rate::link_policy` 查 `by_nic` 用 `.find()`（首个匹配胜出），而项目带来的条目在 `apply_master_config` 里先落位、界面「按网口策略」后 `push`——项目里的旧条目盖过操作员刚填的数，界面显示 900、实际按 1800 判。守在 `per_nic_overrides_never_travel_in_a_project_nor_outrank_the_console_table`。
+  - **合并失败必须响亮**：`apply_master_config` 返回 `Result`，`config_from_request` / `ui_request_base_config` / `config_from_ui_plan` 一路上抛到 `/api/plan` 与 `/api/run`。它以前在两处 `Err` 上静默 `return`——项目里任何一处类型不符都会让整块 patch 悄悄消失，这一轮改用目标机器自己的基线跑完，而界面上看不出区别。守在 `a_master_config_that_cannot_be_merged_stops_the_run_instead_of_falling_back`。
+  - 导出侧同样不许产出空壳：`master_config` 为空在后端等价于「没带」，所以 `exportProject()` 在拿不到基线时**返回 `null` 并留错误**，而不是导出一个结构完整、换台机器就静默改判定口径的文件。随包示例项目 `dist/projects/cpe-ui-project-full.json` 就这么发出去过一次，`shipped-project.test.ts` 现在断言它带着四个块且不含 `by_nic`。
+  - 重跑（`parseRunRequest`）要还原 `master_config`，当时没带项目就显式置 `null`。不还原它，重跑用的既不是归档里那份也不是本机基线，而是内存里当前碰巧加载着的那份。
 
 ### 11.2 常见修改入口
 

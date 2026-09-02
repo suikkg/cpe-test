@@ -15,7 +15,7 @@ pub(super) fn validated_config_from_request(
     req: &RunRequest,
 ) -> Result<Config, String> {
     validate_request(state, req)?;
-    let cfg = config_from_request(state, req);
+    let cfg = config_from_request(state, req)?;
     let problems = cfg.validate();
     if problems.is_empty() {
         Ok(cfg)
@@ -372,38 +372,175 @@ fn apply_wifi_pair_targets(
     }
 }
 
-/// 项目快照钉住的全局门限覆盖本机 `config.json`。
+/// 控制台一轮运行的基线配置。
 ///
-/// 关键是 `Some(全 null)` 也算数：那是「这个项目明确声明没有全局门限」，
-/// 必须把本机配置里的门限清掉。少了这一步，同一份项目在两台主控上会用各自
-/// 的 `rate_check.targets_mbps`——判定口径静默改变，而报告上看不出来。
-fn apply_global_rate_targets(cfg: &mut Config, req: &RunRequest) {
-    if let Some(targets) = req.global_rate_targets.as_ref() {
-        cfg.iperf.rate_check.targets_mbps = targets.clone();
-    }
-    if let Some(mode) = req.global_rate_mode {
-        cfg.iperf.rate_check.mode = mode;
-    }
+/// `state.cfg` 在**启动时**已经被 [`crate::master::webui::console_baseline_config`]
+/// 过滤过：exe 旁边那份 `config.json` 只留下连接信息，判定与档位一律是内置默认值。
+/// 所以这里可以放心整份克隆——用户**显式**导入过 config.json 时，
+/// `state.cfg` 就是他自己挑的那份，理应完整生效。
+///
+/// 项目文件带来的那一份基线在 `apply_master_config` 里覆盖上去。
+pub(super) fn ui_baseline_config(state: &UiState) -> Config {
+    let mut cfg = state.cfg.clone();
+    cfg.agent_host = state.agent_host.clone();
+    cfg
 }
 
-/// 项目快照钉住的 UDP 档位覆盖本机 `config.json`。
+/// 进项目文件的那部分主控配置：**判定与灌包参数的完整基线**。
 ///
-/// 只在「三条轴都留空」的路径上起作用——那正是唯一会回落到本机档位表的地方。
-/// 填了轴的请求本来就是自解释的，不需要也不应该被这份列表改写。
-fn apply_pinned_udp_profiles(cfg: &mut Config, req: &RunRequest) {
-    if let Some(profiles) = req.udp_profiles.as_ref() {
-        if !profiles.is_empty() {
-            cfg.iperf.udp_profiles = profiles.clone();
+/// 白名单而不是黑名单。`Config` 将来加字段时，新字段默认**不会**泄进项目文件
+/// ——那份文件是要传阅的，一个新加的口令类字段悄悄进去就是当场泄露。
+/// 代价是新加的判定参数也不会自动进项目，所以有
+/// `every_config_field_is_either_snapshotted_or_deliberately_local` 守着：
+/// 顶层加任何字段都会让它红，逼人做一次「这是参数还是本机身份」的判断。
+pub(super) const MASTER_CONFIG_KEYS: [&str; 4] = ["link_profiles", "iperf", "ctstraffic", "ping"];
+
+/// **有意留在本机**、不进项目文件的顶层字段。
+///
+/// 只被 `every_config_field_is_either_snapshotted_or_deliberately_local` 读——
+/// 它不驱动任何行为（行为由白名单 `MASTER_CONFIG_KEYS` 决定），存在的意义是
+/// 把「这个字段为什么不进项目」这个判断**写下来并钉住**。
+///
+/// 三类：连接身份（辅测机地址/端口/口令/监听地址、网段前缀、同 /24 门禁）、
+/// 本机运行偏好（`resume` / `screenshot` / `open_report` / 空跑中止阈值 /
+/// UDP 裁剪开关——前三个由 `RunRequest` 单独携带，是界面上的控件）、
+/// 以及命令行的测试矩阵（控制台用自己的 `ui_plan`）。
+#[cfg(test)]
+pub(super) const MASTER_CONFIG_LOCAL_KEYS: [&str; 11] = [
+    "agent_host",
+    "agent_port",
+    "agent_token",
+    "agent_bind",
+    "ipv4_prefixes",
+    "require_same_subnet_for_iperf",
+    "limit_udp_by_link_speed",
+    "screenshot",
+    "resume",
+    "open_report",
+    "abort_after_dead_traffic_units",
+];
+
+/// 命令行专用的测试矩阵；控制台有自己的 `ui_plan`，两者不共存。
+#[cfg(test)]
+pub(super) const MASTER_CONFIG_CLI_KEYS: [&str; 3] = ["pairs", "universal_params", "tests"];
+
+/// 白名单块内部**仍然按本机身份剔除**的路径。
+///
+/// `link_profiles.by_nic` 是按网口的门限覆盖，键是 `host + 接口名 + ipv4`
+/// ——那是**这台机器上这块网卡**的身份，不是判定参数。它跟着项目走会造成两个
+/// 后果，都很隐蔽：
+///
+/// 1. A 机的网口名在 B 机上可能对应完全不同的一块网卡；
+/// 2. `rate::link_policy` 查 `by_nic` 用的是 `.find()`（首个匹配胜出），而项目
+///    带来的条目在 `apply_master_config` 里先落位、界面上的「按网口策略」后
+///    `push`——于是**项目里的旧条目盖过操作员在界面上刚填的那个数**，界面显示
+///    900、实际按 1800 判，两边对不上还没有任何提示。
+///
+/// 按网口策略的唯一来源是请求里的 `nic_policies`（界面那张表）。
+const MASTER_CONFIG_LOCAL_PATHS: [(&str, &str); 1] = [("link_profiles", "by_nic")];
+
+/// 剔除白名单块内部的本机身份字段。
+///
+/// 导出（[`master_config_snapshot`]）和导入（[`apply_master_config`]）共用这
+/// 一个函数：只在导出时剔除的话，历史项目文件里已经带着的那份照样会在导入时
+/// 生效。
+fn strip_local_paths(value: &mut serde_json::Value) {
+    for (block, field) in MASTER_CONFIG_LOCAL_PATHS {
+        if let Some(inner) = value.get_mut(block).and_then(|v| v.as_object_mut()) {
+            inner.remove(field);
         }
     }
 }
 
-pub(super) fn config_from_request(state: &UiState, req: &RunRequest) -> Config {
+/// 把主控当前生效的配置裁成可以进项目文件的那一份。
+pub(super) fn master_config_snapshot(cfg: &Config) -> serde_json::Value {
+    let full = serde_json::to_value(cfg).unwrap_or(serde_json::Value::Null);
+    let mut out = serde_json::Map::new();
+    for key in MASTER_CONFIG_KEYS {
+        if let Some(value) = full.get(key) {
+            out.insert(key.to_string(), value.clone());
+        }
+    }
+    let mut out = serde_json::Value::Object(out);
+    strip_local_paths(&mut out);
+    out
+}
+
+/// 深合并：`patch` 里写了的键覆盖 `base`，没写的保留。
+///
+/// 必须是**深**合并。浅合并的话，项目里只写了 `iperf.rate_check.targets_mbps`
+/// 就会把整个 `iperf` 块换掉，`tcp_windows`、`udp_profiles`、`duration` 一起
+/// 变成 serde 的默认值——比不合并还糟。
+fn merge_json(base: &mut serde_json::Value, patch: &serde_json::Value) {
+    match (base, patch) {
+        (serde_json::Value::Object(base), serde_json::Value::Object(patch)) => {
+            for (key, value) in patch {
+                match base.get_mut(key) {
+                    Some(slot) => merge_json(slot, value),
+                    None => {
+                        base.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+        }
+        (base, patch) => *base = patch.clone(),
+    }
+}
+
+/// 项目快照带来的判定与灌包参数覆盖本机基线。
+///
+/// 这是「导出后在另一台主控上完全复现」的最后一块：界面上有输入框的东西由
+/// `RunRequest` 的各个字段带走，**界面上没有输入框的**——`rate_check` 的负载
+/// 上限与余量、`link_profiles.by_role` 的角色配对门限、`ctstraffic` 的帧率与
+/// 缓冲深度——由这一整块带走。逐字段加通道永远追不完，漏一个就是一次静默的
+/// 口径漂移。
+///
+/// 只认白名单里的四块，别的键一律丢弃：项目文件是外来输入，
+/// 不能让它写到连接身份或本机运行偏好上。
+/// 把项目带来的解析后配置合并进基线。
+///
+/// **失败必须响亮**。这个函数以前在两处 `Err` 上静默 `return`：项目里任何一处
+/// 类型不符（更高版本导出的文件改了字段类型、手工编辑写成了字符串）都会让整块
+/// patch 悄悄消失，这一轮改用目标机器自己的基线跑完，判定口径变了而界面上看不
+/// 出任何区别。那正是「项目自带全部判定参数」要根除的故障，不能由它自己制造。
+fn apply_master_config(cfg: &mut Config, req: &RunRequest) -> Result<(), String> {
+    let Some(raw) = req.master_config.as_ref() else {
+        return Ok(());
+    };
+    let Some(patch) = raw.as_object() else {
+        return Err(
+            "项目里的 master_config 不是一个对象，无法当作主控配置使用；             请重新导出项目，或删掉这一块改用本机基线"
+                .into(),
+        );
+    };
+    let mut base = serde_json::to_value(&*cfg)
+        .map_err(|error| format!("主控基线配置无法序列化，无法合并项目配置：{error}"))?;
+    let mut allowed = serde_json::Map::new();
+    for key in MASTER_CONFIG_KEYS {
+        if let Some(value) = patch.get(key) {
+            allowed.insert(key.to_string(), value.clone());
+        }
+    }
+    if allowed.is_empty() {
+        return Ok(());
+    }
+    let mut allowed = serde_json::Value::Object(allowed);
+    // 老项目文件里可能已经带着 `link_profiles.by_nic`（本机身份），挡在这里。
+    strip_local_paths(&mut allowed);
+    merge_json(&mut base, &allowed);
+    *cfg = serde_json::from_value::<Config>(base).map_err(|error| {
+        format!(
+            "项目里的 master_config 与本版本的配置结构不符，无法合并：{error}。             这一块承载的是判定与灌包参数，忽略它会让这一轮用目标主控自己的基线跑，             因此不继续；请用当前版本重新导出项目"
+        )
+    })?;
+    Ok(())
+}
+
+pub(super) fn config_from_request(state: &UiState, req: &RunRequest) -> Result<Config, String> {
     if let Some(plan) = req.ui_plan.as_ref() {
         return config_from_ui_plan(state, req, plan);
     }
-    let mut cfg = state.cfg.clone();
-    cfg.agent_host = state.agent_host.clone();
+    let mut cfg = ui_baseline_config(state);
     cfg.screenshot = req.screenshot;
     cfg.limit_udp_by_link_speed = req.limit_udp_by_link_speed;
     cfg.resume = req.resume;
@@ -411,8 +548,7 @@ pub(super) fn config_from_request(state: &UiState, req: &RunRequest) -> Config {
     cfg.pairs = None;
     cfg.universal_params = None;
     cfg.link_profiles.by_nic.clear();
-    apply_global_rate_targets(&mut cfg, req);
-    apply_pinned_udp_profiles(&mut cfg, req);
+    apply_master_config(&mut cfg, req)?;
     apply_ping_policy_overrides(&mut cfg.ping, req);
 
     let windows = non_empty(&req.tcp_windows, &cfg.iperf.tcp_windows);
@@ -499,12 +635,11 @@ pub(super) fn config_from_request(state: &UiState, req: &RunRequest) -> Config {
             specs
         })
         .collect();
-    cfg
+    Ok(cfg)
 }
 
-pub(super) fn ui_request_base_config(state: &UiState, req: &RunRequest) -> Config {
-    let mut cfg = state.cfg.clone();
-    cfg.agent_host = state.agent_host.clone();
+pub(super) fn ui_request_base_config(state: &UiState, req: &RunRequest) -> Result<Config, String> {
+    let mut cfg = ui_baseline_config(state);
     cfg.screenshot = req.screenshot;
     cfg.limit_udp_by_link_speed = req.limit_udp_by_link_speed;
     cfg.resume = req.resume;
@@ -512,8 +647,7 @@ pub(super) fn ui_request_base_config(state: &UiState, req: &RunRequest) -> Confi
     cfg.pairs = None;
     cfg.universal_params = None;
     cfg.link_profiles.by_nic.clear();
-    apply_global_rate_targets(&mut cfg, req);
-    apply_pinned_udp_profiles(&mut cfg, req);
+    apply_master_config(&mut cfg, req)?;
 
     if req.ping_count > 0 {
         cfg.ping.count = req.ping_count;
@@ -545,7 +679,7 @@ pub(super) fn ui_request_base_config(state: &UiState, req: &RunRequest) -> Confi
             cfg.link_profiles.by_nic.push(profile);
         }
     }
-    cfg
+    Ok(cfg)
 }
 
 #[derive(Debug, Clone)]
@@ -1101,8 +1235,12 @@ pub(super) fn ui_specs_for_task(
     out
 }
 
-pub(super) fn config_from_ui_plan(state: &UiState, req: &RunRequest, plan: &UiPlan) -> Config {
-    let mut cfg = ui_request_base_config(state, req);
+pub(super) fn config_from_ui_plan(
+    state: &UiState,
+    req: &RunRequest,
+    plan: &UiPlan,
+) -> Result<Config, String> {
+    let mut cfg = ui_request_base_config(state, req)?;
     let mut bindings: Vec<(usize, &UiBinding)> = plan.bindings.iter().enumerate().collect();
     bindings.sort_by_key(|(index, binding)| (binding.order, *index));
     let mut tests = Vec::new();
@@ -1165,7 +1303,7 @@ pub(super) fn config_from_ui_plan(state: &UiState, req: &RunRequest, plan: &UiPl
         }
     }
     cfg.tests = tests;
-    cfg
+    Ok(cfg)
 }
 
 pub(super) fn selected_udp_groups(pair: &PairSelection) -> Vec<usize> {
@@ -1428,6 +1566,56 @@ pub(super) fn nic_profile(policy: &NicPolicySelection) -> Option<crate::config::
 /// 计划页要显示的「最终门限及来源」。
 ///
 /// 双向合计单元额外补一行说明合计门限本身——它挂在单元上，不属于任何一条腿。
+/// 这个单元的两端**是不是都是 Wi-Fi**。
+///
+/// 只回答工具真正知道的那件事。双工模式我们从没探测过，所以不据此下结论。
+fn unit_endpoints(unit: &builder::Unit) -> Option<(&builder::Endpoint, &builder::Endpoint)> {
+    unit.legs.iter().find_map(|leg| match &leg.kind {
+        builder::LegKind::IperfSingle(task) => Some((&task.src, &task.dst)),
+        builder::LegKind::IperfGroup { streams, .. } => {
+            streams.first().map(|task| (&task.src, &task.dst))
+        }
+        builder::LegKind::CtsTraffic(task) => Some((&task.src, &task.dst)),
+        builder::LegKind::Ping(task) => Some((&task.src, &task.dst)),
+        // 故意不写 `_`：新增任务类型时这里编译期就红，不会静默漏掉端点
+        // （和 `builder::for_each_endpoint_mut` 同一个理由）。
+    })
+}
+
+/// 合计门限用在**非 Wi-Fi 互测**的链路上时，逐条提醒。
+///
+/// 合计门限只比一次总和：一个方向掉速会被另一个方向补上。Wi-Fi↔Wi-Fi 上这是
+/// 刻意的——两个方向抢同一段空口时间，要求各达到一半没有依据。换到别的链路上
+/// 就成了把强判据换成弱判据，而界面上看不出来。
+///
+/// 只提示、不拦截：用户明确填了那个数，替他改主意不是这里该做的事。
+fn bidir_total_on_non_wifi_notices(units: &[builder::Unit]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for unit in units {
+        let Some(total) = unit.bidir_total_target_mbps else {
+            continue;
+        };
+        let Some((src, dst)) = unit_endpoints(unit) else {
+            continue;
+        };
+        if nic_is_wifi(&src.nic) && nic_is_wifi(&dst.nic) {
+            continue;
+        }
+        if !seen.insert((src.key(), dst.key())) {
+            continue;
+        }
+        out.push(format!(
+            "{} ↔ {} 不是 Wi-Fi 互测，但配了双向 RX 合计门限 {total:.0}Mbps：\
+             合计只比一次总和，单方向掉速会被另一方向补上。要逐方向把关，\
+             改用「按方向分别设门限」。",
+            src.brief(),
+            dst.brief()
+        ));
+    }
+    out
+}
+
 pub(super) fn unit_target_lines(unit: &builder::Unit) -> Vec<String> {
     let mut lines = unit.target_lines.clone();
     if let Some(total) = unit.bidir_total_target_mbps {
@@ -1620,7 +1808,7 @@ pub(super) fn unit_direction_for_spec(
 
 pub(super) fn compile_request(state: &UiState, req: &RunRequest) -> Result<CompiledPlan, String> {
     validate_request(state, req)?;
-    let cfg = config_from_request(state, req);
+    let cfg = config_from_request(state, req)?;
     let problems = cfg.validate();
     if !problems.is_empty() {
         return Err(format!("配置项异常：{}", problems.join("；")));
@@ -1802,6 +1990,7 @@ pub(super) fn compile_request(state: &UiState, req: &RunRequest) -> Result<Compi
         trace.clear();
         sections.clear();
     }
+    notices.extend(bidir_total_on_non_wifi_notices(&units));
     Ok(CompiledPlan {
         cfg,
         units,

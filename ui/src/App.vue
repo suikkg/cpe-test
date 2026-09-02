@@ -57,7 +57,7 @@ onMounted(() => {
   // 出厂默认计划，而右边导航的角标还显示着上次的分配数。
   loadDraft();
   void load().then(() => {
-    // 没有草稿时，执行区的标量默认取自主控 config.json；有草稿则让路。
+    // 没有草稿时，执行区的标量默认取自控制台基线；有草稿则让路。
     if (session.bootstrap) applyBootstrapDefaults(session.bootstrap);
   });
 });
@@ -109,7 +109,7 @@ onMounted(() => {
         <div v-if="unauthorized" class="screen" data-label="AUTH · 口令失效" role="alert">
           控制台口令无效或已失效。<br />
           请用带 <code>?token=&lt;口令&gt;</code> 的完整地址重新打开这个页面。<br />
-          <span class="dim">口令由主控启动时的 --ui-token 决定；它不会写进 config.json。</span>
+          <span class="dim">口令由主控启动时的 --ui-token 决定。</span>
         </div>
         <LocalView v-else-if="ui.region === 'local'" />
         <AgentView v-else-if="ui.region === 'agent'" />

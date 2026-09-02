@@ -1,6 +1,6 @@
 /** 执行请求里跨套件生效的全局默认档位与策略。 */
 
-import type { BootstrapOut, NicInfo, RateTargets, UdpProfile } from '../api/dto';
+import type { BootstrapOut, NicInfo } from '../api/dto';
 
 export function parseTokenList(raw: string): string[] {
   return String(raw ?? '')
@@ -93,30 +93,6 @@ export interface UiGlobals {
   wifi_band_thresholds: UiWifiBandThreshold[];
   /** 兼容旧项目的具体网口覆盖；新界面不再创建。 */
   wifi_pair_thresholds: UiWifiPairThreshold[];
-  /**
-   * 钉死的 UDP 档位原样列表；空 = 不钉，走主控 config.json。
-   *
-   * 三条轴（带宽/长度/窗口）是**叉乘**语义，而主控档位表是逐条列出来的：
-   * 内置基线只有 `1000m` 带 `-l 64`。把它拆回三条轴再叉乘会变成五档全带
-   * `-l 64`，灌包条件当场就变了。项目要能跨机复现，就只能钉原样列表。
-   */
-  udp_profiles: UdpProfile[];
-  /**
-   * 钉死的**全局** RX 门限；`null` = 不钉，走目标主控自己的 config.json。
-   *
-   * 界面上没有输入框，但它实实在在参与判定。项目快照必须带走它，否则同一份
-   * 项目在另一台主控上会改用那台机器的门限，「怎么判定」静默变了。
-   * 三个字段全是 `null` 的对象也是有意义的：那是「本项目明确没有全局门限」。
-   */
-  global_rate_targets: RateTargets | null;
-  /**
-   * 钉死的判定模式；空串 = 不钉，走目标主控自己的 `config.json`。
-   *
-   * 和全局门限是一对：`observe` 只记录实测能力、不判 PASS/FAIL，`verify`
-   * 没有门限时直接 `TARGET_MISSING`。界面上没有这个开关，但它决定这一轮
-   * 出不出 PASS——不带走它，换台机器同一份项目可能整轮都是 MEASURED。
-   */
-  global_rate_mode: string;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -295,9 +271,6 @@ export function emptyGlobals(): UiGlobals {
     wifi_pair_bidir_total_rx_target_mbps: 0,
     wifi_band_thresholds: [],
     wifi_pair_thresholds: [],
-    udp_profiles: [],
-    global_rate_targets: null,
-    global_rate_mode: '',
   };
 }
 
@@ -345,54 +318,7 @@ export function normalizeGlobals(value: unknown): UiGlobals {
   }
   globals.wifi_band_thresholds = normalizeWifiBandThresholds(source.wifi_band_thresholds);
   globals.wifi_pair_thresholds = normalizeWifiPairThresholds(source.wifi_pair_thresholds);
-  globals.udp_profiles = normalizeUdpProfiles(source.udp_profiles);
-  globals.global_rate_targets = normalizeRateTargets(source.global_rate_targets);
-  globals.global_rate_mode = normalizeRateMode(source.global_rate_mode);
   return globals;
-}
-
-/** 一档 UDP 参数的运行时清洗；`bandwidth` 是必需的，其余两项可缺省。 */
-export function normalizeUdpProfiles(value: unknown): UdpProfile[] {
-  if (!Array.isArray(value)) return [];
-  return value.flatMap((item): UdpProfile[] => {
-    if (!isRecord(item)) return [];
-    const bandwidth = typeof item.bandwidth === 'string' ? item.bandwidth.trim() : '';
-    if (!bandwidth) return [];
-    const optional = (raw: unknown): string | undefined => {
-      const text = typeof raw === 'string' ? raw.trim() : '';
-      return text === '' ? undefined : text;
-    };
-    return [
-      {
-        bandwidth,
-        ...(optional(item.length) ? { length: optional(item.length) } : {}),
-        ...(optional(item.window) ? { window: optional(item.window) } : {}),
-      },
-    ];
-  });
-}
-
-/** 判定模式只认这四个词；别的一律当作「没钉」。 */
-export function normalizeRateMode(value: unknown): string {
-  const text = typeof value === 'string' ? value.trim().toLowerCase() : '';
-  return ['auto', 'verify', 'observe', 'discover'].includes(text) ? text : '';
-}
-
-/**
- * 全局门限的运行时清洗。
- *
- * `null`/非对象 → `null`（不钉）。是对象就逐字段清洗，**保留全 null 的对象**：
- * 那是「明确没有全局门限」，和「没意见」是两件事。
- */
-export function normalizeRateTargets(value: unknown): RateTargets | null {
-  if (!isRecord(value)) return null;
-  const positive = (raw: unknown): number | null =>
-    typeof raw === 'number' && Number.isFinite(raw) && raw > 0 ? raw : null;
-  return {
-    forward: positive(value.forward),
-    ab: positive(value.ab),
-    ba: positive(value.ba),
-  };
 }
 
 export function defaultGlobals(): UiGlobals {
@@ -431,10 +357,7 @@ export function globalsAreEmpty(globals: UiGlobals): boolean {
     globals.wifi_pair_bidir_rx_target_mbps === 0 &&
     globals.wifi_pair_bidir_total_rx_target_mbps === 0 &&
     globals.wifi_band_thresholds.length === 0 &&
-    globals.wifi_pair_thresholds.length === 0 &&
-    globals.udp_profiles.length === 0 &&
-    globals.global_rate_targets === null &&
-    globals.global_rate_mode === ''
+    globals.wifi_pair_thresholds.length === 0
   );
 }
 
@@ -663,8 +586,8 @@ export function activeNicPolicies(policies: readonly UiNicPolicy[]): UiNicPolicy
  * - `tcp_windows` 空 → 主控 `iperf.tcp_windows`（后端 `non_empty`）。
  * - `tcp_streams` 空 → `[1]`。后端的兜底是「取不到就 1」，不是主控档位表；
  *   写成主控档位表会当场改变本机的测试内容。
- * - `udp_*` 三条轴全空 → 钉 `udp_profiles` 原样列表，三条轴保持空。
- *   三条轴是叉乘语义，还原不回逐条档位（见 `UiGlobals.udp_profiles`）。
+ * - `udp_*` 三条轴全空 → **保持空**。这一档回落到主控的档位表，而那张表由项目
+ *   的 `master_config` 整块带走（三条轴是叉乘语义，还原不回逐条档位）。
  * - `udp_lengths` / `udp_windows` 单独留空 → **保持空**：那是「明确不下发
  *   `-l`/`-w`」，回落回去等于替用户加参数。
  * - `udp_streams` 0 → `1`（后端 `max(1)`）。
@@ -683,15 +606,13 @@ export function resolveEffectiveGlobals(
   if (next.tcp_windows.length === 0) next.tcp_windows = [...bootstrap.tcp_windows];
   if (next.tcp_streams.length === 0) next.tcp_streams = [1];
 
-  const udpAxesAllEmpty =
+  // 轴填了一半时带宽回落到主控档位表的带宽集合，与后端 `fallback_bandwidths`
+  // 同一口径；`-l`/`-w` 保持用户填的那份。三条轴全空是另一回事：那一档整个走
+  // 主控档位表，由 `master_config` 带走，这里不许拆成会叉乘的三条轴。
+  if (
     next.udp_bandwidths.length === 0 &&
-    next.udp_lengths.length === 0 &&
-    next.udp_windows.length === 0;
-  if (udpAxesAllEmpty) {
-    next.udp_profiles = normalizeUdpProfiles(bootstrap.udp_profiles);
-  } else if (next.udp_bandwidths.length === 0) {
-    // 轴填了一半：带宽回落到主控档位表的带宽集合，与后端 `fallback_bandwidths`
-    // 同一口径；`-l`/`-w` 保持用户填的那份。
+    (next.udp_lengths.length > 0 || next.udp_windows.length > 0)
+  ) {
     next.udp_bandwidths = [...bootstrap.udp_bandwidths];
   }
   if (next.udp_streams <= 0) next.udp_streams = 1;
@@ -720,14 +641,5 @@ export function resolveEffectiveGlobals(
     'ping_wifi_large_max_rtt_ms',
   ] as const;
   for (const key of rttKeys) next[key] = orNumber(next[key], bootstrap[key]);
-
-  // 全局门限没被项目钉过就固化主控当前那一份。导入方因此不会回落到自己的
-  // config.json——这正是「换机导入判定不变」的关键一条。
-  next.global_rate_targets = next.global_rate_targets ?? {
-    forward: bootstrap.rate_targets_mbps?.forward ?? null,
-    ab: bootstrap.rate_targets_mbps?.ab ?? null,
-    ba: bootstrap.rate_targets_mbps?.ba ?? null,
-  };
-  next.global_rate_mode = next.global_rate_mode || normalizeRateMode(bootstrap.rate_mode);
   return next;
 }

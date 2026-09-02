@@ -4,13 +4,10 @@ import {
   emptyGlobals,
   migrateBidirPairToTotal,
   normalizeGlobals,
-  normalizeRateTargets,
-  normalizeUdpProfiles,
   type UiGlobals,
   type UiNicPolicy,
   type UiWifiBandThreshold,
 } from './globals';
-import type { RateTargets, UdpProfile } from '../api/dto';
 
 /**
  * 项目文件（`cpe-ui-project.json`）的读写。纯函数。
@@ -46,6 +43,18 @@ export interface ProjectSettings {
   duration?: number;
   limit_udp_by_link_speed?: boolean;
   globals?: UiGlobals;
+  /**
+   * 主控的**解析后配置**：判定与灌包参数的完整基线。
+   *
+   * 界面上有输入框的东西由 `globals` / `nicPolicies` 带走；界面上**没有**输入框
+   * 的（`rate_check` 的负载上限与余量、角色配对门限、ctsTraffic 的帧率与缓冲
+   * 深度）只能靠这一整块跨机复现。逐字段加通道永远追不完，漏一个就是一次静默
+   * 的口径漂移。
+   *
+   * 前端不解释它的内容，只**原样搬运**：字段语义在 Rust 的 `Config` 里，
+   * 在这边再写一份类型定义就是两份会漂的实现。
+   */
+  masterConfig?: Record<string, unknown>;
 }
 
 /** v3 的执行默认值块：主控当前**真正会用**的档位。 */
@@ -59,7 +68,7 @@ export interface ProjectExecutionDefaults {
     windows: string[];
     streams: number;
     /** 三条轴留空时钉住的原样档位表；空数组 = 由上面三条轴决定。 */
-    profiles: UdpProfile[];
+    profiles: unknown[];
   };
   ping: { count: number; payload_sizes: number[] };
 }
@@ -67,10 +76,6 @@ export interface ProjectExecutionDefaults {
 /** v3 的验收块：所有影响 PASS/FAIL 的门限。 */
 export interface ProjectAcceptance {
   ping_thresholds: Record<string, number>;
-  /** `null` = 本项目明确没有全局门限，导入方不许回落到自己的 config.json。 */
-  global_rate_targets: RateTargets | null;
-  /** 判定模式；空串 = 本项目没钉，沿用目标主控的配置。 */
-  global_rate_mode: string;
   nic_policies: UiNicPolicy[];
   wifi_band_thresholds: UiWifiBandThreshold[];
   wifi_pair_bidir_total_rx_target_mbps: number;
@@ -87,6 +92,12 @@ export interface ProjectFile {
   plan: UiPlan;
   execution_defaults: ProjectExecutionDefaults;
   acceptance: ProjectAcceptance;
+  /**
+   * 主控的解析后配置。**这一块才是「所有实际测试参数和判定参数」的所在地**；
+   * 上面两块是界面态，运行时叠在它上面（和后端 `ui_baseline_config` +
+   * `RunRequest` 的关系完全一致，不是新发明的优先级）。
+   */
+  master_config: Record<string, unknown>;
 }
 
 export interface ParseResult {
@@ -410,7 +421,12 @@ function legacyDirectionalBidirNotice(value: unknown): boolean {
 function globalsFromFile(
   file: Record<string, unknown>,
   notices: string[],
-): { globals?: UiGlobals; duration?: number; limitUdp?: boolean } {
+): {
+  globals?: UiGlobals;
+  duration?: number;
+  limitUdp?: boolean;
+  masterConfig?: Record<string, unknown>;
+} {
   const execution = isRecord(file.execution_defaults) ? file.execution_defaults : null;
   const acceptance = isRecord(file.acceptance) ? file.acceptance : null;
   if (execution || acceptance) {
@@ -434,8 +450,6 @@ function globalsFromFile(
       ping_count: ping.count,
       ping_payload_sizes: ping.payload_sizes,
       ...pingThresholds,
-      global_rate_targets: acceptance?.global_rate_targets,
-      global_rate_mode: acceptance?.global_rate_mode,
       wifi_band_thresholds: acceptance?.wifi_band_thresholds,
       wifi_pair_bidir_total_rx_target_mbps:
         acceptance?.wifi_pair_bidir_total_rx_target_mbps,
@@ -451,6 +465,7 @@ function globalsFromFile(
         typeof execution?.limit_udp_by_link_speed === 'boolean'
           ? execution.limit_udp_by_link_speed
           : undefined,
+      masterConfig: isRecord(file.master_config) ? file.master_config : undefined,
     };
   }
 
@@ -578,7 +593,7 @@ export function parseProject(text_: string): ParseResult {
   const cleaned = cleanPlan(rawPlan, notices);
   if ('error' in cleaned) return { ok: false, error: cleaned.error, notices };
 
-  const { globals, duration, limitUdp } = globalsFromFile(file, notices);
+  const { globals, duration, limitUdp, masterConfig } = globalsFromFile(file, notices);
   const nicPolicies = parseNicPolicies(
     isRecord(file.acceptance) ? file.acceptance.nic_policies : file.nic_policies,
     notices,
@@ -586,6 +601,7 @@ export function parseProject(text_: string): ParseResult {
 
   const settings: ProjectSettings = {};
   if (globals) settings.globals = globals;
+  if (masterConfig) settings.masterConfig = masterConfig;
   if (duration !== undefined) settings.duration = duration;
   if (limitUdp !== undefined) settings.limit_udp_by_link_speed = limitUdp;
 
@@ -630,7 +646,9 @@ export function buildProject(
         lengths: [...globals.udp_lengths],
         windows: [...globals.udp_windows],
         streams: globals.udp_streams,
-        profiles: [...globals.udp_profiles],
+        // 三条轴全空时走主控档位表，那张表在 `master_config.iperf.udp_profiles`
+        // 里整块带走——拆成会叉乘的三条轴还原不回来。
+        profiles: [],
       },
       ping: {
         count: globals.ping_count,
@@ -639,8 +657,6 @@ export function buildProject(
     },
     acceptance: {
       ping_thresholds: pingThresholds,
-      global_rate_targets: globals.global_rate_targets,
-      global_rate_mode: globals.global_rate_mode,
       nic_policies: nicPolicies ?? [],
       wifi_band_thresholds: [...globals.wifi_band_thresholds],
       wifi_pair_bidir_total_rx_target_mbps: globals.wifi_pair_bidir_total_rx_target_mbps,
@@ -650,6 +666,7 @@ export function buildProject(
         pair_thresholds: [...globals.wifi_pair_thresholds],
       },
     },
+    master_config: settings?.masterConfig ?? {},
   };
 }
 
@@ -661,7 +678,6 @@ export function serializeProject(
   return `${JSON.stringify(buildProject(plan, settings, nicPolicies), null, 2)}\n`;
 }
 
-// 只是为了让 `migrateBidirPairToTotal` / `normalizeRateTargets` / `normalizeUdpProfiles`
-// 的存在被显式表达出来：它们是 globals 层的迁移入口，本模块通过 normalizeGlobals
-// 间接使用。
-export { migrateBidirPairToTotal, normalizeRateTargets, normalizeUdpProfiles };
+// `migrateBidirPairToTotal` 是 globals 层的迁移入口，本模块通过 normalizeGlobals
+// 间接使用；再导出一次是为了让它的存在被显式表达出来。
+export { migrateBidirPairToTotal };

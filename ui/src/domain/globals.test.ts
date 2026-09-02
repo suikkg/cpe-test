@@ -262,9 +262,7 @@ describe('导出前的有效值换算', () => {
     ping_wifi_medium_max_rtt_ms: 100,
     ping_wifi_large_avg_rtt_ms: 100,
     ping_wifi_large_max_rtt_ms: 200,
-    rate_targets_mbps: { forward: 1200, ab: null, ba: null },
-    rate_mode: 'verify',
-    udp_profiles: [{ bandwidth: '1m' }, { bandwidth: '1000m', length: '64' }],
+    master_config: { iperf: { rate_check: { targets_mbps: { forward: 1200 } } } },
     screenshot: false,
     ui_plan_supported: true,
   };
@@ -275,20 +273,17 @@ describe('导出前的有效值换算', () => {
     expect(resolved.ping_payload_sizes).toEqual([32, 1600, 65500]);
     expect(resolved.ping_wifi_large_max_rtt_ms).toBe(200);
     expect(resolved.tcp_windows).toEqual(['4m']);
-    expect(resolved.global_rate_targets).toEqual({ forward: 1200, ab: null, ba: null });
-    expect(resolved.global_rate_mode).toBe('verify');
+
   });
 
-  it('三条 UDP 轴全空时钉住原样档位表，而不是拆成会叉乘的三条轴', () => {
+  it('三条 UDP 轴全空时保持空，不拆成会叉乘的三条轴', () => {
     // 主控内置基线只有 1000m 带 -l 64。拆成「带宽 × 长度」再叉乘，
-    // 会变成两档全带 -l 64，灌包条件当场就变了。
+    // 会变成两档全带 -l 64，灌包条件当场就变了。那一档整个走主控档位表，
+    // 由项目的 master_config 整块带走。
     const resolved = resolveEffectiveGlobals(emptyGlobals(), bootstrap);
-    expect(resolved.udp_profiles).toEqual([
-      { bandwidth: '1m' },
-      { bandwidth: '1000m', length: '64' },
-    ]);
     expect(resolved.udp_bandwidths).toEqual([]);
     expect(resolved.udp_lengths).toEqual([]);
+    expect(resolved.udp_windows).toEqual([]);
   });
 
   it('单独留空的 -l / -w 是「明确不下发」，不许回落', () => {
@@ -296,7 +291,13 @@ describe('导出前的有效值换算', () => {
     const resolved = resolveEffectiveGlobals(globals, bootstrap);
     expect(resolved.udp_lengths).toEqual([]);
     expect(resolved.udp_windows).toEqual([]);
-    expect(resolved.udp_profiles).toEqual([]);
+  });
+
+  it('轴只填了一半时带宽回落到主控档位表的带宽集合', () => {
+    const globals = { ...emptyGlobals(), udp_lengths: ['1400'] };
+    const resolved = resolveEffectiveGlobals(globals, bootstrap);
+    expect(resolved.udp_bandwidths).toEqual(bootstrap.udp_bandwidths);
+    expect(resolved.udp_lengths).toEqual(['1400']);
   });
 
   it('TCP 流数的兜底是 1，不是主控档位表', () => {
@@ -311,13 +312,11 @@ describe('导出前的有效值换算', () => {
       ping_count: 7,
       tcp_windows: ['64k'],
       udp_streams: 4,
-      global_rate_targets: { forward: null, ab: 900, ba: null },
     };
     const resolved = resolveEffectiveGlobals(globals, bootstrap);
     expect(resolved.ping_count).toBe(7);
     expect(resolved.tcp_windows).toEqual(['64k']);
     expect(resolved.udp_streams).toBe(4);
-    expect(resolved.global_rate_targets).toEqual({ forward: null, ab: 900, ba: null });
   });
 
   it('还没拿到 bootstrap 时原样返回，不伪造默认值', () => {

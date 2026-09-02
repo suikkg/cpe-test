@@ -1245,7 +1245,7 @@ impl Ctx {
         let mut leg_diagnostics = crate::master::rate_window::rx_acceptance_diagnostics(
             &rx_stats,
             &tx_stats,
-            crate::rate::effective_rate_target(task.rate_mode, task.rx_target_mbps).is_some(),
+            crate::rate::effective_rate_target(task.rate_mode, task.rx_target_mbps),
             crate::master::rate_window::offered_floor_mbps(
                 task.rx_target_mbps,
                 self.cfg.iperf.rate_check.offered_headroom_pct,

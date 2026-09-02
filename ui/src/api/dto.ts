@@ -56,29 +56,22 @@ export interface BootstrapOut {
   ping_wifi_medium_max_rtt_ms: number,
   ping_wifi_large_avg_rtt_ms: number,
   ping_wifi_large_max_rtt_ms: number,
-  /** 主控 config.json 当前生效的全局 RX 门限；界面没有输入框，但它参与判定。 */
-  rate_targets_mbps: RateTargets;
-  /** 主控当前生效的 UDP 档位原样列表（三条轴是叉乘语义，还原不回来）。 */
-  udp_profiles: UdpProfile[];
-  /** 主控当前生效的判定模式；`observe` 整轮不判 PASS/FAIL。 */
-  rate_mode: string;
+  /**
+   * 主控当前生效的**解析后配置**：判定与灌包参数的完整基线。
+   *
+   * 只含 `link_profiles` / `iperf` / `ctstraffic` / `ping` 四块，不含任何连接
+   * 身份。导出项目时原样固化——界面上没有输入框的那些参数（`rate_check` 的
+   * 负载上限与余量、角色配对门限、ctsTraffic 的帧率）只能靠它跨机复现。
+   *
+   * 前端不解释它的内容，只负责**原样搬运**：字段语义在 Rust 的 `Config` 里，
+   * 在这边再写一份类型定义就是两份会漂的实现。
+   */
+  master_config: Record<string, unknown>;
   screenshot: boolean;
   ui_plan_supported: boolean;
 }
 
-/** 一档 UDP 参数。`length`/`window` 省略表示这一档不下发 `-l`/`-w`。 */
-export interface UdpProfile {
-  bandwidth: string;
-  length?: string | null;
-  window?: string | null;
-}
 
-/** 方向化的 RX 门限；`null` = 这一层没给。 */
-export interface RateTargets {
-  forward: number | null;
-  ab: number | null;
-  ba: number | null;
-}
 
 export interface LocalOut {
   host: HostInfo;

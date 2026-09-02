@@ -116,8 +116,8 @@ export interface UiPlan {
  *
  * `both` 与 `bidir` 是两件不同的事：`both` 是两条独立的 A→B / B→A 单向腿，
  * `bidir` 是同一个双向并发单元。旧项目里两者都可能出现，把 `both` 显示成
- * 「双向」而在保存时悄悄改成 `bidir`，会**改变执行语义**——半双工介质上双向
- * 并发时两个方向抢同一段介质时间，跑出来的数完全不是一回事。
+ * 「双向」而在保存时悄悄改成 `bidir`，会**改变执行语义**——双向并发时两个
+ * 方向的吞吐互相影响，跑出来的数完全不是一回事。
  */
 export function canonicalDirection(raw: string): string | null {
   switch (String(raw ?? '').trim().toLowerCase()) {
@@ -485,7 +485,7 @@ function newTask(plan: UiPlan, protocol: UiProtocol): UiTask {
     name: protocol.toUpperCase(),
     protocol,
     // 默认两个单向而不是 bidir：`both`/两条单向腿与「双向并发」是两件不同的事，
-    // 半双工介质上双向并发时两个方向抢同一段介质时间，跑出来的数完全不是一回事。
+    // 双向并发时两个方向的吞吐互相影响，跑出来的数完全不是一回事。
     directions: ['ab', 'ba'],
     ip: ['v4', 'v6'],
     recipe_ids: [],

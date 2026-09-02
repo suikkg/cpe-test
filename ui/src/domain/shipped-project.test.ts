@@ -25,6 +25,23 @@ describe('随包示例项目', () => {
     expect(result.settings?.globals?.ping_small_max_bytes).toBe(128);
   });
 
+  // 这一条是冲着一个真实缺陷来的：示例项目发布时 `master_config` 是 `{}`，
+  // 而空对象在后端等价于「没带」——这份号称「完整可复现快照」的旗舰示例，
+  // 判定参数一个都没带，导入后全落到目标机器的基线。上面两条断言都是绿的，
+  // 因为它们只看解析和往返。
+  it('带着完整的判定基线，而不是一个空壳', () => {
+    const result = parseProject(text);
+    const master = result.settings?.masterConfig;
+    expect(master, 'master_config 缺失就等于没带判定参数').toBeTruthy();
+    expect(Object.keys(master!).sort()).toEqual(['ctstraffic', 'iperf', 'link_profiles', 'ping']);
+    // 界面上没有输入框、却直接决定 PASS/FAIL 的那些参数必须在里面。
+    const iperf = master!.iperf as Record<string, unknown>;
+    expect(Object.keys(iperf.rate_check as object).length).toBeGreaterThan(10);
+    expect((master!.link_profiles as Record<string, unknown>).by_role).toBeDefined();
+    // 反过来：按网口的门限覆盖是本机身份，不许跟着项目走。
+    expect((master!.link_profiles as Record<string, unknown>).by_nic).toBeUndefined();
+  });
+
   it('再导出一次形状不变（幂等）', () => {
     const first = parseProject(text);
     const second = parseProject(

@@ -1,7 +1,7 @@
 {
   "name": "cpe-test-console",
   "private": true,
-  "version": "6.2.4",
+  "version": "6.2.5",
   "type": "module",
   "description": "CPE 子网测试控制台前端。构建产物是全内联的单个 HTML，提交进仓库供 include_str! 使用。",
   "scripts": {

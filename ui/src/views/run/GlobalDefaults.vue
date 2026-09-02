@@ -319,7 +319,7 @@ const pingSizes = numbers('ping_payload_sizes');
           </tbody>
         </table>
       </div>
-      <p class="muted hint">灰字“默认 xx”是主控当前生效值；输入数值后覆盖。所有档位仍要求 0% 丢包。</p>
+      <p class="muted hint">灰字“默认 xx”是控制台默认值，输入数值后覆盖；所有档位仍要求 0% 丢包。</p>
     </details>
 
     <details class="policy">
@@ -342,11 +342,7 @@ const pingSizes = numbers('ping_payload_sizes');
           </tbody>
         </table>
       </div>
-      <p class="muted hint">
-        双向并发按<strong>两端 RX 合计</strong>判定：<code>主控端 RX 平均 + 辅测端 RX 平均 ≥ 合计门限</code>。
-        Wi-Fi 之间抢的是同一段空口时间，两个方向怎么分完全看调度，不要求各达到一半——
-        合计 900 时「720 + 230 = 950」就是 PASS。留空则双向单元只显示实测值，不判 PASS/FAIL。
-      </p>
+      <p class="muted hint">双向并发按两端 RX 合计判定，不要求各方向达到一半；留空则只显示实测值。</p>
       <div v-if="hasLegacyWifiOverrides" class="legacy-warning">
         <span>当前项目含旧版具体网口覆盖，仍按兼容规则执行。</span>
         <button type="button" class="ghost small" @click="clearLegacyWifiOverrides">清除旧覆盖</button>

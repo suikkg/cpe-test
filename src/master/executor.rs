@@ -830,6 +830,25 @@ impl Ctx {
             if let Some(judgement) = &bidir_total {
                 unit_diagnostics.extend(judgement.diagnostics.clone());
             }
+            // 单元级「结论的理由」只算一次，报告行和进度页共用。
+            //
+            // 这两处以前各算各的：报告行走合计判定，进度页走 `unit_reason` /
+            // `reasons.first()` 的腿级理由。真机联调当场撞上——双向 UDP 单元
+            // 判定是 PASS，进度页却写着「ab:TARGET_UNKNOWN …因此不标记 PASS」。
+            // 腿本来就不该有目标（合计门限存在时 `leg_rate_plan` 把两条腿都落到
+            // Observe），那句话在单元这一层是自相矛盾的。
+            let unit_reason_code = bidir_total
+                .as_ref()
+                .map(|judgement| judgement.code)
+                .or_else(|| unit_reason.map(|outcome| outcome.reason_code()))
+                .unwrap_or_default();
+            let bidir_reason_detail = bidir_total.as_ref().map(|judgement| {
+                if judgement.detail.is_empty() {
+                    judgement.diagnostics.join("；")
+                } else {
+                    judgement.detail.clone()
+                }
+            });
             let direction_summaries = self.direction_summaries(&outcomes);
             let single_direction = (direction_summaries.len() == 1)
                 .then(|| direction_summaries.first())
@@ -845,24 +864,22 @@ impl Ctx {
                     Verdict::NotEvaluated => ExecutionStatus::Partial,
                     _ => ExecutionStatus::Completed,
                 },
-                reason_code: bidir_total
-                    .as_ref()
-                    .map(|judgement| judgement.code)
-                    .or_else(|| unit_reason.map(|outcome| outcome.reason_code()))
-                    .unwrap_or_default(),
-                // 合计判定拍板时，理由必须说合计那件事。落回按腿的理由会出现
-                // 「单元 PASS，理由 ab:TARGET_UNKNOWN 未配置可信目标」——腿本来
-                // 就不该有目标，那句话在这里是自相矛盾的。
-                reason_detail: match &bidir_total {
-                    Some(judgement) if !judgement.detail.is_empty() => judgement.detail.clone(),
-                    Some(judgement) => judgement.diagnostics.join("；"),
-                    None => reasons.join(" | "),
-                },
+                reason_code: unit_reason_code,
+                reason_detail: bidir_reason_detail
+                    .clone()
+                    .unwrap_or_else(|| reasons.join(" | ")),
                 diagnostics: unit_diagnostics,
                 requested_streams: stream_counts.map_or(0, |counts| counts.requested),
                 active_streams: stream_counts.map_or(0, |counts| counts.active),
                 required_streams: stream_counts.map_or(0, |counts| counts.required),
-                rx_avg: single_direction.and_then(|direction| direction.rx_avg),
+                // 双向合计单元的「RX 平均」就是判定用的那个合计值。填
+                // `single_direction`（双向恒为 None）会让报告出现「目标 1000 /
+                // RX 平均 空」这种自相矛盾的一行。
+                rx_avg: bidir_total
+                    .is_some()
+                    .then(|| bidir_total_rx_avg(&outcomes))
+                    .flatten()
+                    .or_else(|| single_direction.and_then(|direction| direction.rx_avg)),
                 rx_p10: single_direction.and_then(|direction| direction.rx_p10),
                 // 双向合计单元的「目标」就是那个合计门限——两条腿各自没有目标，
                 // 报告上必须能看到判定用的是哪个数。
@@ -901,12 +918,13 @@ impl Ctx {
                         seq: useq + 1,
                         title: unit.title.clone(),
                         verdict: unit_verdict.label().to_string(),
-                        reason_code: unit_reason
-                            .map(|outcome| outcome.reason_code().as_str().to_string())
-                            .unwrap_or_default(),
+                        reason_code: unit_reason_code.as_str().to_string(),
                         // 失败清单一行一条，多腿的原因用 " | " 连起来的整串
-                        // 太长；这里只留第一段，完整的在报告里。
-                        reason_detail: reasons.first().cloned().unwrap_or_default(),
+                        // 太长；这里只留第一段，完整的在报告里。合计拍板时那句
+                        // 话本身就是完整的一条，不再截取。
+                        reason_detail: bidir_reason_detail
+                            .clone()
+                            .unwrap_or_else(|| reasons.first().cloned().unwrap_or_default()),
                         skipped: false,
                         secs: self.clock.now().duration_since(unit_started_at).as_secs(),
                         link_group: unit.link_group.clone(),

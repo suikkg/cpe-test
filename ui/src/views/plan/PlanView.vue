@@ -86,7 +86,10 @@ const fileInput = ref<HTMLInputElement | null>(null);
  * 不走服务端：项目文件是纯前端的计划与执行设置文档，服务端根本没有它。
  */
 function onExport(): void {
-  const blob = new Blob([exportProject()], { type: 'application/json' });
+  const text = exportProject();
+  // 拿不到判定基线时不下载——理由已经写进 projectNotices.error，就显示在下面。
+  if (text === null) return;
+  const blob = new Blob([text], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;
@@ -144,7 +147,7 @@ onMounted(() => {
         class="hidden-file"
         @change="onImport"
       />
-      <span class="muted">项目文件保存可复现配置，不含 RESUME、截图、历史结果或口令</span>
+      <span class="muted">项目文件保存完整可复现配置，不含口令</span>
     </div>
 
     <p v-if="projectNotices.error" class="bad" role="alert">{{ projectNotices.error }}</p>
@@ -247,10 +250,7 @@ onMounted(() => {
 
     <div v-else-if="section === 'suites'" class="workbench-panel">
     <h3>套件</h3>
-    <p class="muted hint">
-      一个套件 = 一串按顺序执行的任务。分配表上勾一格，就是「这个链路集合跑这个套件」。
-      加档位、加方向、加 IP 版本都会让单元数变多——数量与耗时以「执行」页预览的服务端回包为准。
-    </p>
+    <p class="muted hint">一个套件 = 一串按顺序执行的任务；数量与耗时以「执行」页预览为准。</p>
     <SuiteEditor @edit-recipe="editRecipe" />
     <div class="panel-next">
       <button type="button" class="ghost" @click="section = 'assign'">← 返回分配</button>
@@ -260,10 +260,7 @@ onMounted(() => {
 
     <div v-else class="workbench-panel">
     <h3>流量配置</h3>
-    <p class="muted hint">
-      档位是<strong>轴</strong>，逐档各跑一轮：<code>-w 4m,64k</code> ×
-      <code>-P 1,10</code> 是四个测试单元。任务一条配置都不选时，走「执行」页的全局默认档位。
-    </p>
+    <p class="muted hint">任务一条配置都不选时，走「执行」页的全局默认档位。</p>
     <RecipeEditor :focus-recipe-id="focusedRecipeId" />
     <div class="panel-next finish">
       <button type="button" class="ghost" @click="section = 'suites'">← 返回套件</button>

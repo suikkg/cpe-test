@@ -300,7 +300,7 @@ fn direction_row_score(row: &Row) -> u8 {
 /// 单向单元只有一条，此时判定用**单元判定**（`group_verdict` → `aggregate_verdict`，
 /// 判定优先级全仓唯一的那一份），而不是代表行自己的 verdict——单元结论可能来自
 /// 多条行的聚合。双向单元每个方向各一条，判定取该方向的行，这与 HTML 报告的
-/// 「双向方向汇总（每个方向各自按接收端 RX 判定）」是同一个读法。
+/// 「双向方向汇总（未设置合计门限，每个方向各自按接收端 RX 判定）」是同一个读法。
 fn link_observations<'a>(group: &UnitGroup<'a>) -> Vec<LinkObservation<'a>> {
     let mut picked: Vec<(RowDirection, &'a Row)> = Vec::new();
     for row in &group.details {
@@ -687,7 +687,7 @@ mod tests {
     ///
     /// 这张表以前只按 `link_group` 一维聚合：一条双向链路的两块接收网卡被压成
     /// 一行，「RX 平均最小值」于是只剩两者里更差的那个，而表上看不出它说的是哪
-    /// 一块——另一块的数字整个消失。半双工链路两个方向差一个数量级是常态
+    /// 一块——另一块的数字整个消失。双向链路两个方向差一个数量级是常态
     /// （同一次运行里见过 1821Mbps 对 17Mbps），压成一行等于把结论抹平。
     #[test]
     fn a_bidirectional_unit_gets_one_row_per_receiving_nic() {

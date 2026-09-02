@@ -95,23 +95,31 @@ pub(super) fn row_has_usable_traffic_measurement(row: &Row) -> bool {
 ///
 /// 为什么不是 TX+RX：同一个包在发送侧 TX 和接收侧 RX 各记一次，相加就是重复
 /// 计数；TX 还会混进背景流量和 socket 缓冲里从未上线的字节。两端 RX 相加得到
-/// 的正是这段时间里真正跨过链路的总量，也正是半双工介质上唯一有物理意义的
-/// 双向指标——要求两个方向各达到一半，在 Wi-Fi 上是凭空发明的约束。
+/// 的正是这段时间里真正跨过链路的总量——在两个方向互相影响的链路上，这是唯一
+/// 有意义的双向指标；要求两个方向各达到一半，在 Wi-Fi 上是凭空发明的约束。
 ///
 /// 两条腿只要有一条形不成可信的 RX 平均值，合计就不成立：这时**不猜**，
 /// 交回给按腿聚合的结论（它会说出到底是哪条腿、什么原因）。
-pub(super) fn bidir_total_verdict(outcomes: &[LegOutcome], total_target: f64) -> VerdictResult {
+/// 双向单元的两条腿。`None` = 缺方向，合计无从谈起。
+fn bidir_legs(outcomes: &[LegOutcome]) -> Option<(&LegOutcome, &LegOutcome)> {
     let leg = |tag: &str| {
         outcomes
             .iter()
             .find(|outcome| outcome.tag.eq_ignore_ascii_case(tag))
     };
-    let (Some(ab), Some(ba)) = (leg("ab"), leg("ba")) else {
-        return VerdictResult::not_evaluated(
-            ReasonCode::NicRateMissing,
-            "双向 RX 合计需要 AB 与 BA 两个方向的结果，本单元缺少其中一个",
-        );
-    };
+    match (leg("ab"), leg("ba")) {
+        (Some(ab), Some(ba)) => Some((ab, ba)),
+        _ => None,
+    }
+}
+
+/// 双向有效吞吐 = 两端接收端 RX 平均之和。
+///
+/// **全仓唯一定义**：判定（[`bidir_total_verdict`]）和报告行填的必须是同一个
+/// 数，否则报告上会出现「判定说合计 950 达标、RX 平均列却是另一个数」。
+/// 任一方向形不成可信的 RX 平均值就返回 `None`——这时合计不成立，不猜。
+pub(super) fn bidir_total_rx_avg(outcomes: &[LegOutcome]) -> Option<f64> {
+    let (ab, ba) = bidir_legs(outcomes)?;
     // 「这条腿测出数了吗」只有一个答案来源：腿级判定有没有走到验收那一步。
     // Measured / Pass / RateFail 都意味着已经形成可信的 RX 平均值。
     let usable = |outcome: &LegOutcome| {
@@ -120,17 +128,21 @@ pub(super) fn bidir_total_verdict(outcomes: &[LegOutcome], total_target: f64) ->
             Verdict::Pass | Verdict::RateFail | Verdict::Measured
         )
     };
-    let (Some(ab_rx), Some(ba_rx)) = (ab.rx_avg, ba.rx_avg) else {
+    if !usable(ab) || !usable(ba) {
+        return None;
+    }
+    let (ab_rx, ba_rx) = (ab.rx_avg?, ba.rx_avg?);
+    (ab_rx.is_finite() && ba_rx.is_finite()).then_some(ab_rx + ba_rx)
+}
+
+pub(super) fn bidir_total_verdict(outcomes: &[LegOutcome], total_target: f64) -> VerdictResult {
+    let Some((ab, ba)) = bidir_legs(outcomes) else {
         return VerdictResult::not_evaluated(
             ReasonCode::NicRateMissing,
-            format!(
-                "双向 RX 合计缺少方向数据：AB={}，BA={}",
-                fmt_opt(ab.rx_avg),
-                fmt_opt(ba.rx_avg)
-            ),
+            "双向 RX 合计需要 AB 与 BA 两个方向的结果，本单元缺少其中一个",
         );
     };
-    if !usable(ab) || !usable(ba) || !ab_rx.is_finite() || !ba_rx.is_finite() {
+    let Some(total) = bidir_total_rx_avg(outcomes) else {
         return VerdictResult::not_evaluated(
             ReasonCode::NicRateMissing,
             format!(
@@ -141,8 +153,8 @@ pub(super) fn bidir_total_verdict(outcomes: &[LegOutcome], total_target: f64) ->
                 ba.reason_code()
             ),
         );
-    }
-    let total = ab_rx + ba_rx;
+    };
+    let (ab_rx, ba_rx) = (ab.rx_avg.unwrap_or_default(), ba.rx_avg.unwrap_or_default());
     let detail = format!(
         "双向 RX 合计 {total:.3}Mbps（AB {ab_rx:.3} + BA {ba_rx:.3}），门限 {total_target:.3}Mbps"
     );
@@ -343,7 +355,7 @@ pub(crate) fn iperf_flow_verdict(input: IperfFlowVerdictIn<'_>) -> VerdictResult
     let mut diagnostics = crate::master::rate_window::rx_acceptance_diagnostics(
         rx_stats,
         tx_stats,
-        crate::rate::effective_rate_target(rate_mode, rx_target_mbps).is_some(),
+        crate::rate::effective_rate_target(rate_mode, rx_target_mbps),
         offered_floor,
     );
     if !summary_lost_after_full_run {
@@ -539,7 +551,7 @@ pub(super) fn udp_leg_verdict(facts: &UdpLegFacts<'_>) -> VerdictResult {
             runtime_failures,
             rx: rx_stats,
             tx: tx_stats,
-            target_present: effective_target.is_some(),
+            target: effective_target,
             offered_floor,
             udp_loss,
             max_udp_loss_pct,
@@ -555,7 +567,8 @@ struct UdpLegDiagnosticFacts<'a> {
     runtime_failures: usize,
     rx: &'a RateStats,
     tx: &'a RateStats,
-    target_present: bool,
+    /// 已折算的判定目标；`None` = 这一腿没有门限。
+    target: Option<f64>,
     offered_floor: Option<f64>,
     udp_loss: Option<f64>,
     max_udp_loss_pct: Option<f64>,
@@ -570,7 +583,7 @@ fn udp_leg_diagnostics(facts: &UdpLegDiagnosticFacts<'_>) -> Vec<String> {
     let mut out = crate::master::rate_window::rx_acceptance_diagnostics(
         facts.rx,
         facts.tx,
-        facts.target_present,
+        facts.target,
         facts.offered_floor,
     );
     if facts.runtime_failures > 0 {
@@ -881,6 +894,31 @@ mod tests {
         assert_eq!(judgement.verdict, Verdict::RateFail);
         assert_eq!(judgement.code, ReasonCode::RxBelowTarget);
         assert!(judgement.detail.contains("800.000"), "{judgement:?}");
+    }
+
+    /// 判定用的合计值和报告行填的必须是**同一个数**。
+    ///
+    /// 单元汇总行以前 `rx_avg` 走 `single_direction`（双向恒为 `None`），而
+    /// `target_mbps` 填了合计门限——报告和 Excel 上于是出现「目标 1000 /
+    /// RX 平均 空」这种自相矛盾的一行，判定用的那个数只以文字形式存在于
+    /// 原因列里。`bidir_total_rx_avg` 是这个数的唯一定义，两边共用。
+    #[test]
+    fn the_number_the_verdict_used_is_the_number_the_row_shows() {
+        let outcomes = vec![measured_leg("ab", 720.0), measured_leg("ba", 230.0)];
+        assert_eq!(bidir_total_rx_avg(&outcomes), Some(950.0));
+
+        // 形不成合计时也不能给报告一个半真半假的数。
+        let one_way = vec![measured_leg("ab", 720.0)];
+        assert_eq!(bidir_total_rx_avg(&one_way), None);
+
+        let mut untrusted = vec![measured_leg("ab", 720.0), measured_leg("ba", 230.0)];
+        untrusted[1].judgement =
+            VerdictResult::not_evaluated(ReasonCode::NicRateMissing, "采样不可信");
+        assert_eq!(
+            bidir_total_rx_avg(&untrusted),
+            None,
+            "有一条腿没形成可信的 RX 平均值，合计就不成立"
+        );
     }
 
     /// 缺一个方向就形不成合计——这时**不猜**。

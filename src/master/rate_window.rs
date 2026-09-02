@@ -35,20 +35,17 @@ pub const ROLLING_COVERAGE_TOLERANCE_MS: u64 = 50;
 /// 判据落在**原始逐样本序列**上，所以这就是字面意义的「连续 5 秒」，
 /// 不再是「某个 5 秒滑动平均越界」。一个采样周期的抖动一律不算：它和
 /// Wi-Fi 发 probe、信道扫描造成的掉一拍在网卡计数器上不可区分。
-#[allow(dead_code)]
 pub const MIN_RATE_EXCURSION_MS: u64 = 5_000;
 /// 掉坑门限相对目标的容差：低于 `target * (1 - 它)` 才算掉坑。
 ///
 /// 门限贴着目标比（老口径的 `rate < target`）会把噪声判成故障：
 /// run_20260828_162822_17788 的 unit-109-110 就是被 1973.171 / 2000 这
 /// 1.35% 的差判掉的。
-#[allow(dead_code)]
 pub const RATE_DROPOUT_TOLERANCE: f64 = 0.20;
 /// 断流判据相对目标的比例：「灌包速率基本为 0」取目标的 1%。
 ///
 /// 不取 `target * 0.1`——那个量级还有十分之一的目标速率在跑，属于掉坑
 /// 而不是断流，两者的排查方向完全不同。
-#[allow(dead_code)]
 pub const RATE_OUTAGE_RATIO: f64 = 0.01;
 
 #[derive(Debug, Clone, Default)]
@@ -75,7 +72,6 @@ pub(crate) struct RateStats {
     /// 断流/掉坑判在它上面，不判在 5 秒滑动平均上：滑动平均会把一个
     /// 采样周期的抖动摊成 5 个窗口，既制造误判也把时长报错（详见
     /// [`RateExcursion`]）。时长已去过重叠，累加即真实覆盖时长。
-    #[allow(dead_code)]
     pub series: Vec<(u64, u64, f64)>,
     /// 判定窗口内「计数器连续零增长」的最长一段占已覆盖时长的比例。
     ///
@@ -97,7 +93,6 @@ pub(crate) struct EffectiveWindow {
 
 /// 越界的形态：断流 / 掉坑。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
 pub(crate) enum ExcursionKind {
     /// 灌包速率基本为 0——链路这几秒是真的断的。
     Outage,
@@ -111,7 +106,6 @@ pub(crate) enum ExcursionKind {
     // 全收进来。真要查异常抬升，判据得相对**链路自身的中位数**而不是目标。
 }
 
-#[allow(dead_code)]
 impl ExcursionKind {
     /// 报告里的原因码。两种形态分开发码，读报告的人一眼就知道该查什么。
     pub fn reason_code(self) -> ReasonCode {
@@ -149,7 +143,6 @@ impl ExcursionKind {
 /// [`MIN_RATE_EXCURSION_MS`] 才算数，报出来的秒数就是真秒数，能直接和截图
 /// 对上；单个采样周期的抖动一律忽略——它和 probe / 信道扫描不可区分。
 #[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
 pub(crate) struct RateExcursion {
     pub kind: ExcursionKind,
     /// 判据门限，已按目标和容差折算。
@@ -168,7 +161,6 @@ pub(crate) struct RateExcursion {
     pub runs: usize,
 }
 
-#[allow(dead_code)]
 impl RateExcursion {
     /// 报告和日志里那句人话。
     pub fn describe(&self) -> String {
@@ -203,7 +195,6 @@ impl RateExcursion {
 ///
 /// `series` 的元素是 `(样本结束时刻ms, 该样本独占的时长ms, 速率Mbps)`——
 /// 时长已经去过重叠，所以直接累加就是真实覆盖时长，不需要假设采样周期。
-#[allow(dead_code)]
 fn scan_excursion(
     series: &[(u64, u64, f64)],
     kind: ExcursionKind,
@@ -273,7 +264,6 @@ fn scan_excursion(
 ///
 /// 顺序是**由重到轻**：断流的样本必然也满足掉坑判据，先报断流才说得清
 /// 「这几秒是真断了」还是「只是掉下去了」。
-#[allow(dead_code)]
 pub(crate) fn rate_excursion(series: &[(u64, u64, f64)], target: f64) -> Option<RateExcursion> {
     if !target.is_finite() || target <= 0.0 {
         return None;
@@ -391,14 +381,16 @@ pub(crate) fn evaluate_rx_acceptance(
 pub(crate) fn rx_acceptance_diagnostics(
     stats: &RateStats,
     tx_stats: &RateStats,
-    target_present: bool,
+    // **已经过 `effective_rate_target` 折算**的判定目标；`None` = 这一腿没有门限。
+    // 收目标本身而不是 `bool`：中途掉坑/断流的判据要拿它当参照。
+    target: Option<f64>,
     // 验证目标所需的最低发送负载（目标 + 余量）；`None` = 没有 offered 参照。
     offered_floor: Option<f64>,
 ) -> Vec<String> {
     let mut out = Vec::new();
-    if !target_present {
+    let Some(target) = target else {
         return out;
-    }
+    };
     let fmt = |value: Option<f64>| {
         value
             .map(|v| format!("{v:.3}Mbps"))
@@ -432,6 +424,21 @@ pub(crate) fn rx_acceptance_diagnostics(
                 fmt(Some(floor))
             ));
         }
+    }
+    // 中途断流 / 掉坑。
+    //
+    // 平均值答不出「中间断没断过」：全程平均 2200、中间断 6 秒，和全程稳定
+    // 2200，对使用者不是同一个结论。它**不再改写判定**（RX 平均达标就是
+    // PASS），但必须留在报告里——否则一条中途断了一分钟的链路会报出一个
+    // 干干净净的 PASS，报告上一个字都看不到。
+    if let Some(excursion) = rate_excursion(&stats.series, target) {
+        // 带上原因码：它是报告里通用的词汇，读的人能直接和 `report/reason.rs`
+        // 的说明对上，也能在一堆诊断行里检索出「断流」和「掉坑」两类。
+        out.push(format!(
+            "{}: {}；平均值已达标，故不改写判定，但这段时间的业务是真的受影响了",
+            excursion.reason_code(),
+            excursion.describe()
+        ));
     }
     out
 }
@@ -772,6 +779,72 @@ mod tests {
         (result.verdict, result.code, result.detail)
     }
 
+    /// **中途断流/掉坑必须出现在报告里，哪怕平均值达标。**
+    ///
+    /// 这条守的是一个真实的回归：把「掉坑」从判定分支降级为诊断时，它被
+    /// `#[allow(dead_code)]` 直接消音了——整套越界判据（`rate_excursion`、
+    /// `ExcursionKind`、`RateStats::series`）在生产代码里一个调用点都没有，
+    /// 只剩测试在读。结果是一条全程平均 2200Mbps、**中间整整断了一分钟**的
+    /// 链路报出一个干干净净的 PASS，报告上一个字都看不到。
+    ///
+    /// 降级的意思是「不改写判定」，不是「不再告诉任何人」。
+    #[test]
+    fn a_mid_run_outage_still_reaches_the_report_even_though_the_average_passed() {
+        let target = 2_000.0;
+        // 前 60 秒正常、中间断 20 秒、后 100 秒正常：平均仍在门限之上。
+        let series: Vec<(u64, u64, f64)> = (1..=180)
+            .map(|i| {
+                let rate = if (61..=80).contains(&i) { 0.0 } else { 2_600.0 };
+                (i * 1_000, 1_000, rate)
+            })
+            .collect();
+        let avg = series.iter().map(|(_, _, r)| r).sum::<f64>() / series.len() as f64;
+        assert!(avg > target, "这条用例的前提就是平均值达标：{avg}");
+
+        let rx = RateStats {
+            avg_mbps: Some(avg),
+            p10_mbps: Some(0.0),
+            coverage: 1.0,
+            rolling_coverage: 1.0,
+            series: series.clone(),
+            ..Default::default()
+        };
+        let tx = RateStats {
+            avg_mbps: Some(2_600.0),
+            p10_mbps: Some(2_600.0),
+            coverage: 1.0,
+            rolling_coverage: 1.0,
+            ..Default::default()
+        };
+
+        // 判定不变：RX 平均达标就是 PASS。
+        let (verdict, _, _) = nic_rx(RateMode::Verify, Some(target), &rx);
+        assert_eq!(verdict, Verdict::Pass, "平均值达标仍然必须 PASS");
+
+        // 但断流这件事必须留下痕迹。
+        let notes = rx_acceptance_diagnostics(&rx, &tx, Some(target), None);
+        assert!(
+            notes.iter().any(|line| line.contains("秒")),
+            "中途断流要出现在诊断里，否则报告上看不出这一分钟：{notes:?}"
+        );
+
+        // 全程平稳的同一条链路不该凭空多出这条诊断。
+        let steady_series: Vec<(u64, u64, f64)> =
+            (1..=180).map(|i| (i * 1_000, 1_000, 2_600.0)).collect();
+        let steady = RateStats {
+            avg_mbps: Some(2_600.0),
+            p10_mbps: Some(2_600.0),
+            coverage: 1.0,
+            rolling_coverage: 1.0,
+            series: steady_series,
+            ..Default::default()
+        };
+        assert!(
+            rx_acceptance_diagnostics(&steady, &tx, Some(target), None).is_empty(),
+            "平稳链路不该有诊断"
+        );
+    }
+
     /// 发送端没灌够、RX 平均也没达到目标时，仍然直接判子网失败；
     /// 「没灌够」只出现在**诊断**里（ADR-17）。
     #[test]
@@ -802,7 +875,7 @@ mod tests {
             "判定明细只讲 RX 平均与门限: {detail}"
         );
         // 发送端的背景交给诊断，不再混进判定明细。
-        let notes = rx_acceptance_diagnostics(&rx, &tx, true, Some(1_050.0));
+        let notes = rx_acceptance_diagnostics(&rx, &tx, Some(1_000.0), Some(1_050.0));
         assert!(
             notes.iter().any(|line| line.contains("TX-P10")),
             "没灌够要留在诊断里: {notes:?}"
@@ -815,7 +888,7 @@ mod tests {
         assert_eq!(code, ReasonCode::RxBelowTarget);
         // 灌足了就不该有 offered 诊断。
         assert!(
-            !rx_acceptance_diagnostics(&rx_low, &stats(1_100.0), true, Some(1_050.0))
+            !rx_acceptance_diagnostics(&rx_low, &stats(1_100.0), Some(1_000.0), Some(1_050.0))
                 .iter()
                 .any(|line| line.contains("TX-P10"))
         );
@@ -1061,7 +1134,7 @@ mod tests {
         assert_eq!((verdict, code), (Verdict::Pass, ReasonCode::None));
         assert!(detail.is_empty());
         assert!(
-            rx_acceptance_diagnostics(&healthy, &tx_low_coverage, true, None)
+            rx_acceptance_diagnostics(&healthy, &tx_low_coverage, Some(1_000.0), None)
                 .iter()
                 .any(|line| line.contains("TX 采样覆盖率"))
         );
@@ -1074,7 +1147,7 @@ mod tests {
         let (verdict, code, _) = nic_rx(RateMode::Verify, target, &healthy);
         assert_eq!((verdict, code), (Verdict::Pass, ReasonCode::None));
         assert!(
-            rx_acceptance_diagnostics(&healthy, &tx_low_rolling, true, None)
+            rx_acceptance_diagnostics(&healthy, &tx_low_rolling, Some(1_000.0), None)
                 .iter()
                 .any(|line| line.contains("滚动窗口"))
         );
@@ -1082,7 +1155,10 @@ mod tests {
         // 发送端根本没采到样本。
         let (verdict, _, _) = nic_rx(RateMode::Verify, target, &healthy);
         assert_eq!(verdict, Verdict::Pass);
-        assert!(!rx_acceptance_diagnostics(&healthy, &RateStats::default(), true, None).is_empty());
+        assert!(
+            !rx_acceptance_diagnostics(&healthy, &RateStats::default(), Some(1_000.0), None)
+                .is_empty()
+        );
 
         // 目标未知时不做双侧要求：只记录实测能力。
         assert_eq!(
@@ -1133,7 +1209,7 @@ mod tests {
                              (coverage={coverage}, rolling={rolling}, p10={p10:?})"
                         );
                         // 诊断仍要把滚动窗口那件事说出来。
-                        let notes = rx_acceptance_diagnostics(&rx, &tx, true, None);
+                        let notes = rx_acceptance_diagnostics(&rx, &tx, Some(target), None);
                         if !rate_window_coverage_sufficient(&rx, &tx, true) {
                             assert!(
                                 notes.iter().any(|line| line.contains("滚动窗口")),

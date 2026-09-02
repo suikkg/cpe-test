@@ -418,13 +418,10 @@ function has(list: string[] | undefined, value: string): boolean {
                 />
               </label>
               <p class="muted small-hint">
-                填了合计门限，这个任务的双向单元就只判一次
-                <strong>A→B 接收端 RX + B→A 接收端 RX ≥ 合计</strong>，两条腿各自只测量。
-                Wi-Fi 之间抢的是同一段空口时间，两个方向怎么分完全看调度，要求各达到一半没有依据。
-                用两端的 RX 相加而不是 TX+RX：同一个包在发送侧和接收侧各记一次，相加就是重复计数。
+                判一次：<strong>A→B 接收端 RX + B→A 接收端 RX ≥ 合计</strong>，单位 Mbps。
               </p>
-              <details class="legacy-bidir">
-                <summary>按方向分别设门限（旧口径）</summary>
+              <details class="per-direction-bidir">
+                <summary>按方向分别设门限（逐方向把关）</summary>
                 <label class="inline">
                   <span>A→B 接收端</span>
                   <input
@@ -443,17 +440,9 @@ function has(list: string[] | undefined, value: string): boolean {
                     @input="onBidirTarget(current.id, task.id, 'rx_target_bidir_ba', $event)"
                   />
                 </label>
-                <p class="muted small-hint">
-                  全双工链路（有线↔有线）两个方向互不抢占，按方向分别判定仍然是对的。
-                  填了上面的合计门限时，这两格不再参与判定。
-                </p>
+                <p class="muted small-hint">两个方向各判一次；填了合计门限时这两格不参与判定。</p>
               </details>
-              <p class="muted small-hint">
-                只收<strong>绝对 Mbps</strong>：百分比要拿单块网口的协商速率去换算，
-                而双向说的是两块口并发时的能力，两者不成比例。
-                这组数字挂在<strong>任务</strong>上，会作用于所有分配了本套件的链路集合；
-                想给某条链路单独的门限，用上面的「复制」再单独分配。
-              </p>
+              <p class="muted small-hint">门限挂在任务上，作用于所有分配了本套件的链路集合。</p>
             </fieldset>
           </div>
         </li>
@@ -476,8 +465,8 @@ function has(list: string[] | undefined, value: string): boolean {
 </template>
 
 <style scoped>
-.legacy-bidir { margin: 4px 0 0; }
-.legacy-bidir > summary { color: var(--muted); cursor: pointer; font-size: 12px; }
+.per-direction-bidir { margin: 4px 0 0; }
+.per-direction-bidir > summary { color: var(--muted); cursor: pointer; font-size: 12px; }
 .split { display: grid; grid-template-columns: 216px minmax(0, 1fr); gap: 12px; align-items: start; }
 .list {
   display: flex; flex-direction: column; gap: 4px;

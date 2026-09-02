@@ -89,9 +89,7 @@ fn request() -> RunRequest {
         wifi_pair_rx_target_mbps: 0.0,
         wifi_pair_bidir_rx_target_mbps: 0.0,
         wifi_pair_bidir_total_rx_target_mbps: 0.0,
-        udp_profiles: None,
-        global_rate_targets: None,
-        global_rate_mode: None,
+        master_config: None,
         wifi_band_thresholds: Vec::new(),
         wifi_pair_thresholds: Vec::new(),
         limit_udp_by_link_speed: false,
@@ -226,6 +224,421 @@ fn effective(targets: Option<&crate::config::RateTargets>, dir: &str) -> Option<
     targets.and_then(|targets| targets.for_direction(dir))
 }
 
+/// `Config` 的每一个顶层字段都必须被明确分类：**进项目快照**，还是**留在本机**。
+///
+/// 项目快照走白名单（`MASTER_CONFIG_KEYS`），因为这份文件是要传阅的——将来
+/// 给 `Config` 加一个口令类字段，黑名单会让它悄悄进项目，白名单不会。代价是
+/// 新加的**判定参数**也不会自动进项目，那正是这条断言要拦的：加字段的人必须
+/// 在这里做一次「这是参数还是本机身份」的判断，而不是等到某天有人发现
+/// 「同一份项目换台机器判出两种结果」。
+#[test]
+fn every_config_field_is_either_snapshotted_or_deliberately_local() {
+    let all = serde_json::to_value(Config::default()).expect("Config 必须能序列化");
+    let keys: HashSet<String> = all
+        .as_object()
+        .expect("Config 序列化成对象")
+        .keys()
+        .cloned()
+        .collect();
+    let classified: HashSet<String> = super::plan::MASTER_CONFIG_KEYS
+        .iter()
+        .chain(super::plan::MASTER_CONFIG_LOCAL_KEYS.iter())
+        .chain(super::plan::MASTER_CONFIG_CLI_KEYS.iter())
+        .map(|key| (*key).to_string())
+        .collect();
+
+    let unclassified: Vec<&String> = keys.difference(&classified).collect();
+    assert!(
+        unclassified.is_empty(),
+        "Config 新增了没有分类的顶层字段 {unclassified:?}：\
+         它是「实际测试/判定参数」就加进 MASTER_CONFIG_KEYS（会随项目导出，\
+         换台主控也能复现），是「本机身份或运行偏好」就加进 MASTER_CONFIG_LOCAL_KEYS。\
+         不做这个判断，同一份项目在两台机器上会跑出不同结果，而项目文件里看不出来。"
+    );
+    let stale: Vec<&String> = classified.difference(&keys).collect();
+    assert!(
+        stale.is_empty(),
+        "分类清单里有 Config 已经没有的字段 {stale:?}"
+    );
+}
+
+/// 快照里**不许**出现任何连接身份——项目文件是要传阅的。
+#[test]
+fn the_master_config_snapshot_carries_parameters_but_never_credentials() {
+    let cfg = Config {
+        agent_token: "super-secret".into(),
+        agent_host: "10.9.9.9".into(),
+        ..Config::default()
+    };
+    let snapshot = super::plan::master_config_snapshot(&cfg);
+    let text = serde_json::to_string(&snapshot).expect("快照必须能序列化");
+    for forbidden in [
+        "token",
+        "super-secret",
+        "10.9.9.9",
+        "agent_host",
+        "ipv4_prefixes",
+    ] {
+        assert!(
+            !text.contains(forbidden),
+            "快照里不该出现 {forbidden}：{text}"
+        );
+    }
+    let keys: Vec<&String> = snapshot.as_object().expect("对象").keys().collect();
+    assert_eq!(keys.len(), super::plan::MASTER_CONFIG_KEYS.len());
+    for key in super::plan::MASTER_CONFIG_KEYS {
+        assert!(snapshot.get(key).is_some(), "缺少 {key}");
+    }
+}
+
+/// **界面上没有输入框的判定参数，也必须跟着项目走。**
+///
+/// 这是用户点名的那一条：项目不能只保存「用户改过的值」。`rate_check` 的负载
+/// 上限与余量、`link_profiles.by_role` 的角色配对门限、`ctstraffic` 的帧率，
+/// 界面上一个入口都没有——逐字段加通道永远追不完，漏一个就是一次静默的口径
+/// 漂移。所以项目带的是**整块解析后配置**。
+/// 合计门限用在**非 Wi-Fi 互测**的链路上时，预览要提醒一句。
+///
+/// 合计门限只比一次总和，单方向掉速会被另一方向补上。Wi-Fi↔Wi-Fi 上这是刻意
+/// 的；换到别的链路上就成了把强判据换成弱判据，而界面上完全看不出来——真机
+/// 联调里 `AB 502.859 + BA 944.235 = 1447` 就是这个形状：AB 只有 BA 的 53%，
+/// 门限设 1400 就会 PASS。
+///
+/// 只提示、不拦截：用户明确填了那个数。
+#[test]
+fn a_total_target_on_a_non_wifi_link_is_flagged_in_the_preview() {
+    let state = state_with_pair();
+    let mut req = suite_request();
+    req.pairs = vec![PairSelection {
+        src: "master:NAME=以太网 6".into(),
+        dst: "agent:NAME=WLAN 3".into(),
+        directions: vec!["bidir".into()],
+        transports: vec!["tcp".into()],
+        ip: vec!["v4".into()],
+        rx_target_bidir_ab: String::new(),
+        rx_target_bidir_ba: String::new(),
+        rx_target_bidir_total: "1500".into(),
+        udp_groups: Vec::new(),
+        tcp_groups: Vec::new(),
+    }];
+    req.ui_plan = None;
+
+    let plan = compile_request(&state, &req).expect("计划应能编译");
+    let flagged: Vec<&String> = plan
+        .notices
+        .iter()
+        .filter(|line| line.contains("不是 Wi-Fi 互测"))
+        .collect();
+    assert_eq!(
+        flagged.len(),
+        1,
+        "有线↔Wi-Fi 的对上配了合计门限要提醒且只提醒一次：{:?}",
+        plan.notices
+    );
+    let notice = flagged[0];
+    assert!(
+        notice.contains("1500") && notice.contains("按方向分别设门限"),
+        "提示要说清门限值和替代做法：{notice}"
+    );
+
+    // 反面一：没配合计门限就不该有这条。
+    req.pairs[0].rx_target_bidir_total = String::new();
+    assert!(!compile_request(&state, &req)
+        .expect("计划应能编译")
+        .notices
+        .iter()
+        .any(|line| line.contains("不是 Wi-Fi 互测")));
+}
+
+/// **按网口的门限覆盖不许跟着项目走，也不许盖过界面上的那张表。**
+///
+/// `link_profiles.by_nic` 的键是 `host + 接口名 + ipv4`——那是这台机器上这块
+/// 网卡的身份，不是判定参数。它跟着项目走会造成一个极隐蔽的故障：
+/// `rate::link_policy` 查 `by_nic` 用 `.find()`（首个匹配胜出），而项目带来的
+/// 条目在 `apply_master_config` 里先落位、界面上的「按网口策略」后 `push`
+/// ——于是项目里的旧条目盖过操作员刚在界面上填的那个数，界面显示 900、实际按
+/// 1800 判，两边对不上还没有任何提示。
+#[test]
+fn per_nic_overrides_never_travel_in_a_project_nor_outrank_the_console_table() {
+    let state = state_with_pair();
+
+    // 一台用 `--config` 启动过的主控：它的基线里带着按网口的覆盖。
+    let mut authored = Config::default();
+    authored.link_profiles.by_nic = vec![crate::config::NicProfile {
+        host: "master".into(),
+        name: "以太网 6".into(),
+        rx_target_mbps: Some(1_800.0),
+        ..Default::default()
+    }];
+
+    // 导出这一侧：整块 link_profiles 进项目，但 by_nic 被剔除。
+    let snapshot = super::plan::master_config_snapshot(&authored);
+    assert!(
+        snapshot["link_profiles"].get("by_nic").is_none(),
+        "按网口覆盖是本机身份，不该出现在项目快照里：{snapshot}"
+    );
+
+    // 导入这一侧：老项目文件里已经带着它，同样要挡住——否则只在导出时剔除
+    // 等于对历史文件毫无防护。
+    let mut legacy = super::plan::master_config_snapshot(&authored);
+    legacy["link_profiles"]["by_nic"] = serde_json::json!([{
+        "host": "master",
+        "name": "以太网 6",
+        "ipv4": "",
+        "rx_target_mbps": 1800.0
+    }]);
+
+    let mut req = suite_request();
+    req.master_config = Some(legacy);
+    req.nic_policies = vec![NicPolicySelection {
+        endpoint: "master:NAME=以太网 6".into(),
+        rx_target: "900".into(),
+        udp_bandwidth: String::new(),
+        udp_length: String::new(),
+    }];
+
+    let cfg = validated_config_from_request(&state, &req).expect("项目快照应能编译");
+    let targets: Vec<Option<f64>> = cfg
+        .link_profiles
+        .by_nic
+        .iter()
+        .map(|profile| profile.rx_target_mbps)
+        .collect();
+    assert_eq!(
+        targets,
+        vec![Some(900.0)],
+        "按网口门限的唯一来源是界面那张表；项目里的旧条目既不该留下、更不该排在前面胜出"
+    );
+}
+
+/// **`master_config` 合并失败必须响亮。**
+///
+/// 这个函数以前在 `Err` 上静默 `return`：项目里任何一处类型不符都会让整块
+/// patch 悄悄消失，这一轮改用目标机器自己的基线跑完，判定口径变了而界面上
+/// 看不出任何区别——正是「项目自带全部判定参数」要根除的那个故障。
+#[test]
+fn a_master_config_that_cannot_be_merged_stops_the_run_instead_of_falling_back() {
+    let state = state_with_pair();
+    let mut req = suite_request();
+
+    // 类型不符：更高版本导出的文件改了字段类型，或者有人手工编辑过。
+    req.master_config = Some(serde_json::json!({
+        "iperf": { "duration": "六十秒" }
+    }));
+    let error =
+        validated_config_from_request(&state, &req).expect_err("合并不了就不能假装没事继续跑");
+    assert!(
+        error.contains("master_config") && error.contains("重新导出"),
+        "报错要说清是哪一块、该怎么办：{error}"
+    );
+
+    // 整块不是对象时同理。
+    req.master_config = Some(serde_json::json!("整块被写成了字符串"));
+    assert!(validated_config_from_request(&state, &req).is_err());
+
+    // 反面：合法的一份仍然照常生效，别把闸门修成一律拒绝。
+    req.master_config = Some(serde_json::json!({
+        "iperf": { "duration": 45 }
+    }));
+    let cfg = validated_config_from_request(&state, &req).expect("合法的项目配置应能合并");
+    assert_eq!(cfg.iperf.duration, 45);
+}
+
+#[test]
+fn a_project_snapshot_overrides_parameters_that_have_no_ui_control() {
+    let mut state = state_with_pair();
+    // 「另一台主控」：内置默认值。
+    let builtin = Config::default();
+    assert_ne!(builtin.iperf.rate_check.wifi_payload_ceiling_mbps, 111.0);
+
+    // 项目里带来的那一份：全都是界面上改不了的东西。
+    let mut authored = Config::default();
+    authored.iperf.rate_check.wifi_payload_ceiling_mbps = 111.0;
+    authored.iperf.rate_check.offered_headroom_pct = 33.0;
+    authored.iperf.rate_check.max_udp_loss_pct = Some(0.5);
+    authored.iperf.rate_check.min_concurrent_streams = 7;
+    authored.iperf.rate_check.targets_mbps = crate::config::RateTargets {
+        forward: Some(1_234.0),
+        ab: None,
+        ba: None,
+    };
+    authored.iperf.rate_check.mode = crate::config::RateMode::Verify;
+    authored.ctstraffic.udp_frame_rate = 321;
+    authored.ping.wifi_large_avg_rtt_ms = 20.0;
+    authored.ping.wifi_large_max_rtt_ms = 42.0;
+    authored.link_profiles.by_role = vec![crate::config::RoleProfile {
+        pair: "WIFI5G<->WIFI5G".into(),
+        ..Default::default()
+    }];
+
+    let mut req = suite_request();
+    req.master_config = Some(super::plan::master_config_snapshot(&authored));
+
+    let cfg = validated_config_from_request(&state, &req).expect("项目快照应能编译");
+    assert_eq!(cfg.iperf.rate_check.wifi_payload_ceiling_mbps, 111.0);
+    assert_eq!(cfg.iperf.rate_check.offered_headroom_pct, 33.0);
+    assert_eq!(cfg.iperf.rate_check.max_udp_loss_pct, Some(0.5));
+    assert_eq!(cfg.iperf.rate_check.min_concurrent_streams, 7);
+    assert_eq!(cfg.iperf.rate_check.targets_mbps.forward, Some(1_234.0));
+    assert_eq!(cfg.iperf.rate_check.mode, crate::config::RateMode::Verify);
+    assert_eq!(cfg.ctstraffic.udp_frame_rate, 321);
+    assert_eq!(cfg.ping.wifi_large_max_rtt_ms, 42.0);
+    assert_eq!(cfg.ping.wifi_large_avg_rtt_ms, 20.0);
+    assert_eq!(cfg.link_profiles.by_role.len(), 1);
+
+    // 连接身份不受项目影响——哪怕项目文件被人手工塞了这些键。
+    state.cfg.agent_token = "local-token".into();
+    let mut tampered = super::plan::master_config_snapshot(&authored);
+    tampered["agent_token"] = serde_json::json!("stolen");
+    tampered["ipv4_prefixes"] = serde_json::json!(["1.2."]);
+    req.master_config = Some(tampered);
+    let cfg = validated_config_from_request(&state, &req).expect("应能编译");
+    assert_eq!(cfg.agent_token, "local-token", "项目文件不许改写本机口令");
+    assert_eq!(
+        cfg.ipv4_prefixes, state.cfg.ipv4_prefixes,
+        "项目文件不许改写本机网段过滤"
+    );
+}
+
+/// 深合并：项目里只写了一小块，基线的其余部分必须原样保留。
+#[test]
+fn a_partial_master_config_merges_instead_of_replacing_the_whole_block() {
+    let state = state_with_pair();
+    let mut req = suite_request();
+    // 只给 rate_check 里的一个键，`iperf` 块的其余部分不许被清成默认值。
+    req.master_config = Some(serde_json::json!({
+        "iperf": { "rate_check": { "offered_headroom_pct": 44.0 } }
+    }));
+    let cfg = validated_config_from_request(&state, &req).expect("应能编译");
+    let builtin = Config::default();
+    assert_eq!(cfg.iperf.rate_check.offered_headroom_pct, 44.0);
+    assert_eq!(
+        cfg.iperf.rate_check.wifi_payload_ceiling_mbps,
+        builtin.iperf.rate_check.wifi_payload_ceiling_mbps,
+        "同一块里没写到的键必须保留基线值"
+    );
+    assert_eq!(
+        cfg.iperf.udp_profiles, builtin.iperf.udp_profiles,
+        "浅合并会把整个 iperf 块换掉，那比不合并还糟"
+    );
+    assert_eq!(cfg.ping.count, builtin.ping.count);
+}
+
+/// **exe 旁边碰巧有一份 `config.json`，不该改变控制台的判定口径。**
+///
+/// 这是「导出后在另一台主控上完全复现」的地基：目标机器上有没有这份文件、
+/// 里面写了什么，都不能影响控制台跑出来的判定与灌包强度。仓库里早就写着
+/// 「同一个勾选框在不同机器上必须是同一个意思」，但 `rate_check` 的门限与
+/// 负载上限、`link_profiles.by_role`、`ctstraffic` 参数一直是从这份文件原样
+/// 带进每一轮运行的。
+#[test]
+fn an_implicitly_loaded_config_only_contributes_connection_identity() {
+    let mut on_disk = Config {
+        // 这台机器接在哪个网络上——必须留下。
+        agent_host: "10.9.9.9".into(),
+        agent_port: 29999,
+        agent_token: "lab-token".into(),
+        ipv4_prefixes: vec!["10.9.".into()],
+        require_same_subnet_for_iperf: false,
+        ..Config::default()
+    };
+    // 判定与档位——必须一律回到内置默认值。
+    on_disk.iperf.duration = 7;
+    on_disk.iperf.tcp_windows = vec!["999k".into()];
+    on_disk.iperf.udp_profiles = vec![crate::config::UdpProfile::bw("9000m")];
+    on_disk.iperf.rate_check.mode = crate::config::RateMode::Observe;
+    on_disk.iperf.rate_check.targets_mbps = crate::config::RateTargets {
+        forward: Some(4242.0),
+        ab: None,
+        ba: None,
+    };
+    on_disk.iperf.rate_check.wifi_payload_ceiling_mbps = 111.0;
+    on_disk.iperf.rate_check.offered_headroom_pct = 77.0;
+    on_disk.ping.count = 3;
+    on_disk.ping.wifi_large_max_rtt_ms = 999.0;
+    on_disk.link_profiles.by_role = vec![crate::config::RoleProfile::default()];
+    on_disk.ctstraffic.udp_frame_rate = 12_345;
+    on_disk.screenshot = !Config::default().screenshot;
+    on_disk.tests = vec![TestSpec {
+        name: "cli-only".into(),
+        src: "master:NAME=以太网 6".into(),
+        dst: "agent:NAME=WLAN 3".into(),
+        direction: OneOrMany::One("A->B".into()),
+        kinds: vec!["iperf".into()],
+        transports: vec!["tcp".into()],
+        ip: vec!["v4".into()],
+        streams: 1,
+        tcp_streams: None,
+        udp_streams: None,
+        iperf_duration: None,
+        ping_count: None,
+        ping_payload_sizes: None,
+        tcp_windows: None,
+        udp_profiles: None,
+        rate_mode: None,
+        rate_targets_mbps: None,
+        rate_targets_bidir_mbps: None,
+        rate_target_bidir_total_mbps: None,
+        link_group: None,
+        origin: None,
+    }];
+
+    let baseline = super::console_baseline_config(on_disk.clone(), false);
+    let builtin = Config::default();
+
+    assert_eq!(baseline.agent_host, "10.9.9.9");
+    assert_eq!(baseline.agent_port, 29999);
+    assert_eq!(baseline.agent_token, "lab-token");
+    assert_eq!(baseline.ipv4_prefixes, vec!["10.9.".to_string()]);
+    assert!(
+        !baseline.require_same_subnet_for_iperf,
+        "同 /24 门禁跟着机器走"
+    );
+
+    assert_eq!(baseline.iperf.duration, builtin.iperf.duration);
+    assert_eq!(baseline.iperf.tcp_windows, builtin.iperf.tcp_windows);
+    assert_eq!(baseline.iperf.udp_profiles, builtin.iperf.udp_profiles);
+    assert_eq!(
+        baseline.iperf.rate_check.mode,
+        builtin.iperf.rate_check.mode
+    );
+    assert_eq!(
+        baseline.iperf.rate_check.targets_mbps.forward,
+        builtin.iperf.rate_check.targets_mbps.forward,
+        "全局门限不许被 exe 旁边的文件悄悄换掉"
+    );
+    assert_eq!(
+        baseline.iperf.rate_check.wifi_payload_ceiling_mbps,
+        builtin.iperf.rate_check.wifi_payload_ceiling_mbps
+    );
+    assert_eq!(
+        baseline.iperf.rate_check.offered_headroom_pct,
+        builtin.iperf.rate_check.offered_headroom_pct
+    );
+    assert_eq!(baseline.ping.count, builtin.ping.count);
+    assert_eq!(
+        baseline.ping.wifi_large_max_rtt_ms,
+        builtin.ping.wifi_large_max_rtt_ms
+    );
+    assert!(
+        baseline.link_profiles.by_role.is_empty(),
+        "角色配对门限也是判定"
+    );
+    assert_eq!(
+        baseline.ctstraffic.udp_frame_rate,
+        builtin.ctstraffic.udp_frame_rate
+    );
+    assert_eq!(baseline.screenshot, builtin.screenshot);
+    assert!(baseline.tests.is_empty(), "CLI 的测试矩阵不该进控制台");
+
+    // 显式指定（`--config`）是用户自己挑的文件，
+    // 整份生效——区别不在文件内容，在于人有没有做这个选择。
+    let explicit = super::console_baseline_config(on_disk, true);
+    assert_eq!(explicit.iperf.duration, 7);
+    assert_eq!(explicit.ping.count, 3);
+    assert_eq!(explicit.iperf.rate_check.targets_mbps.forward, Some(4242.0));
+}
+
 /// 项目快照必须能**跨主控复现判定**。
 ///
 /// 这是 gptreview 的 P1：导出的是空白覆盖状态，导入另一台主控后，后端会改用
@@ -257,20 +670,22 @@ fn a_pinned_project_snapshot_does_not_fall_back_to_the_target_master_config() {
     req.ping_payload_sizes = vec![32, 1600, 65500];
     req.ping_wifi_large_max_rtt_ms = 200.0;
     req.tcp_windows = vec!["4m".into()];
-    req.global_rate_targets = Some(crate::config::RateTargets {
+    let mut authored = Config::default();
+    authored.iperf.rate_check.targets_mbps = crate::config::RateTargets {
         forward: Some(1200.0),
         ab: None,
         ba: None,
-    });
-    req.global_rate_mode = Some(crate::config::RateMode::Verify);
-    req.udp_profiles = Some(vec![
+    };
+    authored.iperf.rate_check.mode = crate::config::RateMode::Verify;
+    authored.iperf.udp_profiles = vec![
         crate::config::UdpProfile::bw("1m"),
         crate::config::UdpProfile {
             bandwidth: "1000m".into(),
             length: Some("64".into()),
             window: None,
         },
-    ]);
+    ];
+    req.master_config = Some(super::plan::master_config_snapshot(&authored));
 
     let cfg = validated_config_from_request(&state, &req).expect("项目快照应能编译");
     assert_eq!(cfg.ping.count, 30, "Ping 次数必须来自项目，不是目标机器");
@@ -320,7 +735,11 @@ fn a_project_that_pins_an_empty_global_target_clears_the_target_master_one() {
     );
 
     // 明确声明「本项目没有全局门限」：本机那一份必须被清掉。
-    req.global_rate_targets = Some(crate::config::RateTargets::default());
+    // 项目带的是**整块解析后配置**，所以「空」是它自己写出来的空，
+    // 不是「这一项没提到」——两者的区别由深合并保证。
+    let pinned_empty = Config::default();
+    assert_eq!(pinned_empty.iperf.rate_check.targets_mbps.forward, None);
+    req.master_config = Some(super::plan::master_config_snapshot(&pinned_empty));
     let pinned = validated_config_from_request(&state, &req).expect("应能编译");
     assert_eq!(pinned.iperf.rate_check.targets_mbps.forward, None);
 }
@@ -1293,7 +1712,7 @@ fn quick_plan_honors_stream_axes_on_legacy_udp_profiles() {
 /// 界面上填的门限/带宽必须真的变成 link_profiles，否则勾了等于没勾。
 #[test]
 fn ui_selection_becomes_a_real_config() {
-    let cfg = config_from_request(&state_with_pair(), &request());
+    let cfg = config_from_request(&state_with_pair(), &request()).expect("配置应能合并");
     assert_eq!(cfg.iperf.tcp_windows, vec!["2m", "4m", "256m"]);
 
     // 发送端网卡带的是它作为发送端时的带宽；接收端网卡带的是对向门限。
@@ -1321,7 +1740,7 @@ fn ui_selection_becomes_a_real_config() {
 /// TCP / UDP 必须拆开，否则「3 个 -P 档位」会把与 -P 无关的 UDP 单元复制三遍。
 #[test]
 fn stream_steps_expand_into_separate_specs_without_duplicating_udp() {
-    let cfg = config_from_request(&state_with_pair(), &request());
+    let cfg = config_from_request(&state_with_pair(), &request()).expect("配置应能合并");
     let tcp: Vec<&TestSpec> = cfg
         .tests
         .iter()
@@ -1351,7 +1770,7 @@ fn stream_steps_expand_into_separate_specs_without_duplicating_udp() {
 /// 否则「档位 1m/500m/1G」×「覆盖 1G」会跑出三个一模一样的单元。
 #[test]
 fn explicit_bandwidth_on_every_sending_nic_opts_out_of_the_global_sweep() {
-    let with_override = config_from_request(&state_with_pair(), &request());
+    let with_override = config_from_request(&state_with_pair(), &request()).expect("配置应能合并");
     let udp = with_override
         .tests
         .iter()
@@ -1363,7 +1782,7 @@ fn explicit_bandwidth_on_every_sending_nic_opts_out_of_the_global_sweep() {
     for policy in &mut req.nic_policies {
         policy.udp_bandwidth.clear();
     }
-    let swept = config_from_request(&state_with_pair(), &req);
+    let swept = config_from_request(&state_with_pair(), &req).expect("配置应能合并");
     let udp = swept
         .tests
         .iter()
@@ -1391,7 +1810,7 @@ fn a_one_sided_bandwidth_override_sweeps_only_the_unpinned_direction() {
     // 发送端 master 钉死在 2.6G，反向发送端 agent 留空。
     req.nic_policies[1].udp_bandwidth.clear();
 
-    let cfg = config_from_request(&state, &req);
+    let cfg = config_from_request(&state, &req).expect("配置应能合并");
     let pinned = cfg
         .tests
         .iter()
@@ -1442,7 +1861,7 @@ fn blank_inputs_produce_no_overrides() {
         policy.udp_bandwidth.clear();
         policy.udp_length.clear();
     }
-    let cfg = config_from_request(&state_with_pair(), &req);
+    let cfg = config_from_request(&state_with_pair(), &req).expect("配置应能合并");
     assert!(cfg.link_profiles.by_nic.is_empty());
 }
 
@@ -1505,7 +1924,7 @@ fn empty_lists_fall_back_to_the_configured_values() {
     req.tcp_streams.clear();
     req.udp_bandwidths.clear();
     let state = state_with_pair();
-    let cfg = config_from_request(&state, &req);
+    let cfg = config_from_request(&state, &req).expect("配置应能合并");
     assert_eq!(cfg.iperf.tcp_windows, state.cfg.iperf.tcp_windows);
     let tcp: Vec<&TestSpec> = cfg
         .tests
@@ -1521,7 +1940,7 @@ fn empty_lists_fall_back_to_the_configured_values() {
 #[test]
 fn the_generated_config_builds_real_units() {
     let state = state_with_pair();
-    let cfg = config_from_request(&state, &request());
+    let cfg = config_from_request(&state, &request()).expect("配置应能合并");
     let spec = builder::spec_from_config(&cfg.tests[0], &cfg, &state.master, &state.agent)
         .expect("界面生成的 TestSpec 必须可解析");
     let mut port = builder::PORT_BASE;
@@ -1574,7 +1993,7 @@ fn the_console_can_change_which_subnets_show_up() {
 fn the_chosen_subnets_reach_the_config_that_actually_runs() {
     let mut state = state_with_pair();
     state.cfg.ipv4_prefixes = vec!["10.228.".into()];
-    let cfg = config_from_request(&state, &request());
+    let cfg = config_from_request(&state, &request()).expect("配置应能合并");
     assert_eq!(cfg.ipv4_prefixes, vec!["10.228."]);
 }
 
@@ -1591,7 +2010,7 @@ fn udp_datagram_size_steps_cross_with_bandwidth_steps() {
     req.udp_bandwidths = vec!["100m".into(), "500m".into()];
     req.udp_lengths = vec!["64".into(), "1400".into()];
 
-    let cfg = config_from_request(&state, &req);
+    let cfg = config_from_request(&state, &req).expect("配置应能合并");
     let udp = cfg
         .tests
         .iter()
@@ -1663,7 +2082,7 @@ fn a_blank_datagram_size_sends_no_l_flag_at_all() {
         .iter_mut()
         .for_each(|p| p.udp_bandwidth.clear());
     req.udp_lengths = vec!["  ".into(), String::new()];
-    let cfg = config_from_request(&state_with_pair(), &req);
+    let cfg = config_from_request(&state_with_pair(), &req).expect("配置应能合并");
     let udp = cfg
         .tests
         .iter()
@@ -1681,7 +2100,7 @@ fn pinning_the_bandwidth_does_not_pin_the_datagram_size() {
     req.pairs[0].transports = vec!["udp".into()];
     req.pairs[0].directions = vec!["ab".into()];
     req.udp_lengths = vec!["64".into(), "1400".into()];
-    let cfg = config_from_request(&state_with_pair(), &req);
+    let cfg = config_from_request(&state_with_pair(), &req).expect("配置应能合并");
     let pinned = cfg
         .tests
         .iter()
@@ -1700,13 +2119,19 @@ fn the_console_decides_clipping_regardless_of_the_config_file() {
 
     let req = request();
     assert!(
-        !config_from_request(&state, &req).limit_udp_by_link_speed,
+        !config_from_request(&state, &req)
+            .expect("配置应能合并")
+            .limit_udp_by_link_speed,
         "界面没勾就不裁剪，配置文件里的 true 不能悄悄生效"
     );
 
     let mut on = request();
     on.limit_udp_by_link_speed = true;
-    assert!(config_from_request(&state, &on).limit_udp_by_link_speed);
+    assert!(
+        config_from_request(&state, &on)
+            .expect("配置应能合并")
+            .limit_udp_by_link_speed
+    );
 }
 
 fn console_with(state: UiState) -> Arc<Console> {
@@ -2217,7 +2642,9 @@ fn the_bidirectional_threshold_is_per_pair_and_only_applies_to_bidirectional_uni
     // 让人以为在生效。
     let mut one_way = request();
     one_way.pairs[0].directions = vec!["ab".into()];
-    assert!(config_from_request(&state, &one_way).tests[0]
+    assert!(config_from_request(&state, &one_way)
+        .expect("配置应能合并")
+        .tests[0]
         .rate_targets_bidir_mbps
         .is_none());
 }
@@ -2691,7 +3118,7 @@ fn a_global_udp_bandwidth_cuts_off_configured_length_and_window() {
 fn downloading_then_importing_restores_the_same_selection() {
     let state = state_with_pair();
     let req = request();
-    let cfg = config_from_request(&state, &req);
+    let cfg = config_from_request(&state, &req).expect("配置应能合并");
     let file = serde_json::to_string(&cfg).unwrap();
 
     let console = console_with(state_with_pair());
@@ -2770,7 +3197,7 @@ fn importing_rebuilds_the_udp_groups_from_the_tests() {
     second.dst = "agent:NAME=USB 4".into();
     second.udp_groups = vec![0];
     req.pairs.push(second);
-    let cfg = config_from_request(&state, &req);
+    let cfg = config_from_request(&state, &req).expect("配置应能合并");
 
     let console = console_with(state_with_two_pairs());
     let out = api_import(&console, &serde_json::to_string(&cfg).unwrap()).unwrap();
@@ -3121,9 +3548,7 @@ fn request_from_import(out: &serde_json::Value) -> RunRequest {
         wifi_pair_rx_target_mbps: 0.0,
         wifi_pair_bidir_rx_target_mbps: 0.0,
         wifi_pair_bidir_total_rx_target_mbps: 0.0,
-        udp_profiles: None,
-        global_rate_targets: None,
-        global_rate_mode: None,
+        master_config: None,
         wifi_band_thresholds: Vec::new(),
         wifi_pair_thresholds: Vec::new(),
         limit_udp_by_link_speed: out["limit_udp_by_link_speed"].as_bool().unwrap_or(false),
@@ -3141,7 +3566,7 @@ fn importing_does_not_multiply_the_udp_bandwidth_steps() {
     let state = state_with_pair();
     let mut req = request();
     req.udp_lengths = vec!["1200".into(), "1400".into()];
-    let cfg = config_from_request(&state, &req);
+    let cfg = config_from_request(&state, &req).expect("配置应能合并");
     assert_eq!(cfg.iperf.udp_profiles.len(), 6, "3 档 -b × 2 档 -l");
 
     let console = console_with(state_with_pair());
@@ -3167,7 +3592,7 @@ fn importing_reads_the_ping_settings_off_the_tests() {
     req.pairs[0].transports = vec!["ping".into()];
     req.ping_count = 50;
     req.ping_payload_sizes = vec![64];
-    let cfg = config_from_request(&state, &req);
+    let cfg = config_from_request(&state, &req).expect("配置应能合并");
 
     let console = console_with(state_with_pair());
     let out = api_import(&console, &serde_json::to_string(&cfg).unwrap()).unwrap();
@@ -3191,7 +3616,7 @@ fn importing_reads_the_ping_settings_off_the_tests() {
 #[test]
 fn importing_folds_a_reversed_pair_into_one_row() {
     let state = state_with_pair();
-    let mut cfg = config_from_request(&state, &request());
+    let mut cfg = config_from_request(&state, &request()).expect("配置应能合并");
     // 只把 UDP 那条掉个头，TCP 三条保持原样：合并要发生在两种写法之间。
     let udp = cfg
         .tests
@@ -3231,7 +3656,7 @@ fn importing_folds_a_reversed_pair_into_one_row() {
 /// 端点名匹配。按角色写的端点（`master:SGMII2.5G`）这时解析不了，得点名。
 #[test]
 fn importing_before_connecting_keeps_the_named_pairs() {
-    let mut cfg = config_from_request(&state_with_pair(), &request());
+    let mut cfg = config_from_request(&state_with_pair(), &request()).expect("配置应能合并");
     cfg.tests.push(TestSpec {
         name: "by-role".into(),
         src: "master:SGMII2.5G".into(),
@@ -3270,7 +3695,7 @@ fn importing_a_file_without_a_token_keeps_the_loaded_one() {
     state.cfg.agent_token = "loaded-secret".into();
     let console = console_with(state);
 
-    let mut cfg = config_from_request(&state_with_pair(), &request());
+    let mut cfg = config_from_request(&state_with_pair(), &request()).expect("配置应能合并");
     // 显式清空：Config::default() 现在带着出厂默认口令，不清掉的话这里测的
     // 就变成「文件里有令牌」，跟本用例要守的「文件里没有令牌」正好相反。
     cfg.agent_token = String::new();
@@ -3302,7 +3727,7 @@ fn importing_rubbish_says_so_instead_of_half_applying_it() {
     let error = api_import(&console, "{ 这不是 json }").expect_err("必须报错");
     assert!(error.contains("config.json"), "{error}");
 
-    let mut cfg = config_from_request(&state_with_pair(), &request());
+    let mut cfg = config_from_request(&state_with_pair(), &request()).expect("配置应能合并");
     cfg.iperf.duration = 0;
     let error = api_import(&console, &serde_json::to_string(&cfg).unwrap())
         .expect_err("过不了 validate 的配置不能导进来");
@@ -3382,7 +3807,7 @@ fn repeated_ping_payload_sizes_collapse_even_when_not_adjacent() {
     req.pairs[0].transports = vec!["ping".into()];
     req.ping_payload_sizes = vec![1600, 32, 1600, 0, 32];
 
-    let cfg = config_from_request(&state, &req);
+    let cfg = config_from_request(&state, &req).expect("配置应能合并");
     let ping = cfg
         .tests
         .iter()
@@ -3590,13 +4015,19 @@ fn the_console_decides_resume_regardless_of_the_config_file() {
 
     let req = request();
     assert!(
-        !config_from_request(&state, &req).resume,
+        !config_from_request(&state, &req)
+            .expect("配置应能合并")
+            .resume,
         "界面没勾就不跳过，配置文件里的 true 不能悄悄生效"
     );
 
     let mut on = request();
     on.resume = true;
-    assert!(config_from_request(&state, &on).resume);
+    assert!(
+        config_from_request(&state, &on)
+            .expect("配置应能合并")
+            .resume
+    );
 }
 
 /// -l 必须能塞进一个 UDP 报文。
@@ -3627,7 +4058,7 @@ fn udp_socket_buffer_steps_join_the_same_cross_product() {
     req.udp_lengths = vec!["64".into(), "1400".into()];
     req.udp_windows = vec!["2m".into(), "8m".into()];
 
-    let cfg = config_from_request(&state, &req);
+    let cfg = config_from_request(&state, &req).expect("配置应能合并");
     let udp = cfg
         .tests
         .iter()
@@ -3700,7 +4131,7 @@ fn blank_udp_extras_add_no_flags_to_the_command() {
     req.udp_lengths = Vec::new();
     req.udp_windows = Vec::new();
 
-    let cfg = config_from_request(&state, &req);
+    let cfg = config_from_request(&state, &req).expect("配置应能合并");
     let profiles = cfg
         .tests
         .iter()
@@ -3761,7 +4192,7 @@ fn percent_and_absolute_thresholds_land_in_different_fields() {
     let mut req = request();
     req.nic_policies[0].rx_target = "90%".into();
     req.nic_policies[1].rx_target = "1600".into();
-    let cfg = config_from_request(&state_with_pair(), &req);
+    let cfg = config_from_request(&state_with_pair(), &req).expect("配置应能合并");
 
     let by_percent = cfg
         .link_profiles
@@ -3795,7 +4226,7 @@ fn a_per_nic_datagram_size_overrides_the_global_step() {
     req.nic_policies[0].udp_length = "64".into();
     req.nic_policies[1].udp_length.clear();
 
-    let cfg = config_from_request(&state, &req);
+    let cfg = config_from_request(&state, &req).expect("配置应能合并");
     let specs: Vec<_> = cfg
         .tests
         .iter()
@@ -3853,7 +4284,7 @@ fn a_per_nic_datagram_size_alone_does_not_pin_the_bandwidth() {
     req.nic_policies[0].udp_length = "64".into();
     req.udp_bandwidths = vec!["1m".into(), "500m".into(), "1G".into()];
 
-    let cfg = config_from_request(&state_with_pair(), &req);
+    let cfg = config_from_request(&state_with_pair(), &req).expect("配置应能合并");
     let udp = cfg
         .tests
         .iter()
@@ -3876,7 +4307,7 @@ fn a_lone_datagram_size_still_produces_an_override() {
         policy.udp_length.clear();
     }
     req.nic_policies[0].udp_length = "64".into();
-    let cfg = config_from_request(&state_with_pair(), &req);
+    let cfg = config_from_request(&state_with_pair(), &req).expect("配置应能合并");
     assert_eq!(cfg.link_profiles.by_nic.len(), 1);
     assert_eq!(
         cfg.link_profiles.by_nic[0].udp_length.as_deref(),

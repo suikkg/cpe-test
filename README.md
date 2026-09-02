@@ -2,6 +2,21 @@
 
 > 两台电脑间自动化 ping + iperf3 / Microsoft ctsTraffic 灌包测试，零 Python/零 PowerShell
 
+## v6.2.5
+
+- **吞吐判定只认接收端 RX 平均（三条路径收敛）**：TCP / UDP / ctsTraffic 收敛到唯一入口 `evaluate_rx_acceptance`，四种结果封闭。形成可信 RX 平均后 `RX ≥ 门限` 直接 PASS；UDP 丢包 / CTS 丢帧、发送端负载与采样覆盖率、滚动窗口、中途掉速、工具退出状态一律降为「诊断（不参与判定）」，报告每行和 Excel 两张表都看得到，但不再推翻 PASS。
+- **中途断流/掉坑仍然出现在报告里**：降级为诊断不等于消音，它带原因码（`RATE_OUTAGE` / `RATE_DROPOUT`）进诊断列。否则一条中间断了一分钟、平均值仍达标的链路会报出干干净净的 PASS。
+- **Ping 的 PASS 要求 0% 丢包且 Avg/Max RTT 都达标**，不再是「收到一个 Echo Reply 就算通」。
+- **Wi-Fi 双向互测按两端 RX 合计判定**：`AB 接收端 RX + BA 接收端 RX ≥ 合计门限`，合计 900 时 `720 + 230 = 950` 就是 PASS，不要求两个方向各到 450。频段组合表改为两个单向门限 + 一个双向合计门限；非 Wi-Fi 互测仍可按方向分别设，逐方向把关。
+- **双向单元的「RX 平均」「目标」「理由」三处同源**：汇总行填的就是判定用的那个合计值，报告与进度页说同一句话；配了合计门限时报告标题明确写「按两端 RX 合计判定一次，两条腿只测量」。
+- **控制台的默认值是内置的，不看 `config.json`**：exe 旁边隐式加载的那份只提供辅测机地址/端口/口令、网卡前缀和同 /24 门禁，档位与判定门限一律用内置默认值。要整份用某份配置，用 `cpe_test ui --config 路径` 显式指定。
+- **项目导出升级为可复现快照（`project_version: 3`）**：导出当前真正生效的**完整参数**，不是「用户改过的那几个」。除界面上的档位与门限，还整块固化主控的解析后配置 `master_config`（`iperf` 含 `rate_check` 全部门限/负载上限/余量、`ping`、`link_profiles.by_role` 角色配对门限、`ctstraffic`）。导入后覆盖目标主控的基线；连接身份不进文件；导入原子化，畸形文件保持当前项目不变并给出具体错误。
+- **按网口的门限覆盖不跟着项目走**：它的键是「这台机器上这块网卡」，属于本机身份。此前它随项目导出，导入后还排在界面那张表前面胜出——界面显示 900、实际按 1800 判。现在导出、导入两侧都剔除，按网口门限的唯一来源是界面上的「按网口策略」。
+- **项目里的判定基线合不进去时直接报错**，不再静默回落到目标机器的配置；控制台也不再导出 `master_config` 为空的项目文件；「重新执行」会还原归档里那一份基线。
+- **计划预览逐单元显示最终门限及其来源**，字段被另一条规则盖掉时当场看得见。
+- **Wi-Fi 负载上限默认值 2800 → 2882**（`wifi_payload_ceiling_mbps`），取 Wi-Fi 7 网卡实际会协商到的 PHY 峰值。
+- **回归验证**：Rust 629/629、前端 Vitest 199/199、格式检查、Linux/Windows Clippy、前端产物溯源戳、dist 包 SHA-256、`git diff --check` 全部通过；并在局域网真机（macOS 主控 ↔ Linux 辅测 192.168.8.101）跑完 15 个单元的端到端联调，覆盖 TCP/UDP/Ping、单向与双向并发、截图、HTML/Excel 报告与统计。
+
 ## v6.2.4
 
 - **吞吐判定只认接收端 RX 平均**：形成可信 RX 平均后，`RX ≥ 门限` 直接 PASS；TX、UDP 丢包、工具退出状态和采样诊断不再推翻 PASS。
@@ -249,12 +264,12 @@
 
 - **双向门限（按配对）**：测试矩阵里每一对网口多两个输入框——`双向门限 A→B / B→A`，
   只在勾了「双向」时生效，留空沿用「网口与策略」里的 RX 门限。
-  半双工介质（Wi-Fi、部分 USB 网卡）双向同时灌包时两个方向抢同一段介质时间，
+  双向同时灌包时两个方向的吞吐互相影响（Wi-Fi、部分 USB 网卡尤其明显），
   每个方向拿到的只有单向的一部分；拿单向门限去卡双向必然判 `RATE_FAIL`，
   而那是配置出来的失败、不是测出来的。典型写法：单向 2000，双向两格各填 1000。
   **按配对而不是按网卡**：同一块 RNDIS 口，和 Wi-Fi 组双向、和 SGMII 组双向，
   能收到的速率完全不是一个量级，挂在网卡上只能填一个数、必然有一组是错的。
-  两个方向分开填是因为半双工链路的两个方向本来就能差很远。只收绝对 Mbps——
+  两个方向分开填是因为双向并发时两个方向本来就能差很远。只收绝对 Mbps——
   百分比要按单块网卡的协商速率换算，跟「两块口凑在一起并发时能跑多少」不成比例。
   配置文件里对应 `rate_targets_bidir_mbps`（`universal_params` 与每个 test 都可写）。
   填了却没勾「双向」会当场报错，不会静默忽略。
@@ -538,7 +553,7 @@ CPE（Customer Premises Equipment）子网测试工具用于在**两台电脑之
 ```
 cpe_test.exe          ← 本工具（单文件）
 iperf3.exe            ← 从 iperf.fr 下载（只测 Ping/ctsTraffic 可不放）
-ctsTraffic.exe        ← v6.2.4 Windows Release 已捆绑（仅 Windows 10+）
+ctsTraffic.exe        ← v6.2.5 Windows Release 已捆绑（仅 Windows 10+）
 start_agent.bat       ← 辅测机双击
 start_ui.bat          ← 主控机双击（图形控制台，推荐）
 start_master.bat      ← 主控机双击（命令行问答式）
@@ -711,6 +726,15 @@ Time,Speed(Mbps)
 ## 配置文件
 
 配置文件 `config.json` 放到 exe 同目录，所有测试参数通过 JSON 控制，**不需要改代码**。
+
+> **这份文件是给命令行路径（`cpe_test master`）用的。**
+> 图形控制台隐式加载它时只取五项连接信息——`agent_host`、`agent_port`、`agent_token`、
+> `ipv4_prefixes`、`require_same_subnet_for_iperf`——档位、Ping 门限、RX 门限、裁剪上限、
+> 角色配对门限和 ctsTraffic 参数一律用内置默认值。理由是同一个控件在不同机器上必须是
+> 同一个意思：exe 旁边碰巧有没有这份文件，不该改变控制台的判定口径，否则同一份测试项目
+> 换台机器跑出来的结论就不一样，而项目文件里一个字都看不出来。
+> 要让控制台用某份配置里的那一套，用 `cpe_test ui --config 路径` 显式指定——
+> 区别不在文件内容，在于人有没有做这个选择。
 
 JSON 标准没有注释，不能可靠地在同一个配置内用 `//`、`#` 或 `/* ... */` 来切换网口。
 发布包的 `configs` 目录提供 `config-sgmii.json`、`config-wifi5g.json`、
@@ -1326,7 +1350,7 @@ cargo build --release --locked
 
 自行编译后，把 `cpe_test.exe`、启动脚本和所需吞吐工具放到两台 Windows 电脑同一目录：
 iperf3 测试需要完整的 iperf3 Windows 发行包；ctsTraffic 测试需要 `ctsTraffic.exe`。
-官方 v6.2.4 Windows Release ZIP 已捆绑固定且校验过的 ctsTraffic 2.0.4.0，但由于发行包差异不内置 iperf3。
+官方 v6.2.5 Windows Release ZIP 已捆绑固定且校验过的 ctsTraffic 2.0.4.0，但由于发行包差异不内置 iperf3。
 
 ### GitHub Actions CI
 
@@ -1349,7 +1373,7 @@ Windows ZIP 包含启动脚本、四份配置、固定 CTS 二进制和第三方
 `tar.gz` 保留 `cpe_test` 可执行位。发布作业会再次核对资产名称、数量、内部结构和哈希。
 
 仓库同时跟踪一份不含可执行程序的
-[`cpe_test-v6.2.4-windows-config-docs.zip`](dist/cpe_test-v6.2.4-windows-config-docs.zip)，
+[`cpe_test-v6.2.5-windows-config-docs.zip`](dist/cpe_test-v6.2.5-windows-config-docs.zip)，
 便于直接从 Git 下载 Windows 配置、文档和启动脚本。其 SHA-256 位于同目录的
 `.zip.sha256` 文件；CI 会逐文件确认压缩包内容与仓库源文件一致。需要开箱即用的程序、
 固定版 ctsTraffic 和许可证全集时，仍应下载上面的正式 Windows Release ZIP。

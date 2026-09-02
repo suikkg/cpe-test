@@ -108,7 +108,9 @@ describe('导入导出往返', () => {
     };
     const back = parseProject(serializeProject(plan, settings, policies));
     expect(back.ok).toBe(true);
-    expect(back.settings).toEqual(settings);
+    expect(back.settings?.duration).toEqual(settings.duration);
+    expect(back.settings?.limit_udp_by_link_speed).toEqual(settings.limit_udp_by_link_speed);
+    expect(back.settings?.globals).toEqual(settings.globals);
     expect(back.nicPolicies).toEqual(policies);
   });
 
@@ -329,7 +331,6 @@ describe('畸形项目文件不抛异常、不产出会让页面崩掉的编辑�
           ping_wifi_large_max_rtt_ms: NaN,
           ping_small_max_bytes: -128,
         },
-        global_rate_targets: { forward: NaN, ab: -1, ba: 900 },
         wifi_band_thresholds: [null, 'x', { master_band: 'wifi_5g' }],
       },
     };
@@ -338,11 +339,6 @@ describe('畸形项目文件不抛异常、不产出会让页面崩掉的编辑�
     expect(result.settings?.globals?.ping_wired_small_avg_rtt_ms).toBe(0);
     expect(result.settings?.globals?.ping_wifi_large_max_rtt_ms).toBe(0);
     expect(result.settings?.globals?.ping_small_max_bytes).toBe(0);
-    expect(result.settings?.globals?.global_rate_targets).toEqual({
-      forward: null,
-      ab: null,
-      ba: 900,
-    });
     expect(result.settings?.globals?.wifi_band_thresholds).toEqual([]);
   });
 });
@@ -360,21 +356,20 @@ describe('v3 是完整有效快照', () => {
           tcp_windows: ['4m'],
           tcp_streams: [1],
           udp_streams: 1,
-          udp_profiles: [{ bandwidth: '2500m' }],
-          global_rate_targets: { forward: null, ab: 900, ba: null },
+        },
+        masterConfig: {
+          iperf: { rate_check: { targets_mbps: { forward: null, ab: 900, ba: null } } },
         },
       }),
     );
     expect(project.execution_defaults.ping.count).toBe(30);
     expect(project.execution_defaults.tcp.windows).toEqual(['4m']);
-    expect(project.execution_defaults.udp.profiles).toEqual([{ bandwidth: '2500m' }]);
     // `-l` / `-w` 留空是「明确不下发」，导出时保持空数组，不许回落。
     expect(project.execution_defaults.udp.lengths).toEqual([]);
     expect(project.execution_defaults.udp.windows).toEqual([]);
-    expect(project.acceptance.global_rate_targets).toEqual({
-      forward: null,
-      ab: 900,
-      ba: null,
+    // 界面上没有输入框的判定参数走 master_config 整块带走。
+    expect(project.master_config.iperf).toEqual({
+      rate_check: { targets_mbps: { forward: null, ab: 900, ba: null } },
     });
   });
 
@@ -388,8 +383,6 @@ describe('v3 是完整有效快照', () => {
       tcp_windows: ['4m'],
       tcp_streams: [10],
       udp_streams: 1,
-      udp_profiles: [{ bandwidth: '1m' }, { bandwidth: '1000m', length: '64' }],
-      global_rate_targets: { forward: 1200, ab: null, ba: null },
       wifi_band_thresholds: [
         {
           master_band: 'wifi_5g',
@@ -400,32 +393,64 @@ describe('v3 是完整有效快照', () => {
         },
       ],
     };
+    // 界面上没有输入框的那一半：档位表、全局门限、判定模式、负载上限。
+    const masterConfig = {
+      iperf: {
+        udp_profiles: [{ bandwidth: '1m' }, { bandwidth: '1000m', length: '64' }],
+        rate_check: {
+          mode: 'verify',
+          targets_mbps: { forward: 1200, ab: null, ba: null },
+          wifi_payload_ceiling_mbps: 2800,
+        },
+      },
+    };
     const back = parseProject(
       serializeProject(ensureDefaults(emptyPlan()), {
         duration: 180,
         limit_udp_by_link_speed: false,
         globals,
+        masterConfig,
       }),
     );
     expect(back.ok).toBe(true);
     expect(back.settings?.globals).toEqual(globals);
+    expect(back.settings?.masterConfig).toEqual(masterConfig);
   });
 
-  it('全局门限的「明确没有」与「没意见」是两件事', () => {
-    // 三个字段全 null 的对象要活着回来：它是「本项目明确没有全局门限」，
-    // 导入方不许回落到自己的 config.json。
-    const pinnedEmpty = parseProject(
+  it('界面上没有输入框的判定参数也跟着项目走', () => {
+    // 用户点名的那一条：项目不能只保存「用户改过的值」。`rate_check` 的负载
+    // 上限与余量、角色配对门限、ctsTraffic 的帧率，界面上一个入口都没有——
+    // 逐字段加通道永远追不完，漏一个就是一次静默的口径漂移。
+    const masterConfig = {
+      iperf: {
+        duration: 180,
+        tcp_windows: ['4m'],
+        udp_profiles: [{ bandwidth: '1m' }, { bandwidth: '1000m', length: '64' }],
+        rate_check: {
+          mode: 'verify',
+          targets_mbps: { forward: 1200, ab: null, ba: null },
+          wifi_payload_ceiling_mbps: 2800,
+          offered_headroom_pct: 5,
+        },
+      },
+      ping: { count: 180, wifi_large_max_rtt_ms: 200 },
+      ctstraffic: { udp_frame_rate: 100 },
+      link_profiles: { by_role: [{ pair: 'WIFI5G<->WIFI5G' }], by_nic: [] },
+    };
+    const back = parseProject(
       serializeProject(ensureDefaults(emptyPlan()), {
-        globals: { ...emptyGlobals(), global_rate_targets: { forward: null, ab: null, ba: null } },
+        duration: 180,
+        limit_udp_by_link_speed: false,
+        globals: emptyGlobals(),
+        masterConfig,
       }),
     );
-    expect(pinnedEmpty.settings?.globals?.global_rate_targets).toEqual({
-      forward: null,
-      ab: null,
-      ba: null,
-    });
+    expect(back.ok).toBe(true);
+    // 原样往返：前端不解释它的内容，字段语义在 Rust 的 Config 里。
+    expect(back.settings?.masterConfig).toEqual(masterConfig);
+  });
 
-    // 旧项目根本没有这个概念：保持 null = 沿用本机配置。
+  it('旧项目没有这一块时保持缺席，用目标主控自己的基线', () => {
     const legacy = parseProject(
       JSON.stringify({
         project_version: 2,
@@ -433,6 +458,7 @@ describe('v3 是完整有效快照', () => {
         settings: { globals: emptyGlobals() },
       }),
     );
-    expect(legacy.settings?.globals?.global_rate_targets).toBeNull();
+    expect(legacy.ok).toBe(true);
+    expect(legacy.settings?.masterConfig).toBeUndefined();
   });
 });

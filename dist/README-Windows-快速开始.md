@@ -1,8 +1,8 @@
 # CPE 测试工具 Windows 包
 
-> 如果你从 Git 仓库下载的是 `cpe_test-v6.2.4-windows-config-docs.zip`，那是一份只含
+> 如果你从 Git 仓库下载的是 `cpe_test-v6.2.5-windows-config-docs.zip`，那是一份只含
 > 配置、文档和启动脚本的资料包，不含 `cpe_test.exe`、`ctsTraffic.exe` 或 iperf3。
-> 开箱即用请下载 GitHub Release 的 `cpe_test-v6.2.4-windows-x86_64.zip`；也可以自行
+> 开箱即用请下载 GitHub Release 的 `cpe_test-v6.2.5-windows-x86_64.zip`；也可以自行
 > 编译程序后，把资料包内容与 exe 放到同一目录。
 
 将这个文件夹完整复制到**主控机**和**辅测机**。两台电脑必须使用同一个
@@ -11,7 +11,7 @@
 ## 包内文件与系统要求
 
 - `cpe_test.exe`：主控、agent、网卡扫描和监控共用的程序。
-- `ctsTraffic.exe`：Microsoft ctsTraffic 2.0.4.0 x64，随官方 v6.2.4 Windows 包固定捆绑并校验；仅支持 Windows 10 或更高版本。
+- `ctsTraffic.exe`：Microsoft ctsTraffic 2.0.4.0 x64，随官方 v6.2.5 Windows 包固定捆绑并校验；仅支持 Windows 10 或更高版本。
 - `start_*.bat`：双击启动脚本。`start_ui.bat` 是图形控制台，`start_master*.bat` 是命令行问答式。
 - `configs\`：SGMII、Wi-Fi、10GUSB 等具名配置。
 - `THIRD_PARTY_NOTICES.md` 及 CTS/WIL 许可文件：第三方归属和许可说明。
@@ -38,7 +38,9 @@ Windows 7/8/8.1、版本无法确认以及 macOS/Linux 都不支持 CTS，但不
      白底参数框可直接输入；套件和配置很多时各自在固定高度列表内滚动，不会拉长整页。
      新任务默认选 IPv4+IPv6，PING 不显示吞吐 Mbps 门限。旧草稿可用「恢复默认计划」一次重置。
    - **执行**：填每单元时长；「全局默认档位」出厂就是 UDP `-b 2500m`、TCP `-w 4m`、
-     `-l` 留空（不下发）。Ping 高级阈值空格会以灰字显示主控当前生效的“默认 xx”，填值后才覆盖。
+     `-l` 留空（不下发）。Ping 高级阈值空格会以灰字显示当前生效的“默认 xx”，填值后才覆盖。
+     这些默认值是**内置的**，不看 exe 旁边的 `config.json`（那份只提供辅测机地址与网段信息），
+     所以两台装了同一个 exe 的机器控制台开局一模一样。
      两端都是 Wi-Fi 时，「Wi-Fi 互测门限」只显示实际识别到的频段组合；每个组合三格：
      单向主控→辅测、单向辅测→主控、**双向 RX 合计**。双向并发按
      `主控端 RX 平均 + 辅测端 RX 平均 ≥ 合计门限` 判定，不要求两个方向各达到一半——

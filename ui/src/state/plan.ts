@@ -17,6 +17,10 @@ import { parseRunRequest } from '../domain/rerun';
 import { agentNics, masterNics } from './inventory';
 import { session } from './session';
 
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
 const DRAFT_KEY = 'cpe_ui_plan_draft';
 
 export const plan = reactive({
@@ -30,6 +34,12 @@ export const plan = reactive({
   limitUdpByLinkSpeed: false,
   globals: defaultGlobals() as UiGlobals,
   nicPolicies: [] as UiNicPolicy[],
+  /**
+   * 项目带来的**解析后主控配置**；`null` = 没有项目，用本机基线。
+   *
+   * 前端不解释它的内容，只原样搬运——字段语义在 Rust 的 `Config` 里。
+   */
+  masterConfig: null as Record<string, unknown> | null,
   preview: null as PlanOut | null,
   previewRequestFingerprint: '',
   previewing: false,
@@ -72,6 +82,7 @@ function saveDraft(): void {
         limitUdpByLinkSpeed: plan.limitUdpByLinkSpeed,
         globals: plan.globals,
         nicPolicies: plan.nicPolicies,
+        masterConfig: plan.masterConfig,
       }),
     );
   } catch {
@@ -95,6 +106,7 @@ export function loadDraft(): boolean {
       limitUdpByLinkSpeed?: boolean;
       globals?: UiGlobals;
       nicPolicies?: UiNicPolicy[];
+      masterConfig?: Record<string, unknown> | null;
     };
     if (!parsed.ui) return false;
     if (!Array.isArray(parsed.ui.suites) || !Array.isArray(parsed.ui.bindings)) return false;
@@ -123,6 +135,7 @@ export function loadDraft(): boolean {
     plan.limitUdpByLinkSpeed = parsed.limitUdpByLinkSpeed === true;
     plan.globals = parsed.globals ? normalizeGlobals(parsed.globals) : defaultGlobals();
     plan.nicPolicies = Array.isArray(parsed.nicPolicies) ? parsed.nicPolicies : [];
+    plan.masterConfig = isPlainObject(parsed.masterConfig) ? parsed.masterConfig : null;
     draftRestored = true;
     return true;
   } catch {
@@ -142,6 +155,7 @@ watch(
     plan.limitUdpByLinkSpeed,
     plan.globals,
     plan.nicPolicies,
+    plan.masterConfig,
   ],
   () => {
     if (saveTimer !== undefined) clearTimeout(saveTimer);
@@ -172,6 +186,7 @@ export function reset(): void {
   plan.limitUdpByLinkSpeed = false;
   plan.globals = defaultGlobals();
   plan.nicPolicies = [];
+  plan.masterConfig = null;
 }
 
 export function restoreDefaultProject(): void {
@@ -218,13 +233,10 @@ export function buildRunRequest(): Record<string, unknown> {
     wifi_pair_bidir_total_rx_target_mbps: globals.wifi_pair_bidir_total_rx_target_mbps,
     wifi_band_thresholds: globals.wifi_band_thresholds,
     wifi_pair_thresholds: globals.wifi_pair_thresholds,
-    // 项目快照钉住的两样东西：界面上没有输入框，但它们参与判定，而且是
-    // 「换一台主控还能不能复现」的关键。没钉过就不发，后端沿用本机配置。
-    ...(globals.udp_profiles.length > 0 ? { udp_profiles: globals.udp_profiles } : {}),
-    ...(globals.global_rate_targets
-      ? { global_rate_targets: globals.global_rate_targets }
-      : {}),
-    ...(globals.global_rate_mode ? { global_rate_mode: globals.global_rate_mode } : {}),
+    // 项目带来的**解析后主控配置**：界面上没有输入框、却决定「怎么跑、怎么判」
+    // 的那一整块（rate_check 的负载上限与余量、角色配对门限、ctsTraffic 参数）。
+    // 没有项目时不发，后端用自己的基线。
+    ...(plan.masterConfig ? { master_config: plan.masterConfig } : {}),
     ...(globals.udp_streams > 0 ? { udp_streams: globals.udp_streams } : {}),
     pairs: [],
     nic_policies: activeNicPolicies(plan.nicPolicies),
@@ -271,6 +283,8 @@ export function importProject(text: string): boolean {
   plan.limitUdpByLinkSpeed = settings.limit_udp_by_link_speed === true;
   plan.globals = settings.globals ? normalizeGlobals(settings.globals) : defaultGlobals();
   plan.nicPolicies = result.nicPolicies ?? [];
+  // 老项目（v1/v2）没有这一块：保持 null，用目标主控自己的基线，行为与从前一致。
+  plan.masterConfig = settings.masterConfig ?? null;
   reconcile();
   return true;
 }
@@ -283,6 +297,9 @@ export function adoptRunRequest(raw: unknown, skipPassed: boolean): boolean {
   plan.limitUdpByLinkSpeed = snapshot.limitUdpByLinkSpeed;
   plan.globals = snapshot.globals;
   plan.nicPolicies = snapshot.nicPolicies;
+  // 归档里那一份判定基线要跟着回来；当时没带项目就显式清空，不能把当前
+  // 内存里另一个项目的那份留着接着用。
+  plan.masterConfig = snapshot.masterConfig;
   plan.resume = skipPassed;
   if (snapshot.plan) {
     plan.ui = snapshot.plan;
@@ -303,13 +320,32 @@ export function adoptRunRequest(raw: unknown, skipPassed: boolean): boolean {
  * 「默认 30」只存在于 bootstrap 回填里——直接序列化编辑态，换一台主控导入就会
  * 改用那台机器自己的默认值，判定口径静默改变。
  */
-export function exportProject(): string {
+/**
+ * 导出项目。**拿不到判定基线时宁可不导**，返回 `null` 并留下一条错误。
+ *
+ * 空的 `master_config` 在后端等价于「没带」——导出一个结构完整、`master_config`
+ * 是 `{}` 的文件，看不出任何异常，换台机器导入却会静默回落到那台机器的基线。
+ * 这正是「项目自带全部判定参数」要根除的故障，导出这一侧不能自己制造。
+ */
+export function exportProject(): string | null {
+  // 判定与灌包参数的完整基线。已经导入过项目就原样带走它自己的那一份，
+  // 否则固化主控当前生效的这一份——两种情况下导出的都是**这一轮真正会用
+  // 的参数**，而不是「用户改过的那几个」。
+  const masterConfig = plan.masterConfig ?? session.bootstrap?.master_config;
+  if (!masterConfig || Object.keys(masterConfig).length === 0) {
+    projectNotices.error =
+      '还没拿到主控的判定基线（档位、门限、角色配对门限等），现在导出的项目在别的机器上会回落到那台机器的配置。' +
+      '请等页面加载完成或刷新一次再导出。';
+    return null;
+  }
+  projectNotices.error = '';
   return serializeProject(
     plan.ui,
     {
       duration: plan.duration,
       limit_udp_by_link_speed: plan.limitUdpByLinkSpeed,
       globals: resolveEffectiveGlobals(plan.globals, session.bootstrap),
+      masterConfig,
     },
     activeNicPolicies(plan.nicPolicies),
   );

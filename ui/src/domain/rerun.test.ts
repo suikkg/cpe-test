@@ -9,6 +9,24 @@ import { parseRunRequest } from './rerun';
  * 东西 == 实际跑的东西」唯一的强制点。
  */
 describe('parseRunRequest', () => {
+  it('把归档里那一份判定基线一起读回来', () => {
+    // 不读它的话，重跑用的既不是归档里那份、也不是本机基线，而是内存里当前
+    // 碰巧加载着的那份：导入项目 A 之后去重跑归档 B，B 会按 A 的门限判。
+    const snapshot = parseRunRequest({
+      duration: 180,
+      master_config: { iperf: { rate_check: { targets_mbps: { wifi_5g: 900 } } } },
+    });
+    expect(snapshot!.masterConfig).toEqual({
+      iperf: { rate_check: { targets_mbps: { wifi_5g: 900 } } },
+    });
+  });
+
+  it('当时没带项目就是 null，不是 undefined——调用方要能据此显式清空', () => {
+    expect(parseRunRequest({ duration: 180 })!.masterConfig).toBeNull();
+    expect(parseRunRequest({ duration: 180, master_config: [] })!.masterConfig).toBeNull();
+    expect(parseRunRequest({ duration: 180, master_config: 'x' })!.masterConfig).toBeNull();
+  });
+
   const full = {
     duration: 300,
     resume: true,

@@ -37,6 +37,40 @@ impl Default for UiU32Values {
 }
 
 /// 启动控制台，阻塞直到进程结束。
+/// 控制台开局的基线配置。
+///
+/// **exe 旁边碰巧有一份 `config.json`，不该改变控制台的判定口径。**
+///
+/// 这条规矩仓库里早就立过，只是没贯彻到底——`使用说明.md` 里写着
+/// 「`config.json` 里的同名开关只作用于命令行路径，**不回填到界面**，
+/// 同一个勾选框在不同机器上必须是同一个意思」。可实际上 `rate_check` 的门限与
+/// 负载上限、`link_profiles.by_role` 的角色配对门限、`ctstraffic` 的参数，
+/// 一直是从这份文件原样带进控制台的每一轮运行的。后果是：同一份测试项目，
+/// 在「exe 旁边放了 config.json」的机器和没放的机器上，判定口径和灌包强度
+/// 都不一样，而项目文件里一个字都看不出来。
+///
+/// 于是隐式加载的那份只留下**「这台机器接在哪个网络上」**：
+/// 辅测机地址/端口/口令、网卡前缀过滤、同 /24 门禁。它们跟着机器走才对，
+/// 也正因如此**不该**进项目文件。其余一律回到内置默认值——两台装了同一个 exe
+/// 的机器，控制台开局必然一模一样。
+///
+/// `--config` 是**显式**指定的，那是用户自己挑的文件，整份生效；
+/// 显式的 `--config` 同理：那是人自己挑的文件，整份生效。
+/// 区别不在文件内容，在于人有没有做这个选择。
+fn console_baseline_config(loaded: Config, explicit: bool) -> Config {
+    if explicit {
+        return loaded;
+    }
+    Config {
+        agent_host: loaded.agent_host,
+        agent_port: loaded.agent_port,
+        agent_token: loaded.agent_token,
+        ipv4_prefixes: loaded.ipv4_prefixes,
+        require_same_subnet_for_iperf: loaded.require_same_subnet_for_iperf,
+        ..Config::default()
+    }
+}
+
 pub fn run(opts: UiOpts) -> i32 {
     let UiOpts {
         bind,
@@ -56,7 +90,18 @@ pub fn run(opts: UiOpts) -> i32 {
         eprintln!("!!   ssh -L {port}:127.0.0.1:{port} 你@这台机器");
         return 2;
     }
-    let (mut cfg, _) = load_config(config_path.as_deref());
+    let (loaded, loaded_path) = load_config(config_path.as_deref());
+    let explicit_config = config_path.is_some();
+    let mut cfg = console_baseline_config(loaded, explicit_config);
+    if let Some(path) = loaded_path.as_ref() {
+        if !explicit_config {
+            eprintln!(
+                "-- 发现 {}：控制台只从它取辅测机地址/端口/口令、网卡前缀和同 /24 门禁。",
+                path.display()
+            );
+            eprintln!("-- 档位与判定门限一律用内置默认值；要整份用它：cpe_test ui --config 路径。");
+        }
+    }
     if let Some(token) = agent_token {
         cfg.agent_token = token;
     }

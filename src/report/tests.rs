@@ -917,6 +917,60 @@ fn bidirectional_overview_keeps_ab_and_ba_separate() {
     assert!(html.contains("data-unit-id=\"unit-bidir\" open"));
 }
 
+/// 配了合计门限的双向单元，标题不能再说「每个方向各自按接收端 RX 判定」。
+///
+/// 真机联调时看到的：报告里判定确实走的是合计（`双向 RX 合计 1447.094…门限
+/// 1500`），标题却写着两条腿各自判定。合计门限存在时 `leg_rate_plan` 已经把
+/// 两条腿落到 Observe，它们**只测量**——那句话会把读报告的人引到错的排查方向。
+#[test]
+fn a_bidirectional_unit_with_a_total_target_says_it_is_judged_once() {
+    let bidir = |total: Option<f64>| {
+        let mut summary = unit_summary("unit-bidir-total", Verdict::RateFail);
+        summary.task = "双向 TCP".into();
+        summary.target_mbps = total;
+        summary.direction_summaries = vec![
+            DirectionSummary {
+                tag: "AB".into(),
+                src: "master/eth0".into(),
+                dst: "agent/eth1".into(),
+                verdict: Verdict::Measured,
+                rx_avg: Some(502.859),
+                ..Default::default()
+            },
+            DirectionSummary {
+                tag: "BA".into(),
+                src: "agent/eth1".into(),
+                dst: "master/eth0".into(),
+                verdict: Verdict::Measured,
+                rx_avg: Some(944.235),
+                ..Default::default()
+            },
+        ];
+        render(vec![summary])
+    };
+
+    let with_total = bidir(Some(1_500.0));
+    assert!(
+        with_total.contains("按两端 RX 合计判定一次，两条腿只测量"),
+        "配了合计门限就要说清判定只做一次：{with_total}"
+    );
+    assert!(
+        !with_total.contains("每个方向各自按接收端 RX 判定"),
+        "这句话在配了合计门限时是假的"
+    );
+    assert!(with_total.contains("门限 1500.000 Mbps"), "门限要写出来");
+    assert!(with_total.contains("1447.094 Mbps"), "合计值要写出来");
+
+    // 没配合计门限的双向单元保持原来的说法。
+    // 没配合计门限的双向单元保持按方向判定，并且**把前提说出来**：
+    // 光写「每个方向各自判定」读的人不知道还有合计门限这个选项、只是没设。
+    let plain = bidir(None);
+    assert!(
+        plain.contains("未设置合计门限，每个方向各自按接收端 RX 判定"),
+        "要说清是「没设合计门限」才按方向判，而不是只能按方向判：{plain}"
+    );
+}
+
 #[test]
 fn passing_direction_does_not_inherit_failure_reason_from_other_direction() {
     let mut summary = unit_summary("unit-mixed", Verdict::RateFail);

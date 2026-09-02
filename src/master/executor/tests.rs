@@ -3215,7 +3215,7 @@ fn a_sparse_tx_sample_series_is_reported_but_never_judged() {
     let with_target = crate::master::rate_window::rx_acceptance_diagnostics(
         &rx_stats,
         &sparse_tx_stats,
-        true,
+        Some(1_000.0),
         None,
     );
     assert!(
@@ -3228,7 +3228,7 @@ fn a_sparse_tx_sample_series_is_reported_but_never_judged() {
     assert!(crate::master::rate_window::rx_acceptance_diagnostics(
         &rx_stats,
         &sparse_tx_stats,
-        false,
+        None,
         None
     )
     .is_empty());
@@ -3242,7 +3242,7 @@ fn a_sparse_tx_sample_series_is_reported_but_never_judged() {
     assert!(crate::master::rate_window::rx_acceptance_diagnostics(
         &rx_stats,
         &complete_tx_stats,
-        true,
+        Some(1_000.0),
         None
     )
     .is_empty());
@@ -3602,6 +3602,42 @@ fn tail_failure_downgrade_never_upgrades_a_failing_rate() {
 ///
 /// 这类「代码位置决定行为」的约束普通单测抓不到（把检查挪回结尾，所有
 /// 现有用例依然全绿），所以在源码层面把门关上。
+/// **报告行和进度页必须说同一句话。**
+///
+/// 这条是真机联调当场抓到的：双向 UDP 单元判定 PASS，报告里写「双向 RX 合计
+/// 1852.734Mbps…门限 1500」，进度页却写「ab:TARGET_UNKNOWN 接收端网卡 RX 已测得
+/// 926.140Mbps；未配置可信目标，**因此不标记 PASS**」——判定是 PASS，理由说不
+/// 标记 PASS。原因是两处各算各的：`Row` 走合计判定，`UnitStatus` 走腿级的
+/// `unit_reason` / `reasons.first()`。合计门限存在时 `leg_rate_plan` 已经把两条
+/// 腿都落到 Observe，腿本来就不该有目标，那句话在单元这一层是自相矛盾的。
+///
+/// 普通单测抓不到：两边分别断言各自的字段都会绿。所以在源码层面钉住「只有一处
+/// 计算，两个消费者」。
+#[test]
+fn the_unit_reason_has_one_source_for_both_the_report_and_the_progress_page() {
+    let source = include_str!("../executor.rs");
+    for name in ["let unit_reason_code", "let bidir_reason_detail"] {
+        assert_eq!(
+            source.matches(name).count(),
+            1,
+            "{name} 必须只算一次；出现两处就是报告和进度页又分叉了"
+        );
+    }
+    // 两个消费者：`Row` 一次、`UnitStatus` 一次（加上定义本身共 2 次以上）。
+    for name in ["unit_reason_code", "bidir_reason_detail"] {
+        assert!(
+            source.matches(name).count() >= 3,
+            "{name} 应当被报告行和进度页同时消费，实得 {} 处",
+            source.matches(name).count()
+        );
+    }
+    // 出过问题的那一行：进度页直接取腿级理由，不看合计判定。
+    assert!(
+        !source.contains("reason_detail: reasons.first().cloned().unwrap_or_default()"),
+        "进度页不能再绕过合计判定直接取腿级理由"
+    );
+}
+
 #[test]
 fn the_abort_gate_runs_before_any_early_continue() {
     let source = include_str!("../executor.rs");

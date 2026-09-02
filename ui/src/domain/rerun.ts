@@ -10,6 +10,14 @@ export interface RerunSnapshot {
   globals: UiGlobals;
   nicPolicies: UiNicPolicy[];
   plan: UiPlan | null;
+  /**
+   * 这一轮实际用的**解析后主控配置**；`null` = 当时就没带项目，用本机基线。
+   *
+   * 必须跟着重跑走。不还原它，重跑用的既不是归档里那份、也不是本机基线，
+   * 而是内存里当前碰巧加载着的那份——导入项目 A 之后去重跑归档 B，B 会按
+   * A 的门限判，而界面上完全看不出来。
+   */
+  masterConfig: Record<string, unknown> | null;
 }
 
 function count(value: unknown, fallback: number): number {
@@ -58,5 +66,10 @@ export function parseRunRequest(raw: unknown): RerunSnapshot | null {
     globals,
     nicPolicies: nicPolicies(request.nic_policies),
     plan,
+    masterConfig:
+      request.master_config && typeof request.master_config === 'object'
+        && !Array.isArray(request.master_config)
+        ? (request.master_config as Record<string, unknown>)
+        : null,
   };
 }
