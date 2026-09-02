@@ -11,8 +11,22 @@
 /** 服务端统一响应包装（Rust: `protocol.rs::Resp`）。 */
 interface Resp<T> {
   ok: boolean;
-  error?: string;
+  error?: unknown;
   data?: T;
+}
+
+/** 把接口/运行时错误转成用户能读懂的文本，避免直接显示 `[object Object]`。 */
+export function errorMessage(value: unknown): string {
+  if (value instanceof Error) return value.message;
+  if (typeof value === 'string') return value;
+  if (value == null) return '';
+  try {
+    const json = JSON.stringify(value);
+    if (json && json !== '{}') return json;
+  } catch {
+    // 某些异常对象不可序列化，退到下面的安全文本。
+  }
+  return String(value) === '[object Object]' ? '服务端返回了无法识别的错误' : String(value);
 }
 
 /** 口令失效。调用方要走专门的终态，不要混进通用错误提示。 */
@@ -135,7 +149,7 @@ async function request<T>(method: 'GET' | 'POST', path: string, body?: unknown):
 
   const payload = (await response.json()) as Resp<T>;
   if (!payload.ok) {
-    throw new Error(payload.error || '服务端返回了失败但没有说明原因');
+    throw new Error(errorMessage(payload.error) || '服务端返回了失败但没有说明原因');
   }
   return payload.data as T;
 }

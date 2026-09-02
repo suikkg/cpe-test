@@ -4,6 +4,7 @@ import {
   UnauthorizedError,
   adoptTokenFromCookie,
   adoptTokenFromUrl,
+  errorMessage,
   hasToken,
 } from '../api/client';
 import type { BootstrapOut, ConnectOut, ConnectReq, LocalOut } from '../api/dto';
@@ -86,7 +87,7 @@ function fail(error: unknown): void {
     return;
   }
   session.phase = 'failed';
-  session.error = error instanceof Error ? error.message : String(error);
+  session.error = errorMessage(error);
 }
 
 /**
@@ -165,7 +166,7 @@ export async function rescan(): Promise<void> {
       session.scanKind = '';
       return;
     }
-    session.scanMessage = `重新扫描失败：${error instanceof Error ? error.message : String(error)}`;
+    session.scanMessage = `重新扫描失败：${errorMessage(error)}`;
     session.scanKind = 'bad';
   } finally {
     session.scanning = false;

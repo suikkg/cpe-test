@@ -188,6 +188,7 @@ pub(super) fn push_row_diagnostics(h: &mut String, row: &Row, is_ping: bool, ari
         ),
     );
     h.push_str("</dl>");
+    push_non_verdict_diagnostics(h, row);
 
     let artifacts = [
         artifact_link(&row.raw_log, "独立原始记录（raw_log）"),
@@ -232,4 +233,20 @@ pub(super) fn push_row_diagnostics(h: &mut String, row: &Row, is_ping: bool, ari
         ));
     }
     h.push_str("</div></details>");
+}
+
+/// 判定旁边那串「不改写结论」的事实。
+///
+/// 单开一块而不是拼进原因明细：原因明细回答的是 `verdict` 为什么是这个值，
+/// 而这里的每一条都**不影响** `verdict`。混在一起写，读报告的人会把
+/// 「UDP 丢包 2.1%」当成 PASS 被推翻的理由，那正是这次改口径要消灭的误解。
+pub(super) fn push_non_verdict_diagnostics(h: &mut String, row: &Row) {
+    if row.diagnostics.is_empty() {
+        return;
+    }
+    h.push_str("<div class=\"non-verdict-diagnostics\"><b>诊断（不参与判定）</b><ul>");
+    for line in &row.diagnostics {
+        h.push_str(&format!("<li>{}</li>", esc(line)));
+    }
+    h.push_str("</ul></div>");
 }

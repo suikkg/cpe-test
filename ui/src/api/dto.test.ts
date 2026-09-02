@@ -119,7 +119,11 @@ describe('PlanOut 契约', () => {
     // 「网口固定值 > 参数组 > 默认组」这条优先级与其让人背，不如把每条腿的
     // 最终数字摆出来：填错了当场看得见。
     for (const unit of plan.units) {
-      expectExactKeys(unit, ['seq', 'title', 'est_secs', 'resumed', 'load'], 'PlannedUnit');
+      expectExactKeys(
+        unit,
+        ['seq', 'title', 'est_secs', 'resumed', 'load', 'targets'],
+        'PlannedUnit',
+      );
     }
   });
 
@@ -166,6 +170,9 @@ describe('BootstrapOut 契约', () => {
         'ping_wifi_medium_max_rtt_ms',
         'ping_wifi_large_avg_rtt_ms',
         'ping_wifi_large_max_rtt_ms',
+        'rate_targets_mbps',
+        'rate_mode',
+        'udp_profiles',
         'screenshot',
         'ui_plan_supported',
       ],

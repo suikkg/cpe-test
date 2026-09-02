@@ -9,27 +9,20 @@ use super::*;
 use super::db::resume_age_is_fresh;
 use crate::master::builder::{Endpoint, PingPurpose, PingTask};
 
-/// 「灌得不够」只有在接收端确实跟上了发送端时才叫判不了。
-///
-/// 门限 1000、灌 1000 收 580：路径丢了 42%，而发送端只少灌 50。补足负载
-/// 也补不回这 420——FAIL 在这一轮就已经成立，报「判不了」等于把一个确凿的
-/// 不达标藏起来。
-#[test]
-fn an_offered_load_shortfall_only_excuses_a_receiver_that_kept_up() {
-    // 收到的几乎就是发出的：设备还能不能再多送是未知数，判不了。
-    assert!(offered_shortfall_explains_rx(Some(990.0), Some(1000.0)));
-    assert!(offered_shortfall_explains_rx(Some(1000.0), Some(1000.0)));
-    // 收到的明显少于发出的：缺口在路径上，和「少灌了 5%」无关。
-    assert!(!offered_shortfall_explains_rx(Some(580.0), Some(1000.0)));
-    assert!(!offered_shortfall_explains_rx(Some(0.5), Some(1000.0)));
-    // 发送端自己就只有 580：那 RX 580 说明不了被测设备的能力。
-    assert!(offered_shortfall_explains_rx(Some(580.0), Some(580.0)));
-    // 少一边数据就没有对照，保守维持「判不了」。
-    assert!(offered_shortfall_explains_rx(None, Some(1000.0)));
-    assert!(offered_shortfall_explains_rx(Some(580.0), None));
-    assert!(offered_shortfall_explains_rx(Some(580.0), Some(0.0)));
+use crate::master::rate_window::{
+    evaluate_rx_acceptance, rate_window_coverage_sufficient, rolling_time_window_series, RateStats,
+    MIN_RATE_SAMPLE_COVERAGE,
+};
+
+/// 测试里仍按老三元组读结论。
+fn nic_rx(
+    mode: crate::config::RateMode,
+    target_mbps: Option<f64>,
+    stats: &RateStats,
+) -> (Verdict, ReasonCode, String) {
+    let result = evaluate_rx_acceptance(mode, target_mbps, stats);
+    (result.verdict, result.code, result.detail)
 }
-use crate::master::rate_window::{rolling_time_window_series, RateStats, MIN_RATE_SAMPLE_COVERAGE};
 use crate::protocol::NicInfo;
 use std::sync::atomic::AtomicUsize;
 
@@ -122,6 +115,8 @@ fn ctstraffic_unit(id: &str, udp: bool) -> Unit {
         },
         link_group: String::new(),
         bidir: false,
+        bidir_total_target_mbps: None,
+        target_lines: Vec::new(),
         direction: String::new(),
         legs: vec![Leg {
             tag: "ab".into(),
@@ -155,6 +150,8 @@ fn a_unit_summary_row_carries_the_protocol_and_backend_of_its_legs() {
         title: "PING".into(),
         link_group: String::new(),
         bidir: false,
+        bidir_total_target_mbps: None,
+        target_lines: Vec::new(),
         direction: String::new(),
         legs: vec![Leg {
             tag: String::new(),
@@ -1837,6 +1834,8 @@ fn bidir_udp_unit(ab_port: u16, ba_port: u16, streams: usize) -> (Unit, Vec<UdpL
         title: "★双向 IPERF V4 UDP -b 500m".into(),
         link_group: String::new(),
         bidir: true,
+        bidir_total_target_mbps: None,
+        target_lines: Vec::new(),
         direction: String::new(),
         legs: vec![],
         est_secs: 60,
@@ -2022,6 +2021,9 @@ fn udp_group_retry_only_restarts_the_flow_that_failed() {
 
 /// U00G：已有工具测量后按真实结果判定，不再为争取更好结果继续重试，
 /// 也不得把真实的运行时错误改写成「未灌通」。
+///
+/// 运行时错误本身现在**只进诊断**（ADR-17）：它描述的是 iperf3 自己跑得干不
+/// 干净，不是这条链路的接收能力。
 #[test]
 fn udp_keeps_the_real_runtime_error_once_a_measurement_exists() {
     let scripts = HashMap::from([
@@ -2031,11 +2033,10 @@ fn udp_keeps_the_real_runtime_error_once_a_measurement_exists() {
     let (outcomes, agent, _) = run_udp_orchestration(scripts, 57_800, 57_900, 1);
 
     let ab = outcomes.iter().find(|o| o.tag == "ab").expect("AB 结果");
-    assert_eq!(ab.verdict(), Verdict::RateFail, "{ab:?}");
-    assert_eq!(
+    assert_ne!(
         ab.reason_code(),
-        ReasonCode::IperfRuntimeErrors,
-        "已有测量时必须保留真实的 runtime error，不能改写成 SINGLE_UDP_STREAM_FAILED"
+        ReasonCode::SingleUdpStreamFailed,
+        "已有测量时不能改写成 SINGLE_UDP_STREAM_FAILED：{ab:?}"
     );
     // 已有测量就不该再重试去"碰运气"。
     let ab_attempts = agent
@@ -2155,61 +2156,29 @@ fn udp_server_start_failure_stays_a_setup_error() {
     }
 }
 
+/// CTS 的 UDP 丢帧**不再改写判定**（ADR-17）。
+///
+/// 这条测试以前锁的是相反的行为：RX 已经达标的一轮会因为丢帧超限被翻成
+/// `RATE_FAIL`，缺丢帧数据还会被翻成 `NOT_EVALUATED`。用户确认的验收规则是
+/// 「接收端 RX 平均达到门限必定 PASS」，所以丢帧降为诊断——数值和限制一个
+/// 都不少，只是不决定 PASS/FAIL。
 #[test]
-fn cts_udp_loss_is_evaluated_after_nic_sampling_and_target_gates() {
-    let pass = || (Verdict::Pass, ReasonCode::None, String::new());
-    let not_evaluated = || {
-        (
-            Verdict::NotEvaluated,
-            ReasonCode::RateWindowCoverageLow,
-            "采样不足".to_string(),
-        )
-    };
-    let measured = || {
-        (
-            Verdict::Measured,
-            ReasonCode::TargetUnknown,
-            "observe".to_string(),
-        )
-    };
-
-    // 采样不足时不能被改写成「丢帧超限」：环境问题不背 CPE 的锅。
-    let (verdict, code, _) = cts_apply_udp_loss(not_evaluated(), true, Some(1.0), Some(9.0));
-    assert_eq!(
-        (verdict, code),
-        (Verdict::NotEvaluated, ReasonCode::RateWindowCoverageLow)
+fn cts_udp_loss_is_a_diagnostic_and_never_overturns_the_rx_verdict() {
+    // 丢帧超限：只出诊断。
+    let over = cts_udp_loss_diagnostics(true, Some(1.0), Some(9.0));
+    assert_eq!(over.len(), 1, "{over:?}");
+    assert!(
+        over[0].contains("9.000%") && over[0].contains("1.000%"),
+        "实测值和限制都要留在诊断里: {over:?}"
     );
-    // 目标未知时同样保持 MEASURED，不产出丢帧失败。
-    let (verdict, code, _) = cts_apply_udp_loss(measured(), true, Some(1.0), Some(9.0));
-    assert_eq!(
-        (verdict, code),
-        (Verdict::Measured, ReasonCode::TargetUnknown)
-    );
-    // 已配置门槛但缺数据：缺的是判定依据本身，优先于速率结论。
-    let (verdict, code, _) = cts_apply_udp_loss(pass(), true, Some(1.0), None);
-    assert_eq!(
-        (verdict, code),
-        (Verdict::NotEvaluated, ReasonCode::CtsUdpLossDataMissing)
-    );
-    // 速率达标但丢帧超限：真实的 RATE_FAIL。
-    let (verdict, code, _) = cts_apply_udp_loss(pass(), true, Some(1.0), Some(9.0));
-    assert_eq!(
-        (verdict, code),
-        (Verdict::RateFail, ReasonCode::CtsUdpLossHigh)
-    );
-    // 门槛内、TCP、未配置门槛都保持原判定。
-    assert_eq!(
-        cts_apply_udp_loss(pass(), true, Some(10.0), Some(9.0)).0,
-        Verdict::Pass
-    );
-    assert_eq!(
-        cts_apply_udp_loss(pass(), false, Some(1.0), Some(9.0)).0,
-        Verdict::Pass
-    );
-    assert_eq!(
-        cts_apply_udp_loss(pass(), true, None, Some(9.0)).0,
-        Verdict::Pass
-    );
+    // 已配置门槛却缺数据：同样只是诊断，不再吃掉速率结论。
+    let missing = cts_udp_loss_diagnostics(true, Some(1.0), None);
+    assert_eq!(missing.len(), 1, "{missing:?}");
+    assert!(missing[0].contains("缺少 dropped frames"), "{missing:?}");
+    // 门槛内、TCP、未配置门槛：一条诊断都不该有。
+    assert!(cts_udp_loss_diagnostics(true, Some(10.0), Some(9.0)).is_empty());
+    assert!(cts_udp_loss_diagnostics(false, Some(1.0), Some(9.0)).is_empty());
+    assert!(cts_udp_loss_diagnostics(true, None, Some(9.0)).is_empty());
 }
 
 #[test]
@@ -2308,7 +2277,7 @@ fn cts_monitor_failures_keep_specific_result_semantics() {
     assert_eq!(issue.code, ReasonCode::CtsMonitorNoSamples);
     assert!(issue.detail.contains("全生命周期平均值不能用于"));
     assert_eq!(
-        cts_monitor_issue_verdict(&issue).unwrap().0,
+        cts_monitor_issue_verdict(&issue).unwrap().verdict,
         Verdict::NotEvaluated
     );
 
@@ -2327,7 +2296,7 @@ fn cts_monitor_failures_keep_specific_result_semantics() {
     assert_eq!(issue.code, ReasonCode::CtsMonitorRuntimeError);
     assert!(issue.detail.contains("counter reset"));
     assert_eq!(
-        cts_monitor_issue_verdict(&issue).unwrap().0,
+        cts_monitor_issue_verdict(&issue).unwrap().verdict,
         Verdict::NotEvaluated
     );
 
@@ -2337,10 +2306,10 @@ fn cts_monitor_failures_keep_specific_result_semantics() {
         setup_error: true,
         affects_verdict: true,
     };
-    let (verdict, code, detail) = cts_monitor_issue_verdict(&startup).unwrap();
-    assert_eq!(verdict, Verdict::SetupError);
-    assert_eq!(code, ReasonCode::CtsMonitorStartFailed);
-    assert_eq!(detail, "interface not found");
+    let judgement = cts_monitor_issue_verdict(&startup).unwrap();
+    assert_eq!(judgement.verdict, Verdict::SetupError);
+    assert_eq!(judgement.code, ReasonCode::CtsMonitorStartFailed);
+    assert_eq!(judgement.detail, "interface not found");
 }
 
 #[test]
@@ -2420,6 +2389,8 @@ fn ctstraffic_builder_setup_error_returns_before_agent_or_cts_start() {
         title: "CTS builder setup error".into(),
         link_group: String::new(),
         bidir: false,
+        bidir_total_target_mbps: None,
+        target_lines: Vec::new(),
         direction: String::new(),
         legs: Vec::new(),
         est_secs: 1,
@@ -2549,8 +2520,13 @@ fn ctstraffic_single_udp_attempt_budget_has_a_three_attempt_floor() {
     assert_eq!(cts_attempt_budget(4, false), 1);
 }
 
+/// ctsTraffic 跑得不干净只留一句诊断（ADR-17）。
+///
+/// 以前这里返回 `RATE_FAIL / CTS_RUNTIME_ERRORS`：接收端网卡已经收满速率的
+/// 一轮，会因为 server 收尾时的一条错误被判失败。线索一个字不少地保留，
+/// 但判定只由 RX 平均与门限决定。
 #[test]
-fn ctstraffic_measured_timeout_or_abnormal_exit_is_a_runtime_failure() {
+fn ctstraffic_measured_timeout_or_abnormal_exit_is_only_a_diagnostic() {
     let mut timed_out = ctstraffic_attempt(0, true);
     timed_out.client = IperfClientOut {
         timed_out: true,
@@ -2559,10 +2535,7 @@ fn ctstraffic_measured_timeout_or_abnormal_exit_is_a_runtime_failure() {
         cleanup_confirmed: Some(true),
         ..Default::default()
     };
-    let (timeout_verdict, timeout_code, timeout_detail) =
-        cts_runtime_failure_verdict(&timed_out, 0, false).unwrap();
-    assert_eq!(timeout_verdict, Verdict::RateFail);
-    assert_eq!(timeout_code, ReasonCode::CtsRuntimeErrors);
+    let timeout_detail = cts_runtime_diagnostic(&timed_out, 0, false).unwrap();
     assert!(timeout_detail.contains("client 超时"));
 
     let mut abnormal_exit = ctstraffic_attempt(0, true);
@@ -2572,22 +2545,18 @@ fn ctstraffic_measured_timeout_or_abnormal_exit_is_a_runtime_failure() {
         cleanup_confirmed: Some(true),
         ..Default::default()
     };
-    let (_, exit_code, exit_detail) =
-        cts_runtime_failure_verdict(&abnormal_exit, 0, false).unwrap();
-    assert_eq!(exit_code, ReasonCode::CtsRuntimeErrors);
+    let exit_detail = cts_runtime_diagnostic(&abnormal_exit, 0, false).unwrap();
     assert!(exit_detail.contains("未正常完成"));
 
-    let (_, counted_code, counted_error) =
-        cts_runtime_failure_verdict(&abnormal_exit, 3, false).unwrap();
-    assert_eq!(counted_code, ReasonCode::CtsRuntimeErrors);
+    let counted_error = cts_runtime_diagnostic(&abnormal_exit, 3, false).unwrap();
     assert!(counted_error.contains("3 个网络/协议/数据错误"));
 
     let normal = ctstraffic_attempt(0, true);
-    assert!(cts_runtime_failure_verdict(&normal, 0, true).is_none());
+    assert!(cts_runtime_diagnostic(&normal, 0, true).is_none());
 }
 
 #[test]
-fn ctstraffic_measured_server_failure_is_runtime_but_unmeasured_is_setup() {
+fn ctstraffic_measured_server_failure_is_a_diagnostic_but_unmeasured_is_setup() {
     let mut measured = ctstraffic_attempt(0, true);
     measured.server_unexpected_failure = true;
     measured.server_output = "server statistics: 500 Mbps\nserver timed out".into();
@@ -2598,9 +2567,7 @@ fn ctstraffic_measured_server_failure_is_runtime_but_unmeasured_is_setup() {
         &measured.server_output,
     )
     .is_none());
-    let (verdict, code, detail) = cts_runtime_failure_verdict(&measured, 0, true).unwrap();
-    assert_eq!(verdict, Verdict::RateFail);
-    assert_eq!(code, ReasonCode::CtsRuntimeErrors);
+    let detail = cts_runtime_diagnostic(&measured, 0, true).unwrap();
     assert!(detail.contains("server 在显式停止前异常退出或超时"));
     assert!(!cts_should_retry_after_last(
         std::slice::from_ref(&measured),
@@ -2624,7 +2591,7 @@ fn ctstraffic_measured_server_failure_is_runtime_but_unmeasured_is_setup() {
     .unwrap();
     assert_eq!(setup_code, ReasonCode::CtsServerFailed);
     assert_eq!(setup_detail, "server exited with code 7");
-    assert!(cts_runtime_failure_verdict(&unmeasured, 0, false).is_none());
+    assert!(cts_runtime_diagnostic(&unmeasured, 0, false).is_none());
     assert!(!cts_should_retry_after_last(
         std::slice::from_ref(&unmeasured),
         3,
@@ -3226,38 +3193,63 @@ fn test_rate_average_is_weighted_by_valid_time_and_clipped_to_window() {
     assert_eq!(nested_stats.coverage, 1.0);
 }
 
+/// 发送端采样覆盖率只进诊断（ADR-17）。
+///
+/// 它以前是否决性门槛：TX 覆盖率不够就把整行判成 `NOT_EVALUATED` /
+/// `RATE_FAIL`。可这块数据描述的是**发送端**，接收端 RX 平均是否达到门限
+/// 与它无关。
 #[test]
-fn test_target_requires_tx_and_rx_sample_coverage() {
+fn a_sparse_tx_sample_series_is_reported_but_never_judged() {
     let rx_stats = RateStats {
         coverage: 1.0,
+        p10_mbps: Some(10_000.0),
+        rolling_coverage: 1.0,
         ..Default::default()
     };
     let sparse_tx_stats = RateStats {
         coverage: 0.2,
         p10_mbps: Some(10_000.0),
+        rolling_coverage: 1.0,
         ..Default::default()
     };
-    assert!(!rate_sample_coverage_sufficient(
+    let with_target = crate::master::rate_window::rx_acceptance_diagnostics(
         &rx_stats,
         &sparse_tx_stats,
-        true
-    ));
-    assert!(rate_sample_coverage_sufficient(
+        true,
+        None,
+    );
+    assert!(
+        with_target
+            .iter()
+            .any(|line| line.contains("TX 采样覆盖率")),
+        "TX 覆盖率不足要说出来: {with_target:?}"
+    );
+    // 没有目标就没有验收，也就没有「诊断为什么不达标」这回事。
+    assert!(crate::master::rate_window::rx_acceptance_diagnostics(
         &rx_stats,
         &sparse_tx_stats,
-        false
-    ));
+        false,
+        None
+    )
+    .is_empty());
 
     let complete_tx_stats = RateStats {
         coverage: MIN_RATE_SAMPLE_COVERAGE,
+        p10_mbps: Some(10_000.0),
+        rolling_coverage: 1.0,
         ..Default::default()
     };
-    assert!(rate_sample_coverage_sufficient(
+    assert!(crate::master::rate_window::rx_acceptance_diagnostics(
         &rx_stats,
         &complete_tx_stats,
-        true
-    ));
+        true,
+        None
+    )
+    .is_empty());
+}
 
+#[test]
+fn test_rolling_window_coverage_requires_both_sides() {
     let missing_p10 = RateStats {
         coverage: 1.0,
         ..Default::default()
@@ -3517,7 +3509,7 @@ const TAIL_HANDSHAKE_ERROR: &str = "iperf3: error - unable to send control messa
 fn client_tail_failure_after_full_window_keeps_nic_verdict() {
     let rx = healthy_stats(1067.902);
     let window = full_window(180.0);
-    let (verdict, code, detail) = iperf_flow_verdict(IperfFlowVerdictIn {
+    let judged = iperf_flow_verdict(IperfFlowVerdictIn {
         raw_ok: false,
         measurement: true,
         effective_window: &window,
@@ -3530,6 +3522,7 @@ fn client_tail_failure_after_full_window_keeps_nic_verdict() {
         client_tail: TAIL_HANDSHAKE_ERROR,
         rx_monitor: None,
     });
+    let (verdict, code, detail) = (judged.verdict, judged.code, judged.detail);
     assert_eq!(
         verdict,
         Verdict::Measured,
@@ -3554,7 +3547,7 @@ fn tail_failure_downgrade_never_upgrades_a_failing_rate() {
     let window = full_window(180.0);
 
     let below = healthy_stats(400.0);
-    let (verdict, code, _) = iperf_flow_verdict(IperfFlowVerdictIn {
+    let judged = iperf_flow_verdict(IperfFlowVerdictIn {
         raw_ok: false,
         measurement: true,
         effective_window: &window,
@@ -3567,6 +3560,7 @@ fn tail_failure_downgrade_never_upgrades_a_failing_rate() {
         client_tail: TAIL_HANDSHAKE_ERROR,
         rx_monitor: None,
     });
+    let (verdict, code) = (judged.verdict, judged.code);
     assert_eq!(verdict, Verdict::RateFail);
     assert_eq!(code, ReasonCode::RxBelowTarget);
 
@@ -3579,7 +3573,7 @@ fn tail_failure_downgrade_never_upgrades_a_failing_rate() {
         rolling_coverage: 1.0,
         ..Default::default()
     };
-    let (verdict, code, _) = iperf_flow_verdict(IperfFlowVerdictIn {
+    let judged = iperf_flow_verdict(IperfFlowVerdictIn {
         raw_ok: false,
         measurement: true,
         effective_window: &window,
@@ -3592,6 +3586,7 @@ fn tail_failure_downgrade_never_upgrades_a_failing_rate() {
         client_tail: TAIL_HANDSHAKE_ERROR,
         rx_monitor: None,
     });
+    let (verdict, code) = (judged.verdict, judged.code);
     assert_eq!(verdict, Verdict::NotEvaluated);
     assert_eq!(code, ReasonCode::NicRateMissing);
 }
@@ -3743,7 +3738,7 @@ fn an_unusable_window_still_reports_what_the_nic_actually_saw() {
         avg_mbps: 487.125_869,
         ..Default::default()
     };
-    let (verdict, code, detail) = iperf_flow_verdict(IperfFlowVerdictIn {
+    let judged = iperf_flow_verdict(IperfFlowVerdictIn {
         raw_ok: true,
         measurement: true,
         effective_window: &empty_window,
@@ -3756,6 +3751,7 @@ fn an_unusable_window_still_reports_what_the_nic_actually_saw() {
         client_tail: "",
         rx_monitor: Some(&monitor),
     });
+    let (verdict, code, detail) = (judged.verdict, judged.code, judged.detail);
     assert_eq!(verdict, Verdict::NotEvaluated, "窗口切不出来就是没结论");
     assert_eq!(code, ReasonCode::IperfEffectiveWindowShort);
     assert!(detail.contains("487.126"), "必须给出全程实测值: {detail}");
@@ -3772,7 +3768,7 @@ fn an_unusable_window_without_samples_stays_silent() {
         required_secs: 180,
         ..Default::default()
     };
-    let (_, _, detail) = iperf_flow_verdict(IperfFlowVerdictIn {
+    let judged = iperf_flow_verdict(IperfFlowVerdictIn {
         raw_ok: true,
         measurement: true,
         effective_window: &empty_window,
@@ -3785,6 +3781,7 @@ fn an_unusable_window_without_samples_stays_silent() {
         client_tail: "",
         rx_monitor: None,
     });
+    let detail = judged.detail;
     assert!(!detail.contains("全程"), "{detail}");
 }
 
@@ -3799,7 +3796,7 @@ fn client_failure_before_a_full_window_is_still_a_setup_error() {
         required_secs: 180,
         complete: false,
     };
-    let (verdict, code, _) = iperf_flow_verdict(IperfFlowVerdictIn {
+    let judged = iperf_flow_verdict(IperfFlowVerdictIn {
         raw_ok: false,
         measurement: true,
         effective_window: &short,
@@ -3812,6 +3809,7 @@ fn client_failure_before_a_full_window_is_still_a_setup_error() {
         client_tail: "iperf3: error - unable to connect to server",
         rx_monitor: None,
     });
+    let (verdict, code) = (judged.verdict, judged.code);
     assert_eq!(verdict, Verdict::SetupError);
     assert_eq!(code, ReasonCode::IperfExecFailed);
 }
@@ -4217,6 +4215,8 @@ fn preflight_block_marks_iperf_without_touching_ping_legs() {
         title: "blocked".into(),
         link_group: String::new(),
         bidir: false,
+        bidir_total_target_mbps: None,
+        target_lines: Vec::new(),
         direction: String::new(),
         legs: vec![Leg {
             tag: "ab".into(),
@@ -4245,6 +4245,8 @@ fn missing_ab_row_is_restored_without_duplicating_existing_ba_row() {
         title: "partial bidirectional TCP".into(),
         link_group: String::new(),
         bidir: true,
+        bidir_total_target_mbps: None,
+        target_lines: Vec::new(),
         direction: String::new(),
         legs: vec![
             Leg {
@@ -4313,6 +4315,8 @@ fn unit_panic_is_expanded_to_both_direction_rows_without_generic_duplicate() {
         title: "panic bidirectional TCP".into(),
         link_group: String::new(),
         bidir: true,
+        bidir_total_target_mbps: None,
+        target_lines: Vec::new(),
         direction: String::new(),
         legs: vec![
             Leg {
@@ -4361,6 +4365,8 @@ fn unit_panic_reuses_a_committed_ab_row_and_only_fills_missing_ba() {
         title: "partial row then unit panic".into(),
         link_group: String::new(),
         bidir: true,
+        bidir_total_target_mbps: None,
+        target_lines: Vec::new(),
         direction: String::new(),
         legs: vec![
             Leg {
@@ -4432,6 +4438,8 @@ fn bidirectional_preflight_keeps_both_ab_and_ba_detail_rows() {
         title: "blocked bidirectional TCP".into(),
         link_group: String::new(),
         bidir: true,
+        bidir_total_target_mbps: None,
+        target_lines: Vec::new(),
         direction: String::new(),
         legs: vec![
             Leg {
@@ -4560,6 +4568,8 @@ fn ctstraffic_preflight_remains_per_leg_when_only_one_direction_has_args_error()
         title: "CTS mixed args/preflight".into(),
         link_group: String::new(),
         bidir: true,
+        bidir_total_target_mbps: None,
+        target_lines: Vec::new(),
         direction: String::new(),
         legs: vec![
             Leg {
@@ -4624,6 +4634,8 @@ fn ctstraffic_two_invalid_directions_keep_two_detail_rows_under_preflight() {
         title: "CTS two invalid directions".into(),
         link_group: String::new(),
         bidir: true,
+        bidir_total_target_mbps: None,
+        target_lines: Vec::new(),
         direction: String::new(),
         legs: vec![
             Leg {
@@ -4701,6 +4713,8 @@ fn preflight_block_takes_priority_over_resume_pass() {
         title: "blocked-resume".into(),
         link_group: String::new(),
         bidir: false,
+        bidir_total_target_mbps: None,
+        target_lines: Vec::new(),
         direction: String::new(),
         legs: vec![Leg {
             tag: String::new(),
@@ -4802,6 +4816,8 @@ round-trip min/avg/max/stddev = 1.250/2.500/3.750/1.021 ms
         title: "PING V4 -l 1400 n=3".into(),
         link_group: String::new(),
         bidir: false,
+        bidir_total_target_mbps: None,
+        target_lines: Vec::new(),
         direction: String::new(),
         legs: vec![Leg {
             tag: String::new(),
@@ -4870,6 +4886,8 @@ fn missing_gateway_is_not_reported_as_network_packet_loss() {
         title: "gateway-missing".into(),
         link_group: String::new(),
         bidir: false,
+        bidir_total_target_mbps: None,
+        target_lines: Vec::new(),
         direction: String::new(),
         legs: vec![Leg {
             tag: "gateway-diagnostic".into(),
@@ -4905,6 +4923,8 @@ fn agent_ping_http_failure_is_setup_error_not_one_hundred_percent_loss() {
         title: "agent-ping-http-error".into(),
         link_group: String::new(),
         bidir: false,
+        bidir_total_target_mbps: None,
+        target_lines: Vec::new(),
         direction: String::new(),
         legs: vec![Leg {
             tag: String::new(),
@@ -4940,6 +4960,8 @@ fn mixed_preflight_failure_still_runs_independent_ping_unit() {
         title: "mixed-iperf".into(),
         link_group: String::new(),
         bidir: false,
+        bidir_total_target_mbps: None,
+        target_lines: Vec::new(),
         direction: String::new(),
         legs: vec![Leg {
             tag: String::new(),
@@ -4966,6 +4988,8 @@ fn mixed_preflight_failure_still_runs_independent_ping_unit() {
         title: "mixed-ping".into(),
         link_group: String::new(),
         bidir: false,
+        bidir_total_target_mbps: None,
+        target_lines: Vec::new(),
         direction: String::new(),
         legs: vec![Leg {
             tag: "gateway-diagnostic".into(),
@@ -5360,11 +5384,10 @@ fn nic_sample_csv_keeps_counter_deltas_rates_validity_and_errors() {
     assert!(!csv.contains("\n# average_rx_mbps,"));
 }
 
-/// UDP 路径必须和 TCP 路径同一口径：平均达标但中间连续掉过坑，一样是
-/// FAIL；不够 5 秒的掉拍两边都不算。两条链的结论分叉过一次（D2），
-/// 不能再分叉第二次。
+/// UDP 路径必须和 TCP 路径同一口径：RX 平均达标就是 PASS，不被中间掉速
+/// 或 TX 诊断指标改写；RX 平均不达标则按子网问题 FAIL。
 #[test]
-fn a_dropout_fails_the_same_way_on_both_transports() {
+fn rx_average_is_the_only_rate_threshold_on_both_transports() {
     let target = 800.0;
     let raw = |rate_at: fn(u64) -> f64| -> Vec<(u64, u64, f64)> {
         (1..=180).map(|i| (i * 1_000, 1_000, rate_at(i))).collect()
@@ -5374,30 +5397,28 @@ fn a_dropout_fails_the_same_way_on_both_transports() {
     let blip = raw(|i| if i == 20 { 0.0 } else { 850.0 });
 
     // TCP 路径
-    let tx = healthy_stats(900.0);
     let pass = RateStats {
         series: steady.clone(),
         ..healthy_stats(850.0)
     };
-    let (verdict, _, _) = evaluate_nic_rx(RateMode::Verify, Some(target), &pass, &tx, None);
+    let (verdict, _, _) = nic_rx(RateMode::Verify, Some(target), &pass);
     assert_eq!(verdict, Verdict::Pass, "全程稳定应当 PASS");
 
     let fails = RateStats {
         series: dipped.clone(),
         ..healthy_stats(850.0)
     };
-    let (verdict, code, _) = evaluate_nic_rx(RateMode::Verify, Some(target), &fails, &tx, None);
-    assert_eq!((verdict, code), (Verdict::RateFail, ReasonCode::RxDropout));
+    let (verdict, code, _) = nic_rx(RateMode::Verify, Some(target), &fails);
+    assert_eq!((verdict, code), (Verdict::Pass, ReasonCode::None));
 
     let tolerated = RateStats {
         series: blip.clone(),
         ..healthy_stats(850.0)
     };
-    let (verdict, _, _) = evaluate_nic_rx(RateMode::Verify, Some(target), &tolerated, &tx, None);
+    let (verdict, _, _) = nic_rx(RateMode::Verify, Some(target), &tolerated);
     assert_eq!(verdict, Verdict::Pass, "一个采样周期的掉拍不该判 FAIL");
 
-    // UDP 路径用的是同一个 rate_excursion 谓词，直接验证它在同样输入上
-    // 给出同样的结论——两处判定链各自成文，共用的必须是这一个事实来源。
+    // `rate_excursion` 仍保留为诊断函数，但不再参与正式 verdict。
     assert!(rate_excursion(&steady, target).is_none());
     assert!(rate_excursion(&blip, target).is_none());
     let excursion = rate_excursion(&dipped, target).expect("UDP 侧也要检出同一个坑");

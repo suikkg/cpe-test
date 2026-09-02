@@ -1,12 +1,15 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import { buildRunRequest, plan, previewIsCurrent, reset } from './plan';
+import { buildRunRequest, importProject, plan, previewIsCurrent, reset } from './plan';
+import { emptyPlan, ensureDefaults } from '../domain/plan-build';
+import { serializeProject } from '../domain/project';
+import { emptyGlobals } from '../domain/globals';
 
 /**
  * 执行请求里那几项**跨套件生效**的设置必须真的发出去。
  *
  * 这条守的是一个已经犯过的错：`buildRunRequest` 只发
- * `duration/resume/screenshot + ui_plan`，`nic_policies` 恒为空数组，
- * 全局档位和 `limit_udp_by_link_speed` 一个都不发。后端这几条通路一直是通的
+ * `duration/resume/screenshot + ui_plan`，`nic_policies` 和全局档位没有发全，
+ * `limit_udp_by_link_speed` 也没有发。后端这几条通路一直是通的
  * （`webui/plan.rs::ui_request_base_config` 全都消费），所以没有任何服务端测试
  * 会红——表现只是「界面上没有这些开关」，而用户以为是设了不生效。
  *
@@ -15,6 +18,20 @@ import { buildRunRequest, plan, previewIsCurrent, reset } from './plan';
  */
 describe('buildRunRequest', () => {
   beforeEach(reset);
+
+  it('reset 会清掉执行态，避免测试或重新开始时沿用上一轮开关', () => {
+    plan.duration = 600;
+    plan.resume = true;
+    plan.screenshot = true;
+    plan.limitUdpByLinkSpeed = true;
+
+    reset();
+
+    expect(plan.duration).toBe(180);
+    expect(plan.resume).toBe(false);
+    expect(plan.screenshot).toBe(false);
+    expect(plan.limitUdpByLinkSpeed).toBe(false);
+  });
 
   it('带上按链路上限裁剪速率的开关', () => {
     expect(buildRunRequest().limit_udp_by_link_speed).toBe(false);
@@ -74,6 +91,39 @@ describe('buildRunRequest', () => {
     expect(filled.ping_payload_sizes).toEqual([32, 1400]);
   });
 
+  it('Wi-Fi 互测单向和双向门限原样进请求体', () => {
+    plan.globals.wifi_pair_rx_target_mbps = 1000;
+    plan.globals.wifi_pair_bidir_rx_target_mbps = 500;
+    const request = buildRunRequest();
+    expect(request.wifi_pair_rx_target_mbps).toBe(1000);
+    expect(request.wifi_pair_bidir_rx_target_mbps).toBe(500);
+  });
+
+  it('频段组合四门限与旧网口覆盖原样进请求体', () => {
+    plan.globals.wifi_band_thresholds = [
+      {
+        master_band: 'wifi_5g',
+        agent_band: 'wifi_2_4g',
+        rx_target_master_to_agent_mbps: 700,
+        rx_target_agent_to_master_mbps: 420,
+        bidir_total_rx_target_mbps: 540,
+      },
+    ];
+    plan.globals.wifi_pair_thresholds = [
+      {
+        src_endpoint: 'master:NAME=WLAN 5',
+        dst_endpoint: 'agent:NAME=WLAN 2',
+        rx_target_ab_mbps: 680,
+        rx_target_ba_mbps: 420,
+        bidir_rx_target_ab_mbps: 300,
+        bidir_rx_target_ba_mbps: 210,
+      },
+    ];
+    const request = buildRunRequest();
+    expect(request.wifi_band_thresholds).toEqual(plan.globals.wifi_band_thresholds);
+    expect(request.wifi_pair_thresholds).toEqual(plan.globals.wifi_pair_thresholds);
+  });
+
   it('只发真的填了东西的网卡策略', () => {
     plan.nicPolicies = [
       { endpoint: 'master:NAME=eth0', rx_target: '90%', udp_bandwidth: '', udp_length: '' },
@@ -86,6 +136,43 @@ describe('buildRunRequest', () => {
 
   it('矩阵路径已退役：pairs 恒为空', () => {
     expect(buildRunRequest().pairs).toEqual([]);
+  });
+
+  it('导入没有执行设置的旧项目时清掉上一项目的设置，避免静默串用', () => {
+    plan.duration = 600;
+    plan.limitUdpByLinkSpeed = true;
+    plan.globals.udp_bandwidths = ['9000m'];
+    plan.nicPolicies = [
+      { endpoint: 'master:NAME=eth0', rx_target: '90%', udp_bandwidth: '', udp_length: '' },
+    ];
+
+    // 真正「没有执行设置」的是旧版项目文件：v3 导出永远带一份完整快照，
+    // 那时的空值是**明确的空**，不该被出厂默认顶掉。
+    const legacy = JSON.stringify({
+      project_version: 2,
+      ui_plan: ensureDefaults(emptyPlan()),
+    });
+    expect(importProject(legacy)).toBe(true);
+
+    expect(plan.duration).toBe(180);
+    expect(plan.limitUdpByLinkSpeed).toBe(false);
+    expect(plan.globals.udp_bandwidths).toEqual(['2500m']);
+    expect(plan.nicPolicies).toEqual([]);
+  });
+
+  it('v3 项目里明确的空值不会被出厂默认顶掉', () => {
+    plan.globals.udp_bandwidths = ['9000m'];
+    // 项目明确声明「不覆盖 UDP 带宽」（走钉住的档位表），导入后必须照办：
+    // 回落到出厂默认 2500m 就等于换一台机器换一套灌包强度。
+    const project = serializeProject(ensureDefaults(emptyPlan()), {
+      duration: 60,
+      limit_udp_by_link_speed: false,
+      globals: { ...emptyGlobals(), udp_profiles: [{ bandwidth: '1000m', length: '64' }] },
+    });
+    expect(importProject(project)).toBe(true);
+    expect(plan.globals.udp_bandwidths).toEqual([]);
+    expect(plan.globals.udp_profiles).toEqual([{ bandwidth: '1000m', length: '64' }]);
+    expect(buildRunRequest().udp_profiles).toEqual([{ bandwidth: '1000m', length: '64' }]);
   });
 });
 

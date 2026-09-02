@@ -61,10 +61,19 @@ shasum -a 256 dist/cpe_test-v<版本号>-windows-config-docs.zip   # 必须等�
    `master::executor::aggregate_unit_verdict` 和 `report::group_verdict` 都必须调它，
    不许各写一份。由 `verdict_priority_has_exactly_one_definition_in_the_tree` 强制。
 
-2. **速率判定口径只有一份实现** —— `master::rate_window`。
-   这一层只吃网卡计数器样本和目标速率，不碰进程、端口、HTTP、线程。
-   所以「采样不可信必须判 NOT_EVALUATED 而不是 RATE_FAIL」这条能被单独审。
-   UDP / TCP / CTS 三条路径都调它。
+2. **速率判定口径只有一份实现** —— `master::rate_window::evaluate_rx_acceptance`。
+   这一层只吃**接收端**网卡计数器样本和目标速率，不碰进程、端口、HTTP、线程，
+   **也不碰发送端**——TX 覆盖率、TX-P10、offered 负载一律不进这个函数。
+   四种结果封闭：无有效 RX 平均 → `NOT_EVALUATED`；无门限 → `MEASURED`；
+   `RX >= 门限` → `PASS`；`RX < 门限` → `RATE_FAIL`。UDP / TCP / CTS 三条路径都调它。
+
+   由此推出**两条不许破坏的推论**（ADR-17，详见 `.ai/PROJECT_ARCHITECTURE.md`）：
+
+   - 「接收端采样不可信必须判 NOT_EVALUATED 而不是 RATE_FAIL」能被单独审；
+   - **判定之后不许再改写结果**。UDP 丢包、CTS 丢帧、TX 负载、滚动窗口、
+     中途掉速、工具退出状态、起流数不足，全部走 `VerdictResult::diagnostics`。
+     历史上正是这些「判定后再叠一层」的代码让同一种故障在 TCP 和 UDP 路径上
+     得到相反结论，并且推翻了用户确认过的「RX 达标必定 PASS」。
 
 3. **鉴权先于路由** —— `master/webui/http.rs::handle()` 里，token 校验在**任何**分支之前，
    页面自己也不例外。页面里带着给 API 用的口令，放行未认证的 `GET /`

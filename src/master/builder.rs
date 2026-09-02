@@ -89,6 +89,11 @@ pub struct SpecNorm {
     pub rate_targets: RateTargets,
     /// 双向并发单元专用的门限，按方向（ab/ba）。空则双向也走既有兜底链。
     pub rate_targets_bidir: RateTargets,
+    /// 双向并发单元的「两端 RX 合计」门限。
+    ///
+    /// 配了它，这个双向单元就只按合计判定：两条腿各自只测量，单元级比一次
+    /// 合计（见 [`crate::config::TestSpec::rate_target_bidir_total_mbps`]）。
+    pub rate_target_bidir_total: Option<f64>,
     pub rate_check: RateCheckCfg,
     /// 两层链路策略（角色兜底 + 单口覆盖）；空则全部走内置推导。
     pub link_profiles: LinkProfiles,
@@ -244,6 +249,15 @@ pub struct Unit {
     /// 纯粹是「这一批单元在报表里归到哪一组」。
     pub link_group: String,
     pub bidir: bool,
+    /// 计划页显示的「每条腿最终按什么门限判、门限来自哪一层」。
+    ///
+    /// **只用于展示**，判定和 resume 都不读它。
+    pub target_lines: Vec<String>,
+    /// 双向单元的「两端 RX 合计」门限；`None` = 按每方向门限判定。
+    ///
+    /// 判定入口在 `executor::bidir_total_verdict`：两条腿都形成有效 RX 平均后，
+    /// **只比一次** `AB.rx_avg + BA.rx_avg >= 门限`。
+    pub bidir_total_target_mbps: Option<f64>,
     /// 规范方向：`ab` / `ba` / `bidir`；诊断类单元为空。
     ///
     /// **只用于展示**，判定和 resume 都不读它。存在的理由是单向单元的
@@ -524,6 +538,9 @@ pub fn spec_from_config(
         rate_mode: t.rate_mode.unwrap_or(cfg.iperf.rate_check.mode),
         rate_targets: t.rate_targets_mbps.clone().unwrap_or_default(),
         rate_targets_bidir: t.rate_targets_bidir_mbps.clone().unwrap_or_default(),
+        rate_target_bidir_total: t
+            .rate_target_bidir_total_mbps
+            .filter(|value| value.is_finite() && *value > 0.0),
         rate_check: cfg.iperf.rate_check.clone(),
         link_profiles: cfg.link_profiles.clone(),
         ctstraffic: cfg.ctstraffic.clone(),
@@ -657,6 +674,24 @@ fn udp_estimated_secs(
         .saturating_add(stagger_ms.saturating_add(discovery_ms).div_ceil(1_000))
 }
 
+/// 计划页要显示的一行「这条腿最终按什么门限判」。
+///
+/// 预览必须直接给出**最终生效值**，而不是把请求体里的字段原样铺出来：
+/// `RateTargets::for_direction("ab")` 是 `ab.or(forward)`，任务里显式填的
+/// `forward` 可以被频段表插进来的 `ab` 无声推翻，两个字段都还在，人看不出来。
+fn target_line(direction: &str, target: Option<f64>, source: RxTargetSource) -> String {
+    let prefix = match direction {
+        "ab" => "A→B ",
+        "ba" => "B→A ",
+        "bidir" => "双向 ",
+        _ => "",
+    };
+    match target {
+        Some(value) => format!("{prefix}门限 {value:.0}Mbps（{}）", source.label()),
+        None => format!("{prefix}{}", source.label()),
+    }
+}
+
 fn dir_pairs<'a>(spec: &'a SpecNorm, dir: &str) -> Vec<(&'a Endpoint, &'a Endpoint, &'static str)> {
     match dir {
         "ab" => vec![(&spec.src, &spec.dst, "")],
@@ -761,6 +796,8 @@ pub fn build_units(
                                         }
                                     }
                                     let mut legs = Vec::new();
+                                    // Ping 单元没有速率门限：RTT 与丢包的判定在别处。
+                                    let mut target_lines: Vec<String> = Vec::new();
                                     for (s, d, tag) in &pairs {
                                         let flow_direction =
                                             if bidir { tag.to_string() } else { dir.clone() };
@@ -771,7 +808,7 @@ pub fn build_units(
                                             &spec.name,
                                             &leg_policy,
                                         );
-                                        let target = leg_rx_target(
+                                        let (effective_mode, target, target_source) = leg_rate_plan(
                                             spec,
                                             &leg_policy,
                                             &flow_direction,
@@ -779,8 +816,11 @@ pub fn build_units(
                                             &s.nic,
                                             &d.nic,
                                         );
-                                        let effective_mode =
-                                            rate::effective_mode(spec.rate_mode, target);
+                                        target_lines.push(target_line(
+                                            &flow_direction,
+                                            target,
+                                            target_source,
+                                        ));
                                         let t = IperfTask {
                                             v6,
                                             udp: false,
@@ -825,6 +865,10 @@ pub fn build_units(
                                         title,
                                         link_group: spec.link_group.clone(),
                                         bidir,
+                                        target_lines,
+                                        bidir_total_target_mbps: bidir
+                                            .then_some(spec.rate_target_bidir_total)
+                                            .flatten(),
                                         direction: dir.to_string(),
                                         legs,
                                         est_secs: spec.duration + 10,
@@ -903,6 +947,8 @@ pub fn build_units(
                                         }
                                     }
                                     let mut legs = Vec::new();
+                                    // Ping 单元没有速率门限：RTT 与丢包的判定在别处。
+                                    let mut target_lines: Vec<String> = Vec::new();
                                     let mut max_n = 1;
                                     for (leg_idx, ((s, d, tag), load)) in
                                         pairs.iter().zip(leg_loads.iter()).enumerate()
@@ -956,7 +1002,7 @@ pub fn build_units(
                                             &spec.name,
                                             &leg_policy,
                                         );
-                                        let target = leg_rx_target(
+                                        let (effective_mode, target, target_source) = leg_rate_plan(
                                             spec,
                                             &leg_policy,
                                             &flow_direction,
@@ -964,8 +1010,11 @@ pub fn build_units(
                                             &s.nic,
                                             &d.nic,
                                         );
-                                        let effective_mode =
-                                            rate::effective_mode(spec.rate_mode, target);
+                                        target_lines.push(target_line(
+                                            &flow_direction,
+                                            target,
+                                            target_source,
+                                        ));
                                         // offered 必须跟着实际下发的 -b 走，否则
                                         // 报表里的「请求负载」和命令行对不上。
                                         let offered_per_stream_mbps = Some(load.mbps);
@@ -1084,6 +1133,10 @@ pub fn build_units(
                                         title,
                                         link_group: spec.link_group.clone(),
                                         bidir,
+                                        target_lines,
+                                        bidir_total_target_mbps: bidir
+                                            .then_some(spec.rate_target_bidir_total)
+                                            .flatten(),
                                         direction: dir.to_string(),
                                         legs,
                                         est_secs: udp_estimated_secs(
@@ -1164,10 +1217,12 @@ pub fn build_units(
                                 let profile_label =
                                     format!("CTS TCP {window_label} ×{}连接", tcp_streams);
                                 let mut legs = Vec::new();
+                                // Ping 单元没有速率门限：RTT 与丢包的判定在别处。
+                                let mut target_lines: Vec<String> = Vec::new();
                                 for (src, dst, tag) in &pairs {
                                     let flow_direction =
                                         if bidir { tag.to_string() } else { dir.clone() };
-                                    let target = leg_rx_target(
+                                    let (effective_mode, target, target_source) = leg_rate_plan(
                                         spec,
                                         &link_policy(spec, src, dst),
                                         &flow_direction,
@@ -1175,8 +1230,11 @@ pub fn build_units(
                                         &src.nic,
                                         &dst.nic,
                                     );
-                                    let effective_mode =
-                                        rate::effective_mode(spec.rate_mode, target);
+                                    target_lines.push(target_line(
+                                        &flow_direction,
+                                        target,
+                                        target_source,
+                                    ));
                                     legs.push(Leg {
                                         tag: tag.to_string(),
                                         kind: LegKind::CtsTraffic(CtsTrafficTask {
@@ -1216,6 +1274,10 @@ pub fn build_units(
                                     title,
                                     link_group: spec.link_group.clone(),
                                     bidir,
+                                    target_lines,
+                                    bidir_total_target_mbps: bidir
+                                        .then_some(spec.rate_target_bidir_total)
+                                        .flatten(),
                                     direction: dir.to_string(),
                                     legs,
                                     est_secs: if setup_error.is_some() {
@@ -1278,6 +1340,8 @@ pub fn build_units(
                                     ));
                                 }
                                 let mut legs = Vec::new();
+                                // Ping 单元没有速率门限：RTT 与丢包的判定在别处。
+                                let mut target_lines: Vec<String> = Vec::new();
                                 let mut max_streams = 1u32;
                                 for (src, dst, tag) in &pairs {
                                     let streams = if setup_error.is_some() {
@@ -1306,7 +1370,7 @@ pub fn build_units(
                                     max_streams = max_streams.max(streams);
                                     let flow_direction =
                                         if bidir { tag.to_string() } else { dir.clone() };
-                                    let target = leg_rx_target(
+                                    let (effective_mode, target, target_source) = leg_rate_plan(
                                         spec,
                                         &link_policy(spec, src, dst),
                                         &flow_direction,
@@ -1314,8 +1378,11 @@ pub fn build_units(
                                         &src.nic,
                                         &dst.nic,
                                     );
-                                    let effective_mode =
-                                        rate::effective_mode(spec.rate_mode, target);
+                                    target_lines.push(target_line(
+                                        &flow_direction,
+                                        target,
+                                        target_source,
+                                    ));
                                     // 每流带宽 × 流数 = 整条腿的总量。CTS 侧的
                                     // 字段是**总量**口径，与 iperf 的每流口径相反。
                                     let offered_total_mbps =
@@ -1373,6 +1440,10 @@ pub fn build_units(
                                     title,
                                     link_group: spec.link_group.clone(),
                                     bidir,
+                                    target_lines,
+                                    bidir_total_target_mbps: bidir
+                                        .then_some(spec.rate_target_bidir_total)
+                                        .flatten(),
                                     direction: dir.to_string(),
                                     legs,
                                     est_secs: if setup_error.is_some() {
@@ -1390,6 +1461,8 @@ pub fn build_units(
                 if spec.kinds.iter().any(|k| k == "ping") {
                     for payload in &spec.payload_sizes {
                         let mut legs = Vec::new();
+                        // Ping 单元没有速率门限：RTT 与丢包的判定在别处。
+                        let target_lines: Vec<String> = Vec::new();
                         for (s, d, tag) in &pairs {
                             legs.push(Leg {
                                 tag: tag.to_string(),
@@ -1425,6 +1498,9 @@ pub fn build_units(
                             title,
                             link_group: spec.link_group.clone(),
                             bidir,
+                            target_lines,
+                            // Ping 不是吞吐测试，没有 RX 合计门限这回事。
+                            bidir_total_target_mbps: None,
                             direction: dir.to_string(),
                             legs,
                             est_secs: ping_estimated_secs(spec.ping_count),
@@ -1522,6 +1598,7 @@ mod tests {
             rate_mode: RateMode::Auto,
             rate_targets: RateTargets::default(),
             rate_targets_bidir: RateTargets::default(),
+            rate_target_bidir_total: None,
             rate_check: RateCheckCfg::default(),
             link_profiles: LinkProfiles::default(),
             ctstraffic: CtsTrafficCfg::default(),
@@ -3310,6 +3387,82 @@ mod tests {
             vec![Some(900.0), Some(2000.0)],
             "没配双向门限的那个方向要回到既有兜底链，而不是丢掉目标"
         );
+    }
+
+    /// 配了「双向 RX 合计」门限时，两条腿**没有自己的门限**，也不许因此变成
+    /// `TARGET_MISSING`。
+    ///
+    /// 判定在单元级只做一次合计比对（`executor::bidir_total_verdict`）。给腿
+    /// 留一个每方向门限，报告上会出现「AB 判 RATE_FAIL、单元判 PASS」这种自相
+    /// 矛盾的两行；只清门限不改模式，显式配 `verify` 的用户会拿到一整轮
+    /// `NOT_EVALUATED / TARGET_MISSING`——腿本来就不该有目标，这不是缺配置。
+    #[test]
+    fn a_bidirectional_total_threshold_turns_both_legs_into_pure_measurement() {
+        let mut spec = base_spec();
+        spec.directions = vec!["bidir".into()];
+        spec.rate_mode = RateMode::Verify;
+        // 每方向门限和全局门限都在，但合计门限必须压过它们。
+        spec.rate_targets_bidir = RateTargets {
+            forward: None,
+            ab: Some(1_000.0),
+            ba: Some(800.0),
+        };
+        spec.rate_targets = RateTargets {
+            forward: Some(2_000.0),
+            ab: None,
+            ba: None,
+        };
+        spec.rate_target_bidir_total = Some(1_500.0);
+
+        let mut port = PORT_BASE;
+        let (units, _) = build_units(&[spec], true, &mut port);
+        let unit = units.first().expect("双向单元");
+        assert_eq!(unit.bidir_total_target_mbps, Some(1_500.0));
+        for leg in &unit.legs {
+            match &leg.kind {
+                LegKind::IperfSingle(task) => {
+                    assert_eq!(task.rx_target_mbps, None, "{} 腿不该有自己的门限", leg.tag);
+                    assert_eq!(
+                        task.rate_mode,
+                        RateMode::Observe,
+                        "{} 腿必须落到 Observe，否则 verify 会判 TARGET_MISSING",
+                        leg.tag
+                    );
+                }
+                other => panic!("预期 iperf 单流腿，实得 {other:?}"),
+            }
+        }
+    }
+
+    /// 合计门限**必须**进 resume identity。
+    ///
+    /// 腿的 `rx_target_mbps` 现在是 `None`，那条既有的「门限变了 identity 就变」
+    /// 的通路在这里断了：不显式记的话，把合计从 900 改成 1200 之后 resume 会拿
+    /// 按 900 判过的 PASS 顶掉这一轮。
+    #[test]
+    fn changing_the_bidirectional_total_threshold_invalidates_the_resume_identity() {
+        let id_with = |total: Option<f64>| {
+            let mut spec = base_spec();
+            spec.directions = vec!["bidir".into()];
+            spec.rate_target_bidir_total = total;
+            let mut port = PORT_BASE;
+            let (units, _) = build_units(&[spec], true, &mut port);
+            units[0].id.clone()
+        };
+        assert_ne!(id_with(Some(900.0)), id_with(Some(1_200.0)));
+        assert_ne!(id_with(Some(900.0)), id_with(None));
+        assert_eq!(id_with(None), id_with(None), "没配时 identity 要稳定");
+
+        // 单向单元不受影响：合计门限对它没有意义，identity 一个字节都不该变。
+        let single = |total: Option<f64>| {
+            let mut spec = base_spec();
+            spec.directions = vec!["ab".into()];
+            spec.rate_target_bidir_total = total;
+            let mut port = PORT_BASE;
+            let (units, _) = build_units(&[spec], true, &mut port);
+            units[0].id.clone()
+        };
+        assert_eq!(single(None), single(Some(900.0)));
     }
 
     /// 门限变了旧 PASS 就得失效——否则开 resume 会拿按 2000 判过的结果

@@ -37,10 +37,56 @@
 | `every_verdict_label_round_trips` | `Verdict::label()` 与 `from_label()` 一一对应 |
 | `the_summary_grid_has_one_cell_for_every_verdict` | 报告概览的统计格覆盖全部六个 verdict |
 
-**判定层的三条新单源**（ADR-12，改之前读变更说明）：
+**判定层的单源**（ADR-12 / ADR-17，改之前读变更说明）：
 `rate::effective_rate_target`（Observe/Discover 不比目标）、
-`rate_window::offered_shortfall_explains_rx` + `offered_floor_mbps`（发送端没灌够的防误判）、
+`rate_window::evaluate_rx_acceptance`（**吞吐验收的唯一入口**）、
+`rate_window::rx_acceptance_diagnostics`（哪些事实只作诊断）、
+`rate_window::offered_floor_mbps`（目标 + 余量）、
 `WINDOW_COMPLETE_TOLERANCE_MS`（有效窗口容差，三条链共用）。
+
+### ADR-17：吞吐验收只有两层，其余全是诊断
+
+用户确认的验收规则是**「接收端 RX 平均达到门限必定 PASS，不看其他指标」**。
+在此之前它在三个地方被推翻：UDP 链把丢包门槛和 `rx_meets_target` 绑在一起、
+`cts_apply_udp_loss` 会把已经 PASS 的 CTS 结果改写成 `RATE_FAIL`、
+CTS/UDP 各自在 RX 比对**之前**插了流数与运行时错误分支。同一种故障因此在
+TCP 和 UDP 两条路径上得到相反的结论。
+
+现在的结构是：
+
+1. **前提层**——这一轮能不能形成可信的接收端 RX 平均值（有效窗口、采样覆盖率、
+   计数器是否整窗停滞、有没有起过流）。形不成就是 `NOT_EVALUATED` / `SETUP_ERROR`。
+2. **验收层**——`evaluate_rx_acceptance(mode, target, rx_stats)`，四种结果封闭：
+   无有效 RX → `NOT_EVALUATED`；无门限 → `MEASURED`；`RX >= 门限` → `PASS`；
+   `RX < 门限` → `RATE_FAIL`。它**不接受**发送端参数，所以「TX 影响了判定」在类型上就不可能。
+
+UDP 丢包、CTS 丢帧、TX 平均/P10/覆盖率、滚动窗口、中途掉速、工具退出状态、
+起流数不足，全部经 `VerdictResult::diagnostics` → `Row::diagnostics` 走展示通道。
+`the_leg_assembly_contracts_have_exactly_one_definition_in_the_tree` 现在也守着
+`fn evaluate_rx_acceptance` 与 `fn rx_acceptance_diagnostics` 各自只有一处定义。
+
+### ADR-18：Wi-Fi 双向按两端 RX 合计判定
+
+Wi-Fi↔Wi-Fi 是半双工共享介质，AB 和 BA 抢同一段空口时间，两个方向怎么分完全
+取决于调度——要求各自达到单向门限的一半是凭空发明的约束。新增
+`TestSpec::rate_target_bidir_total_mbps` → `SpecNorm::rate_target_bidir_total` →
+`Unit::bidir_total_target_mbps`，判定入口是
+`executor::verdict_assembly::bidir_total_verdict`：
+
+```text
+双向有效吞吐 = AB 方向接收端 RX 平均 + BA 方向接收端 RX 平均
+```
+
+用两端 **RX** 相加而不是 TX+RX：同一个包在发送侧 TX 和接收侧 RX 各记一次，
+相加是重复计数；TX 还会混进背景流量和 socket 缓冲里从未上线的字节。
+
+配了合计门限时 `builder::policy::leg_rate_plan` 会把两条腿落到
+`(RateMode::Observe, None)`——腿只测量，单元级比一次合计。只清门限不改模式的话，
+显式配 `verify` 的用户会拿到一整轮 `TARGET_MISSING`。合计门限**必须**进 resume
+identity（`push_bidir_total_identity`）：腿的 `rx_target_mbps` 是 `None`，
+那条既有的「门限变了 identity 就变」的通路在这里断了。
+
+每方向的 bidir 门限保留：有线↔有线是全双工，按方向判定仍然正确。
 
 ## 0. AI 阅读规则
 
@@ -395,6 +441,10 @@ Windows 文本适配器：`src/cmd/ipconfig.rs` 解析中英文 `ipconfig /all`�
 - PASS 规则：ping 见 `ping.rs` 与 `executor.rs`；iperf core、单流、组内流、组汇总和 Unit 分别见 `executor.rs`；组合计行在 `executor.rs` 标记，并由 `report.rs` 排除在报告总数外。
 - RESUME 是 Unit 级；当前按 `age.num_hours() <= 24` 判断，过去记录实际可命中到不足 25 小时，并容忍未来时间 60 秒（`executor.rs`）。agent HTTP 线程池固定 16 worker，但 iperf3/CTS 的 client 作业各自跑在独立命名线程（`iperf-client-<id>`）上，`/iperf/client/start` 立即返回 job id，**并发流数不受 16 的限制**；每 30 秒 sweep，server/monitor 最大存活分别为 10/30 分钟（`agent/server.rs`）。
 - 对外 JSON 字段即使当前生产代码没有本地消费者，也属于协议兼容面；删除/重命名要同步所有端点和版本策略。
+- WebUI 的 Wi-Fi 门限以“主控频段 × 辅测频段”为一组，每组两个单向门限（主控→辅测、辅测→主控）加**一个双向 RX 合计门限**；界面只按当前两端实际频段组合去重显示。旧的两个「每方向双向门限」按两者之和迁移成合计，只填过一个方向的不推导。旧发送频段规则和具体网口覆盖只作 request.json 读取兼容，新项目不再创建。
+- 频段在**存储与比较**上一律是稳定枚举 `wifi_2_4g` / `wifi_5g` / `wifi_6g` / `unknown`（Rust `plan::canonical_wifi_band`，TS `canonicalWifiBand`），界面再渲染成 `2.4G / 5G / 6G`。展示文案是最容易被改的东西，而改完之后频段规则会**静默失效**——找不到规则不报错，只是门限没了。
+- 门限的最终生效值必须能在预览上直接看到（`PlannedUnit::targets`）。`RateTargets::for_direction("ab")` 是 `ab.or(forward)`，所以「`forward` 字段还在」不能证明它还在生效；补兜底门限一律走 `fill_direction_target`，它按 `for_direction` 的结果判断，不看某个字段填没填。
+- 项目文件 `project_version: 3` 是**有效值快照**：导出前经 `resolveEffectiveGlobals` 把留空的格子换算成主控当前真正会用的值，并固化界面上没有输入框却参与判定的两样东西——全局 RX 门限（`RunRequest::global_rate_targets`）和 UDP 档位原样列表（`RunRequest::udp_profiles`）。`Some(全 null)` 的全局门限表示「本项目明确没有全局门限」，与 `None`（没意见，沿用本机）不是一回事。UDP 档位必须按**原样列表**固化，不能拆成三条轴——三条轴是叉乘语义，`1000m` 单独带 `-l 64` 的档位表还原不回来。
 
 ### 11.2 常见修改入口
 

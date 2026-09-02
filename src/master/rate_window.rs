@@ -7,11 +7,12 @@
 //! 验收文档反复强调的两条铁律都在这一层实现：
 //!
 //! 1. 正式口径永远是接收端 OS 网卡计数器，工具自报速率只作诊断；
-//! 2. 采样不可信时必须产出 `NOT_EVALUATED`，绝不能写成 CPE 性能失败。
+//! 2. 没有可用 RX 平均值时才产出 `NOT_EVALUATED`；一旦 RX 平均低于目标，
+//!    TX/RX 侧问题按子网性能失败处理。
 //!
-//! 第 2 条曾经被违反：`evaluate_nic_rx` 一度把 `RX_BELOW_TARGET` 判在滚动窗口
-//! 覆盖率检查之前，导致"网卡计数器中断"被报成"CPE 不达标"。把这一层单独隔出
-//! 来，是为了让判定顺序成为一件能被单独审阅和测试的事。
+//! 这一层仍先排除完全没有可用 RX 平均值、RX 基础采样覆盖不足等无法形成结论的
+//! 情况；一旦 RX 平均值有效且低于目标，TX/RX 的速率问题统一作为子网失败。
+//! 把这一层单独隔出来，是为了让这条判定顺序能被单独审阅和测试。
 
 use crate::reason::ReasonCode;
 use std::collections::HashSet;
@@ -20,7 +21,7 @@ use crate::config::RateMode;
 // 「有效流量」下限与采样层共用同一个常量，避免两处阈值漂移。
 pub use crate::nic::monitor::MIN_VALID_RX_MBPS;
 use crate::protocol::{MonitorSample, MonitorStopOut};
-use crate::verdict::Verdict;
+use crate::verdict::VerdictResult;
 
 /// 接收端网卡 RX 采样覆盖率下限；低于它不允许做正式性能判定。
 pub const MIN_RATE_SAMPLE_COVERAGE: f64 = 0.95;
@@ -34,17 +35,20 @@ pub const ROLLING_COVERAGE_TOLERANCE_MS: u64 = 50;
 /// 判据落在**原始逐样本序列**上，所以这就是字面意义的「连续 5 秒」，
 /// 不再是「某个 5 秒滑动平均越界」。一个采样周期的抖动一律不算：它和
 /// Wi-Fi 发 probe、信道扫描造成的掉一拍在网卡计数器上不可区分。
+#[allow(dead_code)]
 pub const MIN_RATE_EXCURSION_MS: u64 = 5_000;
 /// 掉坑门限相对目标的容差：低于 `target * (1 - 它)` 才算掉坑。
 ///
 /// 门限贴着目标比（老口径的 `rate < target`）会把噪声判成故障：
 /// run_20260828_162822_17788 的 unit-109-110 就是被 1973.171 / 2000 这
 /// 1.35% 的差判掉的。
+#[allow(dead_code)]
 pub const RATE_DROPOUT_TOLERANCE: f64 = 0.20;
 /// 断流判据相对目标的比例：「灌包速率基本为 0」取目标的 1%。
 ///
 /// 不取 `target * 0.1`——那个量级还有十分之一的目标速率在跑，属于掉坑
 /// 而不是断流，两者的排查方向完全不同。
+#[allow(dead_code)]
 pub const RATE_OUTAGE_RATIO: f64 = 0.01;
 
 #[derive(Debug, Clone, Default)]
@@ -71,6 +75,7 @@ pub(crate) struct RateStats {
     /// 断流/掉坑判在它上面，不判在 5 秒滑动平均上：滑动平均会把一个
     /// 采样周期的抖动摊成 5 个窗口，既制造误判也把时长报错（详见
     /// [`RateExcursion`]）。时长已去过重叠，累加即真实覆盖时长。
+    #[allow(dead_code)]
     pub series: Vec<(u64, u64, f64)>,
     /// 判定窗口内「计数器连续零增长」的最长一段占已覆盖时长的比例。
     ///
@@ -92,6 +97,7 @@ pub(crate) struct EffectiveWindow {
 
 /// 越界的形态：断流 / 掉坑。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub(crate) enum ExcursionKind {
     /// 灌包速率基本为 0——链路这几秒是真的断的。
     Outage,
@@ -105,6 +111,7 @@ pub(crate) enum ExcursionKind {
     // 全收进来。真要查异常抬升，判据得相对**链路自身的中位数**而不是目标。
 }
 
+#[allow(dead_code)]
 impl ExcursionKind {
     /// 报告里的原因码。两种形态分开发码，读报告的人一眼就知道该查什么。
     pub fn reason_code(self) -> ReasonCode {
@@ -142,6 +149,7 @@ impl ExcursionKind {
 /// [`MIN_RATE_EXCURSION_MS`] 才算数，报出来的秒数就是真秒数，能直接和截图
 /// 对上；单个采样周期的抖动一律忽略——它和 probe / 信道扫描不可区分。
 #[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
 pub(crate) struct RateExcursion {
     pub kind: ExcursionKind,
     /// 判据门限，已按目标和容差折算。
@@ -160,6 +168,7 @@ pub(crate) struct RateExcursion {
     pub runs: usize,
 }
 
+#[allow(dead_code)]
 impl RateExcursion {
     /// 报告和日志里那句人话。
     pub fn describe(&self) -> String {
@@ -194,6 +203,7 @@ impl RateExcursion {
 ///
 /// `series` 的元素是 `(样本结束时刻ms, 该样本独占的时长ms, 速率Mbps)`——
 /// 时长已经去过重叠，所以直接累加就是真实覆盖时长，不需要假设采样周期。
+#[allow(dead_code)]
 fn scan_excursion(
     series: &[(u64, u64, f64)],
     kind: ExcursionKind,
@@ -263,6 +273,7 @@ fn scan_excursion(
 ///
 /// 顺序是**由重到轻**：断流的样本必然也满足掉坑判据，先报断流才说得清
 /// 「这几秒是真断了」还是「只是掉下去了」。
+#[allow(dead_code)]
 pub(crate) fn rate_excursion(series: &[(u64, u64, f64)], target: f64) -> Option<RateExcursion> {
     if !target.is_finite() || target <= 0.0 {
         return None;
@@ -280,38 +291,6 @@ pub(crate) fn rate_excursion(series: &[(u64, u64, f64)], target: f64) -> Option<
     })
 }
 
-/// 按接收端 OS 网卡 RX 做正式速率判定。
-///
-/// `tx_stats` 是**发送端**网卡的同窗口统计。验收文档 W08 要求「有明确目标时，
-/// RX/TX 任一侧完整滚动窗口覆盖率低于 95% 均为 NOT_EVALUATED」——发送端采样
-/// 塌了同样说明这一轮的时间轴不可信，不能拿去给 CPE 定性。没有目标时（observe
-/// / discover / 目标未知）只记录实测能力，不需要双侧门槛。
-/// 接收速率与发送速率「基本相等」的判定比例。
-///
-/// 高于它就认为**接收端已经把发出去的量基本收下了**，缺口出在发送端而不是
-/// 被测设备身上。
-pub(crate) const RX_TRACKS_TX_RATIO: f64 = 0.95;
-
-/// 「RX 不达标」是不是**发送端没灌够**造成的。
-///
-/// 全仓唯一定义（ADR-12(c)）。在此之前它只存在于 UDP 链（`udp.rs` +
-/// `udp_leg_verdict`），`evaluate_nic_rx` 只查 TX 覆盖率、不查 TX 水平——
-/// 于是 **CTS UDP 单流灌不满时 `RX < target` 直接判 `RX_BELOW_TARGET`**，
-/// 正是 UDP 链两个单测拼命要防的「把发送端瓶颈写成 CPE 性能失败」，
-/// 在 CTS 路径上零防护。
-///
-/// 返回 `true` = 接收端基本等于发出的量，**说明不了被测设备的能力**，
-/// 该判 NOT_EVALUATED 让人把负载补足再测，而不是判 CPE 不达标。
-pub(crate) fn offered_shortfall_explains_rx(rx_avg: Option<f64>, tx_p10: Option<f64>) -> bool {
-    match (rx_avg, tx_p10) {
-        (Some(rx), Some(tx)) if tx.is_finite() && tx > 0.0 && rx.is_finite() => {
-            rx >= tx * RX_TRACKS_TX_RATIO
-        }
-        // 缺数据时保守：宁可不下 CPE 失败的结论。
-        _ => true,
-    }
-}
-
 /// 验证目标所需的最低发送负载（目标 + 余量）。
 ///
 /// 三条链共用同一个算法，免得「余量」在不同后端上是不同的数。
@@ -319,23 +298,41 @@ pub(crate) fn offered_floor_mbps(target_mbps: Option<f64>, headroom_pct: f64) ->
     target_mbps.map(|target| target * (1.0 + headroom_pct.max(0.0) / 100.0))
 }
 
-pub(crate) fn evaluate_nic_rx(
+/// **吞吐验收的唯一入口**（ADR-17）。
+///
+/// 它只回答一个问题，并且只允许四种答案：
+///
+/// ```text
+/// 形不成有效 RX 平均值 → NOT_EVALUATED
+/// 没有可信门限         → MEASURED
+/// RX 平均 >= 门限      → PASS
+/// RX 平均 <  门限      → RATE_FAIL
+/// ```
+///
+/// 「有效 RX 平均值」只有三条门槛，全部落在**接收端**：计数器不能整窗停滞、
+/// 平均值要存在且高于有效流量下限、RX 采样覆盖率要够。三条都过了就必须给出
+/// PASS/FAIL——这是用户确认过的验收规则：**RX 平均达到门限就是 PASS，不看其他
+/// 指标**。
+///
+/// 因此这里**看不到**发送端：TX 覆盖率、TX-P10、offered 负载、滚动窗口覆盖、
+/// UDP 丢包、工具退出状态一律不进这个函数，它们由
+/// [`rx_acceptance_diagnostics`] 收集成诊断行挂在结论旁边。历史上正是这些
+/// 指标在 RX 已经达标之后把结论改写成 RATE_FAIL / NOT_EVALUATED，让同一条
+/// 链路在 TCP 和 UDP 两条路径上得到相反的结论。
+pub(crate) fn evaluate_rx_acceptance(
     mode: RateMode,
     target_mbps: Option<f64>,
     stats: &RateStats,
-    tx_stats: &RateStats,
-    // 验证目标所需的最低发送负载（目标 + 余量）；`None` = 不做 offered 检查。
-    offered_floor: Option<f64>,
-) -> (Verdict, ReasonCode, String) {
-    // 计数器停滞必须排在最前面：它命中的场景里 avg 通常也是 0，会被
+) -> VerdictResult {
+    // 没有可用平均值时不能形成速率结论；计数器停滞仍优先报告具体原因。
+    // 它命中的场景里 avg 通常也是 0，会被
     // NIC_RATE_MISSING 抢先吃掉，而「采到样本但计数器不动」比「没有可用速率」
     // 具体得多——前者直接指向链路或网卡侧，后者只说明这一行没结论。
     //
     // 门槛与采样覆盖率共用同一个常量：窗口里至少 95% 的时间要有真实推进的
     // 计数，剩下 5% 留给起流/收尾的空档。
     if stats.stalled_ratio > 1.0 - MIN_RATE_SAMPLE_COVERAGE {
-        return (
-            Verdict::NotEvaluated,
+        return VerdictResult::not_evaluated(
             ReasonCode::CounterStalled,
             format!(
                 "判定窗口内接收端 OS 网卡计数器有 {:.1}% 的时间零增长（采到了样本，\
@@ -348,15 +345,13 @@ pub(crate) fn evaluate_nic_rx(
         .avg_mbps
         .filter(|value| value.is_finite() && *value > MIN_VALID_RX_MBPS)
     else {
-        return (
-            Verdict::NotEvaluated,
+        return VerdictResult::not_evaluated(
             ReasonCode::NicRateMissing,
-            "有效流量窗口内没有可用的接收端 OS 网卡 RX 速率".into(),
+            "有效流量窗口内没有可用的接收端 OS 网卡 RX 速率",
         );
     };
     if !stats.coverage.is_finite() || stats.coverage < MIN_RATE_SAMPLE_COVERAGE {
-        return (
-            Verdict::NotEvaluated,
+        return VerdictResult::not_evaluated(
             ReasonCode::SampleCoverageLow,
             format!(
                 "接收端网卡 RX 采样覆盖率 {:.1}%，低于 {:.1}%",
@@ -368,153 +363,77 @@ pub(crate) fn evaluate_nic_rx(
     let target_mbps = crate::rate::effective_rate_target(mode, target_mbps);
     let Some(target) = target_mbps else {
         return if mode == RateMode::Verify {
-            (
-                Verdict::NotEvaluated,
+            VerdictResult::not_evaluated(
                 ReasonCode::TargetMissing,
-                "verify 模式必须配置可信的接收端网卡 RX 目标".into(),
+                "verify 模式必须配置可信的接收端网卡 RX 目标",
             )
         } else {
-            (
-                Verdict::Measured,
+            VerdictResult::measured(
                 ReasonCode::TargetUnknown,
                 format!("接收端网卡 RX 已测得 {rx_avg:.3}Mbps；未配置可信目标，因此不标记 PASS"),
             )
         };
     };
-    // 到这里已经有明确目标：采样门槛升级为双侧，与 UDP 路径共用同两个谓词，
-    // 避免两条链再次分叉。
-    if !rate_sample_coverage_sufficient(stats, tx_stats, true) {
-        return (
-            Verdict::NotEvaluated,
-            ReasonCode::SampleCoverageLow,
-            format!(
-                "发送端网卡 TX 采样覆盖率 {:.1}%，低于 {:.1}%；有目标时两端采样都必须完整",
-                tx_stats.coverage * 100.0,
-                MIN_RATE_SAMPLE_COVERAGE * 100.0
-            ),
-        );
+    if rx_avg >= target {
+        return VerdictResult::pass();
     }
-
-    // 采样是否可信必须先于任何 CPE 性能结论，顺序与 UDP 路径（run_udp_unit 的
-    // 判定链）保持一致。
-    //
-    // 总覆盖率可以被一条跨越失败周期的长恢复样本补齐到 100%，但那段时间里
-    // 任意一个完整 5 秒窗口都不成立，基于同一批样本算出的加权均值同样不可信。
-    // 若先判 RX_BELOW_TARGET，就会把「网卡计数器中断」这种环境异常写成
-    // 「CPE 不达标」的 RATE_FAIL —— 正是验收文档要求禁止的误判方向。
-    let rx_p10 = stats
-        .p10_mbps
-        .filter(|value| value.is_finite() && *value >= 0.0);
-    if !stats.rolling_coverage.is_finite()
-        || rx_p10.is_none()
-        || !rate_window_coverage_sufficient(stats, tx_stats, true)
-    {
-        return (
-            Verdict::NotEvaluated,
-            ReasonCode::RateWindowCoverageLow,
-            format!(
-                "完整 5 秒滚动窗口覆盖率 RX {:.1}% / TX {:.1}%，低于 {:.1}%，无法计算可信 P10；\
-                 本轮采样不足以判定 CPE 性能",
-                stats.rolling_coverage * 100.0,
-                tx_stats.rolling_coverage * 100.0,
-                MIN_RATE_SAMPLE_COVERAGE * 100.0
-            ),
-        );
-    }
-    let rx_p10 = rx_p10.unwrap_or_default();
-    // 合格线只有一条：**判定窗口的平均速率**。
-    //
-    // P10 不再参与 PASS/FAIL。它当过判据（`RX_UNSTABLE`），但门限贴着目标
-    // 设的场景下它几乎必挂：主控 WLAN 全场上限 2102、目标 2000，余量 5.1%，
-    // run_20260828_162822_17788 的 unit-7-8 就是 avg 2014 达标、P10 1996
-    // 差 0.2% 被判 FAIL。而这类用例的本意是横比两块 Wi-Fi 的协商速率差异，
-    // 要的就是「平均低于门限才算不达标」。P10 继续算、继续进报告，只当
-    // 诊断指标。真正的业务可感故障由下面的连续越界判据负责。
-    // 「灌够了没有」只在 **RX 没达标** 时才有话可说（ADR-12(c)）。
-    //
-    // 发送端自己就没灌到目标+余量、而接收端基本等于发出的量时，这一轮
-    // **说明不了被测设备的能力**——它只说明发送端没送够。判 RATE_FAIL 就是
-    // 把发送端瓶颈写成 CPE 性能失败。这条防护此前只有 UDP 链有，TCP/CTS
-    // 走的这条路只查 TX 覆盖率、不查 TX 水平。
-    //
-    // **但它必须嵌在「RX 低于目标」里面，不能架在外面。** 这个闸的全部理由是
-    // 「解释缺口」；没有缺口时它无话可说。架在外面时，只要 TX-P10 落在
-    // 目标与目标+余量之间（TCP 不限速，链路上限贴着目标时这是常态），
-    // 一条 RX 已经达标的腿就会被判成 NOT_EVALUATED —— 代码上面那段注释
-    // 引用的 run_20260828_162822_17788（上限 2102、目标 2000、余量 5%，
-    // floor 2100）正是这个形状：R6 拆掉了 P10 造成的误判，又在同一场景上
-    // 装回一条新的。回归测试
-    // `a_leg_that_met_its_target_is_never_downgraded_by_the_offered_gate`。
-    let tx_sufficient = offered_floor
-        .map(|floor| tx_stats.p10_mbps.map(|v| v >= floor).unwrap_or(false))
-        .unwrap_or(true);
-    if rx_avg < target {
-        if !tx_sufficient && offered_shortfall_explains_rx(Some(rx_avg), tx_stats.p10_mbps) {
-            return (
-                Verdict::NotEvaluated,
-                ReasonCode::OfferedLoadLow,
-                format!(
-                    "TX-P10 {}，验证目标所需负载至少 {}；接收端 {rx_avg:.3}Mbps 基本等于发出的量，\
-                     无法判断被测设备还能不能再多送",
-                    tx_stats
-                        .p10_mbps
-                        .map(|v| format!("{v:.3}Mbps"))
-                        .unwrap_or_else(|| "缺失".into()),
-                    offered_floor
-                        .map(|v| format!("{v:.3}Mbps"))
-                        .unwrap_or_else(|| "缺失".into()),
-                ),
-            );
-        }
-        let offered_note = if tx_sufficient {
-            String::new()
-        } else {
-            // 没灌够却仍判 FAIL 时把理由说全：缺口远大于发送端少灌的部分，
-            // 补足负载也补不回来。不写这一句，读报告的人会拿「TX 没到门限」
-            // 来质疑这个结论。
-            format!(
-                "（发送端 TX-P10 {} 未达目标+余量 {}，但接收端只有 {rx_avg:.3}Mbps，\
-                 缺口远大于发送端少灌的部分，补足负载也补不回来）",
-                tx_stats
-                    .p10_mbps
-                    .map(|v| format!("{v:.3}Mbps"))
-                    .unwrap_or_else(|| "缺失".into()),
-                offered_floor
-                    .map(|v| format!("{v:.3}Mbps"))
-                    .unwrap_or_else(|| "缺失".into()),
-            )
-        };
-        return (
-            Verdict::RateFail,
-            ReasonCode::RxBelowTarget,
-            format!("网卡 RX 平均 {rx_avg:.3}Mbps 低于目标 {target:.3}Mbps{offered_note}"),
-        );
-    }
-    // 平均达标之后，再看判定窗口里有没有**连续够 5 秒**的越界段。
-    //
-    // 平均值答不出「中间断没断过」：全程平均 2200、中间断 6 秒，和全程稳定
-    // 2200，对使用者不是同一个结论。判据落在原始逐样本序列上，报出来的
-    // 秒数就是真秒数（详见 [`RateExcursion`]）。
-    if let Some(excursion) = rate_excursion(&stats.series, target) {
-        return (
-            Verdict::RateFail,
-            excursion.reason_code(),
-            format!(
-                "网卡 RX 平均 {rx_avg:.3}Mbps 达标（P10 {rx_p10:.3}Mbps），但{}",
-                excursion.describe()
-            ),
-        );
-    }
-    (Verdict::Pass, ReasonCode::None, String::new())
+    VerdictResult::rate_fail(
+        ReasonCode::RxBelowTarget,
+        format!("网卡 RX 平均 {rx_avg:.3}Mbps 低于目标 {target:.3}Mbps"),
+    )
 }
 
-pub(crate) fn rate_sample_coverage_sufficient(
-    rx_stats: &RateStats,
+/// 收集**不参与判定**的排障线索。
+///
+/// 这里的每一条都曾经是判定分支。它们全部保留下来是因为排查时确实要看，
+/// 但它们回答的是「为什么会这样」，而不是「这条链路合格没有」——
+/// 后者只有 [`evaluate_rx_acceptance`] 一个答案来源。
+pub(crate) fn rx_acceptance_diagnostics(
+    stats: &RateStats,
     tx_stats: &RateStats,
     target_present: bool,
-) -> bool {
-    rx_stats.coverage >= MIN_RATE_SAMPLE_COVERAGE
-        && (!target_present || tx_stats.coverage >= MIN_RATE_SAMPLE_COVERAGE)
+    // 验证目标所需的最低发送负载（目标 + 余量）；`None` = 没有 offered 参照。
+    offered_floor: Option<f64>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    if !target_present {
+        return out;
+    }
+    let fmt = |value: Option<f64>| {
+        value
+            .map(|v| format!("{v:.3}Mbps"))
+            .unwrap_or_else(|| "缺失".into())
+    };
+    if !tx_stats.coverage.is_finite() || tx_stats.coverage < MIN_RATE_SAMPLE_COVERAGE {
+        out.push(format!(
+            "发送端网卡 TX 采样覆盖率 {:.1}%，低于 {:.1}%；只影响这行诊断的可信度，不改写判定",
+            tx_stats.coverage * 100.0,
+            MIN_RATE_SAMPLE_COVERAGE * 100.0
+        ));
+    }
+    if !rate_window_coverage_sufficient(stats, tx_stats, true) {
+        out.push(format!(
+            "完整 5 秒滚动窗口覆盖率 RX {:.1}%（P10 {}）/ TX {:.1}%（P10 {}），低于 {:.1}%；\
+             稳定性无法核对，不改写判定",
+            stats.rolling_coverage * 100.0,
+            fmt(stats.p10_mbps),
+            tx_stats.rolling_coverage * 100.0,
+            fmt(tx_stats.p10_mbps),
+            MIN_RATE_SAMPLE_COVERAGE * 100.0
+        ));
+    }
+    if let Some(floor) = offered_floor {
+        let tx_sufficient = tx_stats.p10_mbps.map(|v| v >= floor).unwrap_or(false);
+        if !tx_sufficient {
+            out.push(format!(
+                "发送端 TX-P10 {} 未达到验证目标所需负载 {}；灌包强度不足只作诊断，\
+                 达标与否仍只看接收端 RX 平均",
+                fmt(tx_stats.p10_mbps),
+                fmt(Some(floor))
+            ));
+        }
+    }
+    out
 }
 
 pub(crate) fn rate_window_coverage_sufficient(
@@ -841,16 +760,22 @@ fn longest_zero_delta_run_ms(out: &MonitorStopOut, window: &EffectiveWindow, rx:
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::verdict::Verdict;
 
-    /// 发送端没灌够时，**TCP/CTS 链也不许判 CPE 不达标**。
-    ///
-    /// 行为变更（ADR-12(c)），方向是把误判改回正确。这条防护此前只存在于 UDP
-    /// 链（`udp.rs` 的 `offered_shortfall_explains_rx` + `udp_leg_verdict`），
-    /// 而 `evaluate_nic_rx` 只查 TX **覆盖率**、不查 TX **水平**——于是 CTS UDP
-    /// 单流灌不满时 `RX < target` 直接判 `RX_BELOW_TARGET`，正是 UDP 链两个单测
-    /// 拼命要防的「把发送端瓶颈写成 CPE 性能失败」，在 CTS 路径上零防护。
+    /// 测试里仍按老三元组读结论，省得每条断言都改成字段访问。
+    fn nic_rx(
+        mode: RateMode,
+        target_mbps: Option<f64>,
+        stats: &RateStats,
+    ) -> (Verdict, ReasonCode, String) {
+        let result = evaluate_rx_acceptance(mode, target_mbps, stats);
+        (result.verdict, result.code, result.detail)
+    }
+
+    /// 发送端没灌够、RX 平均也没达到目标时，仍然直接判子网失败；
+    /// 「没灌够」只出现在**诊断**里（ADR-17）。
     #[test]
-    fn an_underfilled_sender_never_becomes_a_cpe_failure_on_any_chain() {
+    fn an_underfilled_sender_is_a_subnet_failure_and_only_a_diagnostic() {
         let series: Vec<(u64, u64, f64)> = (1..=180).map(|i| (i * 1_000, 1_000, 500.0)).collect();
         let stats = |avg: f64| RateStats {
             avg_mbps: Some(avg),
@@ -861,39 +786,39 @@ mod tests {
             ..Default::default()
         };
         // 发送端只灌了 500，目标 1000、门槛 1050：接收端收到 495，
-        // 基本等于发出的量——这一轮说明不了被测设备的能力。
+        // 基本等于发出的量；按当前验收口径，RX 没达到目标就判子网失败。
         let rx = stats(495.0);
         let tx = stats(500.0);
 
-        let (verdict, code, detail) =
-            evaluate_nic_rx(RateMode::Verify, Some(1_000.0), &rx, &tx, Some(1_050.0));
+        let (verdict, code, detail) = nic_rx(RateMode::Verify, Some(1_000.0), &rx);
         assert_eq!(
             verdict,
-            Verdict::NotEvaluated,
-            "没灌够就不能下 CPE 结论，实得 {verdict:?}/{code}"
+            Verdict::RateFail,
+            "RX 低于目标时，即使发送端也没灌满仍应判 FAIL，实得 {verdict:?}/{code}"
         );
-        assert_eq!(code, ReasonCode::OfferedLoadLow);
+        assert_eq!(code, ReasonCode::RxBelowTarget);
         assert!(
-            detail.contains("无法判断"),
-            "报错要说清为什么不下结论: {detail}"
+            detail.contains("495.000") && detail.contains("1000.000"),
+            "判定明细只讲 RX 平均与门限: {detail}"
+        );
+        // 发送端的背景交给诊断，不再混进判定明细。
+        let notes = rx_acceptance_diagnostics(&rx, &tx, true, Some(1_050.0));
+        assert!(
+            notes.iter().any(|line| line.contains("TX-P10")),
+            "没灌够要留在诊断里: {notes:?}"
         );
 
         // 反面：发送端灌足了、接收端仍然差得远，这才是真的 CPE 不达标。
-        let tx_full = stats(1_100.0);
         let rx_low = stats(400.0);
-        let (verdict, code, _) = evaluate_nic_rx(
-            RateMode::Verify,
-            Some(1_000.0),
-            &rx_low,
-            &tx_full,
-            Some(1_050.0),
-        );
+        let (verdict, code, _) = nic_rx(RateMode::Verify, Some(1_000.0), &rx_low);
         assert_eq!(verdict, Verdict::RateFail, "灌足了还不达标必须判 FAIL");
         assert_eq!(code, ReasonCode::RxBelowTarget);
-
-        // 不传 floor 时行为与从前一致：这条路径上没有 offered 信息可用。
-        let (verdict, _, _) = evaluate_nic_rx(RateMode::Verify, Some(1_000.0), &rx, &tx, None);
-        assert_eq!(verdict, Verdict::RateFail, "没有 floor 就退回原来的口径");
+        // 灌足了就不该有 offered 诊断。
+        assert!(
+            !rx_acceptance_diagnostics(&rx_low, &stats(1_100.0), true, Some(1_050.0))
+                .iter()
+                .any(|line| line.contains("TX-P10"))
+        );
     }
 
     /// **RX 已经达标的腿，永远不许被 offered 闸降级。**
@@ -918,13 +843,7 @@ mod tests {
             ..Default::default()
         };
         // TX-P10 2005 < floor 2100（没灌到目标+余量），但 RX 平均 2014 ≥ 目标 2000。
-        let (verdict, code, detail) = evaluate_nic_rx(
-            RateMode::Verify,
-            Some(2_000.0),
-            &stats(2_014.0),
-            &stats(2_005.0),
-            Some(2_100.0),
-        );
+        let (verdict, code, detail) = nic_rx(RateMode::Verify, Some(2_000.0), &stats(2_014.0));
         assert_eq!(
             verdict,
             Verdict::Pass,
@@ -933,13 +852,7 @@ mod tests {
         assert_ne!(code, ReasonCode::OfferedLoadLow);
 
         // 边界：RX 正好等于目标也算达标（合格线是 `rx_avg < target` 才失败）。
-        let (verdict, _, _) = evaluate_nic_rx(
-            RateMode::Verify,
-            Some(2_000.0),
-            &stats(2_000.0),
-            &stats(2_005.0),
-            Some(2_100.0),
-        );
+        let (verdict, _, _) = nic_rx(RateMode::Verify, Some(2_000.0), &stats(2_000.0));
         assert_eq!(verdict, Verdict::Pass, "RX 正好等于目标仍是达标");
     }
 
@@ -996,12 +909,12 @@ mod tests {
                         "「Observe/Discover 不比目标」只能定义在 rate::effective_rate_target",
                     ),
                     (
-                        "RX_TRACKS_TX_RATIO: f64",
-                        "「RX 是否基本等于 TX」的比例只能定义在 rate_window",
+                        "fn evaluate_rx_acceptance",
+                        "吞吐验收（RX 平均 vs 门限）只能定义在 rate_window",
                     ),
                     (
-                        "fn offered_shortfall_explains_rx",
-                        "offered 防误判谓词只能定义在 rate_window",
+                        "fn rx_acceptance_diagnostics",
+                        "「哪些事实只作诊断」的清单只能定义在 rate_window",
                     ),
                     (
                         "fn effective_rate_target",
@@ -1064,8 +977,7 @@ mod tests {
             stats.stalled_ratio
         );
 
-        let (verdict, code, detail) =
-            evaluate_nic_rx(RateMode::Observe, None, &stats, &RateStats::default(), None);
+        let (verdict, code, detail) = nic_rx(RateMode::Observe, None, &stats);
         assert_eq!(verdict, Verdict::NotEvaluated);
         assert_eq!(
             code,
@@ -1096,8 +1008,7 @@ mod tests {
         };
         let stats = monitor_rate_stats(&out, &window, true, 0);
         assert!(stats.stalled_ratio < 0.05, "{}", stats.stalled_ratio);
-        let (verdict, _, _) =
-            evaluate_nic_rx(RateMode::Observe, None, &stats, &RateStats::default(), None);
+        let (verdict, _, _) = nic_rx(RateMode::Observe, None, &stats);
         assert_eq!(verdict, Verdict::Measured);
     }
 
@@ -1126,20 +1037,9 @@ mod tests {
         assert!(stats.p10_mbps.is_some(), "P10 同样要算");
     }
 
-    /// 两条判定链的一致性属性：**采样不可信时，谁都不许对 CPE 下结论**。
-    ///
-    /// UDP 走 `run_udp_unit` 的内联判定链（用下面两个谓词做门禁），TCP/CTS 走
-    /// `evaluate_nic_rx`。两者曾经在这一点上分叉：`evaluate_nic_rx` 把
-    /// `RX_BELOW_TARGET` 判在滚动窗口覆盖率之前，于是"网卡计数器中断"被写成
-    /// "CPE 不达标"。分叉之所以能长期存在，是因为两条链各自的用例都是绿的——
-    /// 只有把它们放在同一组输入下对比，才看得出来。
-    /// W08：**有明确目标时**，RX/TX 任一侧采样塌了都不能对 CPE 定性。
-    ///
-    /// 这条曾经只在 UDP 路径成立——TCP/CTS 压根不采样发送端网卡，于是发送端
-    /// 计数器失效时它们照样给出 PASS/RATE_FAIL。目标未知时不需要双侧门槛：
-    /// 那时只记录实测能力，不做合格性承诺。
+    /// RX 平均达标时，发送端采样是否完整不再改写 PASS。
     #[test]
-    fn a_collapsed_sender_side_sampling_also_blocks_any_cpe_verdict() {
+    fn a_collapsed_sender_side_sampling_is_ignored_when_rx_average_meets_target() {
         let healthy = RateStats {
             avg_mbps: Some(900.0),
             p10_mbps: Some(880.0),
@@ -1150,62 +1050,49 @@ mod tests {
         let target = Some(800.0);
 
         // 基线：两侧都完好 → 正常给出 PASS。
-        assert_eq!(
-            evaluate_nic_rx(RateMode::Verify, target, &healthy, &healthy, None).0,
-            Verdict::Pass
-        );
+        assert_eq!(nic_rx(RateMode::Verify, target, &healthy).0, Verdict::Pass);
 
-        // 发送端总采样覆盖率塌了。
+        // 发送端总采样覆盖率塌了，但 RX 平均已达标，仍然 PASS——只多一条诊断。
         let tx_low_coverage = RateStats {
             coverage: 0.80,
             ..healthy.clone()
         };
-        let (verdict, code, detail) =
-            evaluate_nic_rx(RateMode::Verify, target, &healthy, &tx_low_coverage, None);
-        assert_eq!(
-            (verdict, code),
-            (Verdict::NotEvaluated, ReasonCode::SampleCoverageLow)
+        let (verdict, code, detail) = nic_rx(RateMode::Verify, target, &healthy);
+        assert_eq!((verdict, code), (Verdict::Pass, ReasonCode::None));
+        assert!(detail.is_empty());
+        assert!(
+            rx_acceptance_diagnostics(&healthy, &tx_low_coverage, true, None)
+                .iter()
+                .any(|line| line.contains("TX 采样覆盖率"))
         );
-        assert!(detail.contains("发送端"), "原因必须指明是发送端: {detail}");
 
-        // 发送端滚动窗口覆盖率塌了（总覆盖率仍满，典型的跨周期恢复样本场景）。
+        // 发送端滚动窗口覆盖率塌了，仍然 PASS。
         let tx_low_rolling = RateStats {
             rolling_coverage: 0.70,
             ..healthy.clone()
         };
-        let (verdict, code, _) =
-            evaluate_nic_rx(RateMode::Verify, target, &healthy, &tx_low_rolling, None);
-        assert_eq!(
-            (verdict, code),
-            (Verdict::NotEvaluated, ReasonCode::RateWindowCoverageLow)
+        let (verdict, code, _) = nic_rx(RateMode::Verify, target, &healthy);
+        assert_eq!((verdict, code), (Verdict::Pass, ReasonCode::None));
+        assert!(
+            rx_acceptance_diagnostics(&healthy, &tx_low_rolling, true, None)
+                .iter()
+                .any(|line| line.contains("滚动窗口"))
         );
 
         // 发送端根本没采到样本。
-        let (verdict, _, _) = evaluate_nic_rx(
-            RateMode::Verify,
-            target,
-            &healthy,
-            &RateStats::default(),
-            None,
-        );
-        assert_eq!(verdict, Verdict::NotEvaluated);
+        let (verdict, _, _) = nic_rx(RateMode::Verify, target, &healthy);
+        assert_eq!(verdict, Verdict::Pass);
+        assert!(!rx_acceptance_diagnostics(&healthy, &RateStats::default(), true, None).is_empty());
 
         // 目标未知时不做双侧要求：只记录实测能力。
         assert_eq!(
-            evaluate_nic_rx(
-                RateMode::Observe,
-                None,
-                &healthy,
-                &RateStats::default(),
-                None
-            )
-            .0,
+            nic_rx(RateMode::Observe, None, &healthy).0,
             Verdict::Measured
         );
     }
 
     #[test]
-    fn neither_backend_blames_the_dut_while_sampling_is_untrustworthy() {
+    fn rx_below_target_is_a_failure_even_when_sampling_has_other_problems() {
         let target = 800.0;
         // 覆盖率 × 滚动覆盖率 × P10 是否可得，遍历"可信/不可信"的各种组合。
         for &coverage in &[1.0_f64, 0.99, 0.94, 0.0] {
@@ -1228,26 +1115,31 @@ mod tests {
                         ..Default::default()
                     };
 
-                    let udp_trusts_sampling = rate_sample_coverage_sufficient(&rx, &tx, true)
-                        && rate_window_coverage_sufficient(&rx, &tx, true);
-                    let (verdict, code, _) =
-                        evaluate_nic_rx(RateMode::Verify, Some(target), &rx, &tx, None);
+                    let (verdict, code, _) = nic_rx(RateMode::Verify, Some(target), &rx);
 
-                    if !udp_trusts_sampling {
+                    if coverage < MIN_RATE_SAMPLE_COVERAGE {
                         assert_eq!(
-                            verdict,
-                            Verdict::NotEvaluated,
-                            "UDP 链认为采样不可信（coverage={coverage}, rolling={rolling}, \
-                             p10={p10:?}），TCP/CTS 链却给出了 {verdict:?}/{code}"
+                            (verdict, code),
+                            (Verdict::NotEvaluated, ReasonCode::SampleCoverageLow),
+                            "RX 采样覆盖率不足仍需保持不可评价（coverage={coverage}）"
                         );
                     } else {
-                        // 采样可信且均值低于目标时，两条链都必须落到真正的性能结论。
+                        // 接收端 RX 平均一旦可信，滚动覆盖率和 P10 是否可得都不再
+                        // 改变结论：低于目标就是低于目标（ADR-17）。
                         assert_eq!(
                             (verdict, code),
                             (Verdict::RateFail, ReasonCode::RxBelowTarget),
-                            "采样可信时应产出真实的性能判定 \
+                            "RX 平均低于目标必须直接 RATE_FAIL \
                              (coverage={coverage}, rolling={rolling}, p10={p10:?})"
                         );
+                        // 诊断仍要把滚动窗口那件事说出来。
+                        let notes = rx_acceptance_diagnostics(&rx, &tx, true, None);
+                        if !rate_window_coverage_sufficient(&rx, &tx, true) {
+                            assert!(
+                                notes.iter().any(|line| line.contains("滚动窗口")),
+                                "滚动窗口不完整要留在诊断里: {notes:?}"
+                            );
+                        }
                     }
                 }
             }
@@ -1255,7 +1147,7 @@ mod tests {
     }
 
     #[test]
-    fn tcp_nic_rx_verdict_matrix_never_passes_without_complete_authoritative_data() {
+    fn rx_verdict_matrix_keeps_missing_rx_data_unrated_but_fails_low_rx() {
         // 全程稳定在 850：35 个 5 秒窗口一个都不掉到 800 以下。
         let complete = RateStats {
             avg_mbps: Some(850.0),
@@ -1265,16 +1157,9 @@ mod tests {
             series: raw_series(180, |_| 850.0),
             ..Default::default()
         };
-        // 发送端采样默认完好，把变量隔离在接收端；TX 侧门槛另有专门用例。
-        let healthy_tx = RateStats {
-            avg_mbps: Some(900.0),
-            p10_mbps: Some(880.0),
-            coverage: 1.0,
-            rolling_coverage: 1.0,
-            ..Default::default()
-        };
+        // 接收端是唯一的判定输入（ADR-17），发送端的事另有专门用例。
         let decision = |mode, target, stats: &RateStats| {
-            let (verdict, code, _) = evaluate_nic_rx(mode, target, stats, &healthy_tx, None);
+            let (verdict, code, _) = nic_rx(mode, target, stats);
             (verdict, code)
         };
 
@@ -1340,9 +1225,8 @@ mod tests {
             (Verdict::RateFail, ReasonCode::RxBelowTarget)
         );
 
-        // 采样不可信时不能给 CPE 扣帽子：总覆盖率被一条跨周期恢复样本补到
-        // 100%，但完整 5 秒滚动窗口只有 86%，此时的加权均值同样不可信。
-        // TCP/CTS 路径必须和 UDP 路径一样先判 RATE_WINDOW_COVERAGE_LOW。
+        // RX 平均低于目标时，滚动窗口是否完整不再改变原因码：结论只有一条
+        // 「RX 低于门限」，滚动窗口的事去诊断里说（ADR-17）。
         let below_target_but_unreliable = RateStats {
             avg_mbps: Some(799.0),
             p10_mbps: Some(700.0),
@@ -1352,10 +1236,9 @@ mod tests {
         };
         assert_eq!(
             decision(RateMode::Verify, Some(800.0), &below_target_but_unreliable),
-            (Verdict::NotEvaluated, ReasonCode::RateWindowCoverageLow),
-            "滚动窗口覆盖不足时禁止产出 RATE_FAIL"
+            (Verdict::RateFail, ReasonCode::RxBelowTarget),
+            "RX 低于目标就是 RX_BELOW_TARGET，不再被滚动窗口改写原因码"
         );
-        // 同样的输入在 UDP 路径上也是 RATE_WINDOW_COVERAGE_LOW，两条路径口径一致。
         let unreliable_p10_missing = RateStats {
             avg_mbps: Some(799.0),
             p10_mbps: None,
@@ -1365,8 +1248,8 @@ mod tests {
         };
         assert_eq!(
             decision(RateMode::Verify, Some(800.0), &unreliable_p10_missing),
-            (Verdict::NotEvaluated, ReasonCode::RateWindowCoverageLow),
-            "窗口不足 5 秒导致 P10 缺失时同样不能判 RATE_FAIL"
+            (Verdict::RateFail, ReasonCode::RxBelowTarget),
+            "P10 缺失同样不改写原因码"
         );
         let missing_p10 = RateStats {
             p10_mbps: None,
@@ -1374,7 +1257,7 @@ mod tests {
         };
         assert_eq!(
             decision(RateMode::Verify, Some(800.0), &missing_p10),
-            (Verdict::NotEvaluated, ReasonCode::RateWindowCoverageLow)
+            (Verdict::Pass, ReasonCode::None)
         );
         let nan_p10 = RateStats {
             p10_mbps: Some(f64::NAN),
@@ -1382,7 +1265,7 @@ mod tests {
         };
         assert_eq!(
             decision(RateMode::Verify, Some(800.0), &nan_p10),
-            (Verdict::NotEvaluated, ReasonCode::RateWindowCoverageLow)
+            (Verdict::Pass, ReasonCode::None)
         );
         let low_rolling_coverage = RateStats {
             rolling_coverage: 0.94,
@@ -1390,7 +1273,7 @@ mod tests {
         };
         assert_eq!(
             decision(RateMode::Verify, Some(800.0), &low_rolling_coverage),
-            (Verdict::NotEvaluated, ReasonCode::RateWindowCoverageLow)
+            (Verdict::Pass, ReasonCode::None)
         );
 
         // P10 低于目标、但平均达标且没有连续够 5 秒的越界段：**不再** FAIL。
@@ -1410,27 +1293,23 @@ mod tests {
             "P10 已退回诊断指标，不该再单独否决一行"
         );
 
-        // 平均达标，但连续 6 秒掉到门限 80% 以下：FAIL。
+        // 平均达标，即使连续 6 秒掉到门限 80% 以下也 PASS。
         let dropout = RateStats {
             series: raw_series(180, |i| if (20..=25).contains(&i) { 120.0 } else { 850.0 }),
             ..complete.clone()
         };
-        let (verdict, code, detail) =
-            evaluate_nic_rx(RateMode::Verify, Some(800.0), &dropout, &healthy_tx, None);
-        assert_eq!((verdict, code), (Verdict::RateFail, ReasonCode::RxDropout));
-        assert!(detail.contains("掉坑"), "{detail}");
-        assert!(detail.contains("连续 6.0 秒"), "秒数必须是真秒数: {detail}");
-        assert!(detail.contains("120.000"), "要说出最低掉到多少: {detail}");
+        let (verdict, code, detail) = nic_rx(RateMode::Verify, Some(800.0), &dropout);
+        assert_eq!((verdict, code), (Verdict::Pass, ReasonCode::None));
+        assert!(detail.is_empty());
 
-        // 掉到接近 0 是「断流」，另发一个码——排查方向和掉坑不一样。
+        // 掉到接近 0 但平均仍达标，也不改变 PASS。
         let outage = RateStats {
             series: raw_series(180, |i| if (18..=23).contains(&i) { 0.0 } else { 850.0 }),
             ..complete.clone()
         };
-        let (verdict, code, detail) =
-            evaluate_nic_rx(RateMode::Verify, Some(800.0), &outage, &healthy_tx, None);
-        assert_eq!((verdict, code), (Verdict::RateFail, ReasonCode::RxOutage));
-        assert!(detail.contains("断流"), "{detail}");
+        let (verdict, code, detail) = nic_rx(RateMode::Verify, Some(800.0), &outage);
+        assert_eq!((verdict, code), (Verdict::Pass, ReasonCode::None));
+        assert!(detail.is_empty());
 
         // 链路比目标快不是缺陷：稳定跑在门限的 1.5 倍照样 PASS。
         // 「连续 5 秒高于 target*1.2」当过一档（RX_SPIKE），拿

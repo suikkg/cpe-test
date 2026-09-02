@@ -87,6 +87,72 @@ pub(super) fn row_has_usable_traffic_measurement(row: &Row) -> bool {
     usable_rate(row.rx_avg) || tool_measurement || usable_rate(row.tx_avg)
 }
 
+/// 双向单元按**两端 RX 合计**判定。
+///
+/// ```text
+/// 双向有效吞吐 = AB 方向接收端 RX 平均 + BA 方向接收端 RX 平均
+/// ```
+///
+/// 为什么不是 TX+RX：同一个包在发送侧 TX 和接收侧 RX 各记一次，相加就是重复
+/// 计数；TX 还会混进背景流量和 socket 缓冲里从未上线的字节。两端 RX 相加得到
+/// 的正是这段时间里真正跨过链路的总量，也正是半双工介质上唯一有物理意义的
+/// 双向指标——要求两个方向各达到一半，在 Wi-Fi 上是凭空发明的约束。
+///
+/// 两条腿只要有一条形不成可信的 RX 平均值，合计就不成立：这时**不猜**，
+/// 交回给按腿聚合的结论（它会说出到底是哪条腿、什么原因）。
+pub(super) fn bidir_total_verdict(outcomes: &[LegOutcome], total_target: f64) -> VerdictResult {
+    let leg = |tag: &str| {
+        outcomes
+            .iter()
+            .find(|outcome| outcome.tag.eq_ignore_ascii_case(tag))
+    };
+    let (Some(ab), Some(ba)) = (leg("ab"), leg("ba")) else {
+        return VerdictResult::not_evaluated(
+            ReasonCode::NicRateMissing,
+            "双向 RX 合计需要 AB 与 BA 两个方向的结果，本单元缺少其中一个",
+        );
+    };
+    // 「这条腿测出数了吗」只有一个答案来源：腿级判定有没有走到验收那一步。
+    // Measured / Pass / RateFail 都意味着已经形成可信的 RX 平均值。
+    let usable = |outcome: &LegOutcome| {
+        matches!(
+            outcome.verdict(),
+            Verdict::Pass | Verdict::RateFail | Verdict::Measured
+        )
+    };
+    let (Some(ab_rx), Some(ba_rx)) = (ab.rx_avg, ba.rx_avg) else {
+        return VerdictResult::not_evaluated(
+            ReasonCode::NicRateMissing,
+            format!(
+                "双向 RX 合计缺少方向数据：AB={}，BA={}",
+                fmt_opt(ab.rx_avg),
+                fmt_opt(ba.rx_avg)
+            ),
+        );
+    };
+    if !usable(ab) || !usable(ba) || !ab_rx.is_finite() || !ba_rx.is_finite() {
+        return VerdictResult::not_evaluated(
+            ReasonCode::NicRateMissing,
+            format!(
+                "双向 RX 合计需要两个方向都形成可信的 RX 平均值：AB={} ({}), BA={} ({})",
+                fmt_opt(ab.rx_avg),
+                ab.reason_code(),
+                fmt_opt(ba.rx_avg),
+                ba.reason_code()
+            ),
+        );
+    }
+    let total = ab_rx + ba_rx;
+    let detail = format!(
+        "双向 RX 合计 {total:.3}Mbps（AB {ab_rx:.3} + BA {ba_rx:.3}），门限 {total_target:.3}Mbps"
+    );
+    if total >= total_target {
+        VerdictResult::pass().with_diagnostics(vec![detail])
+    } else {
+        VerdictResult::rate_fail(ReasonCode::RxBelowTarget, detail)
+    }
+}
+
 pub(super) fn aggregate_unit_verdict(outcomes: &[LegOutcome]) -> Verdict {
     // 优先级的唯一定义在 crate::verdict::aggregate_verdict —— 报告侧的回退聚合
     // 走同一个函数，两边不会再分叉。
@@ -220,7 +286,7 @@ pub(super) fn lifecycle_rx_hint(out: Option<&MonitorStopOut>) -> String {
 /// 判据用「有没有攒够要求时长的有效吞吐窗口」而不是匹配错误文本：窗口本身
 /// 就是「这一轮到底测没测成」的既有权威答案，既不需要引入新的阈值常量，
 /// 也不会随 iperf3 的措辞变化而失效。
-pub(crate) fn iperf_flow_verdict(input: IperfFlowVerdictIn<'_>) -> (Verdict, ReasonCode, String) {
+pub(crate) fn iperf_flow_verdict(input: IperfFlowVerdictIn<'_>) -> VerdictResult {
     let IperfFlowVerdictIn {
         raw_ok,
         measurement,
@@ -238,11 +304,7 @@ pub(crate) fn iperf_flow_verdict(input: IperfFlowVerdictIn<'_>) -> (Verdict, Rea
     let summary_lost_after_full_run = !raw_ok && measurement && effective_window.complete;
 
     if !raw_ok && !summary_lost_after_full_run {
-        return (
-            Verdict::SetupError,
-            ReasonCode::IperfExecFailed,
-            client_tail.to_string(),
-        );
+        return VerdictResult::setup_error(ReasonCode::IperfExecFailed, client_tail.to_string());
     }
     if !measurement {
         // 「工具没产生吞吐测量」= **执行环境的事实**，不是被测设备的性能结论。
@@ -259,17 +321,14 @@ pub(crate) fn iperf_flow_verdict(input: IperfFlowVerdictIn<'_>) -> (Verdict, Rea
         // 没读到」。判 RATE_FAIL 等于在分不清的时候声称是 CPE 的错——正是这套
         // 判定一直在防的误判方向。速率的权威口径本来也是网卡计数器，不是
         // iperf3 的自报值。
-        return (
-            Verdict::SetupError,
+        return VerdictResult::setup_error(
             ReasonCode::NoValidMeasurement,
             "iperf3 已结束，但没有 rate/bytes 吞吐测量；无法判断这一轮是链路没过流量\
-             还是结果交换失败，因此不下 CPE 性能结论"
-                .into(),
+             还是结果交换失败，因此不下 CPE 性能结论",
         );
     }
     if !effective_window.complete {
-        return (
-            Verdict::NotEvaluated,
+        return VerdictResult::not_evaluated(
             ReasonCode::IperfEffectiveWindowShort,
             format!(
                 "iperf3 真实流量事件窗口仅 {:.3}s，短于要求的 {}s；未把 server 启动、连接或清理时间计入平均速率{}",
@@ -280,25 +339,39 @@ pub(crate) fn iperf_flow_verdict(input: IperfFlowVerdictIn<'_>) -> (Verdict, Rea
         );
     }
 
-    let (verdict, code, detail) =
-        evaluate_nic_rx(rate_mode, rx_target_mbps, rx_stats, tx_stats, offered_floor);
+    let acceptance = evaluate_rx_acceptance(rate_mode, rx_target_mbps, rx_stats);
+    let mut diagnostics = crate::master::rate_window::rx_acceptance_diagnostics(
+        rx_stats,
+        tx_stats,
+        crate::rate::effective_rate_target(rate_mode, rx_target_mbps).is_some(),
+        offered_floor,
+    );
     if !summary_lost_after_full_run {
-        return (verdict, code, detail);
+        return acceptance.with_diagnostics(diagnostics);
     }
+    diagnostics.insert(
+        0,
+        format!(
+            "iperf3 结果交换失败（{}），工具自报速率不可用",
+            client_tail.trim()
+        ),
+    );
     // 判定本身仍然完全由网卡口径决定——RX 低于目标照样 RATE_FAIL，RX 缺失
     // 照样 NOT_EVALUATED。这里只把「工具自报速率不可用」记进原因，并保留原始
     // rate 结论的 reason_code，别让 RX_BELOW_TARGET 这类信息被覆盖掉。
     // 该行的执行状态仍是 ExecutionStatus::Error，概览上显示成
     // 「MEASURED · ERROR」，不会看起来一切正常。
-    (
-        verdict,
-        code,
+    VerdictResult::new(
+        acceptance.verdict,
+        acceptance.code,
         format!(
             "IPERF_SUMMARY_LOST: iperf3 已完成全程灌包，仅最后的结果交换失败，\
-             接收端网卡口径有效、工具自报速率不可用（{}）。{detail}",
-            client_tail.trim()
+             接收端网卡口径有效、工具自报速率不可用（{}）。{}",
+            client_tail.trim(),
+            acceptance.detail
         ),
     )
+    .with_diagnostics(diagnostics)
 }
 
 pub(super) fn active_rate_table(
@@ -385,10 +458,19 @@ pub(super) struct UdpLegFacts<'a> {
 
 /// UDP 腿的判定链。
 ///
-/// 顺序是这套判定的核心资产，不是实现细节：**采样/负载是否可信，永远排在
-/// 任何 CPE 性能结论之前**。灌不够、窗口不完整、覆盖率不足时必须产出
-/// `NOT_EVALUATED`，绝不能写成 `RATE_FAIL`——把环境异常记成被测设备不达标，
-/// 是这套判定一直在防的误判方向。
+/// 结构是**两层**，不是一条长链（ADR-17）：
+///
+/// 1. 这一腿有没有产生「能形成有效 RX 平均值」的前提——client 起没起来、
+///    有效流量窗口够不够长。不够就是 `SETUP_ERROR` / `NOT_EVALUATED`，
+///    因为根本没有可比的数。
+/// 2. 前提成立后，把 RX 统计交给全仓唯一的
+///    [`evaluate_rx_acceptance`](crate::master::rate_window::evaluate_rx_acceptance)，
+///    只和门限比一次。
+///
+/// UDP 丢包率、发送端负载、流数、iperf3 是否正常退出**全部是诊断**：它们
+/// 挂在结论旁边，一个字节都不改写第 2 层的结果。用户确认过的规则是「RX 平均
+/// 达到门限必定 PASS」，而这些指标历史上恰恰会在 RX 已达标之后把 PASS 改成
+/// RATE_FAIL / NOT_EVALUATED。
 pub(super) fn udp_leg_verdict(facts: &UdpLegFacts<'_>) -> VerdictResult {
     let &UdpLegFacts {
         streams_total: n,
@@ -414,34 +496,15 @@ pub(super) fn udp_leg_verdict(facts: &UdpLegFacts<'_>) -> VerdictResult {
     // 于是显式配 `observe` 又能解析出目标时，同一台设备的 UDP 腿判 RATE_FAIL、
     // 而 TCP/CTS 腿判 MEASURED。Discover 更糟——它本来就是**故意分阶梯灌不满**
     // 的模式，拿目标判它的 FAIL 是结构性误判。
-    let rx_target_mbps = crate::rate::effective_rate_target(rate_mode, rx_target_mbps);
-    // 目标没了，「需要灌到多少才算数」也就无从谈起：offered 门槛只在有目标
-    // 时才有意义，否则会拿一个不存在的门限去判 OFFERED_LOAD_LOW。
-    let offered_floor = rx_target_mbps.and(offered_floor);
+    let effective_target = crate::rate::effective_rate_target(rate_mode, rx_target_mbps);
+    // 目标没了，「需要灌到多少才算数」也就无从谈起：offered 负载只在有目标
+    // 时才有意义，否则只作为普通诊断数据。
+    let offered_floor = effective_target.and(offered_floor);
 
-    let rate_present = rx_stats
-        .avg_mbps
-        .map(|v| v > MIN_VALID_RX_MBPS)
-        .unwrap_or(false);
-    let tx_sufficient = offered_floor
-        .map(|floor| tx_stats.p10_mbps.map(|v| v >= floor).unwrap_or(false))
-        .unwrap_or(true);
-    let sample_coverage_sufficient =
-        rate_sample_coverage_sufficient(rx_stats, tx_stats, rx_target_mbps.is_some());
-    let rate_window_coverage_sufficient =
-        rate_window_coverage_sufficient(rx_stats, tx_stats, rx_target_mbps.is_some());
-    // 合格线只有平均速率一条，与 TCP/CTS 路径（`evaluate_nic_rx`）同口径。
-    // P10 退回诊断指标，不再参与 PASS/FAIL。
-    let rx_meets_target = rx_target_mbps
-        .map(|target| rx_stats.avg_mbps.map(|v| v >= target).unwrap_or(false))
-        .unwrap_or(true);
-    let loss_ok = max_udp_loss_pct
-        .map(|limit| udp_loss.map(|value| value <= limit))
-        .unwrap_or(Some(true));
-
+    // 第 1 层：没有可比的数。
     if success == 0 {
         let verdict = zero_udp_stream_verdict(n, single_stream_exhausted);
-        if verdict == Verdict::RateFail {
+        return if verdict == Verdict::RateFail {
             VerdictResult::new(
                 verdict,
                 ReasonCode::SingleUdpStreamFailed,
@@ -455,149 +518,105 @@ pub(super) fn udp_leg_verdict(facts: &UdpLegFacts<'_>) -> VerdictResult {
                 ReasonCode::NoStreamStarted,
                 format!("0/{n} 条流产生有效测量；执行环境未完成 client 尝试"),
             )
-        }
-    } else if runtime_failures > 0 {
-        VerdictResult::rate_fail(
-            ReasonCode::IperfRuntimeErrors,
-            format!("{runtime_failures} 条流已有 iperf3 自身吞吐测量，但 client 非正常完成或超时"),
-        )
-    } else if required > n {
-        VerdictResult::not_evaluated(
-            ReasonCode::ConfiguredLoadTooLow,
-            format!("目标需要至少 {required} 条流，但只配置了 {n} 条"),
-        )
-    } else if success < required {
-        VerdictResult::not_evaluated(
-            ReasonCode::ActiveStreamsLow,
-            format!("仅 {success}/{n} 条流成功，正式判定至少需要 {required} 条"),
-        )
-    } else if !effective_window.complete {
-        VerdictResult::not_evaluated(
+        };
+    }
+    if !effective_window.complete {
+        return VerdictResult::not_evaluated(
             ReasonCode::EffectiveWindowShort,
             format!(
                 "本方向有效窗口 {:.1}s，要求 {}s{}",
                 effective_window.available_secs, effective_window.required_secs, rx_lifecycle_hint
             ),
-        )
-    } else if rx_stats.stalled_ratio > 1.0 - MIN_RATE_SAMPLE_COVERAGE {
-        // 与 evaluate_nic_rx 的同名判据保持一致：两条判定链在
-        // 「采样是否可信」上必须给出相同结论，否则同一种故障在
-        // TCP 和 UDP 路径上会被写成两种不同的原因码。
-        VerdictResult::not_evaluated(
-            ReasonCode::CounterStalled,
-            format!(
-                "判定窗口内接收端 OS 网卡计数器有 {:.1}% 的时间零增长（采到了样本，\
-                 但字节计数一直没推进），本轮平均速率不可信",
-                rx_stats.stalled_ratio * 100.0
-            ),
-        )
-    } else if !rate_present || !sample_coverage_sufficient {
-        VerdictResult::not_evaluated(
-            ReasonCode::SampleCoverageLow,
-            format!(
-                "RX采样覆盖率 {:.1}%，TX采样覆盖率 {:.1}%{}，或无有效接收速率",
-                rx_stats.coverage * 100.0,
-                tx_stats.coverage * 100.0,
-                if rx_target_mbps.is_some() {
-                    "（有目标时两端均要求至少 95%）"
-                } else {
-                    ""
-                }
-            ),
-        )
-    } else if !rate_window_coverage_sufficient {
-        VerdictResult::not_evaluated(
-            ReasonCode::RateWindowCoverageLow,
-            format!(
-                "完整5秒滚动窗口覆盖不足（RX {:.1}%/P10={}，TX {:.1}%/P10={}，要求均至少95%），不能用少量窗口或跨周期恢复样本替代稳定性判定",
-                rx_stats.rolling_coverage * 100.0,
-                fmt_opt(rx_stats.p10_mbps),
-                tx_stats.rolling_coverage * 100.0,
-                fmt_opt(tx_stats.p10_mbps)
-            ),
-        )
-    } else if rx_target_mbps.is_none() && rate_mode == RateMode::Verify {
-        VerdictResult::not_evaluated(
-            ReasonCode::TargetMissing,
-            "verify 模式必须配置有效的 rate_targets_mbps，且当前路径没有自动 EVB 目标".to_string(),
-        )
-    } else if rx_target_mbps.is_none() {
-        VerdictResult::measured(
-            ReasonCode::TargetUnknown,
-            format!("{:?} 模式仅记录实际能力，不伪造 PASS/FAIL", rate_mode),
-        )
-    } else if loss_ok.is_none() {
-        VerdictResult::not_evaluated(
-            ReasonCode::UdpLossDataMissing,
-            "已配置 UDP 丢包门槛，但 iperf3 输出缺少 lost/total 数据".to_string(),
-        )
-    } else if !rx_meets_target
-        && !tx_sufficient
-        && offered_shortfall_explains_rx(rx_stats.avg_mbps, tx_stats.p10_mbps)
-    {
-        // `!rx_meets_target` 是后补上的，与 `evaluate_nic_rx` 同口径：这个闸的
-        // 全部理由是「解释缺口」，RX 已经达标时它无话可说。少了这一条，只要
-        // TX-P10 落在目标与目标+余量之间，一条达标的腿就会被判成
-        // NOT_EVALUATED / OFFERED_LOAD_LOW。
-        VerdictResult::not_evaluated(
-            ReasonCode::OfferedLoadLow,
-            format!(
-                "TX-P10 {}，验证目标所需负载至少 {}；接收端 {} 基本等于发出的量，\
-                 无法判断被测设备还能不能再多送",
-                fmt_opt(tx_stats.p10_mbps),
-                fmt_opt(offered_floor),
-                fmt_opt(rx_stats.avg_mbps)
-            ),
-        )
-    } else if !rx_meets_target {
-        let target = rx_target_mbps.unwrap_or_default();
-        // 没灌够却仍然判 FAIL 时，把理由说全：不然读报告的人会
-        // 拿「TX 没到门限+余量」来质疑这个结论。
-        let offered_note = if tx_sufficient {
-            String::new()
-        } else {
-            format!(
-                "（发送端 TX-P10 {} 未达目标+余量 {}，但接收端只有 {}，\
-                 缺口远大于发送端少灌的部分，补足负载也补不回来）",
-                fmt_opt(tx_stats.p10_mbps),
-                fmt_opt(offered_floor),
-                fmt_opt(rx_stats.avg_mbps)
-            )
-        };
-        VerdictResult::rate_fail(
-            ReasonCode::RxBelowTarget,
-            format!(
-                "RX平均 {} 低于目标 {}Mbps{offered_note}",
-                fmt_opt(rx_stats.avg_mbps),
-                target
-            ),
-        )
-    } else if let Some(excursion) =
-        rx_target_mbps.and_then(|target| rate_excursion(&rx_stats.series, target))
-    {
-        // 平均达标，但中间连续断/掉/冲过。平均值答不出这件事，
-        // 使用者却看得见。与 TCP/CTS 路径同一判据、同一口径。
-        VerdictResult::rate_fail(
-            excursion.reason_code(),
-            format!("平均速率达标，但{}", excursion.describe()),
-        )
-    } else if loss_ok == Some(false) {
-        VerdictResult::rate_fail(
-            ReasonCode::UdpLossHigh,
-            format!(
-                "UDP平均丢包率 {:.3}% 超过限制 {:.3}%",
-                udp_loss.unwrap_or_default(),
-                max_udp_loss_pct.unwrap_or_default()
-            ),
-        )
-    } else {
-        VerdictResult::pass()
+        );
     }
+
+    // 第 2 层：只比门限。
+    evaluate_rx_acceptance(rate_mode, rx_target_mbps, rx_stats).with_diagnostics(
+        udp_leg_diagnostics(&UdpLegDiagnosticFacts {
+            streams_total: n,
+            streams_success: success,
+            streams_required: required,
+            runtime_failures,
+            rx: rx_stats,
+            tx: tx_stats,
+            target_present: effective_target.is_some(),
+            offered_floor,
+            udp_loss,
+            max_udp_loss_pct,
+        }),
+    )
+}
+
+/// [`udp_leg_diagnostics`] 需要的那部分事实。
+struct UdpLegDiagnosticFacts<'a> {
+    streams_total: usize,
+    streams_success: usize,
+    streams_required: usize,
+    runtime_failures: usize,
+    rx: &'a RateStats,
+    tx: &'a RateStats,
+    target_present: bool,
+    offered_floor: Option<f64>,
+    udp_loss: Option<f64>,
+    max_udp_loss_pct: Option<f64>,
+}
+
+/// UDP 腿的诊断线索。**没有一条会改写判定**。
+///
+/// 其中「丢包率超过限制」这条尤其要说清楚：它以前是一条 `RATE_FAIL` 分支，
+/// 会把 RX 已经达标的腿翻成失败。丢包率仍然是重要的排障信号，所以完整保留
+/// 数值和限制，只是不再决定 PASS/FAIL。
+fn udp_leg_diagnostics(facts: &UdpLegDiagnosticFacts<'_>) -> Vec<String> {
+    let mut out = crate::master::rate_window::rx_acceptance_diagnostics(
+        facts.rx,
+        facts.tx,
+        facts.target_present,
+        facts.offered_floor,
+    );
+    if facts.runtime_failures > 0 {
+        out.push(format!(
+            "{} 条流已有 iperf3 自身吞吐测量，但 client 非正常完成或超时；\
+             工具退出状态不参与判定",
+            facts.runtime_failures
+        ));
+    }
+    if facts.streams_required > facts.streams_total {
+        out.push(format!(
+            "目标需要至少 {} 条流，但只配置了 {} 条；灌包强度不足只作诊断",
+            facts.streams_required, facts.streams_total
+        ));
+    } else if facts.streams_success < facts.streams_required {
+        out.push(format!(
+            "仅 {}/{} 条流成功，目标推算需要 {} 条；灌包强度不足只作诊断",
+            facts.streams_success, facts.streams_total, facts.streams_required
+        ));
+    }
+    match (facts.max_udp_loss_pct, facts.udp_loss) {
+        (Some(limit), Some(actual)) if actual > limit => out.push(format!(
+            "UDP 平均丢包率 {actual:.3}% 超过限制 {limit:.3}%；丢包只作诊断，\
+             达标与否只看接收端 RX 平均"
+        )),
+        (Some(limit), None) => out.push(format!(
+            "已配置 UDP 丢包门槛 {limit:.3}%，但 iperf3 输出缺少 lost/total 数据"
+        )),
+        _ => {}
+    }
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 测试里仍按老三元组读结论。
+    fn nic_rx(
+        mode: RateMode,
+        target_mbps: Option<f64>,
+        stats: &RateStats,
+    ) -> (Verdict, ReasonCode, String) {
+        let result = crate::master::rate_window::evaluate_rx_acceptance(mode, target_mbps, stats);
+        (result.verdict, result.code, result.detail)
+    }
 
     /// 判定链现在是纯函数，给一份事实就能验口径——不必起进程、不必连对端。
     /// 这正是把它从 `run_udp_unit` 里抽出来的目的：口径是这套工具最贵的资产，
@@ -655,7 +674,7 @@ mod tests {
         let tx = healthy(0.0);
 
         // iperf 单腿：跑完了、没有自报测量。
-        let (verdict, code, detail) = iperf_flow_verdict(IperfFlowVerdictIn {
+        let judged = iperf_flow_verdict(IperfFlowVerdictIn {
             raw_ok: true,
             measurement: false,
             effective_window: &window,
@@ -668,6 +687,7 @@ mod tests {
             client_tail: "",
             rx_monitor: None,
         });
+        let (verdict, code, detail) = (judged.verdict, judged.code, judged.detail);
         assert_eq!(
             verdict,
             Verdict::SetupError,
@@ -722,8 +742,7 @@ mod tests {
         let window = full_window();
         // 发送端灌足了（TX-P10 高于 offered_floor），接收端只有目标的一半——
         // 这才是干净的「CPE 没接住」，verify 下必须判 RATE_FAIL。
-        // TX 也不够的话会先命中 OFFERED_LOAD_LOW（那条防的是「把发送端瓶颈
-        // 写成 CPE 失败」），就验不到这里想验的东西了。
+        // TX 也不够时同样按 RX 平均门限判定，避免发送端问题把子网失败隐藏掉。
         let rx = healthy(500.0);
         let tx = healthy(1_100.0);
 
@@ -755,8 +774,7 @@ mod tests {
 
             // 同一份事实喂给 TCP/CTS 那条链，结论必须一致——这才是「收敛」
             // 的意思：两条链对同一件事不能给出不同答案。
-            let (nic_verdict, nic_reason, _) =
-                crate::master::rate_window::evaluate_nic_rx(mode, Some(1_000.0), &rx, &tx, None);
+            let (nic_verdict, nic_reason, _) = nic_rx(mode, Some(1_000.0), &rx);
             assert_eq!(
                 nic_verdict, result.verdict,
                 "UDP 链与 TCP/CTS 链在 {mode:?} 下判定不一致"
@@ -765,14 +783,11 @@ mod tests {
         }
     }
 
-    /// 目标被模式清掉之后，offered 门槛也必须跟着失效。
-    ///
-    /// 否则会出现「没有目标可比，却因为 TX 没到某个不存在的门限+余量而判
-    /// OFFERED_LOAD_LOW」——一个自相矛盾的结论。
+    /// 目标被模式清掉之后，offered 负载不能改变 observe 的 MEASURED 语义。
     #[test]
     fn clearing_the_target_also_clears_the_offered_floor() {
         let window = full_window();
-        // TX 远低于 offered_floor，verify 下会命中 OFFERED_LOAD_LOW。
+        // TX 远低于 offered_floor，observe 仍只记录实际能力。
         let rx = healthy(300.0);
         let tx = healthy(300.0);
         let observed = udp_leg_verdict(&UdpLegFacts {
@@ -809,13 +824,106 @@ mod tests {
         );
         assert_ne!(judgement.code, ReasonCode::OfferedLoadLow);
 
-        // 三条链同口径：同样的输入喂给 evaluate_nic_rx 必须得到同一个结论。
-        let (nic_verdict, nic_code, _) =
-            evaluate_nic_rx(RateMode::Verify, Some(1_000.0), &rx, &tx, Some(1_050.0));
+        // 三条链同口径：同样的输入喂给 evaluate_rx_acceptance 必须得到同一个结论。
+        let (nic_verdict, nic_code, _) = nic_rx(RateMode::Verify, Some(1_000.0), &rx);
         assert_eq!(
             (nic_verdict, nic_code),
             (judgement.verdict, judgement.code),
             "UDP 链与 TCP/CTS 链在 offered 闸上又分叉了"
+        );
+
+        // 发送端完全没有可用诊断样本，也不影响已经达标的 RX 平均——
+        // 它只会多出几条诊断。
+        let sender_missing = RateStats::default();
+        let judgement = udp_leg_verdict(&facts(&rx, &sender_missing, &window));
+        assert_eq!(
+            (judgement.verdict, judgement.code),
+            (Verdict::Pass, ReasonCode::None)
+        );
+        assert!(
+            !judgement.diagnostics.is_empty(),
+            "发送端一份样本都没有，至少要留下诊断"
+        );
+    }
+
+    fn measured_leg(tag: &str, rx: f64) -> LegOutcome {
+        LegOutcome {
+            judgement: VerdictResult::measured(ReasonCode::TargetUnknown, "只测量"),
+            rx_avg: Some(rx),
+            main_rows: Vec::new(),
+            tag: tag.to_string(),
+        }
+    }
+
+    /// Wi-Fi 双向按**两端 RX 合计**判定：不要求两个方向各达到一半。
+    #[test]
+    fn a_bidirectional_unit_passes_on_the_sum_of_both_receivers() {
+        let outcomes = vec![measured_leg("ab", 720.0), measured_leg("ba", 230.0)];
+        let judgement = bidir_total_verdict(&outcomes, 900.0);
+        assert_eq!(
+            judgement.verdict,
+            Verdict::Pass,
+            "720 + 230 = 950 ≥ 900，不该因为 BA 只有 230 就失败：{judgement:?}"
+        );
+        assert!(
+            judgement
+                .diagnostics
+                .iter()
+                .any(|line| line.contains("950.000")),
+            "合计值要写进报告：{judgement:?}"
+        );
+    }
+
+    #[test]
+    fn a_bidirectional_unit_fails_when_the_sum_is_short() {
+        let outcomes = vec![measured_leg("ab", 600.0), measured_leg("ba", 200.0)];
+        let judgement = bidir_total_verdict(&outcomes, 900.0);
+        assert_eq!(judgement.verdict, Verdict::RateFail);
+        assert_eq!(judgement.code, ReasonCode::RxBelowTarget);
+        assert!(judgement.detail.contains("800.000"), "{judgement:?}");
+    }
+
+    /// 缺一个方向就形不成合计——这时**不猜**。
+    #[test]
+    fn a_bidirectional_unit_without_both_receivers_is_not_evaluated() {
+        let only_ab = vec![measured_leg("ab", 720.0)];
+        assert_eq!(
+            bidir_total_verdict(&only_ab, 900.0).verdict,
+            Verdict::NotEvaluated
+        );
+
+        let mut missing_rx = vec![measured_leg("ab", 720.0), measured_leg("ba", 230.0)];
+        missing_rx[1].rx_avg = None;
+        assert_eq!(
+            bidir_total_verdict(&missing_rx, 900.0).verdict,
+            Verdict::NotEvaluated
+        );
+
+        // 一条腿采样不可信：合计不成立，交回按腿聚合去说明原因。
+        let mut untrusted = vec![measured_leg("ab", 720.0), measured_leg("ba", 230.0)];
+        untrusted[1].judgement =
+            VerdictResult::not_evaluated(ReasonCode::CounterStalled, "计数器停滞");
+        assert_eq!(
+            bidir_total_verdict(&untrusted, 900.0).verdict,
+            Verdict::NotEvaluated
+        );
+    }
+
+    /// 缺一个方向时**不许**退回两条腿各自的 `MEASURED` 假装一切正常。
+    ///
+    /// 单元级的取舍规则是：腿级聚合出的 `SETUP_ERROR` / `NOT_EVALUATED` 更具体
+    /// （说得出哪条腿、什么原因），让它说话；除此之外一律由合计拍板——
+    /// 包括合计自己判 `NOT_EVALUATED`。
+    #[test]
+    fn a_missing_direction_is_not_evaluated_rather_than_the_legs_own_measured() {
+        let only_ab = vec![measured_leg("ab", 720.0)];
+        // 两条腿本身都只是 MEASURED，聚合出来也是 MEASURED——
+        // 单元不能因此显示成「测过了、只是没门限」。
+        assert_eq!(aggregate_unit_verdict(&only_ab), Verdict::Measured);
+        assert_eq!(
+            bidir_total_verdict(&only_ab, 900.0).verdict,
+            Verdict::NotEvaluated,
+            "缺一个方向就是形不成合计"
         );
     }
 
@@ -835,18 +943,106 @@ mod tests {
         assert_eq!(udp_leg_verdict(&facts(&rx, &tx, &w)), VerdictResult::pass());
     }
 
-    /// 灌不够时接收端低于目标**不能**算被测设备不达标。
+    /// **RX 达标就是 PASS，UDP 丢包只留诊断**（ADR-17）。
     ///
-    /// 这是整条链最容易写反的一处：发送端只灌了 800，接收端收到 790，
-    /// 「接收端低于 1000」是事实，但它证明不了设备送不出 1000。
+    /// 这条测试锁的是用户确认过的验收规则里最容易被推翻的一条。丢包门槛以前
+    /// 是一条独立的 `RATE_FAIL` 分支，会把接收端已经收满速率的一轮翻成失败。
     #[test]
-    fn an_offered_load_shortfall_is_not_a_device_failure() {
+    fn udp_loss_over_the_limit_never_overturns_a_passing_rx_average() {
+        let (rx, tx, w) = (healthy(1_200.0), healthy(1_200.0), full_window());
+        let mut over_limit = facts(&rx, &tx, &w);
+        over_limit.max_udp_loss_pct = Some(1.0);
+        over_limit.udp_loss = Some(2.1);
+        let judgement = udp_leg_verdict(&over_limit);
+        assert_eq!(
+            (judgement.verdict, judgement.code),
+            (Verdict::Pass, ReasonCode::None),
+            "RX 平均已达门限，丢包不许改写结论：{judgement:?}"
+        );
+        assert!(
+            judgement
+                .diagnostics
+                .iter()
+                .any(|line| line.contains("2.100%") && line.contains("1.000%")),
+            "丢包实测值和限制必须留在诊断里：{judgement:?}"
+        );
+    }
+
+    /// 工具非正常退出同样只是诊断。
+    #[test]
+    fn an_abnormal_iperf_exit_never_overturns_a_passing_rx_average() {
+        let (rx, tx, w) = (healthy(1_200.0), healthy(1_200.0), full_window());
+        let mut runtime_failed = facts(&rx, &tx, &w);
+        runtime_failed.runtime_failures = 2;
+        let judgement = udp_leg_verdict(&runtime_failed);
+        assert_eq!(judgement.verdict, Verdict::Pass, "{judgement:?}");
+        assert!(
+            judgement
+                .diagnostics
+                .iter()
+                .any(|line| line.contains("非正常完成")),
+            "{judgement:?}"
+        );
+    }
+
+    /// 发送端灌不够同样只是诊断。
+    #[test]
+    fn an_underfilled_sender_never_overturns_a_passing_rx_average() {
+        let rx = healthy(1_200.0);
+        // TX-P10 900 < floor 1050，RX 平均 1200 ≥ 目标 1000。
+        let tx = healthy(900.0);
+        let w = full_window();
+        let judgement = udp_leg_verdict(&facts(&rx, &tx, &w));
+        assert_eq!(judgement.verdict, Verdict::Pass, "{judgement:?}");
+        assert!(
+            judgement
+                .diagnostics
+                .iter()
+                .any(|line| line.contains("TX-P10")),
+            "{judgement:?}"
+        );
+    }
+
+    /// 配置的流数不够、实际起来的流数不够，也都只是诊断。
+    #[test]
+    fn a_stream_count_shortfall_never_overturns_a_passing_rx_average() {
+        let (rx, tx, w) = (healthy(1_200.0), healthy(1_200.0), full_window());
+        let mut too_few_configured = facts(&rx, &tx, &w);
+        too_few_configured.streams_required = 4;
+        let judgement = udp_leg_verdict(&too_few_configured);
+        assert_eq!(judgement.verdict, Verdict::Pass, "{judgement:?}");
+        assert!(
+            judgement
+                .diagnostics
+                .iter()
+                .any(|line| line.contains("只配置了")),
+            "{judgement:?}"
+        );
+
+        let mut too_few_active = facts(&rx, &tx, &w);
+        too_few_active.streams_total = 10;
+        too_few_active.streams_required = 8;
+        too_few_active.streams_success = 3;
+        let judgement = udp_leg_verdict(&too_few_active);
+        assert_eq!(judgement.verdict, Verdict::Pass, "{judgement:?}");
+        assert!(
+            judgement
+                .diagnostics
+                .iter()
+                .any(|line| line.contains("3/10")),
+            "{judgement:?}"
+        );
+    }
+
+    /// RX 平均低于目标时，即使发送端也没灌够，仍按子网问题直接 FAIL。
+    #[test]
+    fn an_offered_load_shortfall_is_a_subnet_failure() {
         let rx = healthy(790.0);
         let tx = healthy(800.0);
         let w = full_window();
         let judgement = udp_leg_verdict(&facts(&rx, &tx, &w));
-        assert_eq!(judgement.verdict, Verdict::NotEvaluated);
-        assert_eq!(judgement.code, ReasonCode::OfferedLoadLow);
+        assert_eq!(judgement.verdict, Verdict::RateFail);
+        assert_eq!(judgement.code, ReasonCode::RxBelowTarget);
     }
 
     /// 反过来：发送端少灌 50、接收端却只有 580，缺口远大于少灌的部分，
@@ -861,9 +1057,12 @@ mod tests {
         assert_eq!(judgement.code, ReasonCode::RxBelowTarget);
     }
 
-    /// 采样不可信时永远不许对被测设备下结论——顺序铁律。
+    /// **接收端**采样不可信时仍然只能是 NOT_EVALUATED，三条链同一口径。
+    ///
+    /// 注意与发送端的区别：TX 侧的任何不足都只进诊断，而 RX 侧采样塌了就是
+    /// 「这一行没有可比的数」——铁律 2 说的正是这一条。
     #[test]
-    fn untrustworthy_sampling_never_becomes_a_device_failure() {
+    fn an_untrustworthy_receiver_sample_series_is_still_not_evaluated() {
         let w = full_window();
         let tx = healthy(1_200.0);
 
@@ -871,10 +1070,13 @@ mod tests {
         low_coverage.coverage = 0.5;
         let judgement = udp_leg_verdict(&facts(&low_coverage, &tx, &w));
         assert_eq!(
-            judgement.verdict,
-            Verdict::NotEvaluated,
-            "覆盖率不足却判了 {judgement:?}"
+            (judgement.verdict, judgement.code),
+            (Verdict::NotEvaluated, ReasonCode::SampleCoverageLow),
+            "接收端覆盖率不足却判了 {judgement:?}"
         );
+        // TCP/CTS 链必须给出同一个结论。
+        let (nic_verdict, nic_code, _) = nic_rx(RateMode::Verify, Some(1_000.0), &low_coverage);
+        assert_eq!((nic_verdict, nic_code), (judgement.verdict, judgement.code));
 
         let mut stalled = healthy(500.0);
         stalled.stalled_ratio = 0.9;
@@ -882,9 +1084,9 @@ mod tests {
         assert_eq!(judgement.code, ReasonCode::CounterStalled);
     }
 
-    /// 平均达标但中途连续掉坑：FAIL，且报的是真秒数。
+    /// 平均达标时中途连续掉坑也 PASS。
     #[test]
-    fn a_real_dropout_still_fails_a_run_whose_average_is_fine() {
+    fn a_real_dropout_does_not_override_a_passing_rx_average() {
         let mut rx = healthy(1_200.0);
         // 第 30~36 秒掉到门限 80% 以下，连续 7 秒。
         rx.series = (1..=180)
@@ -900,9 +1102,30 @@ mod tests {
         let tx = healthy(1_200.0);
         let w = full_window();
         let judgement = udp_leg_verdict(&facts(&rx, &tx, &w));
-        assert_eq!(judgement.verdict, Verdict::RateFail);
-        assert_eq!(judgement.code, ReasonCode::RxDropout);
-        assert!(judgement.detail.contains("连续 7.0 秒"), "{judgement:?}");
+        assert_eq!(judgement.verdict, Verdict::Pass);
+        assert_eq!(judgement.code, ReasonCode::None);
+        assert!(judgement.detail.is_empty());
+    }
+
+    /// 已配置丢包门槛却缺数据：说出来，但不再吃掉一个成立的 PASS。
+    #[test]
+    fn missing_udp_loss_data_is_reported_without_hiding_a_passing_rx() {
+        let rx = healthy(1_200.0);
+        let tx = healthy(1_200.0);
+        let window = full_window();
+        let mut missing_loss = facts(&rx, &tx, &window);
+        missing_loss.max_udp_loss_pct = Some(1.0);
+        missing_loss.udp_loss = None;
+
+        let judgement = udp_leg_verdict(&missing_loss);
+        assert_eq!(judgement.verdict, Verdict::Pass, "{judgement:?}");
+        assert!(
+            judgement
+                .diagnostics
+                .iter()
+                .any(|line| line.contains("缺少 lost/total")),
+            "{judgement:?}"
+        );
     }
 
     /// 一个采样周期的掉拍不算数：Wi-Fi 发 probe 就是这个形态。

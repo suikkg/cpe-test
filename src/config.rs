@@ -136,6 +136,26 @@ pub struct UniversalParams {
     /// 老配置行为不变。
     #[serde(default)]
     pub rate_targets_bidir_mbps: Option<RateTargets>,
+
+    /// **双向并发**单元的「两端 RX 合计」门限。
+    ///
+    /// Wi-Fi↔Wi-Fi 是半双工共享介质：AB 和 BA 抢的是同一段空口时间，
+    /// 两个方向能分到多少完全取决于调度，**没有理由要求各自达到一半**。
+    /// 用户要验收的是这条链路在双向并发下总共还能过多少数据，所以口径是
+    ///
+    /// ```text
+    /// 双向有效吞吐 = AB 方向接收端 RX 平均 + BA 方向接收端 RX 平均
+    /// ```
+    ///
+    /// 用两端的 **RX** 相加而不是 TX+RX：同一个包在发送侧 TX 和接收侧 RX 各
+    /// 记一次，相加就是重复计数；TX 还会混进背景流量和 socket 缓冲里从未上线
+    /// 的字节。
+    ///
+    /// 配了它，这个双向单元就**只按合计判定**：两条腿各自只测量（`MEASURED`），
+    /// 单元级比一次合计。留空则完全走既有的每方向门限链路，有线全双工场景
+    /// 一个字节都没变。
+    #[serde(default)]
+    pub rate_target_bidir_total_mbps: Option<f64>,
 }
 
 fn default_agent_bind() -> String {
@@ -616,6 +636,26 @@ pub struct TestSpec {
     /// 老配置行为不变。
     #[serde(default)]
     pub rate_targets_bidir_mbps: Option<RateTargets>,
+
+    /// **双向并发**单元的「两端 RX 合计」门限。
+    ///
+    /// Wi-Fi↔Wi-Fi 是半双工共享介质：AB 和 BA 抢的是同一段空口时间，
+    /// 两个方向能分到多少完全取决于调度，**没有理由要求各自达到一半**。
+    /// 用户要验收的是这条链路在双向并发下总共还能过多少数据，所以口径是
+    ///
+    /// ```text
+    /// 双向有效吞吐 = AB 方向接收端 RX 平均 + BA 方向接收端 RX 平均
+    /// ```
+    ///
+    /// 用两端的 **RX** 相加而不是 TX+RX：同一个包在发送侧 TX 和接收侧 RX 各
+    /// 记一次，相加就是重复计数；TX 还会混进背景流量和 socket 缓冲里从未上线
+    /// 的字节。
+    ///
+    /// 配了它，这个双向单元就**只按合计判定**：两条腿各自只测量（`MEASURED`），
+    /// 单元级比一次合计。留空则完全走既有的每方向门限链路，有线全双工场景
+    /// 一个字节都没变。
+    #[serde(default)]
+    pub rate_target_bidir_total_mbps: Option<f64>,
 
     /// 报表分组键：这条测试属于哪一组链路。
     ///

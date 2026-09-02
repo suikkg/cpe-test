@@ -168,6 +168,13 @@ pub struct VerdictResult {
     pub verdict: Verdict,
     pub code: ReasonCode,
     pub detail: String,
+    /// **不参与判定**的排障线索（ADR-17）。
+    ///
+    /// 吞吐验收只认接收端网卡 RX 平均：形成了有效平均值就只和门限比一次，
+    /// UDP 丢包、发送端负载、工具退出状态一律不许改写那个结论。但它们仍然是
+    /// 排障必需的事实——把它们塞进 `detail` 会让原因码和明细讲两件事，
+    /// 所以单开一条通道，报告里显示成「诊断」。
+    pub diagnostics: Vec<String>,
 }
 
 impl VerdictResult {
@@ -176,7 +183,19 @@ impl VerdictResult {
             verdict,
             code,
             detail: detail.into(),
+            diagnostics: Vec::new(),
         }
+    }
+
+    /// 挂上诊断线索。判定本身一个字节都不变——这正是它单独存在的意义。
+    #[must_use]
+    pub fn with_diagnostics(mut self, diagnostics: Vec<String>) -> Self {
+        self.diagnostics.extend(
+            diagnostics
+                .into_iter()
+                .filter(|line| !line.trim().is_empty()),
+        );
+        self
     }
 
     /// 通过。通过不需要原因码，也不需要解释。
@@ -185,6 +204,7 @@ impl VerdictResult {
             verdict: Verdict::Pass,
             code: ReasonCode::None,
             detail: String::new(),
+            diagnostics: Vec::new(),
         }
     }
 

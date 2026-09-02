@@ -37,6 +37,7 @@ fn request() -> RunRequest {
         pairs: vec![PairSelection {
             rx_target_bidir_ab: String::new(),
             rx_target_bidir_ba: String::new(),
+            rx_target_bidir_total: String::new(),
             udp_groups: Vec::new(),
             tcp_groups: Vec::new(),
             src: "master:NAME=以太网 6".into(),
@@ -85,6 +86,14 @@ fn request() -> RunRequest {
         ping_wifi_medium_max_rtt_ms: 0.0,
         ping_wifi_large_avg_rtt_ms: 0.0,
         ping_wifi_large_max_rtt_ms: 0.0,
+        wifi_pair_rx_target_mbps: 0.0,
+        wifi_pair_bidir_rx_target_mbps: 0.0,
+        wifi_pair_bidir_total_rx_target_mbps: 0.0,
+        udp_profiles: None,
+        global_rate_targets: None,
+        global_rate_mode: None,
+        wifi_band_thresholds: Vec::new(),
+        wifi_pair_thresholds: Vec::new(),
         limit_udp_by_link_speed: false,
         resume: false,
         screenshot: false,
@@ -207,6 +216,555 @@ fn suite_plan_keeps_tcp_and_udp_as_independent_specs_in_suite_order() {
     assert_eq!(compiled.trace[1].direction.as_deref(), Some("ba"));
     assert!(!compiled.plan_hash.is_empty());
     assert!(!compiled.topology_fingerprint.is_empty());
+}
+
+/// 门限断言一律看**最终生效值**，不看某个字段填没填。
+///
+/// `RateTargets::for_direction("ab")` 是 `ab.or(forward)`，所以「`forward` 字段
+/// 还在」根本不能证明它还在生效：往 `ab` 里插一个数就能悄悄推翻它。
+fn effective(targets: Option<&crate::config::RateTargets>, dir: &str) -> Option<f64> {
+    targets.and_then(|targets| targets.for_direction(dir))
+}
+
+/// 项目快照必须能**跨主控复现判定**。
+///
+/// 这是 gptreview 的 P1：导出的是空白覆盖状态，导入另一台主控后，后端会改用
+/// 那台机器自己的 Ping 次数、payload 分类和 RTT 门限——「怎么判定」静默变了，
+/// 而项目文件上看不出来。修法是导出时把值换算成主控当前真正生效的那一份
+/// （前端 `resolveEffectiveGlobals`），并给全局门限、UDP 档位这两样界面上没有
+/// 输入框的东西补上传输通道。这条测试守的是**后端这一半**：请求里带了值，
+/// 目标机器的 `config.json` 就不许再插话。
+#[test]
+fn a_pinned_project_snapshot_does_not_fall_back_to_the_target_master_config() {
+    let mut state = state_with_pair();
+    // 「另一台主控」：config.json 里的默认值和项目快照完全不同。
+    state.cfg.ping.count = 4;
+    state.cfg.ping.payload_sizes = vec![64];
+    state.cfg.ping.wifi_large_max_rtt_ms = 999.0;
+    state.cfg.iperf.tcp_windows = vec!["64k".into()];
+    state.cfg.iperf.rate_check.targets_mbps = crate::config::RateTargets {
+        forward: Some(4242.0),
+        ab: None,
+        ba: None,
+    };
+    state.cfg.iperf.udp_profiles = vec![crate::config::UdpProfile::bw("9000m")];
+    // 目标机器配的是 observe：不带走判定模式的话，整轮都会变成 MEASURED。
+    state.cfg.iperf.rate_check.mode = crate::config::RateMode::Observe;
+
+    let mut req = suite_request();
+    // 项目快照带来的有效值。
+    req.ping_count = 30;
+    req.ping_payload_sizes = vec![32, 1600, 65500];
+    req.ping_wifi_large_max_rtt_ms = 200.0;
+    req.tcp_windows = vec!["4m".into()];
+    req.global_rate_targets = Some(crate::config::RateTargets {
+        forward: Some(1200.0),
+        ab: None,
+        ba: None,
+    });
+    req.global_rate_mode = Some(crate::config::RateMode::Verify);
+    req.udp_profiles = Some(vec![
+        crate::config::UdpProfile::bw("1m"),
+        crate::config::UdpProfile {
+            bandwidth: "1000m".into(),
+            length: Some("64".into()),
+            window: None,
+        },
+    ]);
+
+    let cfg = validated_config_from_request(&state, &req).expect("项目快照应能编译");
+    assert_eq!(cfg.ping.count, 30, "Ping 次数必须来自项目，不是目标机器");
+    assert_eq!(cfg.ping.payload_sizes, vec![32, 1600, 65500]);
+    assert_eq!(cfg.ping.wifi_large_max_rtt_ms, 200.0);
+    assert_eq!(cfg.iperf.tcp_windows, vec!["4m".to_string()]);
+    assert_eq!(
+        cfg.iperf.rate_check.targets_mbps.forward,
+        Some(1200.0),
+        "全局门限必须来自项目：换机后判定口径不许静默改变"
+    );
+    assert_eq!(
+        cfg.iperf.rate_check.mode,
+        crate::config::RateMode::Verify,
+        "判定模式同样必须来自项目：observe 整轮不判 PASS/FAIL"
+    );
+    assert_eq!(
+        cfg.iperf
+            .udp_profiles
+            .iter()
+            .map(|profile| (profile.bandwidth.clone(), profile.length.clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("1m".to_string(), None),
+            ("1000m".to_string(), Some("64".to_string())),
+        ],
+        "档位表要原样落地：三条轴是叉乘语义，还原不回逐条档位"
+    );
+}
+
+/// 「明确没有全局门限」和「没意见」是两件事。
+#[test]
+fn a_project_that_pins_an_empty_global_target_clears_the_target_master_one() {
+    let mut state = state_with_pair();
+    state.cfg.iperf.rate_check.targets_mbps = crate::config::RateTargets {
+        forward: Some(4242.0),
+        ab: None,
+        ba: None,
+    };
+
+    let mut req = suite_request();
+    // 没意见：沿用本机。
+    let inherited = validated_config_from_request(&state, &req).expect("应能编译");
+    assert_eq!(
+        inherited.iperf.rate_check.targets_mbps.forward,
+        Some(4242.0)
+    );
+
+    // 明确声明「本项目没有全局门限」：本机那一份必须被清掉。
+    req.global_rate_targets = Some(crate::config::RateTargets::default());
+    let pinned = validated_config_from_request(&state, &req).expect("应能编译");
+    assert_eq!(pinned.iperf.rate_check.targets_mbps.forward, None);
+}
+
+#[test]
+fn wifi_pair_global_targets_apply_only_to_wifi_to_wifi_specs() {
+    let mut state = state_with_pair();
+    state.master.interfaces[0].role = "WIFI5G".into();
+    state.master.interfaces[0].is_wifi = true;
+    state.agent.interfaces[0].is_wifi = true;
+
+    let mut req = suite_request();
+    req.wifi_pair_rx_target_mbps = 1000.0;
+    req.wifi_pair_bidir_total_rx_target_mbps = 900.0;
+    let plan = req.ui_plan.as_mut().unwrap();
+    plan.suites[0].tasks.retain(|task| task.id == "task-tcp");
+    plan.suites[0].order = vec!["task-tcp".into()];
+    plan.suites[0].tasks[0].directions = vec!["ab".into(), "bidir".into()];
+
+    let cfg = validated_config_from_request(&state, &req).expect("Wi-Fi 互测门限应能编译");
+    assert_eq!(cfg.tests.len(), 1);
+    let targets = cfg.tests[0].rate_targets_mbps.as_ref();
+    assert_eq!(effective(targets, "ab"), Some(1000.0));
+    assert_eq!(effective(targets, "ba"), Some(1000.0));
+    assert_eq!(cfg.tests[0].rate_target_bidir_total_mbps, Some(900.0));
+
+    // 任务显式填的门限必须压过频段/全局兜底——按**最终生效值**断言。
+    let task = &mut req.ui_plan.as_mut().unwrap().suites[0].tasks[0];
+    task.rate_targets_mbps = Some(crate::config::RateTargets {
+        forward: Some(1200.0),
+        ..Default::default()
+    });
+    task.rx_target_bidir_total = "1500".into();
+    let explicit = validated_config_from_request(&state, &req).expect("任务门限应优先");
+    let targets = explicit.tests[0].rate_targets_mbps.as_ref();
+    assert_eq!(
+        effective(targets, "ab"),
+        Some(1200.0),
+        "任务 forward 已经给 AB 提供了门限，全局兜底不许再插一个 ab 把它盖掉"
+    );
+    assert_eq!(effective(targets, "ba"), Some(1200.0));
+    assert_eq!(explicit.tests[0].rate_target_bidir_total_mbps, Some(1500.0));
+
+    let task = &mut req.ui_plan.as_mut().unwrap().suites[0].tasks[0];
+    task.rate_targets_mbps = None;
+    task.rx_target_bidir_total.clear();
+    state.master.interfaces[0].role = "SGMII2.5G".into();
+    state.master.interfaces[0].is_wifi = false;
+    let wired_wifi = validated_config_from_request(&state, &req).expect("有线↔Wi-Fi 仍应编译");
+    assert!(wired_wifi.tests[0].rate_targets_mbps.is_none());
+    assert!(wired_wifi.tests[0].rate_target_bidir_total_mbps.is_none());
+}
+
+/// 任务方向门限 vs 频段表：**最终生效的必须是任务那一个**。
+///
+/// 这条以前是漏的。任务只填 `forward=1200`、频段表填 `ab=700` 时，旧实现
+/// 看 `targets.ab` 为空就 `get_or_insert(700)`，而 `for_direction("ab")` 优先
+/// 取 `ab`——`forward=1200` 原样躺在结构里，实际执行按 700。
+#[test]
+fn a_task_forward_target_is_not_overridden_by_the_band_table() {
+    let mut state = state_with_pair();
+    state.master.interfaces[0].role = "WIFI5G".into();
+    state.master.interfaces[0].wifi_band = "5GHz".into();
+    state.master.interfaces[0].is_wifi = true;
+    state.agent.interfaces[0].role = "WIFI2.4G".into();
+    state.agent.interfaces[0].wifi_band = "2.4GHz".into();
+    state.agent.interfaces[0].is_wifi = true;
+
+    let mut req = suite_request();
+    req.wifi_band_thresholds = vec![WifiBandThreshold {
+        master_band: "5GHz".into(),
+        agent_band: "2.4GHz".into(),
+        rx_target_master_to_agent_mbps: 700.0,
+        ..Default::default()
+    }];
+    let task = &mut req.ui_plan.as_mut().unwrap().suites[0].tasks[0];
+    task.directions = vec!["ab".into(), "ba".into()];
+    task.rate_targets_mbps = Some(crate::config::RateTargets {
+        forward: Some(1200.0),
+        ..Default::default()
+    });
+
+    let cfg = validated_config_from_request(&state, &req).expect("应能编译");
+    let targets = cfg.tests[0].rate_targets_mbps.as_ref();
+    assert_eq!(
+        effective(targets, "ab"),
+        Some(1200.0),
+        "任务 forward 必须是 AB 的最终生效门限"
+    );
+    assert_eq!(
+        effective(targets, "ba"),
+        Some(1200.0),
+        "BA 方向频段表没填，任务 forward 同样生效"
+    );
+}
+
+/// 百分比门限换算不出来时，频段兜底**不许**被提前禁用。
+///
+/// `90%` 在网卡协商速率未知（Wi-Fi 常见）时算不出绝对值，`rate.rs` 明确要求
+/// 回退到下游兜底。旧实现只看「按网口门限那一栏文本非空」，于是频段门限被删掉，
+/// 而百分比又落不了地，两层兜底同时失效。
+#[test]
+fn an_unresolvable_percent_override_still_leaves_the_band_threshold_in_place() {
+    let mut state = state_with_pair();
+    state.master.interfaces[0].role = "WIFI5G".into();
+    state.master.interfaces[0].wifi_band = "5GHz".into();
+    state.master.interfaces[0].is_wifi = true;
+    state.agent.interfaces[0].role = "WIFI2.4G".into();
+    state.agent.interfaces[0].wifi_band = "2.4GHz".into();
+    state.agent.interfaces[0].is_wifi = true;
+    // 接收端协商速率未知：百分比无法换算。
+    state.agent.interfaces[0].speed_mbps = 0;
+
+    let mut req = suite_request();
+    req.wifi_band_thresholds = vec![WifiBandThreshold {
+        master_band: "5GHz".into(),
+        agent_band: "2.4GHz".into(),
+        rx_target_master_to_agent_mbps: 700.0,
+        rx_target_agent_to_master_mbps: 420.0,
+        ..Default::default()
+    }];
+    req.nic_policies = vec![NicPolicySelection {
+        endpoint: "agent:NAME=WLAN 3".into(),
+        rx_target: "90%".into(),
+        udp_bandwidth: String::new(),
+        udp_length: String::new(),
+    }];
+    req.ui_plan.as_mut().unwrap().suites[0].tasks[0].directions = vec!["ab".into(), "ba".into()];
+
+    let cfg = validated_config_from_request(&state, &req).expect("应能编译");
+    let targets = cfg.tests[0].rate_targets_mbps.as_ref();
+    assert_eq!(
+        effective(targets, "ab"),
+        Some(700.0),
+        "百分比算不出来时频段门限必须留着当下一层兜底"
+    );
+
+    // 反面：协商速率已知时，百分比确实能落地，频段门限就该让位给它。
+    state.agent.interfaces[0].speed_mbps = 1000;
+    let resolved = validated_config_from_request(&state, &req).expect("应能编译");
+    assert_eq!(
+        effective(resolved.tests[0].rate_targets_mbps.as_ref(), "ab"),
+        None,
+        "百分比能落地时由按网口门限负责这个方向"
+    );
+}
+
+#[test]
+fn wifi_band_pair_rules_keep_single_and_bidir_directions_independent() {
+    let mut state = state_with_pair();
+    state.master.interfaces[0].role = "WIFI5G".into();
+    state.master.interfaces[0].wifi_band = "5GHz".into();
+    state.master.interfaces[0].is_wifi = true;
+    state.agent.interfaces[0].role = "WIFI2.4G".into();
+    state.agent.interfaces[0].wifi_band = "2.4GHz".into();
+    state.agent.interfaces[0].is_wifi = true;
+
+    let mut req = suite_request();
+    req.wifi_band_thresholds = vec![WifiBandThreshold {
+        master_band: "5GHz".into(),
+        agent_band: "2.4GHz".into(),
+        rx_target_master_to_agent_mbps: 700.0,
+        rx_target_agent_to_master_mbps: 420.0,
+        bidir_total_rx_target_mbps: 540.0,
+        ..Default::default()
+    }];
+    let task = &mut req.ui_plan.as_mut().unwrap().suites[0].tasks[0];
+    task.directions = vec!["ab".into(), "ba".into(), "bidir".into()];
+
+    let cfg = validated_config_from_request(&state, &req).expect("频段规则应能编译");
+    let targets = cfg.tests[0].rate_targets_mbps.as_ref();
+    assert_eq!(effective(targets, "ab"), Some(700.0));
+    assert_eq!(effective(targets, "ba"), Some(420.0));
+    assert_eq!(
+        cfg.tests[0].rate_target_bidir_total_mbps,
+        Some(540.0),
+        "双向只有一个合计门限，与方向无关"
+    );
+
+    req.nic_policies = vec![NicPolicySelection {
+        endpoint: "agent:NAME=WLAN 3".into(),
+        rx_target: "300".into(),
+        udp_bandwidth: String::new(),
+        udp_length: String::new(),
+    }];
+    let with_nic = validated_config_from_request(&state, &req).expect("网卡门限应能覆盖频段门限");
+    let single = with_nic.tests[0].rate_targets_mbps.as_ref();
+    assert_eq!(effective(single, "ab"), None, "主控→辅测由接收网卡门限负责");
+    assert_eq!(effective(single, "ba"), Some(420.0));
+    assert_eq!(
+        with_nic.tests[0].rate_target_bidir_total_mbps,
+        Some(540.0),
+        "合计门限是链路级的，不因某一端配了网卡门限而消失"
+    );
+
+    let pair = WifiPairThreshold {
+        src_endpoint: "master:NAME=以太网 6".into(),
+        dst_endpoint: "agent:NAME=WLAN 3".into(),
+        rx_target_ab_mbps: 760.0,
+        rx_target_ba_mbps: 390.0,
+        bidir_rx_target_ab_mbps: 280.0,
+        bidir_rx_target_ba_mbps: 190.0,
+    };
+    req.nic_policies.clear();
+    req.wifi_band_thresholds.clear();
+    req.wifi_pair_thresholds = vec![pair];
+    let overridden = validated_config_from_request(&state, &req).expect("旧网口覆盖应能兼容");
+    let targets = overridden.tests[0].rate_targets_mbps.as_ref();
+    assert_eq!(effective(targets, "ab"), Some(760.0));
+    assert_eq!(effective(targets, "ba"), Some(390.0));
+    assert_eq!(
+        overridden.tests[0].rate_target_bidir_total_mbps,
+        Some(470.0),
+        "旧的两个方向双向门限迁移成合计 = 280 + 190"
+    );
+}
+
+/// 只填了一个方向的旧双向门限**不擅自推导**合计。
+#[test]
+fn a_half_configured_legacy_bidir_rule_does_not_invent_a_total() {
+    let mut state = state_with_pair();
+    for nic in [
+        &mut state.master.interfaces[0],
+        &mut state.agent.interfaces[0],
+    ] {
+        nic.role = "WIFI5G".into();
+        nic.wifi_band = "5GHz".into();
+        nic.is_wifi = true;
+    }
+
+    let mut req = suite_request();
+    req.wifi_band_thresholds = vec![WifiBandThreshold {
+        master_band: "5GHz".into(),
+        agent_band: "5GHz".into(),
+        bidir_rx_target_master_to_agent_mbps: 700.0,
+        ..Default::default()
+    }];
+    req.ui_plan.as_mut().unwrap().suites[0].tasks[0].directions = vec!["bidir".into()];
+
+    let cfg = validated_config_from_request(&state, &req).expect("应能编译");
+    assert_eq!(
+        cfg.tests[0].rate_target_bidir_total_mbps, None,
+        "只有一个方向时，当成合计 700 会凭空放宽一倍，当成 1400 又凭空收紧"
+    );
+}
+
+#[test]
+fn same_band_wifi_pair_keeps_both_directions_and_reversed_pair_order() {
+    let mut state = state_with_pair();
+    for nic in [
+        &mut state.master.interfaces[0],
+        &mut state.agent.interfaces[0],
+    ] {
+        nic.role = "WIFI5G".into();
+        nic.wifi_band = "5GHz".into();
+        nic.is_wifi = true;
+    }
+
+    let mut req = suite_request();
+    req.wifi_band_thresholds = vec![WifiBandThreshold {
+        master_band: "5GHz".into(),
+        agent_band: "5GHz".into(),
+        rx_target_master_to_agent_mbps: 910.0,
+        rx_target_agent_to_master_mbps: 730.0,
+        bidir_total_rx_target_mbps: 900.0,
+        ..Default::default()
+    }];
+    let plan = req.ui_plan.as_mut().unwrap();
+    plan.link_sets[0].pair_refs[0].src = "agent:NAME=WLAN 3".into();
+    plan.link_sets[0].pair_refs[0].dst = "master:NAME=以太网 6".into();
+    plan.suites[0].tasks[0].directions = vec!["ab".into(), "ba".into(), "bidir".into()];
+
+    let cfg = validated_config_from_request(&state, &req).expect("同频反向 pair 应能编译");
+    let single = cfg.tests[0].rate_targets_mbps.as_ref();
+    assert_eq!(effective(single, "ab"), Some(730.0), "AB 是辅测→主控");
+    assert_eq!(effective(single, "ba"), Some(910.0), "BA 是主控→辅测");
+    assert_eq!(
+        cfg.tests[0].rate_target_bidir_total_mbps,
+        Some(900.0),
+        "合计与方向无关，反向 pair 取到同一个数"
+    );
+}
+
+#[test]
+fn legacy_directional_wifi_band_rules_still_compile() {
+    let mut state = state_with_pair();
+    state.master.interfaces[0].role = "WIFI5G".into();
+    state.master.interfaces[0].wifi_band = "5GHz".into();
+    state.master.interfaces[0].is_wifi = true;
+    state.agent.interfaces[0].role = "WIFI2.4G".into();
+    state.agent.interfaces[0].wifi_band = "2.4GHz".into();
+    state.agent.interfaces[0].is_wifi = true;
+
+    let mut req = suite_request();
+    req.wifi_band_thresholds = vec![
+        WifiBandThreshold {
+            src_band: "5GHz".into(),
+            dst_band: "2.4GHz".into(),
+            rx_target_mbps: 700.0,
+            bidir_rx_target_mbps: 330.0,
+            ..Default::default()
+        },
+        WifiBandThreshold {
+            src_band: "2.4GHz".into(),
+            dst_band: "5GHz".into(),
+            rx_target_mbps: 420.0,
+            bidir_rx_target_mbps: 210.0,
+            ..Default::default()
+        },
+    ];
+    req.ui_plan.as_mut().unwrap().suites[0].tasks[0].directions =
+        vec!["ab".into(), "ba".into(), "bidir".into()];
+
+    let cfg = validated_config_from_request(&state, &req).expect("旧频段规则应能兼容");
+    let single = cfg.tests[0].rate_targets_mbps.as_ref();
+    assert_eq!(effective(single, "ab"), Some(700.0));
+    assert_eq!(effective(single, "ba"), Some(420.0));
+    // 旧的按方向双向门限由前端 normalize 成频段组合的两个 bidir 字段，
+    // 到这一层再合并成合计；这里直接喂旧字段，走的是全局兜底那条路。
+    assert_eq!(cfg.tests[0].rate_target_bidir_total_mbps, None);
+}
+
+/// 频段在**存储与比较**上是稳定枚举，展示文案只负责显示。
+///
+/// 以前两端各自产出 `"5GHz"` 这样的展示串再按字符串比较——规则一模一样所以
+/// 一直没出事，但那是靠两份实现恰好同步维持的。展示文案是最容易被改的东西
+/// （有人把 `5GHz` 改成 `5 GHz`），改完之后频段规则会**静默失效**：
+/// 找不到规则不会报错，只是门限没了。
+#[test]
+fn wifi_bands_are_compared_as_a_stable_enum_not_as_display_text() {
+    use super::plan::{
+        canonical_wifi_band, WIFI_BAND_24G, WIFI_BAND_5G, WIFI_BAND_6G, WIFI_BAND_UNKNOWN,
+    };
+    for raw in ["5GHz", "5g", "WIFI5G", "wifi_5g", "5 GHz"] {
+        assert_eq!(canonical_wifi_band(raw), WIFI_BAND_5G, "{raw}");
+    }
+    for raw in ["2.4GHz", "2.4G", "WIFI2.4G", "wifi_2_4g", "24g"] {
+        assert_eq!(canonical_wifi_band(raw), WIFI_BAND_24G, "{raw}");
+    }
+    for raw in ["6GHz", "6g", "wifi_6g"] {
+        assert_eq!(canonical_wifi_band(raw), WIFI_BAND_6G, "{raw}");
+    }
+    assert_eq!(canonical_wifi_band("以太网"), WIFI_BAND_UNKNOWN);
+    assert_eq!(canonical_wifi_band(""), WIFI_BAND_UNKNOWN);
+
+    // 项目里存的是旧展示串时，规则仍然命中。
+    let mut state = state_with_pair();
+    for nic in [
+        &mut state.master.interfaces[0],
+        &mut state.agent.interfaces[0],
+    ] {
+        nic.role = "WIFI5G".into();
+        nic.wifi_band = "5GHz".into();
+        nic.is_wifi = true;
+    }
+    let mut req = suite_request();
+    req.wifi_band_thresholds = vec![WifiBandThreshold {
+        master_band: "5 GHz".into(),
+        agent_band: "wifi_5g".into(),
+        rx_target_master_to_agent_mbps: 910.0,
+        ..Default::default()
+    }];
+    req.ui_plan.as_mut().unwrap().suites[0].tasks[0].directions = vec!["ab".into()];
+    let cfg = validated_config_from_request(&state, &req).expect("应能编译");
+    assert_eq!(
+        effective(cfg.tests[0].rate_targets_mbps.as_ref(), "ab"),
+        Some(910.0),
+        "写法不同但频段相同的规则必须命中"
+    );
+}
+
+/// 预览必须直接给出**最终门限及来源**。
+///
+/// 「字段还在、实际却被另一条规则盖掉」光看请求体看不出来，这一条守的就是
+/// 那个可观测性。
+#[test]
+fn the_preview_shows_the_final_threshold_and_where_it_came_from() {
+    let mut state = state_with_pair();
+    for nic in [
+        &mut state.master.interfaces[0],
+        &mut state.agent.interfaces[0],
+    ] {
+        nic.role = "WIFI5G".into();
+        nic.wifi_band = "5GHz".into();
+        nic.is_wifi = true;
+    }
+    let mut req = suite_request();
+    req.wifi_band_thresholds = vec![WifiBandThreshold {
+        master_band: "wifi_5g".into(),
+        agent_band: "wifi_5g".into(),
+        rx_target_master_to_agent_mbps: 910.0,
+        bidir_total_rx_target_mbps: 900.0,
+        ..Default::default()
+    }];
+    let task = &mut req.ui_plan.as_mut().unwrap().suites[0].tasks[0];
+    task.directions = vec!["ab".into(), "bidir".into()];
+
+    let compiled = compile_request(&state, &req).expect("应能编译");
+    let lines: Vec<String> = compiled
+        .units
+        .iter()
+        .flat_map(super::plan::unit_target_lines)
+        .collect();
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("910Mbps") && line.contains("任务/频段/全局门限")),
+        "单向门限要连来源一起显示：{lines:#?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|line| line.contains("AB 接收端 RX + BA 接收端 RX ≥ 900Mbps")),
+        "双向合计判定口径要写在预览上：{lines:#?}"
+    );
+}
+
+#[test]
+fn wifi_threshold_rules_reject_invalid_values_and_duplicates() {
+    let state = state_with_pair();
+    let mut req = suite_request();
+    req.wifi_band_thresholds = vec![WifiBandThreshold {
+        master_band: "5GHz".into(),
+        agent_band: "2.4GHz".into(),
+        rx_target_master_to_agent_mbps: -1.0,
+        ..Default::default()
+    }];
+    let error = validated_config_from_request(&state, &req).expect_err("负数 Wi-Fi 门限必须拒绝");
+    assert!(error.contains("Wi-Fi 单向主控→辅测 RX 门限"));
+
+    req.wifi_band_thresholds[0].rx_target_master_to_agent_mbps = 700.0;
+    req.wifi_band_thresholds
+        .push(req.wifi_band_thresholds[0].clone());
+    let error = validated_config_from_request(&state, &req).expect_err("重复频段规则必须拒绝");
+    assert!(error.contains("与已有规则重复"));
+}
+
+#[test]
+fn ping_threshold_rules_reject_negative_values() {
+    let state = state_with_pair();
+    let mut req = suite_request();
+    req.ping_wired_small_avg_rtt_ms = -0.1;
+    let error = validated_config_from_request(&state, &req).expect_err("负数 RTT 必须拒绝");
+    assert!(error.contains("有线 small Avg RTT"));
 }
 
 #[test]
@@ -444,6 +1002,7 @@ fn a_config_exported_by_the_old_encoder_still_traces_back() {
         rate_mode: None,
         rate_targets_mbps: None,
         rate_targets_bidir_mbps: None,
+        rate_target_bidir_total_mbps: None,
         link_group: None,
         origin: None,
     };
@@ -2077,6 +2636,53 @@ fn clearing_udp_length_and_window_emits_no_such_flags() {
     }
 }
 
+/// 全局 UDP 四项作为一组：只要界面填了 `-b`，空的 `-l` / `-w` 就必须保持空，
+/// 不能从主控原始 config 的 profile 偷渡回来。套件路径和旧矩阵路径都要如此。
+#[test]
+fn a_global_udp_bandwidth_cuts_off_configured_length_and_window() {
+    let mut state = state_with_pair();
+    state.cfg.iperf.udp_profiles = vec![UdpProfile {
+        bandwidth: "9m".into(),
+        length: Some("900".into()),
+        window: Some("9m".into()),
+    }];
+
+    let mut matrix = request();
+    matrix.nic_policies.clear();
+    matrix.pairs[0].directions = vec!["ab".into()];
+    matrix.pairs[0].transports = vec!["udp".into()];
+    matrix.udp_bandwidths = vec!["100m".into()];
+    matrix.udp_lengths.clear();
+    matrix.udp_windows.clear();
+    let cfg = validated_config_from_request(&state, &matrix).expect("矩阵路径必须合法");
+    assert!(cfg
+        .iperf
+        .udp_profiles
+        .iter()
+        .all(|profile| { profile.length.is_none() && profile.window.is_none() }));
+    assert!(cfg
+        .tests
+        .iter()
+        .filter_map(|test| test.udp_profiles.as_ref())
+        .flatten()
+        .all(|profile| profile.length.is_none() && profile.window.is_none()));
+
+    let mut suite = suite_request();
+    suite.udp_bandwidths = vec!["100m".into()];
+    suite.udp_lengths.clear();
+    suite.udp_windows.clear();
+    let udp_recipe = &mut suite.ui_plan.as_mut().unwrap().recipes.udp[0];
+    udp_recipe.profiles[0].length = None;
+    udp_recipe.profiles[0].window = None;
+    let cfg = validated_config_from_request(&state, &suite).expect("套件路径必须合法");
+    assert!(cfg
+        .tests
+        .iter()
+        .filter_map(|test| test.udp_profiles.as_ref())
+        .flatten()
+        .all(|profile| profile.length.is_none() && profile.window.is_none()));
+}
+
 /// 「下载 config.json」再导入回来，界面上的勾选必须原样回到原处。
 ///
 /// 导入是下载的逆运算，这条测试是它唯一的判据：两边任何一处口径不一样，
@@ -2431,6 +3037,10 @@ fn request_from_import(out: &serde_json::Value) -> RunRequest {
                 .as_str()
                 .unwrap_or_default()
                 .to_string(),
+            rx_target_bidir_total: pair["rx_target_bidir_total"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
             rx_target_bidir_ba: pair["rx_target_bidir_ba"]
                 .as_str()
                 .unwrap_or_default()
@@ -2508,6 +3118,14 @@ fn request_from_import(out: &serde_json::Value) -> RunRequest {
         ping_wifi_medium_max_rtt_ms: 0.0,
         ping_wifi_large_avg_rtt_ms: 0.0,
         ping_wifi_large_max_rtt_ms: 0.0,
+        wifi_pair_rx_target_mbps: 0.0,
+        wifi_pair_bidir_rx_target_mbps: 0.0,
+        wifi_pair_bidir_total_rx_target_mbps: 0.0,
+        udp_profiles: None,
+        global_rate_targets: None,
+        global_rate_mode: None,
+        wifi_band_thresholds: Vec::new(),
+        wifi_pair_thresholds: Vec::new(),
         limit_udp_by_link_speed: out["limit_udp_by_link_speed"].as_bool().unwrap_or(false),
         resume: out["resume"].as_bool().unwrap_or(false),
         screenshot: settings["screenshot"].as_bool().unwrap_or(false),
@@ -3403,8 +4021,18 @@ fn the_shipped_full_project_compiles_against_the_topology_it_declares() {
     )
     .expect("测试项目必须是合法 JSON");
 
-    let plan: UiPlan =
-        serde_json::from_value(project["ui_plan"].clone()).expect("ui_plan 必须能被后端 DTO 接受");
+    assert_eq!(
+        project["project_version"].as_u64(),
+        Some(3),
+        "随包项目必须是当前格式：它同时也是 v3 形状的示例"
+    );
+    // v3 把计划挪到了 `plan`；`ui_plan` 是 v1/v2 的位置，仍然读得进来。
+    let raw_plan = if project["plan"].is_object() {
+        project["plan"].clone()
+    } else {
+        project["ui_plan"].clone()
+    };
+    let plan: UiPlan = serde_json::from_value(raw_plan).expect("plan 必须能被后端 DTO 接受");
     assert_eq!(plan.link_sets.len(), 1);
     assert_eq!(
         plan.link_sets[0].pair_refs.len(),
@@ -3434,14 +4062,15 @@ fn the_shipped_full_project_compiles_against_the_topology_it_declares() {
         iface.ipv4 = format!("192.168.0.{}", 101 + index);
     }
 
-    let settings = &project["settings"];
+    let execution = &project["execution_defaults"];
     let mut req = suite_request();
     req.ui_plan = Some(plan);
     req.pairs.clear();
     req.nic_policies.clear();
-    req.duration = settings["duration"].as_u64().unwrap();
-    req.ping_count = settings["ping_count"].as_u64().unwrap() as u32;
-    req.ping_payload_sizes = settings["ping_payload_sizes"]
+    req.duration = execution["duration"].as_u64().unwrap();
+    req.limit_udp_by_link_speed = execution["limit_udp_by_link_speed"].as_bool().unwrap();
+    req.ping_count = execution["ping"]["count"].as_u64().unwrap() as u32;
+    req.ping_payload_sizes = execution["ping"]["payload_sizes"]
         .as_array()
         .unwrap()
         .iter()
@@ -3923,6 +4552,7 @@ fn importing_a_suite_derived_config_warns_that_the_suite_is_lost() {
             rate_mode: None,
             rate_targets_mbps: None,
             rate_targets_bidir_mbps: None,
+            rate_target_bidir_total_mbps: None,
             link_group: None,
             origin: None,
         }],

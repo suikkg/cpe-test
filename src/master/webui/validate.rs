@@ -177,6 +177,23 @@ pub(super) fn validate_global_values(req: &RunRequest) -> Result<(), String> {
     if !(1..=32).contains(&req.udp_streams) {
         return Err("UDP 流数必须在 1..=32 之间".into());
     }
+    for (label, value) in [
+        ("Wi-Fi 互测单向 RX 门限", req.wifi_pair_rx_target_mbps),
+        (
+            "Wi-Fi 互测双向每方向 RX 门限",
+            req.wifi_pair_bidir_rx_target_mbps,
+        ),
+        (
+            "Wi-Fi 互测双向 RX 合计门限",
+            req.wifi_pair_bidir_total_rx_target_mbps,
+        ),
+    ] {
+        if !value.is_finite() || value < 0.0 {
+            return Err(format!("{label}必须是非负有限 Mbps，0 表示不覆盖"));
+        }
+    }
+    validate_ping_thresholds(req)?;
+    validate_wifi_thresholds(req)?;
     for window in req
         .tcp_windows
         .iter()
@@ -221,6 +238,121 @@ pub(super) fn validate_global_values(req: &RunRequest) -> Result<(), String> {
     }
     if req.ping_count > 100_000 {
         return Err(format!("ping 次数 {} 超过上限 100000", req.ping_count));
+    }
+    Ok(())
+}
+
+fn validate_nonnegative_finite(label: &str, value: f64) -> Result<(), String> {
+    if value.is_finite() && value >= 0.0 {
+        Ok(())
+    } else {
+        Err(format!("{label}必须是非负有限值，0 表示不覆盖"))
+    }
+}
+
+fn validate_ping_thresholds(req: &RunRequest) -> Result<(), String> {
+    for (label, value) in [
+        ("有线 small Avg RTT", req.ping_wired_small_avg_rtt_ms),
+        ("有线 small Max RTT", req.ping_wired_small_max_rtt_ms),
+        ("有线 medium Avg RTT", req.ping_wired_medium_avg_rtt_ms),
+        ("有线 medium Max RTT", req.ping_wired_medium_max_rtt_ms),
+        ("有线 large Avg RTT", req.ping_wired_large_avg_rtt_ms),
+        ("有线 large Max RTT", req.ping_wired_large_max_rtt_ms),
+        ("Wi-Fi small Avg RTT", req.ping_wifi_small_avg_rtt_ms),
+        ("Wi-Fi small Max RTT", req.ping_wifi_small_max_rtt_ms),
+        ("Wi-Fi medium Avg RTT", req.ping_wifi_medium_avg_rtt_ms),
+        ("Wi-Fi medium Max RTT", req.ping_wifi_medium_max_rtt_ms),
+        ("Wi-Fi large Avg RTT", req.ping_wifi_large_avg_rtt_ms),
+        ("Wi-Fi large Max RTT", req.ping_wifi_large_max_rtt_ms),
+    ] {
+        validate_nonnegative_finite(label, value)?;
+    }
+    validate_nonnegative_finite("兼容旧版有线 small Max RTT", req.ping_max_rtt_ms)
+}
+
+fn validate_wifi_thresholds(req: &RunRequest) -> Result<(), String> {
+    let mut band_pairs = HashSet::new();
+    let mut legacy_bands = HashSet::new();
+    for (index, rule) in req.wifi_band_thresholds.iter().enumerate() {
+        // 去重按**稳定枚举**判：`5GHz` 和 `5g` 是同一个频段，两条规则同时存在
+        // 时到底哪条生效取决于遍历顺序，那正是要挡住的形态。
+        let master = super::plan::canonical_wifi_band(&rule.master_band);
+        let agent = super::plan::canonical_wifi_band(&rule.agent_band);
+        let src = super::plan::canonical_wifi_band(&rule.src_band);
+        let dst = super::plan::canonical_wifi_band(&rule.dst_band);
+        let canonical = !rule.master_band.trim().is_empty() || !rule.agent_band.trim().is_empty();
+        let legacy = !rule.src_band.trim().is_empty() || !rule.dst_band.trim().is_empty();
+        if canonical && legacy {
+            return Err(format!("Wi-Fi 频段门限第 {} 行混用了新旧字段", index + 1));
+        }
+        if canonical {
+            if rule.master_band.trim().is_empty() || rule.agent_band.trim().is_empty() {
+                return Err(format!(
+                    "Wi-Fi 频段门限第 {} 行缺少主控或辅测频段",
+                    index + 1
+                ));
+            }
+            if !band_pairs.insert((master, agent)) {
+                return Err(format!("Wi-Fi 频段门限第 {} 行与已有规则重复", index + 1));
+            }
+            for (label, value) in [
+                (
+                    "Wi-Fi 单向主控→辅测 RX 门限",
+                    rule.rx_target_master_to_agent_mbps,
+                ),
+                (
+                    "Wi-Fi 单向辅测→主控 RX 门限",
+                    rule.rx_target_agent_to_master_mbps,
+                ),
+                ("Wi-Fi 双向 RX 合计门限", rule.bidir_total_rx_target_mbps),
+                (
+                    "Wi-Fi 双向主控→辅测 RX 门限",
+                    rule.bidir_rx_target_master_to_agent_mbps,
+                ),
+                (
+                    "Wi-Fi 双向辅测→主控 RX 门限",
+                    rule.bidir_rx_target_agent_to_master_mbps,
+                ),
+            ] {
+                validate_nonnegative_finite(label, value)?;
+            }
+            continue;
+        }
+
+        if rule.src_band.trim().is_empty() || rule.dst_band.trim().is_empty() {
+            return Err(format!(
+                "Wi-Fi 频段门限第 {} 行缺少发送或接收频段",
+                index + 1
+            ));
+        }
+        if !legacy_bands.insert((src, dst)) {
+            return Err(format!("Wi-Fi 频段门限第 {} 行与已有规则重复", index + 1));
+        }
+        validate_nonnegative_finite("Wi-Fi 频段单向 RX 门限", rule.rx_target_mbps)?;
+        validate_nonnegative_finite("Wi-Fi 频段双向每方向 RX 门限", rule.bidir_rx_target_mbps)?;
+    }
+
+    let mut pairs = HashSet::new();
+    for (index, rule) in req.wifi_pair_thresholds.iter().enumerate() {
+        let src = rule.src_endpoint.trim();
+        let dst = rule.dst_endpoint.trim();
+        if src.is_empty() || dst.is_empty() {
+            return Err(format!(
+                "Wi-Fi 网口对门限第 {} 行缺少发送或接收网口",
+                index + 1
+            ));
+        }
+        if !pairs.insert((src, dst)) {
+            return Err(format!("Wi-Fi 网口对门限第 {} 行与已有规则重复", index + 1));
+        }
+        for (label, value) in [
+            ("Wi-Fi 网口对单向 A→B RX 门限", rule.rx_target_ab_mbps),
+            ("Wi-Fi 网口对单向 B→A RX 门限", rule.rx_target_ba_mbps),
+            ("Wi-Fi 网口对双向 A→B RX 门限", rule.bidir_rx_target_ab_mbps),
+            ("Wi-Fi 网口对双向 B→A RX 门限", rule.bidir_rx_target_ba_mbps),
+        ] {
+            validate_nonnegative_finite(label, value)?;
+        }
     }
     Ok(())
 }
@@ -728,6 +860,7 @@ pub(super) fn validate_ui_plan(state: &UiState, plan: &UiPlan) -> Result<(), Str
             for (label, raw) in [
                 ("A→B", &task.rx_target_bidir_ab),
                 ("B→A", &task.rx_target_bidir_ba),
+                ("双向 RX 合计", &task.rx_target_bidir_total),
             ] {
                 if raw.trim().is_empty() {
                     continue;
@@ -870,6 +1003,7 @@ pub(super) fn validate_pair(
     for (label, raw) in [
         ("A→B", &pair.rx_target_bidir_ab),
         ("B→A", &pair.rx_target_bidir_ba),
+        ("双向 RX 合计", &pair.rx_target_bidir_total),
     ] {
         if raw.trim().is_empty() {
             continue;

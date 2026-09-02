@@ -11,10 +11,11 @@ use crate::http_client;
 use crate::master::builder::{
     v6_addrs, CtsTrafficTask, Endpoint, IperfTask, Leg, LegKind, PingPurpose, PingTask, Side, Unit,
 };
+#[cfg(test)]
+use crate::master::rate_window::rate_excursion;
 use crate::master::rate_window::{
-    evaluate_nic_rx, monitor_rate_stats, nearest_valid_sample, percentile, rate_excursion,
-    rate_sample_coverage_sufficient, rate_window_coverage_sufficient, EffectiveWindow, RateStats,
-    MIN_RATE_SAMPLE_COVERAGE, MIN_VALID_RX_MBPS,
+    evaluate_rx_acceptance, monitor_rate_stats, nearest_valid_sample, percentile, EffectiveWindow,
+    RateStats, MIN_VALID_RX_MBPS,
 };
 use crate::master::run_status::{CurrentUnit, RunObserver, UnitStatus};
 use crate::nic::monitor::MonitorMgr;
@@ -733,7 +734,27 @@ impl Ctx {
                 populate_peer_rx(&mut g, &outcomes);
             }
 
-            let unit_verdict = aggregate_unit_verdict(&outcomes);
+            // 双向合计门限存在时，**判定在单元级只做一次**：AB 接收端 RX +
+            // BA 接收端 RX 与门限比一次。两条腿此时本来就没有各自的门限
+            // （builder 的 `leg_rate_plan` 已经把它们落到 Observe），所以按腿
+            // 聚合出来的只会是 MEASURED——真正的结论必须在这里给。
+            //
+            // 合计形不成时（有一条腿是 SETUP_ERROR / 采样不可信）退回按腿聚合：
+            // 那条链能说出到底是哪条腿、什么原因，比一句「合计缺数据」有用。
+            // 腿级聚合永远算一遍：合计判定要不要让位给它，取决于它是不是更具体。
+            let aggregated = aggregate_unit_verdict(&outcomes);
+            let bidir_total = unit
+                .bidir_total_target_mbps
+                .map(|target| bidir_total_verdict(&outcomes, target))
+                // 腿级的 SETUP_ERROR / NOT_EVALUATED 说得出「哪条腿、什么原因」，
+                // 比一句「合计缺数据」有用，所以让它说话。除此之外一律由合计拍板
+                // ——包括合计自己判 NOT_EVALUATED（缺一个方向就是形不成合计，
+                // 这时**不许**退回两条腿各自的 MEASURED 假装一切正常）。
+                .filter(|_| !matches!(aggregated, Verdict::SetupError | Verdict::NotEvaluated));
+            let unit_verdict = bidir_total
+                .as_ref()
+                .map(|judgement| judgement.verdict)
+                .unwrap_or(aggregated);
             if is_traffic_unit {
                 let usable =
                     blocked.is_none() && self.outcomes_have_usable_traffic_measurement(&outcomes);
@@ -756,6 +777,7 @@ impl Ctx {
                 }
             }
             let unit_reason = outcome_matching_verdict(&outcomes, unit_verdict);
+            let bidir_total_target = unit.bidir_total_target_mbps;
             let unit_ok = unit_verdict.is_pass();
             match unit_verdict {
                 Verdict::Pass => sum.pass += 1,
@@ -791,6 +813,23 @@ impl Ctx {
                     )
                 })
                 .collect();
+            // 诊断按腿汇总到单元行：判定只有一份，排障线索要能在概览上一次看全。
+            let mut unit_diagnostics: Vec<String> = outcomes
+                .iter()
+                .flat_map(|outcome| {
+                    let tag = outcome.tag.clone();
+                    outcome.judgement.diagnostics.iter().map(move |line| {
+                        if tag.is_empty() {
+                            line.clone()
+                        } else {
+                            format!("{tag}: {line}")
+                        }
+                    })
+                })
+                .collect();
+            if let Some(judgement) = &bidir_total {
+                unit_diagnostics.extend(judgement.diagnostics.clone());
+            }
             let direction_summaries = self.direction_summaries(&outcomes);
             let single_direction = (direction_summaries.len() == 1)
                 .then(|| direction_summaries.first())
@@ -806,16 +845,29 @@ impl Ctx {
                     Verdict::NotEvaluated => ExecutionStatus::Partial,
                     _ => ExecutionStatus::Completed,
                 },
-                reason_code: unit_reason
-                    .map(|outcome| outcome.reason_code())
+                reason_code: bidir_total
+                    .as_ref()
+                    .map(|judgement| judgement.code)
+                    .or_else(|| unit_reason.map(|outcome| outcome.reason_code()))
                     .unwrap_or_default(),
-                reason_detail: reasons.join(" | "),
+                // 合计判定拍板时，理由必须说合计那件事。落回按腿的理由会出现
+                // 「单元 PASS，理由 ab:TARGET_UNKNOWN 未配置可信目标」——腿本来
+                // 就不该有目标，那句话在这里是自相矛盾的。
+                reason_detail: match &bidir_total {
+                    Some(judgement) if !judgement.detail.is_empty() => judgement.detail.clone(),
+                    Some(judgement) => judgement.diagnostics.join("；"),
+                    None => reasons.join(" | "),
+                },
+                diagnostics: unit_diagnostics,
                 requested_streams: stream_counts.map_or(0, |counts| counts.requested),
                 active_streams: stream_counts.map_or(0, |counts| counts.active),
                 required_streams: stream_counts.map_or(0, |counts| counts.required),
                 rx_avg: single_direction.and_then(|direction| direction.rx_avg),
                 rx_p10: single_direction.and_then(|direction| direction.rx_p10),
-                target_mbps: single_direction.and_then(|direction| direction.target_mbps),
+                // 双向合计单元的「目标」就是那个合计门限——两条腿各自没有目标，
+                // 报告上必须能看到判定用的是哪个数。
+                target_mbps: bidir_total_target
+                    .or_else(|| single_direction.and_then(|direction| direction.target_mbps)),
                 sample_coverage: single_direction.and_then(|direction| direction.sample_coverage),
                 udp_loss: single_direction.and_then(|direction| direction.udp_loss),
                 ping_loss: single_direction.and_then(|direction| direction.ping_loss),

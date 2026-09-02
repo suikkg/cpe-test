@@ -1,5 +1,5 @@
 import { reactive } from 'vue';
-import { api } from '../api/client';
+import { api, errorMessage } from '../api/client';
 import type { MonitorPoint, MonitorSeriesOut } from '../api/dto';
 import { appendPoints } from '../domain/monitor-chart';
 import { isMonitored, pendingStarts, type MonitorSide } from '../domain/monitor-plan';
@@ -122,7 +122,7 @@ export async function startSession(
     startPolling();
     return true;
   } catch (error) {
-    monitor.error = error instanceof Error ? error.message : String(error);
+    monitor.error = errorMessage(error);
     return false;
   } finally {
     monitor.starting = false;

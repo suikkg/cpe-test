@@ -17,6 +17,11 @@ import NicPolicyTable from './NicPolicyTable.vue';
 
 const out = computed(() => plan.preview);
 const units = computed<PlannedUnit[]>(() => out.value?.units ?? []);
+// socket 缓冲诊断属于底层排查信息，暂不在 WebUI 预览区展开。
+// 保留其它预览提示，避免把真正影响执行的错误一并隐藏。
+const visiblePreviewNotices = computed(
+  () => out.value?.notices.filter((notice) => !notice.includes('socket 缓冲')) ?? [],
+);
 
 /** 按 sections 分组的单元；sections 空时退化成一个「全部」组。 */
 const grouped = computed(() => {
@@ -116,7 +121,7 @@ const canStart = computed(
         </div>
       </div>
 
-      <p v-for="(notice, i) in out.notices" :key="i" class="warn">{{ notice }}</p>
+      <p v-for="(notice, i) in visiblePreviewNotices" :key="i" class="warn">{{ notice }}</p>
 
       <h3>计划复核</h3>
       <details v-for="(group, gi) in grouped" :key="gi" class="section" open>
@@ -133,6 +138,11 @@ const canStart = computed(
                 <small v-if="unit.resumed" class="tag">将跳过</small>
               </div>
               <div class="load mono">{{ unit.load.join(' · ') || '—' }}</div>
+              <!-- 「字段还在、实际却被另一条规则盖掉」光看请求体看不出来，
+                   所以这里直接印最终门限和它来自哪一层。 -->
+              <div v-if="unit.targets?.length" class="targets">
+                {{ unit.targets.join(' · ') }}
+              </div>
               <div v-if="traceBySeq.get(unit.seq)" class="trace muted">
                 {{ traceBySeq.get(unit.seq)!.protocol ?? '' }}
                 <template v-if="traceBySeq.get(unit.seq)!.direction">
@@ -199,6 +209,7 @@ input[type='number'] {
 .unit-body { flex: 1 1 auto; min-width: 0; }
 .unit-title { overflow-wrap: anywhere; }
 .load { font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+.targets { font-size: 12px; color: #145a94; overflow-wrap: anywhere; }
 .trace { font-size: 11.5px; }
 .est { flex: 0 0 auto; font-size: 12px; color: var(--muted); }
 .tag { margin-left: 6px; padding: 1px 5px; border-radius: 3px; background: var(--info-bg); font-size: 10.5px; }

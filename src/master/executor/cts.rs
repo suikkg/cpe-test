@@ -133,40 +133,34 @@ full_attempt={} cleanup_confirmed={} client_process_started={:?} client_process_
     out
 }
 
-/// 在网卡 RX 判定之上叠加 ctsTraffic 的 UDP 丢帧门槛。
+/// ctsTraffic 的 UDP 丢帧线索。
 ///
-/// 顺序对齐 iperf3 路径：只有当网卡侧已经完成一次真正的目标比对
-/// （Pass/RateFail/Unstable）时才评估丢帧；采样不足、目标缺失或未知
-/// （NotEvaluated/Measured）时原样返回，不把环境问题写成 CPE 丢帧超限。
-/// 已配置门槛却缺少丢帧数据时，缺的是判定依据本身，因此优先于速率结论。
-pub(super) fn cts_apply_udp_loss(
-    nic: (Verdict, ReasonCode, String),
+/// **它不再改写判定**（ADR-17）。这个函数以前会把已经 PASS 的结果翻成
+/// `RATE_FAIL`，或者在缺丢帧数据时翻成 `NOT_EVALUATED`——那正是「RX 平均达到
+/// 门限必定 PASS」这条确认规则被推翻的地方，而且和 iperf3 路径一起构成了
+/// 同一种故障在两个后端上得到两种结论。丢帧率仍然重要，所以数值和限制原样
+/// 保留，只是作为诊断挂在结论旁边。
+pub(super) fn cts_udp_loss_diagnostics(
     is_udp: bool,
     loss_limit: Option<f64>,
     loss: Option<f64>,
-) -> (Verdict, ReasonCode, String) {
-    let (verdict, code, detail) = nic;
-    if !is_udp || matches!(verdict, Verdict::NotEvaluated | Verdict::Measured) {
-        return (verdict, code, detail);
+) -> Vec<String> {
+    if !is_udp {
+        return Vec::new();
     }
     let Some(limit) = loss_limit else {
-        return (verdict, code, detail);
+        return Vec::new();
     };
-    let Some(actual) = loss else {
-        return (
-            Verdict::NotEvaluated,
-            ReasonCode::CtsUdpLossDataMissing,
-            "已配置 UDP 丢帧门槛，但 ctsTraffic 输出缺少 dropped frames 数据".into(),
-        );
-    };
-    if verdict == Verdict::Pass && actual > limit {
-        return (
-            Verdict::RateFail,
-            ReasonCode::CtsUdpLossHigh,
-            format!("CTS UDP 丢帧率 {actual:.3}% 超过限制 {limit:.3}%"),
-        );
+    match loss {
+        None => vec![format!(
+            "已配置 CTS UDP 丢帧门槛 {limit:.3}%，但 ctsTraffic 输出缺少 dropped frames 数据"
+        )],
+        Some(actual) if actual > limit => vec![format!(
+            "CTS UDP 丢帧率 {actual:.3}% 超过限制 {limit:.3}%；丢帧只作诊断，\
+             达标与否只看接收端 RX 平均"
+        )],
+        Some(_) => Vec::new(),
     }
-    (verdict, code, detail)
 }
 
 pub(super) fn cts_attempt_budget(configured_retries: usize, strict_single_udp: bool) -> usize {
@@ -256,11 +250,9 @@ pub(super) fn cts_monitor_runtime_issue(
     })
 }
 
-pub(super) fn cts_monitor_issue_verdict(
-    issue: &CtsMonitorIssue,
-) -> Option<(Verdict, ReasonCode, String)> {
+pub(super) fn cts_monitor_issue_verdict(issue: &CtsMonitorIssue) -> Option<VerdictResult> {
     issue.affects_verdict.then(|| {
-        (
+        VerdictResult::new(
             if issue.setup_error {
                 Verdict::SetupError
             } else {
@@ -372,11 +364,15 @@ pub(super) fn cts_server_unexpected_setup_error(
     })
 }
 
-pub(super) fn cts_runtime_failure_verdict(
+/// ctsTraffic 已经产生测量、但工具自身跑得不干净时的一句线索。
+///
+/// **不改写判定**（ADR-17）：它以前返回 `RATE_FAIL / CTS_RUNTIME_ERRORS`，
+/// 于是接收端网卡已经收满速率的一轮，会因为 server 收尾时的一条错误被判失败。
+pub(super) fn cts_runtime_diagnostic(
     attempt: &CtsAttemptRun,
     runtime_errors: u64,
     client_expected_completion: bool,
-) -> Option<(Verdict, ReasonCode, String)> {
+) -> Option<String> {
     if !attempt.traffic_established {
         return None;
     }
@@ -415,7 +411,7 @@ pub(super) fn cts_runtime_failure_verdict(
     } else {
         return None;
     };
-    Some((Verdict::RateFail, ReasonCode::CtsRuntimeErrors, detail))
+    Some(detail)
 }
 
 impl Ctx {
@@ -1196,19 +1192,17 @@ impl Ctx {
                     )
                 })
             });
-        let (verdict, reason_code, reason_detail) = if let Some((code, detail)) = setup_error {
-            (Verdict::SetupError, code, detail)
+        let judgement = if let Some((code, detail)) = setup_error {
+            VerdictResult::setup_error(code, detail)
         } else if single_stream_exhausted {
-            (
-                Verdict::RateFail,
+            VerdictResult::rate_fail(
                 ReasonCode::CtsSingleUdpStreamFailed,
                 format!(
                     "CTS 单流 UDP 在 {full_attempts} 次完整 server/client 尝试且每轮双端清理均确认后，仍无 ctsTraffic 自身 rate/bytes/successful frames 测量；该方向必须灌通"
                 ),
             )
         } else if !measurement && (selected.client.timed_out || selected.client.cancelled) {
-            (
-                Verdict::SetupError,
+            VerdictResult::setup_error(
                 ReasonCode::CtsClientAborted,
                 selected
                     .client
@@ -1219,8 +1213,7 @@ impl Ctx {
                     .to_string(),
             )
         } else if !measurement {
-            (
-                Verdict::SetupError,
+            VerdictResult::setup_error(
                 ReasonCode::CtsNoMeasurement,
                 selected
                     .client
@@ -1230,58 +1223,53 @@ impl Ctx {
                     .unwrap_or("没有吞吐测量")
                     .to_string(),
             )
-        } else if let Some(runtime_failure) =
-            cts_runtime_failure_verdict(selected, runtime_errors, client_expected_completion)
-        {
-            runtime_failure
         } else if let Some(monitor_verdict) =
             monitor_issue.as_ref().and_then(cts_monitor_issue_verdict)
         {
             monitor_verdict
         } else if !selected.traffic_window.complete {
-            (
-                Verdict::NotEvaluated,
+            VerdictResult::not_evaluated(
                 ReasonCode::CtsEffectiveWindowShort,
                 format!(
                     "CTS 真实流量事件窗口仅 {:.3}s，短于要求的 {}s；未把启动、握手、轮询或清理时间计入有效窗口",
                     selected.traffic_window.available_secs, task.duration
                 ),
             )
-        } else if required_streams > requested_streams {
-            (
-                Verdict::NotEvaluated,
-                ReasonCode::ConfiguredLoadTooLow,
-                format!(
-                    "目标与余量要求至少 {required_streams} 条流，但只配置了 {requested_streams} 条"
-                ),
-            )
-        } else if active_streams < required_streams {
-            (
-                Verdict::NotEvaluated,
-                ReasonCode::ActiveStreamsLow,
-                format!(
-                    "ctsTraffic 最多观测到 {active_streams}/{requested_streams} 条活跃连接，正式判定至少需要 {required_streams} 条"
-                ),
-            )
         } else {
-            // 丢帧判定必须排在网卡采样/目标可信度之后，与 iperf3 路径的判定链
-            // 一致：采样不足或目标未知时先产出 NOT_EVALUATED / MEASURED，不能
-            // 拿一个无法核对的窗口去判 RATE_FAIL。
-            // offered 门槛此前**只有 UDP 链有**：CTS UDP 单流灌不满时
-            // `RX < target` 直接判 RX_BELOW_TARGET，正是 UDP 链两个单测拼命
-            // 要防的「把发送端瓶颈写成 CPE 性能失败」，在这条路上零防护。
-            let nic = evaluate_nic_rx(
-                task.rate_mode,
-                task.rx_target_mbps,
-                &rx_stats,
-                &tx_stats,
-                crate::master::rate_window::offered_floor_mbps(
-                    task.rx_target_mbps,
-                    self.cfg.iperf.rate_check.offered_headroom_pct,
-                ),
-            );
-            cts_apply_udp_loss(nic, task.udp, loss_limit, loss)
+            // 前面几条全是「形不成有效 RX 平均值」的前提；到这里就只剩一件事：
+            // 把 RX 统计交给全仓唯一的验收入口，只和门限比一次（ADR-17）。
+            // 流数、丢帧、工具退出状态在下面作为诊断收集，不参与这个结论。
+            evaluate_rx_acceptance(task.rate_mode, task.rx_target_mbps, &rx_stats)
         };
+        // 诊断：全部**不改写**上面的判定。
+        let mut leg_diagnostics = crate::master::rate_window::rx_acceptance_diagnostics(
+            &rx_stats,
+            &tx_stats,
+            crate::rate::effective_rate_target(task.rate_mode, task.rx_target_mbps).is_some(),
+            crate::master::rate_window::offered_floor_mbps(
+                task.rx_target_mbps,
+                self.cfg.iperf.rate_check.offered_headroom_pct,
+            ),
+        );
+        leg_diagnostics.extend(cts_runtime_diagnostic(
+            selected,
+            runtime_errors,
+            client_expected_completion,
+        ));
+        if required_streams > requested_streams {
+            leg_diagnostics.push(format!(
+                "目标与余量要求至少 {required_streams} 条流，但只配置了 {requested_streams} 条；\
+                 灌包强度不足只作诊断"
+            ));
+        } else if active_streams < required_streams {
+            leg_diagnostics.push(format!(
+                "ctsTraffic 最多观测到 {active_streams}/{requested_streams} 条活跃连接，\
+                 目标推算需要 {required_streams} 条；灌包强度不足只作诊断"
+            ));
+        }
+        leg_diagnostics.extend(cts_udp_loss_diagnostics(task.udp, loss_limit, loss));
+        let (verdict, reason_code) = (judgement.verdict, judgement.code);
+        let reason_detail = judgement.detail.clone();
         let mut raw_diagnostics = Vec::new();
         if !reason_code.is_empty() {
             raw_diagnostics.push(format!("[{reason_code}] {reason_detail}"));
@@ -1353,6 +1341,7 @@ impl Ctx {
             },
             reason_code,
             reason_detail: reason_detail.clone(),
+            diagnostics: leg_diagnostics.clone(),
             rx_avg,
             tx_mbps: parsed.send_mbps,
             rx_mbps: parsed.recv_mbps,
@@ -1405,7 +1394,7 @@ impl Ctx {
             })
         });
         LegOutcome {
-            judgement: VerdictResult::new(verdict, reason_code, reason_detail),
+            judgement: judgement.with_diagnostics(leg_diagnostics),
             rx_avg,
             main_rows: vec![idx],
             tag: tag.to_string(),

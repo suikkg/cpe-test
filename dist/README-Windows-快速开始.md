@@ -1,8 +1,8 @@
 # CPE 测试工具 Windows 包
 
-> 如果你从 Git 仓库下载的是 `cpe_test-v6.2.1-windows-config-docs.zip`，那是一份只含
+> 如果你从 Git 仓库下载的是 `cpe_test-v6.2.4-windows-config-docs.zip`，那是一份只含
 > 配置、文档和启动脚本的资料包，不含 `cpe_test.exe`、`ctsTraffic.exe` 或 iperf3。
-> 开箱即用请下载 GitHub Release 的 `cpe_test-v6.2.1-windows-x86_64.zip`；也可以自行
+> 开箱即用请下载 GitHub Release 的 `cpe_test-v6.2.4-windows-x86_64.zip`；也可以自行
 > 编译程序后，把资料包内容与 exe 放到同一目录。
 
 将这个文件夹完整复制到**主控机**和**辅测机**。两台电脑必须使用同一个
@@ -11,7 +11,7 @@
 ## 包内文件与系统要求
 
 - `cpe_test.exe`：主控、agent、网卡扫描和监控共用的程序。
-- `ctsTraffic.exe`：Microsoft ctsTraffic 2.0.4.0 x64，随官方 v6.2.1 Windows 包固定捆绑并校验；仅支持 Windows 10 或更高版本。
+- `ctsTraffic.exe`：Microsoft ctsTraffic 2.0.4.0 x64，随官方 v6.2.4 Windows 包固定捆绑并校验；仅支持 Windows 10 或更高版本。
 - `start_*.bat`：双击启动脚本。`start_ui.bat` 是图形控制台，`start_master*.bat` 是命令行问答式。
 - `configs\`：SGMII、Wi-Fi、10GUSB 等具名配置。
 - `THIRD_PARTY_NOTICES.md` 及 CTS/WIL 许可文件：第三方归属和许可说明。
@@ -38,8 +38,12 @@ Windows 7/8/8.1、版本无法确认以及 macOS/Linux 都不支持 CTS，但不
      白底参数框可直接输入；套件和配置很多时各自在固定高度列表内滚动，不会拉长整页。
      新任务默认选 IPv4+IPv6，PING 不显示吞吐 Mbps 门限。旧草稿可用「恢复默认计划」一次重置。
    - **执行**：填每单元时长；「全局默认档位」出厂就是 UDP `-b 2500m`、TCP `-w 4m`、
-     `-l` 留空（不下发），其余空格子沿用 `config.json`，当前值以灰字写在框里。
-     需要时展开「按网口门限与负载」逐网口填 RX 门限（`1800` 或 `90%`）和发送端 UDP `-b`；
+     `-l` 留空（不下发）。Ping 高级阈值空格会以灰字显示主控当前生效的“默认 xx”，填值后才覆盖。
+     两端都是 Wi-Fi 时，「Wi-Fi 互测门限」只显示实际识别到的频段组合；每个组合三格：
+     单向主控→辅测、单向辅测→主控、**双向 RX 合计**。双向并发按
+     `主控端 RX 平均 + 辅测端 RX 平均 ≥ 合计门限` 判定，不要求两个方向各达到一半——
+     Wi-Fi 之间抢的是同一段空口时间。具体网卡差异在「按网口门限与负载」里填 RX 门限
+     （`1800` 或 `90%`）、发送端 UDP `-b` 和 `-l`；
      需要时勾「按链路上限裁剪 UDP 发送速率」（默认不勾）。
    - 点“预览”确认单元数和预计耗时 → 点“开始测试”。预览后若再改任何计划或运行参数，
      必须按提示“重新预览”，旧计划不会被误启动。
@@ -93,7 +97,8 @@ JSON 标准不支持注释，不能在一个 JSON 内可靠地“取消注释”
   用之前先把 `tests[]` 里的 `NAME=` 换成你那两台的网卡名。
 
 图形控制台还可以直接导入 `projects/cpe-ui-project-full.json`（「导入测试项目」按钮），
-拿到同一套链路集合、套件和 TCP/UDP 参数配置，不必手工勾 10 对网口。
+拿到同一套链路集合、套件、TCP/UDP 参数配置、判定门限和网口策略，不必手工勾 10 对网口；
+项目文件不携带 RESUME、截图、历史结果或口令。
 
 预置配置为了保持升级前的默认测试量，仍使用 `"kinds": ["iperf", "ping"]`。只跑 CTS：
 

@@ -9,15 +9,14 @@ import { plan } from '../../state/plan';
  * 「按网口门限与负载」：一块网口在**所有**配对里共用的策略。
  *
  * 对应 `RunRequest.nic_policies`（`webui/model.rs::NicPolicySelection`）。
- * 三项都是可选的，三项全空的条目不会发出去。
+ * 四项都是可选的，四项全空的条目不会发出去。
  *
  * 门限为什么挂在网口上而不是配对上：一块口作为接收端能收多少，主要由它自己
  * 决定，而配对有 N² 条、逐条填不现实。**双向并发**是例外——那时受限的是这条
  * 链路而不是某一端，所以双向门限按任务分方向填，在「测试计划」页的任务上。
  *
- * **这里没有 UDP 包长 `-l`**（`NicPolicySelection.udp_length` 仍在协议里，只是
- * 界面不给入口）：`-l` 属于流量配置，在「测试计划」页每条 TCP/UDP 配置里设置，
- * 全表只留那一处来源。同一个参数开两个入口，最后一定是两处对不上。
+ * UDP `-b` / `-l` 都是发送端网口覆盖：留空走全局档位；填入后只影响该网口作为
+ * 发送端的测试腿。`-l` 是固定单值，不会再逐档扫描全局报文长度。
  *
  * 写法两种共用一个框：`1800` = 绝对 1800Mbps，`90%` = 协商速率的 90%。
  * **不在前端校验**：语义报错一律交给 `/api/plan`（ADR-11），前端再写一份
@@ -55,11 +54,15 @@ const rows = computed<Row[]>(() => [
 
 const activeCount = computed(() => activeNicPolicies(plan.nicPolicies).length);
 
-function value(endpoint: string, field: 'rx_target' | 'udp_bandwidth'): string {
+function value(endpoint: string, field: 'rx_target' | 'udp_bandwidth' | 'udp_length'): string {
   return policyFor(plan.nicPolicies, endpoint)[field];
 }
 
-function update(endpoint: string, field: 'rx_target' | 'udp_bandwidth', event: Event): void {
+function update(
+  endpoint: string,
+  field: 'rx_target' | 'udp_bandwidth' | 'udp_length',
+  event: Event,
+): void {
   const next = (event.target as HTMLInputElement).value;
   plan.nicPolicies = setNicPolicy(plan.nicPolicies, endpoint, { [field]: next });
 }
@@ -74,7 +77,7 @@ function clearAll(): void {
     <summary>
       <strong>按网口门限与负载</strong>
       <small class="muted">
-        {{ activeCount ? `${activeCount} 个网口已设` : '未设，全部走兜底判定' }}
+        {{ activeCount ? `${activeCount} 个网口已设` : '' }}
       </small>
     </summary>
 
@@ -97,6 +100,7 @@ function clearAll(): void {
               <th class="num">协商速率</th>
               <th>RX 通过门限</th>
               <th>UDP 带宽 <code>-b</code></th>
+              <th>UDP 报文长度 <code>-l</code></th>
             </tr>
           </thead>
           <tbody>
@@ -129,6 +133,16 @@ function clearAll(): void {
                   @input="update(row.endpoint, 'udp_bandwidth', $event)"
                 />
               </td>
+              <td>
+                <input
+                  type="text"
+                  placeholder="如 1400 或 14k"
+                  autocomplete="off"
+                  :value="value(row.endpoint, 'udp_length')"
+                  :aria-label="`${row.name} 作为发送端的 UDP 报文长度`"
+                  @input="update(row.endpoint, 'udp_length', $event)"
+                />
+              </td>
             </tr>
           </tbody>
         </table>
@@ -137,7 +151,7 @@ function clearAll(): void {
         <button type="button" class="ghost" :disabled="activeCount === 0" @click="clearAll">
           清空全部网口策略
         </button>
-        <span class="muted">钉死了发送带宽的方向不会再逐档扫描，单元数会随之减少。</span>
+        <span class="muted">钉死发送端的 UDP 带宽或报文长度后，该轴不再逐档扫描，单元数会随之减少。</span>
       </div>
     </template>
   </details>

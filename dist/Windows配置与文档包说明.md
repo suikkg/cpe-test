@@ -1,13 +1,13 @@
-# cpe_test v6.2.1 Windows 配置与文档包
+# cpe_test v6.2.4 Windows 配置与文档包
 
-仓库中的 `cpe_test-v6.2.1-windows-config-docs.zip` 是便于从 Git 直接下载的
+仓库中的 `cpe_test-v6.2.4-windows-config-docs.zip` 是便于从 Git 直接下载的
 Windows 配置、说明文档和启动脚本资料包。包内文件由仓库当前版本生成，并由 CI
 逐文件与源码副本比对，避免配置或文档过期。
 
 这个资料包**不包含可执行程序或吞吐工具**：
 
 - 不包含 `cpe_test.exe`；请从 GitHub Release 下载正式
-  `cpe_test-v6.2.1-windows-x86_64.zip`，或自行编译。
+  `cpe_test-v6.2.4-windows-x86_64.zip`，或自行编译。
 - 不包含 `ctsTraffic.exe`；正式 Windows Release ZIP 会捆绑固定并校验过的
   Microsoft ctsTraffic 2.0.4.0 x64。
 - 不包含 `iperf3.exe` 及其 DLL；需要 iperf3 测试时，请放入完整的 Windows
@@ -20,10 +20,27 @@ Windows 配置、说明文档和启动脚本资料包。包内文件由仓库当
   `iperf.duration` 三项，其余走内置默认值）。
 - `config.example.json`（完整字段面）与 `configs/` 下五份可直接选择的具名配置，
   其中 `config-full-tcp-udp-ping.json` 是 TCP+UDP+PING 全量预设（约 210 个单元）。
-- `projects/cpe-ui-project-full.json`：图形控制台的「导入测试项目」文件，内含全网口
-  配对的链路集合、TCP/UDP 参数配置和 TCP→UDP→PING 套件。
+- `projects/cpe-ui-project-full.json`：图形控制台的「导入测试项目」文件（`project_version: 3`），
+  内含全网口配对的链路集合、TCP/UDP/PING 参数、全局判定设置、Wi-Fi 互测门限、按网口策略和
+  TCP→UDP→PING 套件；不包含 agent 地址、口令、RESUME、截图开关等本地运行态。
+  v3 存的是**有效值快照**：界面上留空、由主控默认值兜底的格子在导出时已经换算成具体数字，
+  换一台主控导入不会改判定口径。Wi-Fi 门限按实际频段组合保存两个单向门限和一个双向 RX 合计门限。
 - `start_ui.bat`（图形控制台）、`start_agent.bat`、`start_master.bat`、`start_master_select_config.bat`。
 - iperf3/ctsTraffic 放置说明、MIT 许可证和第三方声明。
+
+## v6.2.4 行为要点
+
+- **吞吐判定只认接收端 RX 平均**：形成可信 RX 平均后只和门限比一次，`RX ≥ 门限` 就是 `PASS`。
+  UDP 丢包/CTS 丢帧、发送端负载与采样覆盖率、滚动窗口、中途掉速、工具退出状态全部降为
+  「诊断（不参与判定）」，在报告每行和 Excel 的两张表里都看得到，但不再改写 PASS/FAIL。
+- **Wi-Fi 双向按两端 RX 合计判定**：`AB 接收端 RX + BA 接收端 RX ≥ 合计门限`。
+  合计 900 时 `720 + 230 = 950` 就是 PASS，不要求两个方向各到 450。有线↔有线是全双工，
+  仍可按方向分别设门限（任务里折叠在「按方向分别设门限（旧口径）」下）。
+- **Ping 的 `PASS` 要求 0% 丢包且 Avg/Max RTT 都达标**，不再是「收到一个 Echo Reply 就算通」。
+- **项目文件升到 `project_version: 3`**：导出的是当前真正生效的值而不是输入框状态，
+  并固化界面上没有输入框却参与判定的全局 RX 门限与 UDP 档位表。旧的 v1/v2 项目照样导入。
+  导入是原子的：文件里任何一处形状不对都保持当前项目不变并给出具体错误。
+- 计划预览逐单元显示**最终门限及其来源**（任务/频段/全局、按网口、内置推导、双向合计）。
 
 ## v6.2.1 行为要点
 
@@ -43,7 +60,7 @@ Windows 配置、说明文档和启动脚本资料包。包内文件由仓库当
 ## v4.5.0 行为要点
 
 - 控制台默认进入**快速测试计划工作台**：「链路集合 → 流量套件 → 分配 → 复核」，一次配置 20 对以上网口。套件里的 TCP、UDP、PING 是独立任务，「TCP+UDP」表示 `TCP → UDP` 连续执行而不是混合并发；执行粒度是每个具体网口对。需要逐行控制时切「高级矩阵」，旧 `pairs` 和 `config.json` 照常可用。
-- 工作台可导出/导入 `cpe-ui-project.json`（链路集合、套件、稳定 ID、绑定，不含 token）；`config.json` 仍单独下载，仍可交给 `master --auto`。
+- 工作台可导出/导入 `cpe-ui-project.json`（链路集合、套件、稳定 ID、绑定、流量与判定设置、按网口策略，不含 token 和本地运行态）；`config.json` 仍单独下载，仍可交给 `master --auto`。
 - 「开始测试」会校验预览时的 `plan_hash`：网口刷新或计划改动后必须重新预览，避免误跑旧分配。
 - 测试矩阵上方可定义若干组 UDP / TCP 参数，每行选用哪一组；**每组是完整定义**，组里 `-l` 留空就是不下发 `-l`。优先级「网口 > 参数组」直接标在行内，「预览任务」逐单元列出每条腿最终下发的参数。
 - 双向单元里一条腿「判不了」不再一律掩盖另一条腿的 `RATE_FAIL`：只有采样/时间轴不可信才继续掩盖，腿内局部的配置问题不再藏住确凿的不达标。`OFFERED_LOAD_LOW` 同理加了前提——只有接收端确实跟上发送端时才算判不了。

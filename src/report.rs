@@ -399,8 +399,14 @@ fn push_bidirectional_summary(h: &mut String, group: &UnitGroup<'_>) {
         return;
     };
     let fallback_reason = group_reason(group);
+    let rx_sum = bidirectional_rx_average_sum(group)
+        .map(|value| format!("{value:.3} Mbps"))
+        .unwrap_or_else(|| "未形成（需两方向都有 RX 平均）".into());
     h.push_str(
-        "<div class=\"direction-summary\" role=\"group\" aria-label=\"双向方向汇总\"><strong class=\"direction-summary-title\">双向方向汇总（每个方向各自按接收端 RX 判定）</strong>",
+        &format!(
+            "<div class=\"direction-summary\" role=\"group\" aria-label=\"双向方向汇总\"><strong class=\"direction-summary-title\">双向方向汇总（每个方向各自按接收端 RX 判定） · 双向 RX 平均合计 <span class=\"bidir-rx-sum\">{}</span></strong>",
+            esc(&rx_sum)
+        ),
     );
     push_bidirectional_direction(h, ab, &fallback_reason);
     push_bidirectional_direction(h, ba, &fallback_reason);
@@ -661,6 +667,10 @@ details.proto-section > summary.proto-toggle::marker { color: #1769aa; }
 .diagnostic-grid { display: grid; grid-template-columns: minmax(130px, auto) minmax(0, 1fr); gap: 1px; margin: 0; background: var(--line); border: 1px solid var(--line); }
 .diagnostic-grid dt, .diagnostic-grid dd { min-width: 0; margin: 0; padding: 5px 7px; background: var(--surface); overflow-wrap: anywhere; }
 .diagnostic-grid dt { color: var(--muted); font-weight: 600; }
+.non-verdict-diagnostics { margin-top: 8px; padding: 7px 9px; border: 1px solid var(--line); background: #fffdf5; }
+.non-verdict-diagnostics b { display: block; margin-bottom: 3px; color: var(--muted); font-size: 12px; }
+.non-verdict-diagnostics ul { margin: 0; padding-left: 18px; }
+.non-verdict-diagnostics li { overflow-wrap: anywhere; }
 .artifact-list { display: flex; flex-wrap: wrap; gap: 8px 12px; margin-top: 8px; }
 .command-block { margin-top: 8px; }
 .command { display: block; max-width: 100%; margin-top: 4px; padding: 7px; overflow-wrap: anywhere; border: 1px solid var(--line); background: #f7f9fb; white-space: pre-wrap; }

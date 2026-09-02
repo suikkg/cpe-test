@@ -17,7 +17,9 @@
 //!
 //! 速率、丢包、覆盖率一律写成数字单元格而不是字符串。验收的人拿到 xlsx 是要
 //! 排序、筛选、做透视表的；写成字符串的话「930.5」会排在「1000」前面。
-use super::model::{group_is_ping, group_rows, group_verdict, UnitGroup};
+use super::model::{
+    bidirectional_rx_average_sum, group_is_ping, group_rows, group_verdict, UnitGroup,
+};
 use super::{ReportMeta, Row, RowBackend, RowDirection, RowProtocol, RowSide};
 use crate::verdict::Verdict;
 use rust_xlsxwriter::{Format, FormatAlign, Workbook, Worksheet};
@@ -112,6 +114,7 @@ fn write_overview_sheet(
             "目标端",
             "目标网口",
             "RX 平均(Mbps)",
+            "双向 RX 平均合计(Mbps)",
             // TX 紧挨着 RX：一眼看出「发出去多少 / 收到多少」。判定口径仍然
             // 只有 RX，TX 是解释性的——RX 不达标时先看这一列是不是压根没发够。
             "TX 平均(Mbps)",
@@ -120,6 +123,7 @@ fn write_overview_sheet(
             "UDP 丢包(%)",
             "Ping 丢包(%)",
             "原因明细",
+            "诊断(不参与判定)",
         ],
     )?;
 
@@ -143,12 +147,14 @@ fn write_overview_sheet(
         sheet.write_string(line, 10, side_label(row.dst_side))?;
         sheet.write_string(line, 11, &row.dst_iface)?;
         write_opt_number(sheet, line, 12, row.rx_avg)?;
-        write_opt_number(sheet, line, 13, row.tx_avg)?;
-        write_opt_number(sheet, line, 14, row.target_mbps)?;
-        write_opt_number(sheet, line, 15, row.sample_coverage)?;
-        write_opt_number(sheet, line, 16, row.udp_loss)?;
-        write_opt_number(sheet, line, 17, row.ping_loss)?;
-        sheet.write_string(line, 18, &row.reason_detail)?;
+        write_opt_number(sheet, line, 13, bidirectional_rx_average_sum(group))?;
+        write_opt_number(sheet, line, 14, row.tx_avg)?;
+        write_opt_number(sheet, line, 15, row.target_mbps)?;
+        write_opt_number(sheet, line, 16, row.sample_coverage)?;
+        write_opt_number(sheet, line, 17, row.udp_loss)?;
+        write_opt_number(sheet, line, 18, row.ping_loss)?;
+        sheet.write_string(line, 19, &row.reason_detail)?;
+        sheet.write_string(line, 20, row.diagnostics.join("；"))?;
         line += 1;
     }
 
@@ -219,6 +225,7 @@ fn write_detail_sheet(
             "UDP 丢包(%)",
             "执行状态",
             "原因明细",
+            "诊断(不参与判定)",
         ],
     )?;
 
@@ -255,6 +262,7 @@ fn write_detail_sheet(
         write_opt_number(sheet, line, 24, row.udp_loss)?;
         sheet.write_string(line, 25, row.execution_status.label())?;
         sheet.write_string(line, 26, &row.reason_detail)?;
+        sheet.write_string(line, 27, row.diagnostics.join("；"))?;
         line += 1;
     }
     Ok(())
@@ -699,6 +707,7 @@ mod tests {
         };
         ba.src_iface = "eth1".into();
         ba.dst_iface = "eth0".into();
+        ba.kind_label = "灌包-ba".into();
         let rows = vec![ab, ba, summary(0, Verdict::RateFail, "SGMII ↔ WLAN")];
         let groups = group_rows(&rows);
         let observations = link_observations(&groups[0]);
@@ -711,6 +720,11 @@ mod tests {
         seen.sort_by(|a, b| a.0.cmp(b.0));
         assert_eq!(seen[0], ("eth0", Some(17.0), Verdict::RateFail));
         assert_eq!(seen[1], ("eth1", Some(1821.0), Verdict::Pass));
+        assert_eq!(
+            bidirectional_rx_average_sum(&groups[0]),
+            Some(1838.0),
+            "概览里的双向 RX 合计必须和两个方向摘要共用同一口径"
+        );
     }
 
     /// 单向单元的判定要用**单元判定**，不是代表行自己的 verdict。

@@ -1,5 +1,5 @@
 import { computed, reactive } from 'vue';
-import { api } from '../api/client';
+import { api, errorMessage } from '../api/client';
 import type { ProgressOut, RunStatus, UnitStatus } from '../api/dto';
 import { mergeUnits, progressView } from '../domain/progress';
 import { buildRunRequest, plan, previewIsCurrent } from './plan';
@@ -158,7 +158,7 @@ export async function start(): Promise<void> {
     run.running = true;
     startPolling();
   } catch (error) {
-    run.startError = error instanceof Error ? error.message : String(error);
+    run.startError = errorMessage(error);
   } finally {
     run.starting = false;
   }
@@ -168,7 +168,7 @@ export async function stop(): Promise<void> {
   try {
     await api.post('/api/stop', {});
   } catch (error) {
-    run.startError = error instanceof Error ? error.message : String(error);
+    run.startError = errorMessage(error);
   }
 }
 
@@ -176,6 +176,6 @@ export async function openReport(): Promise<void> {
   try {
     await api.post('/api/open-report', {});
   } catch (error) {
-    run.startError = error instanceof Error ? error.message : String(error);
+    run.startError = errorMessage(error);
   }
 }

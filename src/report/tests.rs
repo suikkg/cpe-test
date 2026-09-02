@@ -762,6 +762,47 @@ fn diagnostics_expose_the_window_baseline_and_rolling_coverage_used_for_judgemen
     assert!(html.contains("97.8%"));
 }
 
+/// 「不参与判定」的事实必须单独成块，不能和判定理由混在一起。
+///
+/// 混在一起写，读报告的人会把「UDP 丢包 2.1%」当成 PASS 被推翻的理由——
+/// 那正是这次改口径要消灭的误解（ADR-17）。
+#[test]
+fn non_verdict_diagnostics_are_rendered_next_to_a_passing_row_without_changing_it() {
+    let mut detail = traffic_detail("unit-diag", (0, 0, 0, 0));
+    detail.verdict = Verdict::Pass;
+    detail.reason_code = ReasonCode::None;
+    detail.reason_detail = String::new();
+    detail.diagnostics = vec![
+        "UDP 平均丢包率 2.100% 超过限制 1.000%；丢包只作诊断，达标与否只看接收端 RX 平均".into(),
+        "发送端 TX-P10 900.000Mbps 未达到验证目标所需负载 1050.000Mbps".into(),
+    ];
+    let html = render(vec![detail, unit_summary("unit-diag", Verdict::Pass)]);
+
+    assert!(html.contains("诊断（不参与判定）"), "诊断要单独成块");
+    assert!(html.contains("non-verdict-diagnostics"));
+    assert!(html.contains("2.100%"));
+    assert!(html.contains("TX-P10"));
+    // 丢包那句话只出现在诊断块里，不进「判定理由」那一行——混在一起写，
+    // 读报告的人会把它当成 PASS 被推翻的理由。
+    let block = html
+        .split("<div class=\"non-verdict-diagnostics\">")
+        .nth(1)
+        .expect("诊断块");
+    assert!(block.contains("2.100%"));
+    assert!(
+        !html.contains("reason-row\"><td>2.100%"),
+        "诊断不该被写进判定理由行"
+    );
+}
+
+/// 没有诊断的行不该多出一个空块。
+#[test]
+fn a_row_without_diagnostics_does_not_render_an_empty_block() {
+    let detail = traffic_detail("unit-clean", (0, 0, 0, 0));
+    let html = render(vec![detail, unit_summary("unit-clean", Verdict::Pass)]);
+    assert!(!html.contains("诊断（不参与判定）"));
+}
+
 #[test]
 fn transport_column_names_the_backend_and_warns_when_both_are_mixed() {
     assert_eq!(transport_display("UDP"), "iperf3 UDP");
@@ -870,12 +911,9 @@ fn bidirectional_overview_keeps_ab_and_ba_separate() {
     assert!(html.contains("RX_P10_BELOW_TARGET"));
     assert!(html.contains("双向方向汇总"));
     assert!(html.contains("2 个方向执行行（AB / BA）"));
-    // 双向只按各自方向的接收端速率判定；任何形式的 AB+BA 相加都会被误读成
-    // 整机吞吐，尤其是一个方向未评价时。
-    assert!(!html.contains("AB + BA"));
-    assert!(!html.contains("RX 平均合计"));
-    assert!(!html.contains("1700.000 Mbps"));
-    assert!(!html.contains("1640.000 Mbps"));
+    // 仍按各自方向的接收端速率判定；合计只是结果里的诊断指标，不能替代任一方向。
+    assert!(html.contains("双向 RX 平均合计"));
+    assert!(html.contains("1700.000 Mbps"));
     assert!(html.contains("data-unit-id=\"unit-bidir\" open"));
 }
 

@@ -26,6 +26,12 @@
   "ping_wired_medium_max_rtt_ms": 50.0,
   "ping_wired_small_avg_rtt_ms": 10.0,
   "ping_wired_small_max_rtt_ms": 30.0,
+  "rate_mode": "auto",
+  "rate_targets_mbps": {
+    "ab": null,
+    "ba": null,
+    "forward": null
+  },
   "screenshot": true,
   "tcp_streams": [
     10
@@ -45,6 +51,33 @@
   ],
   "udp_lengths": [
     "64"
+  ],
+  "udp_profiles": [
+    {
+      "bandwidth": "1m",
+      "length": null,
+      "window": null
+    },
+    {
+      "bandwidth": "100m",
+      "length": null,
+      "window": null
+    },
+    {
+      "bandwidth": "500m",
+      "length": null,
+      "window": null
+    },
+    {
+      "bandwidth": "1000m",
+      "length": "64",
+      "window": null
+    },
+    {
+      "bandwidth": "2500m",
+      "length": null,
+      "window": null
+    }
   ],
   "udp_streams": 1,
   "udp_windows": [],

@@ -1,19 +1,21 @@
 import { computed, reactive, watch } from 'vue';
-import { api } from '../api/client';
+import { api, errorMessage } from '../api/client';
 import type { BootstrapOut, PlanOut } from '../api/dto';
 import {
   activeNicPolicies,
   defaultGlobals,
-  emptyGlobals,
+  normalizeGlobals,
+  resolveEffectiveGlobals,
   type UiGlobals,
   type UiNicPolicy,
 } from '../domain/globals';
 import { pruneBindings, reconcileLinkSets, type ManagedLinkSet } from '../domain/grouping';
 import { buildCandidates, type Candidate, type LinkFilter } from '../domain/pairs';
 import { emptyPlan, ensureDefaults, type UiPlan } from '../domain/plan-build';
-import { parseProject, serializeProject } from '../domain/project';
+import { parseProject, serializeProject, type ProjectSettings } from '../domain/project';
 import { parseRunRequest } from '../domain/rerun';
 import { agentNics, masterNics } from './inventory';
+import { session } from './session';
 
 const DRAFT_KEY = 'cpe_ui_plan_draft';
 
@@ -96,6 +98,20 @@ export function loadDraft(): boolean {
     };
     if (!parsed.ui) return false;
     if (!Array.isArray(parsed.ui.suites) || !Array.isArray(parsed.ui.bindings)) return false;
+    const rawUi = parsed.ui as unknown as Record<string, unknown>;
+    const rawRecipes = rawUi.recipes;
+    if (
+      rawRecipes !== undefined &&
+      (typeof rawRecipes !== 'object' || rawRecipes === null || Array.isArray(rawRecipes))
+    ) {
+      return false;
+    }
+    if (rawRecipes && typeof rawRecipes === 'object') {
+      for (const key of ['tcp', 'udp', 'ping']) {
+        const value = (rawRecipes as Record<string, unknown>)[key];
+        if (value !== undefined && !Array.isArray(value)) return false;
+      }
+    }
     plan.ui = ensureDefaults(parsed.ui);
     plan.linkSets = Array.isArray(parsed.linkSets) ? parsed.linkSets : [];
     plan.filter = parsed.filter ?? 'all';
@@ -105,7 +121,7 @@ export function loadDraft(): boolean {
     plan.resume = parsed.resume === true;
     plan.screenshot = parsed.screenshot === true;
     plan.limitUdpByLinkSpeed = parsed.limitUdpByLinkSpeed === true;
-    plan.globals = parsed.globals ? { ...emptyGlobals(), ...parsed.globals } : defaultGlobals();
+    plan.globals = parsed.globals ? normalizeGlobals(parsed.globals) : defaultGlobals();
     plan.nicPolicies = Array.isArray(parsed.nicPolicies) ? parsed.nicPolicies : [];
     draftRestored = true;
     return true;
@@ -150,6 +166,9 @@ export function reset(): void {
   plan.previewRequestFingerprint = '';
   plan.previewing = false;
   plan.previewError = '';
+  plan.duration = 180;
+  plan.resume = false;
+  plan.screenshot = false;
   plan.limitUdpByLinkSpeed = false;
   plan.globals = defaultGlobals();
   plan.nicPolicies = [];
@@ -180,7 +199,6 @@ export function buildRunRequest(): Record<string, unknown> {
     udp_windows: globals.udp_windows,
     ping_count: globals.ping_count,
     ping_payload_sizes: globals.ping_payload_sizes,
-    ping_max_rtt_ms: globals.ping_max_rtt_ms,
     ping_small_max_bytes: globals.ping_small_max_bytes,
     ping_medium_max_bytes: globals.ping_medium_max_bytes,
     ping_wired_small_avg_rtt_ms: globals.ping_wired_small_avg_rtt_ms,
@@ -195,6 +213,18 @@ export function buildRunRequest(): Record<string, unknown> {
     ping_wifi_medium_max_rtt_ms: globals.ping_wifi_medium_max_rtt_ms,
     ping_wifi_large_avg_rtt_ms: globals.ping_wifi_large_avg_rtt_ms,
     ping_wifi_large_max_rtt_ms: globals.ping_wifi_large_max_rtt_ms,
+    wifi_pair_rx_target_mbps: globals.wifi_pair_rx_target_mbps,
+    wifi_pair_bidir_rx_target_mbps: globals.wifi_pair_bidir_rx_target_mbps,
+    wifi_pair_bidir_total_rx_target_mbps: globals.wifi_pair_bidir_total_rx_target_mbps,
+    wifi_band_thresholds: globals.wifi_band_thresholds,
+    wifi_pair_thresholds: globals.wifi_pair_thresholds,
+    // 项目快照钉住的两样东西：界面上没有输入框，但它们参与判定，而且是
+    // 「换一台主控还能不能复现」的关键。没钉过就不发，后端沿用本机配置。
+    ...(globals.udp_profiles.length > 0 ? { udp_profiles: globals.udp_profiles } : {}),
+    ...(globals.global_rate_targets
+      ? { global_rate_targets: globals.global_rate_targets }
+      : {}),
+    ...(globals.global_rate_mode ? { global_rate_mode: globals.global_rate_mode } : {}),
     ...(globals.udp_streams > 0 ? { udp_streams: globals.udp_streams } : {}),
     pairs: [],
     nic_policies: activeNicPolicies(plan.nicPolicies),
@@ -220,7 +250,7 @@ export async function preview(): Promise<void> {
   } catch (error) {
     plan.preview = null;
     plan.previewRequestFingerprint = '';
-    plan.previewError = error instanceof Error ? error.message : String(error);
+    plan.previewError = errorMessage(error);
   } finally {
     plan.previewing = false;
   }
@@ -235,6 +265,12 @@ export function importProject(text: string): boolean {
   if (!result.ok || !result.plan) return false;
   plan.ui = result.plan;
   plan.linkSets = result.plan.link_sets.map((set) => ({ ...set, auto: false }));
+  const settings: ProjectSettings = result.settings ?? {};
+  plan.duration =
+    typeof settings.duration === 'number' && settings.duration > 0 ? settings.duration : 180;
+  plan.limitUdpByLinkSpeed = settings.limit_udp_by_link_speed === true;
+  plan.globals = settings.globals ? normalizeGlobals(settings.globals) : defaultGlobals();
+  plan.nicPolicies = result.nicPolicies ?? [];
   reconcile();
   return true;
 }
@@ -259,6 +295,22 @@ export function adoptRunRequest(raw: unknown, skipPassed: boolean): boolean {
   return true;
 }
 
+/**
+ * 导出项目。
+ *
+ * 关键一步是 `resolveEffectiveGlobals`：导出的必须是**主控当前真正会用的值**，
+ * 不是输入框状态。留空的格子在编辑态里是 `0` / `[]`，而屏幕上显示的灰字
+ * 「默认 30」只存在于 bootstrap 回填里——直接序列化编辑态，换一台主控导入就会
+ * 改用那台机器自己的默认值，判定口径静默改变。
+ */
 export function exportProject(): string {
-  return serializeProject(plan.ui);
+  return serializeProject(
+    plan.ui,
+    {
+      duration: plan.duration,
+      limit_udp_by_link_speed: plan.limitUdpByLinkSpeed,
+      globals: resolveEffectiveGlobals(plan.globals, session.bootstrap),
+    },
+    activeNicPolicies(plan.nicPolicies),
+  );
 }

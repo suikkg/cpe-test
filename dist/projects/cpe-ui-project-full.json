@@ -1,6 +1,6 @@
 {
-  "project_version": 1,
-  "ui_plan": {
+  "project_version": 3,
+  "plan": {
     "ui_plan_version": 1,
     "link_sets": [
       {
@@ -127,7 +127,8 @@
               "recipe-tcp-full"
             ],
             "rx_target_bidir_ab": "",
-            "rx_target_bidir_ba": ""
+            "rx_target_bidir_ba": "",
+            "rx_target_bidir_total": ""
           },
           {
             "id": "task-full-udp",
@@ -146,7 +147,8 @@
               "recipe-udp-full"
             ],
             "rx_target_bidir_ab": "",
-            "rx_target_bidir_ba": ""
+            "rx_target_bidir_ba": "",
+            "rx_target_bidir_total": ""
           },
           {
             "id": "task-full-ping",
@@ -163,7 +165,8 @@
             ],
             "recipe_ids": [],
             "rx_target_bidir_ab": "",
-            "rx_target_bidir_ba": ""
+            "rx_target_bidir_ba": "",
+            "rx_target_bidir_total": ""
           }
         ]
       }
@@ -176,44 +179,77 @@
         "mode": "replace",
         "order": 1
       }
-    ],
-    "plan_hash": null
+    ]
   },
-  "settings": {
-    "agent_host": "192.168.0.101",
-    "agent_port": 28801,
-    "ipv4_prefixes": [
-      "192.168."
-    ],
+  "execution_defaults": {
     "duration": 180,
-    "tcp_windows": [
-      "64k",
-      "4m"
-    ],
-    "tcp_streams": [
-      10
-    ],
-    "udp_bandwidths": [
-      "1000m",
-      "2500m"
-    ],
-    "udp_lengths": [
-      "14k"
-    ],
-    "udp_windows": [
-      "256m"
-    ],
-    "udp_streams": 1,
-    "ping_count": 180,
-    "ping_payload_sizes": [
-      32,
-      1600,
-      65500
-    ],
-    "screenshot": false
+    "limit_udp_by_link_speed": true,
+    "tcp": {
+      "windows": [
+        "64k",
+        "4m"
+      ],
+      "streams": [
+        10
+      ]
+    },
+    "udp": {
+      "bandwidths": [
+        "1000m",
+        "2500m"
+      ],
+      "lengths": [
+        "14k"
+      ],
+      "windows": [
+        "256m"
+      ],
+      "streams": 1,
+      "profiles": []
+    },
+    "ping": {
+      "count": 180,
+      "payload_sizes": [
+        32,
+        1600,
+        65500
+      ]
+    }
   },
-  "nic_policies": [],
-  "limit_udp_by_link_speed": true,
-  "resume": false,
-  "topology_fingerprint": ""
+  "acceptance": {
+    "ping_thresholds": {
+      "ping_small_max_bytes": 128,
+      "ping_medium_max_bytes": 2000,
+      "ping_wired_small_avg_rtt_ms": 10.0,
+      "ping_wired_small_max_rtt_ms": 30.0,
+      "ping_wired_medium_avg_rtt_ms": 20.0,
+      "ping_wired_medium_max_rtt_ms": 50.0,
+      "ping_wired_large_avg_rtt_ms": 50.0,
+      "ping_wired_large_max_rtt_ms": 100.0,
+      "ping_wifi_small_avg_rtt_ms": 30.0,
+      "ping_wifi_small_max_rtt_ms": 80.0,
+      "ping_wifi_medium_avg_rtt_ms": 50.0,
+      "ping_wifi_medium_max_rtt_ms": 100.0,
+      "ping_wifi_large_avg_rtt_ms": 100.0,
+      "ping_wifi_large_max_rtt_ms": 200.0
+    },
+    "global_rate_targets": null,
+    "global_rate_mode": "",
+    "nic_policies": [],
+    "wifi_band_thresholds": [
+      {
+        "master_band": "wifi_5g",
+        "agent_band": "wifi_5g",
+        "rx_target_master_to_agent_mbps": 1000,
+        "rx_target_agent_to_master_mbps": 900,
+        "bidir_total_rx_target_mbps": 1000
+      }
+    ],
+    "wifi_pair_bidir_total_rx_target_mbps": 0,
+    "legacy_wifi_overrides": {
+      "rx_target_mbps": 0,
+      "bidir_rx_target_mbps": 0,
+      "pair_thresholds": []
+    }
+  }
 }

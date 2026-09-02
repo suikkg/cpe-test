@@ -2,7 +2,7 @@
   "est_full_secs": 158,
   "est_total_secs": 158,
   "notices": [],
-  "plan_hash": "bf5d9d60af6acc9d08388df8722b4c6a",
+  "plan_hash": "8ff8b829370683e13b8eb769a2c02ada",
   "sections": [
     {
       "link_set_id": "set-a",
@@ -93,6 +93,9 @@
       ],
       "resumed": false,
       "seq": 1,
+      "targets": [
+        "A→B 未配置门限"
+      ],
       "title": "IPERF V4 TCP -w 4m -P 10 | 主控 以太网 6(192.168.0.101, 2500Mbps) -> 辅测 WLAN 3(192.168.0.104, 2500Mbps)"
     },
     {
@@ -102,6 +105,9 @@
       ],
       "resumed": false,
       "seq": 2,
+      "targets": [
+        "B→A 未配置门限"
+      ],
       "title": "IPERF V4 UDP -b 100m -l 1200 | 辅测 WLAN 3(192.168.0.104, 2500Mbps) -> 主控 以太网 6(192.168.0.101, 2500Mbps)"
     }
   ]

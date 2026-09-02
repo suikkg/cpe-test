@@ -127,6 +127,8 @@ pub fn build_traffic_failure_diagnostics(selected_units: &[Unit]) -> Vec<Unit> {
             link_group: diagnostic_link_group(&origin, &src, &dst),
             title,
             bidir: false,
+            bidir_total_target_mbps: None,
+            target_lines: Vec::new(),
             // 诊断单元不是用户勾出来的方向，留空即可（展示层会跳过）。
             direction: String::new(),
             legs: vec![Leg {
@@ -181,6 +183,8 @@ pub fn build_traffic_failure_diagnostics(selected_units: &[Unit]) -> Vec<Unit> {
             link_group: diagnostic_link_group(&origin, &endpoint, &peer),
             title,
             bidir: false,
+            bidir_total_target_mbps: None,
+            target_lines: Vec::new(),
             // 诊断单元不是用户勾出来的方向，留空即可（展示层会跳过）。
             direction: String::new(),
             legs: vec![Leg {

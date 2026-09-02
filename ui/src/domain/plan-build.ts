@@ -72,6 +72,14 @@ export interface UiTask {
   ping_payload_sizes?: number[];
   rx_target_bidir_ab?: string;
   rx_target_bidir_ba?: string;
+  /**
+   * 双向并发下**两端 RX 合计**的门限。
+   *
+   * 填了它，这个任务的双向单元只按 `AB 接收端 RX + BA 接收端 RX >= 门限`
+   * 判一次，两条腿各自只测量。Wi-Fi↔Wi-Fi 抢的是同一段空口时间，要求两个
+   * 方向各达到一半没有物理依据。
+   */
+  rx_target_bidir_total?: string;
 }
 
 export interface UiSuite {
@@ -212,6 +220,7 @@ export function baselineSuite(): UiSuite {
         recipe_ids: ['recipe-tcp-default'],
         rx_target_bidir_ab: '',
         rx_target_bidir_ba: '',
+        rx_target_bidir_total: '',
       },
       {
         id: 'task-udp',
@@ -222,6 +231,7 @@ export function baselineSuite(): UiSuite {
         recipe_ids: ['recipe-udp-default'],
         rx_target_bidir_ab: '',
         rx_target_bidir_ba: '',
+        rx_target_bidir_total: '',
       },
     ],
   };
@@ -444,7 +454,7 @@ export function removeSuite(plan: UiPlan, suiteId: string): UiPlan {
 /**
  * 复制一个套件（含全部任务），**不复制绑定**。
  *
- * 这是「按链路集合给不同门限」唯一可行的做法：`rx_target_bidir_ab/ba` 挂在
+ * 这是「按链路集合给不同门限」唯一可行的做法：`rx_target_bidir_*` 挂在
  * 任务上，一个套件绑给三个链路集合时三边共用同一组数字。要给某条链路单独的
  * 门限，就复制一份套件、改数字、只绑给那条链路。
  */
@@ -481,6 +491,7 @@ function newTask(plan: UiPlan, protocol: UiProtocol): UiTask {
     recipe_ids: [],
     rx_target_bidir_ab: '',
     rx_target_bidir_ba: '',
+    rx_target_bidir_total: '',
   };
 }
 
@@ -529,7 +540,11 @@ export function setTaskProtocol(
           protocol,
           recipe_ids: [],
           ...(protocol === 'ping'
-            ? { rx_target_bidir_ab: '', rx_target_bidir_ba: '' }
+            ? {
+                rx_target_bidir_ab: '',
+                rx_target_bidir_ba: '',
+                rx_target_bidir_total: '',
+              }
             : {}),
           name: task.name === task.protocol.toUpperCase() ? protocol.toUpperCase() : task.name,
         },
@@ -570,7 +585,13 @@ export function toggleTaskDirection(
     const stillBidir = directions.some((item) => canonicalDirection(item) === 'bidir');
     return stillBidir
       ? { ...task, directions }
-      : { ...task, directions, rx_target_bidir_ab: '', rx_target_bidir_ba: '' };
+      : {
+          ...task,
+          directions,
+          rx_target_bidir_ab: '',
+          rx_target_bidir_ba: '',
+          rx_target_bidir_total: '',
+        };
   });
 }
 

@@ -1,7 +1,7 @@
 //! UDP 灌包专属：并发流计划、重试口径、丢包汇总。
 //!
-//! UDP 有一条 TCP 没有的判定分支——「发送端灌够了没有」。灌不够时接收端低于
-//! 目标不能算被测设备不达标，必须判 NOT_EVALUATED；这条口径的谓词都在这里。
+//! UDP 有一条 TCP 没有的诊断分支——「发送端灌够了没有」。正式速率结论仍以
+//! RX 平均为准；RX 低于目标时，发送端负载不足也按子网问题判 FAIL。
 
 use super::*;
 
@@ -84,12 +84,6 @@ pub(super) fn zero_udp_stream_verdict(requested: usize, attempts_exhausted: bool
         Verdict::SetupError
     }
 }
-
-// 「灌够了没有」的口径现在是全仓共享的（ADR-12(c)）：定义搬到了
-// `rate_window`，连同 `RX_TRACKS_TX_RATIO`（接收端跟得上发送端的比例，
-// 与 `offered_headroom_pct` 无关，也不该跟着它走）。以前它们只存在于这里，
-// 而 `evaluate_nic_rx` 只查 TX 覆盖率不查 TX 水平，于是 CTS 路径上零防护。
-pub(super) use crate::master::rate_window::offered_shortfall_explains_rx;
 
 pub(super) fn required_udp_streams(
     requested: usize,
@@ -948,8 +942,9 @@ impl Ctx {
                 max_udp_loss_pct: self.cfg.iperf.rate_check.max_udp_loss_pct,
                 rx_lifecycle_hint: &lifecycle_rx_hint(monitor_outputs.get(&first.dst.key())),
             });
-            let (verdict, reason_code, reason_detail) =
-                (judgement.verdict, judgement.code, judgement.detail);
+            let (verdict, reason_code) = (judgement.verdict, judgement.code);
+            let reason_detail = judgement.detail.clone();
+            let leg_diagnostics = judgement.diagnostics.clone();
             // 「这条腿测到了多少」和「两条腿有没有真正并发」是两件事，必须
             // 分别说清楚。腿级窗口让前者不再被后者连坐，但如果不把后者显式
             // 写出来，读报告的人会把单向条件下的数字当成双向并发结果。
@@ -1130,6 +1125,7 @@ impl Ctx {
                 },
                 reason_code,
                 reason_detail: reason_detail.clone(),
+                diagnostics: leg_diagnostics.clone(),
                 rx_avg,
                 requested_streams: n,
                 active_streams: success,
@@ -1162,9 +1158,9 @@ impl Ctx {
                     .get(&first.dst.key())
                     .cloned()
                     .unwrap_or_default(),
-                // TX 逐样本同样要能回查：`tx_p10` 决定 OFFERED_LOAD_LOW、TX 滚动
-                // 覆盖率不足会把整行打成 NOT_EVALUATED，两个都是否决性门槛。
-                // iperf 单腿和 CTS 已经挂了这个链接，UDP 组之前漏了。
+                // TX 逐样本同样要能回查：`tx_p10`、TX 滚动覆盖率和 RX 中途掉速
+                // 现在只作诊断，不会否决已经达标的 RX 平均。iperf 单腿和 CTS
+                // 已经挂了这个链接，UDP 组之前漏了。
                 nic_samples_tx: monitor_sample_files
                     .get(&first.src.key())
                     .cloned()
@@ -1200,7 +1196,7 @@ impl Ctx {
                 })
             });
             outcomes.push(LegOutcome {
-                judgement: VerdictResult::new(verdict, reason_code, reason_detail),
+                judgement,
                 rx_avg,
                 main_rows: vec![idx],
                 tag: plan.tag.clone(),

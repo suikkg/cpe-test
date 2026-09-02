@@ -69,6 +69,12 @@ pub(super) fn leg_rx_target(
     dst: &NicInfo,
 ) -> Option<f64> {
     if bidir {
+        // 配了「两端 RX 合计」门限时，这一腿**没有自己的门限**：判定在单元级
+        // 比一次合计。给它留一个每方向门限，报告上就会出现「AB 判 RATE_FAIL、
+        // 单元判 PASS」这种自相矛盾的两行。
+        if spec.rate_target_bidir_total.is_some() {
+            return None;
+        }
         if let Some(target) = spec.rate_targets_bidir.for_direction(flow_direction) {
             return Some(target);
         }
@@ -83,6 +89,83 @@ pub(super) fn leg_rx_target(
             &spec.rate_check,
         )
     })
+}
+
+/// 这一腿的门限**是从哪一层来的**。
+///
+/// 存在的理由是预览：「字段还在、实际却被另一条规则盖掉」这种事，光看请求体
+/// 看不出来——`RateTargets::for_direction("ab")` 是 `ab.or(forward)`，任务里
+/// 显式填的 `forward` 可以被一张频段表插进来的 `ab` 无声推翻。把最终数字和它
+/// 的来源一起印在计划页上，是唯一能让人当场发现的办法。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RxTargetSource {
+    /// 双向单元按两端 RX 合计判定，这一腿只测量。
+    BidirTotal,
+    /// 双向单元的每方向门限（任务/配对填的，或旧频段规则迁移来的）。
+    BidirDirection,
+    /// 按网口门限与负载（含百分比换算）。
+    NicPolicy,
+    /// 任务 / Wi-Fi 频段表 / 全局门限——它们最终都落在 `rate_targets` 上。
+    ScenarioTargets,
+    /// 内置 EVB 推导。
+    Derived,
+    /// 这一腿没有门限，只记录实测能力。
+    None,
+}
+
+impl RxTargetSource {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            RxTargetSource::BidirTotal => "双向 RX 合计门限（本腿只测量）",
+            RxTargetSource::BidirDirection => "双向方向门限",
+            RxTargetSource::NicPolicy => "按网口门限",
+            RxTargetSource::ScenarioTargets => "任务/频段/全局门限",
+            RxTargetSource::Derived => "内置推导",
+            RxTargetSource::None => "未配置门限",
+        }
+    }
+}
+
+/// 这一腿要用的 `(判定模式, RX 门限, 门限来源)`。
+///
+/// 单独包一层的理由是「配了合计门限的双向腿」必须同时改两件事：门限清空，
+/// **并且**模式落到 `Observe`。只清门限的话，显式配 `verify` 的用户会拿到
+/// 一整轮 `NOT_EVALUATED / TARGET_MISSING`——腿本来就不该有目标，这不是缺配置。
+pub(super) fn leg_rate_plan(
+    spec: &SpecNorm,
+    policy: &rate::LinkPolicy,
+    flow_direction: &str,
+    bidir: bool,
+    src: &NicInfo,
+    dst: &NicInfo,
+) -> (RateMode, Option<f64>, RxTargetSource) {
+    if bidir && spec.rate_target_bidir_total.is_some() {
+        return (RateMode::Observe, None, RxTargetSource::BidirTotal);
+    }
+    if bidir
+        && spec
+            .rate_targets_bidir
+            .for_direction(flow_direction)
+            .is_some()
+    {
+        let target = leg_rx_target(spec, policy, flow_direction, bidir, src, dst);
+        return (
+            rate::effective_mode(spec.rate_mode, target),
+            target,
+            RxTargetSource::BidirDirection,
+        );
+    }
+    let target = leg_rx_target(spec, policy, flow_direction, bidir, src, dst);
+    let source = if policy.rx_target_mbps.is_some() {
+        RxTargetSource::NicPolicy
+    } else if spec.rate_targets.for_direction(flow_direction).is_some() {
+        RxTargetSource::ScenarioTargets
+    } else if target.is_some() {
+        RxTargetSource::Derived
+    } else {
+        RxTargetSource::None
+    };
+    (rate::effective_mode(spec.rate_mode, target), target, source)
 }
 
 /// `-w × 流数` 大到这条链路要花多少秒才排空；超过它就提示。

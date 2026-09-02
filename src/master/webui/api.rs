@@ -132,6 +132,9 @@ pub(super) fn bootstrap_out(state: &UiState) -> BootstrapOut {
         ping_wifi_medium_max_rtt_ms: state.cfg.ping.wifi_medium_max_rtt_ms,
         ping_wifi_large_avg_rtt_ms: state.cfg.ping.wifi_large_avg_rtt_ms,
         ping_wifi_large_max_rtt_ms: state.cfg.ping.wifi_large_max_rtt_ms,
+        rate_targets_mbps: state.cfg.iperf.rate_check.targets_mbps.clone(),
+        rate_mode: state.cfg.iperf.rate_check.mode,
+        udp_profiles: state.cfg.iperf.udp_profiles.clone(),
         screenshot: state.cfg.screenshot,
         ui_plan_supported: true,
     }
@@ -269,6 +272,7 @@ pub(super) fn api_plan(console: &Arc<Console>, body: &str) -> Result<serde_json:
             est_secs: unit.est_secs,
             resumed: *skipped,
             load: unit_load_lines(unit),
+            targets: unit_target_lines(unit),
         })
         .collect();
     serde_json::to_value(PlanOut {

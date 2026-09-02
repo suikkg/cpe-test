@@ -83,7 +83,7 @@ const fileInput = ref<HTMLInputElement | null>(null);
 /**
  * 导出项目：用 Blob + 一次性 <a download>。
  *
- * 不走服务端：项目文件是纯前端的意图文档，服务端根本没有它。
+ * 不走服务端：项目文件是纯前端的计划与执行设置文档，服务端根本没有它。
  */
 function onExport(): void {
   const blob = new Blob([exportProject()], { type: 'application/json' });
@@ -144,7 +144,7 @@ onMounted(() => {
         class="hidden-file"
         @change="onImport"
       />
-      <span class="muted">项目文件只存计划意图，不含口令</span>
+      <span class="muted">项目文件保存可复现配置，不含 RESUME、截图、历史结果或口令</span>
     </div>
 
     <p v-if="projectNotices.error" class="bad" role="alert">{{ projectNotices.error }}</p>

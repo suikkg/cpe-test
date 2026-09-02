@@ -346,7 +346,7 @@ impl Ctx {
             .unwrap_or_default();
 
         let measurement = parsed.has_measurement();
-        let (verdict, reason_code, reason_detail) = iperf_flow_verdict(IperfFlowVerdictIn {
+        let judgement = iperf_flow_verdict(IperfFlowVerdictIn {
             raw_ok,
             measurement,
             effective_window: &effective_window,
@@ -362,6 +362,8 @@ impl Ctx {
             client_tail: client.output.lines().last().unwrap_or_default(),
             rx_monitor: mon_out.as_ref(),
         });
+        let (verdict, reason_code) = (judgement.verdict, judgement.code);
+        let reason_detail = judgement.detail.clone();
         let raw_error = if raw_ok {
             String::new()
         } else {
@@ -417,6 +419,7 @@ impl Ctx {
             },
             reason_code,
             reason_detail: reason_detail.clone(),
+            diagnostics: judgement.diagnostics.clone(),
             rx_avg,
             tx_mbps: parsed.best_sender(),
             rx_mbps: parsed.best_receiver(),
@@ -482,7 +485,7 @@ impl Ctx {
             })
         });
         LegOutcome {
-            judgement: VerdictResult::new(verdict, reason_code, reason_detail),
+            judgement,
             rx_avg,
             main_rows: vec![idx],
             tag: tag.to_string(),

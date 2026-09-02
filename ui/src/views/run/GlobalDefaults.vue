@@ -1,12 +1,17 @@
 <script setup lang="ts">
 import { computed } from 'vue';
 import {
+  defaultNumberPlaceholder,
   formatNumberList,
   formatTokenList,
-  globalsAreEmpty,
+  wifiBandLabel,
+  wifiBandPairRows,
   parseNumberList,
   parseTokenList,
+  setWifiBandThreshold,
+  wifiBandThresholdFor,
 } from '../../domain/globals';
+import { agentNics, masterNics } from '../../state/inventory';
 import { plan } from '../../state/plan';
 import { session } from '../../state/session';
 
@@ -39,7 +44,7 @@ function scalar(key: 'udp_streams' | 'ping_count') {
 }
 
 /** RTT 允许小数毫秒，不能复用上面会 Math.trunc 的整数绑定。 */
-type PingPolicyNumberKey =
+type PositiveDecimalKey =
   | 'ping_small_max_bytes'
   | 'ping_medium_max_bytes'
   | 'ping_wired_small_avg_rtt_ms'
@@ -55,36 +60,135 @@ type PingPolicyNumberKey =
   | 'ping_wifi_large_avg_rtt_ms'
   | 'ping_wifi_large_max_rtt_ms';
 
-function positiveDecimal(key: PingPolicyNumberKey) {
-  return computed({
-    get: () => (plan.globals[key] > 0 ? String(plan.globals[key]) : ''),
-    set: (raw: string) => {
-      const value = Number(raw.trim());
-      plan.globals[key] = Number.isFinite(value) && value > 0 ? value : 0;
-    },
-  });
+type PingPolicyNumberKey = PositiveDecimalKey;
+
+type WifiBandKey =
+  | 'rx_target_master_to_agent_mbps'
+  | 'rx_target_agent_to_master_mbps'
+  | 'bidir_total_rx_target_mbps';
+
+function positiveValue(key: PositiveDecimalKey): string {
+  const value = plan.globals[key];
+  return value > 0 ? String(value) : '';
+}
+
+function positiveNumber(event: Event): number {
+  const value = Number((event.target as HTMLInputElement).value.trim());
+  return Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+const integerPositiveKeys = new Set<PositiveDecimalKey>([
+  'ping_small_max_bytes',
+  'ping_medium_max_bytes',
+]);
+
+function updatePositive(key: PositiveDecimalKey, event: Event): void {
+  const value = positiveNumber(event);
+  plan.globals[key] = integerPositiveKeys.has(key) ? Math.trunc(value) : value;
 }
 
 const udpStreams = scalar('udp_streams');
 const pingCount = scalar('ping_count');
-const policyKeys = [
-  'ping_small_max_bytes','ping_medium_max_bytes','ping_wired_small_avg_rtt_ms','ping_wired_small_max_rtt_ms','ping_wired_medium_avg_rtt_ms','ping_wired_medium_max_rtt_ms','ping_wired_large_avg_rtt_ms','ping_wired_large_max_rtt_ms','ping_wifi_small_avg_rtt_ms','ping_wifi_small_max_rtt_ms','ping_wifi_medium_avg_rtt_ms','ping_wifi_medium_max_rtt_ms','ping_wifi_large_avg_rtt_ms','ping_wifi_large_max_rtt_ms',
-] as const;
-const policy = Object.fromEntries(policyKeys.map((key) => [key, positiveDecimal(key)])) as Record<(typeof policyKeys)[number], ReturnType<typeof positiveDecimal>>;
 
-const policyRows: Array<{ label: string; avgKey: PingPolicyNumberKey; maxKey: PingPolicyNumberKey }> = [
-  { label: '有线 small', avgKey: 'ping_wired_small_avg_rtt_ms', maxKey: 'ping_wired_small_max_rtt_ms' },
-  { label: '有线 medium', avgKey: 'ping_wired_medium_avg_rtt_ms', maxKey: 'ping_wired_medium_max_rtt_ms' },
-  { label: '有线 large', avgKey: 'ping_wired_large_avg_rtt_ms', maxKey: 'ping_wired_large_max_rtt_ms' },
-  { label: 'Wi-Fi small', avgKey: 'ping_wifi_small_avg_rtt_ms', maxKey: 'ping_wifi_small_max_rtt_ms' },
-  { label: 'Wi-Fi medium', avgKey: 'ping_wifi_medium_avg_rtt_ms', maxKey: 'ping_wifi_medium_max_rtt_ms' },
-  { label: 'Wi-Fi large', avgKey: 'ping_wifi_large_avg_rtt_ms', maxKey: 'ping_wifi_large_max_rtt_ms' },
-];
+type PingPolicyRow = {
+  bucket: string;
+  range: string;
+  wiredAvgKey: PingPolicyNumberKey;
+  wiredMaxKey: PingPolicyNumberKey;
+  wifiAvgKey: PingPolicyNumberKey;
+  wifiMaxKey: PingPolicyNumberKey;
+};
 
-function policyPlaceholder(key: PingPolicyNumberKey): string {
-  const value = configured.value?.[key];
-  return typeof value === 'number' && value > 0 ? String(value) : '';
+function configuredPingValue(key: PingPolicyNumberKey): number {
+  const value = session.bootstrap?.[key];
+  return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : 0;
 }
+
+function effectivePingValue(key: PingPolicyNumberKey): number {
+  return plan.globals[key] > 0 ? plan.globals[key] : configuredPingValue(key);
+}
+
+function pingPlaceholder(key: PingPolicyNumberKey): string {
+  return defaultNumberPlaceholder(configuredPingValue(key));
+}
+
+const policyRows = computed<PingPolicyRow[]>(() => {
+  const smallMax = effectivePingValue('ping_small_max_bytes');
+  const mediumMax = effectivePingValue('ping_medium_max_bytes');
+  return [
+    {
+      bucket: 'small',
+      range: smallMax > 0 ? `≤ ${smallMax} B` : '—',
+      wiredAvgKey: 'ping_wired_small_avg_rtt_ms',
+      wiredMaxKey: 'ping_wired_small_max_rtt_ms',
+      wifiAvgKey: 'ping_wifi_small_avg_rtt_ms',
+      wifiMaxKey: 'ping_wifi_small_max_rtt_ms',
+    },
+    {
+      bucket: 'medium',
+      range: smallMax > 0 && mediumMax > 0 ? `${smallMax + 1}–${mediumMax} B` : '—',
+      wiredAvgKey: 'ping_wired_medium_avg_rtt_ms',
+      wiredMaxKey: 'ping_wired_medium_max_rtt_ms',
+      wifiAvgKey: 'ping_wifi_medium_avg_rtt_ms',
+      wifiMaxKey: 'ping_wifi_medium_max_rtt_ms',
+    },
+    {
+      bucket: 'large',
+      range: mediumMax > 0 ? `> ${mediumMax} B` : '—',
+      wiredAvgKey: 'ping_wired_large_avg_rtt_ms',
+      wiredMaxKey: 'ping_wired_large_max_rtt_ms',
+      wifiAvgKey: 'ping_wifi_large_avg_rtt_ms',
+      wifiMaxKey: 'ping_wifi_large_max_rtt_ms',
+    },
+  ];
+});
+
+function pingValue(key: PingPolicyNumberKey): string {
+  return positiveValue(key);
+}
+
+const wifiBandRows = computed(() => wifiBandPairRows(masterNics.value, agentNics.value));
+
+function bandRuleValue(
+  row: { masterBand: string; agentBand: string },
+  key: WifiBandKey,
+): string {
+  const value = wifiBandThresholdFor(
+    plan.globals.wifi_band_thresholds,
+    row.masterBand,
+    row.agentBand,
+  )[key];
+  return value > 0 ? String(value) : '';
+}
+
+function updateBandRule(
+  row: { masterBand: string; agentBand: string },
+  key: WifiBandKey,
+  event: Event,
+): void {
+  plan.globals.wifi_band_thresholds = setWifiBandThreshold(
+    plan.globals.wifi_band_thresholds,
+    row.masterBand,
+    row.agentBand,
+    { [key]: positiveNumber(event) },
+  );
+}
+
+const hasLegacyWifiOverrides = computed(
+  () =>
+    plan.globals.wifi_pair_rx_target_mbps > 0 ||
+    plan.globals.wifi_pair_bidir_rx_target_mbps > 0 ||
+    plan.globals.wifi_pair_bidir_total_rx_target_mbps > 0 ||
+    plan.globals.wifi_pair_thresholds.length > 0,
+);
+
+function clearLegacyWifiOverrides(): void {
+  plan.globals.wifi_pair_rx_target_mbps = 0;
+  plan.globals.wifi_pair_bidir_rx_target_mbps = 0;
+  plan.globals.wifi_pair_bidir_total_rx_target_mbps = 0;
+  plan.globals.wifi_pair_thresholds = [];
+}
+
 const tcpWindows = tokens('tcp_windows');
 const tcpStreams = numbers('tcp_streams');
 const udpBandwidths = tokens('udp_bandwidths');
@@ -92,36 +196,12 @@ const udpLengths = tokens('udp_lengths');
 const udpWindows = tokens('udp_windows');
 const pingSizes = numbers('ping_payload_sizes');
 
-const configured = computed(() => session.bootstrap);
-
-function hint(values: readonly string[] | readonly number[] | undefined, fallback: string): string {
-  if (!values || values.length === 0) return fallback;
-  return `沿用配置：${values.join(', ')}`;
-}
-
-function udpProfileHint(values: readonly string[] | undefined, flag: string): string {
-  if (plan.globals.udp_bandwidths.length > 0) return `留空 = 不下发 ${flag}`;
-  return hint(values, `留空 = 不下发 ${flag}`);
-}
-
-function scalarHint(value: number | undefined, fallback: string): string {
-  return value && value > 0 ? `沿用配置：${value}` : fallback;
-}
-
-const untouched = computed(() => globalsAreEmpty(plan.globals));
 </script>
 
 <template>
   <section class="block">
     <div class="head">
       <strong>全局默认档位</strong>
-      <small class="muted">
-        {{
-          untouched
-            ? '全部沿用主控 config.json（灰字就是它当前的值）'
-            : '填了值的格子按填的跑；空格子沿用主控 config.json（灰字）'
-        }}
-      </small>
     </div>
 
     <div class="grid">
@@ -130,7 +210,7 @@ const untouched = computed(() => globalsAreEmpty(plan.globals));
         <input
           v-model="udpBandwidths"
           type="text"
-          :placeholder="hint(configured?.udp_bandwidths, '如 2500m, 1000m')"
+          placeholder="如 2500m, 1000m"
           autocomplete="off"
         />
       </label>
@@ -139,7 +219,7 @@ const untouched = computed(() => globalsAreEmpty(plan.globals));
         <input
           v-model="udpLengths"
           type="text"
-          :placeholder="udpProfileHint(configured?.udp_lengths, '-l')"
+          placeholder="留空 = 不下发 -l"
           autocomplete="off"
         />
       </label>
@@ -148,7 +228,7 @@ const untouched = computed(() => globalsAreEmpty(plan.globals));
         <input
           v-model="udpWindows"
           type="text"
-          :placeholder="udpProfileHint(configured?.udp_windows, '-w')"
+          placeholder="留空 = 不下发 -w"
           autocomplete="off"
         />
       </label>
@@ -158,7 +238,7 @@ const untouched = computed(() => globalsAreEmpty(plan.globals));
           v-model="udpStreams"
           type="text"
           inputmode="numeric"
-          :placeholder="scalarHint(configured?.udp_streams, '留空 = 不覆盖')"
+          placeholder="如 1"
           autocomplete="off"
         />
       </label>
@@ -167,7 +247,7 @@ const untouched = computed(() => globalsAreEmpty(plan.globals));
         <input
           v-model="tcpWindows"
           type="text"
-          :placeholder="hint(configured?.tcp_windows, '如 4m, 64k')"
+          placeholder="如 4m, 64k"
           autocomplete="off"
         />
       </label>
@@ -176,7 +256,7 @@ const untouched = computed(() => globalsAreEmpty(plan.globals));
         <input
           v-model="tcpStreams"
           type="text"
-          :placeholder="hint(configured?.tcp_streams, '如 1, 10')"
+          placeholder="如 1, 10"
           autocomplete="off"
         />
       </label>
@@ -186,7 +266,7 @@ const untouched = computed(() => globalsAreEmpty(plan.globals));
           v-model="pingCount"
           type="text"
           inputmode="numeric"
-          :placeholder="scalarHint(configured?.ping_count, '留空 = 不覆盖')"
+          placeholder="如 180"
           autocomplete="off"
         />
       </label>
@@ -195,7 +275,7 @@ const untouched = computed(() => globalsAreEmpty(plan.globals));
         <input
           v-model="pingSizes"
           type="text"
-          :placeholder="hint(configured?.ping_payload_sizes, '如 32, 1400')"
+          placeholder="如 32, 1400"
           autocomplete="off"
         />
       </label>
@@ -204,26 +284,75 @@ const untouched = computed(() => globalsAreEmpty(plan.globals));
     <details class="policy">
       <summary><strong>Ping 高级阈值</strong> <span class="muted">自动按链路类型 × payload 档位选择；需要时可临时收紧/放宽</span></summary>
       <div class="policy-grid">
-        <label><span>small 最大字节</span><input v-model="policy.ping_small_max_bytes" :placeholder="String(configured?.ping_small_max_bytes ?? 128)" /></label>
-        <label><span>medium 最大字节</span><input v-model="policy.ping_medium_max_bytes" :placeholder="String(configured?.ping_medium_max_bytes ?? 2000)" /></label>
-        <template v-for="row in policyRows" :key="row.label">
-          <label><span>{{ row.label }} Avg RTT（ms）</span><input v-model="policy[row.avgKey]" :placeholder="policyPlaceholder(row.avgKey)" /></label>
-          <label><span>{{ row.label }} Max RTT（ms）</span><input v-model="policy[row.maxKey]" :placeholder="policyPlaceholder(row.maxKey)" /></label>
-        </template>
+        <label class="bucket-rule">
+          <span>small 最大字节</span>
+          <input :value="positiveValue('ping_small_max_bytes')" inputmode="numeric" :placeholder="pingPlaceholder('ping_small_max_bytes')" @input="updatePositive('ping_small_max_bytes', $event)" />
+        </label>
+        <label class="bucket-rule">
+          <span>medium 最大字节</span>
+          <input :value="positiveValue('ping_medium_max_bytes')" inputmode="numeric" :placeholder="pingPlaceholder('ping_medium_max_bytes')" @input="updatePositive('ping_medium_max_bytes', $event)" />
+        </label>
       </div>
-      <p class="muted hint">留空 = 沿用主控 config.json。默认分类：small ≤ 128，medium ≤ 2000，其余为 large；所有档位仍要求 0% 丢包。</p>
+      <div class="table-scroll">
+        <table class="ping-policy-table">
+          <colgroup>
+            <col class="payload-col" />
+            <col class="range-col" />
+            <col class="rtt-col" />
+            <col class="rtt-col" />
+            <col class="rtt-col" />
+            <col class="rtt-col" />
+          </colgroup>
+          <thead>
+            <tr><th>payload 档位</th><th>范围</th><th colspan="2">有线</th><th colspan="2">Wi-Fi</th></tr>
+            <tr class="subhead"><th></th><th></th><th>Avg RTT（ms）</th><th>Max RTT（ms）</th><th>Avg RTT（ms）</th><th>Max RTT（ms）</th></tr>
+          </thead>
+          <tbody>
+            <tr v-for="row in policyRows" :key="row.bucket">
+              <th scope="row">{{ row.bucket }}</th>
+              <td class="muted">{{ row.range }}</td>
+              <td><input :value="pingValue(row.wiredAvgKey)" :placeholder="pingPlaceholder(row.wiredAvgKey)" :aria-label="`有线 ${row.bucket} Avg RTT`" @input="updatePositive(row.wiredAvgKey, $event)" /></td>
+              <td><input :value="pingValue(row.wiredMaxKey)" :placeholder="pingPlaceholder(row.wiredMaxKey)" :aria-label="`有线 ${row.bucket} Max RTT`" @input="updatePositive(row.wiredMaxKey, $event)" /></td>
+              <td><input :value="pingValue(row.wifiAvgKey)" :placeholder="pingPlaceholder(row.wifiAvgKey)" :aria-label="`Wi-Fi ${row.bucket} Avg RTT`" @input="updatePositive(row.wifiAvgKey, $event)" /></td>
+              <td><input :value="pingValue(row.wifiMaxKey)" :placeholder="pingPlaceholder(row.wifiMaxKey)" :aria-label="`Wi-Fi ${row.bucket} Max RTT`" @input="updatePositive(row.wifiMaxKey, $event)" /></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="muted hint">灰字“默认 xx”是主控当前生效值；输入数值后覆盖。所有档位仍要求 0% 丢包。</p>
     </details>
 
-    <p class="muted hint">
-      套件里选中的配置优先；这里填的是「套件没选配置时用哪一组」。填多个用逗号分隔，逐档各跑一轮。
-      <br />
-      <strong>Ping 一律要求 0% 丢包</strong>，RTT 按“有线/Wi‑Fi × small/medium/large”自动选 Avg/Max 门限；
-      <code>-l</code> 可以是任意值，不依赖固定的 32/1600/65500。需要收紧时展开上面的高级阈值。
-      <br />
-      <strong>UDP 那四格是一整组</strong>：只要 <code>-b</code> 填了，
-      <code>-l</code> / <code>-w</code> 留空就是<strong>真的不下发</strong>这两个参数（用 iperf3 默认），
-      配置文件里的值不再参与。TCP 两格则各自独立回落。
-    </p>
+    <details class="policy">
+      <summary><strong>Wi-Fi 互测门限</strong> <span class="muted">按当前识别到的频段组合显示</span></summary>
+      <div v-if="wifiBandRows.length === 0" class="empty-inline">两端识别到 Wi-Fi 网口后显示门限表。</div>
+      <div v-else class="table-scroll">
+        <table class="ping-policy-table wifi-table wifi-matrix">
+          <thead>
+            <tr><th colspan="2">频段组合</th><th colspan="2">单向测试</th><th>双向并发</th></tr>
+            <tr class="subhead"><th>主控</th><th>辅测</th><th>主控 → 辅测</th><th>辅测 → 主控</th><th>两端 RX 合计</th></tr>
+          </thead>
+          <tbody>
+            <tr v-for="row in wifiBandRows" :key="`${row.masterBand}-${row.agentBand}`">
+              <th scope="row">{{ wifiBandLabel(row.masterBand) }}</th>
+              <td class="band-cell">{{ wifiBandLabel(row.agentBand) }}</td>
+              <td><input :value="bandRuleValue(row, 'rx_target_master_to_agent_mbps')" inputmode="decimal" placeholder="Mbps" :aria-label="`${wifiBandLabel(row.masterBand)} 到 ${wifiBandLabel(row.agentBand)} 单向 RX 门限`" @input="updateBandRule(row, 'rx_target_master_to_agent_mbps', $event)" /></td>
+              <td><input :value="bandRuleValue(row, 'rx_target_agent_to_master_mbps')" inputmode="decimal" placeholder="Mbps" :aria-label="`${wifiBandLabel(row.agentBand)} 到 ${wifiBandLabel(row.masterBand)} 单向 RX 门限`" @input="updateBandRule(row, 'rx_target_agent_to_master_mbps', $event)" /></td>
+              <td><input :value="bandRuleValue(row, 'bidir_total_rx_target_mbps')" inputmode="decimal" placeholder="Mbps" :aria-label="`${wifiBandLabel(row.masterBand)} 与 ${wifiBandLabel(row.agentBand)} 双向并发两端 RX 合计门限`" @input="updateBandRule(row, 'bidir_total_rx_target_mbps', $event)" /></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="muted hint">
+        双向并发按<strong>两端 RX 合计</strong>判定：<code>主控端 RX 平均 + 辅测端 RX 平均 ≥ 合计门限</code>。
+        Wi-Fi 之间抢的是同一段空口时间，两个方向怎么分完全看调度，不要求各达到一半——
+        合计 900 时「720 + 230 = 950」就是 PASS。留空则双向单元只显示实测值，不判 PASS/FAIL。
+      </p>
+      <div v-if="hasLegacyWifiOverrides" class="legacy-warning">
+        <span>当前项目含旧版具体网口覆盖，仍按兼容规则执行。</span>
+        <button type="button" class="ghost small" @click="clearLegacyWifiOverrides">清除旧覆盖</button>
+      </div>
+    </details>
+
   </section>
 </template>
 
@@ -261,7 +390,25 @@ input:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
 .hint { margin: 9px 0 0; font-size: 12px; }
 .policy { margin-top: 10px; border-top: 1px dashed var(--line); padding-top: 9px; }
 .policy summary { cursor: pointer; font-size: 12px; }
-.policy-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 8px; margin-top: 9px; }
+.policy-grid { display: grid; grid-template-columns: repeat(2, minmax(190px, 1fr)); gap: 10px; margin-top: 9px; max-width: 520px; }
+.table-scroll { max-width: 100%; overflow-x: auto; margin-top: 11px; border: 1px solid var(--line); border-radius: 5px; }
+.ping-policy-table { width: 100%; min-width: 660px; table-layout: fixed; border-collapse: separate; border-spacing: 0; font-size: 12px; }
+.ping-policy-table .payload-col { width: 92px; }
+.ping-policy-table .range-col { width: 108px; }
+.ping-policy-table .rtt-col { width: 176px; }
+.ping-policy-table th, .ping-policy-table td { padding: 7px 8px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: middle; }
+.ping-policy-table thead th { background: var(--head); color: var(--muted); font-weight: 600; line-height: 1.35; white-space: normal; }
+.ping-policy-table thead .subhead th { padding-top: 4px; padding-bottom: 5px; font-size: 11px; font-weight: 500; }
+.ping-policy-table tbody th { font-weight: 600; }
+.ping-policy-table tbody tr:last-child th, .ping-policy-table tbody tr:last-child td { border-bottom: 0; }
+.ping-policy-table input { width: 100%; box-sizing: border-box; }
+.wifi-table { min-width: 720px; }
+.wifi-table input { min-width: 100px; }
+.empty-inline { margin-top: 9px; padding: 10px; border: 1px dashed var(--line); color: var(--muted); font-size: 12px; }
+.wifi-matrix th:nth-child(-n + 2), .wifi-matrix td:nth-child(-n + 2) { width: 13%; }
+.wifi-matrix .band-cell { font-weight: 600; }
+.legacy-warning { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 9px; padding: 8px 10px; border: 1px solid var(--warn); border-radius: 5px; color: var(--muted); font-size: 12px; }
+@media (max-width: 560px) { .policy-grid { grid-template-columns: 1fr; max-width: none; } }
 code { font-family: var(--fm); }
 .muted { color: var(--muted); }
 </style>

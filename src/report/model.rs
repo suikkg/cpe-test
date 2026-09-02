@@ -194,6 +194,12 @@ pub struct Row {
     pub execution_status: ExecutionStatus,
     pub reason_code: ReasonCode,
     pub reason_detail: String,
+    /// **不参与判定**的排障线索（ADR-17）。
+    ///
+    /// UDP 丢包、发送端负载、滚动窗口覆盖、工具退出状态这些事实以前是判定
+    /// 分支，会在接收端 RX 已经达标之后把 PASS 翻成 RATE_FAIL。现在它们走
+    /// 这条通道：报告里照样看得见，但 `verdict` 只由接收端 RX 平均与门限决定。
+    pub diagnostics: Vec<String>,
     pub kind_label: String,
     pub rx_avg: Option<f64>,
     pub peer_rx: String,
@@ -613,6 +619,23 @@ pub(super) fn group_direction_summaries(group: &UnitGroup<'_>) -> Vec<DirectionS
         }
     }
     directions
+}
+
+/// 双向单元的两个接收方向 RX 平均合计。
+///
+/// HTML 与 Excel 都展示这个诊断值，判定仍然逐方向进行；把合计放在模型层，
+/// 避免两个结果出口各自挑 AB/BA 或各自处理缺失值。
+pub(super) fn bidirectional_rx_average_sum(group: &UnitGroup<'_>) -> Option<f64> {
+    let directions = group_direction_summaries(group);
+    let ab = directions
+        .iter()
+        .find(|direction| direction.tag.eq_ignore_ascii_case("AB"))?
+        .rx_avg?;
+    let ba = directions
+        .iter()
+        .find(|direction| direction.tag.eq_ignore_ascii_case("BA"))?
+        .rx_avg?;
+    (ab.is_finite() && ba.is_finite()).then_some(ab + ba)
 }
 
 pub(super) fn group_is_udp(group: &UnitGroup<'_>) -> bool {

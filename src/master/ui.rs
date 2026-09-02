@@ -1126,6 +1126,10 @@ fn generate_specs_from_pairs(
             .as_ref()
             .and_then(|p| p.rate_targets_bidir_mbps.clone())
             .unwrap_or_default();
+        let rate_target_bidir_total = default_params
+            .as_ref()
+            .and_then(|p| p.rate_target_bidir_total_mbps)
+            .filter(|value| value.is_finite() && *value > 0.0);
 
         out.push(SpecNorm {
             name: format!("{}<->{}", p.master, p.agent),
@@ -1151,6 +1155,7 @@ fn generate_specs_from_pairs(
             rate_mode,
             rate_targets,
             rate_targets_bidir,
+            rate_target_bidir_total,
             rate_check: cfg.iperf.rate_check.clone(),
             link_profiles: cfg.link_profiles.clone(),
             ctstraffic: cfg.ctstraffic.clone(),
@@ -1382,6 +1387,7 @@ fn spec_from_params(
         // 双向门限按配对配置，这条「全局参数」兜底路径没有配对上下文；
         // 需要它的场景走 pairs / tests。
         rate_targets_bidir: crate::config::RateTargets::default(),
+        rate_target_bidir_total: None,
         rate_check: cfg.iperf.rate_check.clone(),
         link_profiles: cfg.link_profiles.clone(),
         ctstraffic: cfg.ctstraffic.clone(),
@@ -1653,6 +1659,8 @@ mod tests {
             title: "ping-only".into(),
             link_group: String::new(),
             bidir: false,
+            bidir_total_target_mbps: None,
+            target_lines: Vec::new(),
             direction: String::new(),
             est_secs: 1,
             legs: vec![Leg {
@@ -1677,6 +1685,8 @@ mod tests {
             title: "iperf".into(),
             link_group: String::new(),
             bidir: false,
+            bidir_total_target_mbps: None,
+            target_lines: Vec::new(),
             direction: String::new(),
             est_secs: 1,
             legs: vec![Leg {
@@ -1708,6 +1718,8 @@ mod tests {
             title: "ctstraffic".into(),
             link_group: String::new(),
             bidir: false,
+            bidir_total_target_mbps: None,
+            target_lines: Vec::new(),
             direction: String::new(),
             est_secs: 1,
             legs: vec![Leg {

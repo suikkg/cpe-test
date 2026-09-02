@@ -56,8 +56,28 @@ export interface BootstrapOut {
   ping_wifi_medium_max_rtt_ms: number,
   ping_wifi_large_avg_rtt_ms: number,
   ping_wifi_large_max_rtt_ms: number,
+  /** 主控 config.json 当前生效的全局 RX 门限；界面没有输入框，但它参与判定。 */
+  rate_targets_mbps: RateTargets;
+  /** 主控当前生效的 UDP 档位原样列表（三条轴是叉乘语义，还原不回来）。 */
+  udp_profiles: UdpProfile[];
+  /** 主控当前生效的判定模式；`observe` 整轮不判 PASS/FAIL。 */
+  rate_mode: string;
   screenshot: boolean;
   ui_plan_supported: boolean;
+}
+
+/** 一档 UDP 参数。`length`/`window` 省略表示这一档不下发 `-l`/`-w`。 */
+export interface UdpProfile {
+  bandwidth: string;
+  length?: string | null;
+  window?: string | null;
+}
+
+/** 方向化的 RX 门限；`null` = 这一层没给。 */
+export interface RateTargets {
+  forward: number | null;
+  ab: number | null;
+  ba: number | null;
 }
 
 export interface LocalOut {
@@ -93,6 +113,8 @@ export interface PlannedUnit {
   est_secs: number;
   resumed: boolean;
   load: string[];
+  /** 每条腿**最终**按什么门限判、门限来自哪一层。 */
+  targets: string[];
 }
 
 export interface PlanSection {

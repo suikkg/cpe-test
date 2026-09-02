@@ -1,4 +1,4 @@
-import { emptyGlobals, type UiGlobals, type UiNicPolicy } from './globals';
+import { normalizeGlobals, type UiGlobals, type UiNicPolicy } from './globals';
 import { ensureDefaults, type UiPlan } from './plan-build';
 
 /** 把 runs/<run>/request.json 读回成控制台编辑态。 */
@@ -10,16 +10,6 @@ export interface RerunSnapshot {
   globals: UiGlobals;
   nicPolicies: UiNicPolicy[];
   plan: UiPlan | null;
-}
-
-function stringList(value: unknown): string[] {
-  return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
-}
-
-function numberList(value: unknown): number[] {
-  return Array.isArray(value)
-    ? value.filter((item): item is number => typeof item === 'number' && Number.isFinite(item))
-    : [];
 }
 
 function count(value: unknown, fallback: number): number {
@@ -48,32 +38,7 @@ export function parseRunRequest(raw: unknown): RerunSnapshot | null {
   if (!raw || typeof raw !== 'object') return null;
   const request = raw as Record<string, unknown>;
 
-  const globals: UiGlobals = {
-    ...emptyGlobals(),
-    tcp_windows: stringList(request.tcp_windows),
-    tcp_streams: numberList(request.tcp_streams),
-    udp_bandwidths: stringList(request.udp_bandwidths),
-    udp_lengths: stringList(request.udp_lengths),
-    udp_windows: stringList(request.udp_windows),
-    udp_streams: count(request.udp_streams, 0),
-    ping_count: count(request.ping_count, 0),
-    ping_payload_sizes: numberList(request.ping_payload_sizes),
-    ping_max_rtt_ms: count(request.ping_max_rtt_ms, 0),
-    ping_small_max_bytes: count(request.ping_small_max_bytes, 0),
-    ping_medium_max_bytes: count(request.ping_medium_max_bytes, 0),
-    ping_wired_small_avg_rtt_ms: count(request.ping_wired_small_avg_rtt_ms, 0),
-    ping_wired_small_max_rtt_ms: count(request.ping_wired_small_max_rtt_ms, 0),
-    ping_wired_medium_avg_rtt_ms: count(request.ping_wired_medium_avg_rtt_ms, 0),
-    ping_wired_medium_max_rtt_ms: count(request.ping_wired_medium_max_rtt_ms, 0),
-    ping_wired_large_avg_rtt_ms: count(request.ping_wired_large_avg_rtt_ms, 0),
-    ping_wired_large_max_rtt_ms: count(request.ping_wired_large_max_rtt_ms, 0),
-    ping_wifi_small_avg_rtt_ms: count(request.ping_wifi_small_avg_rtt_ms, 0),
-    ping_wifi_small_max_rtt_ms: count(request.ping_wifi_small_max_rtt_ms, 0),
-    ping_wifi_medium_avg_rtt_ms: count(request.ping_wifi_medium_avg_rtt_ms, 0),
-    ping_wifi_medium_max_rtt_ms: count(request.ping_wifi_medium_max_rtt_ms, 0),
-    ping_wifi_large_avg_rtt_ms: count(request.ping_wifi_large_avg_rtt_ms, 0),
-    ping_wifi_large_max_rtt_ms: count(request.ping_wifi_large_max_rtt_ms, 0),
-  };
+  const globals: UiGlobals = normalizeGlobals(request);
 
   const rawPlan = request.ui_plan;
   let plan: UiPlan | null = null;

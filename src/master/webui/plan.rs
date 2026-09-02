@@ -7,6 +7,7 @@
 
 use super::*;
 use crate::master::plan::ExecutionPlan;
+use crate::protocol::NicInfo;
 
 #[allow(dead_code)]
 pub(super) fn validated_config_from_request(
@@ -117,6 +118,286 @@ fn apply_ping_policy_overrides(cfg: &mut crate::config::PingCfg, req: &RunReques
     }
 }
 
+/// 频段的**稳定枚举**。
+///
+/// 存进请求和项目文件的一律是这四个词，界面再渲染成 `2.4G / 5G / 6G`。
+/// 以前两端各自产出 `"5GHz"` 这样的展示串然后按字符串比较——两边的规则一模
+/// 一样，所以一直没出事，但那是靠两份实现恰好同步维持的。展示文案是最容易被
+/// 改的东西（有人把 `5GHz` 改成 `5 GHz`），而改完之后频段规则会**静默失效**：
+/// 找不到规则不会报错，只是门限没了。
+pub(super) const WIFI_BAND_24G: &str = "wifi_2_4g";
+pub(super) const WIFI_BAND_5G: &str = "wifi_5g";
+pub(super) const WIFI_BAND_6G: &str = "wifi_6g";
+pub(super) const WIFI_BAND_UNKNOWN: &str = "unknown";
+
+/// 把任意来源的频段写法收敛成稳定枚举。
+///
+/// 同时吃三类输入：网卡自报的 `wifi_band`/`role`、旧项目里存的展示串
+/// （`5GHz` / `2.4GHz` / `未知频段`）、以及新格式自己的枚举值。
+pub(super) fn canonical_wifi_band(raw: &str) -> &'static str {
+    let text = raw.to_ascii_lowercase();
+    if text.contains("2.4") || text.contains("2_4") || text.contains("24g") {
+        WIFI_BAND_24G
+    } else if text.contains('6') {
+        WIFI_BAND_6G
+    } else if text.contains('5') {
+        WIFI_BAND_5G
+    } else {
+        WIFI_BAND_UNKNOWN
+    }
+}
+
+fn normalized_wifi_band(nic: &NicInfo) -> &'static str {
+    canonical_wifi_band(&format!("{} {}", nic.wifi_band, nic.role))
+}
+
+fn nic_is_wifi(nic: &NicInfo) -> bool {
+    nic.is_wifi
+        || !nic.wifi_band.trim().is_empty()
+        || nic.role.to_ascii_uppercase().contains("WIFI")
+}
+
+fn wifi_endpoints(
+    state: &UiState,
+    src: &str,
+    dst: &str,
+) -> Option<(builder::Endpoint, builder::Endpoint)> {
+    let src = builder::resolve_endpoint(src, &state.master, &state.agent).ok()?;
+    let dst = builder::resolve_endpoint(dst, &state.master, &state.agent).ok()?;
+    (nic_is_wifi(&src.nic) && nic_is_wifi(&dst.nic)).then_some((src, dst))
+}
+
+fn positive_wifi_target(value: f64) -> Option<f64> {
+    value
+        .is_finite()
+        .then_some(value)
+        .filter(|value| *value > 0.0)
+}
+
+/// 这个端点上的「按网口门限」是不是**真的能算出一个 Mbps**。
+///
+/// 只看文本非空是不够的：`90%` 这类百分比在网卡协商速率未知（`speed_mbps == 0`，
+/// Wi-Fi 上很常见）时，`rate::rx_target_from` 明确返回 `None` 并要求继续走下游
+/// 兜底。此前这里只要文本非空就当作「已被网口覆盖」，于是频段门限被提前删掉，
+/// 而百分比又算不出来——最终落到全局门限或 `TARGET_MISSING`，两层兜底同时失效。
+fn nic_rx_override_resolves(state: &UiState, req: &RunRequest, endpoint: &str) -> bool {
+    let Some(policy) = req
+        .nic_policies
+        .iter()
+        .find(|policy| policy.endpoint.trim() == endpoint)
+    else {
+        return false;
+    };
+    let Ok(Some(target)) = parse_rx_target(&policy.rx_target) else {
+        return false;
+    };
+    match target {
+        RxTarget::Mbps(value) => value.is_finite() && value > 0.0,
+        // 百分比要有协商速率才能落地；落不了地就当这一层没给，交给下游兜底。
+        RxTarget::Percent(_) => builder::resolve_endpoint(endpoint, &state.master, &state.agent)
+            .map(|resolved| resolved.nic.speed_mbps > 0)
+            .unwrap_or(false),
+    }
+}
+
+fn wifi_band_target(req: &RunRequest, src_band: &str, dst_band: &str) -> Option<f64> {
+    req.wifi_band_thresholds
+        .iter()
+        .find(|rule| {
+            canonical_wifi_band(&rule.src_band) == src_band
+                && canonical_wifi_band(&rule.dst_band) == dst_band
+        })
+        .and_then(|rule| positive_wifi_target(rule.rx_target_mbps))
+}
+
+#[derive(Default)]
+struct WifiBandPairTargets {
+    single_ab: Option<f64>,
+    single_ba: Option<f64>,
+    /// 双向并发下**两端 RX 合计**的门限；与方向无关，所以只有一个数。
+    bidir_total: Option<f64>,
+}
+
+/// 旧项目里按方向填的两个双向门限，迁移成一个合计门限。
+///
+/// 两个方向都填过：合计就是两者之和——这正是老口径下「双向判定通过」所要求
+/// 的总量，换算不改变验收严格程度。只填了一个方向时**不擅自推导**：把 700
+/// 当成合计 700 会凭空放宽一倍，当成 1400 又是凭空收紧，两种都是替用户做决定。
+fn migrate_bidir_pair_to_total(ab: Option<f64>, ba: Option<f64>) -> Option<f64> {
+    match (ab, ba) {
+        (Some(ab), Some(ba)) => Some(ab + ba),
+        _ => None,
+    }
+}
+
+/// 把“主控→辅测/辅测→主控”规则换算成当前 TestSpec 的 AB/BA。
+/// UI 目前生成的跨机 pair 固定是 master→agent，但历史 request.json 不保证顺序，
+/// 所以这里必须看解析后的 Side，不能靠端点字符串猜。
+///
+/// 双向合计与方向无关，两种排列取到的是同一个数。
+fn wifi_band_pair_targets(
+    req: &RunRequest,
+    src: &builder::Endpoint,
+    dst: &builder::Endpoint,
+) -> Option<WifiBandPairTargets> {
+    let (master, agent, src_is_master) = match (src.side, dst.side) {
+        (builder::Side::Master, builder::Side::Agent) => (src, dst, true),
+        (builder::Side::Agent, builder::Side::Master) => (dst, src, false),
+        _ => return None,
+    };
+    let master_band = normalized_wifi_band(&master.nic);
+    let agent_band = normalized_wifi_band(&agent.nic);
+    let rule = req.wifi_band_thresholds.iter().find(|rule| {
+        canonical_wifi_band(&rule.master_band) == master_band
+            && canonical_wifi_band(&rule.agent_band) == agent_band
+    })?;
+    let master_to_agent = positive_wifi_target(rule.rx_target_master_to_agent_mbps);
+    let agent_to_master = positive_wifi_target(rule.rx_target_agent_to_master_mbps);
+    let bidir_total = positive_wifi_target(rule.bidir_total_rx_target_mbps).or_else(|| {
+        migrate_bidir_pair_to_total(
+            positive_wifi_target(rule.bidir_rx_target_master_to_agent_mbps),
+            positive_wifi_target(rule.bidir_rx_target_agent_to_master_mbps),
+        )
+    });
+    Some(if src_is_master {
+        WifiBandPairTargets {
+            single_ab: master_to_agent,
+            single_ba: agent_to_master,
+            bidir_total,
+        }
+    } else {
+        WifiBandPairTargets {
+            single_ab: agent_to_master,
+            single_ba: master_to_agent,
+            bidir_total,
+        }
+    })
+}
+
+/// 这条 spec 在某个方向上**最终**会用哪个门限。
+///
+/// 判断「要不要再兜一层」必须看这个，而不是看某个字段填没填：
+/// `RateTargets::for_direction("ab")` 是 `ab.or(forward)`，所以一条只填了
+/// `forward=1200` 的任务，在 `targets.ab` 为空时看起来「这个方向还没有门限」，
+/// 而 `get_or_insert(700)` 一插进去，`for_direction("ab")` 就改成返回 700——
+/// 任务里显式填的 1200 被一张频段表悄悄推翻，字段却原样躺在那里。
+fn direction_already_targeted(targets: Option<&crate::config::RateTargets>, dir: &str) -> bool {
+    targets.is_some_and(|targets| targets.for_direction(dir).is_some())
+}
+
+/// 按方向补一个兜底门限；该方向**最终解析结果**已经有值时一个字节都不动。
+fn fill_direction_target(spec: &mut TestSpec, dir: &str, value: f64) {
+    if direction_already_targeted(spec.rate_targets_mbps.as_ref(), dir) {
+        return;
+    }
+    let targets = spec
+        .rate_targets_mbps
+        .get_or_insert_with(crate::config::RateTargets::default);
+    match dir {
+        "ab" => targets.ab = Some(value),
+        "ba" => targets.ba = Some(value),
+        _ => {}
+    }
+}
+
+fn apply_wifi_pair_targets(
+    spec: &mut TestSpec,
+    state: &UiState,
+    req: &RunRequest,
+    src: &str,
+    dst: &str,
+) {
+    let Some((src_endpoint, dst_endpoint)) = wifi_endpoints(state, src, dst) else {
+        return;
+    };
+    let src_band = normalized_wifi_band(&src_endpoint.nic);
+    let dst_band = normalized_wifi_band(&dst_endpoint.nic);
+    let band_pair = wifi_band_pair_targets(req, &src_endpoint, &dst_endpoint).unwrap_or_default();
+    // 具体网口规则只保留为旧项目兼容。当前频段组合里填过的方向优先，避免
+    // 用户修改新表后仍被一个看不见的旧覆盖压住。
+    let pair = req
+        .wifi_pair_thresholds
+        .iter()
+        .find(|rule| rule.src_endpoint.trim() == src && rule.dst_endpoint.trim() == dst);
+    // 门限看接收端：AB 方向的接收端是 dst，BA 方向的接收端是 src。
+    let ab_nic_override = nic_rx_override_resolves(state, req, dst);
+    let ba_nic_override = nic_rx_override_resolves(state, req, src);
+
+    // ---- 单向 ----
+    let single_ab = (!ab_nic_override)
+        .then(|| {
+            band_pair
+                .single_ab
+                .or_else(|| pair.and_then(|rule| positive_wifi_target(rule.rx_target_ab_mbps)))
+                .or_else(|| wifi_band_target(req, src_band, dst_band))
+                .or_else(|| positive_wifi_target(req.wifi_pair_rx_target_mbps))
+        })
+        .flatten();
+    let single_ba = (!ba_nic_override)
+        .then(|| {
+            band_pair
+                .single_ba
+                .or_else(|| pair.and_then(|rule| positive_wifi_target(rule.rx_target_ba_mbps)))
+                .or_else(|| wifi_band_target(req, dst_band, src_band))
+                .or_else(|| positive_wifi_target(req.wifi_pair_rx_target_mbps))
+        })
+        .flatten();
+    if let Some(value) = single_ab {
+        fill_direction_target(spec, "ab", value);
+    }
+    if let Some(value) = single_ba {
+        fill_direction_target(spec, "ba", value);
+    }
+
+    // ---- 双向合计 ----
+    //
+    // 任务自己填的合计门限优先，其次频段组合，最后全局 Wi-Fi 合计。
+    // 一个都没有就保持 `None`：双向单元只显示 MEASURED，不伪造 PASS/FAIL。
+    if spec.rate_target_bidir_total_mbps.is_none() {
+        spec.rate_target_bidir_total_mbps = band_pair
+            .bidir_total
+            .or_else(|| {
+                pair.and_then(|rule| {
+                    migrate_bidir_pair_to_total(
+                        positive_wifi_target(rule.bidir_rx_target_ab_mbps),
+                        positive_wifi_target(rule.bidir_rx_target_ba_mbps),
+                    )
+                })
+            })
+            .or_else(|| positive_wifi_target(req.wifi_pair_bidir_total_rx_target_mbps))
+            .or_else(|| {
+                // 旧的「统一每方向双向门限」：两个方向都是同一个数，合计就是两倍。
+                positive_wifi_target(req.wifi_pair_bidir_rx_target_mbps).map(|value| value * 2.0)
+            });
+    }
+}
+
+/// 项目快照钉住的全局门限覆盖本机 `config.json`。
+///
+/// 关键是 `Some(全 null)` 也算数：那是「这个项目明确声明没有全局门限」，
+/// 必须把本机配置里的门限清掉。少了这一步，同一份项目在两台主控上会用各自
+/// 的 `rate_check.targets_mbps`——判定口径静默改变，而报告上看不出来。
+fn apply_global_rate_targets(cfg: &mut Config, req: &RunRequest) {
+    if let Some(targets) = req.global_rate_targets.as_ref() {
+        cfg.iperf.rate_check.targets_mbps = targets.clone();
+    }
+    if let Some(mode) = req.global_rate_mode {
+        cfg.iperf.rate_check.mode = mode;
+    }
+}
+
+/// 项目快照钉住的 UDP 档位覆盖本机 `config.json`。
+///
+/// 只在「三条轴都留空」的路径上起作用——那正是唯一会回落到本机档位表的地方。
+/// 填了轴的请求本来就是自解释的，不需要也不应该被这份列表改写。
+fn apply_pinned_udp_profiles(cfg: &mut Config, req: &RunRequest) {
+    if let Some(profiles) = req.udp_profiles.as_ref() {
+        if !profiles.is_empty() {
+            cfg.iperf.udp_profiles = profiles.clone();
+        }
+    }
+}
+
 pub(super) fn config_from_request(state: &UiState, req: &RunRequest) -> Config {
     if let Some(plan) = req.ui_plan.as_ref() {
         return config_from_ui_plan(state, req, plan);
@@ -130,6 +411,8 @@ pub(super) fn config_from_request(state: &UiState, req: &RunRequest) -> Config {
     cfg.pairs = None;
     cfg.universal_params = None;
     cfg.link_profiles.by_nic.clear();
+    apply_global_rate_targets(&mut cfg, req);
+    apply_pinned_udp_profiles(&mut cfg, req);
     apply_ping_policy_overrides(&mut cfg.ping, req);
 
     let windows = non_empty(&req.tcp_windows, &cfg.iperf.tcp_windows);
@@ -208,7 +491,13 @@ pub(super) fn config_from_request(state: &UiState, req: &RunRequest) -> Config {
         .pairs
         .iter()
         .enumerate()
-        .flat_map(|(idx, pair)| specs_for_pair(idx, pair, req, &sweeps))
+        .flat_map(|(idx, pair)| {
+            let mut specs = specs_for_pair(idx, pair, req, &sweeps);
+            for spec in &mut specs {
+                apply_wifi_pair_targets(spec, state, req, &pair.src, &pair.dst);
+            }
+            specs
+        })
         .collect();
     cfg
 }
@@ -223,6 +512,8 @@ pub(super) fn ui_request_base_config(state: &UiState, req: &RunRequest) -> Confi
     cfg.pairs = None;
     cfg.universal_params = None;
     cfg.link_profiles.by_nic.clear();
+    apply_global_rate_targets(&mut cfg, req);
+    apply_pinned_udp_profiles(&mut cfg, req);
 
     if req.ping_count > 0 {
         cfg.ping.count = req.ping_count;
@@ -494,6 +785,14 @@ pub(super) fn normalized_ui_ips(raw: &[String]) -> Vec<String> {
     out
 }
 
+/// 任务上填的「双向 RX 合计」门限。
+pub(super) fn ui_task_bidir_total(task: &UiTask) -> Option<f64> {
+    parse_rx_target(&task.rx_target_bidir_total)
+        .ok()
+        .flatten()
+        .and_then(rx_target_mbps)
+}
+
 pub(super) fn ui_task_targets(task: &UiTask) -> Option<crate::config::RateTargets> {
     let ab = parse_rx_target(&task.rx_target_bidir_ab)
         .ok()
@@ -587,6 +886,7 @@ pub(super) fn ui_task_base_spec(
         rate_mode: task.rate_mode,
         rate_targets_mbps: task.rate_targets_mbps.clone(),
         rate_targets_bidir_mbps: ui_task_targets(task),
+        rate_target_bidir_total_mbps: ui_task_bidir_total(task),
         link_group: None,
         origin: None,
     }
@@ -847,7 +1147,7 @@ pub(super) fn config_from_ui_plan(state: &UiState, req: &RunRequest, plan: &UiPl
         }
         for pair in pairs {
             for task in &tasks {
-                tests.extend(ui_specs_for_task(
+                let mut pair_tests = ui_specs_for_task(
                     pair,
                     suite,
                     task,
@@ -856,7 +1156,11 @@ pub(super) fn config_from_ui_plan(state: &UiState, req: &RunRequest, plan: &UiPl
                     &cfg,
                     &binding.id,
                     set,
-                ));
+                );
+                for spec in &mut pair_tests {
+                    apply_wifi_pair_targets(spec, state, req, &pair.src, &pair.dst);
+                }
+                tests.extend(pair_tests);
             }
         }
     }
@@ -917,9 +1221,21 @@ pub(super) fn specs_for_pair(
         })
         .filter(|targets| targets.ab.is_some() || targets.ba.is_some());
 
+    let bidir_total = directions
+        .iter()
+        .any(|d| d == "bidir")
+        .then(|| {
+            parse_rx_target(&pair.rx_target_bidir_total)
+                .ok()
+                .flatten()
+                .and_then(rx_target_mbps)
+        })
+        .flatten();
+
     let base = |name: String, transports: Vec<String>| TestSpec {
         name,
         rate_targets_bidir_mbps: bidir_targets.clone(),
+        rate_target_bidir_total_mbps: bidir_total,
         src: pair.src.clone(),
         dst: pair.dst.clone(),
         direction: OneOrMany::Many(directions.clone()),
@@ -1107,6 +1423,19 @@ pub(super) fn nic_profile(policy: &NicPolicySelection) -> Option<crate::config::
         udp_bandwidth: (!bandwidth.is_empty()).then(|| bandwidth.to_string()),
         udp_length: (!length.is_empty()).then(|| length.to_string()),
     })
+}
+
+/// 计划页要显示的「最终门限及来源」。
+///
+/// 双向合计单元额外补一行说明合计门限本身——它挂在单元上，不属于任何一条腿。
+pub(super) fn unit_target_lines(unit: &builder::Unit) -> Vec<String> {
+    let mut lines = unit.target_lines.clone();
+    if let Some(total) = unit.bidir_total_target_mbps {
+        lines.push(format!(
+            "双向判定：AB 接收端 RX + BA 接收端 RX ≥ {total:.0}Mbps"
+        ));
+    }
+    lines
 }
 
 pub(super) fn unit_load_lines(unit: &builder::Unit) -> Vec<String> {

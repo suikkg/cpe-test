@@ -27,6 +27,14 @@ pub(super) struct PairSelection {
     pub(super) rx_target_bidir_ab: String,
     #[serde(default)]
     pub(super) rx_target_bidir_ba: String,
+    /// **双向并发**下「两端 RX 合计」门限（Mbps 或百分比文本）。
+    ///
+    /// 配了它，这个双向单元只按合计判定：`AB 接收端 RX + BA 接收端 RX >= 门限`，
+    /// 两条腿各自只测量。Wi-Fi↔Wi-Fi 抢的是同一段空口时间，要求两个方向各达到
+    /// 一半没有物理依据；用户要验收的是双向并发下这条链路总共还能过多少。
+    /// 留空 = 走上面的每方向门限。
+    #[serde(default)]
+    pub(super) rx_target_bidir_total: String,
     /// 这一行要跑哪几组 UDP 参数。`0` = 默认组，`1..` 指 `RunRequest::udp_groups`
     /// 里的第 n-1 组。空列表 = 只跑默认组（老页面/手写请求不带这个字段时的行为）。
     ///
@@ -111,6 +119,44 @@ pub(super) struct TcpGroup {
     /// 和默认组 `tcp_streams` 留空时一致）。
     #[serde(default)]
     pub(super) streams: Vec<u32>,
+}
+
+/// 一组主控/辅测 Wi-Fi 频段门限。单向与双向并发都按两个方向独立配置。
+///
+/// `src_band`/`dst_band` 与两个无方向值只用于读取 v6.2.2 试验版 request.json；
+/// 新前端只写 `master_band`/`agent_band` 与四个方向值。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub(super) struct WifiBandThreshold {
+    pub(super) master_band: String,
+    pub(super) agent_band: String,
+    pub(super) rx_target_master_to_agent_mbps: f64,
+    pub(super) rx_target_agent_to_master_mbps: f64,
+    /// 双向并发下**两端 RX 合计**的门限。
+    ///
+    /// 取代了曾经的两个「每方向双向门限」：Wi-Fi↔Wi-Fi 抢同一段空口时间，
+    /// 两个方向怎么分完全取决于调度，要求各自达到一半没有物理依据。
+    pub(super) bidir_total_rx_target_mbps: f64,
+    /// 兼容旧版按方向填的双向门限；导入时按两者之和迁移到合计。
+    pub(super) bidir_rx_target_master_to_agent_mbps: f64,
+    pub(super) bidir_rx_target_agent_to_master_mbps: f64,
+    /// 兼容旧版有方向的频段规则。
+    pub(super) src_band: String,
+    pub(super) dst_band: String,
+    pub(super) rx_target_mbps: f64,
+    pub(super) bidir_rx_target_mbps: f64,
+}
+
+/// 兼容旧项目的一对具体 Wi-Fi 网口覆盖；新前端不再创建这类规则。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub(super) struct WifiPairThreshold {
+    pub(super) src_endpoint: String,
+    pub(super) dst_endpoint: String,
+    pub(super) rx_target_ab_mbps: f64,
+    pub(super) rx_target_ba_mbps: f64,
+    pub(super) bidir_rx_target_ab_mbps: f64,
+    pub(super) bidir_rx_target_ba_mbps: f64,
 }
 
 // ---------------------------------------------------------------------------
@@ -209,6 +255,8 @@ pub(super) struct UiTask {
     pub(super) recipe_ids: Vec<String>,
     pub(super) rx_target_bidir_ab: String,
     pub(super) rx_target_bidir_ba: String,
+    /// 双向并发下「两端 RX 合计」门限；配了它这个任务的双向单元只按合计判定。
+    pub(super) rx_target_bidir_total: String,
     pub(super) rate_targets_mbps: Option<crate::config::RateTargets>,
     pub(super) rate_mode: Option<crate::config::RateMode>,
     pub(super) duration: Option<u64>,
@@ -289,10 +337,10 @@ pub(super) struct RunRequest {
     /// 默认组之外的 TCP 参数组。矩阵里 `tcp_group = 1` 指的是这里的第 0 项。
     #[serde(default)]
     pub(super) tcp_groups: Vec<TcpGroup>,
-    /// ping 次数；0 = 沿用配置里的 `ping.count`。
+    /// ping 次数；0 = 不覆盖当前测试配置。
     #[serde(default)]
     pub(super) ping_count: u32,
-    /// ping 包长档位（每个档位单独成一个测试单元）；空 = 沿用 `ping.payload_sizes`。
+    /// ping 包长档位（每个档位单独成一个测试单元）；空 = 不覆盖当前测试配置。
     #[serde(default)]
     pub(super) ping_payload_sizes: Vec<u32>,
     /// 兼容旧前端：有线 small 最大 RTT；0 = 沿用配置。
@@ -326,6 +374,21 @@ pub(super) struct RunRequest {
     pub(super) ping_wifi_large_avg_rtt_ms: f64,
     #[serde(default)]
     pub(super) ping_wifi_large_max_rtt_ms: f64,
+    /// 兼容旧项目：两端都是 Wi-Fi 时的单向 RX 门限。
+    #[serde(default)]
+    pub(super) wifi_pair_rx_target_mbps: f64,
+    /// 兼容旧项目：两端都是 Wi-Fi 且双向并发时的统一门限。
+    #[serde(default)]
+    pub(super) wifi_pair_bidir_rx_target_mbps: f64,
+    /// 全局 Wi-Fi 双向 **RX 合计** 门限；频段表没填时的最后一层兜底。
+    #[serde(default)]
+    pub(super) wifi_pair_bidir_total_rx_target_mbps: f64,
+    /// 按主控频段 × 辅测频段配置的四向 Wi-Fi 门限。
+    #[serde(default)]
+    pub(super) wifi_band_thresholds: Vec<WifiBandThreshold>,
+    /// 兼容旧项目的具体主控/辅测网口对门限；新前端不再创建。
+    #[serde(default)]
+    pub(super) wifi_pair_thresholds: Vec<WifiPairThreshold>,
     /// 是否按整条路径的可信上限裁剪 UDP `-b`。
     #[serde(default)]
     pub(super) limit_udp_by_link_speed: bool,
@@ -337,6 +400,31 @@ pub(super) struct RunRequest {
     /// New suite-plan request.  It is mutually exclusive with legacy `pairs`.
     #[serde(default)]
     pub(super) ui_plan: Option<UiPlan>,
+    /// 项目快照钉住的 UDP 档位**原样列表**。
+    ///
+    /// 为什么不能只钉「带宽/长度/窗口」三条轴：三条轴是**叉乘**语义，而主控
+    /// `config.json` 里的档位是逐条列出来的——内置基线里只有 `1000m` 带 `-l 64`，
+    /// 其余四档不带。把它还原成三条轴再叉乘，会变成五档全带 `-l 64`，
+    /// 灌包条件当场就变了。要「导出真正生效的值」，这里就得是原样列表。
+    ///
+    /// `None` = 请求没有意见，沿用本机 `config.json`。
+    #[serde(default)]
+    pub(super) udp_profiles: Option<Vec<crate::config::UdpProfile>>,
+    /// 项目快照钉住的判定模式（`auto` / `verify` / `observe` / `discover`）。
+    ///
+    /// 它和全局门限是一对：`observe` 只记录实测能力、不判 PASS/FAIL，`verify`
+    /// 没有门限时直接 `TARGET_MISSING`。界面上没有这个开关，但主控
+    /// `config.json` 里配的是哪个，直接决定这一轮出不出 PASS——不带走它，
+    /// 换台机器同一份项目可能整轮都是 MEASURED。
+    #[serde(default)]
+    pub(super) global_rate_mode: Option<crate::config::RateMode>,
+    /// 项目快照钉住的**全局** RX 门限。
+    ///
+    /// `None` = 请求没有意见，沿用本机 `config.json`（老页面、手写请求）。
+    /// `Some(..)` = 项目明确声明过，**包括三个字段全为 null 的「明确没有全局
+    /// 门限」**——那正是「导入后不许回落到目标主控机默认值」这条要求的落点。
+    #[serde(default)]
+    pub(super) global_rate_targets: Option<crate::config::RateTargets>,
     /// Optional hash returned by `/api/plan`; checked by `/api/run`.
     #[serde(default)]
     pub(super) plan_hash: Option<String>,
@@ -388,6 +476,17 @@ pub(super) struct BootstrapOut {
     pub(super) ping_wifi_medium_max_rtt_ms: f64,
     pub(super) ping_wifi_large_avg_rtt_ms: f64,
     pub(super) ping_wifi_large_max_rtt_ms: f64,
+    /// 主控 `config.json` 里当前生效的**全局** RX 门限。
+    ///
+    /// 界面上没有对应输入框，但它照样参与判定：导出项目时必须把这一份写进
+    /// 快照，否则同一个项目在另一台主控上会改用那台机器的门限，
+    /// 「怎么判定」静默变了（`RunRequest::global_rate_targets`）。
+    pub(super) rate_targets_mbps: crate::config::RateTargets,
+    /// 主控当前生效的判定模式；导出项目时按它固化。
+    pub(super) rate_mode: crate::config::RateMode,
+    /// 主控当前生效的 UDP 档位原样列表；导出项目时按它固化，见
+    /// [`RunRequest::udp_profiles`]。
+    pub(super) udp_profiles: Vec<crate::config::UdpProfile>,
     pub(super) screenshot: bool,
     /// Feature flag for pages that can send the suite-oriented `ui_plan` DTO.
     pub(super) ui_plan_supported: bool,
@@ -410,6 +509,11 @@ pub(super) struct PlannedUnit {
     pub(super) resumed: bool,
     /// 这个单元每条腿**最终**下发的参数。
     pub(super) load: Vec<String>,
+    /// 这个单元每条腿**最终**按什么门限判、门限来自哪一层。
+    ///
+    /// 「字段还在、实际却被另一条规则盖掉」光看请求体看不出来，所以预览必须
+    /// 直接把最终数字和来源摆出来。
+    pub(super) targets: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]

@@ -24,6 +24,23 @@ pub(super) fn push_resume_field(identity: &mut String, name: &str, value: &str) 
     identity.push_str(value);
 }
 
+/// 双向 RX 合计门限进 resume identity。
+///
+/// 必须显式记：配了合计门限的双向腿 `rx_target_mbps` 是 `None`，
+/// 那条既有的「门限变了 identity 就变」的通路在这里断了——不记的话，把合计
+/// 从 900 改成 1200 之后 resume 会拿按 900 判过的 PASS 顶掉这一轮。
+///
+/// 只在**有值**时写入：没用这个功能的配置 identity 一个字节都不变，
+/// 不会让所有人的 resume 缓存白清一次。
+pub(super) fn push_bidir_total_identity(identity: &mut String, direction: &str, spec: &SpecNorm) {
+    if direction != "bidir" {
+        return;
+    }
+    if let Some(total) = spec.rate_target_bidir_total {
+        push_resume_field(identity, "bidir_total_target", &f64_identity(total));
+    }
+}
+
 pub(super) fn rate_mode_identity(mode: RateMode) -> &'static str {
     match mode {
         RateMode::Auto => "auto",
@@ -236,6 +253,7 @@ pub(super) fn udp_resume_unit_id_with_schema(
         rate_mode_identity(spec.rate_mode),
     );
     push_rate_targets_identity(&mut identity, "scenario_targets", &spec.rate_targets);
+    push_bidir_total_identity(&mut identity, direction, spec);
     push_rate_check_identity(&mut identity, &spec.rate_check);
     push_endpoint_identity(&mut identity, "spec.src", &spec.src);
     push_endpoint_identity(&mut identity, "spec.dst", &spec.dst);
@@ -317,6 +335,7 @@ pub(super) fn tcp_resume_unit_id_v2(
         rate_mode_identity(spec.rate_mode),
     );
     push_rate_targets_identity(&mut identity, "scenario_targets", &spec.rate_targets);
+    push_bidir_total_identity(&mut identity, direction, spec);
     push_rate_check_identity(&mut identity, &spec.rate_check);
     push_endpoint_identity(&mut identity, "spec.src", &spec.src);
     push_endpoint_identity(&mut identity, "spec.dst", &spec.dst);
@@ -412,6 +431,7 @@ pub(super) fn cts_resume_unit_id_with_schema(
         rate_mode_identity(spec.rate_mode),
     );
     push_rate_targets_identity(&mut identity, "scenario_targets", &spec.rate_targets);
+    push_bidir_total_identity(&mut identity, direction, spec);
     push_rate_check_identity(&mut identity, &spec.rate_check);
     push_resume_field(&mut identity, "leg_count", &legs.len().to_string());
     for (index, leg) in legs.iter().enumerate() {

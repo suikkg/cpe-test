@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { onMounted, ref } from 'vue';
-import { api, downloadQuery } from '../../api/client';
+import { api, downloadQuery, errorMessage } from '../../api/client';
 import type { ReplayOut, RunEntry, RunRequestOut } from '../../api/dto';
 import { adoptRunRequest, preview } from '../../state/plan';
 import { goto } from '../../state/ui';
@@ -31,7 +31,7 @@ async function load(): Promise<void> {
   try {
     entries.value = await api.get<RunEntry[]>('/api/runs');
   } catch (e) {
-    error.value = e instanceof Error ? e.message : String(e);
+    error.value = errorMessage(e);
   } finally {
     loading.value = false;
   }
@@ -89,7 +89,7 @@ async function replay(entry: RunEntry): Promise<void> {
     notice.value = parts.join('；');
     await load();
   } catch (e) {
-    error.value = e instanceof Error ? e.message : String(e);
+    error.value = errorMessage(e);
   } finally {
     busy.value = '';
   }
@@ -116,7 +116,7 @@ async function rerun(entry: RunEntry): Promise<void> {
     // 装载完立刻预览一次：拓扑变了要当场看见，而不是等人点了「开始」才被拒。
     await preview();
   } catch (e) {
-    error.value = e instanceof Error ? e.message : String(e);
+    error.value = errorMessage(e);
   } finally {
     busy.value = '';
   }
