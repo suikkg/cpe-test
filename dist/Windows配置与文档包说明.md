@@ -1,13 +1,13 @@
-# cpe_test v6.2.5 Windows 配置与文档包
+# cpe_test v6.2.6 Windows 配置与文档包
 
-仓库中的 `cpe_test-v6.2.5-windows-config-docs.zip` 是便于从 Git 直接下载的
+仓库中的 `cpe_test-v6.2.6-windows-config-docs.zip` 是便于从 Git 直接下载的
 Windows 配置、说明文档和启动脚本资料包。包内文件由仓库当前版本生成，并由 CI
 逐文件与源码副本比对，避免配置或文档过期。
 
 这个资料包**不包含可执行程序或吞吐工具**：
 
 - 不包含 `cpe_test.exe`；请从 GitHub Release 下载正式
-  `cpe_test-v6.2.5-windows-x86_64.zip`，或自行编译。
+  `cpe_test-v6.2.6-windows-x86_64.zip`，或自行编译。
 - 不包含 `ctsTraffic.exe`；正式 Windows Release ZIP 会捆绑固定并校验过的
   Microsoft ctsTraffic 2.0.4.0 x64。
 - 不包含 `iperf3.exe` 及其 DLL；需要 iperf3 测试时，请放入完整的 Windows
@@ -27,6 +27,22 @@ Windows 配置、说明文档和启动脚本资料包。包内文件由仓库当
   换一台主控导入不会改判定口径。Wi-Fi 门限按实际频段组合保存两个单向门限和一个双向 RX 合计门限。
 - `start_ui.bat`（图形控制台）、`start_agent.bat`、`start_master.bat`、`start_master_select_config.bat`。
 - iperf3/ctsTraffic 放置说明、MIT 许可证和第三方声明。
+
+## v6.2.6 行为要点
+
+- **判定窗口不再被 socket 缓冲拖偏**：`-w` 开大时（配方默认的 `-w 256m -P 10` = 2.56GB
+  缓冲），iperf3 的 `-t` 到点后还要 5~14 秒排空，以前判定窗口会整体后移那么多秒——
+  掐掉开头的高速段、把结尾没有流量的尾巴收进来。现在窗口按 iperf3 自己的测量时钟定位，
+  和排空时间无关。由此消掉三类误报：RX 平均被压低（实测最多低 32%）、末尾计数器零增长
+  凑成 `COUNTER_STALLED` 让整条腿判 `NOT_EVALUATED`、窗口尾巴被报成 `RX_OUTAGE`「断流」。
+- **门限超过链路物理上限时自动折算**：门限一直只看接收端，于是 1G 口做发送口、门限却取
+  接收口的 1800/2000 时，哪怕跑到 1G 线速也永远是 `RATE_FAIL`。现在按
+  `min(门限, 路径上限 × 95%)` 判，并在计划提示里写出算式。系数是
+  `rate_check.rx_target_link_speed_ratio`，设 0 关掉这道封顶。
+- **配了双向 RX 合计门限时会提示「逐方向门限已被它盖掉」**：判定口径不变（仍然只比一次
+  合计，两条腿只测量），但两处配置同时存在时，现在能在计划阶段当场看出哪一处生效。
+- **报告文案两处更正**：掉坑/断流诊断不再对不达标的行说「平均值已达标」；越界起点改成
+  窗口内的相对秒数（以前印的是绝对时刻，会出现「60 秒窗口的第 69.6 秒」）。判定不受影响。
 
 ## v6.2.4 行为要点
 

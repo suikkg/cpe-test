@@ -2,6 +2,15 @@
 
 > 两台电脑间自动化 ping + iperf3 / Microsoft ctsTraffic 灌包测试，零 Python/零 PowerShell
 
+## v6.2.6
+
+- **判定窗口锚在 iperf3 自己的测量时钟上，不再锚在汇总行的到达时刻**：以前只取汇总行的**行内时长**，起点却按这一行**到达的时刻**倒推。`-w` 开大时（配方默认的 `-w 256m -P 10` = 2.56GB socket 缓冲），client 的 `-t` 到点后还要 5~14 秒排空缓冲，汇总行压在排空之后才吐出来，窗口就整体后移那么多秒——掐掉开头的高速段、把结尾没有流量的尾巴收进来。现在改用两条时钟的偏移定位：每条 interval 行的「到达时刻 − 行内区间终点」都是偏移的一个上界（到达只会被推迟、不会提前），取最小值即最紧的估计。末尾几行连同汇总行成块吐出时不受影响；老版 iperf3 无 `--forceflush`、全部成块到达时自动退回旧口径。
+- **由此消掉的三类误报**：拿 run_20260905_125327_5940 的 80 条灌包腿回放，窗口平均前移 1.0 秒（最大 13.4 秒）。一条腿的 RX 平均从被压低的 705.1Mbps 回到 1036.0（iperf3 自报接收端 1017）；假 `COUNTER_STALLED` 1 → 0（窗口越过流量末端，末尾 3 秒计数器零增长凑够 5%，整条腿本来被判成 `NOT_EVALUATED`）；假 `RX_OUTAGE`「断流」2 → 0（越界段全落在窗口尾巴上，链路并没有断）。
+- **RX 门限按路径上限封顶**（新增 `rate_check.rx_target_link_speed_ratio`，默认 0.95，设 0 关掉）：门限一直只看接收端（「门限看接收端，带宽看发送端」），于是发送口比接收口慢的组合会拿到物理上跑不到的门限——1G 口做发送口、门限却取收口策略的 1800/2000，实测 934~984Mbps（就是 1G 线速）全判 `RATE_FAIL`，那是门限配错了，不是设备不达标。上限取仓库既有的 role 表（`rate::path_payload_ceiling_mbps`）而不是协商速率：10GUSB(NCM) 报的 4.2G 是已知的驱动显示问题，照它封顶会把 EVB 那条 6400Mbps 的已知目标压成 3990，凭空制造一批 PASS。压过就在计划提示里报出算式。
+- **双向 RX 合计门限盖掉逐方向门限时给出计划提示**：判定优先级不变（合计仍然优先，两条腿只测量），但「套件里写了 ab/ba 各 900、频段表里一条 `bidir_total = 900` 把它们整个吞掉」这件事以前完全无声——两处配置都在，报告上看不出是哪一处生效了。
+- **修正两处会让报告自相矛盾的文案**：掉坑/断流诊断尾巴那句「平均值已达标，故不改写判定」是写死的，从不检查平均值到底达没达标，那一轮 116 条诊断有 110 条挂在非 PASS 行上，和同一行的「网卡 RX 平均 948.658Mbps 低于目标 1800.000Mbps」正面打架；越界起点印的是监控起点的**绝对时刻**，文案却写成「自判定窗口第 X 秒起」，于是出现「60 秒窗口的第 69.6 秒」这种窗口里根本不存在的时刻。两处都按本行实际数据改正，判定不受影响。
+- **回归验证**：Rust 639/639、前端 Vitest 199/199、格式检查、Linux/Windows Clippy、前端产物溯源戳、dist 配置文档包 SHA-256 与 22 项逐条比对全部通过。
+
 ## v6.2.5
 
 - **吞吐判定只认接收端 RX 平均（三条路径收敛）**：TCP / UDP / ctsTraffic 收敛到唯一入口 `evaluate_rx_acceptance`，四种结果封闭。形成可信 RX 平均后 `RX ≥ 门限` 直接 PASS；UDP 丢包 / CTS 丢帧、发送端负载与采样覆盖率、滚动窗口、中途掉速、工具退出状态一律降为「诊断（不参与判定）」，报告每行和 Excel 两张表都看得到，但不再推翻 PASS。
@@ -553,7 +562,7 @@ CPE（Customer Premises Equipment）子网测试工具用于在**两台电脑之
 ```
 cpe_test.exe          ← 本工具（单文件）
 iperf3.exe            ← 从 iperf.fr 下载（只测 Ping/ctsTraffic 可不放）
-ctsTraffic.exe        ← v6.2.5 Windows Release 已捆绑（仅 Windows 10+）
+ctsTraffic.exe        ← v6.2.6 Windows Release 已捆绑（仅 Windows 10+）
 start_agent.bat       ← 辅测机双击
 start_ui.bat          ← 主控机双击（图形控制台，推荐）
 start_master.bat      ← 主控机双击（命令行问答式）
@@ -1350,7 +1359,7 @@ cargo build --release --locked
 
 自行编译后，把 `cpe_test.exe`、启动脚本和所需吞吐工具放到两台 Windows 电脑同一目录：
 iperf3 测试需要完整的 iperf3 Windows 发行包；ctsTraffic 测试需要 `ctsTraffic.exe`。
-官方 v6.2.5 Windows Release ZIP 已捆绑固定且校验过的 ctsTraffic 2.0.4.0，但由于发行包差异不内置 iperf3。
+官方 v6.2.6 Windows Release ZIP 已捆绑固定且校验过的 ctsTraffic 2.0.4.0，但由于发行包差异不内置 iperf3。
 
 ### GitHub Actions CI
 
@@ -1373,7 +1382,7 @@ Windows ZIP 包含启动脚本、四份配置、固定 CTS 二进制和第三方
 `tar.gz` 保留 `cpe_test` 可执行位。发布作业会再次核对资产名称、数量、内部结构和哈希。
 
 仓库同时跟踪一份不含可执行程序的
-[`cpe_test-v6.2.5-windows-config-docs.zip`](dist/cpe_test-v6.2.5-windows-config-docs.zip)，
+[`cpe_test-v6.2.6-windows-config-docs.zip`](dist/cpe_test-v6.2.6-windows-config-docs.zip)，
 便于直接从 Git 下载 Windows 配置、文档和启动脚本。其 SHA-256 位于同目录的
 `.zip.sha256` 文件；CI 会逐文件确认压缩包内容与仓库源文件一致。需要开箱即用的程序、
 固定版 ctsTraffic 和许可证全集时，仍应下载上面的正式 Windows Release ZIP。
