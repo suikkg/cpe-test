@@ -175,6 +175,30 @@ pub(super) fn iperf_baseline_cutoff_ms<'a>(
         .unwrap_or(0)
 }
 
+/// iperf3 自己的测量时钟相对监控时钟的偏移：iperf 的 `t=0` 落在监控的第几毫秒。
+///
+/// 每条 interval 行都带两个时刻：行内区间终点（iperf 自己的测量时钟）和事件
+/// 到达时刻（监控时钟）。两者之差就是偏移的一个估计。到达**只会被推迟、
+/// 不会提前**（stdout 缓冲、线程调度、进程排空缓冲期间的停顿都只加不减），
+/// 所以每个估计都是偏移的上界，**取最小值**就是最紧的那个上界。
+///
+/// 取最小值同时也是这段代码的抗扰点：`-w` 开大时，末尾几行连同汇总行会在
+/// 排空结束后成块吐出，那几条的估计会比真值大十几秒；只要前面有任何一条
+/// 按时到达的逐秒行，最小值就不受影响。全部成块到达（老版 iperf3 无
+/// `--forceflush`）时，最小值退化成「汇总行到达时刻 − 行内终点」，与旧口径
+/// 一致——不会更好，但也不会更差。
+fn iperf_clock_offset_ms(traffic_events: &[&IperfFlowEvent]) -> Option<u64> {
+    traffic_events
+        .iter()
+        .filter_map(|event| {
+            let (_, line_end_ms) = iperf_interval_ms(&event.line)?;
+            // 到达早于行内终点只可能是解析到了不属于本次测量的行；宁可丢掉
+            // 这个估计，也不能让它把偏移拉成负数再饱和成 0。
+            event.elapsed_ms.checked_sub(line_end_ms)
+        })
+        .min()
+}
+
 pub(super) fn iperf_active_interval(
     events: &[IperfFlowEvent],
     required_secs: u64,
@@ -228,16 +252,41 @@ pub(super) fn iperf_active_interval(
     // 「共同有效窗口不足」判定。若因为“不够长”而丢弃它，回退项反而是更长的
     // client 进程寿命（含 startup/settle/退出收尾），会把一次只测到 175 秒的
     // 短测量补成完整 180 秒窗口，并把启动爬升算进 RX 平均。
+    let clock_offset_ms = iperf_clock_offset_ms(&traffic_events);
     let reported_interval = traffic_events
         .iter()
         .filter_map(|event| {
-            iperf_interval_ms(&event.line)
-                .map(|(start_ms, end_ms)| (end_ms.saturating_sub(start_ms), event.elapsed_ms))
+            iperf_interval_ms(&event.line).map(|(line_start_ms, line_end_ms)| {
+                (
+                    line_end_ms.saturating_sub(line_start_ms),
+                    event.elapsed_ms,
+                    line_start_ms,
+                    line_end_ms,
+                )
+            })
         })
         // 最终汇总行覆盖的区间最长，正常也最后到达；按时长优先排序，避免
         // 逐秒 interval 行恰好排在汇总行之后时被当成整段测量。
-        .max_by_key(|(duration_ms, event_elapsed_ms)| (*duration_ms, *event_elapsed_ms));
-    if let Some((duration_ms, event_elapsed_ms)) = reported_interval {
+        .max_by_key(|(duration_ms, event_elapsed_ms, _, _)| (*duration_ms, *event_elapsed_ms));
+    if let Some((duration_ms, event_elapsed_ms, line_start_ms, line_end_ms)) = reported_interval {
+        // 首选：把行内区间按两条时钟的偏移投影回监控时间轴。
+        //
+        // 只用行内**时长**、拿汇总行的到达时刻当锚点是不行的：`-w` 开大时
+        // client 的 `-t` 到点后还要几秒到十几秒排空 socket 缓冲，汇总行压在
+        // 排空之后才吐出来，整个窗口就跟着后移那么多秒——掐掉开头的高速段、
+        // 把结尾没有流量的尾巴收进来。run_20260905_125327_5940 的 unit-112
+        // 后移 12.4 秒，RX 平均从 1036 被压到 705；unit-113 更是让窗口越过
+        // 流量末端，末尾 3 秒零增长凑够 5%，整条腿判成 COUNTER_STALLED。
+        if let Some(offset_ms) = clock_offset_ms {
+            let start = offset_ms.saturating_add(line_start_ms).max(attempt_floor);
+            let measured_end = offset_ms.saturating_add(line_end_ms).min(end);
+            if measured_end > start {
+                return Some((start, measured_end));
+            }
+        }
+        // 退化路径：一条 interval 行都对不出偏移（老版 iperf3 在退出时才一次性
+        // 吐出全部输出）。此时只剩到达时刻可用，行为与 v6.2.5 及以前一致。
+        //
         // 最终汇总行已经证明吞吐测量结束；它之后到 Ended 之间只剩
         // child wait、stdout reader join 等退出收尾，不能纳入网卡平均。
         let measured_end = event_elapsed_ms.min(end);

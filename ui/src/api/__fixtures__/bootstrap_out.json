@@ -26,6 +26,7 @@
         "min_concurrent_streams": 2,
         "mode": "auto",
         "offered_headroom_pct": 5.0,
+        "rx_target_link_speed_ratio": 0.95,
         "sample_interval_ms": 1000,
         "settle_secs": 5,
         "startup_timeout_secs": 15,

@@ -47,6 +47,65 @@ pub fn path_payload_ceiling_mbps(src: &NicInfo, dst: &NicInfo, cfg: &RateCheckCf
     }
 }
 
+/// 这条 (src -> dst) 的 RX 门限**物理上**不可能超过的数。
+///
+/// 复用 [`path_payload_ceiling_mbps`] 那张按 role 的表，而不是直接拿协商速率：
+/// 协商速率并不总是可用载荷的上界。10GUSB(NCM) 报的 4.2G 是**已知的驱动显示
+/// 问题**，那块口跑的是 10G；照 4.2G 封顶会把 EVB 那条 6400Mbps 的已知目标
+/// 压成 3990，凭空制造一批 PASS。那张表就是全仓对「这块口能扛多少」的答案，
+/// 封顶必须问它，不能另起一套。
+///
+/// Wi-Fi 在表里取的是固定 PHY 峰值（2882）而不是抖动的协商速率，所以这条线
+/// 落在 2738：比任何现实的 Wi-Fi 门限都高，不会把真实不达标洗成 PASS，
+/// 又能拦住「给 Wi-Fi 口配一个超过 PHY 峰值的门限」。
+pub fn rx_target_ceiling_mbps(src: &NicInfo, dst: &NicInfo, cfg: &RateCheckCfg) -> Option<f64> {
+    let ratio = cfg.rx_target_link_speed_ratio;
+    if !ratio.is_finite() || ratio <= 0.0 {
+        return None;
+    }
+    let ceiling = path_payload_ceiling_mbps(src, dst, cfg)? * ratio;
+    ceiling.is_finite().then_some(ceiling)
+}
+
+/// 把一条腿的 RX 门限压到这条链路物理上能达到的范围内。
+///
+/// 返回 `(生效门限, 算式说明)`；没压到就返回原值和 `None`。说明必须跟着走：
+/// 报告上「门限 950」和配置里「门限 1800」对不上时，看的人要能当场知道是
+/// 谁改的、按什么改的。
+pub fn cap_rx_target_to_link_speed(
+    target_mbps: Option<f64>,
+    src: &NicInfo,
+    dst: &NicInfo,
+    cfg: &RateCheckCfg,
+) -> (Option<f64>, Option<String>) {
+    let Some(target) = target_mbps.filter(|value| value.is_finite() && *value > 0.0) else {
+        return (target_mbps, None);
+    };
+    let Some(ceiling) = rx_target_ceiling_mbps(src, dst, cfg) else {
+        return (target_mbps, None);
+    };
+    if target <= ceiling {
+        return (target_mbps, None);
+    }
+    // 报出的是**这条路径上更窄的那一端**：读的人要改的就是那块口的配置。
+    let slower = [src, dst]
+        .into_iter()
+        .filter_map(|nic| nic_payload_ceiling_mbps(nic, cfg).map(|cap| (nic, cap)))
+        .min_by(|a, b| a.1.total_cmp(&b.1));
+    let where_from = match slower {
+        Some((nic, cap)) => format!("{} 上限 {cap:.0}Mbps", nic.name),
+        None => "本条路径上限".into(),
+    };
+    (
+        Some(ceiling),
+        Some(format!(
+            "门限 {target:.0}Mbps 超过这条链路的物理上限（{where_from}）；\
+             本条按 {:.0}% 折算到 {ceiling:.0}Mbps 判定",
+            cfg.rx_target_link_speed_ratio * 100.0
+        )),
+    )
+}
+
 pub fn auto_evb_target_mbps(src: &NicInfo, dst: &NicInfo, cfg: &RateCheckCfg) -> Option<f64> {
     let src_role = src.role.to_ascii_uppercase();
     let dst_role = dst.role.to_ascii_uppercase();

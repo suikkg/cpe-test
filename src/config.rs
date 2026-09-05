@@ -326,6 +326,23 @@ pub struct RateCheckCfg {
     /// 实际能力裁，在 `link_profiles` 里给那块网卡明确配 `-b`——明确配过的链路
     /// 不受本上限影响，那是操作者的判断，安全网不该推翻它。
     pub wifi_24g_payload_ceiling_mbps: f64,
+    /// RX 门限相对**协商速率**的封顶系数；0 或负数 = 关掉这道封顶。
+    ///
+    /// 门限一直只看接收端（`rate::resolve_link_policy` 的「门限看接收端，
+    /// 带宽看发送端」），于是发送口比接收口慢的组合会拿到一个物理上跑不到的
+    /// 门限：run_20260905_125327_5940 里 `以太网 6`（协商 1000Mbps）做发送口、
+    /// 门限取的是收口策略的 1800/2000，16 个单元实测 934~984（就是 1G 线速）
+    /// 全判 RATE_FAIL——那是配置错误，不是设备缺陷。
+    ///
+    /// 封顶只能用**协商速率**，不能用 `nic_payload_ceiling_mbps`：后者对 Wi-Fi
+    /// 返回的是固定档位（2882），拿它封顶会把 Wi-Fi 口上合理的高门限一起压低，
+    /// 把真实不达标洗成 PASS。协商速率则永远是可用载荷的上界——它只可能删掉
+    /// 本来就达不到的门限，不可能放过任何一条真的没跑到的链路。
+    ///
+    /// 默认 0.95：GbE 上 1518/1538 的成帧开销约 1.3%，再留一点余量。取值偏
+    /// 保守是有意的——这条线的作用是拦住「门限比线速还高」，不是替操作者
+    /// 决定「跑到线速的百分之几才算合格」。
+    pub rx_target_link_speed_ratio: f64,
     pub max_udp_loss_pct: Option<f64>,
 }
 
@@ -349,6 +366,7 @@ impl Default for RateCheckCfg {
             cpe_path_ceiling_mbps: 2600.0,
             wifi_payload_ceiling_mbps: 2882.0,
             wifi_24g_payload_ceiling_mbps: 574.0,
+            rx_target_link_speed_ratio: 0.95,
             max_udp_loss_pct: None,
         }
     }

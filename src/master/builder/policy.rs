@@ -126,11 +126,33 @@ impl RxTargetSource {
     }
 }
 
-/// 这一腿要用的 `(判定模式, RX 门限, 门限来源)`。
+/// 这一腿最终的判定参数。
+///
+/// 单独成结构而不是元组，是因为它有四件必须一起读的事：门限、门限的来源、
+/// 判定模式，以及**这个门限有没有被改写过**。少读最后一条，报告上就会出现
+/// 「配置里 1800、判定按 950」而没人说得清是谁改的。
+#[derive(Debug, Clone)]
+pub(super) struct LegRatePlan {
+    pub mode: RateMode,
+    pub target_mbps: Option<f64>,
+    pub source: RxTargetSource,
+    /// 「最终判定用的门限，为什么不是你在配置里填的那个」。
+    ///
+    /// 只装这一类话：被路径上限折算了、被合计门限盖掉了。这类改写不说出来
+    /// 就是无声的——配置里的字段原样躺着，报告里印的却是另一个数，而两边
+    /// 都不会提示读的人去看另一边。
+    pub notes: Vec<String>,
+}
+
+/// 这一腿要用的判定参数。
 ///
 /// 单独包一层的理由是「配了合计门限的双向腿」必须同时改两件事：门限清空，
 /// **并且**模式落到 `Observe`。只清门限的话，显式配 `verify` 的用户会拿到
 /// 一整轮 `NOT_EVALUATED / TARGET_MISSING`——腿本来就不该有目标，这不是缺配置。
+///
+/// 协商速率封顶也收在这里，而不是散在四个调用点：它是**全仓唯一**一处把
+/// 「配置里的门限」换算成「实际判定的门限」的地方，多一处就会有一条腿按
+/// 未封顶的值判。
 pub(super) fn leg_rate_plan(
     spec: &SpecNorm,
     policy: &rate::LinkPolicy,
@@ -138,9 +160,39 @@ pub(super) fn leg_rate_plan(
     bidir: bool,
     src: &NicInfo,
     dst: &NicInfo,
-) -> (RateMode, Option<f64>, RxTargetSource) {
-    if bidir && spec.rate_target_bidir_total.is_some() {
-        return (RateMode::Observe, None, RxTargetSource::BidirTotal);
+) -> LegRatePlan {
+    let capped = |target: Option<f64>, source: RxTargetSource| {
+        let (target_mbps, cap_note) =
+            rate::cap_rx_target_to_link_speed(target, src, dst, &spec.rate_check);
+        LegRatePlan {
+            mode: rate::effective_mode(spec.rate_mode, target_mbps),
+            target_mbps,
+            source,
+            notes: cap_note.into_iter().collect(),
+        }
+    };
+    if let Some(total) = spec.rate_target_bidir_total.filter(|_| bidir) {
+        // 合计门限继续优先——判定口径不变。但它把两条腿的门限清空这件事必须
+        // 说出来：run_20260905_125327_5940 里套件明明写了 ab/ba 各 900Mbps，
+        // 频段表里一条 `bidir_total = 900` 就把它们整个吞掉，单元按
+        // 「AB + BA ≥ 900」判成 PASS（522.9 + 440.5 = 963.4），而逐方向判的话
+        // 两条腿都不达标。两处配置都在，报告上却看不出是哪一处生效了。
+        let shadowed = spec
+            .rate_targets_bidir
+            .for_direction(flow_direction)
+            .map(|per_direction| {
+                format!(
+                    "双向 RX 合计门限 {total:.0}Mbps 已盖掉逐方向门限 {flow_direction} \
+                     {per_direction:.0}Mbps：本单元只比一次合计，两条腿各自不再判定。\
+                     要逐方向把关，请清掉合计门限。"
+                )
+            });
+        return LegRatePlan {
+            mode: RateMode::Observe,
+            target_mbps: None,
+            source: RxTargetSource::BidirTotal,
+            notes: shadowed.into_iter().collect(),
+        };
     }
     if bidir
         && spec
@@ -149,11 +201,7 @@ pub(super) fn leg_rate_plan(
             .is_some()
     {
         let target = leg_rx_target(spec, policy, flow_direction, bidir, src, dst);
-        return (
-            rate::effective_mode(spec.rate_mode, target),
-            target,
-            RxTargetSource::BidirDirection,
-        );
+        return capped(target, RxTargetSource::BidirDirection);
     }
     let target = leg_rx_target(spec, policy, flow_direction, bidir, src, dst);
     let source = if policy.rx_target_mbps.is_some() {
@@ -165,7 +213,22 @@ pub(super) fn leg_rate_plan(
     } else {
         RxTargetSource::None
     };
-    (rate::effective_mode(spec.rate_mode, target), target, source)
+    capped(target, source)
+}
+
+/// 把「最终门限为什么不是配置里那个」作为计划提示说出来（每条只说一次）。
+pub(super) fn note_target_cap(
+    notices: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+    spec_name: &str,
+    plan: &LegRatePlan,
+) {
+    for note in &plan.notes {
+        let line = format!("{spec_name}：{note}");
+        if seen.insert(line.clone()) {
+            notices.push(line);
+        }
+    }
 }
 
 /// `-w × 流数` 大到这条链路要花多少秒才排空；超过它就提示。

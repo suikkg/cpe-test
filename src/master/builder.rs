@@ -808,7 +808,7 @@ pub fn build_units(
                                             &spec.name,
                                             &leg_policy,
                                         );
-                                        let (effective_mode, target, target_source) = leg_rate_plan(
+                                        let rate_plan = leg_rate_plan(
                                             spec,
                                             &leg_policy,
                                             &flow_direction,
@@ -816,10 +816,18 @@ pub fn build_units(
                                             &s.nic,
                                             &d.nic,
                                         );
+                                        note_target_cap(
+                                            &mut notices,
+                                            &mut rx_target_notes,
+                                            &spec.name,
+                                            &rate_plan,
+                                        );
+                                        let (effective_mode, target) =
+                                            (rate_plan.mode, rate_plan.target_mbps);
                                         target_lines.push(target_line(
                                             &flow_direction,
                                             target,
-                                            target_source,
+                                            rate_plan.source,
                                         ));
                                         let t = IperfTask {
                                             v6,
@@ -1002,7 +1010,7 @@ pub fn build_units(
                                             &spec.name,
                                             &leg_policy,
                                         );
-                                        let (effective_mode, target, target_source) = leg_rate_plan(
+                                        let rate_plan = leg_rate_plan(
                                             spec,
                                             &leg_policy,
                                             &flow_direction,
@@ -1010,10 +1018,18 @@ pub fn build_units(
                                             &s.nic,
                                             &d.nic,
                                         );
+                                        note_target_cap(
+                                            &mut notices,
+                                            &mut rx_target_notes,
+                                            &spec.name,
+                                            &rate_plan,
+                                        );
+                                        let (effective_mode, target) =
+                                            (rate_plan.mode, rate_plan.target_mbps);
                                         target_lines.push(target_line(
                                             &flow_direction,
                                             target,
-                                            target_source,
+                                            rate_plan.source,
                                         ));
                                         // offered 必须跟着实际下发的 -b 走，否则
                                         // 报表里的「请求负载」和命令行对不上。
@@ -1222,7 +1238,7 @@ pub fn build_units(
                                 for (src, dst, tag) in &pairs {
                                     let flow_direction =
                                         if bidir { tag.to_string() } else { dir.clone() };
-                                    let (effective_mode, target, target_source) = leg_rate_plan(
+                                    let rate_plan = leg_rate_plan(
                                         spec,
                                         &link_policy(spec, src, dst),
                                         &flow_direction,
@@ -1230,10 +1246,18 @@ pub fn build_units(
                                         &src.nic,
                                         &dst.nic,
                                     );
+                                    note_target_cap(
+                                        &mut notices,
+                                        &mut rx_target_notes,
+                                        &spec.name,
+                                        &rate_plan,
+                                    );
+                                    let (effective_mode, target) =
+                                        (rate_plan.mode, rate_plan.target_mbps);
                                     target_lines.push(target_line(
                                         &flow_direction,
                                         target,
-                                        target_source,
+                                        rate_plan.source,
                                     ));
                                     legs.push(Leg {
                                         tag: tag.to_string(),
@@ -1370,7 +1394,7 @@ pub fn build_units(
                                     max_streams = max_streams.max(streams);
                                     let flow_direction =
                                         if bidir { tag.to_string() } else { dir.clone() };
-                                    let (effective_mode, target, target_source) = leg_rate_plan(
+                                    let rate_plan = leg_rate_plan(
                                         spec,
                                         &link_policy(spec, src, dst),
                                         &flow_direction,
@@ -1378,10 +1402,18 @@ pub fn build_units(
                                         &src.nic,
                                         &dst.nic,
                                     );
+                                    note_target_cap(
+                                        &mut notices,
+                                        &mut rx_target_notes,
+                                        &spec.name,
+                                        &rate_plan,
+                                    );
+                                    let (effective_mode, target) =
+                                        (rate_plan.mode, rate_plan.target_mbps);
                                     target_lines.push(target_line(
                                         &flow_direction,
                                         target,
-                                        target_source,
+                                        rate_plan.source,
                                     ));
                                     // 每流带宽 × 流数 = 整条腿的总量。CTS 侧的
                                     // 字段是**总量**口径，与 iperf 的每流口径相反。
@@ -1871,18 +1903,22 @@ mod tests {
 
     #[test]
     fn tcp_and_cts_rate_modes_resolve_targets_consistently() {
+        // 2321 而不是随手一个大数：这条用例查的是「模式与门限怎么传递」，
+        // 门限必须落在 `base_spec()` 那条 2.5G 链路的物理上限（2600 × 95%
+        // = 2470）以内，否则会被 `cap_rx_target_to_link_speed` 折算走，
+        // 断言到的就不再是传递本身。
         let cases = [
             (RateMode::Auto, None, RateMode::Observe, None),
-            (RateMode::Auto, Some(4321.0), RateMode::Verify, Some(4321.0)),
+            (RateMode::Auto, Some(2321.0), RateMode::Verify, Some(2321.0)),
             (RateMode::Verify, None, RateMode::Verify, None),
             (
                 RateMode::Verify,
-                Some(4321.0),
+                Some(2321.0),
                 RateMode::Verify,
-                Some(4321.0),
+                Some(2321.0),
             ),
-            (RateMode::Observe, Some(4321.0), RateMode::Observe, None),
-            (RateMode::Discover, Some(4321.0), RateMode::Discover, None),
+            (RateMode::Observe, Some(2321.0), RateMode::Observe, None),
+            (RateMode::Discover, Some(2321.0), RateMode::Discover, None),
         ];
 
         for (configured_mode, configured_target, expected_mode, expected_target) in cases {
@@ -1902,6 +1938,116 @@ mod tests {
             assert_eq!(cts_task_ref.rate_mode, expected_mode);
             assert_eq!(cts_task_ref.rx_target_mbps, expected_target);
         }
+    }
+
+    /// 合计门限继续优先（判定口径不变），但「逐方向门限被它盖掉了」必须进
+    /// 计划提示。run_20260905_125327_5940 里套件写了 ab/ba 各 900Mbps，频段表
+    /// 里一条 bidir_total=900 就把两条腿的门限清空，单元按合计判成 PASS——
+    /// 两处配置都在，报告上却看不出是哪一处生效了。
+    #[test]
+    fn a_bidir_total_that_shadows_per_direction_targets_says_so_in_the_plan() {
+        let mut spec = base_spec();
+        spec.directions = vec!["bidir".into()];
+        spec.rate_mode = RateMode::Verify;
+        spec.rate_targets_bidir.ab = Some(900.0);
+        spec.rate_targets_bidir.ba = Some(900.0);
+        spec.rate_target_bidir_total = Some(900.0);
+
+        let mut port = PORT_BASE;
+        let (units, notices) = build_units(&[spec], true, &mut port);
+        // 判定口径一个字节都没改：两条腿仍然只测量，合计仍然是唯一结论。
+        for leg in &units[0].legs {
+            let LegKind::IperfSingle(task) = &leg.kind else {
+                panic!("expected iperf legs");
+            };
+            assert_eq!(task.rx_target_mbps, None);
+            assert_eq!(task.rate_mode, RateMode::Observe);
+        }
+        assert_eq!(units[0].bidir_total_target_mbps, Some(900.0));
+        // 变的只是「说不说」。两个方向各一条。
+        let shadow: Vec<&String> = notices
+            .iter()
+            .filter(|line| line.contains("已盖掉逐方向门限"))
+            .collect();
+        assert_eq!(shadow.len(), 2, "ab/ba 各说一次: {notices:?}");
+        assert!(shadow.iter().any(|line| line.contains("ab")));
+        assert!(shadow.iter().any(|line| line.contains("ba")));
+    }
+
+    /// 没配合计门限时不能凭空冒出这条提示。
+    #[test]
+    fn per_direction_targets_alone_do_not_trigger_the_shadow_notice() {
+        let mut spec = base_spec();
+        spec.directions = vec!["bidir".into()];
+        spec.rate_mode = RateMode::Verify;
+        spec.rate_targets_bidir.ab = Some(900.0);
+        spec.rate_targets_bidir.ba = Some(900.0);
+        let unit = build_single_iperf_unit(spec, PORT_BASE);
+        for leg in &unit.legs {
+            let LegKind::IperfSingle(task) = &leg.kind else {
+                panic!("expected iperf legs");
+            };
+            assert_eq!(task.rx_target_mbps, Some(900.0));
+        }
+    }
+
+    /// 现场回归：run_20260905_125327_5940 的 `以太网 6`（SGMII1G，协商 1000Mbps）
+    /// 做发送口时，门限取的是接收口策略的 1800/2000（`resolve_link_policy` 的
+    /// 「门限看接收端」），16 个单元实测 934~984——就是 1G 线速——全判 RATE_FAIL。
+    /// 那是门限配错了，不是设备不达标。
+    #[test]
+    fn a_target_above_the_path_ceiling_is_capped_and_the_formula_is_reported() {
+        let mut spec = base_spec();
+        spec.src = ep(Side::Master, "以太网 6", "SGMII1G", "192.168.0.101", 1000);
+        spec.dst = ep(Side::Agent, "以太网 18", "SGMII2.5G", "192.168.0.105", 2500);
+        spec.rate_mode = RateMode::Verify;
+        spec.rate_targets.forward = Some(1_800.0);
+
+        let mut port = PORT_BASE;
+        let (units, notices) = build_units(&[spec], true, &mut port);
+        let task = iperf_single_task(&units[0]);
+        // 1G 口 × 95%：1800 是这条路径上跑不到的数。
+        assert_eq!(task.rx_target_mbps, Some(950.0));
+        assert_eq!(task.rate_mode, RateMode::Verify);
+        // 折算过就必须说出来，否则报告上「门限 950」和配置里「1800」对不上。
+        assert!(
+            notices
+                .iter()
+                .any(|line| line.contains("超过这条链路的物理上限")
+                    && line.contains("950")
+                    && line.contains("以太网 6")),
+            "封顶算式必须进计划提示: {notices:?}"
+        );
+    }
+
+    /// 反过来：门限在路径上限之内时一个字节都不能动，提示也不能冒出来。
+    #[test]
+    fn a_reachable_target_is_left_alone_by_the_path_ceiling() {
+        let mut spec = base_spec();
+        spec.src = ep(Side::Master, "以太网 5", "RNDIS", "192.168.0.100", 3750);
+        spec.dst = ep(Side::Agent, "以太网 18", "SGMII2.5G", "192.168.0.105", 2500);
+        spec.rate_mode = RateMode::Verify;
+        spec.rate_targets.forward = Some(1_800.0);
+        let unit = build_single_iperf_unit(spec, PORT_BASE);
+        assert_eq!(iperf_single_task(&unit).rx_target_mbps, Some(1_800.0));
+    }
+
+    /// 10GUSB(NCM) 报的 4.2G 是**已知的驱动显示问题**，那块口跑的是 10G。
+    /// 封顶必须问 role 表而不是协商速率，否则 EVB 那条 6400Mbps 的已知目标
+    /// 会被压成 3990，凭空制造一批 PASS。
+    #[test]
+    fn the_path_ceiling_does_not_trust_the_10gusb_negotiated_speed() {
+        let mut spec = base_spec();
+        set_evb_endpoints(&mut spec);
+        spec.rate_mode = RateMode::Verify;
+        let unit = build_single_iperf_unit(spec, PORT_BASE);
+        let target = iperf_single_task(&unit)
+            .rx_target_mbps
+            .expect("EVB 有已知目标");
+        assert!(
+            target > 4_000.0,
+            "10GUSB 的 4200Mbps 协商值不能用来封顶: {target}"
+        );
     }
 
     #[test]

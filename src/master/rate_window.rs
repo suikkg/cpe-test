@@ -73,6 +73,12 @@ pub(crate) struct RateStats {
     /// 采样周期的抖动摊成 5 个窗口，既制造误判也把时长报错（详见
     /// [`RateExcursion`]）。时长已去过重叠，累加即真实覆盖时长。
     pub series: Vec<(u64, u64, f64)>,
+    /// 产出 `series` 的那个判定窗口的起点（监控时间轴毫秒）。
+    ///
+    /// `series` 存的是绝对时刻，报告里要印的却是「窗口内第几秒」。把窗口起点
+    /// 跟着数据一起带走，折算才有唯一的依据；否则每个使用点都得自己去找窗口，
+    /// 找漏一个就印出越界的秒数。
+    pub window_start_ms: u64,
     /// 判定窗口内「计数器连续零增长」的最长一段占已覆盖时长的比例。
     ///
     /// 这是与采样覆盖率**正交**的一种不可信：样本采到了、`valid` 也是 true，
@@ -151,7 +157,13 @@ pub(crate) struct RateExcursion {
     pub target_mbps: f64,
     /// 最长一段连续越界的时长。判定看的就是它。
     pub longest_ms: u64,
-    /// 最长那一段的起始时刻（判定窗口内的相对毫秒）。
+    /// 最长那一段的起始时刻，**相对判定窗口起点**的毫秒。
+    ///
+    /// 必须是窗口相对量：`describe()` 印的就是「自判定窗口第 X 秒起」，而
+    /// `RateStats::series` 里存的是监控起点的绝对时刻。两者差一个
+    /// `window.start_ms`，直接拿绝对值去印，报告里就会出现
+    /// 「60 秒窗口的第 69.6 秒」这种不可能的数——run_20260905_125327_5940
+    /// 的 unit-112 就是这么印出来的。折算在 [`rate_excursion`] 里做一次。
     pub started_at_ms: u64,
     /// 最长那一段里的极值：该段最低掉到多少。
     pub extreme_mbps: f64,
@@ -264,21 +276,30 @@ fn scan_excursion(
 ///
 /// 顺序是**由重到轻**：断流的样本必然也满足掉坑判据，先报断流才说得清
 /// 「这几秒是真断了」还是「只是掉下去了」。
-pub(crate) fn rate_excursion(series: &[(u64, u64, f64)], target: f64) -> Option<RateExcursion> {
+pub(crate) fn rate_excursion(
+    series: &[(u64, u64, f64)],
+    target: f64,
+    // 判定窗口起点（监控时间轴的毫秒）。`series` 用的是同一条绝对时间轴，
+    // 减掉它才是 `describe()` 承诺的「自判定窗口第 X 秒起」。
+    window_start_ms: u64,
+) -> Option<RateExcursion> {
     if !target.is_finite() || target <= 0.0 {
         return None;
     }
     // 「速率基本为 0」不能直接拿 0 比：背景扣除、ARP/重传这类零星帧都会留下
     // 零点几到几十 Mbps 的残值。取目标的 1%，并以有效流量下限兜底。
     let outage_floor = (target * RATE_OUTAGE_RATIO).max(MIN_VALID_RX_MBPS);
-    scan_excursion(series, ExcursionKind::Outage, outage_floor, target).or_else(|| {
-        scan_excursion(
-            series,
-            ExcursionKind::Dropout,
-            target * (1.0 - RATE_DROPOUT_TOLERANCE),
-            target,
-        )
-    })
+    let mut excursion = scan_excursion(series, ExcursionKind::Outage, outage_floor, target)
+        .or_else(|| {
+            scan_excursion(
+                series,
+                ExcursionKind::Dropout,
+                target * (1.0 - RATE_DROPOUT_TOLERANCE),
+                target,
+            )
+        })?;
+    excursion.started_at_ms = excursion.started_at_ms.saturating_sub(window_start_ms);
+    Some(excursion)
 }
 
 /// 验证目标所需的最低发送负载（目标 + 余量）。
@@ -431,11 +452,25 @@ pub(crate) fn rx_acceptance_diagnostics(
     // 2200，对使用者不是同一个结论。它**不再改写判定**（RX 平均达标就是
     // PASS），但必须留在报告里——否则一条中途断了一分钟的链路会报出一个
     // 干干净净的 PASS，报告上一个字都看不到。
-    if let Some(excursion) = rate_excursion(&stats.series, target) {
+    if let Some(excursion) = rate_excursion(&stats.series, target, stats.window_start_ms) {
+        // 尾巴那句话必须跟着**这一行自己**的平均值走。
+        //
+        // 它以前是写死的「平均值已达标，故不改写判定」，而这个函数在 RX 平均
+        // 不达标时同样会跑：run_20260905_125327_5940 里 116 条掉坑诊断有 110
+        // 条挂在 RATE_FAIL 行上，和同一行的「网卡 RX 平均 948.658Mbps 低于目标
+        // 1800.000Mbps」正面打架。判定没错，但读报告的人会先怀疑数据。
+        let verdict_note = if stats
+            .avg_mbps
+            .is_some_and(|avg| avg.is_finite() && avg >= target)
+        {
+            "平均值已达标，故不改写判定，但这段时间的业务是真的受影响了"
+        } else {
+            "本行平均值本就不达标，掉坑只是补充说明它掉在哪几秒"
+        };
         // 带上原因码：它是报告里通用的词汇，读的人能直接和 `report/reason.rs`
         // 的说明对上，也能在一堆诊断行里检索出「断流」和「掉坑」两类。
         out.push(format!(
-            "{}: {}；平均值已达标，故不改写判定，但这段时间的业务是真的受影响了",
+            "{}: {}；{verdict_note}",
             excursion.reason_code(),
             excursion.describe()
         ));
@@ -717,6 +752,7 @@ pub(crate) fn monitor_rate_stats(
     RateStats {
         avg_mbps: Some(avg),
         series: rate_samples,
+        window_start_ms: window.start_ms,
         p10_mbps: percentile(&rolling_sorted, 0.10),
         median_mbps: percentile(&rates, 0.50),
         p95_mbps: percentile(&rates, 0.95),
@@ -1435,7 +1471,7 @@ mod tests {
         let target = 800.0;
         // 第 20~26 秒掉到 100Mbps：整整 7 秒，不多不少。
         let series = raw_series(35, |i| if (20..=26).contains(&i) { 100.0 } else { 900.0 });
-        let excursion = rate_excursion(&series, target).expect("应检出掉坑");
+        let excursion = rate_excursion(&series, target, 0).expect("应检出掉坑");
         assert_eq!(excursion.kind, ExcursionKind::Dropout);
         assert_eq!(excursion.longest_ms, 7_000, "19s 起掉了 7 秒");
         assert_eq!(excursion.started_at_ms, 19_000);
@@ -1454,7 +1490,7 @@ mod tests {
                 900.0
             }
         });
-        let excursion = rate_excursion(&split, target).expect("应检出掉坑");
+        let excursion = rate_excursion(&split, target, 0).expect("应检出掉坑");
         assert_eq!(excursion.longest_ms, 9_000, "19s 起到 28s 止的那一段");
         assert_eq!(excursion.started_at_ms, 19_000);
         assert_eq!(excursion.runs, 2, "短的那段也要算进段数");
@@ -1475,14 +1511,14 @@ mod tests {
                 }
             });
             assert!(
-                rate_excursion(&series, target).is_none(),
+                rate_excursion(&series, target, 0).is_none(),
                 "{blip_secs} 秒的掉拍不该判 FAIL"
             );
         }
         // 够 5 秒就必须检出。
         let series = raw_series(35, |i| if (20..25).contains(&i) { 0.0 } else { 900.0 });
         assert_eq!(
-            rate_excursion(&series, target).map(|e| e.kind),
+            rate_excursion(&series, target, 0).map(|e| e.kind),
             Some(ExcursionKind::Outage)
         );
     }
@@ -1503,19 +1539,19 @@ mod tests {
 
         // 0Mbps：断流。
         assert_eq!(
-            rate_excursion(&long(0.0), target).map(|e| e.kind),
+            rate_excursion(&long(0.0), target, 0).map(|e| e.kind),
             Some(ExcursionKind::Outage)
         );
         // 目标的 10%：还有流量在跑，算掉坑不算断流。
         assert_eq!(
-            rate_excursion(&long(100.0), target).map(|e| e.kind),
+            rate_excursion(&long(100.0), target, 0).map(|e| e.kind),
             Some(ExcursionKind::Dropout)
         );
         // 目标的 85%：在 80% 容差之内，不判。
-        assert!(rate_excursion(&long(850.0), target).is_none());
+        assert!(rate_excursion(&long(850.0), target, 0).is_none());
         // 高于目标一律不判：链路比目标快不是缺陷。
-        assert!(rate_excursion(&long(1_300.0), target).is_none());
-        assert!(rate_excursion(&long(5_000.0), target).is_none());
+        assert!(rate_excursion(&long(1_300.0), target, 0).is_none());
+        assert!(rate_excursion(&long(5_000.0), target, 0).is_none());
     }
 
     /// 采样周期是 ~1005ms 而不是整 1000ms，5 个连续样本累到 5030ms；
@@ -1530,7 +1566,7 @@ mod tests {
                 (end, 995, if (20..25).contains(&i) { 100.0 } else { 900.0 })
             })
             .collect();
-        let excursion = rate_excursion(&series, target).expect("4975ms 属于舍入误差");
+        let excursion = rate_excursion(&series, target, 0).expect("4975ms 属于舍入误差");
         assert_eq!(excursion.longest_ms, 4_975);
 
         // 4 个样本 = 3980ms，差得远，不算。
@@ -1540,16 +1576,115 @@ mod tests {
                 (end, 995, if (20..24).contains(&i) { 100.0 } else { 900.0 })
             })
             .collect();
-        assert!(rate_excursion(&series, target).is_none());
+        assert!(rate_excursion(&series, target, 0).is_none());
     }
 
     /// 没有可信目标时无从谈越界。
     #[test]
     fn an_excursion_needs_a_target() {
         let series = raw_series(35, |i| if (20..=26).contains(&i) { 0.0 } else { 900.0 });
-        assert!(rate_excursion(&series, 0.0).is_none());
-        assert!(rate_excursion(&series, f64::NAN).is_none());
+        assert!(rate_excursion(&series, 0.0, 0).is_none());
+        assert!(rate_excursion(&series, f64::NAN, 0).is_none());
         let steady = raw_series(35, |_| 900.0);
-        assert!(rate_excursion(&steady, 800.0).is_none());
+        assert!(rate_excursion(&steady, 800.0, 0).is_none());
+    }
+
+    /// `describe()` 承诺的是「自判定窗口第 X 秒起」，`series` 存的却是监控
+    /// 起点的绝对时刻。run_20260905_125327_5940 的 unit-112 就因此印出了
+    /// 「60 秒窗口的第 69.6 秒」——一个窗口里根本不存在的时刻。
+    #[test]
+    fn excursion_start_is_relative_to_the_judgement_window_not_the_monitor_origin() {
+        let target = 1_800.0;
+        // 监控第 20~30 秒掉到门限以下；判定窗口从第 15 秒开始，
+        // 所以报出来必须是「窗口第 5 秒起」。
+        let series: Vec<(u64, u64, f64)> = (15..=75)
+            .map(|second| {
+                let rate = if (20..=30).contains(&second) {
+                    200.0
+                } else {
+                    1_900.0
+                };
+                (second * 1_000, 1_000, rate)
+            })
+            .collect();
+        let excursion = rate_excursion(&series, target, 15_000).expect("应检出掉坑");
+        assert_eq!(excursion.started_at_ms, 4_000);
+        let text = excursion.describe();
+        assert!(
+            text.contains("自判定窗口第 4.0 秒起"),
+            "越界起点必须是窗口内相对秒数: {text}"
+        );
+        // 绝对时刻是 19 秒；它不能出现在这句话里。
+        assert!(
+            !text.contains("第 19.0 秒"),
+            "不能印监控起点的绝对时刻: {text}"
+        );
+    }
+
+    /// 掉坑诊断尾巴那句话必须跟着**这一行自己**的平均值走。写死「平均值已达标」
+    /// 会让 RATE_FAIL 行同时印出「RX 平均 948 低于目标 1800」和「平均值已达标」。
+    #[test]
+    fn dropout_note_does_not_claim_the_average_passed_on_a_failing_row() {
+        let target = 1_800.0;
+        let series: Vec<(u64, u64, f64)> = (1..=60)
+            .map(|second| {
+                let rate = if (10..=25).contains(&second) {
+                    300.0
+                } else {
+                    1_100.0
+                };
+                (second * 1_000, 1_000, rate)
+            })
+            .collect();
+        let avg = series.iter().map(|(_, _, rate)| rate).sum::<f64>() / series.len() as f64;
+        let failing = RateStats {
+            avg_mbps: Some(avg),
+            p10_mbps: Some(avg),
+            coverage: 1.0,
+            rolling_coverage: 1.0,
+            series: series.clone(),
+            ..Default::default()
+        };
+        assert!(avg < target, "这份数据的平均值本来就不达标");
+        let notes = rx_acceptance_diagnostics(&failing, &failing, Some(target), None);
+        let dropout = notes
+            .iter()
+            .find(|line| line.contains("RX_DROPOUT"))
+            .expect("应有掉坑诊断");
+        assert!(
+            !dropout.contains("平均值已达标"),
+            "平均值没达标就不能说达标了: {dropout}"
+        );
+        assert!(dropout.contains("本行平均值本就不达标"), "{dropout}");
+
+        // 平均值确实达标时，原来那句话一个字不改。
+        let passing_series: Vec<(u64, u64, f64)> = (1..=60)
+            .map(|second| {
+                let rate = if (10..=20).contains(&second) {
+                    300.0
+                } else {
+                    2_300.0
+                };
+                (second * 1_000, 1_000, rate)
+            })
+            .collect();
+        let passing_avg = passing_series.iter().map(|(_, _, rate)| rate).sum::<f64>()
+            / passing_series.len() as f64;
+        assert!(passing_avg >= target);
+        let passing = RateStats {
+            avg_mbps: Some(passing_avg),
+            p10_mbps: Some(passing_avg),
+            coverage: 1.0,
+            rolling_coverage: 1.0,
+            series: passing_series,
+            ..Default::default()
+        };
+        let notes = rx_acceptance_diagnostics(&passing, &passing, Some(target), None);
+        assert!(
+            notes
+                .iter()
+                .any(|line| line.contains("RX_DROPOUT") && line.contains("平均值已达标")),
+            "{notes:?}"
+        );
     }
 }

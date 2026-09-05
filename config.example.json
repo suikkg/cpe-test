@@ -78,6 +78,8 @@
       "_wifi_ceilings": "WiFi 的负载上限不跟协商速率（那是会来回跳的 PHY 速率）。5G/6G 用 wifi_payload_ceiling_mbps，2.4G 单列 wifi_24g_payload_ceiling_mbps——2.4GHz 只有 3 个不重叠信道、最多 40MHz，够不到 5G 的档。频段没识别出来的 WIFI 按 5G 档处理。",
       "wifi_payload_ceiling_mbps": 2882,
       "wifi_24g_payload_ceiling_mbps": 574,
+      "_rx_target_link_speed_ratio": "门限一直只看接收端，于是发送口比接收口慢的组合会拿到一个物理上跑不到的门限（1G 口发包、门限却按收口的 1800 判）。这条系数把门限压回路径上限之内，压过就在计划提示里报出算式。设 0 关掉。",
+      "rx_target_link_speed_ratio": 0.95,
       "max_udp_loss_pct": null
     }
   },

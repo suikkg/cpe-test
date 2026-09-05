@@ -3484,6 +3484,7 @@ fn healthy_stats(rx_mbps: f64) -> RateStats {
         rolling_coverage: 1.0,
         // 全程稳定在 rx_mbps：180 个 1 秒样本一个都不越界。
         series: (1..=180).map(|i| (i * 1_000, 1_000, rx_mbps)).collect(),
+        window_start_ms: 0,
         baseline_mbps: 0.0,
         stalled_ratio: 0.0,
     }
@@ -5455,9 +5456,9 @@ fn rx_average_is_the_only_rate_threshold_on_both_transports() {
     assert_eq!(verdict, Verdict::Pass, "一个采样周期的掉拍不该判 FAIL");
 
     // `rate_excursion` 仍保留为诊断函数，但不再参与正式 verdict。
-    assert!(rate_excursion(&steady, target).is_none());
-    assert!(rate_excursion(&blip, target).is_none());
-    let excursion = rate_excursion(&dipped, target).expect("UDP 侧也要检出同一个坑");
+    assert!(rate_excursion(&steady, target, 0).is_none());
+    assert!(rate_excursion(&blip, target, 0).is_none());
+    let excursion = rate_excursion(&dipped, target, 0).expect("UDP 侧也要检出同一个坑");
     assert_eq!(excursion.reason_code(), ReasonCode::RxDropout);
     assert_eq!(excursion.longest_ms, 6_000);
     assert_eq!(excursion.extreme_mbps, 120.0);
@@ -5526,4 +5527,116 @@ fn every_production_row_is_built_through_the_shared_constructor() {
         offenders.is_empty(),
         "这些 Row 构造点绕过了 base_row/unit_row，新增报告列时会变成空列：{offenders:#?}"
     );
+}
+
+#[test]
+fn socket_buffer_drain_does_not_drag_the_window_past_the_end_of_traffic() {
+    // 现场回归：run_20260905_125327_5940 的 unit-112（★★双向 V4 TCP，
+    // 主控 以太网 5 ↔ 辅测 以太网 18）的 ba 腿。
+    //
+    // `-w 256m -P 10` = 2.56GB socket 缓冲，client 的 `-t 60` 到点后还要十几秒
+    // 排空；末尾两条逐秒行连同汇总行一起压到 74.635s 才吐出来。只用行内时长、
+    // 拿汇总行到达时刻当锚点的话，窗口会变成 [14.625s, 74.625s]——比真实流量
+    // 后移 12.4 秒，掐掉开头 1300~1840Mbps 的高速段、把结尾没有流量的尾巴收进
+    // 来，RX 平均从 1036 被压到 705.1（iperf3 自报接收端 1017）。
+    let mut events = vec![
+        IperfFlowEvent {
+            kind: IperfEventKind::Started,
+            elapsed_ms: 656,
+            line: "started".into(),
+            ..Default::default()
+        },
+        IperfFlowEvent {
+            kind: IperfEventKind::Connected,
+            elapsed_ms: 2_252,
+            line: "connected".into(),
+            ..Default::default()
+        },
+    ];
+    // 逐秒 interval 行按时到达：到达时刻 − 行内终点 ≈ 2.25s，就是真实偏移。
+    events.push(IperfFlowEvent {
+        kind: IperfEventKind::Traffic,
+        elapsed_ms: 59_246,
+        mbps: Some(194.0),
+        line: "[SUM]  56.01-57.00  sec  23.0 MBytes   194 Mbits/sec".into(),
+    });
+    events.push(IperfFlowEvent {
+        kind: IperfEventKind::Traffic,
+        elapsed_ms: 60_253,
+        mbps: Some(162.0),
+        line: "[SUM]  57.00-58.00  sec  19.2 MBytes   162 Mbits/sec".into(),
+    });
+    // 排空期间的停顿：剩下的行全部在 74.635s 成块到达。
+    for line in [
+        "[SUM]  58.00-59.01  sec  28.1 MBytes   234 Mbits/sec",
+        "[SUM]  59.01-60.00  sec  24.8 MBytes   209 Mbits/sec",
+        "[SUM]   0.00-60.00  sec  9.48 GBytes  1357 Mbits/sec                  sender",
+        "[SUM]   0.00-60.01  sec  7.11 GBytes  1017 Mbits/sec                  receiver",
+    ] {
+        events.push(IperfFlowEvent {
+            kind: IperfEventKind::Traffic,
+            elapsed_ms: 74_635,
+            mbps: Some(1_017.0),
+            line: line.into(),
+        });
+    }
+    events.push(IperfFlowEvent {
+        kind: IperfEventKind::Ended,
+        elapsed_ms: 74_641,
+        line: "ended".into(),
+        ..Default::default()
+    });
+
+    let window = iperf_effective_window(&events, 60, true);
+    assert!(window.complete, "60 秒测量必须判成完整窗口: {window:?}");
+    // 汇总行的行内区间 0.00-60.01 投影回监控时间轴 = [2.246s, 62.256s]，
+    // 判定窗口取其中前 60 秒。
+    assert_eq!((window.start_ms, window.end_ms), (2_246, 62_246));
+    // 老口径会落在这里；它越过了 70s 的流量末端。
+    assert_ne!(window.start_ms, 14_625);
+    assert!(
+        window.end_ms < 70_000,
+        "判定窗口不能越过流量末端，否则末尾零增长会凑成 COUNTER_STALLED: {window:?}"
+    );
+}
+
+#[test]
+fn clock_offset_falls_back_to_arrival_time_when_every_line_arrives_in_one_block() {
+    // 老版 iperf3 没有 --forceflush：全部输出在退出时一次性吐出，一条按时到达
+    // 的行都没有。此时偏移只能由汇总行自己给出，口径与 v6.2.5 及以前一致。
+    let events = vec![
+        IperfFlowEvent {
+            kind: IperfEventKind::Started,
+            elapsed_ms: 500,
+            line: "started".into(),
+            ..Default::default()
+        },
+        IperfFlowEvent {
+            kind: IperfEventKind::Connected,
+            elapsed_ms: 2_000,
+            line: "connected".into(),
+            ..Default::default()
+        },
+        IperfFlowEvent {
+            kind: IperfEventKind::Traffic,
+            elapsed_ms: 12_400,
+            mbps: Some(100.0),
+            line: "[  5]   9.00-10.00 sec  11.9 MBytes  100 Mbits/sec".into(),
+        },
+        IperfFlowEvent {
+            kind: IperfEventKind::Traffic,
+            elapsed_ms: 12_400,
+            mbps: Some(100.0),
+            line: "[SUM] 0.00-10.00 sec 125 MBytes 100 Mbits/sec receiver".into(),
+        },
+        IperfFlowEvent {
+            kind: IperfEventKind::Ended,
+            elapsed_ms: 12_500,
+            line: "ended".into(),
+            ..Default::default()
+        },
+    ];
+    let window = iperf_effective_window(&events, 10, true);
+    assert_eq!((window.start_ms, window.end_ms), (2_400, 12_400));
+    assert!(window.complete);
 }
