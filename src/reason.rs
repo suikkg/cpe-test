@@ -74,6 +74,10 @@ pub enum ReasonCode {
     PingExecError,
     PingGatewayUnreachable,
     PingOk,
+    PingPacketLossHigh,
+    PingRttAvgExceeded,
+    PingRttMaxExceeded,
+    PingRttMissing,
     PingSubnetUnreachable,
     PingTimeout,
     PingUnreachable,
@@ -170,6 +174,10 @@ impl ReasonCode {
             ReasonCode::PingExecError => "PING_EXEC_ERROR",
             ReasonCode::PingGatewayUnreachable => "PING_GATEWAY_UNREACHABLE",
             ReasonCode::PingOk => "PING_OK",
+            ReasonCode::PingPacketLossHigh => "PING_PACKET_LOSS_HIGH",
+            ReasonCode::PingRttAvgExceeded => "PING_RTT_AVG_EXCEEDED",
+            ReasonCode::PingRttMaxExceeded => "PING_RTT_MAX_EXCEEDED",
+            ReasonCode::PingRttMissing => "PING_RTT_MISSING",
             ReasonCode::PingSubnetUnreachable => "PING_SUBNET_UNREACHABLE",
             ReasonCode::PingTimeout => "PING_TIMEOUT",
             ReasonCode::PingUnreachable => "PING_UNREACHABLE",
@@ -302,6 +310,10 @@ impl FromStr for ReasonCode {
             "PING_EXEC_ERROR" => ReasonCode::PingExecError,
             "PING_GATEWAY_UNREACHABLE" => ReasonCode::PingGatewayUnreachable,
             "PING_OK" => ReasonCode::PingOk,
+            "PING_PACKET_LOSS_HIGH" => ReasonCode::PingPacketLossHigh,
+            "PING_RTT_AVG_EXCEEDED" => ReasonCode::PingRttAvgExceeded,
+            "PING_RTT_MAX_EXCEEDED" => ReasonCode::PingRttMaxExceeded,
+            "PING_RTT_MISSING" => ReasonCode::PingRttMissing,
             "PING_SUBNET_UNREACHABLE" => ReasonCode::PingSubnetUnreachable,
             "PING_TIMEOUT" => ReasonCode::PingTimeout,
             "PING_UNREACHABLE" => ReasonCode::PingUnreachable,
@@ -335,7 +347,7 @@ impl FromStr for ReasonCode {
 
 /// 所有码，供穷举式测试使用。
 #[cfg(test)]
-pub const ALL_REASON_CODES: [ReasonCode; 79] = [
+pub const ALL_REASON_CODES: [ReasonCode; 83] = [
     ReasonCode::ActiveStreamsLow,
     ReasonCode::ConfiguredLoadTooLow,
     ReasonCode::CounterStalled,
@@ -389,6 +401,10 @@ pub const ALL_REASON_CODES: [ReasonCode; 79] = [
     ReasonCode::PingExecError,
     ReasonCode::PingGatewayUnreachable,
     ReasonCode::PingOk,
+    ReasonCode::PingPacketLossHigh,
+    ReasonCode::PingRttAvgExceeded,
+    ReasonCode::PingRttMaxExceeded,
+    ReasonCode::PingRttMissing,
     ReasonCode::PingSubnetUnreachable,
     ReasonCode::PingTimeout,
     ReasonCode::PingUnreachable,

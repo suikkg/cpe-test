@@ -449,7 +449,11 @@ pub fn disposition_advice(reason_code: ReasonCode) -> Option<&'static str> {
         ReasonCode::NicDisappeared => {
             "测试期间接收端网卡从系统里消失了，请检查被测链路/设备的是否存在问题；恢复网卡后重跑。"
         }
-        ReasonCode::PingUnreachable | ReasonCode::PingSubnetUnreachable => "目标不可达，先确认两端 IP、网线和防火墙；请检查被测链路/设备的是否存在问题",
+        ReasonCode::PingPacketLossHigh => "Ping 丢包率超过阈值。检查被测链路/设备是否存在问题，如掉线、路由中断或信号干扰。",
+        ReasonCode::PingRttAvgExceeded => "Ping 平均延迟超过阈值。被测链路延迟较大，检查是否存在拥塞或路由不优。",
+        ReasonCode::PingRttMaxExceeded => "Ping 最大延迟超过阈值。被测链路存在延迟波动或瞬时拥塞，检查网络是否稳定。",
+        ReasonCode::PingRttMissing => "Ping 缺少延迟数据。通常是没有收到足够的 Echo Reply，先检查链路连通性。",
+        ReasonCode::PingUnreachable | ReasonCode::PingSubnetUnreachable => "目标不可达。确认两端 IP 配置、网线连接和防火墙设置是否正确；检查被测链路/设备是否存在问题。",
         ReasonCode::PingGatewayUnreachable => "网关不可达，说明该网卡的链路或组网本身有问题。",
         ReasonCode::PingTimeout | ReasonCode::PingExecError => "Ping 命令本身没能正常执行，属于测试环境问题。",
 

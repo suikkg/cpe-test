@@ -216,6 +216,14 @@ impl Ctx {
             ReasonCode::PingExecError
         } else if acceptance_ok {
             ReasonCode::PingOk
+        } else if !packet_loss_ok {
+            ReasonCode::PingPacketLossHigh
+        } else if out.rtt_avg.is_none() || out.rtt_max.is_none() {
+            ReasonCode::PingRttMissing
+        } else if !avg_rtt_ok {
+            ReasonCode::PingRttAvgExceeded
+        } else if !max_rtt_ok {
+            ReasonCode::PingRttMaxExceeded
         } else {
             match t.purpose {
                 PingPurpose::SubnetTest => ReasonCode::PingUnreachable,
