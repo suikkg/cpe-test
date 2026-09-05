@@ -95,8 +95,9 @@ pub(super) fn validate_rate_reason(
             _ => metric_reason_mismatch(code, "缺少 RX 平均或目标，无法核对该判定"),
         },
         ReasonCode::RxP10BelowTarget => match (rx_p10, target_mbps) {
-            (Some(rx_p10), Some(target)) if rx_p10 < target => format!(
-                "RX_P10_BELOW_TARGET: RX-P10 {rx_p10:.3} Mbps < 目标 {target:.3} Mbps"
+            (Some(rx_p10), Some(target)) if rx_p10 < target * 0.9 => format!(
+                "RX_P10_BELOW_TARGET: RX-P10 {rx_p10:.3} Mbps < 目标 90% {:.3} Mbps",
+                target * 0.9
             ),
             (Some(rx_p10), Some(target)) => metric_reason_mismatch(
                 code,

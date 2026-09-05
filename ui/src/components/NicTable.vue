@@ -22,16 +22,16 @@ function speed(nic: NicInfo): string {
 
 <template>
   <div v-if="nics.length === 0" class="empty">{{ emptyHint }}</div>
-  <div v-else class="scroll">
+  <div v-else class="scroll" tabindex="0" role="region" aria-label="网卡列表，可横向滚动">
     <table>
       <thead>
         <tr>
-          <th>接口名</th>
-          <th>角色</th>
-          <th>IPv4</th>
-          <th>网关</th>
-          <th class="num">协商速率</th>
-          <th>IPv6 link-local</th>
+          <th scope="col">接口名</th>
+          <th scope="col">角色</th>
+          <th scope="col">IPv4</th>
+          <th scope="col">网关</th>
+          <th scope="col" class="num">协商速率</th>
+          <th scope="col">IPv6 link-local</th>
         </tr>
       </thead>
       <tbody>
@@ -68,13 +68,14 @@ function speed(nic: NicInfo): string {
 }
 table {
   width: 100%;
+  min-width: 760px;
   border-collapse: separate;
   border-spacing: 0;
   font-size: 13px;
 }
 th,
 td {
-  padding: 8px 11px;
+  padding: 13px 14px;
   text-align: left;
   border-bottom: 1px solid var(--line);
   vertical-align: top;
@@ -91,6 +92,10 @@ thead th {
 tbody tr:last-child td {
   border-bottom: 0;
 }
+tbody tr:hover { background: var(--panel-2); }
+td:first-child { min-width: 180px; max-width: 270px; overflow-wrap: anywhere; }
+td:first-child small { display: inline-block; margin-top: 3px; line-height: 1.5; }
+td:not(:first-child) { white-space: nowrap; }
 .num {
   text-align: right;
   font-variant-numeric: tabular-nums;

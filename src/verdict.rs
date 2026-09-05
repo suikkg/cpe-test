@@ -390,7 +390,7 @@ pub fn disposition_advice(reason_code: ReasonCode) -> Option<&'static str> {
              网卡计数器上不可区分。"
         }
         ReasonCode::RxP10BelowTarget => {
-            "接收端速率的低十分位低于目标：不是偶发掉坑，是有相当一部分时间都没达标。按被测链路性能问题处理。"
+            "【诊断指标，不改写 PASS/FAIL】接收端速率的低十分位低于目标 90%：说明最差区间的性能较弱。结合平均 RX 和连续掉速诊断，判断是持续性波动还是瞬时波动。单看 P10 不能认定设备性能有问题。"
         }
         // —— ctsTraffic 生命周期没确认：不是被测设备的问题，是这一轮没跑成 ——
         ReasonCode::CtsClientStartFailed

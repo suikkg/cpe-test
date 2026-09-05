@@ -132,17 +132,16 @@ function numbers(values: number[] | undefined): string {
 <template>
   <div class="split">
     <!-- 左：配置列表，按协议分段 -->
-    <div class="list" role="listbox" aria-label="流量配置">
+    <div class="list" role="group" aria-label="选择流量配置">
       <template v-for="bucket in (['tcp', 'udp'] as Bucket[])" :key="bucket">
-        <div class="list-group">{{ bucket.toUpperCase() }}</div>
+        <div class="list-group"><span>{{ bucket.toUpperCase() }} 配置</span><span>{{ plan.ui.recipes[bucket].length }}</span></div>
         <button
           v-for="recipe in plan.ui.recipes[bucket]"
           :key="recipe.id"
           type="button"
-          role="option"
           class="list-item"
           :class="{ on: current?.recipe.id === recipe.id }"
-          :aria-selected="current?.recipe.id === recipe.id"
+          :aria-pressed="current?.recipe.id === recipe.id"
           @click="selectedId = recipe.id"
         >
           <span class="list-name">{{ recipe.name || '(未命名)' }}</span>
@@ -159,13 +158,15 @@ function numbers(values: number[] | undefined): string {
     <div v-if="current" class="detail">
       <div class="detail-head">
         <span class="proto mono">{{ current.protocol.toUpperCase() }}</span>
-        <input
-          class="name"
-          type="text"
-          :value="current.recipe.name"
-          aria-label="配置名称"
-          @input="onName(current.protocol, current.recipe.id, $event)"
-        />
+        <label class="name-field">
+          <span>配置名称</span>
+          <input
+            class="name"
+            type="text"
+            :value="current.recipe.name"
+            @input="onName(current.protocol, current.recipe.id, $event)"
+          />
+        </label>
         <button
           type="button"
           class="ghost small danger"
@@ -182,19 +183,19 @@ function numbers(values: number[] | undefined): string {
 
       <!-- 影响面：共享是有意的，但得看得见 -->
       <p v-if="referencedBy(current.recipe.id).length" class="impact">
-        <strong>改它会同时影响这 {{ referencedBy(current.recipe.id).length }} 个任务：</strong>
+        <strong>共享配置：修改会应用到以下 {{ referencedBy(current.recipe.id).length }} 个任务</strong>
         <span v-for="(ref, i) in referencedBy(current.recipe.id)" :key="i" class="chip">
           {{ ref.suite }} / {{ ref.task }}
         </span>
       </p>
       <p v-else class="muted impact-none">
-        还没有任务引用它。到上面的套件里勾上，或者它不会产生任何单元。
+        尚未被任务引用。在「编辑套件」中勾选此配置后，才会用于测试。
       </p>
 
       <template v-if="recipeIsAxisEditable(current.recipe)">
         <div v-if="current.protocol === 'tcp'" class="fields">
           <label>
-            <span>socket buffer <code>-w</code></span>
+            <span>套接字缓冲区 <code>-w</code></span>
             <input
               type="text"
               placeholder="留空 = 用 iperf3 默认窗口"
@@ -232,7 +233,7 @@ function numbers(values: number[] | undefined): string {
             />
           </label>
           <label>
-            <span>socket buffer <code>-w</code></span>
+            <span>套接字缓冲区 <code>-w</code></span>
             <input
               type="text"
               placeholder="留空 = 不下发 -w"
@@ -251,15 +252,15 @@ function numbers(values: number[] | undefined): string {
           </label>
         </div>
         <p class="muted hint">
-          档位是<strong>轴</strong>，逐档各跑一轮：填 <code>4m, 64k</code> 就是两档，
-          再配 <code>-P 1, 10</code> 就是 2×2 = 四个测试单元。
+          多个档位用逗号分隔，每种组合各跑一轮。例如缓冲区 <code>4m, 64k</code>
+          搭配并发流 <code>1, 10</code>，会展开为 2 × 2 = 4 个测试单元。
         </p>
       </template>
 
       <div v-else class="frozen">
         <p class="muted">
-          这条配置用的是「固定组合」（{{ current.recipe.profiles.length }} 条），
-          服务端在有固定组合时不看下面的档位——所以这里不给输入框，免得改了不生效。
+          此配置包含 {{ current.recipe.profiles.length }} 条固定组合，测试时按以下组合逐条执行。
+          需要调整参数时，可先转成可编辑档位。
         </p>
         <ul class="mono">
           <li v-for="(profile, i) in current.recipe.profiles" :key="i">
@@ -274,82 +275,72 @@ function numbers(values: number[] | undefined): string {
         </button>
       </div>
     </div>
+    <div v-else class="empty">
+      <strong>添加第一条流量配置</strong>
+      <p>选择添加 TCP 或 UDP 配置，设置带宽、缓冲区与并发流档位。</p>
+    </div>
   </div>
 </template>
 
 <style scoped>
-.split { display: grid; grid-template-columns: 216px minmax(0, 1fr); gap: 12px; align-items: start; }
+.split { display: grid; grid-template-columns: 236px minmax(0, 1fr); gap: 20px; align-items: start; }
 .list {
-  display: flex; flex-direction: column; gap: 4px;
-  max-height: min(480px, calc(100vh - 300px));
-  overflow-y: auto; overscroll-behavior: contain; padding-right: 4px;
-  scrollbar-gutter: stable;
+  display: flex; flex-direction: column; gap: 6px; max-height: min(620px, calc(100vh - 240px));
+  overflow-y: auto; overscroll-behavior: contain; padding-right: 6px; scrollbar-gutter: stable;
 }
-.list-group {
-  margin: 6px 0 2px; padding-left: 4px;
-  font: 600 10.5px/1 var(--fm); letter-spacing: .18em; color: var(--muted);
-}
+.list-group { display: flex; align-items: center; justify-content: space-between; margin: 10px 0 3px; padding: 0 8px; font-size: 12px; font-weight: 600; color: var(--muted); }
+.list-group:first-child { margin-top: 0; }
+.list-group > span:last-child { font-size: 11px; font-variant-numeric: tabular-nums; }
 .list-item {
-  display: flex; flex-direction: column; gap: 2px;
-  padding: 7px 9px; text-align: left;
-  border: 1px solid transparent; border-radius: 5px;
-  background: transparent; color: var(--ink); font: inherit; cursor: pointer;
+  display: flex; flex-direction: column; gap: 5px; padding: 12px; text-align: left;
+  border: 1px solid transparent; border-radius: 7px; background: transparent; color: var(--ink); font: inherit; cursor: pointer;
 }
 .list-item:hover { background: var(--head); }
-.list-item.on {
-  background: var(--surface); border-color: var(--line);
-  box-shadow: inset 3px 0 0 var(--accent); font-weight: 600;
-}
-.list-name { font-size: 13px; overflow-wrap: anywhere; }
-.list-meta { font-size: 11px; color: var(--muted); font-weight: 400; overflow-wrap: anywhere; }
-.add { margin-bottom: 2px; }
-
-.detail {
-  min-width: 0; padding: 11px 12px;
-  border: 1px solid var(--line); border-radius: 6px; background: var(--surface);
-}
-.detail-head { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
-.detail-head .name { flex: 1 1 170px; font-weight: 700; }
-.proto {
-  flex: 0 0 auto; padding: 2px 7px; border-radius: 3px;
-  background: var(--panel-2); color: var(--muted); font-size: 11px;
-}
-.impact {
-  margin: 9px 0 0; padding: 7px 10px; font-size: 12px;
-  border-left: 3px solid var(--focus); background: var(--info-bg);
-}
-.impact-none { margin: 9px 0 0; font-size: 12px; }
-.chip {
-  display: inline-block; margin: 2px 4px 0 0; padding: 1px 6px;
-  border-radius: 3px; background: var(--surface); font-size: 11.5px;
-}
-.fields {
-  display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
-  gap: 10px; margin: 11px 0 0;
-}
-label { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
-label span { font-size: 11.5px; color: var(--muted); }
-input {
-  padding: 6px 8px; border: 1px solid var(--line); border-radius: 4px;
-  background: var(--surface); color: var(--ink); font: inherit; font-size: 13px; min-width: 0;
-  cursor: text; box-shadow: inset 0 0 0 1px var(--bezel-hi);
-}
+.list-item.on { background: var(--info-bg); border-color: var(--line); box-shadow: inset 3px 0 0 var(--accent); }
+.list-name { font-size: 13px; font-weight: 600; overflow-wrap: anywhere; }
+.list-meta { font-size: 11px; line-height: 1.55; color: var(--muted); overflow-wrap: anywhere; }
+.add { margin: 1px 0 12px; }
+.detail { min-width: 0; padding: 20px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface); }
+.detail-head { display: flex; align-items: flex-end; gap: 12px; flex-wrap: wrap; }
+.name-field { flex: 1 1 170px; }
+.name-field .name { font-weight: 600; font-size: 14px; }
+.proto { flex: 0 0 auto; align-self: flex-start; margin-top: 25px; padding: 4px 8px; border-radius: 4px; background: var(--info-bg); color: var(--accent); font-size: 11px; font-weight: 700; }
+.impact { margin: 18px 0 0; padding: 12px; font-size: 12px; border-left: 3px solid var(--focus); background: var(--info-bg); border-radius: 0 5px 5px 0; }
+.impact strong { display: block; margin-bottom: 6px; font-weight: 600; }
+.impact-none { margin: 18px 0 0; padding: 10px 12px; background: var(--panel-2); border-radius: 5px; font-size: 12px; }
+.chip { display: inline-block; margin: 3px 5px 0 0; padding: 3px 7px; border-radius: 4px; background: var(--surface); font-size: 11px; overflow-wrap: anywhere; }
+.fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px 16px; margin: 22px 0 0; }
+label { display: flex; flex-direction: column; gap: 7px; min-width: 0; }
+label > span { font-size: 12px; color: var(--muted); }
+input { width: 100%; min-height: 38px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 5px; background: var(--surface); color: var(--ink); font: inherit; font-size: 13px; min-width: 0; cursor: text; }
 input:hover { border-color: var(--accent); }
-input:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
-.hint { margin: 9px 0 0; font-size: 12px; }
-.frozen { margin: 11px 0 0; font-size: 12.5px; }
-.frozen ul { margin: 6px 0 8px; padding-left: 20px; }
-.ghost {
-  padding: 5px 12px; border: 1px solid var(--line); border-radius: 4px;
-  background: var(--surface); color: var(--ink); font: inherit; font-size: 12.5px; cursor: pointer;
-}
-.ghost.small { padding: 3px 10px; font-size: 12px; }
-.ghost.danger { border-color: var(--bad); color: var(--bad); }
+input:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.hint { margin: 20px 0 0; padding-top: 14px; border-top: 1px solid var(--line); font-size: 12px; line-height: 1.8; }
+.frozen { margin: 18px 0 0; font-size: 12.5px; }
+.frozen > p { line-height: 1.7; }
+.frozen ul { margin: 12px 0 16px; padding: 12px 12px 12px 30px; border-radius: 5px; background: var(--panel-2); line-height: 1.9; overflow-wrap: anywhere; }
+.ghost { min-height: 36px; padding: 7px 12px; border: 1px solid var(--line); border-radius: 5px; background: var(--surface); color: var(--ink); font: inherit; font-size: 12px; cursor: pointer; }
+.ghost.small { font-size: 12px; }
+.ghost.danger { color: var(--bad); }
 .muted { color: var(--muted); }
-.mono { font-family: var(--fm); }
-code { font-family: var(--fm); }
-@media (max-width: 860px) {
+.mono, code { font-family: var(--fm); }
+.empty { padding: 24px; border: 1px dashed var(--line); border-radius: 8px; }
+.empty strong { font-size: 14px; }
+.empty p { font-size: 13px; color: var(--muted); }
+@media (max-width: 1000px) {
+  .split { grid-template-columns: 190px minmax(0, 1fr); gap: 14px; }
+  .detail { padding: 16px; }
+}
+@media (max-width: 760px) {
   .split { grid-template-columns: minmax(0, 1fr); }
-  .list { max-height: 220px; }
+  .list { max-height: 240px; padding: 8px; border: 1px solid var(--line); border-radius: 7px; background: var(--panel-2); }
+  .list-item { background: var(--surface); }
+}
+@media (max-width: 480px) {
+  .fields { grid-template-columns: minmax(0, 1fr); }
+  .detail { padding: 14px; }
+  .detail-head { gap: 8px; }
+  .proto { padding: 4px 6px; }
+  .name-field { flex-basis: 130px; }
 }
 </style>

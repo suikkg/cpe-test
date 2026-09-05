@@ -129,139 +129,155 @@ onMounted(load);
   <section class="view">
     <header class="view-head">
       <h2>历史运行</h2>
-      <p class="muted">
-        每一轮的报告、逐样本 CSV 和原始输出。远程访问时用「下载包」把整个目录取回本地。
-      </p>
+      <p class="muted">取回每一轮的报告与原始数据，也可以恢复报告或载入计划重新执行。</p>
     </header>
 
     <div class="bar">
-      <button type="button" class="ghost" :disabled="loading" @click="load">
-        {{ loading ? '刷新中…' : '刷新' }}
-      </button>
-      <span class="muted">{{ entries.length }} 轮</span>
+      <div class="list-heading">
+        <strong>运行记录 <span class="count">{{ entries.length }}</span></strong>
+        <button type="button" class="ghost" :disabled="loading || !!busy" @click="load">
+          {{ loading ? '刷新中…' : '刷新' }}
+        </button>
+      </div>
       <label class="switch">
         <input v-model="skipPassed" type="checkbox" />
-        <span>重新执行时跳过 24 小时内已 PASS 的单元（RESUME）</span>
+        <span><strong>重新执行时启用 RESUME</strong><small>跳过 24 小时内已 PASS 的单元</small></span>
       </label>
     </div>
 
     <p v-if="error" class="bad" role="alert">{{ error }}</p>
-    <p v-if="notice" class="ok" role="status">{{ notice }}</p>
+    <p v-if="notice" class="notice" role="status">{{ notice }}</p>
 
-    <div v-if="entries.length === 0 && !loading" class="empty">
-      还没有跑过测试。
+    <div v-if="loading && entries.length === 0" class="empty" role="status">正在读取运行记录…</div>
+    <div v-else-if="entries.length === 0 && !error" class="empty">
+      <strong>还没有运行记录</strong>
+      <p>完成一轮测试后，可在这里下载报告、样本 CSV 和原始输出。</p>
+      <button type="button" @click="goto('run')">前往执行</button>
     </div>
-    <div v-else class="scroll">
-      <table>
+    <div v-else-if="entries.length" class="scroll" tabindex="0" role="region" aria-label="历史运行记录，可横向滚动">
+      <table :aria-busy="loading || !!busy">
         <thead>
           <tr>
-            <th>运行</th><th>时间</th><th>产物</th><th class="num">大小</th><th>操作</th>
+            <th scope="col">运行 / 时间</th><th scope="col">产物</th><th scope="col" class="num">大小</th><th scope="col">操作</th>
           </tr>
         </thead>
         <tbody>
-          <tr v-for="entry in entries" :key="entry.id">
-            <td class="mono">{{ entry.id }}</td>
-            <td class="muted">{{ entry.modified || '—' }}</td>
+          <tr v-for="entry in entries" :key="entry.id" :class="{ working: busy === entry.id }">
+            <td class="run-identity">
+              <strong class="mono">{{ entry.id }}</strong>
+              <span class="muted">{{ entry.modified || '时间未知' }}</span>
+              <span v-if="busy === entry.id" class="working-label" role="status">正在处理…</span>
+            </td>
             <td>
-              <span v-if="entry.has_report" class="chip ok">报告</span>
-              <span v-if="entry.has_xlsx" class="chip">Excel</span>
-              <span
-                v-if="entry.has_rows"
-                class="chip"
-                title="目录里有 rows.jsonl（每个单元跑完即落盘的结果明细），可以据此重新渲染报告"
-              >
-                结果明细
-              </span>
-              <span v-if="!entry.has_report && !entry.has_rows" class="chip warn">仅日志</span>
+              <div class="artifacts">
+                <span v-if="entry.has_report" class="chip ready">报告</span>
+                <span v-if="entry.has_xlsx" class="chip">Excel</span>
+                <span
+                  v-if="entry.has_rows"
+                  class="chip"
+                  title="已有逐单元结果明细，可用来重新生成报告"
+                >结果明细</span>
+                <span v-if="!entry.has_report && !entry.has_rows" class="chip warn">仅日志</span>
+              </div>
             </td>
             <td class="num mono">{{ size(entry.bytes) }}</td>
-            <td class="actions">
-              <a class="dl" :href="bundleUrl(entry.id)" :download="`${entry.id}.zip`">下载包</a>
-              <button
-                v-if="entry.has_rows"
-                type="button"
-                class="ghost small"
-                :disabled="busy === entry.id"
-                :title="
-                  entry.has_report
-                    ? '用 rows.jsonl 重新渲染报告，覆盖现有的 report.html 与 summary.xlsx'
-                    : '这一轮没写出报告，用 rows.jsonl 把它放出来'
-                "
-                @click="replay(entry)"
-              >
-                {{ entry.has_report ? '重新生成报告' : '恢复报告' }}
-              </button>
-              <button
-                v-if="entry.has_request"
-                type="button"
-                class="ghost small"
-                :disabled="busy === entry.id"
-                title="把这一轮的计划装载回控制台并跳到「执行」页预览；确认无误后再点「开始测试」"
-                @click="rerun(entry)"
-              >
-                重新执行
-              </button>
+            <td>
+              <div class="actions">
+                <a class="dl" :href="bundleUrl(entry.id)" :download="`${entry.id}.zip`">下载包</a>
+                <button
+                  v-if="entry.has_rows"
+                  type="button"
+                  class="ghost small"
+                  :disabled="!!busy"
+                  :title="entry.has_report ? '用已保存的结果明细重新生成报告，覆盖现有报告与 Excel' : '用已保存的结果明细恢复这一轮报告'"
+                  @click="replay(entry)"
+                >{{ entry.has_report ? '重新生成报告' : '恢复报告' }}</button>
+                <button
+                  v-if="entry.has_request"
+                  type="button"
+                  class="ghost small"
+                  :disabled="!!busy"
+                  title="载入这一轮的计划并跳到「执行」页预览，确认后再开始测试"
+                  @click="rerun(entry)"
+                >重新执行</button>
+              </div>
             </td>
           </tr>
         </tbody>
       </table>
     </div>
 
-    <dl class="legend">
-      <dt>结果明细</dt>
-      <dd>
-        目录里有 <code>rows.jsonl</code>——每个单元跑完就追加落盘的结果行。
-        主控崩溃/断电时报告可能还没写出来，但这份数据在，所以随时可以按上面的按钮
-        把报告重新渲染出来（命令行等价物是
-        <code>cpe_test report runs/&lt;目录&gt;</code>）。<strong>不要求先没有报告</strong>：
-        重放是幂等的，同一批行放几次都是同一份报告。
-      </dd>
-      <dt>重新执行</dt>
-      <dd>
-        目录里有 <code>request.json</code>，即这一轮的完整计划原文（控制台发起的运行才有）。
-        点它会把计划装载回控制台并跳到「执行」页预览一次——<strong>不会直接开跑</strong>：
-        隔了一夜网口拓扑可能变了，该看到的是复核页上的差异，而不是一轮悄悄少跑几条链路的测试。
-      </dd>
-      <dt>崩溃之后怎么办</dt>
-      <dd>
-        先看这一行有没有「结果明细」。有就点「恢复报告」，已完成的部分会变成一份完整报告；
-        再点「重新执行」并勾上上面的 RESUME，只有失败和没跑到的单元会重来。
-        <strong>崩溃恢复的语义是「结果不丢，但运行本身不续跑」</strong>——被打断的那个单元
-        会整个重跑，而不是接着半份测量往下算。
-      </dd>
-    </dl>
+    <p v-if="entries.length" class="download-hint muted">「下载包」包含这一轮的全部产物，远程访问时也可以取回本地。</p>
+
+    <details class="help">
+      <summary><strong>报告恢复与重新执行说明</strong></summary>
+      <dl class="legend">
+        <dt>结果明细与报告恢复</dt>
+        <dd>
+          每个单元完成后都会保存结果明细。即使主控崩溃或断电，已有明细仍可通过「恢复报告」生成报告。
+          已有报告时，可用「重新生成报告」更新报告与 Excel。
+        </dd>
+        <dt>重新执行</dt>
+        <dd>
+          有完整计划的记录会显示「重新执行」。点击后载入该轮计划，并前往「执行」页预览；
+          检查当前网口与单元列表后，再点击「开始测试」。
+        </dd>
+        <dt>测试被中断后</dt>
+        <dd>
+          先恢复报告，查看已完成的结果，再启用 RESUME 并「重新执行」。
+          24 小时内已 PASS 的单元会被跳过，被中断的单元会从头重跑。
+        </dd>
+      </dl>
+    </details>
   </section>
 </template>
 
 <style scoped>
-.bar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin: 0 0 14px; }
-.switch { display: flex; align-items: center; gap: 6px; font-size: 13px; }
-.scroll { max-width: 100%; overflow-x: auto; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); }
-table { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 13px; }
-th, td { padding: 8px 11px; text-align: left; border-bottom: 1px solid var(--line); }
-thead th { background: var(--head); font-size: 11.5px; color: var(--muted); white-space: nowrap; }
+.bar { margin: 0 0 16px; padding: 16px 18px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel-2); }
+.list-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.list-heading > strong { display: flex; align-items: center; gap: 10px; font-size: 14px; }
+.count { padding: 1px 7px; border: 1px solid var(--line); border-radius: 4px; background: var(--surface); color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.switch { display: flex; align-items: flex-start; gap: 9px; margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--line); font-size: 13px; cursor: pointer; }
+.switch input { margin: 4px 0 0; accent-color: var(--accent); }
+.switch strong { font-weight: 500; }
+.switch small { margin-left: 12px; font-size: 12px; color: var(--muted); }
+.scroll { max-width: 100%; overflow-x: auto; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); }
+table { width: 100%; min-width: 700px; border-collapse: separate; border-spacing: 0; font-size: 13px; }
+th, td { padding: 14px; text-align: left; border-bottom: 1px solid var(--line); }
+thead th { padding-block: 10px; background: var(--head); font-size: 11.5px; color: var(--muted); white-space: nowrap; }
 tbody tr:last-child td { border-bottom: 0; }
-.num { text-align: right; font-variant-numeric: tabular-nums; }
-.actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.chip {
-  display: inline-block; margin-right: 5px; padding: 1px 6px;
-  border-radius: 3px; background: var(--panel-2); color: var(--muted); font-size: 11px;
-}
-.chip.ok { background: var(--ok-bg); color: var(--ok); }
-.chip.warn { background: var(--info-bg); color: var(--focus); }
-.dl { color: var(--accent); }
-.ghost {
-  padding: 6px 14px; border: 1px solid var(--line); border-radius: 4px;
-  background: var(--surface); color: var(--ink); font: inherit; cursor: pointer;
-}
-.ghost.small { padding: 3px 10px; font-size: 12px; }
-.ghost:disabled { opacity: .55; cursor: default; }
-.empty { padding: 14px 16px; border: 1px dashed var(--line); border-radius: 6px; color: var(--muted); background: var(--panel-2); }
-.bad { margin: 0 0 12px; padding: 9px 12px; border-left: 3px solid var(--bad); background: var(--bad-bg); }
-.ok { margin: 0 0 12px; padding: 9px 12px; border-left: 3px solid var(--ok); background: var(--ok-bg); overflow-wrap: anywhere; }
-.legend { margin: 16px 0 0; font-size: 12.5px; }
-.legend dt { margin: 10px 0 3px; font-weight: 700; }
-.legend dd { margin: 0; color: var(--muted); }
+tbody tr:hover, tbody tr.working { background: var(--panel-2); }
+.run-identity { min-width: 240px; }
+.run-identity > strong { display: block; font-size: 12px; font-weight: 600; overflow-wrap: anywhere; }
+.run-identity > span { display: block; margin-top: 4px; font-size: 11.5px; }
+.working-label { color: var(--accent); }
+.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.artifacts { display: flex; flex-wrap: wrap; gap: 5px; min-width: 120px; }
+.actions { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; min-width: 180px; }
+.chip { display: inline-block; padding: 2px 6px; border: 1px solid var(--line); border-radius: 3px; background: var(--panel-2); color: var(--muted); font-size: 11px; white-space: nowrap; }
+.chip.ready { border-color: transparent; background: var(--ok-bg); color: var(--ok); }
+.chip.warn { border-color: transparent; background: var(--info-bg); color: var(--focus); }
+.dl { display: inline-flex; align-items: center; justify-content: center; min-height: 33px; padding: 5px 10px; border: 1px solid var(--accent); border-radius: 5px; color: var(--accent); font-size: 12px; font-weight: 600; text-decoration: none; white-space: nowrap; }
+.dl:hover { background: var(--info-bg); }
+.ghost { padding: 7px 14px; border: 1px solid var(--line); border-radius: 5px; background: var(--surface); color: var(--ink); font: inherit; cursor: pointer; }
+.ghost.small { min-height: 33px; padding: 5px 10px; font-size: 12px; white-space: nowrap; }
+.ghost:disabled { opacity: .55; cursor: not-allowed; }
+.empty { padding: 30px 24px; border: 1px dashed var(--line); border-radius: 7px; color: var(--muted); background: var(--panel-2); }
+.empty strong { display: block; font-size: 15px; color: var(--ink); }
+.empty p { margin: 6px 0 16px; max-width: 60ch; font-size: 13px; }
+.bad { margin: 0 0 12px; padding: 10px 13px; border-left: 3px solid var(--bad); background: var(--bad-bg); overflow-wrap: anywhere; }
+.notice { margin: 0 0 12px; padding: 10px 13px; border-left: 3px solid var(--ok); background: var(--ok-bg); overflow-wrap: anywhere; }
+.download-hint { margin: 10px 0 0; font-size: 12px; }
+.help { margin-top: 24px; border-top: 1px solid var(--line); }
+.help > summary { padding: 15px 0; font-size: 13px; cursor: pointer; }
+.legend { margin: 0; padding: 0 0 8px 18px; font-size: 12.5px; max-width: 80ch; }
+.legend dt { margin: 12px 0 4px; font-weight: 700; }
+.legend dt:first-child { margin-top: 0; }
+.legend dd { margin: 0; color: var(--muted); line-height: 1.7; }
 .mono { font-family: var(--fm); }
-code { font-family: var(--fm); }
+@media (max-width: 600px) {
+  .bar { padding: 14px; }
+  .switch small { display: block; margin: 4px 0 0; }
+  .actions { gap: 6px; }
+}
 </style>

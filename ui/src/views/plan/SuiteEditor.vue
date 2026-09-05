@@ -190,21 +190,22 @@ function has(list: string[] | undefined, value: string): boolean {
 <template>
   <div class="split">
     <!-- 左：套件列表 -->
-    <div class="list" role="listbox" aria-label="套件">
+    <div class="list" role="group" aria-label="选择套件">
       <button
         v-for="suite in plan.ui.suites"
         :key="suite.id"
         type="button"
-        role="option"
         class="list-item"
         :class="{ on: current?.id === suite.id }"
-        :aria-selected="current?.id === suite.id"
+        :aria-pressed="current?.id === suite.id"
         @click="selectedId = suite.id"
       >
         <span class="list-name">{{ suite.name || '(未命名)' }}</span>
         <span class="list-meta">
-          {{ suiteOutline(suite) }} ·
-          {{ boundSets(suite.id) ? `已分配 ${boundSets(suite.id)}` : '未分配' }}
+          {{ suiteOutline(suite) }}
+        </span>
+        <span class="list-meta">
+          {{ boundSets(suite.id) ? `已分配给 ${boundSets(suite.id)} 个链路集合` : '尚未分配链路集合' }}
         </span>
       </button>
       <button type="button" class="ghost add" @click="onAddSuite">+ 新增套件</button>
@@ -213,21 +214,25 @@ function has(list: string[] | undefined, value: string): boolean {
     <!-- 右：编辑选中的那一个 -->
     <div v-if="current" class="detail">
       <div class="detail-head">
-        <input
-          class="name"
-          type="text"
-          :value="current.name"
-          aria-label="套件名称"
-          @input="onSuiteField(current.id, 'name', $event)"
-        />
-        <input
-          class="note"
-          type="text"
-          placeholder="备注（可留空）"
-          :value="current.note"
-          aria-label="套件备注"
-          @input="onSuiteField(current.id, 'note', $event)"
-        />
+        <label class="name-field">
+          <span>套件名称</span>
+          <input
+            class="name"
+            type="text"
+            :value="current.name"
+            @input="onSuiteField(current.id, 'name', $event)"
+          />
+        </label>
+        <label class="note-field">
+          <span>备注 <small>可选</small></span>
+          <input
+            class="note"
+            type="text"
+            placeholder="说明此套件的用途"
+            :value="current.note"
+            @input="onSuiteField(current.id, 'note', $event)"
+          />
+        </label>
         <button
           type="button"
           class="ghost small"
@@ -251,15 +256,22 @@ function has(list: string[] | undefined, value: string): boolean {
         </button>
       </div>
 
-      <p class="muted outline">按顺序执行：{{ suiteOutline(current) }}</p>
+      <div class="outline">
+        <strong>{{ current.tasks.length }} 个任务</strong>
+        <span class="muted">按顺序执行：{{ suiteOutline(current) }}</span>
+        <span class="muted">展开任务可调整方向、IP 与参数</span>
+      </div>
 
       <ol class="tasks">
         <li v-for="(task, ti) in current.tasks" :key="task.id" class="task">
           <div class="task-row">
+            <span class="task-number" :aria-label="`第 ${ti + 1} 个任务`">{{ ti + 1 }}</span>
             <button
               type="button"
               class="disclose"
               :aria-expanded="openTasks.includes(task.id)"
+              :aria-controls="`task-settings-${task.id}`"
+              :aria-label="`${openTasks.includes(task.id) ? '收起' : '展开'} ${task.name || '任务'} 的配置`"
               :title="openTasks.includes(task.id) ? '收起' : '展开配置'"
               @click="toggleTask(task.id)"
             >
@@ -280,36 +292,40 @@ function has(list: string[] | undefined, value: string): boolean {
               @input="onTaskName(current.id, task.id, $event)"
             />
             <span class="task-summary muted">{{ taskSummary(task) }}</span>
-            <button
-              type="button"
-              class="ghost tiny"
-              :disabled="ti === 0"
-              title="上移（套件里的任务按顺序执行）"
-              @click="plan.ui = moveTask(plan.ui, current.id, task.id, -1)"
-            >
-              ↑
-            </button>
-            <button
-              type="button"
-              class="ghost tiny"
-              :disabled="ti === current.tasks.length - 1"
-              title="下移"
-              @click="plan.ui = moveTask(plan.ui, current.id, task.id, 1)"
-            >
-              ↓
-            </button>
-            <button
-              type="button"
-              class="ghost tiny danger"
-              :disabled="current.tasks.length <= 1"
-              :title="current.tasks.length <= 1 ? '套件至少要留一个任务' : '删除这个任务'"
-              @click="plan.ui = removeTask(plan.ui, current.id, task.id)"
-            >
-              删除
-            </button>
+            <div class="task-actions">
+              <button
+                type="button"
+                class="ghost tiny"
+                :disabled="ti === 0"
+                title="上移（套件里的任务按顺序执行）"
+                :aria-label="`上移 ${task.name || '任务'}`"
+                @click="plan.ui = moveTask(plan.ui, current.id, task.id, -1)"
+              >
+                ↑
+              </button>
+              <button
+                type="button"
+                class="ghost tiny"
+                :disabled="ti === current.tasks.length - 1"
+                title="下移"
+                :aria-label="`下移 ${task.name || '任务'}`"
+                @click="plan.ui = moveTask(plan.ui, current.id, task.id, 1)"
+              >
+                ↓
+              </button>
+              <button
+                type="button"
+                class="ghost tiny danger"
+                :disabled="current.tasks.length <= 1"
+                :title="current.tasks.length <= 1 ? '套件至少要留一个任务' : '删除这个任务'"
+                @click="plan.ui = removeTask(plan.ui, current.id, task.id)"
+              >
+                删除
+              </button>
+            </div>
           </div>
 
-          <div v-if="openTasks.includes(task.id)" class="task-body">
+          <div v-if="openTasks.includes(task.id)" :id="`task-settings-${task.id}`" class="task-body">
             <fieldset>
               <legend>方向</legend>
               <label v-for="direction in DIRECTIONS" :key="direction" class="check">
@@ -334,10 +350,10 @@ function has(list: string[] | undefined, value: string): boolean {
               </label>
             </fieldset>
 
-            <fieldset v-if="task.protocol !== 'ping'">
+            <fieldset v-if="task.protocol !== 'ping'" class="wide recipe-fieldset">
               <legend>配置（多选 = 各跑一遍）</legend>
               <span v-if="recipesFor(task.protocol).length === 0" class="muted small-hint">
-                还没有 {{ task.protocol.toUpperCase() }} 配置，去下面「流量配置」加一条
+                还没有 {{ task.protocol.toUpperCase() }} 配置，请在「编辑流量配置」中添加。
               </span>
               <div
                 v-for="recipe in recipesFor(task.protocol)"
@@ -361,7 +377,7 @@ function has(list: string[] | undefined, value: string): boolean {
                   :aria-label="`编辑 ${recipe.name} 的参数`"
                   @click="emit('editRecipe', recipe.id)"
                 >
-                  编辑参数 →
+                  编辑参数
                 </button>
               </div>
               <span v-if="task.recipe_ids.length === 0" class="muted small-hint">
@@ -369,7 +385,7 @@ function has(list: string[] | undefined, value: string): boolean {
               </span>
             </fieldset>
 
-            <fieldset v-else>
+            <fieldset v-else class="wide ping-fieldset">
               <legend>PING 参数</legend>
               <label class="inline">
                 <span>次数</span>
@@ -392,7 +408,7 @@ function has(list: string[] | undefined, value: string): boolean {
               </label>
             </fieldset>
 
-            <fieldset>
+            <fieldset class="wide duration-fieldset">
               <legend>本任务时长</legend>
               <label class="inline">
                 <span>秒</span>
@@ -449,7 +465,7 @@ function has(list: string[] | undefined, value: string): boolean {
       </ol>
 
       <div class="task-add">
-        <span class="muted">加一条任务：</span>
+        <span class="muted">添加任务</span>
         <button
           v-for="p in PROTOCOLS"
           :key="p.id"
@@ -465,96 +481,89 @@ function has(list: string[] | undefined, value: string): boolean {
 </template>
 
 <style scoped>
-.per-direction-bidir { margin: 4px 0 0; }
-.per-direction-bidir > summary { color: var(--muted); cursor: pointer; font-size: 12px; }
-.split { display: grid; grid-template-columns: 216px minmax(0, 1fr); gap: 12px; align-items: start; }
-.list {
-  display: flex; flex-direction: column; gap: 4px;
-  max-height: min(480px, calc(100vh - 300px));
-  overflow-y: auto; overscroll-behavior: contain; padding-right: 4px;
-  scrollbar-gutter: stable;
-}
-.list-item {
-  display: flex; flex-direction: column; gap: 2px;
-  padding: 7px 9px; text-align: left;
-  border: 1px solid transparent; border-radius: 5px;
-  background: transparent; color: var(--ink); font: inherit; cursor: pointer;
-}
+.split { display: grid; grid-template-columns: 236px minmax(0, 1fr); gap: 20px; align-items: start; }
+.list { display: flex; flex-direction: column; gap: 6px; max-height: min(620px, calc(100vh - 240px)); overflow-y: auto; overscroll-behavior: contain; padding-right: 6px; scrollbar-gutter: stable; }
+.list-item { display: flex; flex-direction: column; gap: 5px; padding: 12px; text-align: left; border: 1px solid transparent; border-radius: 7px; background: transparent; color: var(--ink); font: inherit; cursor: pointer; }
 .list-item:hover { background: var(--head); }
-.list-item.on {
-  background: var(--surface); border-color: var(--line);
-  box-shadow: inset 3px 0 0 var(--accent); font-weight: 600;
-}
-.list-name { font-size: 13px; overflow-wrap: anywhere; }
-.list-meta { font-size: 11px; color: var(--muted); font-weight: 400; overflow-wrap: anywhere; }
+.list-item.on { background: var(--info-bg); border-color: var(--line); box-shadow: inset 3px 0 0 var(--accent); }
+.list-name { font-size: 13px; font-weight: 600; overflow-wrap: anywhere; }
+.list-meta { font-size: 11px; line-height: 1.55; color: var(--muted); overflow-wrap: anywhere; }
 .add { margin-top: 4px; }
-
-.detail {
-  min-width: 0; padding: 11px 12px;
-  border: 1px solid var(--line); border-radius: 6px; background: var(--surface);
-}
-.detail-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.detail-head .name { flex: 0 1 190px; font-weight: 700; }
-.detail-head .note { flex: 1 1 160px; }
-.outline { margin: 8px 0 10px; font-size: 12px; }
-
+.detail { min-width: 0; padding: 20px; border: 1px solid var(--line); border-radius: 9px; background: var(--surface); }
+.detail-head { display: flex; align-items: flex-end; gap: 10px; flex-wrap: wrap; }
+.detail-head > label { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.detail-head label > span { font-size: 12px; color: var(--muted); }
+.detail-head label small { margin-left: 5px; font-size: 10px; }
+.name-field { flex: 1 1 170px; }
+.note-field { flex: 1 1 200px; }
+.detail-head .name { font-weight: 600; font-size: 14px; }
+.outline { display: flex; align-items: baseline; gap: 5px 12px; flex-wrap: wrap; margin: 20px 0 12px; font-size: 12px; }
+.outline > strong { font-size: 13px; }
+.outline > span:last-child { flex-basis: 100%; font-size: 11px; }
 .tasks { margin: 0; padding: 0; list-style: none; }
-.task { margin: 0 0 6px; border: 1px solid var(--line); border-radius: 5px; background: var(--canvas); }
-.task-row { display: flex; align-items: center; gap: 7px; padding: 6px 8px; flex-wrap: wrap; }
-.task-row .name { flex: 0 1 130px; font-weight: 600; }
-.task-summary { flex: 1 1 180px; min-width: 0; font-size: 11.5px; overflow-wrap: anywhere; }
-.disclose {
-  flex: 0 0 auto; width: 20px; padding: 0;
-  border: 0; background: none; color: var(--muted); font: inherit; cursor: pointer;
-}
-.task-body {
-  display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
-  gap: 9px; padding: 0 8px 8px; border-top: 1px solid var(--line); padding-top: 9px;
-}
-fieldset { margin: 0; padding: 6px 8px; border: 1px solid var(--line); border-radius: 5px; min-width: 0; }
+.task { margin: 0 0 10px; border: 1px solid var(--line); border-radius: 7px; background: var(--panel-2); }
+.task-row { display: grid; grid-template-columns: 22px 30px 80px minmax(90px, 1fr) auto; align-items: center; gap: 8px; padding: 12px; }
+.task-number { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; text-align: center; }
+.task-row .name { width: 100%; font-weight: 600; }
+.task-summary { grid-row: 2; grid-column: 3 / -1; min-width: 0; font-size: 11px; line-height: 1.6; overflow-wrap: anywhere; }
+.task-actions { display: flex; align-items: center; gap: 4px; }
+.disclose { display: flex; justify-content: center; align-items: center; width: 30px; min-height: 34px; padding: 0; border: 1px solid var(--line); border-radius: 4px; background: var(--surface); color: var(--accent); font: inherit; font-size: 16px; cursor: pointer; }
+.disclose:hover { background: var(--head); }
+.task-body { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; padding: 18px 14px 14px; border-top: 1px solid var(--line); background: var(--surface); border-radius: 0 0 7px 7px; }
+fieldset { margin: 0; padding: 12px; border: 1px solid var(--line); border-radius: 6px; min-width: 0; }
 fieldset.wide { grid-column: 1 / -1; }
-legend { padding: 0 4px; font-size: 11px; color: var(--muted); }
-.check { display: flex; align-items: flex-start; gap: 6px; font-size: 12.5px; margin: 3px 0; }
-.check input { width: 15px; height: 15px; flex: 0 0 auto; margin-top: 1px; }
+legend { padding: 0 5px; font-size: 12px; font-weight: 600; color: var(--muted); }
+.check { display: flex; align-items: flex-start; gap: 9px; font-size: 12px; min-height: 32px; padding: 5px 0; cursor: pointer; }
+.check input { width: 17px; height: 17px; flex: 0 0 auto; margin: 1px 0 0; accent-color: var(--accent); cursor: pointer; }
 .check > span { min-width: 0; overflow-wrap: anywhere; }
-.check small { display: block; font-size: 11px; line-height: 1.4; }
-.recipe-choice { display: flex; align-items: center; gap: 6px; }
+.check small { display: block; margin-top: 3px; font-size: 11px; line-height: 1.5; }
+.recipe-choice { display: flex; align-items: center; gap: 12px; padding: 4px 0; border-bottom: 1px solid var(--line); }
+.recipe-choice:last-of-type { border-bottom: 0; }
 .recipe-choice .check { flex: 1 1 auto; min-width: 0; }
-.recipe-edit {
-  margin-left: auto; padding: 1px 6px; border: 0; background: transparent;
-  color: var(--accent); font-size: 11.5px; white-space: nowrap;
-}
+.recipe-edit { margin-left: auto; min-height: 32px; padding: 5px 8px; border: 0; background: transparent; color: var(--accent); font-size: 11px; white-space: nowrap; }
 .recipe-edit:hover { background: var(--head); }
-.inline { display: flex; align-items: center; gap: 6px; margin: 3px 0; font-size: 12.5px; }
-.inline span { color: var(--muted); font-size: 11.5px; }
-.inline input { flex: 1 1 80px; min-width: 0; }
-.small-hint { display: block; margin: 4px 0 0; font-size: 11.5px; line-height: 1.5; }
-input[type='text'], select {
-  padding: 5px 7px; border: 1px solid var(--line); border-radius: 4px;
-  background: var(--surface); color: var(--ink); font: inherit; font-size: 12.5px; min-width: 0;
-  cursor: text; box-shadow: inset 0 0 0 1px var(--bezel-hi);
-}
-.detail-head input { background: var(--surface); }
-input[type='text']:hover { border-color: var(--accent); }
-input:focus-visible, select:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
-.task-add { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 8px 0 0; }
-.ghost {
-  padding: 5px 12px; border: 1px solid var(--line); border-radius: 4px;
-  background: var(--surface); color: var(--ink); font: inherit; font-size: 12.5px; cursor: pointer;
-}
-.ghost.small { padding: 3px 10px; font-size: 12px; }
-.ghost.tiny { padding: 2px 7px; font-size: 12px; }
-.ghost.danger { border-color: var(--bad); color: var(--bad); }
-.ghost:disabled { opacity: .5; cursor: default; }
+.inline { display: grid; grid-template-columns: minmax(120px, .75fr) minmax(0, 1fr); align-items: center; gap: 12px; margin: 7px 0; font-size: 12px; }
+.inline span { color: var(--muted); font-size: 12px; }
+.inline input { width: 100%; min-width: 0; }
+.duration-fieldset .inline { max-width: 380px; }
+.small-hint { display: block; margin: 8px 0 0; font-size: 11px; line-height: 1.7; }
+input[type='text'], select { min-height: 36px; padding: 7px 9px; border: 1px solid var(--line); border-radius: 5px; background: var(--surface); color: var(--ink); font: inherit; font-size: 12px; min-width: 0; }
+input[type='text'] { cursor: text; }
+select { cursor: pointer; }
+input[type='text']:hover, select:hover { border-color: var(--accent); }
+input:focus-visible, select:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.task-add { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 18px 0 0; padding-top: 14px; border-top: 1px solid var(--line); }
+.task-add > span { font-size: 12px; margin-right: 4px; }
+.ghost { min-height: 36px; padding: 7px 12px; border: 1px solid var(--line); border-radius: 5px; background: var(--surface); color: var(--ink); font: inherit; font-size: 12px; cursor: pointer; }
+.ghost.small { font-size: 12px; }
+.ghost.tiny { min-width: 30px; min-height: 32px; padding: 5px 7px; font-size: 11px; }
+.ghost.danger { color: var(--bad); }
+.ghost:disabled { opacity: .45; cursor: not-allowed; }
+.per-direction-bidir { margin: 14px 0 0; padding-top: 10px; border-top: 1px solid var(--line); }
+.per-direction-bidir > summary { color: var(--accent); cursor: pointer; font-size: 12px; line-height: 1.7; }
+.per-direction-bidir[open] > summary { margin-bottom: 12px; }
 .muted { color: var(--muted); }
 .mono { font-family: var(--fm); }
-/* 窄屏退化成上下两段：左列变成一条横向可滚的清单。 */
-@media (max-width: 860px) {
+@media (max-width: 1100px) {
+  .split { grid-template-columns: 190px minmax(0, 1fr); gap: 14px; }
+  .detail { padding: 16px; }
+  .task-row { grid-template-columns: 18px 30px 78px minmax(80px, 1fr); gap: 7px; }
+  .task-actions { grid-column: 3 / -1; justify-content: flex-end; }
+  .task-summary { grid-row: 2; }
+}
+@media (max-width: 760px) {
   .split { grid-template-columns: minmax(0, 1fr); }
-  .list {
-    flex-direction: row; max-height: none; overflow-x: auto; overflow-y: hidden;
-    padding: 0 0 4px; scrollbar-gutter: auto;
-  }
-  .list-item { flex: 0 0 auto; min-width: 150px; }
+  .list { flex-direction: row; max-height: none; overflow-x: auto; overflow-y: hidden; padding: 0 0 8px; scrollbar-gutter: auto; }
+  .list-item { flex: 0 0 200px; border-color: var(--line); }
+  .list > .add { flex: 0 0 auto; margin: 0; }
+}
+@media (max-width: 480px) {
+  .detail { padding: 12px; }
+  .task-row { padding: 10px; grid-template-columns: 16px 28px 76px minmax(65px, 1fr); gap: 6px; }
+  .task-row .name { font-size: 11px; padding-inline: 6px; }
+  .task-body { grid-template-columns: minmax(0, 1fr); gap: 12px; padding: 14px 10px 10px; }
+  .inline { grid-template-columns: minmax(0, 1fr); gap: 5px; margin: 10px 0; }
+  .recipe-choice { align-items: flex-start; gap: 4px; }
+  .recipe-edit { padding-inline: 3px; }
 }
 </style>
