@@ -1,13 +1,13 @@
-# cpe_test v6.2.6 Windows 配置与文档包
+# cpe_test v6.2.7 Windows 配置与文档包
 
-仓库中的 `cpe_test-v6.2.6-windows-config-docs.zip` 是便于从 Git 直接下载的
+仓库中的 `cpe_test-v6.2.7-windows-config-docs.zip` 是便于从 Git 直接下载的
 Windows 配置、说明文档和启动脚本资料包。包内文件由仓库当前版本生成，并由 CI
 逐文件与源码副本比对，避免配置或文档过期。
 
 这个资料包**不包含可执行程序或吞吐工具**：
 
 - 不包含 `cpe_test.exe`；请从 GitHub Release 下载正式
-  `cpe_test-v6.2.6-windows-x86_64.zip`，或自行编译。
+  `cpe_test-v6.2.7-windows-x86_64.zip`，或自行编译。
 - 不包含 `ctsTraffic.exe`；正式 Windows Release ZIP 会捆绑固定并校验过的
   Microsoft ctsTraffic 2.0.4.0 x64。
 - 不包含 `iperf3.exe` 及其 DLL；需要 iperf3 测试时，请放入完整的 Windows
