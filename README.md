@@ -2,6 +2,17 @@
 
 > 两台电脑间自动化 ping + iperf3 / Microsoft ctsTraffic 灌包测试，零 Python/零 PowerShell
 
+## v6.2.9
+
+- **修：Wi-Fi 协商速率一抖，控制台就再也开不了跑**。现场是「任何一次带 Wi-Fi 口的开跑都被拒」，日志固定停在「执行计划与复核页确认的不一致」。查下去：`plan_hash = md5(版本 | config_hash | units_fingerprint)`，而 `units_fingerprint` 是整个 `Unit` 的 `{:?}`——协商速率从三条路漏进闸门（端点的 `speed_mbps`、标题里那句 `en1(…, 2401Mbps, 5GHz)`、以及 `Unit.id`，RESUME identity 里**有意**记着速率）。而 Wi-Fi 的协商速率是 PHY 速率，相邻两次扫描之间就会跳（实测同一块 5G 口 286 / 2401Mbps 交替），控制台预览走连接时缓存的拓扑、执行端开跑前又要重新扫一次。实测两次开跑的 `config_hash` 完全相同、只有单元指纹不同。`ExecutionPlan::topology_hash` 的注释正是为防这件事才把拓扑排除在闸门之外，那个数却从单元里绕了回来。现在算指纹前把**只影响显示、不影响执行**的三样归一掉（`title` / `target_lines` / `Unit.id`）并把端点速率置 0；**RESUME identity 一个字节没动**，换了链路速率的 PASS 仍然不会被复用。两条回归钉住这条边界：只动显示不拦，RNDIS 跟随协商速率裁 `-b`（跑的东西真变了）必须拦。
+- **前端工作台按 `.ai/DESIGN-frontend-workbench.md` 走完 P1–P9**：
+  - **可访问性**：浅色 `--focus` 此前两头不合格（作焦点圈在 `--head` 上 2.74:1、作 11px 告警文字在 `--info-bg` 上 2.64:1），拆成 `--focus` 与 `--warn` 两个色；另修掉一个悬空 token（`var(--warn)` 从未定义，那条 `border` 整条作废）。1440/720/360 × 亮暗六种组合下，七个页面的横向溢出与文字对比度不合格均为 0。
+  - **状态可信度**：新增 `NetworkError` 区分「服务端说失败」与「连应答都没有」。读到运行状态之前显示「运行状态待同步」而不是「空闲」；轮询断线只标旧不清数据（已完成单元、日志、游标原样留着）；轮询里的 401 以前被静默吞掉、一秒一拍地刷，现在进全局终态并停链；开始/停止拿不到应答时**绝不重发**，只去读一次状态——重发一次「开始」就是两轮同时灌包。连接身份与表单草稿分开，连接/重扫失败保留上次成功的网卡表并标明是哪台、什么时候。
+  - **找得到**：本机网卡、链路集合、预览单元、已完成单元、历史运行五处加页内搜索（一份规则：字面量、大小写不敏感、多词 AND、不重排），各自可选中看详情；分配表的整列操作仍作用于全部链路集合，界面写明作用域。进度页六张统计卡换成一行可点筛选，日志默认跟随、一往上翻就停。监控从「全部曲线向下堆叠」改成左选右看。
+  - **组件库**：真装了 Reka UI 试点后**决定不引入**——只为 Tabs 一族就让单文件产物涨 13.7KB（+5.4%），自写的 `UiTabs` 只要 821 字节且行为更完整。
+  - **伴随页面**：辅测状态页与离线报告的字体顺序此前是反的（Windows 是主战场，`Segoe UI` 要在前）；协商速率未知统一写「未获取」而不是 `—`；两条结构断言钉住「辅测页只读且自包含」与「报告不联网」。
+- **回归验证**：Rust 646/646、前端 Vitest 246/246、格式检查、Linux/Windows Clippy、前端产物溯源戳、dist 配置文档包 SHA-256 与 22 项逐条比对全部通过。浏览器验收在真实控制台 + 本机 agent 上逐阶段完成（含一轮真实运行）；双机 Windows 的最终验收仍然缺席，缺在哪里记在方案文档里。
+
 ## v6.2.8
 
 - **单向腿也能按「这一对网口」设门限**（套件里的任务勾了 A→B / B→A 就出现「单向的接收门限」两格；配置文件里对应新增的 `rate_targets_single_mbps`，`universal_params` 与每个 test 都可写）：门限链里此前**只有双向**有这一层——`rate_targets_bidir` 排在按网口门限之前，而单向那条腿只能拿收口网卡上那个数。挂在网卡上的一个数没法同时对这块口的所有对端成立：同一块 SGMII2.5G 口，对端是 1G 口时，收口上挂的 1800/2000 在这条路径上物理就跑不到。v6.2.6 那道路径上限封顶只能把它折算到线速的 95%（1G 上是 950），而现场实测 934~984 正好骑在 950 上——它是防离谱值的安全网，不是「这条链路该验收多少」。现在单向与双向两套数对称、互不串台（双向同时灌包时两个方向互相抢，拿单向的数去卡双向必然判 `RATE_FAIL`），计划预览多一个来源标签「单向方向门限」。
@@ -568,7 +579,7 @@ CPE（Customer Premises Equipment）子网测试工具用于在**两台电脑之
 ```
 cpe_test.exe          ← 本工具（单文件）
 iperf3.exe            ← 从 iperf.fr 下载（只测 Ping/ctsTraffic 可不放）
-ctsTraffic.exe        ← v6.2.8 Windows Release 已捆绑（仅 Windows 10+）
+ctsTraffic.exe        ← v6.2.9 Windows Release 已捆绑（仅 Windows 10+）
 start_agent.bat       ← 辅测机双击
 start_ui.bat          ← 主控机双击（图形控制台，推荐）
 start_master.bat      ← 主控机双击（命令行问答式）
@@ -1365,7 +1376,7 @@ cargo build --release --locked
 
 自行编译后，把 `cpe_test.exe`、启动脚本和所需吞吐工具放到两台 Windows 电脑同一目录：
 iperf3 测试需要完整的 iperf3 Windows 发行包；ctsTraffic 测试需要 `ctsTraffic.exe`。
-官方 v6.2.8 Windows Release ZIP 已捆绑固定且校验过的 ctsTraffic 2.0.4.0，但由于发行包差异不内置 iperf3。
+官方 v6.2.9 Windows Release ZIP 已捆绑固定且校验过的 ctsTraffic 2.0.4.0，但由于发行包差异不内置 iperf3。
 
 ### GitHub Actions CI
 
@@ -1388,7 +1399,7 @@ Windows ZIP 包含启动脚本、四份配置、固定 CTS 二进制和第三方
 `tar.gz` 保留 `cpe_test` 可执行位。发布作业会再次核对资产名称、数量、内部结构和哈希。
 
 仓库同时跟踪一份不含可执行程序的
-[`cpe_test-v6.2.8-windows-config-docs.zip`](dist/cpe_test-v6.2.8-windows-config-docs.zip)，
+[`cpe_test-v6.2.9-windows-config-docs.zip`](dist/cpe_test-v6.2.9-windows-config-docs.zip)，
 便于直接从 Git 下载 Windows 配置、文档和启动脚本。其 SHA-256 位于同目录的
 `.zip.sha256` 文件；CI 会逐文件确认压缩包内容与仓库源文件一致。需要开箱即用的程序、
 固定版 ctsTraffic 和许可证全集时，仍应下载上面的正式 Windows Release ZIP。
