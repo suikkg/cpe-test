@@ -335,13 +335,35 @@ fn handle(mut rq: Request, st: &Arc<AgentState>) {
     // 用 `String::from_utf8` 而不是 `from_utf8_lossy(..).into_owned()`：后者在
     // 合法 UTF-8 时返回 Cow::Borrowed，`into_owned()` 必然再拷一份，等于每个
     // 请求体都在内存里存在两份。非法 UTF-8 才退回 lossy。
-    let body = {
-        let mut limited = rq.as_reader().take(MAX_BODY);
+    //
+    // 多读一个字节，好让「刚好到上限」和「超了」分得开：只 `take(MAX_BODY)` 的话
+    // 超限请求会被**静默截断**，而截断后的 JSON 未必不合法——那时 agent 会按一份
+    // 它没读完的请求去起进程。主控侧同一个写法已经证实能让 `/api/import` 静默
+    // 导入截断后的配置，这里的后果是启停指令本身被改写。
+    let (body, oversized) = {
+        let mut limited = rq.as_reader().take(MAX_BODY + 1);
         let mut bytes = Vec::new();
         let _ = limited.read_to_end(&mut bytes);
-        String::from_utf8(bytes)
-            .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned())
+        let oversized = bytes.len() as u64 > MAX_BODY;
+        let text = String::from_utf8(bytes)
+            .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned());
+        (text, oversized)
     };
+    if oversized {
+        let resp_body = err_json(&format!(
+            "请求体超过 {} MiB 上限，已拒绝；没有按截断后的内容执行任何操作",
+            MAX_BODY / (1024 * 1024)
+        ));
+        st.activity
+            .record(&peer, url.split('?').next().unwrap_or(&url), false);
+        let header = Header::from_bytes(
+            &b"Content-Type"[..],
+            &b"application/json; charset=utf-8"[..],
+        )
+        .expect("header");
+        let _ = rq.respond(Response::from_data(resp_body.into_bytes()).with_header(header));
+        return;
+    }
 
     // handler panic 不能弄崩 server
     let resp_body = std::panic::catch_unwind(AssertUnwindSafe(|| route(&method, &url, &body, st)))
@@ -903,5 +925,89 @@ mod tests {
             panic!("owner cleanup 后的迟到 start 不应执行")
         });
         assert!(late.is_err());
+    }
+
+    /// **一个 owner 的清理不能碰到另一个**（回归方案 LIFE-03）。
+    ///
+    /// 两轮测试可以同时挂在同一台辅测机上（一轮在跑、另一轮的监控还开着），
+    /// owner 就是把它们分开的唯一凭据。清理 A 顺手把 B 封了，表现是 B 那一轮
+    /// 后面每一个 start 都被拒，报出来却是「已完成资源清理」——而 B 根本没被
+    /// 清理过。
+    ///
+    /// 墓碑的**过期**（`OWNER_TOMBSTONE_TTL` = 10 分钟）这里测不到：
+    /// `Instant::elapsed` 没有注入时钟的口子，真等 10 分钟又会让测试不可用。
+    /// 能钉的是有效期**之内**的行为，以及下面几条边界。
+    #[test]
+    fn cleaning_one_owner_leaves_every_other_owner_alone() {
+        let lifecycle = OwnerLifecycle::new();
+
+        // 两个 owner 各自都能 start。
+        assert!(lifecycle
+            .with_start("owner-a", || Ok::<_, String>(1))
+            .is_ok());
+        assert!(lifecycle
+            .with_start("owner-b", || Ok::<_, String>(1))
+            .is_ok());
+
+        lifecycle.with_cleanup("owner-a", || ());
+
+        // A 封口：迟到的 start 一律拒，闭包不许被执行。
+        let late = lifecycle.with_start("owner-a", || -> Result<(), String> {
+            panic!("A 已清理，迟到的 start 不该跑起来")
+        });
+        assert!(
+            late.is_err_and(|e| e.contains("已完成资源清理")),
+            "A 的迟到 start 必须被明确拒绝"
+        );
+
+        // B 毫发无伤，而且还能继续开新的。
+        assert!(
+            lifecycle
+                .with_start("owner-b", || Ok::<_, String>(2))
+                .is_ok(),
+            "清理 A 把 B 也封了——两轮测试共用一台辅测机时，B 会莫名其妙全线被拒"
+        );
+
+        // 重复 cleanup 幂等，不许 panic、不许把别人也带进去。
+        lifecycle.with_cleanup("owner-a", || ());
+        lifecycle.with_cleanup("owner-a", || ());
+        assert!(
+            lifecycle
+                .with_start("owner-b", || Ok::<_, String>(3))
+                .is_ok(),
+            "反复清理 A 之后 B 仍要能用"
+        );
+    }
+
+    /// owner_id 的取值边界。
+    ///
+    /// **空串是有意放行的**：不带 owner 的老客户端照旧能用，代价是那条路上没有
+    /// 生命周期保护。这条测试把它钉成**明确的取舍**而不是漏判——哪天有人想
+    /// 「顺手也给空串加上保护」，会先看到这里写着为什么没加。
+    #[test]
+    fn an_owner_id_is_validated_and_an_empty_one_deliberately_bypasses_the_gate() {
+        let lifecycle = OwnerLifecycle::new();
+
+        // 非法字符：当场拒绝，不进业务。
+        for bad in ["owner id", "owner/../x", "owner\n", &"x".repeat(161)] {
+            let result = lifecycle.with_start(bad, || -> Result<(), String> {
+                panic!("非法 owner_id 不该跑到业务里：{bad:?}")
+            });
+            assert!(
+                result.is_err_and(|e| e.contains("owner_id 非法")),
+                "{bad:?} 应当被拒"
+            );
+        }
+        // 合法字符集：字母、数字、-_.:
+        assert!(lifecycle
+            .with_start("run-2026.09.06_17:55:51-a", || Ok::<_, String>(()))
+            .is_ok());
+
+        // 空串：绕过整道闸门，连 cleanup 过也照跑。这是**有意**的向后兼容。
+        lifecycle.with_cleanup("", || ());
+        assert!(
+            lifecycle.with_start("", || Ok::<_, String>(())).is_ok(),
+            "空 owner_id 是老客户端的兼容路径，不该被墓碑挡住"
+        );
     }
 }

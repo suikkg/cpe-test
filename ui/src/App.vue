@@ -95,7 +95,7 @@ onMounted(() => {
         <span class="brand-mark" aria-hidden="true">CPE</span>
         <div>
           <h1>CPE 子网测试控制台</h1>
-          <p>双机链路测试 <span>Ping / iperf3 / ctsTraffic</span></p>
+          <p>双机链路测试 <span>Ping / iperf3</span></p>
         </div>
       </div>
       <div class="header-status">

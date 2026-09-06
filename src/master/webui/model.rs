@@ -35,6 +35,38 @@ pub(super) struct PairSelection {
     /// 留空 = 走上面的每方向门限。
     #[serde(default)]
     pub(super) rx_target_bidir_total: String,
+    /// 这一对网口在**单向**单元里的接收门限，按方向分开填。
+    ///
+    /// 和 `rx_target_bidir_*` 对称，语义相反：只在勾了 `A→B` / `B→A` 时生效。
+    /// v6.2.8 加这一层是因为现场撞上过——网口门限设 1800/2000，双向靠
+    /// `rx_target_bidir_*` 压到单边 850，而**单向漏掉了**：SGMII1G 口物理上
+    /// 只能发 1G，却仍被按 1800 判。两层必须各管各的，不能互相顶替。
+    #[serde(default)]
+    pub(super) rx_target_single_ab: String,
+    #[serde(default)]
+    pub(super) rx_target_single_ba: String,
+    /// 这一对网口的**通用**接收门限（`TestSpec.rate_targets_mbps`）。
+    ///
+    /// 它排在门限链的最后一层：单向/双向那两层都没填时才轮到它，单向和双向
+    /// 单元都吃。矩阵界面上没有它的输入框——留着是为了**导出导入不丢**，
+    /// 手写配置和老项目会用到这一层。
+    ///
+    /// 名字里的 `generic` 不是修辞：`UiTask` 上的 `rx_target_ab` 指的是**单向层**
+    /// （落在 `rate_targets_single_mbps`，排在按网口门限**之上**），而这里指的是
+    /// 通用层（排在按网口门限**之下**）。两个 DTO 都挂在同一个 `RunRequest` 上,
+    /// 同名不同层会让人把一个数填到网口层的另一侧去。旧名 `rx_target_ab` 保留为
+    /// alias，老请求照样解析。
+    #[serde(default, alias = "rx_target_ab")]
+    pub(super) rx_target_generic_ab: String,
+    #[serde(default, alias = "rx_target_ba")]
+    pub(super) rx_target_generic_ba: String,
+    /// 这一对网口的判定模式（`auto` / `verify` / `observe` / `discover`）。
+    /// 空串 = 不指定，走全局 `iperf.rate_check.mode`。
+    ///
+    /// 它决定 PASS/FAIL 还是只测量，漏掉它等于把一份 verify 配置悄悄降级成
+    /// observe——同一份文件跑出完全不同的结论。
+    #[serde(default)]
+    pub(super) rate_mode: String,
     /// 这一行要跑哪几组 UDP 参数。`0` = 默认组，`1..` 指 `RunRequest::udp_groups`
     /// 里的第 n-1 组。空列表 = 只跑默认组（老页面/手写请求不带这个字段时的行为）。
     ///

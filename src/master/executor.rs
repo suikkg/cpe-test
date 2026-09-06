@@ -250,6 +250,33 @@ pub struct RunSummary {
 }
 
 impl RunSummary {
+    /// 判定 → 计数的**唯一映射**，与 `RunCounts::bump` 同名同义。
+    ///
+    /// 历史上这两处各写一份，`fail` 于是长成了两个意思：CLI 这边把
+    /// NOT_EVALUATED / SETUP_ERROR 也累加进 `fail`（当成「没过」的汇总），
+    /// 控制台那边只数 RATE_FAIL。同一轮运行，命令行报「FAIL: 2」而控制台报
+    /// 「0 失败、2 搭建错误」——两个出口对同一个词给出不同的数。
+    /// `counters_mean_the_same_thing_on_both_exits` 现在盯着这件事。
+    pub fn bump(&mut self, verdict: Verdict) {
+        match verdict {
+            Verdict::Pass => self.pass += 1,
+            Verdict::RateFail => self.fail += 1,
+            Verdict::Measured => self.measured += 1,
+            Verdict::NotEvaluated => self.not_evaluated += 1,
+            Verdict::SetupError => self.setup_error += 1,
+            Verdict::Skip => self.skip += 1,
+        }
+    }
+
+    /// 「这一轮有没有出问题」——退出码用它。
+    ///
+    /// 刻意**不等于** `fail > 0`：把 NOT_EVALUATED / SETUP_ERROR 折进 `fail`
+    /// 会让那个词说谎，但退出码本来就该对这三种一视同仁（跑坏了的一轮不能
+    /// 因为「只是没判成」而返回 0）。所以分成两件事说。
+    pub fn any_not_passed(&self) -> usize {
+        self.fail + self.not_evaluated + self.setup_error
+    }
+
     pub fn merge(&mut self, other: RunSummary) {
         self.pass += other.pass;
         self.fail += other.fail;
@@ -560,8 +587,7 @@ impl Ctx {
                                 gone.describe()
                             );
                             logln(&format!("  !! {detail}"));
-                            sum.setup_error += 1;
-                            sum.fail += 1;
+                            sum.bump(Verdict::SetupError);
                             if is_traffic_unit {
                                 sum.traffic_setup_errors += 1;
                                 dead_streak += 1;
@@ -779,20 +805,7 @@ impl Ctx {
             let unit_reason = outcome_matching_verdict(&outcomes, unit_verdict);
             let bidir_total_target = unit.bidir_total_target_mbps;
             let unit_ok = unit_verdict.is_pass();
-            match unit_verdict {
-                Verdict::Pass => sum.pass += 1,
-                Verdict::Measured => sum.measured += 1,
-                Verdict::NotEvaluated => {
-                    sum.not_evaluated += 1;
-                    sum.fail += 1;
-                }
-                Verdict::SetupError => {
-                    sum.setup_error += 1;
-                    sum.fail += 1;
-                }
-                Verdict::RateFail => sum.fail += 1,
-                Verdict::Skip => sum.skip += 1,
-            }
+            sum.bump(unit_verdict);
             let reasons: Vec<String> = outcomes
                 .iter()
                 .filter(|outcome| {
@@ -1299,6 +1312,7 @@ use cts::*;
 pub use db::{ResultDb, RESUME_MAX_AGE_HOURS};
 use format::*;
 use progress::*;
+pub(crate) use udp::required_udp_streams;
 use udp::*;
 use verdict_assembly::*;
 use window::*;

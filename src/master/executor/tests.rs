@@ -5640,3 +5640,318 @@ fn clock_offset_falls_back_to_arrival_time_when_every_line_arrives_in_one_block(
     assert_eq!((window.start_ms, window.end_ms), (2_400, 12_400));
     assert!(window.complete);
 }
+
+/// **两个出口对同一个词必须给出同一个数**（回归方案 OUT-01）。
+///
+/// `RunCounts` 的文档注释写着「字段与 `RunSummary` 同名同义，不另起炉灶」，
+/// 而实际上 `RunSummary::fail` 曾经是个汇总口径（RATE_FAIL + NOT_EVALUATED +
+/// SETUP_ERROR），`RunCounts::fail` 只数 RATE_FAIL。现场实测撞上过：
+/// 一轮 6 个单元里 RATE_FAIL 一条都没有，命令行却打印「FAIL: 2」——那 2 个
+/// 是 SETUP_ERROR，在同一行里被数了两遍（自己一列、又并进 FAIL 一列）。
+///
+/// 做验收的人读到「FAIL: 2」会报给客户「两个吞吐不达标」，而控制台上同一轮
+/// 显示 0 失败。判定层有「只有一份实现」的铁律，计数层同理。
+#[test]
+fn counters_mean_the_same_thing_on_both_exits() {
+    use crate::master::run_status::RunCounts;
+
+    for verdict in [
+        Verdict::Pass,
+        Verdict::RateFail,
+        Verdict::Measured,
+        Verdict::NotEvaluated,
+        Verdict::SetupError,
+        Verdict::Skip,
+    ] {
+        let mut summary = RunSummary::default();
+        summary.bump(verdict);
+        let mut counts = RunCounts::default();
+        counts.bump(verdict);
+        assert_eq!(
+            (
+                summary.pass,
+                summary.fail,
+                summary.measured,
+                summary.not_evaluated,
+                summary.setup_error,
+                summary.skip
+            ),
+            (
+                counts.pass,
+                counts.fail,
+                counts.measured,
+                counts.not_evaluated,
+                counts.setup_error,
+                counts.skip
+            ),
+            "{verdict:?} 在命令行汇总和控制台进度上被数进了不同的格子"
+        );
+    }
+
+    // 分区性：每个判定只落进**一格**，总数才等于单元数。
+    // 命令行那行「单元总数」正是六格相加，多算一格就会大于真实单元数。
+    for verdict in [
+        Verdict::Pass,
+        Verdict::RateFail,
+        Verdict::Measured,
+        Verdict::NotEvaluated,
+        Verdict::SetupError,
+        Verdict::Skip,
+    ] {
+        let mut summary = RunSummary::default();
+        summary.bump(verdict);
+        let total = summary.pass
+            + summary.fail
+            + summary.measured
+            + summary.not_evaluated
+            + summary.setup_error
+            + summary.skip;
+        assert_eq!(total, 1, "{verdict:?} 落进了不止一格");
+    }
+
+    // 退出码的口径**不能**跟着变严：跑坏了的一轮不许因为「只是没判成」返回 0。
+    for verdict in [
+        Verdict::RateFail,
+        Verdict::NotEvaluated,
+        Verdict::SetupError,
+    ] {
+        let mut summary = RunSummary::default();
+        summary.bump(verdict);
+        assert!(
+            summary.any_not_passed() > 0,
+            "{verdict:?} 必须让退出码非 0——这是脚本和 CI 唯一看得见的信号"
+        );
+    }
+    for verdict in [Verdict::Pass, Verdict::Measured, Verdict::Skip] {
+        let mut summary = RunSummary::default();
+        summary.bump(verdict);
+        assert_eq!(summary.any_not_passed(), 0, "{verdict:?} 不该让退出码非 0");
+    }
+}
+
+/// 判定 → 计数的映射只能有两处定义（`RunSummary::bump` 与 `RunCounts::bump`），
+/// 且已由 `counters_mean_the_same_thing_on_both_exits` 钉住两者等价。
+///
+/// 这条结构断言防的是**回退**：把 `match unit_verdict` 重新内联回 executor，
+/// 上面那条等价测试照样全绿（它测的是 helper，不是调用点），而命令行汇总会
+/// 悄悄退回「FAIL 把 SETUP_ERROR 也算进去」的老口径。判定优先级用同样的手法
+/// 守着唯一入口，计数层同理。
+#[test]
+fn the_verdict_to_counter_mapping_has_no_third_copy() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let allowed = ["executor.rs", "run_status.rs"];
+    let mut offenders = Vec::new();
+    let mut stack = vec![root];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read src dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if allowed.contains(&name) || name == "tests.rs" {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("read source");
+            // 「按判定分派到计数字段」的形状：同时出现这两个分支就是又抄了一份。
+            if text.contains("Verdict::SetupError => ") && text.contains("setup_error += 1") {
+                offenders.push(path.display().to_string());
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "判定→计数的映射又多了一份，命令行与控制台会再次对同一个词给出不同的数: {offenders:#?}"
+    );
+
+    // 调用点必须走 helper：executor 里不许再出现内联的 `sum.setup_error += 1`。
+    let executor = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/master/executor.rs"),
+    )
+    .expect("read executor");
+    let body = executor
+        .split("impl RunSummary {")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}").next())
+        .unwrap_or("");
+    let outside = executor.replace(body, "");
+    for banned in [
+        "sum.setup_error += 1",
+        "sum.not_evaluated += 1",
+        "sum.fail += 1",
+    ] {
+        assert!(
+            !outside.contains(banned),
+            "executor 里又出现了绕过 `RunSummary::bump` 的直接累加：{banned}"
+        );
+    }
+}
+
+/// **RESUME 命中条件的精确边界**（回归方案 RES-01）。
+///
+/// 命中一次的代价是**整个单元不跑**，报告里写 SKIP 并沿用上一次的 PASS。所以
+/// 这道判据错在哪一侧不是对称的：错过（该命中没命中）只是多跑一轮，误中
+/// （不该命中却命中）会让一份**过期结论**冒充本轮结果交出去。
+///
+/// 现有覆盖只到 `resume_age_is_fresh` 这个纯函数，和 `test_result_db` 的三个
+/// 粗粒度情形。真正做决定的是 `fresh_pass`——它还要过 `ok` 和**时间字符串解析**
+/// 两道，而那两道一条断言都没有。这里把整条路补齐。
+#[test]
+fn a_resume_hit_needs_a_pass_a_parseable_time_and_an_age_inside_the_window() {
+    let dir = std::env::temp_dir().join("cpe_db_res01");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("task_results.json");
+    let _ = std::fs::remove_file(&path);
+
+    // 直接写库文件，才能把「多久以前」精确摆到边界上。
+    let write = |entries: &[(&str, bool, chrono::Duration)]| {
+        let now = chrono::Local::now().naive_local();
+        let map: std::collections::HashMap<String, serde_json::Value> = entries
+            .iter()
+            .map(|(id, ok, age)| {
+                (
+                    id.to_string(),
+                    serde_json::json!({
+                        "ok": ok,
+                        "time": (now - *age).format("%Y-%m-%d %H:%M:%S").to_string(),
+                        "title": "t",
+                    }),
+                )
+            })
+            .collect();
+        std::fs::write(&path, serde_json::to_string(&map).unwrap()).unwrap();
+        ResultDb::load(path.clone())
+    };
+
+    let hour = chrono::Duration::hours(1);
+    let db = write(&[
+        ("just_now", true, chrono::Duration::zero()),
+        (
+            "almost_a_day",
+            true,
+            chrono::Duration::hours(23) + chrono::Duration::minutes(59),
+        ),
+        ("exactly_a_day", true, chrono::Duration::hours(24)),
+        ("stale", true, chrono::Duration::hours(25)),
+        // 负 age = 记录时间在「现在」之后。60 秒容差是给同一轮内写完立刻读的；
+        // 再往前就是时钟真的错了，那份记录不能信。
+        ("clock_skew_ok", true, chrono::Duration::seconds(-60)),
+        ("clock_skew_bad", true, chrono::Duration::seconds(-61)),
+        // 非 PASS：年龄再新也不能命中，否则一次失败会把自己跳过去。
+        ("failed_but_fresh", false, hour),
+    ]);
+
+    for (id, want) in [
+        ("just_now", true),
+        ("almost_a_day", true),
+        ("exactly_a_day", false),
+        ("stale", false),
+        ("clock_skew_ok", true),
+        ("clock_skew_bad", false),
+        ("failed_but_fresh", false),
+        ("never_seen", false),
+    ] {
+        assert_eq!(
+            db.fresh_pass(id).is_some(),
+            want,
+            "{id} 的 RESUME 命中判断错了。误中会让过期结论冒充本轮结果，\
+             比多跑一轮贵得多"
+        );
+    }
+
+    // **坏时间一律不命中**。库文件是人可以手改的，也可能被写坏一半；
+    // 解析不出来时唯一安全的答案是「重跑」，不是「就当它很新」。
+    let now = chrono::Local::now().naive_local();
+    for bad_time in [
+        "",
+        "not-a-time",
+        "2026-09-06",                                 // 缺时分秒
+        "2026-09-06T12:00:00",                        // ISO 的 T，本格式不收
+        "2026-13-45 99:99:99",                        // 结构像但值越界
+        &now.format("%Y/%m/%d %H:%M:%S").to_string(), // 斜杠分隔
+    ] {
+        let map = serde_json::json!({ "x": { "ok": true, "time": bad_time, "title": "t" } });
+        std::fs::write(&path, serde_json::to_string(&map).unwrap()).unwrap();
+        assert!(
+            ResultDb::load(path.clone()).fresh_pass("x").is_none(),
+            "时间 {bad_time:?} 解析不出来时必须重跑，不能当成新鲜的 PASS"
+        );
+    }
+
+    // 整个库文件坏掉时同样只能是「什么都没命中」，不能 panic、也不能全命中。
+    std::fs::write(&path, "{ this is not json").unwrap();
+    assert!(ResultDb::load(path.clone())
+        .fresh_pass("just_now")
+        .is_none());
+
+    // 毫秒级邻界只能在纯函数上钉：落盘格式精确到秒（`%H:%M:%S`），
+    // 24h−1ms 与 24h+1ms 存进去是同一个字符串，`fresh_pass` 分不出来。
+    let day = chrono::Duration::hours(RESUME_MAX_AGE_HOURS);
+    assert!(resume_age_is_fresh(day - chrono::Duration::milliseconds(1)));
+    assert!(!resume_age_is_fresh(day));
+    assert!(!resume_age_is_fresh(
+        day + chrono::Duration::milliseconds(1)
+    ));
+    assert!(resume_age_is_fresh(chrono::Duration::seconds(-60)));
+    assert!(!resume_age_is_fresh(
+        chrono::Duration::seconds(-60) - chrono::Duration::milliseconds(1)
+    ));
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// **三条链路共用同一个「窗口够不够长」的容差**（回归方案 TIME-05）。
+///
+/// TCP、UDP、CTS 各有自己的窗口推导，但「差几毫秒算不算跑满」这件事对三者
+/// 是同一个问题：毫秒取整、采样对不齐、进程收尾各差一点点。三处各写一个字面量
+/// 的话，同一条链路上 TCP 判「完整」而 UDP 判「不足」是迟早的事——而两边给出的
+/// 是**不同的 verdict**（PASS vs NOT_EVALUATED/EFFECTIVE_WINDOW_SHORT），
+/// 不是显示差异。
+///
+/// 这条是结构断言：`window.rs` 里不许出现第二个「和 required 比较时加的毫秒
+/// 字面量」。判定优先级、速率口径、判定→计数三处都用同样的手法守着唯一入口。
+#[test]
+fn every_transport_shares_one_window_completeness_tolerance() {
+    let source = include_str!("window.rs");
+    let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+    let code: String = production
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    // 「跑满没有」的比较必须走那个常量。
+    let uses = code.matches("WINDOW_COMPLETE_TOLERANCE_MS").count();
+    assert!(
+        uses >= 3,
+        "只有 {uses} 处用到 WINDOW_COMPLETE_TOLERANCE_MS；\
+         TCP/UDP/CTS 三条窗口推导本该共用它"
+    );
+
+    // 不许有人另起一个数。只看**和 required 比较**的那些式子：
+    // 别处的 `saturating_add(1_000)` 是扫描循环的一秒步进，与容差无关。
+    //
+    // 比较可能跨行写（rustfmt 会折），所以按语句而不是按行切。
+    for statement in code.split(';') {
+        if !statement.contains("required_ms") || !statement.contains("saturating_add(") {
+            continue;
+        }
+        for piece in statement.split("saturating_add(").skip(1) {
+            let arg: String = piece.chars().take_while(|c| *c != ')').collect();
+            let is_literal = !arg.is_empty() && arg.chars().all(|c| c.is_ascii_digit() || c == '_');
+            assert!(
+                !is_literal,
+                "window.rs 里出现了写死的毫秒容差 `saturating_add({arg})`，\
+                 而这条式子正在和 required_ms 比较。三条链路必须共用 \
+                 WINDOW_COMPLETE_TOLERANCE_MS——各写一个数的话，同一条链路上 TCP 判\
+                 「完整」而 UDP 判「不足」，两边给出的是不同的 verdict，不是显示差异。\
+                 涉事语句：{}",
+                statement.trim()
+            );
+        }
+    }
+}

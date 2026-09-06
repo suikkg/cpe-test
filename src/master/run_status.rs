@@ -73,7 +73,7 @@ pub struct RunCounts {
 }
 
 impl RunCounts {
-    fn bump(&mut self, verdict: Verdict) {
+    pub(crate) fn bump(&mut self, verdict: Verdict) {
         match verdict {
             Verdict::Pass => self.pass += 1,
             Verdict::RateFail => self.fail += 1,

@@ -30,6 +30,19 @@ pub(super) struct PairImport {
     pub(super) directions: Vec<String>,
     pub(super) rx_target_bidir_ab: String,
     pub(super) rx_target_bidir_ba: String,
+    /// 双向「两端 RX 合计」门限。`PairSelection` 一直有这一格，回填侧却漏了，
+    /// 于是配了合计门限的配置往返一趟就退回逐方向判定——判定口径整个变了。
+    pub(super) rx_target_bidir_total: String,
+    /// 单向门限（v6.2.8）。漏掉它，单向腿会回落到网口门限——正是那一版修掉的
+    /// 现场问题：SGMII1G 口只能发 1G，却被按 1800 判。
+    pub(super) rx_target_single_ab: String,
+    pub(super) rx_target_single_ba: String,
+    /// 通用门限（门限链最后一层）。名字带 `generic` 是为了和 `UiTask.rx_target_ab`
+    /// 区分——那个指的是单向层，排在按网口门限之上，和这一层不在同一侧。
+    pub(super) rx_target_generic_ab: String,
+    pub(super) rx_target_generic_ba: String,
+    /// 判定模式。漏掉它会把 verify 悄悄降级成全局默认，同一份文件跑出不同结论。
+    pub(super) rate_mode: String,
     pub(super) udp_groups: Vec<usize>,
     pub(super) tcp_groups: Vec<usize>,
     pub(super) transports: Vec<String>,
@@ -258,6 +271,28 @@ pub(super) fn pairs_from_tests(
             .filter(|v| v == "v4" || v == "v6")
             .collect();
         let bidir = test.rate_targets_bidir_mbps.clone().unwrap_or_default();
+        // `forward` 是「两个方向都用这个数」的简写，`RateTargets::for_direction`
+        // 读的是 `ab.or(forward)` / `ba.or(forward)`，而这条链上 direction 只会是
+        // "ab" / "ba"（`flow_direction = if bidir { tag } else { dir }`，两者都取
+        // 自规范化后的方向集）。所以把 forward 摊进空着的 ab/ba **判定等价**，
+        // 而矩阵行上少两格。
+        let spread = |t: Option<crate::config::RateTargets>| {
+            let t = t.unwrap_or_default();
+            (t.ab.or(t.forward), t.ba.or(t.forward))
+        };
+        let (bidir_ab, bidir_ba) = (bidir.ab.or(bidir.forward), bidir.ba.or(bidir.forward));
+        let (single_ab, single_ba) = spread(test.rate_targets_single_mbps.clone());
+        let (generic_ab, generic_ba) = spread(test.rate_targets_mbps.clone());
+        let bidir_total = test.rate_target_bidir_total_mbps;
+        let rate_mode = test.rate_mode.map(|mode| {
+            match mode {
+                crate::config::RateMode::Auto => "auto",
+                crate::config::RateMode::Verify => "verify",
+                crate::config::RateMode::Observe => "observe",
+                crate::config::RateMode::Discover => "discover",
+            }
+            .to_string()
+        });
 
         let (idx, flip) =
             if let Some(idx) = out.iter().position(|row| row.src == src && row.dst == dst) {
@@ -352,20 +387,55 @@ pub(super) fn pairs_from_tests(
             }
         }
 
-        let (ab, ba) = if flip {
-            (bidir.ba, bidir.ab)
-        } else {
-            (bidir.ab, bidir.ba)
-        };
+        // 同一对网口反向出现时整行按 A/B 归一，方向敏感的门限必须跟着交换，
+        // 否则 B→A 的门限会落到 A→B 那一格上。
+        let oriented = |ab: Option<f64>, ba: Option<f64>| if flip { (ba, ab) } else { (ab, ba) };
+        let (bidir_ab, bidir_ba) = oriented(bidir_ab, bidir_ba);
+        let (single_ab, single_ba) = oriented(single_ab, single_ba);
+        let (generic_ab, generic_ba) = oriented(generic_ab, generic_ba);
         for (slot, value) in [
-            (&mut row.rx_target_bidir_ab, ab),
-            (&mut row.rx_target_bidir_ba, ba),
+            (&mut row.rx_target_bidir_ab, bidir_ab),
+            (&mut row.rx_target_bidir_ba, bidir_ba),
+            (&mut row.rx_target_bidir_total, bidir_total),
+            (&mut row.rx_target_single_ab, single_ab),
+            (&mut row.rx_target_single_ba, single_ba),
+            (&mut row.rx_target_generic_ab, generic_ab),
+            (&mut row.rx_target_generic_ba, generic_ba),
         ] {
             if let Some(value) = value.filter(|v| v.is_finite() && *v > 0.0) {
                 if slot.is_empty() {
                     *slot = format_mbps(value);
                 }
             }
+        }
+        if let Some(mode) = rate_mode {
+            if row.rate_mode.is_empty() {
+                row.rate_mode = mode;
+            }
+        }
+    }
+    // **方向门限只回填这一行真的跑得到的方向**。
+    //
+    // 上面的回填是逐 test 做的，而一行的方向集要等所有 test 都并进来才定。所以
+    // 裁剪必须是**最后一遍**：`ab` 与 `bidir` 两条 test 并成一行时，两层门限都
+    // 该留下；而一行全是双向腿时，那份单向门限从头到尾就没有消费者
+    // （`leg_rx_target` 只在 `!bidir` 时读 `rate_targets_single`），是死值。
+    //
+    // 不裁的后果不是「多留一个数」，是**这一行再也跑不了**：`validate_pair` 会
+    // 判「填了门限却没勾对应方向」。而那个值用户从没填过，是导入自己塞进去的
+    // ——报错指着一格他没碰过的东西，还让他去取消勾选。双向那三格在本轮之前
+    // 就已经这样了（手写 config 上留一份没人用的 `rate_targets_bidir_mbps`，
+    // 导进来就卡死），单向那两格是本轮新接的，一并按同一条规矩裁掉。
+    for row in &mut out {
+        let has = |want: &str| row.directions.iter().any(|d| d == want);
+        if !has("bidir") {
+            row.rx_target_bidir_ab.clear();
+            row.rx_target_bidir_ba.clear();
+            row.rx_target_bidir_total.clear();
+        }
+        if !has("ab") && !has("ba") {
+            row.rx_target_single_ab.clear();
+            row.rx_target_single_ba.clear();
         }
     }
     // 一条 UDP test 都没认出来的行（纯 TCP/ping，或者被网口值钉死的那种）

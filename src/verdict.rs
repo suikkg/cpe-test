@@ -820,4 +820,202 @@ mod tests {
             ReasonCode::RxBelowTarget
         ));
     }
+    /// **聚合优先级的穷举交叉验证**（回归方案 RATE-07）。
+    ///
+    /// `aggregate_verdict` 是一串带特例谓词的顺序扫描；文档注释承诺的却是一个
+    /// **全序优先级**（第 1～9 条）。这两件事不是同一回事：顺序扫描很容易在
+    /// 加一个特例时变成「取第一个匹配到的」，那时结果就会跟着 `items` 的排列
+    /// 顺序走，而调用方（executor 收腿、report 收行）给的顺序本来就不固定。
+    ///
+    /// 所以这里按文档把每一类 `(verdict, reason_code)` 标上它的条号，再断言
+    /// 聚合结果**等于条号最小的那一项**——对全部单项、全部有序对、全部三元组
+    /// 都成立。表达方式和实现不同，才有交叉验证的价值。
+    #[test]
+    fn aggregation_is_a_total_priority_order_not_an_iteration_artifact() {
+        // 文档第 1～9 条里的条号。数字小 = 优先级高。
+        let ranked: Vec<(Verdict, ReasonCode, u8, &str)> = vec![
+            (
+                Verdict::SetupError,
+                ReasonCode::IperfExecFailed,
+                2,
+                "搭建失败",
+            ),
+            (
+                Verdict::RateFail,
+                ReasonCode::SingleUdpStreamFailed,
+                3,
+                "单流 UDP 硬失败",
+            ),
+            (
+                Verdict::RateFail,
+                ReasonCode::CtsSingleUdpStreamFailed,
+                3,
+                "CTS 单流硬失败",
+            ),
+            (
+                Verdict::NotEvaluated,
+                ReasonCode::CounterStalled,
+                4,
+                "计数器停滞（会盖住别的腿）",
+            ),
+            (
+                Verdict::NotEvaluated,
+                ReasonCode::SampleCoverageLow,
+                4,
+                "覆盖率不足（会盖住）",
+            ),
+            (
+                Verdict::NotEvaluated,
+                ReasonCode::NicRateMissing,
+                4,
+                "没有 RX 速率（会盖住）",
+            ),
+            (
+                Verdict::RateFail,
+                ReasonCode::RxBelowTarget,
+                5,
+                "普通不达标",
+            ),
+            (
+                Verdict::NotEvaluated,
+                ReasonCode::TargetMissing,
+                6,
+                "缺目标（只是自己的事）",
+            ),
+            (
+                Verdict::NotEvaluated,
+                ReasonCode::OfferedLoadLow,
+                6,
+                "灌得不够（只是自己的事）",
+            ),
+            (
+                Verdict::NotEvaluated,
+                ReasonCode::ConfiguredLoadTooLow,
+                6,
+                "配得不够（只是自己的事）",
+            ),
+            (Verdict::Measured, ReasonCode::TargetUnknown, 7, "只测不判"),
+            (Verdict::Skip, ReasonCode::None, 8, "跳过"),
+            (Verdict::Pass, ReasonCode::None, 9, "通过"),
+        ];
+        let winner = |picks: &[usize]| -> Verdict {
+            let best = picks.iter().map(|&i| ranked[i].2).min().expect("非空");
+            // 条号唯一决定结论：同条号的几项判定标签本来就一样。
+            ranked
+                .iter()
+                .find(|(_, _, rank, _)| *rank == best)
+                .map(|(verdict, _, _, _)| *verdict)
+                .expect("条号必有归属")
+        };
+        let item = |i: usize| (ranked[i].0, ranked[i].1);
+        let name = |i: usize| ranked[i].3;
+
+        // 空集是第 1 条，单独一格。
+        assert_eq!(
+            aggregate_verdict(Vec::<(Verdict, ReasonCode)>::new()),
+            Verdict::SetupError,
+            "一次结果都没有 = 搭建失败，绝不是 PASS"
+        );
+
+        // 单项。
+        for i in 0..ranked.len() {
+            assert_eq!(
+                aggregate_verdict(vec![item(i)]),
+                winner(&[i]),
+                "单独一项 {} 聚合后应保持自己",
+                name(i)
+            );
+        }
+
+        // 全部有序对：顺序不能影响结论。
+        for a in 0..ranked.len() {
+            for b in 0..ranked.len() {
+                let expected = winner(&[a, b]);
+                let forward = aggregate_verdict(vec![item(a), item(b)]);
+                let backward = aggregate_verdict(vec![item(b), item(a)]);
+                assert_eq!(
+                    forward,
+                    expected,
+                    "[{} , {}] 应按条号取胜者",
+                    name(a),
+                    name(b)
+                );
+                assert_eq!(
+                    forward,
+                    backward,
+                    "[{} , {}] 换个顺序就换了结论——那说明聚合取的是「第一个匹配」，\
+                     而不是文档承诺的优先级",
+                    name(a),
+                    name(b)
+                );
+            }
+        }
+
+        // 全部三元组：加进第三条腿不该让已经确定的胜者翻盘。
+        for a in 0..ranked.len() {
+            for b in 0..ranked.len() {
+                for c in 0..ranked.len() {
+                    assert_eq!(
+                        aggregate_verdict(vec![item(a), item(b), item(c)]),
+                        winner(&[a, b, c]),
+                        "[{} , {} , {}]",
+                        name(a),
+                        name(b),
+                        name(c)
+                    );
+                }
+            }
+        }
+
+        // 文档专门点名的两条反直觉边：它们值得单独立字据。
+        assert_eq!(
+            aggregate_verdict(vec![
+                (Verdict::RateFail, ReasonCode::SingleUdpStreamFailed),
+                (Verdict::NotEvaluated, ReasonCode::CounterStalled),
+            ]),
+            Verdict::RateFail,
+            "单流硬失败必须排在「会盖住别的腿的判不了」前面，否则必须灌通的方向\
+             没灌通会被采样问题吃掉"
+        );
+        assert_eq!(
+            aggregate_verdict(vec![
+                (Verdict::RateFail, ReasonCode::RxBelowTarget),
+                (Verdict::NotEvaluated, ReasonCode::TargetMissing),
+            ]),
+            Verdict::RateFail,
+            "只是自己缺目标的那条腿，不许把另一条腿确凿的不达标从概览里抹掉"
+        );
+        assert_eq!(
+            aggregate_verdict(vec![
+                (Verdict::RateFail, ReasonCode::RxBelowTarget),
+                (Verdict::NotEvaluated, ReasonCode::CounterStalled),
+            ]),
+            Verdict::NotEvaluated,
+            "反过来，采样塌了的那一段时间里另一条腿的数同样不可信，\
+             拿它判 FAIL 就是把环境异常写成 CPE 性能失败"
+        );
+
+        // 判定标签一样、原因码不同，结论就可以不同——聚合必须读组合，不能只读标签。
+        assert_ne!(
+            aggregate_verdict(vec![
+                (Verdict::NotEvaluated, ReasonCode::CounterStalled),
+                (Verdict::RateFail, ReasonCode::RxBelowTarget),
+            ]),
+            aggregate_verdict(vec![
+                (Verdict::NotEvaluated, ReasonCode::TargetMissing),
+                (Verdict::RateFail, ReasonCode::RxBelowTarget),
+            ]),
+            "两边的判定标签完全一样，只有原因码不同；结论必须跟着原因码走"
+        );
+
+        // PASS 是唯一一个「加进去不改变任何结论」的项（空集除外）。
+        for i in 0..ranked.len() {
+            assert_eq!(
+                aggregate_verdict(vec![item(i), (Verdict::Pass, ReasonCode::None)]),
+                aggregate_verdict(vec![item(i)]),
+                "补一条 PASS 不该动 {} 的结论",
+                name(i)
+            );
+        }
+    }
 }

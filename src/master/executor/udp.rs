@@ -85,7 +85,10 @@ pub(super) fn zero_udp_stream_verdict(requested: usize, attempts_exhausted: bool
     }
 }
 
-pub(super) fn required_udp_streams(
+/// 计划期也要调它：**这条公式只能有一份**。builder 里若自己再算一遍
+/// 「几条流才够灌到门限」，就会和执行端算出不同的数——那正是本仓库刚在
+/// 计数层修掉的那类分裂。
+pub(crate) fn required_udp_streams(
     requested: usize,
     rate_cfg: &RateCheckCfg,
     target_mbps: Option<f64>,

@@ -94,15 +94,23 @@ pub(super) fn validate_rate_reason(
             ),
             _ => metric_reason_mismatch(code, "缺少 RX 平均或目标，无法核对该判定"),
         },
+        // P10 的触发线是**目标的 90%**（v6.2.7 起）：它只是诊断指标，不参与
+        // PASS/FAIL，正常抖动不该次次报警。两条分支必须比同一个数——曾经条件
+        // 用 90% 线、文案却拿目标去比，于是目标 800、P10 750 时报告里印出
+        // 「RX-P10 750.000 Mbps >= 目标 800.000 Mbps」，一句不成立的不等式，
+        // 而且偏偏出现在工具**判对了**的时候。报告是拿去做验收证据的那份东西。
         ReasonCode::RxP10BelowTarget => match (rx_p10, target_mbps) {
-            (Some(rx_p10), Some(target)) if rx_p10 < target * 0.9 => format!(
-                "RX_P10_BELOW_TARGET: RX-P10 {rx_p10:.3} Mbps < 目标 90% {:.3} Mbps",
-                target * 0.9
-            ),
-            (Some(rx_p10), Some(target)) => metric_reason_mismatch(
-                code,
-                &format!("RX-P10 {rx_p10:.3} Mbps >= 目标 {target:.3} Mbps"),
-            ),
+            (Some(rx_p10), Some(target)) => {
+                let floor = target * 0.9;
+                if rx_p10 < floor {
+                    format!("RX_P10_BELOW_TARGET: RX-P10 {rx_p10:.3} Mbps < 目标 90% {floor:.3} Mbps")
+                } else {
+                    metric_reason_mismatch(
+                        code,
+                        &format!("RX-P10 {rx_p10:.3} Mbps >= 目标 90% {floor:.3} Mbps"),
+                    )
+                }
+            }
             _ => metric_reason_mismatch(code, "缺少 RX-P10 或目标，无法核对该判定"),
         },
         // 断流/掉坑的共同前提是「**平均速率达标**，但窗口里有连续够 5 秒的

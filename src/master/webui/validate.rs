@@ -1065,6 +1065,61 @@ pub(super) fn validate_pair(
             None => {}
         }
     }
+    // 单向门限与通用门限走**同一道**校验：写法认不出、或者写成百分比，都要当场
+    // 说，不能「看不懂就当没填」。`specs_for_pair` 那边是
+    // `parse_rx_target(..).ok().flatten()`——错误在那里会被吞掉，所以拦必须拦在
+    // 这里。百分比错在哪与双向那几格完全一样：它的基准是收口自己的协商速率，
+    // 而这几层要压的恰恰是「收口协商速率对这条路径不成立」的情形。
+    //
+    // 单向那两格还要过方向门禁，和双向那三格、以及 `UiTask` 完全同一条规矩：
+    // 填了却不生效要当场说。通用层**没有**方向门禁——它是门限链最后一层，
+    // 单向双向都吃，勾哪个方向都成立。
+    let single_selected = pair.directions.iter().any(|d| d == "ab" || d == "ba");
+    for (label, raw, gated) in [
+        ("A→B 单向", &pair.rx_target_single_ab, true),
+        ("B→A 单向", &pair.rx_target_single_ba, true),
+        ("A→B 通用", &pair.rx_target_generic_ab, false),
+        ("B→A 通用", &pair.rx_target_generic_ba, false),
+    ] {
+        if raw.trim().is_empty() {
+            continue;
+        }
+        if gated && !single_selected {
+            return Err(format!(
+                "配对 {} / {} 填了 {label}门限，却没有勾「A→B」或「B→A」。\
+                 单向门限只作用于单向单元；双向的门限在双向那几格里填",
+                pair.src, pair.dst
+            ));
+        }
+        match parse_rx_target(raw)
+            .map_err(|error| format!("配对 {} / {} 的 {label}门限：{error}", pair.src, pair.dst))?
+        {
+            Some(RxTarget::Percent(_)) => {
+                return Err(format!(
+                    "配对 {} / {} 的 {label}门限只能填绝对 Mbps。\
+                     百分比要按单块网卡的协商速率换算，而这一层要压的恰恰是\
+                     「收口协商速率对这条路径不成立」，换个写法犯的是同一个错",
+                    pair.src, pair.dst
+                ))
+            }
+            Some(RxTarget::Mbps(_)) | None => {}
+        }
+    }
+    // 判定模式认不出就报错，**不许静默回落到全局默认**。`"verfiy"` 打错一个字母
+    // 却被当成「没指定」，跑出来是 observe 的结论而报表上写着 verify 的期待——
+    // 这正是本轮 D-01 要根除的那种降级，不能在请求侧再留一条同样的路。
+    if !pair.rate_mode.trim().is_empty()
+        && !matches!(
+            pair.rate_mode.trim().to_ascii_lowercase().as_str(),
+            "auto" | "verify" | "observe" | "discover"
+        )
+    {
+        return Err(format!(
+            "配对 {} / {} 的判定模式 {:?} 认不出；只认 auto / verify / observe / discover，\
+             留空表示跟随全局设置",
+            pair.src, pair.dst, pair.rate_mode
+        ));
+    }
     // 选了默认组之外的组，却没勾 UDP：那几组一个单元都不会跑。和双向门限
     // 同一条规矩——选了却不生效要当场说，静默忽略的话人会以为跑的是那组。
     let udp_selected = pair.transports.iter().any(|t| t == "udp");

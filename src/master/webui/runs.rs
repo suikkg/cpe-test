@@ -68,6 +68,12 @@ pub(super) struct RunEntry {
 /// 这正是「穷举危险写法」这条路的失败方式：本模块和它的测试当时都已经把
 /// 「盘符」写进注释当反例，实现里却没有它。所以改成按名字精确比对——不需要
 /// 知道有哪些危险写法。
+///
+/// 名字对上还不够，**那个名字得真的是这里的一个目录**。符号链接名字一样能命中、
+/// `is_dir()` 也为真（它跟着走），于是 `runs/x -> /etc` 会被当成一次运行打包出去。
+/// 单看不是提权——能在 `runs/` 里建链接的人本来就读得到那些文件；危险在于它跨了
+/// 信任边界：`--ui-bind` 之后控制台在局域网上，「本地写一个链接」被放大成
+/// 「远程凭口令读任意文件」。这个工具自己从不在 `runs/` 里建链接，挡它零代价。
 pub(super) fn resolve_run_dir(id: &str) -> Option<std::path::PathBuf> {
     if id.is_empty() {
         return None;
@@ -75,7 +81,12 @@ pub(super) fn resolve_run_dir(id: &str) -> Option<std::path::PathBuf> {
     std::fs::read_dir(RUNS_DIR)
         .ok()?
         .flatten()
-        .find(|entry| entry.file_name() == std::ffi::OsStr::new(id) && entry.path().is_dir())
+        .find(|entry| {
+            entry.file_name() == std::ffi::OsStr::new(id)
+                // `file_type()` 不跟随链接，`is_dir()` 跟随——两者都要过。
+                && entry.file_type().is_ok_and(|kind| kind.is_dir())
+                && entry.path().is_dir()
+        })
         .map(|entry| entry.path())
 }
 
@@ -203,7 +214,13 @@ fn collect_files(dir: &std::path::Path, base: &std::path::Path, out: &mut Vec<(S
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
-    let mut paths: Vec<_> = entries.flatten().map(|e| e.path()).collect();
+    // 同 `resolve_run_dir`：run 目录**里面**的符号链接也不打包。跟着走会把
+    // 链接目标塞进 zip，而 zip 里的路径仍是 `run_xxx/...`，看不出内容来自别处。
+    let mut paths: Vec<_> = entries
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| !kind.is_symlink()))
+        .map(|e| e.path())
+        .collect();
     paths.sort();
     for path in paths {
         if path.is_dir() {

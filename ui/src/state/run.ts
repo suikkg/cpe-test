@@ -86,6 +86,9 @@ export const view = computed(() =>
 
 export function reset(): void {
   stopPolling();
+  // `inFlight` 也要清。它是模块级的，「断开连接 / 换辅测机」之后如果还留着
+  // 上一台机器那次挂死请求的 true，新连上的这台会被自己的闸门永久挡在门外。
+  inFlight = false;
   run.running = false;
   run.synced = false;
   run.lastSyncAt = null;
@@ -126,6 +129,9 @@ function schedule(): void {
  */
 let inFlight = false;
 
+/** 一拍进度的上限，见 `tick()` 里的说明。 */
+const PROGRESS_TIMEOUT_MS = 30_000;
+
 async function tick(): Promise<boolean> {
   if (inFlight) return false;
   inFlight = true;
@@ -137,6 +143,10 @@ async function tick(): Promise<boolean> {
     const out = await api.get<ProgressOut>(
       `/api/progress?from=${run.logCursor}&units_from=${run.unitCursor}` +
         `&run_id=${encodeURIComponent(run.status.run_id)}`,
+      // 进度是**每秒一拍**的端点，服务端那边只是读内存里的快照。给它一个远
+      // 松于正常耗时、又远短于「永远」的上限：挂死时要能落到断线分支，把
+      // 「这份是旧的」显示出来，而不是无声地停在上一拍。
+      { timeoutMs: PROGRESS_TIMEOUT_MS },
     );
     applyProgress(out);
     run.synced = true;

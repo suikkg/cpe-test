@@ -1177,4 +1177,90 @@ mod tests {
         let w = full_window();
         assert_eq!(udp_leg_verdict(&facts(&rx, &tx, &w)).verdict, Verdict::Pass);
     }
+
+    /// **网卡上有流量，不等于「本次灌通了」**（回归方案 RATE-09）。
+    ///
+    /// 现场形状：server 没起来 / client 一次都没连上，而这块网卡上恰好有别的
+    /// 东西在跑——另一轮测试、备份任务、Wi-Fi 上的邻居流量。网卡计数器照样往上
+    /// 走，`RateStats` 于是长得**非常健康**：平均值远超门限、覆盖率 100%、
+    /// 滚动窗口齐全。
+    ///
+    /// 这时候唯一不能给的答案就是 PASS。它会把一次「根本没跑起来」写成
+    /// 「这条链路达标」，而且是**最难发现的那种错**——报告上每个数都好看。
+    ///
+    /// 现有的零流测试用的是 `healthy(0.0)`（RX 平均为 0），那种夹具证明不了
+    /// 这件事：把「先看有没有流」这一步挪到门限比较之后，它照样绿。这里把
+    /// 背景速率抬到门限的两倍以上，专门钉住那个顺序。
+    #[test]
+    fn a_busy_nic_cannot_turn_a_run_that_never_started_into_a_pass() {
+        let window = full_window();
+        // 门限 1000，而网卡上看着有 2400——全是背景流量。
+        let busy = healthy(2_400.0);
+        let target = Some(1_000.0);
+
+        // ---- UDP 多流：一条都没起来 ----
+        let udp = udp_leg_verdict(&UdpLegFacts {
+            streams_total: 4,
+            streams_success: 0,
+            single_stream_exhausted: false,
+            rx_target_mbps: target,
+            ..facts(&busy, &busy, &window)
+        });
+        assert_ne!(
+            udp.verdict,
+            Verdict::Pass,
+            "0/4 条流却判 PASS——背景流量被当成了本次的吞吐"
+        );
+        assert_eq!(udp.verdict, Verdict::SetupError);
+        assert_eq!(udp.code, ReasonCode::NoStreamStarted);
+
+        // ---- 单流 UDP：重试用尽仍未灌通 ----
+        let single = udp_leg_verdict(&UdpLegFacts {
+            streams_total: 1,
+            streams_success: 0,
+            single_stream_exhausted: true,
+            single_attempts: 3,
+            rx_target_mbps: target,
+            ..facts(&busy, &busy, &window)
+        });
+        assert_ne!(single.verdict, Verdict::Pass, "单流没灌通却判 PASS");
+        assert_eq!(single.verdict, Verdict::RateFail);
+        assert_eq!(single.code, ReasonCode::SingleUdpStreamFailed);
+
+        // ---- iperf 单腿：跑完了但没有自报测量 ----
+        let iperf = iperf_flow_verdict(IperfFlowVerdictIn {
+            raw_ok: true,
+            measurement: false,
+            effective_window: &window,
+            required_secs: 180,
+            rate_mode: RateMode::Verify,
+            rx_target_mbps: target,
+            rx_stats: &busy,
+            tx_stats: &busy,
+            offered_floor: None,
+            client_tail: "",
+            rx_monitor: None,
+        });
+        assert_ne!(
+            iperf.verdict,
+            Verdict::Pass,
+            "iperf 没产生任何测量，网卡再热闹也不能算达标"
+        );
+        assert_eq!(iperf.verdict, Verdict::SetupError);
+
+        // ---- 反面：真的灌通了，同一份 RX 就该是 PASS ----
+        // 否则上面三条只是「什么都判不过」，证明不了顺序对。
+        let ran = udp_leg_verdict(&UdpLegFacts {
+            streams_total: 4,
+            streams_success: 4,
+            streams_required: 4,
+            rx_target_mbps: target,
+            ..facts(&busy, &busy, &window)
+        });
+        assert_eq!(
+            ran.verdict,
+            Verdict::Pass,
+            "同样的 RX，流真的起来了就该 PASS——否则上面三条断言什么都没证明"
+        );
+    }
 }

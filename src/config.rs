@@ -943,35 +943,70 @@ impl Config {
     }
 }
 
-pub fn load_config(explicit: Option<&str>) -> (Config, Option<PathBuf>) {
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Some(p) = explicit {
-        candidates.push(PathBuf::from(p));
-    } else {
-        candidates.push(PathBuf::from("config.json"));
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(dir) = exe.parent() {
-                candidates.push(dir.join("config.json"));
+/// 按优先级列出候选配置路径。抽出来是为了能测**顺序**本身——
+/// 它依赖当前目录和 exe 位置，直接测 `load_config` 会互相踩。
+pub(crate) fn config_candidates(explicit: Option<&str>, exe_dir: Option<&Path>) -> Vec<PathBuf> {
+    match explicit {
+        // 显式指定就**只认这一个**：找不到或读不了都不该悄悄换成别的文件。
+        Some(path) => vec![PathBuf::from(path)],
+        None => {
+            let mut candidates = vec![PathBuf::from("config.json")];
+            if let Some(dir) = exe_dir {
+                let beside_exe = dir.join("config.json");
+                // 从 exe 目录启动时两者是同一个文件，别读两遍。
+                if beside_exe != candidates[0] {
+                    candidates.push(beside_exe);
+                }
             }
+            candidates
         }
     }
-    for p in candidates {
+}
+
+/// [`load_config`] 的可测内核。**显式指定的配置读不出来是致命错误。**
+///
+/// 隐式那条路读不出来时退回默认是合理的：本来就是「碰运气看看旁边有没有」。
+/// 但 `--config` 是人明确点名的那一份——解析失败却打一行 stderr 就接着用默认值
+/// 跑，意味着整轮测试用的是**用户从没写过的门限**，而报告上不会有任何地方提到
+/// 这件事。命令行刷过去的那一行警告，在 CI 日志和滚动的终端里等于不存在。
+pub fn load_config_checked(
+    explicit: Option<&str>,
+    exe_dir: Option<&Path>,
+) -> Result<(Config, Option<PathBuf>), String> {
+    for p in config_candidates(explicit, exe_dir) {
         if p.exists() {
             match load_from(&p) {
                 Ok(c) => {
                     for problem in c.validate() {
                         eprintln!("!! 配置项异常: {problem}");
                     }
-                    return (c, Some(p));
+                    return Ok((c, Some(p)));
                 }
                 Err(e) => {
+                    if explicit.is_some() {
+                        return Err(format!(
+                            "配置文件 {} 解析失败: {e}\n                             这是 --config 明确指定的那一份，不会退回默认配置继续跑——\
+                             用默认门限跑完一整轮，报告上不会有任何地方提到配置没生效。",
+                            p.display()
+                        ));
+                    }
                     eprintln!("!! 配置文件 {} 解析失败: {e}", p.display());
                     eprintln!("!! 将使用默认配置继续");
-                    return (Config::default(), None);
+                    return Ok((Config::default(), None));
                 }
             }
         }
     }
+    // 显式指定的文件不存在同样是致命的：静默用默认值跑等于换了一份配置。
+    if let Some(path) = explicit {
+        return Err(format!(
+            "配置文件 {path} 不存在。--config 指定的路径不会退回默认配置。"
+        ));
+    }
+    Ok((default_config_from_env(), None))
+}
+
+fn default_config_from_env() -> Config {
     let mut cfg = Config::default();
     // 兼容旧版环境变量
     if let Ok(v) = std::env::var("AUTOTEST_IPV4_PREFIXES") {
@@ -989,7 +1024,23 @@ pub fn load_config(explicit: Option<&str>) -> (Config, Option<PathBuf>) {
             cfg.agent_host = v.trim().to_string();
         }
     }
-    (cfg, None)
+    cfg
+}
+
+/// 加载配置：--config 指定 > ./config.json > 程序同目录 config.json > 默认。
+///
+/// 显式指定的那一份读不出来时**直接退出**，理由见 [`load_config_checked`]。
+pub fn load_config(explicit: Option<&str>) -> (Config, Option<PathBuf>) {
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(PathBuf::from));
+    match load_config_checked(explicit, exe_dir.as_deref()) {
+        Ok(loaded) => loaded,
+        Err(message) => {
+            eprintln!("!! {message}");
+            std::process::exit(1);
+        }
+    }
 }
 
 fn load_from(p: &Path) -> Result<Config, String> {
@@ -1412,5 +1463,86 @@ mod tests {
         .unwrap();
         assert_eq!(legacy.iperf.rate_check.evb_usb_to_eth_target_mbps, 6200.0);
         assert_eq!(legacy.iperf.rate_check.evb_eth_to_usb_target_mbps, 8200.0);
+    }
+
+    /// **`--config` 指定的那一份读不出来，必须停下来**（回归方案 CFG-01 / 缺陷 D-11）。
+    ///
+    /// 原行为是打一行 stderr 警告然后**用默认配置把整轮跑完**。代价不是「跑失败」
+    /// ——是跑成功，然后交出一份按**用户从没写过的门限**判出来的报告。命令行上
+    /// 刷过去的那一行警告，在 CI 日志和滚动的终端里等于不存在。
+    ///
+    /// 隐式那条路（不带 `--config`，碰运气看看旁边有没有）保持原样：退回默认
+    /// 本来就是它的语义。
+    #[test]
+    fn an_explicitly_named_config_never_silently_falls_back_to_defaults() {
+        let dir = std::env::temp_dir().join(format!("cpe_cfg01_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 坏 JSON：显式指定 → 报错，不返回配置。
+        let bad = dir.join("bad.json");
+        std::fs::write(&bad, "{ \"iperf\": { \"duration\": ").unwrap();
+        let error = load_config_checked(Some(bad.to_str().unwrap()), None)
+            .expect_err("显式指定的坏配置必须是致命错误");
+        assert!(
+            error.contains("解析失败") && error.contains("不会退回默认配置"),
+            "错误要说清为什么不继续：{error}"
+        );
+
+        // 文件根本不存在：同样不许静默用默认值跑。
+        let missing = dir.join("nope.json");
+        let error = load_config_checked(Some(missing.to_str().unwrap()), None)
+            .expect_err("显式指定的文件不存在必须是致命错误");
+        assert!(error.contains("不存在"), "{error}");
+
+        // 好配置：正常读出来，并带回它的路径。
+        let good = dir.join("good.json");
+        std::fs::write(
+            &good,
+            "{\"agent_host\":\"10.0.0.9\",\"iperf\":{\"duration\":42}}",
+        )
+        .unwrap();
+        let (cfg, path) =
+            load_config_checked(Some(good.to_str().unwrap()), None).expect("合法配置必须读得出");
+        assert_eq!(cfg.agent_host, "10.0.0.9");
+        assert_eq!(cfg.iperf.duration, 42);
+        assert_eq!(path.as_deref(), Some(good.as_path()));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 候选路径的**顺序**：显式 > ./config.json > 程序同目录（回归方案 CFG-01）。
+    ///
+    /// 「有冲突 config」正是靠这个顺序解决的。显式指定时**只有一个候选**——
+    /// 找不到就报错，不许悄悄滑到当前目录那一份去：那会让「我明明指定了 A」
+    /// 变成「实际跑的是 B」，而两份文件的门限完全可以不一样。
+    #[test]
+    fn config_lookup_order_is_explicit_then_cwd_then_next_to_the_exe() {
+        let exe_dir = Path::new("/opt/cpe");
+
+        assert_eq!(
+            config_candidates(Some("/tmp/mine.json"), Some(exe_dir)),
+            vec![PathBuf::from("/tmp/mine.json")],
+            "显式指定时只能有一个候选——滑到别的文件上意味着跑的不是我指定的那份"
+        );
+
+        assert_eq!(
+            config_candidates(None, Some(exe_dir)),
+            vec![PathBuf::from("config.json"), exe_dir.join("config.json")],
+            "隐式顺序：先当前目录，再程序同目录"
+        );
+
+        assert_eq!(
+            config_candidates(None, None),
+            vec![PathBuf::from("config.json")],
+            "拿不到 exe 位置时只剩当前目录"
+        );
+
+        // 从 exe 目录启动时两者是同一个文件，不该读两遍。
+        assert_eq!(
+            config_candidates(None, Some(Path::new(""))),
+            vec![PathBuf::from("config.json")],
+            "当前目录就是 exe 目录时候选不该重复"
+        );
     }
 }

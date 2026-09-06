@@ -778,4 +778,91 @@ mod tests {
         assert!(path.exists());
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
+
+    /// **以 `=` `+` `-` `@` 开头的文本必须是文本，不是公式**（回归方案 OUT-03）。
+    ///
+    /// 表格软件里最有名的一类注入：单元格内容以这四个字符之一开头时，某些导入
+    /// 路径会把它当公式求值。落到这个工具上，能被人控制又会原样写进 xlsx 的
+    /// 字段有一串——链路分组名、任务名、网口名、原因文本，全部来自配置文件或
+    /// 网卡自己上报的名字。
+    ///
+    /// 这里的答案是**结构性**的而不是靠转义：`rust_xlsxwriter` 的
+    /// `write_string` 写出的是显式的字符串型单元格，公式要走 `write_formula`
+    /// 才写得出来。所以这条测试守两件事——
+    /// 1. 生成的工作簿里**一个 `<f>` 元素都没有**（`<f>` 就是公式）；
+    /// 2. 生产代码里不出现 `write_formula` / 会自行推断类型的 `write(`。
+    ///
+    /// 第 2 条是必要的：`rust_xlsxwriter` 的泛型 `write()` 对以 `=` 开头的
+    /// 字符串会推断成公式，哪一天有人为了省事换过去，第 1 条要靠恰好构造到
+    /// 那个字段才抓得住，第 2 条则当场就红。
+    #[test]
+    fn text_that_looks_like_a_formula_is_still_written_as_text() {
+        let path = temp_path("formula");
+        let nasty = "=1+1";
+        let mut row = detail(0, Verdict::RateFail, "=cmd|' /c calc'!A1");
+        row.task = "+SUM(1,1)".into();
+        row.src_iface = "-2+3".into();
+        row.dst_iface = "@SUM(A1)".into();
+        row.reason_detail = format!("{nasty} 与引号 \" 和 Unicode ✓ 以及 <b>标签</b>");
+        let rows = vec![
+            row.clone(),
+            Row {
+                sort_key: (0, usize::MAX, usize::MAX, u8::MAX),
+                is_unit_summary: true,
+                ..row
+            },
+        ];
+        write_xlsx(&path, &rows, &ReportMeta::default()).expect("写 xlsx");
+
+        let file = std::fs::File::open(&path).expect("打得开");
+        let mut zip = zip::ZipArchive::new(file).expect("xlsx 就是一个 zip");
+        let mut sheet_xml = String::new();
+        let mut saw_payload = false;
+        for i in 0..zip.len() {
+            let mut entry = zip.by_index(i).expect("条目");
+            let name = entry.name().to_string();
+            if !name.ends_with(".xml") {
+                continue;
+            }
+            let mut text = String::new();
+            use std::io::Read;
+            if entry.read_to_string(&mut text).is_err() {
+                continue;
+            }
+            if text.contains("SUM(A1)") || text.contains("1+1") {
+                saw_payload = true;
+            }
+            if name.contains("sheet") {
+                sheet_xml.push_str(&text);
+            }
+            assert!(
+                !text.contains("<f>") && !text.contains("<f "),
+                "{name} 里出现了公式元素 <f>——以 = 开头的文本被当成公式写出去了"
+            );
+        }
+        assert!(
+            saw_payload,
+            "工作簿里没找到那几个构造的字符串，这条测试没验到任何东西"
+        );
+        assert!(!sheet_xml.is_empty(), "至少要读到一张 sheet");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+
+        // 生产代码不许用会自行推断类型的写法。
+        let source = include_str!("xlsx.rs");
+        let production = source
+            .split_once("#[cfg(test)]")
+            .map(|(head, _)| head)
+            .unwrap_or(source);
+        let code: String = production
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for banned in ["write_formula", "write_dynamic_formula", "sheet.write("] {
+            assert!(
+                !code.contains(banned),
+                "Excel 出口用了 {banned}：以 = 开头的字符串会被推断成公式"
+            );
+        }
+    }
 }

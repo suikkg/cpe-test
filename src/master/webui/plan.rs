@@ -1392,10 +1392,38 @@ pub(super) fn specs_for_pair(
         })
         .flatten();
 
+    // 单向门限只在勾了单向时成立，和 `bidir_targets` 的门禁对称：
+    // 一行同时勾了 A→B 和双向时，两层各自管各自的腿，互不顶替。
+    let text_target = |raw: &String| parse_rx_target(raw).ok().flatten().and_then(rx_target_mbps);
+    let single_targets = directions
+        .iter()
+        .any(|d| d == "ab" || d == "ba")
+        .then(|| crate::config::RateTargets {
+            forward: None,
+            ab: text_target(&pair.rx_target_single_ab),
+            ba: text_target(&pair.rx_target_single_ba),
+        })
+        .filter(|targets| targets.ab.is_some() || targets.ba.is_some());
+
+    // 通用门限是门限链的最后一层，不挑方向，所以没有方向门禁。
+    let generic_targets = Some(crate::config::RateTargets {
+        forward: None,
+        ab: text_target(&pair.rx_target_generic_ab),
+        ba: text_target(&pair.rx_target_generic_ba),
+    })
+    .filter(|targets| targets.ab.is_some() || targets.ba.is_some());
+
+    let rate_mode = match pair.rate_mode.trim().to_ascii_lowercase().as_str() {
+        "auto" => Some(crate::config::RateMode::Auto),
+        "verify" => Some(crate::config::RateMode::Verify),
+        "observe" => Some(crate::config::RateMode::Observe),
+        "discover" => Some(crate::config::RateMode::Discover),
+        _ => None,
+    };
+
     let base = |name: String, transports: Vec<String>| TestSpec {
         name,
-        // 旧矩阵没有单向门限那两格：它整体只作请求兼容，新界面发的是 `ui_plan`。
-        rate_targets_single_mbps: None,
+        rate_targets_single_mbps: single_targets.clone(),
         rate_targets_bidir_mbps: bidir_targets.clone(),
         rate_target_bidir_total_mbps: bidir_total,
         src: pair.src.clone(),
@@ -1412,8 +1440,8 @@ pub(super) fn specs_for_pair(
         ping_payload_sizes: None,
         tcp_windows: None,
         udp_profiles: None,
-        rate_mode: None,
-        rate_targets_mbps: None,
+        rate_mode,
+        rate_targets_mbps: generic_targets.clone(),
         link_group: None,
         origin: None,
     };

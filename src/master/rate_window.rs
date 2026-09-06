@@ -1687,4 +1687,349 @@ mod tests {
             "{notes:?}"
         );
     }
+    /// **RX 判定真值表的穷举复算**（回归方案 RATE-01 / RATE-02 / RATE-03）。
+    ///
+    /// 期望值不是照着 `evaluate_rx_acceptance` 抄的，而是从两份**契约文本**
+    /// 独立写出来的：AGENTS.md 铁律 2（四种结果封闭）与回归方案 §3。照抄实现
+    /// 的表只能证明「它等于它自己」；这张表能在实现漂了以后仍然指出漂到哪。
+    ///
+    /// 契约：
+    /// 1. 三道可信度门槛任一不过 → NOT_EVALUATED（覆盖率 ≥ 0.95、平均值有限且
+    ///    严格大于 MIN_VALID_RX_MBPS、停滞比例 ≤ 1 − 0.95）；
+    /// 2. 可信之后再看目标：Observe/Discover 清目标 → MEASURED；
+    ///    **Verify 缺目标 → NOT_EVALUATED/TARGET_MISSING**；Auto 无目标 → MEASURED；
+    /// 3. 有目标：RX ≥ 目标 → PASS，RX < 目标 → RATE_FAIL。
+    ///
+    /// 边界一律用**常量表达式及其上下邻值**（`next_after`），不写十进制字面量
+    /// ——`0.95` 在二进制里不是 0.95，用字符串写边界测的是四舍五入而不是判据。
+    #[test]
+    fn the_rx_truth_table_matches_the_contract_not_just_itself() {
+        let up = |v: f64| f64::from_bits(v.to_bits() + 1);
+        let down = |v: f64| f64::from_bits(v.to_bits() - 1);
+
+        let trustworthy = |avg: f64| RateStats {
+            avg_mbps: Some(avg),
+            coverage: 1.0,
+            stalled_ratio: 0.0,
+            ..Default::default()
+        };
+
+        // ---- 契约 1：三道可信度门槛，逐道单独触发，其余保持健康 ----
+        let stall_limit = 1.0 - MIN_RATE_SAMPLE_COVERAGE;
+        let untrustworthy: Vec<(&str, RateStats, ReasonCode)> = vec![
+            (
+                "停滞比例刚过线",
+                RateStats {
+                    stalled_ratio: up(stall_limit),
+                    ..trustworthy(500.0)
+                },
+                ReasonCode::CounterStalled,
+            ),
+            (
+                "平均值恰好等于有效流量下限（要求严格大于）",
+                RateStats {
+                    avg_mbps: Some(MIN_VALID_RX_MBPS),
+                    ..trustworthy(500.0)
+                },
+                ReasonCode::NicRateMissing,
+            ),
+            (
+                "平均值缺失",
+                RateStats {
+                    avg_mbps: None,
+                    ..trustworthy(500.0)
+                },
+                ReasonCode::NicRateMissing,
+            ),
+            (
+                "平均值是 NaN",
+                RateStats {
+                    avg_mbps: Some(f64::NAN),
+                    ..trustworthy(500.0)
+                },
+                ReasonCode::NicRateMissing,
+            ),
+            (
+                "平均值是 +inf",
+                RateStats {
+                    avg_mbps: Some(f64::INFINITY),
+                    ..trustworthy(500.0)
+                },
+                ReasonCode::NicRateMissing,
+            ),
+            (
+                "覆盖率差一个 ULP",
+                RateStats {
+                    coverage: down(MIN_RATE_SAMPLE_COVERAGE),
+                    ..trustworthy(500.0)
+                },
+                ReasonCode::SampleCoverageLow,
+            ),
+            (
+                "覆盖率是 NaN",
+                RateStats {
+                    coverage: f64::NAN,
+                    ..trustworthy(500.0)
+                },
+                ReasonCode::SampleCoverageLow,
+            ),
+        ];
+        for (label, stats, code) in &untrustworthy {
+            for mode in [
+                RateMode::Verify,
+                RateMode::Auto,
+                RateMode::Observe,
+                RateMode::Discover,
+            ] {
+                for target in [None, Some(1.0), Some(1e9)] {
+                    let got = evaluate_rx_acceptance(mode, target, stats);
+                    assert_eq!(
+                        (got.verdict, got.code),
+                        (Verdict::NotEvaluated, *code),
+                        "{label} / {mode:?} / 目标 {target:?}：不可信的采样必须 NOT_EVALUATED，\
+                         而且原因码要说清是哪一道门槛"
+                    );
+                }
+            }
+        }
+
+        // ---- 契约 1 的反面：三道门槛的**恰好通过**侧必须形成结论 ----
+        let just_ok = RateStats {
+            avg_mbps: Some(up(MIN_VALID_RX_MBPS)),
+            coverage: MIN_RATE_SAMPLE_COVERAGE,
+            stalled_ratio: stall_limit,
+            ..Default::default()
+        };
+        let got = evaluate_rx_acceptance(RateMode::Verify, Some(1e9), &just_ok);
+        assert_eq!(
+            (got.verdict, got.code),
+            (Verdict::RateFail, ReasonCode::RxBelowTarget),
+            "三道门槛都恰好在通过侧，就必须给出速率结论，不能再退回 NOT_EVALUATED"
+        );
+
+        // ---- 契约 2：可信之后，模式与「有没有目标」决定的分支 ----
+        let healthy = trustworthy(500.0);
+        for mode in [RateMode::Observe, RateMode::Discover] {
+            for target in [None, Some(1.0), Some(1e9)] {
+                let got = evaluate_rx_acceptance(mode, target, &healthy);
+                assert_eq!(
+                    (got.verdict, got.code),
+                    (Verdict::Measured, ReasonCode::TargetUnknown),
+                    "{mode:?} 只记录能力：给了目标也必须清掉，绝不 PASS/FAIL（目标 {target:?}）"
+                );
+            }
+        }
+        let verify_no_target = evaluate_rx_acceptance(RateMode::Verify, None, &healthy);
+        assert_eq!(
+            (verify_no_target.verdict, verify_no_target.code),
+            (Verdict::NotEvaluated, ReasonCode::TargetMissing),
+            "**Verify 缺目标是 NOT_EVALUATED/TARGET_MISSING**，不是 MEASURED——\
+             旧文档那句「无门限一律 MEASURED」在这一格是错的"
+        );
+        let auto_no_target = evaluate_rx_acceptance(RateMode::Auto, None, &healthy);
+        assert_eq!(
+            (auto_no_target.verdict, auto_no_target.code),
+            (Verdict::Measured, ReasonCode::TargetUnknown),
+            "Auto 没有目标可比，只能 MEASURED"
+        );
+        // 目标为 0 / 负数 / NaN 等于「没有可信目标」，必须走缺目标那一支。
+        for bad in [Some(0.0), Some(-1.0), Some(f64::NAN), Some(f64::INFINITY)] {
+            let got = evaluate_rx_acceptance(RateMode::Verify, bad, &healthy);
+            assert_eq!(
+                (got.verdict, got.code),
+                (Verdict::NotEvaluated, ReasonCode::TargetMissing),
+                "目标 {bad:?} 不是可信目标，Verify 下必须缺目标"
+            );
+            let got = evaluate_rx_acceptance(RateMode::Auto, bad, &healthy);
+            assert_eq!(
+                (got.verdict, got.code),
+                (Verdict::Measured, ReasonCode::TargetUnknown),
+                "目标 {bad:?} 不是可信目标，Auto 下必须 MEASURED"
+            );
+        }
+
+        // ---- 契约 3：等号在 PASS 侧，边界用常量的上下邻值 ----
+        let target = 850.0_f64;
+        for mode in [RateMode::Verify, RateMode::Auto] {
+            let exact = evaluate_rx_acceptance(mode, Some(target), &trustworthy(target));
+            assert_eq!(
+                exact.verdict,
+                Verdict::Pass,
+                "{mode:?}：RX 恰好等于门限就是 PASS"
+            );
+            let over = evaluate_rx_acceptance(mode, Some(target), &trustworthy(up(target)));
+            assert_eq!(
+                over.verdict,
+                Verdict::Pass,
+                "{mode:?}：高于门限一个 ULP 仍是 PASS"
+            );
+            let under = evaluate_rx_acceptance(mode, Some(target), &trustworthy(down(target)));
+            assert_eq!(
+                (under.verdict, under.code),
+                (Verdict::RateFail, ReasonCode::RxBelowTarget),
+                "{mode:?}：低于门限一个 ULP 就是 RATE_FAIL，等号不许两边都占"
+            );
+        }
+
+        // ---- 封闭性：这个函数只允许产出这四种判定 ----
+        for mode in [
+            RateMode::Verify,
+            RateMode::Auto,
+            RateMode::Observe,
+            RateMode::Discover,
+        ] {
+            for target in [None, Some(0.0), Some(850.0), Some(f64::NAN)] {
+                for stats in [&healthy, &just_ok, &untrustworthy[0].1, &untrustworthy[5].1] {
+                    let got = evaluate_rx_acceptance(mode, target, stats);
+                    assert!(
+                        matches!(
+                            got.verdict,
+                            Verdict::Pass
+                                | Verdict::RateFail
+                                | Verdict::Measured
+                                | Verdict::NotEvaluated
+                        ),
+                        "四种结果之外冒出了 {:?}（{mode:?} / {target:?}）",
+                        got.verdict
+                    );
+                    assert!(
+                        got.diagnostics.is_empty(),
+                        "诊断不由这个函数产出（ADR-17），它只回答合格没有"
+                    );
+                }
+            }
+        }
+    }
+
+    /// **采样积分对畸形输入的抵抗力**（回归方案 TIME-04）。
+    ///
+    /// 这一层吃的是从两台机器上收回来的采样序列，而那个序列**不保证规整**：
+    /// 线程失调度会漏拍，重试与合并会送来重复行，跨机传输不保证保序，网卡
+    /// 计数器会 reset。每一种畸形都能把「平均速率」变成一个凭空的数——而那个
+    /// 数直接决定 PASS/FAIL。
+    ///
+    /// 判据只有一条：**同一段时间只能被算一次，且任何输入都不该造出负速率**。
+    ///
+    /// 夹具有两个地方必须刻意设计，否则测试会变成空的：
+    /// 1. 平均值是**按时长加权**的，所以重复一条与其它同速率的样本，分子分母
+    ///    同倍放大、均值纹丝不动——重复的那一拍速率必须和别人不一样才测得到。
+    /// 2. `coverage` 出厂就带 `.min(1.0)`，拿它断言「没有重复计时」永远为真。
+    #[test]
+    fn a_malformed_sample_stream_cannot_inflate_or_invert_the_rate() {
+        let fast = 118_750_000; // ≈ 950 Mbps
+        let slow = 12_500_000; // = 100 Mbps
+        let window = EffectiveWindow {
+            start_ms: 0,
+            end_ms: 10_000,
+            available_secs: 10.0,
+            required_secs: 10,
+            complete: true,
+        };
+        // 9 拍 950 + 第 5 拍 100：留一个与众不同的速率，好让重复计时显形。
+        let clean: Vec<MonitorSample> = (1..=10)
+            .map(|i| sample(i * 1_000, if i == 5 { slow } else { fast }))
+            .collect();
+        let stats_of = |samples: Vec<MonitorSample>, first_active_ms: u64| {
+            monitor_rate_stats(
+                &MonitorStopOut {
+                    samples,
+                    ..Default::default()
+                },
+                &window,
+                true,
+                first_active_ms,
+            )
+        };
+        let baseline_avg = stats_of(clean.clone(), 0)
+            .avg_mbps
+            .expect("规整序列必须有值");
+        assert!(
+            (baseline_avg - 865.0).abs() < 1.0,
+            "基线应是 (9×950 + 100)/10 = 865，实际 {baseline_avg}"
+        );
+
+        // ---- 重复行：第 5 拍送来两遍 ----
+        // 逐样本累加会给那 100Mbps 两份权重，均值掉到 (8550+200)/11 ≈ 795。
+        let mut duplicated = clean.clone();
+        duplicated.push(sample(5_000, slow));
+        let dup = stats_of(duplicated, 0).avg_mbps.expect("有值");
+        assert!(
+            (dup - baseline_avg).abs() < 1.0,
+            "重复行把平均值改成了 {dup}（应为 {baseline_avg}）——同一段时间被算了两次"
+        );
+
+        // ---- 乱序到达：结论不许跟着到达顺序走 ----
+        let mut shuffled = clean.clone();
+        shuffled.reverse();
+        shuffled.swap(0, 5);
+        let out_of_order = stats_of(shuffled, 0).avg_mbps.expect("有值");
+        assert!(
+            (out_of_order - baseline_avg).abs() < 1.0,
+            "乱序改变了结论：{out_of_order}"
+        );
+
+        // ---- 零间隔：它没有覆盖任何时间，不该有权重 ----
+        let mut zero_interval = clean.clone();
+        zero_interval.push(MonitorSample {
+            elapsed_ms: 5_000,
+            interval_ms: 0,
+            rx_delta_bytes: fast * 100,
+            rx_mbps: 95_000.0,
+            valid: true,
+            ..Default::default()
+        });
+        let zero = stats_of(zero_interval, 0).avg_mbps.expect("有值");
+        assert!(
+            zero.is_finite() && (zero - baseline_avg).abs() < 1.0,
+            "零间隔样本把平均值带成了 {zero}"
+        );
+
+        // ---- 计数器 reset：delta 归零、valid=false ----
+        // 采集侧已把回退那一拍记成 delta=0 / valid=false（见
+        // `nic::monitor::record_counter_result`）。这一层不能把它当成
+        // 「这一秒真的是 0Mbps」计进平均——那会把一次计数器事故说成掉速。
+        let mut with_reset: Vec<MonitorSample> =
+            (1..=10).map(|i| sample(i * 1_000, fast)).collect();
+        with_reset[4] = MonitorSample {
+            elapsed_ms: 5_000,
+            interval_ms: 1_000,
+            rx_delta_bytes: 0,
+            rx_mbps: 0.0,
+            valid: false,
+            error: "接口计数器回退/reset: RX 900->0, TX 900->0".into(),
+            ..Default::default()
+        };
+        let reset = stats_of(with_reset, 0);
+        let reset_avg = reset.avg_mbps.expect("剩下 9 秒仍算得出平均");
+        assert!(
+            (reset_avg - 950.0).abs() < 1.0,
+            "计数器 reset 那一拍被当成 0Mbps 计进了平均（{reset_avg}，应为 950）——\
+             一次计数器事故会被说成掉速"
+        );
+        assert!(
+            reset.coverage < 0.95,
+            "但覆盖率必须掉下来（当前 {}）：那一秒**确实没有数据**，\
+             说成「测到了、只是没算」就把缺失藏起来了",
+            reset.coverage
+        );
+
+        // ---- 负速率：扣背景基线是唯一造得出负数的地方 ----
+        // 前 3 拍 950 全部落在背景段（cutoff=3000），基线取其中位数 950；
+        // 后 7 拍只有 100，差值 −850。夹到 0 才有物理含义。
+        let mixed: Vec<MonitorSample> = (1..=10)
+            .map(|i| sample(i * 1_000, if i <= 3 { fast } else { slow }))
+            .collect();
+        let subtracted = stats_of(mixed, 3_000);
+        let avg = subtracted.avg_mbps.expect("有值");
+        assert!(
+            avg >= 0.0,
+            "扣完背景基线出现负速率 {avg}——负的吞吐没有物理含义，\
+             它会一路流进报告和 xlsx"
+        );
+        assert!(
+            subtracted.min_mbps.is_none_or(|v| v >= 0.0),
+            "最小值同样不许为负：{:?}",
+            subtracted.min_mbps
+        );
+    }
 }

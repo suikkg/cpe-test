@@ -38,6 +38,11 @@ fn request() -> RunRequest {
             rx_target_bidir_ab: String::new(),
             rx_target_bidir_ba: String::new(),
             rx_target_bidir_total: String::new(),
+            rx_target_single_ab: String::new(),
+            rx_target_single_ba: String::new(),
+            rx_target_generic_ab: String::new(),
+            rx_target_generic_ba: String::new(),
+            rate_mode: String::new(),
             udp_groups: Vec::new(),
             tcp_groups: Vec::new(),
             src: "master:NAME=以太网 6".into(),
@@ -318,6 +323,11 @@ fn a_total_target_on_a_non_wifi_link_is_flagged_in_the_preview() {
         rx_target_bidir_ab: String::new(),
         rx_target_bidir_ba: String::new(),
         rx_target_bidir_total: "1500".into(),
+        rx_target_single_ab: String::new(),
+        rx_target_single_ba: String::new(),
+        rx_target_generic_ab: String::new(),
+        rx_target_generic_ba: String::new(),
+        rate_mode: String::new(),
         udp_groups: Vec::new(),
         tcp_groups: Vec::new(),
     }];
@@ -3522,6 +3532,25 @@ fn request_from_import(out: &serde_json::Value) -> RunRequest {
                 .as_str()
                 .unwrap_or_default()
                 .to_string(),
+            // 这个 helper 就是「请求 → 配置 → 导入 → 请求」那一圈本身：
+            // 新门限层不接进来，往返测试就测不到它们。
+            rx_target_single_ab: pair["rx_target_single_ab"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            rx_target_single_ba: pair["rx_target_single_ba"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            rx_target_generic_ab: pair["rx_target_generic_ab"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            rx_target_generic_ba: pair["rx_target_generic_ba"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            rate_mode: pair["rate_mode"].as_str().unwrap_or_default().to_string(),
             udp_groups: pair["udp_groups"]
                 .as_array()
                 .map(|items| {
@@ -5275,4 +5304,614 @@ fn the_run_list_puts_the_newest_first() {
     let mut sorted = ids.clone();
     sorted.sort_by(|a, b| b.cmp(a));
     assert_eq!(ids, sorted, "历史运行应当新的在前");
+}
+
+/// **导出再导入，门限一格都不许丢。**
+///
+/// 现场问题：网口门限 1800/2000，双向靠逐方向门限压到单边 850，而**单向漏了**
+/// ——SGMII1G 口物理上只能发 1G，却仍被按 1800 判。v6.2.8 为此加了
+/// `rate_targets_single_mbps`。可它当时只接到了导出侧：`/api/import` 回填的
+/// `PairImport` 上没有落点，于是「下载 config.json → 导回来」一趟就把它抹掉，
+/// 单向腿回落到网口门限，**那个 bug 原样装回来**，而 `notices` 是空的。
+///
+/// 一并补上的还有两处同样漏掉的：`rx_target_bidir_total`（配了合计门限的配置
+/// 往返后退回逐方向判定，判定口径整个变了）和 `rate_mode`（verify 被悄悄降级
+/// 成全局默认，同一份文件跑出不同结论）。
+///
+/// 这条测试守的是**往返恒等**，不是「有没有提示」——四层门限加判定模式全部
+/// 逐字段比对。以后再加第五层门限，忘了接导入侧，这里就会红。
+#[test]
+fn every_rate_target_layer_survives_a_download_import_round_trip() {
+    let state = state_with_pair();
+    let mut req = request();
+    // 单向和双向都勾上：两层门限各自的方向门禁都要走到。
+    req.pairs[0].directions = vec!["ab".into(), "ba".into(), "bidir".into()];
+    req.pairs[0].rx_target_bidir_ab = "850".into();
+    req.pairs[0].rx_target_bidir_ba = "840".into();
+    req.pairs[0].rx_target_bidir_total = "1700".into();
+    req.pairs[0].rx_target_single_ab = "1800".into();
+    req.pairs[0].rx_target_single_ba = "1790".into();
+    req.pairs[0].rx_target_generic_ab = "700".into();
+    req.pairs[0].rx_target_generic_ba = "690".into();
+    req.pairs[0].rate_mode = "verify".into();
+
+    let cfg = config_from_request(&state, &req).expect("配置应能合并");
+
+    // 先确认这一趟真的写进了 config：否则下面的往返是在比两个空值。
+    let spec = cfg.tests.first().expect("至少一条 tests[]");
+    assert_eq!(
+        spec.rate_targets_single_mbps.as_ref().and_then(|t| t.ab),
+        Some(1800.0)
+    );
+    assert_eq!(
+        spec.rate_targets_bidir_mbps.as_ref().and_then(|t| t.ab),
+        Some(850.0)
+    );
+    assert_eq!(spec.rate_target_bidir_total_mbps, Some(1700.0));
+    assert_eq!(
+        spec.rate_targets_mbps.as_ref().and_then(|t| t.ab),
+        Some(700.0)
+    );
+    assert_eq!(spec.rate_mode, Some(crate::config::RateMode::Verify));
+
+    // 下载 → 导入。
+    let console = console_with(state_with_pair());
+    let out = api_import(&console, &serde_json::to_string(&cfg).unwrap()).expect("必须能导回来");
+    let back = &out["pairs"][0];
+
+    for (field, want) in [
+        ("rx_target_bidir_ab", "850"),
+        ("rx_target_bidir_ba", "840"),
+        ("rx_target_bidir_total", "1700"),
+        ("rx_target_single_ab", "1800"),
+        ("rx_target_single_ba", "1790"),
+        ("rx_target_generic_ab", "700"),
+        ("rx_target_generic_ba", "690"),
+        ("rate_mode", "verify"),
+    ] {
+        assert_eq!(
+            back[field], want,
+            "{field} 没能原样回来。导入是下载的逆运算，丢一格就是「导进来看着差不多、\
+             跑出来不是那份配置」——比报错难查得多。实际回填：{back}"
+        );
+    }
+}
+
+/// `forward` 是「两个方向都用这个数」的简写，回填时摊进空着的 ab/ba。
+///
+/// 摊平**判定等价**：`RateTargets::for_direction` 读的是 `ab.or(forward)` /
+/// `ba.or(forward)`，而这条链上 direction 只会是 "ab" / "ba"
+/// （`flow_direction = if bidir { tag } else { dir }`，两者都取自规范化方向集）。
+/// 所以矩阵行上少两格，跑出来的门限一个字节不差。
+#[test]
+fn a_forward_shorthand_is_spread_into_both_directions_on_import() {
+    let state = state_with_pair();
+    let req = request();
+    let mut cfg = config_from_request(&state, &req).expect("配置应能合并");
+    for test in &mut cfg.tests {
+        test.rate_targets_single_mbps = Some(crate::config::RateTargets {
+            forward: Some(1234.0),
+            ab: None,
+            ba: None,
+        });
+        // ab 显式填了就以 ab 为准，forward 只补空着的那一格。
+        test.rate_targets_mbps = Some(crate::config::RateTargets {
+            forward: Some(555.0),
+            ab: Some(666.0),
+            ba: None,
+        });
+    }
+    let console = console_with(state_with_pair());
+    let out = api_import(&console, &serde_json::to_string(&cfg).unwrap()).expect("必须能导回来");
+    let back = &out["pairs"][0];
+    assert_eq!(back["rx_target_single_ab"], "1234");
+    assert_eq!(back["rx_target_single_ba"], "1234");
+    assert_eq!(
+        back["rx_target_generic_ab"], "666",
+        "显式的 ab 不许被 forward 盖掉"
+    );
+    assert_eq!(back["rx_target_generic_ba"], "555");
+}
+
+/// **新补的这几层门限也要走同一道校验**（D-01 的收尾）。
+///
+/// D-01 把单向 / 通用门限和 `rate_mode` 接进了矩阵路径，但只接了「读得懂就用」
+/// 那一半：`text_target` 是 `parse_rx_target(..).ok().flatten()`，`rate_mode` 是
+/// `_ => None`——**看不懂就当没填**。于是同一个错误写法，填进 `rx_target_bidir_ab`
+/// 会当场报错，填进 `rx_target_single_ab` 却一声不响地失效。
+///
+/// `rate_mode` 那一格尤其要命：`"verfiy"` 打错一个字母 → `None` → 回落到全局
+/// 模式。**D-01 修的就是「verify 被悄悄降级成全局默认」**，留着这条路等于把
+/// 同一个 bug 从导入侧搬到了请求侧。
+#[test]
+fn the_new_target_layers_reject_what_the_old_ones_reject() {
+    let state = state_with_pair();
+    let bad = |patch: fn(&mut PairSelection)| {
+        let mut req = request();
+        req.pairs[0].directions = vec!["ab".into(), "bidir".into()];
+        patch(&mut req.pairs[0]);
+        validated_config_from_request(&state, &req)
+    };
+
+    // 看不懂的写法：和双向那两格同一个待遇。
+    let err = bad(|p| p.rx_target_single_ab = "abc".into())
+        .expect_err("看不懂的单向门限必须报错，不能静默失效");
+    assert!(err.contains("abc"), "错误里要带上原样输入：{err}");
+    let err = bad(|p| p.rx_target_generic_ba = "1800m".into())
+        .expect_err("看不懂的通用门限必须报错，不能静默失效");
+    assert!(err.contains("1800m"), "错误里要带上原样输入：{err}");
+
+    // 百分比：换个格子写不改变它错在哪——百分比的基准是收口自己的协商速率，
+    // 而这几层要压的恰恰是「收口协商速率对这条路径不成立」。
+    let err = bad(|p| p.rx_target_single_ba = "90%".into()).expect_err("单向门限不该收百分比");
+    assert!(err.contains("绝对 Mbps"), "要说清只能填绝对值：{err}");
+    let err = bad(|p| p.rx_target_generic_ab = "90%".into()).expect_err("通用门限不该收百分比");
+    assert!(err.contains("绝对 Mbps"), "要说清只能填绝对值：{err}");
+
+    // 打错的判定模式：静默回落到全局，正是 D-01 要根除的那种降级。
+    let err = bad(|p| p.rate_mode = "verfiy".into()).expect_err("认不出的判定模式必须报错");
+    assert!(
+        err.contains("verfiy") && err.contains("verify"),
+        "要同时点出错在哪、以及认得哪几个：{err}"
+    );
+
+    // 合法值一个都不许误伤：大小写与首尾空格都按既有写法容忍。
+    for mode in ["", "auto", "Verify", " observe ", "discover"] {
+        let mut req = request();
+        req.pairs[0].directions = vec!["ab".into(), "bidir".into()];
+        req.pairs[0].rate_mode = mode.into();
+        req.pairs[0].rx_target_single_ab = "1800".into();
+        req.pairs[0].rx_target_generic_ab = "700".into();
+        validated_config_from_request(&state, &req)
+            .unwrap_or_else(|e| panic!("{mode:?} 是合法输入，不该被拦：{e}"));
+    }
+}
+
+/// **导入回填不许塞进一个让这一行跑不了的值**。
+///
+/// 回填是逐 test 做的，而一行的方向集要等所有 test 并完才定；`validate_pair` 又
+/// 要求「填了方向门限就得勾对应方向」。两者对不上时的表现很难查：导入成功、
+/// `notices` 干净，**点开始才报错**，而报错指着的那一格用户从没碰过——是导入
+/// 自己塞进去的，还让他去取消勾选。
+///
+/// 双向那三格在本轮之前就已经这样了：手写 config 上留一份没人用的
+/// `rate_targets_bidir_mbps`（只跑单向时它是死值，`leg_rx_target` 只在 bidir 时读
+/// 它），导进来这一行就卡死。单向那两格是本轮新接的，同一条规矩。
+#[test]
+fn importing_never_backfills_a_target_the_row_cannot_run() {
+    let state = state_with_pair();
+    let dead_value_config = |directions: Vec<String>, single: bool| {
+        let mut req = request();
+        req.pairs[0].directions = directions;
+        req.pairs[0].rx_target_bidir_ab = String::new();
+        let mut cfg = validated_config_from_request(&state, &req).expect("原始配置合法");
+        for t in &mut cfg.tests {
+            let targets = crate::config::RateTargets {
+                forward: None,
+                ab: Some(850.0),
+                ba: None,
+            };
+            if single {
+                t.rate_targets_single_mbps = Some(targets);
+            } else {
+                t.rate_targets_bidir_mbps = Some(targets);
+            }
+        }
+        cfg
+    };
+
+    // 只跑单向，却带一份双向门限：那个数一次都不会被查，回填时要裁掉。
+    let console = console_with(state_with_pair());
+    let out = api_import(
+        &console,
+        &serde_json::to_string(&dead_value_config(vec!["ab".into()], false)).unwrap(),
+    )
+    .expect("导入本身不做校验，必须成功");
+    assert_eq!(
+        out["pairs"][0]["rx_target_bidir_ab"], "",
+        "行里没有双向腿，双向门限就是死值，不许回填：{}",
+        out["pairs"][0]
+    );
+    let replayed = request_from_import(&out);
+    {
+        let st = lock_recover(&console.state);
+        validated_config_from_request(&st, &replayed)
+            .expect("导进来的行必须能直接跑——报错指着用户没填过的格子最难查");
+    }
+
+    // 对称的一半：只跑双向，却带一份单向门限。
+    let console = console_with(state_with_pair());
+    let out = api_import(
+        &console,
+        &serde_json::to_string(&dead_value_config(vec!["bidir".into()], true)).unwrap(),
+    )
+    .expect("导入必须成功");
+    assert_eq!(
+        out["pairs"][0]["rx_target_single_ab"], "",
+        "行里没有单向腿，单向门限同样是死值：{}",
+        out["pairs"][0]
+    );
+    let replayed = request_from_import(&out);
+    {
+        let st = lock_recover(&console.state);
+        validated_config_from_request(&st, &replayed).expect("同样必须能直接跑");
+    }
+
+    // 反面：`ab` 与 `bidir` 两条 test 并成一行时，两层门限都得留下——
+    // 裁剪只能按**最终**方向集判断，按逐 test 判断会把该留的也裁掉。
+    let mut req = request();
+    req.pairs[0].directions = vec!["ab".into(), "bidir".into()];
+    req.pairs[0].rx_target_bidir_ab = "850".into();
+    req.pairs[0].rx_target_single_ab = "1800".into();
+    let cfg = validated_config_from_request(&state, &req).expect("配置合法");
+    let console = console_with(state_with_pair());
+    let out = api_import(&console, &serde_json::to_string(&cfg).unwrap()).expect("导入必须成功");
+    assert_eq!(out["pairs"][0]["rx_target_bidir_ab"], "850");
+    assert_eq!(out["pairs"][0]["rx_target_single_ab"], "1800");
+}
+
+/// 单向门限的方向门禁，和双向那三格、以及 `UiTask` 完全同一条规矩。
+///
+/// 通用层**没有**门禁：它是门限链最后一层，单向双向都吃，勾哪个方向都成立。
+/// 这条同时钉住「该拦的拦、不该拦的不许误伤」，防的是照着双向那段复制粘贴时
+/// 顺手把通用层也套进门禁。
+#[test]
+fn a_single_direction_target_needs_a_single_direction_selected() {
+    let state = state_with_pair();
+    let with = |directions: Vec<&str>, patch: fn(&mut PairSelection)| {
+        let mut req = request();
+        req.pairs[0].directions = directions.into_iter().map(String::from).collect();
+        req.pairs[0].rx_target_bidir_ab = String::new();
+        patch(&mut req.pairs[0]);
+        validated_config_from_request(&state, &req)
+    };
+
+    let err = with(vec!["bidir"], |p| p.rx_target_single_ab = "1800".into())
+        .expect_err("只勾双向却填单向门限，必须当场说");
+    assert!(
+        err.contains("单向") && err.contains("A→B"),
+        "要点清是哪一格：{err}"
+    );
+
+    with(vec!["ab"], |p| p.rx_target_single_ab = "1800".into()).expect("勾了 A→B 就该放行");
+    with(vec!["ba"], |p| p.rx_target_single_ab = "1800".into())
+        .expect("勾了任一单向即可——两格共用一层，方向由 for_direction 挑");
+
+    // 通用层不挑方向，只勾双向也合法。
+    with(vec!["bidir"], |p| p.rx_target_generic_ab = "700".into())
+        .expect("通用门限排在最后一层，单向双向都吃，不该有方向门禁");
+}
+
+/// 通用门限改名后，老请求里的 `rx_target_ab` 仍然认得（serde alias）。
+///
+/// 改名是为了消歧：`UiTask.rx_target_ab` 指的是**单向层**（排在按网口门限之上），
+/// 而矩阵这边指的是**通用层**（排在按网口门限之下）。两个 DTO 挂在同一个
+/// `RunRequest` 上，同名不同层会让人把一个数填到网口层的另一侧去。
+/// 但字段名是对外兼容面，老脚本不能因为改名就发不动请求。
+#[test]
+fn the_old_generic_target_field_name_still_parses() {
+    let json = serde_json::json!({
+        "src": "master:NAME=以太网 6",
+        "dst": "agent:NAME=WLAN 3",
+        "directions": ["ab"],
+        "transports": ["tcp"],
+        "ip": ["v4"],
+        "rx_target_ab": "700",
+        "rx_target_ba": "690",
+    });
+    let pair: PairSelection = serde_json::from_value(json).expect("老字段名必须还能解析");
+    assert_eq!(pair.rx_target_generic_ab, "700");
+    assert_eq!(pair.rx_target_generic_ba, "690");
+    // 新名字同样认。
+    let pair: PairSelection = serde_json::from_value(serde_json::json!({
+        "src": "master:NAME=以太网 6",
+        "dst": "agent:NAME=WLAN 3",
+        "directions": ["ab"],
+        "transports": ["tcp"],
+        "ip": ["v4"],
+        "rx_target_generic_ab": "700",
+    }))
+    .expect("新字段名必须能解析");
+    assert_eq!(pair.rx_target_generic_ab, "700");
+}
+
+/// 白名单的另一半：**真实的目录必须解析得出来**（回归方案 SEC-05）。
+///
+/// `the_bundle_id_only_resolves_to_directories_that_actually_exist` 通篇断言
+/// `is_none()`——把 `resolve_run_dir` 改成无条件返回 `None`，它照样全绿，而
+/// 「下载报告包」这个功能已经死了。安全断言只写拒绝侧，等于没有区分「守住了」
+/// 和「什么都做不了」。
+#[test]
+fn a_real_run_directory_still_resolves_to_exactly_itself() {
+    use super::runs::resolve_run_dir;
+    let name = format!("sec05-real-{}", std::process::id());
+    let dir = std::path::Path::new("runs").join(&name);
+    std::fs::create_dir_all(&dir).expect("建得出测试目录");
+    let resolved = resolve_run_dir(&name);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(
+        resolved.as_deref(),
+        Some(dir.as_path()),
+        "真实存在的 run 目录必须解析出**它自己**的路径"
+    );
+}
+
+/// **`runs/` 下的符号链接不是 run 目录**（回归方案 SEC-05）。
+///
+/// 解析是按名字精确比对的白名单，这挡住了所有「能表示上级目录的写法」。
+/// 但它比对的是**名字**，不是那个名字指向哪儿：`runs/whatever -> /etc` 同样
+/// 名字命中、`is_dir()` 为真，于是 `/api/runs/whatever/bundle.zip` 打包的是
+/// `/etc`。实测确认过——探针建了一个指向临时目录的链接，包顺利打出来了。
+///
+/// 单看它不是提权：能在 `runs/` 里建链接的人本来就能读那些文件。**危险在于
+/// 它跨了信任边界**——`--ui-bind` 之后控制台在局域网上，于是「本地任何一个
+/// 以当前用户身份跑的东西写下一个链接」被放大成「远程用户凭口令读任意文件」。
+///
+/// 挡它的代价是零：这个工具自己从不在 `runs/` 里建符号链接，一个都不该有。
+/// 这和本模块既定的思路一致——不去猜有哪些危险写法，只认自己产出的东西。
+#[cfg(unix)]
+#[test]
+fn a_symlink_in_the_runs_directory_is_not_a_run() {
+    use super::runs::resolve_run_dir;
+    let outside = std::env::temp_dir().join(format!("cpe_sec05_outside_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&outside);
+    std::fs::write(outside.join("secret.txt"), "runs/ 之外的文件").unwrap();
+
+    let name = format!("sec05-link-{}", std::process::id());
+    let link = std::path::Path::new("runs").join(&name);
+    let _ = std::fs::remove_file(&link);
+    std::os::unix::fs::symlink(&outside, &link).unwrap();
+
+    let resolved = resolve_run_dir(&name);
+    let _ = std::fs::remove_file(&link);
+    let _ = std::fs::remove_dir_all(&outside);
+
+    assert!(
+        resolved.is_none(),
+        "`runs/` 下的符号链接被当成了 run 目录（解析到 {resolved:?}）。\
+         下载报告包会把链接目标整个打进 zip——本地写一个链接就换来远程读任意文件"
+    );
+}
+
+/// run 目录**里面**的符号链接同样不打包（回归方案 SEC-05）。
+///
+/// 挡住顶层还不够：`runs/<真实运行>/x -> /etc/passwd` 会被 `collect_files`
+/// 跟着走，而 zip 里的条目名仍然是 `run_xxx/x`——解开的人看不出这份内容
+/// 根本不来自那次运行。
+#[cfg(unix)]
+#[test]
+fn a_symlink_inside_a_run_directory_is_not_bundled() {
+    let outside = std::env::temp_dir().join(format!("cpe_sec05_inner_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&outside);
+    std::fs::write(outside.join("secret.txt"), "runs/ 之外的文件").unwrap();
+
+    let name = format!("sec05-inner-{}", std::process::id());
+    let dir = std::path::Path::new("runs").join(&name);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("report.html"), "<html>真实产物</html>").unwrap();
+    std::os::unix::fs::symlink(&outside, dir.join("escape")).unwrap();
+    std::os::unix::fs::symlink(outside.join("secret.txt"), dir.join("secret-link.txt")).unwrap();
+
+    let bundle = super::runs::build_bundle(&dir, &name).expect("真实 run 目录应能打包");
+    let names: Vec<String> = {
+        let file = std::fs::File::open(&bundle.path).unwrap();
+        let mut zip = zip::ZipArchive::new(file).unwrap();
+        (0..zip.len())
+            .map(|i| zip.by_index(i).unwrap().name().to_string())
+            .collect()
+    };
+    drop(bundle);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&outside);
+
+    assert!(
+        names.contains(&format!("{name}/report.html")),
+        "真实产物必须还在包里，否则这条断言只证明了「什么都没打包」：{names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n.contains("secret")),
+        "链接目标被打进了 zip，而条目名看着就像这次运行自己的产物：{names:?}"
+    );
+    assert!(
+        !names.iter().any(|n| n.contains("escape")),
+        "链接指向的目录被递归进去了：{names:?}"
+    );
+}
+
+fn raw_post(port: u16, path: &str, token: &str, body: &str) -> (u16, String) {
+    use std::io::{Read, Write};
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("连上控制台");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(60)))
+        .expect("读超时");
+    let head = format!(
+        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nX-CPE-Token: {token}\r\nX-CPE-Console: 1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes()).expect("发头");
+    stream.write_all(body.as_bytes()).expect("发体");
+    let mut bytes = Vec::new();
+    let _ = stream.read_to_end(&mut bytes);
+    let text = String::from_utf8_lossy(&bytes).into_owned();
+    let status = text
+        .split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0);
+    (status, text)
+}
+
+fn spawn_console(token: &str) -> (u16, Arc<Server>, std::thread::JoinHandle<()>) {
+    let console = Arc::new(Console {
+        state: Mutex::new(state_with_pair()),
+        running: AtomicBool::new(false),
+        run_gate: Mutex::new(()),
+        report: Mutex::new(String::new()),
+        ui_token: token.into(),
+        monitors: Mutex::new(HashMap::new()),
+        run_status: Arc::new(RunStatusRecorder::new()),
+    });
+    let server = Arc::new(Server::http("127.0.0.1:0").unwrap());
+    let port = server.server_addr().to_ip().unwrap().port();
+    let worker = Arc::clone(&console);
+    let worker_server = Arc::clone(&server);
+    let thread = std::thread::spawn(move || {
+        for request in worker_server.incoming_requests() {
+            handle(request, &worker);
+        }
+    });
+    (port, server, thread)
+}
+
+/// **请求体上限：刚好能用，超了要说清，而且绝不按截断后的内容动手**
+/// （回归方案 SEC-04）。
+///
+/// 只 `take(MAX_BODY_BYTES)` 的写法有两个都很难查的失败面，实测都成立过：
+///
+/// | 请求体 | 修复前 | 真正的问题 |
+/// |---|---|---|
+/// | 上限+1，尾部是空白 | **200，导入成功** | 截断后仍是合法 JSON，服务端**据此执行了导入**；用户手上的文件和实际生效的配置不是一份东西 |
+/// | 上限+1，截到内容里 | 「这不是一份能解析的 config.json」 | 真因是请求体超限，人会去查自己的文件 |
+///
+/// 第一行尤其要命：它和 D-01 是同一类——配置静默地变成了另一份，而没有任何
+/// 地方说过。区别是这次截掉的是任意内容。
+#[test]
+fn a_body_at_the_limit_works_and_one_byte_over_is_refused_not_truncated() {
+    let (port, server, thread) = spawn_console("unit-secret");
+    let cfg = serde_json::json!({"agent_host":"10.0.0.2","agent_token":"t","tests":[]});
+    let json = serde_json::to_string(&cfg).unwrap();
+    let limit = super::MAX_BODY_BYTES as usize;
+    // JSON 允许词法单元之间有任意空白，所以补空白既能凑到精确字节数，
+    // 又不改变语义。补在尾部 = 截断掉的是空白；补在头部 = 截断到内容里。
+    let pad = |total: usize, leading: bool| {
+        let fill = " ".repeat(total - json.len());
+        if leading {
+            format!("{fill}{json}")
+        } else {
+            format!("{json}{fill}")
+        }
+    };
+
+    // ---- 上限之内：必须能用 ----
+    // 反面同样重要：一个「什么都拒绝」的实现也能让下面的拒绝断言全绿。
+    for total in [json.len(), limit - 1, limit] {
+        for leading in [true, false] {
+            let (status, body) = raw_post(port, "/api/import", "unit-secret", &pad(total, leading));
+            assert_eq!(status, 200, "{total} 字节（leading={leading}）应当被受理");
+            assert!(
+                body.contains("\"ok\":true"),
+                "{total} 字节正好在上限之内，必须正常处理：{}",
+                body.lines().last().unwrap_or("")
+            );
+        }
+    }
+
+    // ---- 超一个字节：拒绝，而且要说清是超限 ----
+    for leading in [true, false] {
+        let (status, body) = raw_post(port, "/api/import", "unit-secret", &pad(limit + 1, leading));
+        assert_eq!(
+            status, 200,
+            "错误按本仓约定走 200 + ok:false，前端才拿得到原文"
+        );
+        let last = body.lines().last().unwrap_or("");
+        assert!(
+            last.contains("\"ok\":false"),
+            "超限请求被受理了（leading={leading}）——服务端按**截断后**的内容动了手：{last}"
+        );
+        assert!(
+            last.contains("超过") && last.contains("上限"),
+            "要说清真因是请求体超限，不能报成「config.json 解析不了」\
+             （leading={leading}）：{last}"
+        );
+    }
+
+    // ---- 没认证的超限请求：先 401，不泄露任何业务信息 ----
+    let (status, body) = raw_post(port, "/api/import", "wrong-token", &pad(limit + 1, false));
+    assert_eq!(status, 401, "鉴权先于一切，超限也不例外");
+    assert!(
+        !body.contains("超过"),
+        "未认证的请求不该知道上限是多少：{body}"
+    );
+
+    server.unblock();
+    let _ = thread.join();
+}
+
+/// **口令对了也不够：POST 还得带上那个自定义头**（回归方案 SEC-06）。
+///
+/// 浏览器允许任何页面向任何源发**表单** POST，并且会自动带上该源的 cookie。
+/// 这套鉴权的 CSRF 门就是 `X-CPE-Console`——自定义头触发预检，跨站表单发不出来。
+///
+/// 危险的组合很具体：控制台 `--ui-bind` 之后在局域网上，用户在同一台机器上
+/// 打开了别的网页，那个网页可以往 `http://<控制台>/api/run` 发一个表单 POST。
+/// 没有这道门的话，一次点击就能在别人的机器上起一轮灌包。
+///
+/// 这条同时钉住「拒绝就是真的没做」：错误必须在**路由之前**返回，不能先把
+/// 动作做了再报错。
+#[test]
+fn a_post_without_the_console_header_is_refused_before_it_reaches_any_route() {
+    use std::io::{Read, Write};
+    let (port, server, thread) = spawn_console("unit-secret");
+
+    // 带对口令、但**不带** X-CPE-Console 的 POST。
+    let post_without_header = |path: &str, body: &str| -> (u16, String) {
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("连上控制台");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(60)))
+            .expect("读超时");
+        let head = format!(
+            "POST {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nX-CPE-Token: unit-secret\r\n\
+             Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(head.as_bytes()).expect("发头");
+        stream.write_all(body.as_bytes()).expect("发体");
+        let mut bytes = Vec::new();
+        let _ = stream.read_to_end(&mut bytes);
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        let status = text
+            .split_whitespace()
+            .nth(1)
+            .and_then(|c| c.parse().ok())
+            .unwrap_or(0);
+        (status, text)
+    };
+
+    for path in [
+        "/api/run",
+        "/api/import",
+        "/api/plan",
+        "/api/stop",
+        "/api/connect",
+    ] {
+        let (status, body) = post_without_header(path, "{}");
+        let last = body.lines().last().unwrap_or("");
+        assert_eq!(status, 200, "{path}：错误按本仓约定走 200 + ok:false");
+        assert!(
+            last.contains("\"ok\":false") && last.contains("X-CPE-Console"),
+            "{path} 少了 CSRF 头却被放行了。浏览器允许任何页面发跨站表单 POST——\
+             没有这道门，别人的网页一次点击就能在这台机器上起一轮灌包：{last}"
+        );
+    }
+
+    // 反面：带上头就正常受理，否则上面那些只证明了「什么都不接受」。
+    let (status, body) = raw_post(
+        port,
+        "/api/import",
+        "unit-secret",
+        "{\"agent_host\":\"10.0.0.2\"}",
+    );
+    assert_eq!(status, 200);
+    assert!(
+        body.contains("\"ok\":true"),
+        "带齐口令与 X-CPE-Console 的请求必须正常受理：{}",
+        body.lines().last().unwrap_or("")
+    );
+
+    // GET 不需要这个头：它本来就发不出跨站的副作用请求。
+    let (status, _) = raw_get(port, "/api/bootstrap", &[("X-CPE-Token", "unit-secret")]);
+    assert_eq!(status, 200, "GET 不该被 CSRF 门挡住");
+
+    server.unblock();
+    let _ = thread.join();
 }

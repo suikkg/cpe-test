@@ -1056,6 +1056,46 @@ pub fn build_units(
                                             rx_target_mbps: target,
                                             offered_per_stream_mbps,
                                         };
+                                        // **计划期就要说清「这几条流灌不到这个门限」。**
+                                        //
+                                        // 执行端要求「所有必需流并发活跃」才算有效判定窗口，
+                                        // 而必需流数按 `target×(1+余量)/每流负载` 上取整。配少了
+                                        // 就不是「勉强够呛」，而是那个窗口**永远形不成**：整条腿
+                                        // 稳定判 NOT_EVALUATED/EFFECTIVE_WINDOW_SHORT。
+                                        //
+                                        // 现场代价是这条链路完全确定、却只能事后才知道：真机上
+                                        // 一轮 180s 预设的 UDP 单元会**全部**这样跑完再报「无法
+                                        // 评价」，而拿到的原因码指向采样窗口，不指向真因。
+                                        // 公式复用执行端那一份，不在这里重写。
+                                        if n > 1 {
+                                            let required =
+                                                crate::master::executor::required_udp_streams(
+                                                    n as usize,
+                                                    &spec.rate_check,
+                                                    target,
+                                                    offered_per_stream_mbps,
+                                                );
+                                            if required > n as usize {
+                                                if let (Some(target), Some(per_stream)) =
+                                                    (target, offered_per_stream_mbps)
+                                                {
+                                                    let msg = format!(
+                                                        "{} UDP {n} 条流 × {per_stream:.0}Mbps 灌不到 {target:.0}Mbps 门限\
+                                                         （含 {:.0}% 余量至少要 {required} 条并发流）。\
+                                                         按当前配置这一腿的有效判定窗口永远形不成，结果会稳定落在\
+                                                         「无法评价 / EFFECTIVE_WINDOW_SHORT」。把流数提到 {required}、\
+                                                         调大每流 -b，或把门限降到 {:.0}Mbps 以下。",
+                                                        leg_label,
+                                                        spec.rate_check.offered_headroom_pct.max(0.0),
+                                                        per_stream * n as f64
+                                                            / (1.0 + spec.rate_check.offered_headroom_pct.max(0.0) / 100.0),
+                                                    );
+                                                    if rx_target_notes.insert(msg.clone()) {
+                                                        notices.push(msg);
+                                                    }
+                                                }
+                                            }
+                                        }
                                         let kind = if n <= 1 {
                                             LegKind::IperfSingle(mk(0, alloc_port(next_port)))
                                         } else {
@@ -3818,7 +3858,12 @@ mod tests {
         let mut base = evb_udp_spec();
         base.streams = 20;
         base.tcp_streams = 20;
-        base.udp_streams = 4;
+        // 16/15 而不是 4/3：EVB 的 ab 门限是 6400Mbps，每流 500Mbps 时至少要
+        // 14 条并发流才够灌到它。4 条在计划期就会被判成「这一腿的有效判定窗口
+        // 永远形不成」并收到提示，而 `build_single_udp_id` 要求一份**干净**的
+        // 构建——这条测试问的是 resume identity，不该顺带背上一个不可行的负载。
+        // 两个数仍然只差 1，「改了 UDP 流数身份就得变」的判据一个字没动。
+        base.udp_streams = 16;
         let base_id = build_single_udp_id(base.clone(), PORT_BASE);
 
         let mut tcp_changed = base.clone();
@@ -3832,7 +3877,7 @@ mod tests {
         );
 
         let mut udp_changed = base;
-        udp_changed.udp_streams = 3;
+        udp_changed.udp_streams = 15;
         assert_ne!(
             base_id,
             build_single_udp_id(udp_changed, PORT_BASE),
@@ -4199,5 +4244,748 @@ mod tests {
         a.ipv6_ll = String::new();
         let b = nic("eth0", "SGMII1G", "192.168.1.3", 1000);
         assert!(v6_addrs(&a, &b).is_none());
+    }
+    /// **门限优先级的整层剥离**（回归方案 PLAN-08 / PLAN-09）。
+    ///
+    /// 现有测试逐对验证「A 盖过 B」，但那种两两断言挡不住**重排**：把「按网口」
+    /// 挪到「单向方向门限」前面，逐对测试里只会红一条，而整条链的形状已经变了。
+    /// 这里把四层同时钉上去，再从高到低一层层拿掉，断言每一步的胜者和**预览里
+    /// 印的来源**同时正确——数字对而来源印错，用户在计划页上照样查不出为什么。
+    ///
+    /// 单向链：单向方向门限 → 按网口 → 任务/全局 → （无）。
+    /// 双向链：双向合计（本腿只测量） → 双向方向门限 → 按网口 → 任务/全局。
+    #[test]
+    fn every_rx_target_layer_yields_to_the_one_above_it() {
+        // 路径两端都是 2.5G，让路径上限（0.95 × 2500 = 2375）高于以下所有门限，
+        // 免得封顶插进来把「哪一层赢了」搅浑——封顶本身另有测试。
+        let stacked = || {
+            let mut spec = base_spec();
+            spec.src = ep(Side::Master, "以太网 6", "SGMII2.5G", "192.168.0.101", 2500);
+            spec.dst = ep(Side::Agent, "以太网 18", "SGMII2.5G", "192.168.0.105", 2500);
+            spec.rate_mode = RateMode::Verify;
+            // 第 4 层：任务/全局门限。
+            spec.rate_targets.ab = Some(400.0);
+            spec.rate_targets.ba = Some(400.0);
+            // 第 3 层：按网口。
+            spec.link_profiles = LinkProfiles {
+                by_role: Vec::new(),
+                by_nic: vec![NicProfile {
+                    host: "agent".into(),
+                    name: "以太网 18".into(),
+                    ipv4: "192.168.0.105".into(),
+                    rx_target_mbps: Some(600.0),
+                    udp_bandwidth: None,
+                    ..Default::default()
+                }],
+            };
+            // 第 2 层：方向门限（单向一套、双向一套，互不相干）。
+            spec.rate_targets_single.ab = Some(800.0);
+            spec.rate_targets_bidir.ab = Some(900.0);
+            spec.rate_targets_bidir.ba = Some(900.0);
+            spec
+        };
+
+        let target_of = |spec: SpecNorm, want_bidir: bool| -> (Option<f64>, Vec<String>) {
+            let mut spec = spec;
+            spec.directions = vec![if want_bidir { "bidir" } else { "ab" }.into()];
+            let mut port = PORT_BASE;
+            let (units, _) = build_units(&[spec], true, &mut port);
+            let unit = units
+                .iter()
+                .find(|u| u.bidir == want_bidir)
+                .expect("应有对应方向的单元");
+            let LegKind::IperfSingle(task) = &unit.legs[0].kind else {
+                panic!("expect iperf leg");
+            };
+            (task.rx_target_mbps, unit.target_lines.clone())
+        };
+        let says = |lines: &[String], number: &str, source: &str| {
+            assert!(
+                lines
+                    .iter()
+                    .any(|l| l.contains(number) && l.contains(source)),
+                "计划页要同时说清数字 {number} 和它来自「{source}」，实际：{lines:?}"
+            );
+        };
+
+        // ---- 单向链 ----
+        let (target, lines) = target_of(stacked(), false);
+        assert_eq!(target, Some(800.0), "单向：方向门限在最上层");
+        says(&lines, "800", "单向方向门限");
+
+        let mut spec = stacked();
+        spec.rate_targets_single = Default::default();
+        let (target, lines) = target_of(spec, false);
+        assert_eq!(target, Some(600.0), "拿掉方向门限，按网口接手");
+        says(&lines, "600", "按网口门限");
+
+        let mut spec = stacked();
+        spec.rate_targets_single = Default::default();
+        spec.link_profiles = LinkProfiles::default();
+        let (target, lines) = target_of(spec, false);
+        assert_eq!(target, Some(400.0), "再拿掉按网口，落到任务/全局");
+        says(&lines, "400", "任务/频段/全局门限");
+
+        let mut spec = stacked();
+        spec.rate_targets_single = Default::default();
+        spec.link_profiles = LinkProfiles::default();
+        spec.rate_targets = Default::default();
+        let (target, _) = target_of(spec, false);
+        assert_eq!(target, None, "四层都没有就是没有门限，不许凭空造一个");
+
+        // ---- 双向链：双向那一套不受单向门限影响 ----
+        let (target, lines) = target_of(stacked(), true);
+        assert_eq!(
+            target,
+            Some(900.0),
+            "双向腿只认双向方向门限；单向的 800 不许渗进来"
+        );
+        says(&lines, "900", "双向方向门限");
+
+        let mut spec = stacked();
+        spec.rate_target_bidir_total = Some(1700.0);
+        spec.directions = vec!["bidir".into()];
+        let mut port = PORT_BASE;
+        let (units, _) = build_units(&[spec], true, &mut port);
+        let unit = &units[0];
+        let LegKind::IperfSingle(task) = &unit.legs[0].kind else {
+            panic!("expect iperf leg");
+        };
+        assert_eq!(
+            task.rx_target_mbps, None,
+            "配了两端 RX 合计，这一腿就没有自己的门限——否则会出现\
+             「AB 判 RATE_FAIL、单元判 PASS」这种自相矛盾的两行"
+        );
+        // 分工：builder 这一层**只**说「本腿只测量」——逐腿门限本来就不存在，
+        // 印一个数字反而是撒谎。合计那个数字是单元级的，由
+        // `webui::plan::unit_target_lines` 在预览时补一行
+        // 「AB 接收端 RX + BA 接收端 RX ≥ …」，那一层由
+        // `wifi_band_thresholds_flow_into_targets_and_show_their_source` 守着。
+        // 这里钉住的是分界：本层不许把单元级门限混进逐腿行里。
+        says(&unit.target_lines, "本腿只测量", "双向 RX 合计门限");
+        assert!(
+            !unit.target_lines.iter().any(|line| line.contains("1700")),
+            "逐腿行里冒出单元级的合计门限，会读成「这条腿按 1700 判」：{:?}",
+            unit.target_lines
+        );
+        assert_eq!(unit.bidir_total_target_mbps, Some(1700.0));
+
+        let mut spec = stacked();
+        spec.rate_targets_bidir = Default::default();
+        let (target, lines) = target_of(spec, true);
+        assert_eq!(target, Some(600.0), "双向拿掉方向门限后，同样落到按网口");
+        says(&lines, "600", "按网口门限");
+
+        // ---- 两条链彼此隔离 ----
+        let mut spec = stacked();
+        spec.rate_targets_bidir = Default::default();
+        spec.link_profiles = LinkProfiles::default();
+        spec.rate_targets = Default::default();
+        let (bidir_target, _) = target_of(spec.clone(), true);
+        assert_eq!(
+            bidir_target, None,
+            "只填了单向门限时，双向腿必须是「没有门限」——\
+             这正是 v6.2.8 分成两套的理由：850/850 的双向不该被 1800 的单向顶掉"
+        );
+        let (single_target, _) = target_of(spec, false);
+        assert_eq!(single_target, Some(800.0), "同一份 spec，单向腿仍然拿得到");
+    }
+
+    /// **流数灌不到门限时，计划期就要说**（回归方案 CFG-07 / PLAN-12）。
+    ///
+    /// 真机复现（run_20260906_175551，macOS ↔ Arch）：`udp_streams=2`、每流
+    /// `-b 300m`、门限 850Mbps。执行端要求「所有必需流并发活跃」才算有效判定
+    /// 窗口，而必需流数 = ceil(850 × 1.05 / 300) = 3 > 2——那个窗口**永远形不成**，
+    /// 整条腿稳定判 `NOT_EVALUATED / EFFECTIVE_WINDOW_SHORT`。
+    ///
+    /// 三件事让它比「配错了」更值得挡：①完全确定，不是概率性的；②计划期
+    /// 已知全部输入，本可以提前算出来；③用户拿到的原因码指向采样窗口，
+    /// 而真因是流数不够——排查方向被带偏一整层。180s 的 Windows 预设下，
+    /// 这会让一轮里**每一个** UDP 单元都白跑。
+    #[test]
+    fn a_stream_count_that_can_never_reach_the_target_is_called_out_before_the_run() {
+        let under_provisioned = |streams: u32, bandwidth: &str, target: f64| {
+            let mut spec = base_spec();
+            spec.transports = vec!["udp".into()];
+            spec.udp_streams = streams;
+            spec.udp_profiles = vec![UdpProfile::bw(bandwidth)];
+            spec.udp_limit = false;
+            spec.rate_mode = RateMode::Verify;
+            spec.rate_targets_single.ab = Some(target);
+            let mut port = PORT_BASE;
+            build_units(&[spec], true, &mut port).1
+        };
+
+        // 2 × 300 = 600Mbps，够不到 850（含 5% 余量要 892.5）。
+        let notices = under_provisioned(2, "300m", 850.0);
+        let hit = notices
+            .iter()
+            .find(|line| line.contains("灌不到") && line.contains("850"))
+            .unwrap_or_else(|| panic!("必须在计划期点名，实际提示：{notices:#?}"));
+        assert!(hit.contains("至少要 3 条"), "要说清到底需要几条：{hit}");
+        assert!(
+            hit.contains("EFFECTIVE_WINDOW_SHORT"),
+            "要把「跑完会得到哪个原因码」写出来，否则用户仍然会去查采样窗口：{hit}"
+        );
+
+        // 够了就不许聒噪：4 × 300 = 1200 > 892.5。
+        let quiet = under_provisioned(4, "300m", 850.0);
+        assert!(
+            !quiet.iter().any(|line| line.contains("灌不到")),
+            "灌得够却还在提示，下次真的不够时没人会看：{quiet:#?}"
+        );
+
+        // 没有门限就无从判断够不够，同样不许提示。
+        let mut spec = base_spec();
+        spec.transports = vec!["udp".into()];
+        spec.udp_streams = 2;
+        spec.udp_profiles = vec![UdpProfile::bw("300m")];
+        spec.udp_limit = false;
+        let mut port = PORT_BASE;
+        let (_, notices) = build_units(&[spec], true, &mut port);
+        assert!(
+            !notices.iter().any(|line| line.contains("灌不到")),
+            "没有门限时无从比较，不该提示：{notices:#?}"
+        );
+    }
+
+    /// **凡是能改变「跑什么」或「按什么判」的输入，resume 身份都必须跟着变**
+    /// （回归方案 RES-02）。
+    ///
+    /// 现有覆盖是**两两**的：合计门限一条、双向门限一条、2.4G 上限一条……
+    /// 那种写法挡不住「**忘了接**」——新加一层门限、或者给 `SpecNorm` 添一个
+    /// 影响下发的字段，逐对测试一条都不会红，而身份里少了它。少一个字段的后果
+    /// 不是「多跑一轮」，是**改完配置重跑，整批单元被 SKIP 掉，报告里沿用上一
+    /// 次的 PASS**——用户看到的是「我改的东西没生效」，而没有任何地方说为什么。
+    ///
+    /// 所以这里按「改一格 → 身份必须变 / 必须不变」逐项扫，两侧都钉。
+    #[test]
+    fn every_input_that_changes_what_runs_or_how_it_is_judged_changes_the_resume_id() {
+        // 单向 UDP 基线：这条路上四层门限、负载、判定模式全都走得到。
+        let baseline = || {
+            let mut spec = evb_udp_spec();
+            spec.directions = vec!["ab".into()];
+            spec.udp_streams = 16;
+            spec.rate_mode = RateMode::Verify;
+            spec.rate_targets_single.ab = Some(800.0);
+            spec.rate_targets.ab = Some(400.0);
+            spec
+        };
+        /// 「这一格改成什么样」——一句话说明 + 改法。
+        type Tweak = (&'static str, Box<dyn Fn(&mut SpecNorm)>);
+
+        // 不复用 `build_single_udp_id`：它要求一份不带任何提示的构建，而这里有
+        // 几格（协商速率、余量）本来就会顺带触发计划期提示。提示与身份是两件事。
+        let id = |spec: SpecNorm| {
+            let mut port = PORT_BASE;
+            let (units, _) = build_units(&[spec], true, &mut port);
+            assert_eq!(units.len(), 1, "这一组夹具每次只该生成一个单元");
+            units[0].id.clone()
+        };
+        let base_id = id(baseline());
+
+        // ---- 改了必须失效 ----
+        let must_change: Vec<Tweak> = vec![
+            (
+                "单向方向门限（本腿的实际验收线）",
+                Box::new(|s: &mut SpecNorm| s.rate_targets_single.ab = Some(801.0)),
+            ),
+            (
+                "通用门限（单向门限拿掉后就是它说了算）",
+                Box::new(|s: &mut SpecNorm| {
+                    s.rate_targets_single = Default::default();
+                    s.rate_targets.ab = Some(401.0);
+                }),
+            ),
+            (
+                "按网口门限（同样能改出本腿的验收线）",
+                Box::new(|s: &mut SpecNorm| {
+                    s.rate_targets_single = Default::default();
+                    s.rate_targets = Default::default();
+                    s.link_profiles = LinkProfiles {
+                        by_role: Vec::new(),
+                        by_nic: vec![NicProfile {
+                            host: "agent".into(),
+                            name: "10g".into(),
+                            ipv4: "192.168.1.3".into(),
+                            rx_target_mbps: Some(1234.0),
+                            ..Default::default()
+                        }],
+                    };
+                }),
+            ),
+            (
+                "判定模式（verify 与 observe 是两种结论）",
+                Box::new(|s: &mut SpecNorm| s.rate_mode = RateMode::Observe),
+            ),
+            (
+                "每流负载 -b",
+                Box::new(|s: &mut SpecNorm| s.udp_profiles = vec![UdpProfile::bw("501m")]),
+            ),
+            (
+                "报文长度 -l",
+                Box::new(|s: &mut SpecNorm| {
+                    s.udp_profiles = vec![UdpProfile {
+                        bandwidth: "500m".into(),
+                        length: Some("1200".into()),
+                        window: None,
+                    }]
+                }),
+            ),
+            ("并发流数", Box::new(|s: &mut SpecNorm| s.udp_streams = 15)),
+            ("时长", Box::new(|s: &mut SpecNorm| s.duration += 1)),
+            (
+                "方向",
+                Box::new(|s: &mut SpecNorm| s.directions = vec!["ba".into()]),
+            ),
+            (
+                "链路身份：发送口换了一块网卡",
+                Box::new(|s: &mut SpecNorm| {
+                    s.src = ep(Side::Master, "usb2", "10GUSB", "192.168.1.4", 4200)
+                }),
+            ),
+            (
+                "链路身份：协商速率变了（裁流与封顶都吃它）",
+                Box::new(|s: &mut SpecNorm| {
+                    s.dst = ep(Side::Agent, "10g", "10GETH", "192.168.1.3", 1000)
+                }),
+            ),
+            (
+                "判定口径本身：采样间隔",
+                Box::new(|s: &mut SpecNorm| s.rate_check.sample_interval_ms += 1),
+            ),
+            (
+                "判定口径本身：最低并发比例",
+                Box::new(|s: &mut SpecNorm| s.rate_check.min_active_ratio = 0.5),
+            ),
+            (
+                "判定口径本身：灌包余量",
+                Box::new(|s: &mut SpecNorm| s.rate_check.offered_headroom_pct = 10.0),
+            ),
+        ];
+        for (what, mutate) in must_change {
+            let mut spec = baseline();
+            mutate(&mut spec);
+            assert_ne!(
+                base_id,
+                id(spec),
+                "改了「{what}」，resume 身份却没变——改完配置重跑会整批 SKIP，\
+                 报告里沿用上一次的 PASS，而用户只会看到「我改的东西没生效」"
+            );
+        }
+
+        // ---- 只改显示项，身份不许动 ----
+        // 反面同样重要：身份平白失效意味着 resume 名存实亡，每次都全量重跑，
+        // 而这个功能存在的理由就是别再跑一遍已经过了的。
+        let must_not_change: Vec<Tweak> = vec![
+            (
+                "测试项名字",
+                Box::new(|s: &mut SpecNorm| s.name = "换个名字".into()),
+            ),
+            (
+                "报告里的链路分组标签",
+                Box::new(|s: &mut SpecNorm| s.link_group = "有线 ↔ 有线".into()),
+            ),
+            (
+                "双向门限（本腿是单向，它一次都不会被查）",
+                Box::new(|s: &mut SpecNorm| {
+                    s.rate_targets_bidir.ab = Some(999.0);
+                    s.rate_targets_bidir.ba = Some(999.0);
+                }),
+            ),
+            (
+                "双向 RX 合计门限（同上，只对双向腿成立）",
+                Box::new(|s: &mut SpecNorm| s.rate_target_bidir_total = Some(1700.0)),
+            ),
+        ];
+        for (what, mutate) in must_not_change {
+            let mut spec = baseline();
+            mutate(&mut spec);
+            assert_eq!(
+                base_id,
+                id(spec),
+                "只改了「{what}」，resume 身份却失效了——每次都全量重跑，\
+                 resume 就名存实亡"
+            );
+        }
+
+        // 双向腿是另一条链：那两层在这里必须**反过来**生效。
+        let bidir = || {
+            let mut spec = baseline();
+            spec.directions = vec!["bidir".into()];
+            spec.rate_targets_bidir.ab = Some(900.0);
+            spec.rate_targets_bidir.ba = Some(900.0);
+            spec
+        };
+        let bidir_id = id(bidir());
+        let mut changed = bidir();
+        changed.rate_targets_bidir.ab = Some(901.0);
+        assert_ne!(bidir_id, id(changed), "双向腿上，双向方向门限必须进身份");
+        let mut changed = bidir();
+        changed.rate_target_bidir_total = Some(1700.0);
+        assert_ne!(
+            bidir_id,
+            id(changed),
+            "合计门限一配，这个单元就改成「按两端 RX 相加判一次」——\
+             判定口径整个换了，绝不能复用逐方向那一次的 PASS"
+        );
+        // **两个不同的合计值之间**也必须分得开。配了合计，逐腿门限就统一变成
+        // `None`（本腿只测量），于是 1700 和 1800 在逐腿身份上**一个字节都不差**
+        // ——只有合计那一项自己能区分。少了它，把合计从 1700 调到 1800 重跑，
+        // 整批单元会拿 1700 那次的 PASS 顶上来。
+        let mut at_1700 = bidir();
+        at_1700.rate_target_bidir_total = Some(1700.0);
+        let mut at_1800 = bidir();
+        at_1800.rate_target_bidir_total = Some(1800.0);
+        let (a, b) = (id(at_1700), id(at_1800));
+        assert_ne!(
+            a, b,
+            "合计门限 1700 与 1800 的 resume 身份相同。配了合计后逐腿门限都是 None，\
+             逐腿身份分不出这两者，必须靠合计自己进身份"
+        );
+
+        let mut changed = bidir();
+        changed.rate_targets_single.ab = Some(1.0);
+        assert_eq!(
+            bidir_id,
+            id(changed),
+            "双向腿不读单向门限，改它不该让身份失效"
+        );
+    }
+
+    /// 灌包命令是**逐参数**下发的，不经过 shell（回归方案 SEC-05 后半）。
+    ///
+    /// `extra` 里每一项都是一个独立的 argv 元素，最终交给
+    /// `Command::new(bin).args(&args)`——中间没有 shell。所以 `;` `&&` `$()`
+    /// 反引号这些只在 shell 里才有意义的字符，到 iperf3 手上就是普通字符，
+    /// 它会因为「这不是个合法的带宽写法」而拒绝，而不是执行什么。
+    ///
+    /// 走的是**配置**这条路而不是控制台：`check_udp_bandwidth` 会把界面上填的
+    /// 怪写法挡在门外，但项目文件里的 `master_config.iperf.udp_profiles` 是整块
+    /// 原样搬运的，能把任意字符串送到这里。
+    ///
+    /// 这条钉住的是**结构**而不是某几个字符：只要还有人把 extra 拼成一个字符串
+    /// 再交出去（为了打日志、为了展示命令行），注入面立刻就回来。所以断言的是
+    /// 「一个值 = 一个元素，原样，不拆不拼」。
+    #[test]
+    fn traffic_arguments_are_separate_argv_entries_never_a_shell_string() {
+        let build = |bandwidth: &str, length: Option<&str>, window: Option<&str>| {
+            let mut spec = base_spec();
+            spec.transports = vec!["udp".into()];
+            spec.udp_streams = 1;
+            spec.udp_limit = false;
+            spec.udp_profiles = vec![UdpProfile {
+                bandwidth: bandwidth.into(),
+                length: length.map(String::from),
+                window: window.map(String::from),
+            }];
+            let mut port = PORT_BASE;
+            build_units(&[spec], true, &mut port).0
+        };
+        let first_task = |units: &[Unit]| {
+            units
+                .iter()
+                .flat_map(|u| u.legs.iter())
+                .find_map(|leg| match &leg.kind {
+                    LegKind::IperfSingle(task) => Some(task.clone()),
+                    LegKind::IperfGroup { streams, .. } => streams.first().cloned(),
+                    _ => None,
+                })
+        };
+
+        // `-b` 解析不出来时**整条单元都不产生**：那个字符串到不了命令行。
+        assert!(
+            first_task(&build("1m; rm -rf / #", None, None)).is_none(),
+            "带宽解析不出来却仍排出了灌包腿——那个字符串会一路走到 argv 上"
+        );
+
+        // `-l` / `-w` 不参与数值解析，会原样下发；它们必须各自是**一个**元素。
+        let units = build("1m", Some("1200 && whoami"), Some("256k; id"));
+        let task = first_task(&units).expect("合法带宽下应有一条 iperf 腿");
+
+        for needle in ["&& whoami", "; id"] {
+            let hits: Vec<&String> = task
+                .extra
+                .iter()
+                .filter(|arg| arg.contains(needle))
+                .collect();
+            assert_eq!(
+                hits.len(),
+                1,
+                "{needle:?} 应当整体留在**单个** argv 元素里，实际 extra = {:?}",
+                task.extra
+            );
+        }
+        assert!(
+            !task.extra.iter().any(|arg| arg.trim().is_empty()),
+            "不许出现空参数——空元素是「按空白切过」的痕迹：{:?}",
+            task.extra
+        );
+        // flag 与值必须成对且顺序正确：值跑到 flag 位置上是另一种注入。
+        // `-b` 是**解析后重新生成**的（`1m` → `1000000`），原串一个字节都不留；
+        // `-l` / `-w` 不做数值解析，原样透传，但各自只占**一个** argv 元素。
+        // 后者意味着怪写法会走到 iperf3 手上并被它拒绝——那是执行期报错，不是
+        // 注入；代价只是这一腿要跑起来才失败，而不是计划期就挡下。
+        for (flag, value) in [
+            ("-b", "1000000"),
+            ("-l", "1200 && whoami"),
+            ("-w", "256k; id"),
+        ] {
+            let idx = task
+                .extra
+                .iter()
+                .position(|a| a == flag)
+                .unwrap_or_else(|| panic!("{flag} 应当下发：{:?}", task.extra));
+            assert_eq!(
+                task.extra[idx + 1],
+                value,
+                "{flag} 的值必须原样、单元素地紧跟其后：{:?}",
+                task.extra
+            );
+        }
+    }
+
+    /// **裁流的两个边界：速率未知时不裁，一条腿灌不动时整个单元不排**
+    /// （回归方案 PLAN-05）。
+    ///
+    /// 逐腿裁剪、Wi-Fi 固定档、RNDIS/NCM/10GUSB 的特例各自已有测试，这里补的是
+    /// 两端：
+    ///
+    /// **① 速率未知不许裁，但也不许因此放过已知的那端。**
+    /// `path_payload_ceiling_mbps` 只在**两端都**问不出上限时才返回 `None`；
+    /// 一端已知就用已知那端——它仍然是实打实的物理约束。
+    /// 两端都未知时唯一正确的做法是照请求发：按一个猜出来的上限裁，等于用工具的
+    /// 猜测替换掉操作者的配置，失败方向还是「灌得比要求的少、却按原门限判」，
+    /// 直接制造假 FAIL。
+    ///
+    /// **② 单流就灌不动时，整个单元不许排。** CTS 那条路上流数会算到 0
+    /// （iperf 那条路 v4.3.0 起改成压 `-b` 而不是跳过，见
+    /// `test_udp_over_path_ceiling_clips_bandwidth_instead_of_skipping`）。
+    /// 0 流必须让**整个单元消失**，而不是留下一个没有腿的空单元——空单元会
+    /// 进计数、进报告、占一行，却什么都没跑。
+    #[test]
+    fn an_unknown_link_speed_is_never_clipped_and_a_leg_that_cannot_run_drops_the_unit() {
+        let cfg = RateCheckCfg::default();
+
+        // ---- ① 未知速率 ----
+        // 角色不在那张表里、协商速率又拿不到（macOS/Linux 扫不到 PHY 速率是常态）。
+        let unknown = ep(Side::Master, "eth9", "MYSTERY", "192.168.1.9", 0);
+        let known = ep(Side::Agent, "eth0", "SGMII1G", "192.168.1.3", 1000);
+        let requested = UdpProfile::bw("2.6G").parsed_bandwidth().expect("合法带宽");
+
+        // 两端都未知 → 整条路径无从裁起，照请求发。
+        assert!(
+            crate::rate::path_payload_ceiling_mbps(&unknown.nic, &unknown.nic, &cfg).is_none(),
+            "两端都未知时，路径上限就不该被猜出来"
+        );
+        let load = udp_load_for_leg(&unknown, &unknown, requested, 4, true, false, &cfg);
+        assert_eq!(
+            (load.mbps, load.streams, load.clipped_from_mbps),
+            (requested.mbps, 4, None),
+            "两端速率都未知却裁了：按猜出来的上限灌、再按原门限判，就是配置出来的 FAIL"
+        );
+
+        // 一端已知 → **用已知那端**，不因为另一端未知就整条放行。
+        // 这是「不误裁」的真实边界：不猜未知的那端，也不放过已知的那端。
+        assert_eq!(
+            crate::rate::path_payload_ceiling_mbps(&unknown.nic, &known.nic, &cfg),
+            Some(1000.0),
+            "一端未知不该让整条路径失去上限——已知那端仍然是物理约束"
+        );
+        let half_known = udp_load_for_leg(&unknown, &known, requested, 4, true, false, &cfg);
+        assert!(
+            half_known.clipped_from_mbps.is_some() || half_known.streams < 4,
+            "已知那端是 1G，2.6G 却原样放行：{half_known:?}"
+        );
+
+        // 反面：两端都已知时必须裁，否则上面那条只是「从来不裁」。
+        let clipped = udp_load_for_leg(&known, &known, requested, 4, true, false, &cfg);
+        assert!(
+            clipped.clipped_from_mbps.is_some() || clipped.streams < 4,
+            "1G 路径上灌 2.6G 却原样放行：{clipped:?}"
+        );
+
+        // ---- ② 一条腿排不出来，整个单元不许留 ----
+        // CTS UDP 那条路上单流超过路径上限时流数算到 0。
+        let mut spec = base_spec();
+        spec.src = ep(Side::Master, "eth0", "SGMII1G", "192.168.1.2", 1000);
+        spec.dst = ep(Side::Agent, "eth0", "SGMII1G", "192.168.1.3", 1000);
+        spec.kinds = vec!["ctstraffic".into()];
+        spec.transports = vec!["udp".into()];
+        spec.udp_streams = 4;
+        spec.udp_limit = true;
+        spec.udp_profiles = vec![UdpProfile {
+            bandwidth: "2.6G".into(),
+            length: Some("1200".into()),
+            window: None,
+        }];
+        let mut port = PORT_BASE;
+        let (units, notices) = build_units(&[spec], true, &mut port);
+        // 注：`legs.clear()` 那一步在当前结构下够不到——路径上限是
+        // `min(两端)`，对称，所以一个单元的两条腿永远同进同退，第一条排不出来时
+        // `legs` 本来就是空的。它是防御性的，不是本条测试证到的东西。
+        // 真正证到的是下面两条：0 流检查在，且跳过会说一声。
+        assert!(
+            units.iter().all(|unit| !unit.legs.is_empty()),
+            "留下了一个没有腿的空单元：它会进计数、进报告、占一行，却什么都没跑"
+        );
+        assert!(
+            units.is_empty(),
+            "单流就超过路径上限时整个单元都该消失，实际排出了 {} 个",
+            units.len()
+        );
+        assert!(
+            notices.iter().any(|line| line.contains("跳过")),
+            "跳过必须说一声，否则用户只会发现「少跑了几个」：{notices:#?}"
+        );
+    }
+
+    /// **端口游标的回绕**（回归方案 PLAN-03）。
+    ///
+    /// `alloc_port` 是 `wrapping_add(1).max(PORT_BASE)`。两个细节都要钉：
+    ///
+    /// 1. `wrapping_add` 而不是 `+`：u16 加到 65535 再 +1 会 **panic**（debug）
+    ///    或悄悄归零（release）。长计划真的会走到这里。
+    /// 2. `.max(PORT_BASE)` 而不是让它从 0 开始：0..56000 里全是别人的地盘
+    ///    （系统服务、iperf3 默认的 5201、被测设备自己的管理口）。分到那段上
+    ///    的表现不是「端口冲突」这么直白，而是 iperf3 绑不上、或者更糟——
+    ///    绑上了一个**别人正在用**的端口，测出来的数里混着别人的流量。
+    #[test]
+    fn the_port_cursor_wraps_back_into_the_test_range_never_into_system_ports() {
+        let step = |from: u16| {
+            let mut next = from;
+            let issued = alloc_port(&mut next);
+            (issued, next)
+        };
+
+        assert_eq!(step(PORT_BASE), (PORT_BASE, PORT_BASE + 1));
+        assert_eq!(step(65_534), (65_534, 65_535));
+        // 回绕：下一个必须是 PORT_BASE，不是 0、也不是 1。
+        assert_eq!(
+            step(65_535),
+            (65_535, PORT_BASE),
+            "端口游标回绕到了测试区间之外——0..{PORT_BASE} 里全是别人的地盘，\
+             绑上一个别人正在用的端口意味着测出来的数里混着别人的流量"
+        );
+
+        // 连续分配一整圈：每一个都必须落在 [PORT_BASE, 65535] 之内。
+        let mut next = 65_530;
+        for _ in 0..20 {
+            let port = alloc_port(&mut next);
+            assert!(
+                port >= PORT_BASE,
+                "分出了 {port}，低于测试区间下界 {PORT_BASE}"
+            );
+        }
+    }
+
+    /// 一个计划之内不许出现重复端口（回归方案 PLAN-03「同时活跃任务不碰撞」）。
+    ///
+    /// 双向、多流、多档位叠加时端口是逐个游标分出去的；重复的后果是两个并发
+    /// 任务抢同一个监听口——先起的那个占住，后起的报「address in use」，而它
+    /// 在报表里会显示成一次**灌包失败**。
+    #[test]
+    fn one_plan_never_hands_out_the_same_port_twice() {
+        let mut specs = Vec::new();
+        for idx in 0..8 {
+            let mut spec = base_spec();
+            spec.name = format!("t{idx}");
+            spec.directions = vec!["ab".into(), "ba".into(), "bidir".into()];
+            spec.transports = vec!["tcp".into(), "udp".into()];
+            spec.udp_streams = 4;
+            spec.tcp_streams = 4;
+            spec.udp_profiles = vec![UdpProfile::bw("100m"), UdpProfile::bw("200m")];
+            spec.udp_limit = false;
+            specs.push(spec);
+        }
+        let mut next = PORT_BASE;
+        let (units, _) = build_units(&specs, true, &mut next);
+        assert!(units.len() > 8, "夹具要足够大才测得到碰撞");
+
+        let mut ports: Vec<u16> = Vec::new();
+        for unit in &units {
+            for leg in &unit.legs {
+                match &leg.kind {
+                    LegKind::IperfSingle(task) => ports.push(task.port),
+                    LegKind::IperfGroup { streams, .. } => {
+                        ports.extend(streams.iter().map(|task| task.port))
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let unique: std::collections::HashSet<u16> = ports.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            ports.len(),
+            "同一个计划里分出了重复端口（{} 个里只有 {} 个不同）——\
+             两个并发任务抢同一个监听口，后起的那个会在报表里显示成一次灌包失败",
+            ports.len(),
+            unique.len()
+        );
+    }
+
+    /// **同 /24 门禁只挡 iperf，绝不挡 ping**（回归方案 PLAN-04）。
+    ///
+    /// 两端 IPv4 不在同一个 /24 时直连灌包起不来，跳过 iperf 是对的。但 ping
+    /// **必须照跑**——它正是那个能告诉你「到底通不通、通到什么程度」的东西。
+    /// 连 ping 一起挡掉的话，用户拿到的是一个空单元和一句「不同网段」，既不知道
+    /// 链路是死的还是活的，也没有 RTT 可以对比。跳过提示里那句「（ping 不受限）」
+    /// 就是这个承诺，而在此之前没有任何测试钉着它。
+    ///
+    /// 另外两条边界一并钉住：门禁只对**跨机**成立（同机两块网卡不受限），
+    /// 以及 IPv6 不走这道门（v6 有自己的可用性判断）。
+    #[test]
+    fn the_same_subnet_gate_blocks_iperf_but_never_ping() {
+        let build = |require_same_subnet: bool, cross: bool, v6: bool| {
+            let mut spec = base_spec();
+            spec.kinds = vec!["iperf".into(), "ping".into()];
+            spec.transports = vec!["tcp".into()];
+            spec.ipvers = vec![if v6 { "v6" } else { "v4" }.into()];
+            spec.src = ep(Side::Master, "eth0", "SGMII1G", "192.168.1.2", 1000);
+            // 不同 /24。
+            spec.dst = ep(
+                if cross { Side::Agent } else { Side::Master },
+                "eth1",
+                "SGMII1G",
+                "10.9.9.3",
+                1000,
+            );
+            let mut port = PORT_BASE;
+            build_units(&[spec], require_same_subnet, &mut port)
+        };
+        let kinds = |units: &[Unit]| {
+            let mut has_iperf = false;
+            let mut has_ping = false;
+            for unit in units {
+                for leg in &unit.legs {
+                    match &leg.kind {
+                        LegKind::Ping(_) => has_ping = true,
+                        LegKind::IperfSingle(_) | LegKind::IperfGroup { .. } => has_iperf = true,
+                        _ => {}
+                    }
+                }
+            }
+            (has_iperf, has_ping)
+        };
+
+        // 跨机 + 不同 /24 + 门禁开：iperf 挡掉，ping 必须还在。
+        let (units, notices) = build(true, true, false);
+        assert_eq!(
+            kinds(&units),
+            (false, true),
+            "同 /24 门禁把 ping 也挡掉了。那一行于是只剩一句「不同网段」——\
+             链路是死是活、RTT 多少，全都无从知道"
+        );
+        assert!(
+            notices.iter().any(|line| line.contains("ping 不受限")),
+            "跳过 iperf 时要说清 ping 仍然会跑：{notices:#?}"
+        );
+
+        // 门禁关掉：iperf 照排（反面，否则上面那条只证明了「iperf 从来不排」）。
+        assert_eq!(kinds(&build(false, true, false).0), (true, true));
+
+        // 同机两块网卡：门禁只对跨机成立。
+        assert_eq!(kinds(&build(true, false, false).0), (true, true));
     }
 }

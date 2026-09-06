@@ -1225,7 +1225,11 @@ fn rate_reason_validation_uses_the_metrics_shown_to_the_user() {
             Some(850.0),
             Some(800.0),
         ),
-        "判定原因与展示指标不一致: RX_P10_BELOW_TARGET；RX-P10 850.000 Mbps >= 目标 800.000 Mbps"
+        // 比的是**目标的 90%**（720），不是目标本身。原先这里钉的是
+        // 「>= 目标 800.000」——那句话在 P10 落进 720..800 时根本不成立
+        // （见 `the_p10_diagnostic_compares_against_ninety_percent_and_says_so`）。
+        // 断言强度没变，仍是全等比对，只是钉住的数对了。
+        "判定原因与展示指标不一致: RX_P10_BELOW_TARGET；RX-P10 850.000 Mbps >= 目标 90% 720.000 Mbps"
     );
     assert_eq!(
         validate_rate_reason(
@@ -1266,7 +1270,7 @@ fn contradictory_direction_reason_is_flagged_in_overview_and_bidir_summary() {
     let html = render(vec![summary]);
 
     assert!(html.contains("判定原因与展示指标不一致"));
-    assert!(html.contains("RX-P10 850.000 Mbps &gt;= 目标 800.000 Mbps"));
+    assert!(html.contains("RX-P10 850.000 Mbps &gt;= 目标 90% 720.000 Mbps"));
     assert!(!html.contains("RX_P10_BELOW_TARGET: 旧汇总原因"));
 }
 
@@ -1399,4 +1403,194 @@ fn unit_toggle_ids_stay_unique_across_sections() {
         .collect();
     assert_eq!(ids.len(), 2, "两个单元两个 id");
     assert_ne!(ids[0], ids[1], "跨节的 unit-toggle id 撞了: {ids:?}");
+}
+
+/// **RX-P10 诊断的 90% 比较符，以及它印出来的那句话**（回归方案 RATE-06）。
+///
+/// v6.2.7 把这条诊断的触发线从「低于目标」放宽到「低于目标的 90%」，理由是
+/// P10 只是诊断指标、不参与 PASS/FAIL，正常抖动不该次次报警。改对了，但
+/// **核对不通过时印的那句话没跟着改**：条件比的是 `target * 0.9`，文案却拿
+/// `target` 去比，于是目标 800、P10 750 时，报告里会白纸黑字印一句
+///
+/// ```text
+/// 判定原因与展示指标不一致: RX_P10_BELOW_TARGET；RX-P10 750.000 Mbps >= 目标 800.000 Mbps
+/// ```
+///
+/// 750 >= 800 不成立。这一行出现的时机偏偏是工具**判对了**的时候（P10 在容差
+/// 内、正确地不报警），却让读报告的人看到一个算错的不等式——而报告正是拿去做
+/// 验收证据的那份东西。
+///
+/// 这条同时钉住比较符本身：严格小于，等于 90% 不触发。
+#[test]
+fn the_p10_diagnostic_compares_against_ninety_percent_and_says_so() {
+    let check = |p10: f64, target: f64| {
+        validate_rate_reason(
+            "RX_P10_BELOW_TARGET: stale",
+            Some(target + 75.0), // 平均值达标：P10 不该推翻它
+            Some(p10),
+            Some(target),
+        )
+    };
+
+    // 低于 90% 线：触发，且把实际比的那个数（720）写出来。
+    assert_eq!(
+        check(719.0, 800.0),
+        "RX_P10_BELOW_TARGET: RX-P10 719.000 Mbps < 目标 90% 720.000 Mbps"
+    );
+
+    // 恰好等于 90% 线：不触发（严格小于）。
+    // 落在 90% 线与目标之间：同样不触发——这正是那次放宽的用意。
+    for p10 in [720.0, 750.0, 799.0] {
+        let got = check(p10, 800.0);
+        assert!(
+            got.starts_with("判定原因与展示指标不一致"),
+            "P10 {p10} 在 800 的 90% 容差内，不该触发诊断：{got}"
+        );
+        assert!(
+            got.contains("目标 90% 720.000"),
+            "不一致提示要拿**实际比较的那个数**（目标的 90%）说话。\
+             拿 800 去比会印出「{p10:.3} >= 800.000」这种不成立的不等式，\
+             而报告是拿去做验收证据的：{got}"
+        );
+        assert!(
+            !got.contains(">= 目标 800.000"),
+            "这句话本身不成立（{p10} >= 800 是假的）：{got}"
+        );
+    }
+
+    // 高于目标：也是不触发，同样按 90% 线说话。
+    let got = check(850.0, 800.0);
+    assert!(got.contains("目标 90% 720.000"), "{got}");
+
+    // 缺指标时只能说「核对不了」，不能猜。
+    assert!(
+        validate_rate_reason("RX_P10_BELOW_TARGET: x", Some(1.0), None, Some(800.0))
+            .contains("无法核对")
+    );
+    assert!(
+        validate_rate_reason("RX_P10_BELOW_TARGET: x", Some(1.0), Some(1.0), None)
+            .contains("无法核对")
+    );
+}
+
+/// **控制台上的 `#37` 和报告里的 `#37` 必须是同一个单元**（回归方案 UI-08）。
+///
+/// 两个出口各自算自己的序号：进度页用 `UnitStatus.seq`（`executor.rs` 里
+/// `seq: useq + 1`），报告用 `group_seq`（`sort_key.0 + 1`，而 `sort_key.0`
+/// 就是 `useq`）。两边现在是一致的，但**没有任何东西钉住它**——哪天有人为了
+/// 别的目的把其中一处的 `+1` 去掉或改成别的基数，两个屏幕上的编号会整体错开
+/// 一位，而每一个数字看着都完全正常。
+///
+/// 代价是做验收的人按控制台上的编号去报告里找，找到的是**相邻的另一个单元**
+/// ——两个单元的判定还很可能不同。
+#[test]
+fn the_unit_number_on_screen_is_the_same_one_the_report_prints() {
+    // 报告侧：sort_key.0 == useq，展示序号 = useq + 1。
+    for useq in [0usize, 1, 36, 209] {
+        let mut row = unit_summary(&format!("unit-{useq}"), Verdict::Pass);
+        row.sort_key = (useq, usize::MAX, usize::MAX, u8::MAX);
+        let html = render(vec![row]);
+        let shown = useq + 1;
+        assert!(
+            html.contains(&format!("#{shown}")),
+            "第 {useq} 个单元在报告里应当显示成 #{shown}"
+        );
+    }
+
+    // 进度侧：钉住 `executor.rs` 用的是同一个换算。结构断言而不是运行整轮，
+    // 因为这条约定的失效方式是「有人改了其中一处」，不是「跑起来不对」。
+    let executor = include_str!("../master/executor.rs");
+    let production = executor.split("mod tests").next().unwrap_or(executor);
+    assert!(
+        production.contains("seq: useq + 1"),
+        "进度页的单元序号不再是 `useq + 1` 了。报告侧的 `group_seq` 仍然是 \
+         `sort_key.0 + 1`（= useq + 1），两个屏幕上的编号会整体错开——\
+         按控制台编号去报告里找，找到的是相邻的另一个单元"
+    );
+}
+
+/// **结构走类型化字段，展示串怎么改都不该动它**（回归方案 OUT-02）。
+///
+/// 报告过去是从 `kind_label` 里搜 `-ab`/`-ba` 反推方向、从 `task` 里搜
+/// 「UDP」反推协议的。那种写法的失效方式很安静：把「灌包-ab」改成
+/// 「灌包 A→B」这样一次纯文案调整，方向列会集体退化成「单向」，**而每一格
+/// 看起来都还是个正常的值**。类型化之后推断降级为兜底，只服务于历史数据
+/// （`rows.jsonl` 里没有这些字段的老行）。
+///
+/// 这条测试把两半都钉住：
+/// - **新数据**：展示串故意写成和类型化字段**相反**的内容，输出必须按类型走；
+/// - **老数据**：类型化字段缺省时，才允许按展示串兜底。
+#[test]
+fn typed_structure_wins_over_display_strings_and_legacy_rows_still_fall_back() {
+    // ---- 新数据：展示串说 BA，类型化字段说 AB ----
+    let mut row = unit_summary("typed-row", Verdict::Pass);
+    row.is_unit_summary = false;
+    row.direction = RowDirection::Ab;
+    row.protocol = RowProtocol::Udp;
+    row.backend = RowBackend::CtsTraffic;
+    row.src_side = RowSide::Agent;
+    row.dst_side = RowSide::Master;
+    // 展示串一律说反话：如果哪天有人退回字符串推断，这些会把它带偏。
+    row.kind_label = "灌包-ba".into();
+    row.task = "IPERF V4 TCP 反向".into();
+    assert_eq!(
+        direction_tag(&row),
+        "AB",
+        "方向必须来自类型化字段。`kind_label` 里的 `-ba` 是给人看的文案，\
+         让它决定方向意味着一次纯文案调整就能改写报告里的结构"
+    );
+
+    // xlsx 出口同样：写进去的必须是类型化字段的标签。
+    let path = std::env::temp_dir().join(format!("cpe_out02_{}.xlsx", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let summary = Row {
+        sort_key: (0, usize::MAX, usize::MAX, u8::MAX),
+        is_unit_summary: true,
+        ..row.clone()
+    };
+    crate::report::xlsx::write_xlsx(&path, &[row.clone(), summary], &ReportMeta::default())
+        .expect("写 xlsx");
+    let file = std::fs::File::open(&path).expect("打得开");
+    let mut zip = zip::ZipArchive::new(file).expect("xlsx 是 zip");
+    let mut all = String::new();
+    for i in 0..zip.len() {
+        use std::io::Read;
+        let mut entry = zip.by_index(i).expect("条目");
+        if entry.name().ends_with(".xml") {
+            let mut text = String::new();
+            if entry.read_to_string(&mut text).is_ok() {
+                all.push_str(&text);
+            }
+        }
+    }
+    let _ = std::fs::remove_file(&path);
+    assert!(
+        all.contains("ctsTraffic") || all.contains("CTS"),
+        "后端列必须按类型化的 CtsTraffic 写，而不是从 task 串里的「IPERF」猜"
+    );
+    assert!(
+        all.contains("UDP"),
+        "协议列必须按类型化的 Udp 写，而不是从 task 串里的「TCP」猜"
+    );
+
+    // ---- 老数据：类型化字段缺省，才轮到兜底 ----
+    let mut legacy = unit_summary("legacy-row", Verdict::Pass);
+    legacy.is_unit_summary = false;
+    legacy.kind_label = "灌包-ba".into();
+    assert_eq!(
+        legacy.direction,
+        RowDirection::Single,
+        "没有类型化字段的老行反序列化出来就是 Single"
+    );
+    assert_eq!(
+        direction_tag(&legacy),
+        "BA",
+        "老数据没有类型化字段，这时候才允许按展示串兜底"
+    );
+
+    // 兜底也只在**真的没有**方向时生效：真单向的行不该被文案里的 `-ab` 带偏。
+    let mut plain = unit_summary("plain-row", Verdict::Pass);
+    plain.is_unit_summary = false;
+    plain.kind_label = "灌包".into();
+    assert_eq!(direction_tag(&plain), "单向");
 }

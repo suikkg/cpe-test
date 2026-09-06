@@ -218,3 +218,135 @@ describe('停止：受理不是结束', () => {
     expect(stopPosts).toHaveLength(1);
   });
 });
+
+/**
+ * **一秒一拍，而且任何时刻最多一个在飞的请求**（回归方案 UI-05）。
+ *
+ * 这条守的是 `run.ts` 里那个 `inFlight` 闸门。它有历史：旧页用的是
+ * `setInterval(poll, 1000)`，机器一忙请求就叠着发——而这台机器此刻**正在灌
+ * 线速**，多出来的请求抢的是被测链路自己的带宽，测出来的数会因为「打开了
+ * 控制台」而变低。`lint-arch.mjs` 全局禁 `setInterval` 挡的是同一件事，但
+ * 挡不住「快照那条链和轮询那条链各发各的」。
+ *
+ * 光有 `setTimeout` 链不够：`syncStatus()` 是第二个出口，页面刚打开时它和
+ * 轮询链会同时在跑。所以断言的是**出口合并后的效果**——慢响应期间无论怎么
+ * 催，都只有一个请求在飞。
+ */
+describe('轮询不叠加', () => {
+  it('响应比轮询周期还慢时，请求也不许叠着发', async () => {
+    let inFlight = 0;
+    let maxInFlight = 0;
+    let release: (() => void) | undefined;
+    fetchMock.mockImplementation(async () => {
+      inFlight += 1;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      inFlight -= 1;
+      return progress('run-slow', true);
+    });
+
+    // 第一拍挂住不返回，模拟一个比轮询周期还慢的响应。
+    const first = syncStatus();
+    await Promise.resolve();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // 在它还没落地时反复催——真实里这是「用户切回页面 + 轮询到点」同时发生。
+    const extra = [syncStatus(), syncStatus(), syncStatus()];
+    await Promise.resolve();
+    expect(maxInFlight).toBe(1);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    release?.();
+    await Promise.all([first, ...extra]);
+    expect(maxInFlight).toBe(1);
+    // `syncStatus` 读到 running=true 会顺手接上轮询链，那条链会再发一拍并
+    // 挂在同一个 mock 上。收尾时放掉它，免得把 `inFlight` 漏给下一条用例。
+    stopPolling();
+    release?.();
+    await Promise.resolve();
+  });
+
+  it('前一拍落地之后才排下一拍，且落地的数据照常生效', async () => {
+    // running=false：这一条只看闸门的放开，不把轮询链也牵进来
+    // （读到「正在跑」会顺手接上轮询，那会多发一拍，掩盖掉这里要验的东西）。
+    fetchMock.mockResolvedValue(progress('run-a', false));
+    await syncStatus();
+    expect(run.synced).toBe(true);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    // 落地之后再催一次，这一次必须真的发出去——否则闸门就成了「只发一次」。
+    await syncStatus();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+});
+
+/**
+ * **一个挂死的请求不许把轮询链永久卡住**（回归方案 UI-05 / 缺陷 D-10）。
+ *
+ * `inFlight` 保证同时最多一个在飞的请求——但它是模块级的，而 `fetch` 自己
+ * **不带超时**。连接断在半路（被测链路正被灌到线速、辅测机掉线）时 `fetch`
+ * 可能几分钟既不 reject 也不 resolve，于是：
+ *
+ * - 后续每一拍都被 `inFlight` 挡掉，`tick()` 在进 try 之前就返回；
+ * - `run.refreshError` 因此**永远不会被赋值**——屏幕上没有任何错误，只是数据
+ *   一直是上一拍的，「上次同步」停在几分钟前；
+ * - 「断开连接 / 换辅测机」也救不回来：`reset()` 不清 `inFlight`。
+ *
+ * 11.5 小时的长测试里网络抖一次就够了。两处都要修：请求要有上限，
+ * `reset()` 要把闸门放开。
+ */
+describe('挂死的请求不会永久卡住轮询', () => {
+  it('reset 之后闸门必须放开，新连上的机器不该被上一台的挂死请求挡住', async () => {
+    let release: (() => void) | undefined;
+    fetchMock.mockImplementation(
+      () =>
+        new Promise<FakeResponse>((resolve) => {
+          release = () => resolve(progress('run-x', false));
+        }),
+    );
+    const hung = syncStatus();
+    await Promise.resolve();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    // 请求还挂着，这时候「断开连接」。
+    reset();
+
+    // 换了一台机器，新的读取必须真的发得出去。
+    fetchMock.mockResolvedValue(progress('run-y', false));
+    await syncStatus();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(run.synced).toBe(true);
+
+    release?.();
+    await hung;
+  });
+
+  it('超过上限的请求会被中止，并落到「断线」那条路上显示出来', async () => {
+    vi.useFakeTimers();
+    try {
+      // 真实的 fetch 会在 signal abort 时 reject；这里照做。
+      fetchMock.mockImplementation(
+        (_url: string, init: { signal?: AbortSignal }) =>
+          new Promise((_resolve, reject) => {
+            init.signal?.addEventListener('abort', () =>
+              reject(new Error('The operation was aborted')),
+            );
+          }),
+      );
+      const pending = syncStatus();
+      await vi.advanceTimersByTimeAsync(31_000);
+      await pending;
+      expect(run.refreshError).not.toBe('');
+      expect(run.synced).toBe(false);
+    } finally {
+      vi.useRealTimers();
+    }
+
+    // 关键的一半：中止之后闸门放开了，下一拍能正常发。
+    fetchMock.mockResolvedValue(progress('run-z', false));
+    await syncStatus();
+    expect(run.synced).toBe(true);
+    expect(run.refreshError).toBe('');
+  });
+});

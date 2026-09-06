@@ -692,7 +692,7 @@ pub fn run_master(opts: MasterOpts) -> i32 {
 
     logln(&format!(
         "\n========== 全部完成 ==========\n单元总数: {}  PASS: {}  FAIL: {}  MEASURED: {}  NOT_EVALUATED: {}  SETUP_ERROR: {}  跳过: {}  最终清理错误: {}  耗时: {}",
-        sum.pass + sum.fail + sum.measured + sum.skip,
+        sum.pass + sum.fail + sum.measured + sum.not_evaluated + sum.setup_error + sum.skip,
         sum.pass,
         sum.fail,
         sum.measured,
@@ -705,7 +705,7 @@ pub fn run_master(opts: MasterOpts) -> i32 {
     if cfg.open_report && run_paths.report.exists() {
         open_path(&run_paths.report);
     }
-    if sum.fail > 0 || !final_cleanup_errors.is_empty() {
+    if sum.any_not_passed() > 0 || !final_cleanup_errors.is_empty() {
         1
     } else {
         0

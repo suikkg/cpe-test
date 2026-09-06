@@ -424,4 +424,66 @@ mod tests {
         assert_eq!(forward.run_id, "r");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// **崩溃时写了一半的最后一行，不能带走前面那些完整的**（回归方案 RES-04）。
+    ///
+    /// `rows.jsonl` 是**增量**落盘的：跑完一个单元追加一行。进程被杀 / 掉电时，
+    /// 最后一次写有很大概率停在半路。这时候唯一可接受的行为是：前面那些完整的
+    /// 行一条不少地读回来，半条丢掉并**把丢了几条说出来**。
+    ///
+    /// 两个失败方向都很难查：整份文件因为最后一行坏掉而读不出来，等于一次
+    /// 11 小时的运行白跑；反过来，静默丢掉半条又不吭声，重放出的报告会比崩溃前
+    /// 那份少几行，而每一行看着都正常——拿两份报告对数量的人会以为自己记错了。
+    #[test]
+    fn a_half_written_last_line_does_not_take_the_finished_rows_with_it() {
+        let dir = temp_dir("crash");
+        append_rows(
+            &dir,
+            &[
+                sample_row(1, Verdict::Pass),
+                sample_row(2, Verdict::RateFail),
+                sample_row(3, Verdict::Pass),
+            ],
+        )
+        .expect("append");
+
+        // 模拟崩溃：在完整的三行之后追加半条 JSON（没有闭合的 `}`，也没有换行）。
+        let mut text = std::fs::read_to_string(rows_path(&dir)).expect("read");
+        text.push_str(r#"{"task_id":"unit-4","verdict":"PA"#);
+        std::fs::write(rows_path(&dir), &text).expect("write");
+
+        let (rows, skipped) = load_rows(&dir).expect("坏的最后一行不该让整份文件读不出来");
+        assert_eq!(
+            rows.len(),
+            3,
+            "完整的三行必须全部读回来——因为最后一行坏掉就丢掉整份文件，\
+             等于一次跑了十几小时的运行白跑"
+        );
+        assert_eq!(
+            skipped, 1,
+            "半条必须被计进 skipped 并报给用户（`replay_report` 会把它打出来）；\
+             静默丢掉的话，重放报告会比崩溃前那份少几行而看不出来"
+        );
+        assert_eq!(rows[1].verdict, Verdict::RateFail, "判定不能在重放里变样");
+
+        // 只有半条、一条完整的都没有：明确是空结果，而不是假装读到了什么。
+        let empty = temp_dir("crash-only");
+        std::fs::write(rows_path(&empty), r#"{"task_id":"x","verd"#).expect("write");
+        let (rows, skipped) = load_rows(&empty).expect("load");
+        assert!(rows.is_empty());
+        assert_eq!(skipped, 1);
+
+        // 空行不算坏行：追加时的换行、编辑器补的尾行都不该被记成丢数据。
+        let blanks = temp_dir("crash-blank");
+        append_rows(&blanks, &[sample_row(1, Verdict::Pass)]).expect("append");
+        let mut text = std::fs::read_to_string(rows_path(&blanks)).expect("read");
+        text.push_str("\n\n   \n");
+        std::fs::write(rows_path(&blanks), &text).expect("write");
+        let (rows, skipped) = load_rows(&blanks).expect("load");
+        assert_eq!((rows.len(), skipped), (1, 0), "空行不是坏行");
+
+        for d in [dir, empty, blanks] {
+            let _ = std::fs::remove_dir_all(&d);
+        }
+    }
 }

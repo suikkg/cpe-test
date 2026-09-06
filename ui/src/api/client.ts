@@ -137,7 +137,31 @@ export function downloadQuery(): string {
   return value ? `?token=${encodeURIComponent(value)}` : '';
 }
 
-async function request<T>(method: 'GET' | 'POST', path: string, body?: unknown): Promise<T> {
+/**
+ * 单次请求的上限。**没有它，一个挂死的请求会让轮询链永久停摆。**
+ *
+ * `fetch` 自己不带超时：连接断在半路（被测链路正被灌到线速、辅测机掉线）时，
+ * 它可能几分钟不 reject 也不 resolve。而 `run.ts` 的 `inFlight` 闸门在此期间
+ * 会把后续每一拍都挡掉——屏幕上不报错，只是数据一直是上一拍的，「上次同步」
+ * 停在几分钟前。11.5 小时的长测试里网络抖一次就够了。
+ *
+ * 默认放到 120 秒是照着**最慢的合法端点**定的：`/api/local` 在 Windows 上要
+ * 真去扫网卡（`ipconfig /all` 20s + 每块 Wi-Fi 卡 `netsh` 10s + `iperf3
+ * --version` 8s），这条路正常就能跑到几十秒。轮询那条链自己传更短的值。
+ */
+const DEFAULT_TIMEOUT_MS = 120_000;
+
+export interface RequestOptions {
+  /** 覆盖默认超时；轮询用更短的值，慢扫描端点用默认值。 */
+  timeoutMs?: number;
+}
+
+async function request<T>(
+  method: 'GET' | 'POST',
+  path: string,
+  body?: unknown,
+  options?: RequestOptions,
+): Promise<T> {
   const headers: Record<string, string> = { 'X-CPE-Token': token() };
   if (method === 'POST') {
     headers['Content-Type'] = 'application/json';
@@ -148,6 +172,13 @@ async function request<T>(method: 'GET' | 'POST', path: string, body?: unknown):
   }
 
   let response: Response;
+  // `AbortSignal.timeout` 在测试环境和老 WebView 里未必有，退回手搓的
+  // controller；两条路的可观察行为一样——超时即 reject，落到 NetworkError。
+  const timeoutMs = options?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const controller = typeof AbortController === 'function' ? new AbortController() : undefined;
+  const timer = controller
+    ? setTimeout(() => controller.abort(new Error(`请求超过 ${timeoutMs}ms 未返回`)), timeoutMs)
+    : undefined;
   try {
     response = await fetch(path, {
       method,
@@ -156,11 +187,15 @@ async function request<T>(method: 'GET' | 'POST', path: string, body?: unknown):
       // 内网工具，不需要也不该带 cookie。
       credentials: 'omit',
       cache: 'no-store',
+      signal: controller?.signal,
     });
   } catch (reason) {
     // fetch 只在**拿不到应答**时 reject（HTTP 500 也算 resolve）。这一层
-    // 单独成类，调用方才能区分「确定失败」和「结果未知」。
+    // 单独成类，调用方才能区分「确定失败」和「结果未知」。超时走的也是这里：
+    // 对调用方来说「超时了」和「连不上」是同一件事——结果未知。
     throw new NetworkError(reason);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
   }
 
   // 401 单独成一类：旧页面把它混进通用 toast，看到的人只会以为是网络抖动，
@@ -187,6 +222,7 @@ async function request<T>(method: 'GET' | 'POST', path: string, body?: unknown):
  * 一下」，然后在真出问题的时候多花十分钟才被发现。
  */
 export const api = {
-  get: <T>(path: string) => request<T>('GET', path),
-  post: <T>(path: string, body?: unknown) => request<T>('POST', path, body),
+  get: <T>(path: string, options?: RequestOptions) => request<T>('GET', path, undefined, options),
+  post: <T>(path: string, body?: unknown, options?: RequestOptions) =>
+    request<T>('POST', path, body, options),
 };

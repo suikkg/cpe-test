@@ -352,10 +352,21 @@ pub(super) fn handle(mut request: Request, console: &Arc<Console>) {
         .unwrap_or_default();
     let trusted_post = *request.method() != Method::Post || has_console_request_header(&request);
     let mut body = String::new();
-    if *request.method() == Method::Post {
-        let mut limited = request.as_reader().take(MAX_BODY_BYTES);
+    // **多读一个字节**，这样「刚好到上限」和「超了」分得开。
+    //
+    // 只 `take(MAX_BODY_BYTES)` 的话超限请求会被**静默截断**，而截断后的内容
+    // 未必不合法：一份尾部带空白的 config.json 截掉最后一个空格仍是合法 JSON，
+    // 于是 `/api/import` 返回 200 并**按截断后的内容执行了导入**——用户手上的
+    // 文件和实际生效的配置不是一份东西，而没有任何地方说过。截断到内容里时
+    // 表现同样糟：报出来的是「这不是一份能解析的 config.json」，真因却是请求
+    // 体超限，人会去查自己的文件。
+    let oversized = if *request.method() == Method::Post {
+        let mut limited = request.as_reader().take(MAX_BODY_BYTES + 1);
         let _ = limited.read_to_string(&mut body);
-    }
+        body.len() as u64 > MAX_BODY_BYTES
+    } else {
+        false
+    };
 
     // 鉴权先于一切，页面本身也不例外：页面里带着给 API 用的口令，
     // 放行未认证的 GET / 等于把口令发给任何来问的人。
@@ -395,6 +406,18 @@ pub(super) fn handle(mut request: Request, console: &Arc<Console>) {
 
     if is_page {
         let _ = request.respond(page_response(&console.ui_token));
+        return;
+    }
+
+    // 超限的请求体一律不进业务分支：截断过的内容不能拿来做任何决定。
+    // 放在鉴权之后是有意的——先认人再谈请求内容（铁律三）。
+    if oversized {
+        let message = format!(
+            "请求体超过 {} MiB 上限，已拒绝。没有按截断后的内容执行任何操作——\
+             这个上限针对的是控制台请求，超了多半是配置文件本身出了问题（例如把日志或抓包混进了 JSON）。",
+            MAX_BODY_BYTES / (1024 * 1024)
+        );
+        let _ = request.respond(json_response(crate::protocol::err_json(&message)));
         return;
     }
 

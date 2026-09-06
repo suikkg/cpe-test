@@ -148,6 +148,28 @@ for (const file of files) {
     [/url\(\s*['"]?https?:/i, 'CSS 里有外部 url()（§3.2）'],
     [/\/\/fonts\./, '外部字体主机（§3.2）'],
   ];
+  // 7. 控制台界面上不出现 ctsTraffic。
+  //
+  // 它是 Windows 上的一个**可选吞吐后端实现**，不是用户在界面上要做的选择；
+  // 摆进标题/导航/按钮里，用户会以为那是个需要理解或配置的东西。
+  // 这条已经回潮过一次：v5.0 脚手架的 App.vue eyebrow 写成
+  // `Ping · iperf3 · ctsTraffic`，被用户当场指出改掉，v6.2.9 又变回
+  // `Ping / iperf3 / ctsTraffic`。口头约定挡不住第三次，所以钉进闸门。
+  //
+  // **只管 .vue**：Rust 侧后端代码、报告列名（`CTS/TCP` 这类既有列）、日志
+  // 都不受约束；TS 里的 DTO 字段名、注释、fixture 同理——`api/dto.ts` 和
+  // `domain/project.ts` 里那几处 `ctstraffic` 是**协议字段名**，改了就对不上后端。
+  //
+  // 代价说清楚：界面文案并非全在 .vue，`state/ui.ts` 的 REGIONS 就是一组显示
+  // 用的 label。这道闸门管不到那里。放宽到 .ts 会同时命中上面那些字段名和注释，
+  // 除非再加一套「只查字符串字面量」的解析——那要一个真解析器，收益不抵成本。
+  // 已知的回潮点是 .vue 里的标题/导航/按钮，先把这块钉死。
+  if (file.endsWith('.vue')) {
+    bans.push([
+      /ctsTraffic|\bCTS\b/i,
+      '控制台界面文案不许出现 ctsTraffic/CTS：它是可选的后端实现，不是用户要做的选择',
+    ]);
+  }
   for (const [re, message] of bans) {
     const hit = code.match(re);
     if (hit) fail(file, `${message}（命中 ${JSON.stringify(hit[0])}）`);
