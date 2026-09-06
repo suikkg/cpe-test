@@ -2,6 +2,12 @@
 
 > 两台电脑间自动化 ping + iperf3 / Microsoft ctsTraffic 灌包测试，零 Python/零 PowerShell
 
+## v6.2.8
+
+- **单向腿也能按「这一对网口」设门限**（套件里的任务勾了 A→B / B→A 就出现「单向的接收门限」两格；配置文件里对应新增的 `rate_targets_single_mbps`，`universal_params` 与每个 test 都可写）：门限链里此前**只有双向**有这一层——`rate_targets_bidir` 排在按网口门限之前，而单向那条腿只能拿收口网卡上那个数。挂在网卡上的一个数没法同时对这块口的所有对端成立：同一块 SGMII2.5G 口，对端是 1G 口时，收口上挂的 1800/2000 在这条路径上物理就跑不到。v6.2.6 那道路径上限封顶只能把它折算到线速的 95%（1G 上是 950），而现场实测 934~984 正好骑在 950 上——它是防离谱值的安全网，不是「这条链路该验收多少」。现在单向与双向两套数对称、互不串台（双向同时灌包时两个方向互相抢，拿单向的数去卡双向必然判 `RATE_FAIL`），计划预览多一个来源标签「单向方向门限」。
+- **这两格只收绝对 Mbps**：百分比换算的基准是**接收网卡**自己的协商速率，而它们要压的恰恰是「收口协商速率对这条路径不成立」，按百分比写等于换个写法犯同一个错。服务端另外对「填了门限却没勾那个方向」明确报错——那一格这时已经从界面上消失，静默失效没人看得见。留空则单向照旧走既有兜底链（按网口门限 → 频段/全局门限 → 内置推导），老配置一个字节都没变。
+- **回归验证**：Rust 642/642、前端 Vitest 202/202、格式检查、Linux/Windows Clippy、前端产物溯源戳、dist 配置文档包 SHA-256 与 22 项逐条比对全部通过。
+
 ## v6.2.6
 
 - **判定窗口锚在 iperf3 自己的测量时钟上，不再锚在汇总行的到达时刻**：以前只取汇总行的**行内时长**，起点却按这一行**到达的时刻**倒推。`-w` 开大时（配方默认的 `-w 256m -P 10` = 2.56GB socket 缓冲），client 的 `-t` 到点后还要 5~14 秒排空缓冲，汇总行压在排空之后才吐出来，窗口就整体后移那么多秒——掐掉开头的高速段、把结尾没有流量的尾巴收进来。现在改用两条时钟的偏移定位：每条 interval 行的「到达时刻 − 行内区间终点」都是偏移的一个上界（到达只会被推迟、不会提前），取最小值即最紧的估计。末尾几行连同汇总行成块吐出时不受影响；老版 iperf3 无 `--forceflush`、全部成块到达时自动退回旧口径。
@@ -562,7 +568,7 @@ CPE（Customer Premises Equipment）子网测试工具用于在**两台电脑之
 ```
 cpe_test.exe          ← 本工具（单文件）
 iperf3.exe            ← 从 iperf.fr 下载（只测 Ping/ctsTraffic 可不放）
-ctsTraffic.exe        ← v6.2.7 Windows Release 已捆绑（仅 Windows 10+）
+ctsTraffic.exe        ← v6.2.8 Windows Release 已捆绑（仅 Windows 10+）
 start_agent.bat       ← 辅测机双击
 start_ui.bat          ← 主控机双击（图形控制台，推荐）
 start_master.bat      ← 主控机双击（命令行问答式）
@@ -1359,7 +1365,7 @@ cargo build --release --locked
 
 自行编译后，把 `cpe_test.exe`、启动脚本和所需吞吐工具放到两台 Windows 电脑同一目录：
 iperf3 测试需要完整的 iperf3 Windows 发行包；ctsTraffic 测试需要 `ctsTraffic.exe`。
-官方 v6.2.7 Windows Release ZIP 已捆绑固定且校验过的 ctsTraffic 2.0.4.0，但由于发行包差异不内置 iperf3。
+官方 v6.2.8 Windows Release ZIP 已捆绑固定且校验过的 ctsTraffic 2.0.4.0，但由于发行包差异不内置 iperf3。
 
 ### GitHub Actions CI
 
@@ -1382,7 +1388,7 @@ Windows ZIP 包含启动脚本、四份配置、固定 CTS 二进制和第三方
 `tar.gz` 保留 `cpe_test` 可执行位。发布作业会再次核对资产名称、数量、内部结构和哈希。
 
 仓库同时跟踪一份不含可执行程序的
-[`cpe_test-v6.2.7-windows-config-docs.zip`](dist/cpe_test-v6.2.7-windows-config-docs.zip)，
+[`cpe_test-v6.2.8-windows-config-docs.zip`](dist/cpe_test-v6.2.8-windows-config-docs.zip)，
 便于直接从 Git 下载 Windows 配置、文档和启动脚本。其 SHA-256 位于同目录的
 `.zip.sha256` 文件；CI 会逐文件确认压缩包内容与仓库源文件一致。需要开箱即用的程序、
 固定版 ctsTraffic 和许可证全集时，仍应下载上面的正式 Windows Release ZIP。
