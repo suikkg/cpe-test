@@ -7,7 +7,12 @@
    控件、表格）是安静的拉丝钢，跟随明暗主题；而“数据屏”（吞吐示波屏、运行
    日志、任务预览）永远是刻框暗玻璃 + 磷光信号色——两套主题下都长成一块真
    正的仪表屏，这是全站唯一的“张扬”之处，其余一律克制。
-   约束：这台机器同时在灌包，界面不使用持续动画和高成本滤镜。 */
+   约束：这台机器同时在灌包，界面不使用持续动画和高成本滤镜。
+
+   `--focus` 与 `--warn` 是**两个**颜色，不是一个：焦点圈只要求 3:1（非文字），
+   而告警文字按 4.5:1 算。合成一个数时，浅色下那一个数必然在其中一边不合格——
+   量出来的就是这样：合并期的 #c8811a 作焦点圈在 --head 上只有 2.74:1，
+   作 11px 告警文字在 --info-bg 上只有 2.64:1，两头都差一截。 */
 :root {
   color-scheme:light;
   --fu:"Segoe UI","Microsoft YaHei","PingFang SC",system-ui,-apple-system,sans-serif;
@@ -18,7 +23,7 @@
   --ink:#15222b; --muted:#536671; --line:#ccd6dc; --head:#e9eff2;
   --accent:#0e5a6b; --accent-hover:#0a4553; --on-accent:#eefbfd;
   --ok:#12783e; --ok-bg:#dff0e6; --bad:#b3242f; --bad-bg:#f9e5e7;
-  --info-bg:#e1ecef; --focus:#c8811a; --edited:#e0f4ef;
+  --info-bg:#e1ecef; --focus:#b87111; --warn:#8f5500; --edited:#e0f4ef;
 
   /* 数据屏（明暗主题下都不变——屏永远是屏） */
   --screen-bg:#081210; --screen-ink:#c9e7dc; --screen-dim:#8caaa3;
@@ -32,7 +37,7 @@
     --ink:#e7f0f1; --muted:#9cafb5; --line:#2a393f; --head:#19242a;
     --accent:#3fb9ca; --accent-hover:#63cddb; --on-accent:#05161a;
     --ok:#6ecf95; --ok-bg:#143324; --bad:#ff969b; --bad-bg:#3f2128;
-    --info-bg:#112f38; --focus:#ffc65c; --edited:#113330;
+    --info-bg:#112f38; --focus:#ffc65c; --warn:#ffc65c; --edited:#113330;
   }
 }
 :root[data-theme="dark"] {
@@ -41,7 +46,7 @@
   --ink:#e7f0f1; --muted:#9cafb5; --line:#2a393f; --head:#19242a;
   --accent:#3fb9ca; --accent-hover:#63cddb; --on-accent:#05161a;
   --ok:#6ecf95; --ok-bg:#143324; --bad:#ff969b; --bad-bg:#3f2128;
-  --info-bg:#112f38; --focus:#ffc65c; --edited:#113330;
+  --info-bg:#112f38; --focus:#ffc65c; --warn:#ffc65c; --edited:#113330;
 }
 
 * { box-sizing:border-box; }

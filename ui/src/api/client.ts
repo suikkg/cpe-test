@@ -37,6 +37,24 @@ export class UnauthorizedError extends Error {
   }
 }
 
+/**
+ * 请求**没能拿到应答**：网络断了、主控进程没了、连接被中途掐断。
+ *
+ * 和「服务端答了但说失败」必须分开，因为这两种的下一步完全不同：服务端答了
+ * `ok:false`，那这条命令**确定没执行**；而连应答都没有时，它可能已经在对面
+ * 跑起来了。开始/停止这类有副作用的命令只能按后者处理——去读一次运行状态，
+ * 而不是再发一遍（这套 client 一贯不自动重试，理由见文件末尾）。
+ */
+export class NetworkError extends Error {
+  /** 原始的 fetch 拒因，只进诊断，不直接显示——它常常是一句 `Failed to fetch`。 */
+  readonly reason: unknown;
+  constructor(reason: unknown) {
+    super('请求没有得到应答：网络中断，或主控没有响应');
+    this.name = 'NetworkError';
+    this.reason = reason;
+  }
+}
+
 const TOKEN_KEY = 'cpe_ui_token';
 /** 服务端交付页面时下发的会话 cookie；名字与 `webui/http.rs::SESSION_COOKIE` 同源。 */
 const SESSION_COOKIE = 'cpe_ui_session';
@@ -129,14 +147,21 @@ async function request<T>(method: 'GET' | 'POST', path: string, body?: unknown):
     headers['X-CPE-Console'] = '1';
   }
 
-  const response = await fetch(path, {
-    method,
-    headers,
-    body: method === 'POST' ? JSON.stringify(body ?? {}) : undefined,
-    // 内网工具，不需要也不该带 cookie。
-    credentials: 'omit',
-    cache: 'no-store',
-  });
+  let response: Response;
+  try {
+    response = await fetch(path, {
+      method,
+      headers,
+      body: method === 'POST' ? JSON.stringify(body ?? {}) : undefined,
+      // 内网工具，不需要也不该带 cookie。
+      credentials: 'omit',
+      cache: 'no-store',
+    });
+  } catch (reason) {
+    // fetch 只在**拿不到应答**时 reject（HTTP 500 也算 resolve）。这一层
+    // 单独成类，调用方才能区分「确定失败」和「结果未知」。
+    throw new NetworkError(reason);
+  }
 
   // 401 单独成一类：旧页面把它混进通用 toast，看到的人只会以为是网络抖动，
   // 然后一直刷新。它需要的是「用带 ?token= 的完整地址重新打开」。

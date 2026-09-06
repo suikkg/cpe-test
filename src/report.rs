@@ -545,7 +545,7 @@ pub fn write_report(path: &Path, rows: &mut [Row], meta: &ReportMeta) -> std::io
 :root { color-scheme: light; --ink:#17202a; --muted:#5f6b76; --line:#d8dee4; --surface:#fff; --canvas:#f4f6f8; --head:#edf2f6; --yellow:#fff3cd; }
 * { box-sizing: border-box; }
 html, body { max-width: 100%; overflow-x: hidden; }
-body { margin: 0; padding: 20px; color: var(--ink); background: var(--canvas); font-family: "Microsoft YaHei", "PingFang SC", sans-serif; font-size: 14px; line-height: 1.45; }
+body { margin: 0; padding: 20px; color: var(--ink); background: var(--canvas); font-family: "Segoe UI", "Microsoft YaHei", "PingFang SC", sans-serif; font-size: 14px; line-height: 1.45; }
 .report { width: min(100%, 1800px); min-width: 0; margin: 0 auto; }
 h1 { margin: 0 0 12px; font-size: 22px; line-height: 1.25; }
 h2 { margin: 28px 0 10px; font-size: 17px; line-height: 1.3; }

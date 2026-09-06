@@ -8,8 +8,10 @@ import {
   pendingStarts,
   type MonitorSide,
 } from '../../domain/monitor-plan';
+import { readings } from '../../domain/monitor-chart';
 import { agentNics, masterNics } from '../../state/inventory';
 import { monitor, startAll, startSession, stopAll, stopSession } from '../../state/monitor';
+import { ui } from '../../state/ui';
 
 /**
  * 「监控」：独立于一轮测试的网卡速率观测。
@@ -44,6 +46,24 @@ const pending = computed(() =>
 );
 
 const full = computed(() => monitor.sessions.length >= MONITOR_MAX_SESSIONS);
+
+/**
+ * 当前展示哪一路。选中失效（那一路被停掉并移除）时回落到第一路——
+ * 但**不**因此启停任何会话：这里只决定右边画谁。
+ */
+const current = computed(
+  () =>
+    monitor.sessions.find((s) => s.session === ui.monitor.selected) ?? monitor.sessions[0] ?? null,
+);
+
+/** 列表里那行小字：不点开也知道这一路现在多少。没样本就说没样本。 */
+function sessionReadout(s: (typeof monitor.sessions)[number]): string {
+  const rx = readings(s.points, 'rx_mbps');
+  if (rx.samples === 0) return '等待首个样本';
+  const tx = readings(s.points, 'tx_mbps');
+  const fmt = (v: number) => (v >= 1000 ? `${(v / 1000).toFixed(2)}G` : `${v.toFixed(0)}M`);
+  return `RX ${fmt(rx.last)} · TX ${fmt(tx.last)}`;
+}
 const selectable = computed(() => nics.value.filter((nic) => !taken(nic.name)).length);
 
 async function add(): Promise<void> {
@@ -138,14 +158,39 @@ async function addAll(): Promise<void> {
       还没有在跑的监控。选一块网卡开始。
     </div>
 
-    <div v-for="s in monitor.sessions" :key="s.session" class="panel">
-      <div class="panel-head">
-        <strong>{{ s.side === 'master' ? '主控' : '辅测' }} · {{ s.iface }}</strong>
-        <span v-if="s.error" class="err">{{ s.error }}</span>
-        <span v-else-if="!s.running" class="muted">已停止</span>
-        <button type="button" class="ghost small" @click="stopSession(s.session)">停止</button>
+    <!-- 左边选，右边看：全部曲线一路向下堆叠时，第三路以后就得靠滚动去找，
+         而每一张图都在按采样间隔重画。切换选中**只换展示**，不启停任何会话。 -->
+    <div v-else class="monitor-split">
+      <div class="session-list" role="group" aria-label="选择要查看的监控会话">
+        <button
+          v-for="s in monitor.sessions"
+          :key="s.session"
+          type="button"
+          class="session"
+          :class="{ on: s.session === current?.session }"
+          :aria-pressed="s.session === current?.session"
+          @click="ui.monitor.selected = s.session"
+        >
+          <span class="session-name">
+            {{ s.side === 'master' ? '主控' : '辅测' }} · {{ s.iface }}
+          </span>
+          <span class="session-meta mono">{{ sessionReadout(s) }}</span>
+          <span v-if="s.error" class="session-meta err">{{ s.error }}</span>
+          <span v-else-if="!s.running" class="session-meta muted">已停止</span>
+        </button>
       </div>
-      <RateChart :points="s.points" :interval-ms="s.intervalMs" />
+
+      <div v-if="current" class="session-detail">
+        <div class="panel-head">
+          <strong>{{ current.side === 'master' ? '主控' : '辅测' }} · {{ current.iface }}</strong>
+          <span v-if="current.error" class="err">{{ current.error }}</span>
+          <span v-else-if="!current.running" class="muted">已停止</span>
+          <button type="button" class="ghost small" @click="stopSession(current.session)">
+            停止这一路
+          </button>
+        </div>
+        <RateChart :points="current.points" :interval-ms="current.intervalMs" />
+      </div>
     </div>
   </section>
 </template>
@@ -171,6 +216,25 @@ select option:disabled { color: var(--muted); }
 .ghost.small { padding: 3px 10px; font-size: 12px; }
 .primary:disabled, .ghost:disabled { opacity: .55; cursor: default; }
 .hint { margin: 0 0 14px; font-size: 12px; }
+/* 桌面左右分栏；窄屏改成上下：列表在上（可横滚），曲线在下。 */
+.monitor-split { display: grid; grid-template-columns: 236px minmax(0, 1fr); gap: 16px; align-items: start; }
+.session-list { display: grid; gap: 6px; min-width: 0; }
+.session {
+  display: grid; gap: 3px; padding: 9px 11px; text-align: left;
+  color: var(--ink); background: var(--surface);
+  border: 1px solid var(--line); border-radius: 6px; cursor: pointer;
+}
+.session:hover { background: var(--head); }
+.session.on { border-color: var(--accent); background: var(--info-bg); }
+.session-name { font-size: 13px; font-weight: 600; overflow-wrap: anywhere; }
+.session-meta { font-size: 11.5px; color: var(--muted); }
+.session-meta.err { color: var(--bad); }
+.session-detail { min-width: 0; }
+.mono { font-family: var(--fm); }
+@media (max-width: 860px) {
+  .monitor-split { grid-template-columns: minmax(0, 1fr); }
+  .session-list { grid-auto-flow: column; grid-auto-columns: minmax(150px, 1fr); overflow-x: auto; }
+}
 .panel { margin: 0 0 14px; }
 .panel-head { display: flex; align-items: center; gap: 10px; margin: 0 0 6px; }
 .panel-head .err { color: var(--bad); font-size: 12px; }

@@ -189,6 +189,25 @@ describe('buildRunRequest', () => {
     expect(buildRunRequest().master_config).toEqual(masterConfig);
   });
 
+  it('导入失败时旧计划原样保留，一个字段都不动', () => {
+    // 这是「导入」这条路上最贵的一条：畸形文件把当前计划清空，而用户刚花二十
+    // 分钟把套件分配好。校验不过就必须在动任何状态**之前**返回。
+    const before = {
+      ui: JSON.stringify(plan.ui),
+      duration: plan.duration,
+      globals: JSON.stringify(plan.globals),
+      linkSets: JSON.stringify(plan.linkSets),
+    };
+    expect(importProject('{ 这不是 json')).toBe(false);
+    expect(importProject(JSON.stringify({ project_version: 999 }))).toBe(false);
+    expect(JSON.stringify(plan.ui)).toBe(before.ui);
+    expect(plan.duration).toBe(before.duration);
+    expect(JSON.stringify(plan.globals)).toBe(before.globals);
+    expect(JSON.stringify(plan.linkSets)).toBe(before.linkSets);
+    // 失败要说出来，不能静默。
+    expect(projectNotices.error).not.toBe('');
+  });
+
   it('没有项目时不发 master_config，后端用自己的基线', () => {
     expect(buildRunRequest().master_config).toBeUndefined();
   });

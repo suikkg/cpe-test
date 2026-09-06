@@ -140,3 +140,43 @@ export function mergeUnits(existing: UnitStatus[], incoming: UnitStatus[]): Unit
   merged.sort((a, b) => a.seq - b.seq);
   return merged;
 }
+
+/** 进度页那一行可点筛选的取值。`all` = 不筛。 */
+export type VerdictFilter = 'all' | 'pass' | 'fail' | 'measured' | 'not_evaluated' | 'setup_error' | 'skip';
+
+/**
+ * 判定字符串 → 筛选桶。
+ *
+ * 桶名和服务端 `counts` 的字段一一对应，这样「筛选行显示的数」和「统计里的数」
+ * 出自同一套口径。**未知判定归到 `not_evaluated`**，不归 `pass`——§3.1 那条
+ * 「未知值显示『未知状态』和原值，不能自动归入成功」在这里的落点。
+ */
+export function verdictBucket(verdict: string): Exclude<VerdictFilter, 'all'> {
+  switch (verdict.trim().toUpperCase()) {
+    case 'PASS':
+      return 'pass';
+    case 'RATE_FAIL':
+    case 'FAIL':
+      return 'fail';
+    case 'MEASURED':
+      return 'measured';
+    case 'SETUP_ERROR':
+      return 'setup_error';
+    case 'SKIP':
+    case 'SKIPPED':
+      return 'skip';
+    default:
+      return 'not_evaluated';
+  }
+}
+
+/** 按筛选桶过滤已完成单元，**保持 seq 顺序**（过滤不重排）。 */
+export function filterByVerdict(units: UnitStatus[], filter: VerdictFilter): UnitStatus[] {
+  if (filter === 'all') return [...units];
+  return units.filter((unit) => verdictBucket(unit.verdict) === filter);
+}
+
+/** 已完成单元的可搜索字段（§11.1）：序号、标题、链路、判定、原因码与原因详情。 */
+export function unitSearchFields(unit: UnitStatus): Array<string | number | null | undefined> {
+  return [unit.seq, `#${unit.seq}`, unit.title, unit.link_group, unit.verdict, unit.reason_code, unit.reason_detail];
+}

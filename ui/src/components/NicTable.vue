@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { nicKey, nicSpeedLabel } from '../domain/nics';
 import type { NicInfo } from '../api/dto';
 
 /**
@@ -12,12 +13,18 @@ defineProps<{
   nics: NicInfo[];
   /** 空表时显示的提示；不同来源（本机 / 未连接的辅测机）说法不一样 */
   emptyHint: string;
+  /**
+   * 当前选中行的 `nicKey`；不传 = 这张表不参与主从选择（辅测页现在就这样）。
+   *
+   * 选中是**可选**能力：加了它，接口名变成按钮；不加则和以前逐字节一样。
+   */
+  selectedKey?: string;
 }>();
+const emit = defineEmits<{ select: [nic: NicInfo] }>();
 
-function speed(nic: NicInfo): string {
-  // 0 表示「拿不到协商速率」，不是「0 Mbps」。填 0 会让人以为链路挂了。
-  return nic.speed_mbps > 0 ? `${nic.speed_mbps} Mbps` : '—';
-}
+// 速率与选中标识都走 domain：表格和详情面板必须说同一句话。
+const speed = nicSpeedLabel;
+const keyOf = nicKey;
 </script>
 
 <template>
@@ -35,9 +42,22 @@ function speed(nic: NicInfo): string {
         </tr>
       </thead>
       <tbody>
-        <tr v-for="nic in nics" :key="nic.ifindex || nic.name">
+        <tr
+          v-for="nic in nics"
+          :key="keyOf(nic)"
+          :class="{ picked: selectedKey !== undefined && selectedKey === keyOf(nic) }"
+        >
           <td>
-            <strong>{{ nic.name }}</strong>
+            <button
+              v-if="selectedKey !== undefined"
+              type="button"
+              class="pick"
+              :aria-pressed="selectedKey === keyOf(nic)"
+              @click="emit('select', nic)"
+            >
+              {{ nic.name }}
+            </button>
+            <strong v-else>{{ nic.name }}</strong>
             <br />
             <small class="muted">{{ nic.description || '—' }}</small>
           </td>
@@ -93,6 +113,23 @@ tbody tr:last-child td {
   border-bottom: 0;
 }
 tbody tr:hover { background: var(--panel-2); }
+tbody tr.picked { background: var(--info-bg); }
+/* 选中入口是接口名本身：不额外占一列，也不让整行变成一个巨大的点击区
+   （整行可点时，用户复制 IP 的每一次划选都会顺手切换选中）。 */
+.pick {
+  padding: 0;
+  font: inherit;
+  font-weight: 700;
+  color: var(--accent);
+  background: none;
+  border: 0;
+  min-height: 0;
+  text-align: left;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.pick:hover:not(:disabled) { background: none; color: var(--accent-hover); }
+.pick[aria-pressed='true'] { color: var(--ink); text-decoration: none; }
 td:first-child { min-width: 180px; max-width: 270px; overflow-wrap: anywhere; }
 td:first-child small { display: inline-block; margin-top: 3px; line-height: 1.5; }
 td:not(:first-child) { white-space: nowrap; }

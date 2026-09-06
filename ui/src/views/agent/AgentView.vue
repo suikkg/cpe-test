@@ -2,6 +2,7 @@
 import { computed, ref } from 'vue';
 import NicTable from '../../components/NicTable.vue';
 import { agentHostname, agentNics, masterNics } from '../../state/inventory';
+import { freshnessLabel } from '../../domain/freshness';
 import { connect, rescan, session } from '../../state/session';
 import { goto } from '../../state/ui';
 
@@ -19,6 +20,8 @@ const prefixText = computed({
 });
 const showToken = ref(false);
 const busy = computed(() => session.phase === 'connecting');
+/** 旧快照标注用的时刻；从没连上过时是「尚未同步」，不填页面打开时间。 */
+const connectedStamp = computed(() => freshnessLabel(session.connectedAt));
 const connected = computed(() => session.phase === 'connected');
 
 /**
@@ -104,14 +107,19 @@ async function onRescan(): Promise<void> {
     </p>
     <p v-else-if="session.phase === 'failed' && session.error" class="bad" role="alert">
       {{ session.error }}
+      <template v-if="session.topologyStale">
+        <br />
+        下面两张网卡表仍是<strong>上次成功</strong>的那一份（{{ session.connectedHost }}
+        · {{ connectedStamp }}），不是这次请求的结果。
+      </template>
     </p>
     <div v-else-if="connected && !agentEmpty" class="ok connection-success" role="status">
-      <span>已连上 <strong>{{ agentHostname || session.host }}</strong>，扫到 {{ agentNics.length }} 块网卡。</span>
+      <span>已连上 <strong>{{ agentHostname || session.connectedHost }}</strong>，扫到 {{ agentNics.length }} 块网卡。</span>
       <button type="button" class="ghost" @click="goto('plan')">配置测试计划</button>
     </div>
 
     <p v-if="agentEmpty" class="warn" role="alert">
-      已连上 <strong>{{ agentHostname || session.host }}</strong>，但<strong>辅测机无对应网卡</strong>：
+      已连上 <strong>{{ agentHostname || session.connectedHost }}</strong>，但<strong>辅测机无对应网卡</strong>：
       它没有一块网卡的 IPv4 落在当前前缀过滤 <code>{{ prefixHint }}</code> 里。
       对端在 10.x / 172.x 这类网段时，把上面的「IPv4 前缀过滤」改掉再连一次。
     </p>
@@ -157,7 +165,7 @@ input { width: 100%; padding: 9px 11px; border: 1px solid var(--line); border-ra
 .ok, .bad, .warn { margin: 0 0 20px; padding: 12px 16px; border-radius: 5px; }
 .ok { border-left: 3px solid var(--ok); background: var(--ok-bg); }
 .bad { border-left: 3px solid var(--bad); background: var(--bad-bg); }
-.warn { border-left: 3px solid var(--focus); background: var(--info-bg); }
+.warn { border-left: 3px solid var(--warn); background: var(--info-bg); }
 .connection-success { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
 .connection-success button { font-size: 12px; }
 code { font-family: var(--fm); overflow-wrap: anywhere; }

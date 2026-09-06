@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from 'vitest';
-import { REGIONS, goto, reset, ui } from './ui';
+import { REGIONS, goto, reset, syncProgressRun, ui } from './ui';
 import type { RegionId } from './ui';
 
 describe('导航区域表', () => {
@@ -43,5 +43,28 @@ describe('导航区域表', () => {
     expect(ui.region).toBe('monitor');
     reset();
     expect(ui.region).toBe('local');
+  });
+});
+
+describe('进度页的按轮上下文', () => {
+  it('换了 run_id 才清，同一轮之内反复调用是空操作', () => {
+    reset();
+    syncProgressRun('run_a');
+    ui.progress.query = 'en1';
+    ui.progress.selected = '37';
+    ui.progressFilter = 'fail';
+
+    // 同一轮：一个字节都不许动，否则每一拍轮询都会把用户的筛选抹掉。
+    syncProgressRun('run_a');
+    expect(ui.progress.query).toBe('en1');
+    expect(ui.progress.selected).toBe('37');
+    expect(ui.progressFilter).toBe('fail');
+
+    // 换轮：整组清掉。上一轮的「只看未达标 + 搜 en1 + 选中 #37」套在新一轮上，
+    // 看到的是一份筛过的新数据，而屏幕上没有一处说筛条件是上一轮留下的。
+    syncProgressRun('run_b');
+    expect(ui.progress.query).toBe('');
+    expect(ui.progress.selected).toBe('');
+    expect(ui.progressFilter).toBe('all');
   });
 });

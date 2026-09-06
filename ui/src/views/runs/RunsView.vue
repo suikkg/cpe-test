@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { onMounted, ref } from 'vue';
+import { computed, onMounted, ref } from 'vue';
 import { api, downloadQuery, errorMessage } from '../../api/client';
 import type { ReplayOut, RunEntry, RunRequestOut } from '../../api/dto';
 import { adoptRunRequest, preview } from '../../state/plan';
-import { goto } from '../../state/ui';
+import { filterByQuery, visibleCountLabel } from '../../domain/search';
+import { goto, ui } from '../../state/ui';
 
 /**
  * 「历史运行」：列出 `runs/` 下的每一轮，并给出取回、重放、重跑三个出口。
@@ -13,6 +14,30 @@ import { goto } from '../../state/ui';
  */
 
 const entries = ref<RunEntry[]>([]);
+
+/**
+ * 页内搜索。字段就是 `RunEntry` **真的有**的那两样：完整目录 id 与它返回的
+ * 修改时间文本（§11.1）。
+ *
+ * 这里**没有**设备、通过率、失败数或测试状态——`RunEntry` 里根本没有这些字段，
+ * 按它们筛就得先发明一个接口。也不能把 `modified` 当成"测试开始时间"：那是
+ * 目录的修改时刻，恢复一次报告它就会变。
+ */
+const shownEntries = computed(() =>
+  filterByQuery(entries.value, ui.runs.query, (entry) => [entry.id, entry.modified]),
+);
+const entryCountLabel = computed(() =>
+  visibleCountLabel(shownEntries.value.length, entries.value.length),
+);
+const selectedEntry = computed(
+  () => entries.value.find((entry) => entry.id === ui.runs.selected) ?? null,
+);
+const selectedHidden = computed(
+  () => !!selectedEntry.value && !shownEntries.value.some((entry) => entry.id === ui.runs.selected),
+);
+function pickEntry(id: string): void {
+  ui.runs.selected = ui.runs.selected === id ? '' : id;
+}
 const loading = ref(false);
 const error = ref('');
 const notice = ref('');
@@ -154,6 +179,57 @@ onMounted(load);
       <p>完成一轮测试后，可在这里下载报告、样本 CSV 和原始输出。</p>
       <button type="button" @click="goto('run')">前往执行</button>
     </div>
+    <div v-else-if="entries.length" class="runs-bar">
+      <label class="search">
+        <span class="sr-only">搜索运行记录</span>
+        <input
+          type="search"
+          :value="ui.runs.query"
+          placeholder="搜运行目录 ID 或修改时间"
+          @input="ui.runs.query = ($event.target as HTMLInputElement).value"
+        />
+      </label>
+      <button v-if="ui.runs.query" type="button" class="ghost small" @click="ui.runs.query = ''">
+        清空搜索
+      </button>
+      <span class="muted">{{ entryCountLabel }}</span>
+    </div>
+
+    <p v-if="selectedHidden" class="hint" role="status">
+      选中的运行不在搜索结果里，下面的详情仍是它。
+    </p>
+
+    <div v-if="selectedEntry" class="run-detail" aria-label="运行详情">
+      <div class="run-detail-head">
+        <strong class="mono">{{ selectedEntry.id }}</strong>
+        <button type="button" class="ghost small" @click="ui.runs.selected = ''">收起详情</button>
+      </div>
+      <dl>
+        <dt>修改时间</dt>
+        <dd>{{ selectedEntry.modified || '时间未知' }}</dd>
+        <dt>目录大小</dt>
+        <dd class="mono">{{ size(selectedEntry.bytes) }}</dd>
+        <dt>HTML 报告</dt>
+        <dd>{{ selectedEntry.has_report ? '有' : '没有' }}</dd>
+        <dt>Excel</dt>
+        <dd>{{ selectedEntry.has_xlsx ? '有' : '没有' }}</dd>
+        <dt>结果明细</dt>
+        <dd>{{ selectedEntry.has_rows ? '有（可重新生成报告）' : '没有（不能恢复报告）' }}</dd>
+        <dt>原计划</dt>
+        <dd>{{ selectedEntry.has_request ? '有（可装载重跑）' : '没有（不能重跑）' }}</dd>
+      </dl>
+      <p class="muted small">
+        「修改时间」是这个目录最后被写过的时刻，<strong>不是测试开始时间</strong>——恢复一次报告它就会变。
+        这一页只有运行记录里已有的字段：没有设备、通过率或失败数，那些要打开报告看。
+      </p>
+    </div>
+
+    <div v-if="entries.length && shownEntries.length === 0" class="empty" role="status">
+      没有运行记录匹配「{{ ui.runs.query.trim() }}」。
+      <button type="button" class="linklike" @click="ui.runs.query = ''">清空搜索</button>
+      可以看到全部 {{ entries.length }} 条。
+    </div>
+
     <div v-else-if="entries.length" class="scroll" tabindex="0" role="region" aria-label="历史运行记录，可横向滚动">
       <table :aria-busy="loading || !!busy">
         <thead>
@@ -162,9 +238,20 @@ onMounted(load);
           </tr>
         </thead>
         <tbody>
-          <tr v-for="entry in entries" :key="entry.id" :class="{ working: busy === entry.id }">
+          <tr
+            v-for="entry in shownEntries"
+            :key="entry.id"
+            :class="{ working: busy === entry.id, picked: entry.id === ui.runs.selected }"
+          >
             <td class="run-identity">
-              <strong class="mono">{{ entry.id }}</strong>
+              <button
+                type="button"
+                class="pick mono"
+                :aria-pressed="entry.id === ui.runs.selected"
+                @click="pickEntry(entry.id)"
+              >
+                {{ entry.id }}
+              </button>
               <span class="muted">{{ entry.modified || '时间未知' }}</span>
               <span v-if="busy === entry.id" class="working-label" role="status">正在处理…</span>
             </td>
@@ -254,9 +341,25 @@ tbody tr:hover, tbody tr.working { background: var(--panel-2); }
 .num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .artifacts { display: flex; flex-wrap: wrap; gap: 5px; min-width: 120px; }
 .actions { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; min-width: 180px; }
+.runs-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 0 0 12px; }
+.search { flex: 1 1 240px; max-width: 360px; }
+.search input { width: 100%; padding: 8px 11px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); color: var(--ink); font: inherit; }
+button.small { min-height: 32px; padding: 6px 11px; font-size: 12.5px; }
+.linklike { padding: 0; min-height: 0; font: inherit; color: var(--accent); background: none; border: 0; text-decoration: underline; text-underline-offset: 3px; }
+.linklike:hover:not(:disabled) { background: none; color: var(--accent-hover); }
+.run-detail { margin: 0 0 14px; padding: 14px 16px; border: 1px solid var(--line); border-radius: 7px; background: var(--panel-2); }
+.run-detail-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; }
+.run-detail dl { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 6px 14px; margin: 0 0 10px; font-size: 12.5px; }
+.run-detail dt { color: var(--muted); white-space: nowrap; }
+.run-detail dd { margin: 0; overflow-wrap: anywhere; }
+.run-detail .small { margin: 0; font-size: 12px; }
+tbody tr.picked { background: var(--info-bg); }
+.pick { padding: 0; min-height: 0; font: inherit; font-weight: 700; color: var(--accent); background: none; border: 0; text-align: left; text-decoration: underline; text-underline-offset: 3px; }
+.pick:hover:not(:disabled) { background: none; color: var(--accent-hover); }
+.pick[aria-pressed='true'] { color: var(--ink); text-decoration: none; }
 .chip { display: inline-block; padding: 2px 6px; border: 1px solid var(--line); border-radius: 3px; background: var(--panel-2); color: var(--muted); font-size: 11px; white-space: nowrap; }
 .chip.ready { border-color: transparent; background: var(--ok-bg); color: var(--ok); }
-.chip.warn { border-color: transparent; background: var(--info-bg); color: var(--focus); }
+.chip.warn { border-color: transparent; background: var(--info-bg); color: var(--warn); }
 .dl { display: inline-flex; align-items: center; justify-content: center; min-height: 33px; padding: 5px 10px; border: 1px solid var(--accent); border-radius: 5px; color: var(--accent); font-size: 12px; font-weight: 600; text-decoration: none; white-space: nowrap; }
 .dl:hover { background: var(--info-bg); }
 .ghost { padding: 7px 14px; border: 1px solid var(--line); border-radius: 5px; background: var(--surface); color: var(--ink); font: inherit; cursor: pointer; }

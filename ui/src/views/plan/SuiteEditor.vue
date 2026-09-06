@@ -22,9 +22,12 @@ import {
   type UiSuite,
   type UiTask,
 } from '../../domain/plan-build';
+import { filterByQuery, visibleCountLabel } from '../../domain/search';
 import { plan } from '../../state/plan';
+import { ui } from '../../state/ui';
 
-const emit = defineEmits<{ editRecipe: [recipeId: string] }>();
+// 带上**来源**：光有 recipeId，「返回任务」只能回到这个工作区，回不到那一条任务。
+const emit = defineEmits<{ editRecipe: [payload: { recipeId: string; suiteId: string; taskId: string }] }>();
 
 /**
  * 「套件」：左边一列套件名，右边只编辑选中的那一个。
@@ -57,9 +60,26 @@ const PROTOCOLS: Array<{ id: UiProtocol; label: string }> = [
  * 存 id 而不是下标：删掉一个套件之后下标会指向**另一个**套件，而那看起来像是
  * 「删错了」。读取一律走 `current`，它在 id 失效时回落到第一个。
  */
-const selectedId = ref('');
+// 选中放 `state/ui`，不放组件本地 `ref`：这一页是 `v-if` 卸载的，切去
+// 「配置」改完参数再回来，本地 ref 已经没了，用户会看到另一个套件被选中。
+const selectedId = computed({
+  get: () => ui.suites.selected,
+  set: (value: string) => { ui.suites.selected = value; },
+});
 const current = computed<UiSuite | undefined>(
   () => plan.ui.suites.find((suite) => suite.id === selectedId.value) ?? plan.ui.suites[0],
+);
+
+/** 左列的搜索：套件名，外加它里面任务的名字与协议（§11.1）。 */
+const visibleSuites = computed(() =>
+  filterByQuery(plan.ui.suites, ui.suites.query, (suite) => [
+    suite.name,
+    ...suite.tasks.map((task) => task.name),
+    ...suite.tasks.map((task) => task.protocol),
+  ]),
+);
+const suiteCountLabel = computed(() =>
+  visibleCountLabel(visibleSuites.value.length, plan.ui.suites.length),
 );
 
 /** 展开了细节的任务 id。默认全收起——细节是「改的时候才看」的东西。 */
@@ -110,9 +130,17 @@ function onAddSuite(): void {
   selectedId.value = plan.ui.suites[plan.ui.suites.length - 1].id;
 }
 
+/**
+ * 删掉之后选**原位置的下一个**，末项则选上一个（§11.2）。
+ *
+ * 一律回到第一个的话，删掉第 7 个套件之后视线被甩回列表顶端——用户接下来
+ * 多半还要删第 8 个，而他得先滚回去重新找。
+ */
 function onRemoveSuite(suiteId: string): void {
+  const at = plan.ui.suites.findIndex((suite) => suite.id === suiteId);
   plan.ui = removeSuite(plan.ui, suiteId);
-  selectedId.value = plan.ui.suites[0]?.id ?? '';
+  const next = plan.ui.suites[at] ?? plan.ui.suites[at - 1] ?? plan.ui.suites[0];
+  selectedId.value = next?.id ?? '';
 }
 
 function onDuplicateSuite(suiteId: string): void {
@@ -196,9 +224,23 @@ function has(list: string[] | undefined, value: string): boolean {
 <template>
   <div class="split">
     <!-- 左：套件列表 -->
+    <div class="list-col">
+      <label v-if="plan.ui.suites.length > 3" class="list-search">
+        <span class="sr-only">搜索套件</span>
+        <input
+          type="search"
+          :value="ui.suites.query"
+          placeholder="搜套件名或任务"
+          @input="ui.suites.query = ($event.target as HTMLInputElement).value"
+        />
+      </label>
+      <p v-if="ui.suites.query" class="list-count muted">
+        {{ suiteCountLabel }}
+        <button type="button" class="linklike" @click="ui.suites.query = ''">清空</button>
+      </p>
     <div class="list" role="group" aria-label="选择套件">
       <button
-        v-for="suite in plan.ui.suites"
+        v-for="suite in visibleSuites"
         :key="suite.id"
         type="button"
         class="list-item"
@@ -214,7 +256,11 @@ function has(list: string[] | undefined, value: string): boolean {
           {{ boundSets(suite.id) ? `已分配给 ${boundSets(suite.id)} 个链路集合` : '尚未分配链路集合' }}
         </span>
       </button>
+      <p v-if="visibleSuites.length === 0" class="list-empty muted">
+        没有套件匹配「{{ ui.suites.query.trim() }}」。
+      </p>
       <button type="button" class="ghost add" @click="onAddSuite">+ 新增套件</button>
+    </div>
     </div>
 
     <!-- 右：编辑选中的那一个 -->
@@ -381,7 +427,7 @@ function has(list: string[] | undefined, value: string): boolean {
                   type="button"
                   class="recipe-edit"
                   :aria-label="`编辑 ${recipe.name} 的参数`"
-                  @click="emit('editRecipe', recipe.id)"
+                  @click="emit('editRecipe', { recipeId: recipe.id, suiteId: current.id, taskId: task.id })"
                 >
                   编辑参数
                 </button>
@@ -519,6 +565,12 @@ function has(list: string[] | undefined, value: string): boolean {
 
 <style scoped>
 .split { display: grid; grid-template-columns: 236px minmax(0, 1fr); gap: 20px; align-items: start; }
+.list-col { display: grid; gap: 8px; min-width: 0; }
+.list-search input { width: 100%; padding: 7px 10px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); color: var(--ink); font: inherit; font-size: 13px; }
+.list-count { margin: 0; font-size: 12px; }
+.list-empty { margin: 4px 0; font-size: 12.5px; }
+.linklike { padding: 0; min-height: 0; font: inherit; font-size: 12px; color: var(--accent); background: none; border: 0; text-decoration: underline; text-underline-offset: 3px; }
+.linklike:hover:not(:disabled) { background: none; color: var(--accent-hover); }
 .list { display: flex; flex-direction: column; gap: 6px; max-height: min(620px, calc(100vh - 240px)); overflow-y: auto; overscroll-behavior: contain; padding-right: 6px; scrollbar-gutter: stable; }
 .list-item { display: flex; flex-direction: column; gap: 5px; padding: 12px; text-align: left; border: 1px solid transparent; border-radius: 7px; background: transparent; color: var(--ink); font: inherit; cursor: pointer; }
 .list-item:hover { background: var(--head); }

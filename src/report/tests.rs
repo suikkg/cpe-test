@@ -32,6 +32,28 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 static REPORT_INDEX: AtomicUsize = AtomicUsize::new(0);
 
+/// 离线报告**完全自包含**：没有任何一个要联网才能拿到的东西。
+///
+/// 这份 HTML 的使用场景就是拷走：拷进邮件附件、拷到没有外网的验收机、隔半年再打开。
+/// 任何 CDN 上的字体或脚本在那些场景里都是一张永远转不出来的圈，而页面本身
+/// 「看起来没坏」——只是排版塌了或者交互没了。附件（截图、CSV、Excel）走的是
+/// **同目录相对路径**，跟着 run 目录一起走，那是有意的，不算外链。
+///
+/// 主控控制台那边由 `the_embedded_page_has_no_external_subresources` 守同一件事，
+/// 辅测状态页由 `the_agent_status_page_stays_read_only_and_self_contained` 守。
+#[test]
+fn the_offline_report_never_reaches_out_to_the_network() {
+    let html = render(vec![unit_summary("unit-a", Verdict::Pass)]);
+    for needle in ["http://", "https://", "//cdn", "@import", "src=\"//"] {
+        assert!(
+            !html.contains(needle),
+            "报告里出现了外部资源 {needle:?}：它要能在没有外网的机器上原样打开"
+        );
+    }
+    // 附件仍然是同目录相对路径，不是被一起删掉了。
+    assert!(html.contains("<html"), "报告应当是一份完整 HTML");
+}
+
 fn render(rows: Vec<Row>) -> String {
     render_with_meta(rows, &ReportMeta::default())
 }

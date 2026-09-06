@@ -143,3 +143,30 @@ export function pruneBindings(plan: UiPlan, linkSets: { id: string }[]): UiPlan 
     ),
   };
 }
+
+/**
+ * 链路集合的可搜索字段（方案 §11.1）：**集合名，加上真实成员的端点名 / IP / 角色**。
+ *
+ * 成员信息不在 `UiLinkSet` 里——那里只有端点串（`master:NAME=en0`）。所以要一份
+ * 候选表把 pair id 映射回两块网卡。查不到的成员（拓扑变了、集合是导入进来的）
+ * 就只贡献端点串本身：**搜不到比搜错好**，绝不能因为查不到就把这一行从结果里
+ * 抹掉——那正是「搜索悄悄删掉已绑定集合」那条禁令要防的事。
+ */
+export function linkSetSearchFields(
+  set: UiLinkSet,
+  byPairId: Map<string, Candidate>,
+): Array<string | number | null | undefined> {
+  const fields: Array<string | number | null | undefined> = [set.name];
+  for (const ref of set.pair_refs) {
+    const pair = byPairId.get(ref.id);
+    if (!pair) {
+      fields.push(ref.src, ref.dst);
+      continue;
+    }
+    fields.push(
+      pair.srcNic.name, pair.srcNic.ipv4, pair.srcNic.role,
+      pair.dstNic.name, pair.dstNic.ipv4, pair.dstNic.role,
+    );
+  }
+  return fields;
+}

@@ -4,7 +4,7 @@ import { REGIONS, ui, goto, setTheme, applyTheme } from './state/ui';
 import type { RegionId } from './state/ui';
 import { agentNics, masterNics } from './state/inventory';
 import { applyBootstrapDefaults, loadDraft, plan } from './state/plan';
-import { run, view as runView } from './state/run';
+import { run, view as runView, syncStatus } from './state/run';
 import { load, session } from './state/session';
 import LocalView from './views/local/LocalView.vue';
 import AgentView from './views/agent/AgentView.vue';
@@ -27,13 +27,19 @@ const badges = computed<Partial<Record<RegionId, string>>>(() => ({
 
 /** 口令失效是**全局终态**：没有口令时点什么都是 401，不该让人逐页去撞。 */
 const unauthorized = computed(() => session.phase === 'unauthorized');
+// 顶栏说的是**已经连上的那台**，不是地址栏里正在敲的那个。用 `session.host`
+// 的话，光在输入框里改一个字符，这里就立刻宣称连上了那台还没连过的机器。
 const connectionLabel = computed(() => {
   if (session.phase === 'connecting') return '连接中';
-  if (session.phase === 'connected') return `已连 ${session.host || '辅测机'}`;
+  if (session.phase === 'connected') return `已连 ${session.connectedHost || '辅测机'}`;
+  if (session.connectedHost) return `与 ${session.connectedHost} 的连接已断开`;
   if (session.phase === 'failed') return '辅测机未连接';
   return '待连接辅测机';
 });
+// 「还没读到」和「读到了，是空闲」必须分开：屏幕上长得一样，下一步却相反——
+// 真空闲可以开跑，没读到时开跑就是往一轮已经在跑的测试上再叠一轮。
 const runLabel = computed(() => {
+  if (!run.synced) return '运行状态待同步';
   if (run.running) return `运行中 ${runView.value.done}/${runView.value.total}`;
   if (runView.value.finished) return '本轮已结束';
   return '空闲';
@@ -71,6 +77,9 @@ onMounted(() => {
   // 上，于是不路过那一页就永远不恢复：刷新之后直接点「执行」，看到的是一份
   // 出厂默认计划，而右边导航的角标还显示着上次的分配数。
   loadDraft();
+  // 先认一次「服务器上是不是已经有一轮在跑」。走的是轮询那同一个出口，
+  // 不新开第二条链、不提高频率；读到在跑才把轮询接上。
+  void syncStatus();
   void load().then(() => {
     // 没有草稿时，执行区的标量默认取自控制台基线；有草稿则让路。
     if (session.bootstrap) applyBootstrapDefaults(session.bootstrap);

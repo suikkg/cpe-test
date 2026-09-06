@@ -305,7 +305,7 @@ function numbers(values: number[] | undefined): string {
 .name-field { flex: 1 1 170px; }
 .name-field .name { font-weight: 600; font-size: 14px; }
 .proto { flex: 0 0 auto; align-self: flex-start; margin-top: 25px; padding: 4px 8px; border-radius: 4px; background: var(--info-bg); color: var(--accent); font-size: 11px; font-weight: 700; }
-.impact { margin: 18px 0 0; padding: 12px; font-size: 12px; border-left: 3px solid var(--focus); background: var(--info-bg); border-radius: 0 5px 5px 0; }
+.impact { margin: 18px 0 0; padding: 12px; font-size: 12px; border-left: 3px solid var(--warn); background: var(--info-bg); border-radius: 0 5px 5px 0; }
 .impact strong { display: block; margin-bottom: 6px; font-weight: 600; }
 .impact-none { margin: 18px 0 0; padding: 10px 12px; background: var(--panel-2); border-radius: 5px; font-size: 12px; }
 .chip { display: inline-block; margin: 3px 5px 0 0; padding: 3px 7px; border-radius: 4px; background: var(--surface); font-size: 11px; overflow-wrap: anywhere; }

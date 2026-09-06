@@ -28,6 +28,10 @@ export const plan = reactive({
   linkSets: [] as ManagedLinkSet[],
   filter: 'all' as LinkFilter,
   stale: [] as Array<{ setId: string; pairId: string; src: string; dst: string }>,
+  /** 草稿写入的可见状态，见 `DraftState`。 */
+  draftState: 'idle' as DraftState,
+  /** 最近一次真的写进去的时刻；没写成过就是 null。 */
+  draftAt: null as number | null,
   duration: 180,
   resume: false,
   screenshot: false,
@@ -68,6 +72,23 @@ export function reconcile(): void {
   );
 }
 
+/**
+ * 草稿的三种可见状态（方案 §11.3）。
+ *
+ * 「已保存」**只能在 `localStorage.setItem` 真的成功之后**说。隐私模式、
+ * 配额满、被策略禁掉的浏览器上它会抛——那时候还显示"已保存"，用户关掉标签页
+ * 才发现二十分钟的分配没了，而界面从头到尾都在说没事。
+ */
+export type DraftState =
+  /** 还没有过改动 */
+  | 'idle'
+  /** 改了，等 500ms 的节流窗口 */
+  | 'pending'
+  /** 真的写进去了 */
+  | 'saved'
+  /** 写不进去：不挡编辑，但必须让人知道该导出备份 */
+  | 'failed';
+
 function saveDraft(): void {
   try {
     localStorage.setItem(
@@ -85,12 +106,18 @@ function saveDraft(): void {
         masterConfig: plan.masterConfig,
       }),
     );
+    plan.draftState = 'saved';
+    plan.draftAt = Date.now();
   } catch {
-    // localStorage 不可用时只失去草稿恢复，不阻断编辑。
+    // 写不进去不阻断编辑（那会让人连改都改不了），但**必须说出来**：
+    // 这一刻起，关掉标签页就真的没了。
+    plan.draftState = 'failed';
   }
 }
 
 let draftRestored = false;
+/** 刚从 localStorage 恢复完：紧接着那一次 watcher 触发不算"用户改了东西"。 */
+let restoredThisTick = false;
 
 export function loadDraft(): boolean {
   try {
@@ -137,6 +164,10 @@ export function loadDraft(): boolean {
     plan.nicPolicies = Array.isArray(parsed.nicPolicies) ? parsed.nicPolicies : [];
     plan.masterConfig = isPlainObject(parsed.masterConfig) ? parsed.masterConfig : null;
     draftRestored = true;
+    // 恢复出来的这一份**本来就在盘上**，不是"待保存的改动"。不标一下的话，
+    // 页面一打开就会闪一句「修改待保存」，而用户什么都没动过。
+    restoredThisTick = true;
+    plan.draftState = 'saved';
     return true;
   } catch {
     return false;
@@ -158,6 +189,12 @@ watch(
     plan.masterConfig,
   ],
   () => {
+    if (restoredThisTick) {
+      restoredThisTick = false;
+      return;
+    }
+    // 先说「待保存」：这是用户按下键到真正落盘之间那 500ms 的真实状态。
+    plan.draftState = 'pending';
     if (saveTimer !== undefined) clearTimeout(saveTimer);
     saveTimer = setTimeout(saveDraft, 500);
   },

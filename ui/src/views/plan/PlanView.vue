@@ -1,6 +1,10 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue';
+import UiTabs from '../../components/UiTabs.vue';
 import { toggleBinding, toggleSuiteColumn, isBound } from '../../domain/plan-build';
+import { linkSetSearchFields } from '../../domain/grouping';
+import { freshnessLabel } from '../../domain/freshness';
+import { filterByQuery, visibleCountLabel } from '../../domain/search';
 import type { LinkFilter } from '../../domain/pairs';
 import { topologyReady } from '../../state/inventory';
 import {
@@ -14,7 +18,7 @@ import {
 } from '../../state/plan';
 import RecipeEditor from './RecipeEditor.vue';
 import SuiteEditor from './SuiteEditor.vue';
-import { goto } from '../../state/ui';
+import { goto, ui } from '../../state/ui';
 
 /**
  * 「测试计划」：链路集合 × 套件的分配表。
@@ -42,8 +46,40 @@ const assignedSets = computed(
 const pairCount = computed(() => sets.value.reduce((sum, set) => sum + set.pair_refs.length, 0));
 const taskCount = computed(() => suites.value.reduce((sum, suite) => sum + suite.tasks.length, 0));
 
-function editRecipe(recipeId: string): void {
-  focusedRecipeId.value = recipeId;
+/** 三个工作区。小字是**当前实况**，不是说明文案——它回答「这一区现在有什么」。 */
+const workbenchTabs = computed(() => [
+  { id: 'assign', label: '分配链路与套件', hint: `${assignedSets.value}/${sets.value.length} 个集合已分配` },
+  { id: 'suites', label: '编辑套件', hint: `${taskCount.value} 个任务` },
+  { id: 'recipes', label: '编辑流量配置', hint: 'TCP / UDP 档位' },
+]);
+
+/**
+ * 「从哪一条任务来的」——找不到就是 null（来源被删了）。
+ *
+ * §11.2：来源已删除时返回它的列表并说明对象已不存在，**不能**挑一个同名的
+ * 冒充原对象。这里的做法是：找不到就不给「返回任务」，只留通用的「返回套件」。
+ */
+const returnTask = computed(() => {
+  const from = ui.recipeReturn;
+  if (!from) return null;
+  const suite = plan.ui.suites.find((item) => item.id === from.suiteId);
+  const task = suite?.tasks.find((item) => item.id === from.taskId);
+  if (!suite || !task) return null;
+  return { suiteName: suite.name || '(未命名)', taskName: task.name || task.protocol.toUpperCase() };
+});
+
+function backToTask(): void {
+  const from = ui.recipeReturn;
+  if (from) ui.suites.selected = from.suiteId;
+  ui.recipeReturn = null;
+  section.value = 'suites';
+}
+
+function editRecipe(payload: { recipeId: string; suiteId: string; taskId: string }): void {
+  focusedRecipeId.value = payload.recipeId;
+  // 记下从哪一条任务来的；配置编辑器据此给出「返回任务」。
+  ui.recipeReturn = { suiteId: payload.suiteId, taskId: payload.taskId };
+  ui.recipes.selected = payload.recipeId;
   section.value = 'recipes';
 }
 
@@ -57,7 +93,49 @@ function onRestoreDefault(): void {
   section.value = 'assign';
 }
 
-/** 一个套件是不是已经分配给了全部集合（整列开关的三态显示）。 */
+// ---- 分配表的名称查询 ----
+//
+// **只控制看得见哪些行**，不碰配对、绑定或链路范围（§11.1）。它绝不调用
+// `reconcile()`：那是「全部/跨机/同机」那一组的事，它会重建链路集合并连带
+// 剪掉指向不存在集合的绑定——用搜索触发它，等于打一个字就悄悄删掉用户的分配。
+const pairIndex = computed(() => new Map(candidates.value.map((pair) => [pair.id, pair])));
+const visibleSets = computed(() =>
+  filterByQuery(sets.value, ui.plan.query, (set) => linkSetSearchFields(set, pairIndex.value)),
+);
+const setCountLabel = computed(() => visibleCountLabel(visibleSets.value.length, sets.value.length));
+
+/**
+ * 草稿的可见状态（§11.3 的三句话）。
+ *
+ * 「已保存」只在真的写进去之后说；写不进去时给的是**可执行的下一步**
+ * （导出项目备份），不是一句"保存失败"。
+ */
+const draftLabel = computed(() => {
+  switch (plan.draftState) {
+    case 'pending':
+      return '修改待保存…';
+    case 'saved':
+      return `草稿已保存 · ${freshnessLabel(plan.draftAt)}`;
+    case 'failed':
+      return '草稿未保存（浏览器不让写本地存储），请用「导出项目」留个备份';
+    default:
+      return '';
+  }
+});
+/** 有查询时必须把「整列操作到底影响谁」说出来（§11.1）。 */
+const columnScopeNote = computed(() =>
+  ui.plan.query.trim() && visibleSets.value.length !== sets.value.length
+    ? `整列操作影响全部 ${sets.value.length} 个链路集合，当前显示 ${visibleSets.value.length} 个`
+    : '',
+);
+
+/**
+ * 一个套件是不是已经分配给了全部集合（整列开关的三态显示）。
+ *
+ * 按**全部**集合算，不按当前显示的那几行——整列按钮作用于全部，三态就必须
+ * 跟它说同一件事。否则搜出两行、两行都勾上，按钮会显示「取消全选」，
+ * 而点下去取消的是全部集合的绑定。
+ */
 function columnState(suiteId: string): 'none' | 'some' | 'all' {
   if (sets.value.length === 0) return 'none';
   const bound = sets.value.filter((set) => isBound(plan.ui, set.id, suiteId)).length;
@@ -149,6 +227,7 @@ onMounted(() => {
         @change="onImport"
       />
       <span class="muted project-note">项目文件保存完整配置，不含口令</span>
+      <span class="draft" :class="plan.draftState" role="status">{{ draftLabel }}</span>
     </div>
 
     <p v-if="projectNotices.error" class="bad" role="alert">{{ projectNotices.error }}</p>
@@ -161,19 +240,21 @@ onMounted(() => {
       <div><strong>{{ plan.ui.bindings.length }}</strong><span>套件分配</span></div>
     </div>
 
-    <nav class="workbench-tabs" aria-label="计划编辑区域">
-      <button type="button" :class="{ on: section === 'assign' }" :aria-pressed="section === 'assign'" @click="section = 'assign'">
-        <span>分配链路与套件</span><small>{{ assignedSets }}/{{ sets.length }} 个集合已分配</small>
-      </button>
-      <button type="button" :class="{ on: section === 'suites' }" :aria-pressed="section === 'suites'" @click="section = 'suites'">
-        <span>编辑套件</span><small>{{ taskCount }} 个任务</small>
-      </button>
-      <button type="button" :class="{ on: section === 'recipes' }" :aria-pressed="section === 'recipes'" @click="section = 'recipes'">
-        <span>编辑流量配置</span><small>TCP / UDP 档位</small>
-      </button>
-    </nav>
+    <UiTabs
+      v-model="section"
+      class="workbench-tabs"
+      label="计划编辑区域"
+      panel-prefix="workbench"
+      :tabs="workbenchTabs"
+    />
 
-    <div v-if="section === 'assign'" class="workbench-panel">
+    <div
+      v-if="section === 'assign'"
+      id="workbench-assign"
+      role="tabpanel"
+      aria-labelledby="workbench-tab-assign"
+      class="workbench-panel"
+    >
     <div class="bar filter-bar">
       <span class="bar-label">候选链路</span>
       <div class="segmented" role="group" aria-label="候选链路筛选">
@@ -189,6 +270,23 @@ onMounted(() => {
         </button>
       </div>
       <span class="muted">共 {{ candidates.length }} 条候选</span>
+    </div>
+
+    <div v-if="sets.length" class="bar search-bar">
+      <label class="search">
+        <span class="sr-only">搜索链路集合</span>
+        <input
+          type="search"
+          :value="ui.plan.query"
+          placeholder="搜集合名、网口名、IP、角色"
+          @input="ui.plan.query = ($event.target as HTMLInputElement).value"
+        />
+      </label>
+      <button v-if="ui.plan.query" type="button" class="ghost small" @click="ui.plan.query = ''">
+        清空搜索
+      </button>
+      <span class="muted">{{ setCountLabel }}</span>
+      <span v-if="columnScopeNote" class="muted scope-note">{{ columnScopeNote }}</span>
     </div>
 
     <p v-if="plan.stale.length" class="warn" role="alert">
@@ -207,6 +305,11 @@ onMounted(() => {
       <p>连接辅测机并确认两端网卡信息后，会按网卡角色自动生成链路集合。</p>
       <button type="button" class="ghost" @click="goto('agent')">前往连接辅测机</button>
     </div>
+    <p v-else-if="visibleSets.length === 0" class="empty compact-empty" role="status">
+      没有链路集合匹配「{{ ui.plan.query.trim() }}」。
+      <button type="button" class="linklike" @click="ui.plan.query = ''">清空搜索</button>
+      可以看到全部 {{ sets.length }} 个。
+    </p>
     <div v-else class="scroll">
       <table aria-label="链路集合与套件分配表">
         <thead>
@@ -231,7 +334,7 @@ onMounted(() => {
           </tr>
         </thead>
         <tbody>
-          <tr v-for="set in sets" :key="set.id">
+          <tr v-for="set in visibleSets" :key="set.id">
             <th scope="row" class="set-col">
               <strong>{{ set.name }}</strong>
               <span class="set-meta">
@@ -260,7 +363,13 @@ onMounted(() => {
     </div>
     </div>
 
-    <div v-else-if="section === 'suites'" class="workbench-panel">
+    <div
+      v-else-if="section === 'suites'"
+      id="workbench-suites"
+      role="tabpanel"
+      aria-labelledby="workbench-tab-suites"
+      class="workbench-panel"
+    >
     <h3>套件</h3>
     <p class="muted hint">一个套件包含一组按顺序执行的任务。选中套件，展开任务调整参数。</p>
     <SuiteEditor @edit-recipe="editRecipe" />
@@ -270,12 +379,27 @@ onMounted(() => {
     </div>
     </div>
 
-    <div v-else class="workbench-panel">
+    <div
+      v-else
+      id="workbench-recipes"
+      role="tabpanel"
+      aria-labelledby="workbench-tab-recipes"
+      class="workbench-panel"
+    >
     <h3>流量配置</h3>
     <p class="muted hint">任务一条配置都不选时，走「执行」页的全局默认档位。</p>
+    <p v-if="returnTask" class="return-note" role="status">
+      正在改的是<strong>共享配置</strong>，改动对所有引用它的任务立即生效。
+      <button type="button" class="linklike" @click="backToTask">
+        返回「{{ returnTask.suiteName }} · {{ returnTask.taskName }}」
+      </button>
+    </p>
     <RecipeEditor :focus-recipe-id="focusedRecipeId" />
     <div class="panel-next finish">
-      <button type="button" class="ghost" @click="section = 'suites'">返回套件</button>
+      <button v-if="returnTask" type="button" class="ghost" @click="backToTask">
+        返回「{{ returnTask.taskName }}」
+      </button>
+      <button v-else type="button" class="ghost" @click="section = 'suites'">返回套件</button>
       <div>
         <strong>计划配置完成？</strong>
         <span class="muted">在执行页预览实际测试单元、门限与预计耗时。</span>
@@ -317,6 +441,19 @@ onMounted(() => {
 .workbench-panel > h3:first-child { margin-top: 0; }
 .filter-bar { margin-bottom: 20px; }
 .bar-label { margin-right: 4px; font-size: 13px; font-weight: 600; }
+.search-bar { margin-bottom: 14px; }
+.search { flex: 1 1 240px; max-width: 360px; }
+.search input { width: 100%; padding: 8px 11px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); color: var(--ink); font: inherit; }
+button.small { min-height: 32px; padding: 6px 11px; font-size: 12.5px; }
+/* 整列操作的作用域说明：有查询时它必须在场，所以给它一个不会被挤没的落点。 */
+.scope-note { flex-basis: 100%; font-size: 12px; }
+.linklike { padding: 0; min-height: 0; font: inherit; color: var(--accent); background: none; border: 0; text-decoration: underline; text-underline-offset: 3px; }
+.linklike:hover:not(:disabled) { background: none; color: var(--accent-hover); }
+.compact-empty { padding: 16px 18px; font-size: 13px; }
+.return-note { margin: 0 0 12px; padding: 9px 12px; border-left: 3px solid var(--accent); background: var(--info-bg); font-size: 12.5px; }
+.draft { font-size: 12px; color: var(--muted); }
+.draft.saved { color: var(--ok); }
+.draft.failed { color: var(--warn); font-weight: 600; }
 .filter-bar > .muted { margin-left: 4px; font-size: 12px; }
 .section-head h3 { margin: 0 0 6px; }
 .panel-next {
@@ -331,7 +468,7 @@ onMounted(() => {
 }
 .ghost.danger { border-color: var(--bad); color: var(--bad); }
 .bad, .warn { margin: 0 0 16px; padding: 12px 14px; border-left: 3px solid var(--bad); background: var(--bad-bg); border-radius: 0 6px 6px 0; }
-.warn { border-left-color: var(--focus); background: var(--info-bg); }
+.warn { border-left-color: var(--warn); background: var(--info-bg); }
 .segmented { display: inline-flex; padding: 3px; gap: 3px; border: 1px solid var(--line); border-radius: 7px; background: var(--panel-2); }
 .segmented button {
   min-height: 30px; padding: 5px 16px; border: 0; border-radius: 4px;

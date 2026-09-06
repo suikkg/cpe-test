@@ -320,6 +320,35 @@ fn api_status(console: &Arc<Console>) -> Result<serde_json::Value, String> {
 mod tests {
     use super::*;
 
+    /// 辅测状态页**只读、且完全自包含**。
+    ///
+    /// 两条都是「下一次顺手改一行就没了、而且不会有任何报错」的约束：
+    ///
+    /// - 只读：这一页跑在辅测机上，谁能打开它取决于 `--ui-bind`。它一旦能发出
+    ///   会改状态的请求，那台机器就多了一个不需要口令的控制面。现在它只 GET
+    ///   `/api/status` 与 `/api/activity`。
+    /// - 自包含：辅测机常年在离线的实验网里，任何外链子资源都是一张永远转不出来
+    ///   的圈。主控控制台那边由 `the_embedded_page_has_no_external_subresources`
+    ///   守着同一件事。
+    #[test]
+    fn the_agent_status_page_stays_read_only_and_self_contained() {
+        for needle in ["http://", "https://", "//cdn", "<script src", "<link "] {
+            assert!(
+                !PAGE.contains(needle),
+                "辅测状态页出现了外部资源 {needle:?}：这台机器可能根本没有外网"
+            );
+        }
+        for needle in [
+            "method:", "method =", "'POST'", "\"POST\"", "'DELETE'", "'PUT'",
+        ] {
+            assert!(
+                !PAGE.contains(needle),
+                "辅测状态页出现了会改状态的请求 {needle:?}：它必须是只读的"
+            );
+        }
+        assert!(PAGE.contains("/api/status") && PAGE.contains("/api/activity"));
+    }
+
     #[test]
     fn repeated_polling_collapses_into_one_line() {
         let activity = Activity::new();

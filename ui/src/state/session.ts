@@ -7,6 +7,7 @@ import {
   errorMessage,
   hasToken,
 } from '../api/client';
+import { clockStamp } from '../domain/freshness';
 import type { BootstrapOut, ConnectOut, ConnectReq, LocalOut } from '../api/dto';
 
 /**
@@ -33,6 +34,9 @@ export type SessionPhase =
    */
   | 'unauthorized';
 
+/** 表单里端口那一格的出厂值；和 `reset()` 用同一个常量，别写两遍。 */
+const DEFAULT_AGENT_PORT = 28801;
+
 export const session = reactive({
   phase: 'idle' as SessionPhase,
   error: '',
@@ -40,11 +44,33 @@ export const session = reactive({
   bootstrap: null as BootstrapOut | null,
   /** 本机信息。**不需要连上辅测机**就能拿到 */
   local: null as LocalOut | null,
-  /** 连上之后的双端拓扑 */
+  /**
+   * 连上之后的双端拓扑。
+   *
+   * **失败不清它。** 清掉的话，改错一个地址、点一次连接，两张网卡表就空了，
+   * 屏幕上「没扫到网卡」和「刚才那次请求失败了」长得一模一样。留着上一份并
+   * 标成旧快照，人才知道自己看的是什么时候的数据。
+   */
   connection: null as ConnectOut | null,
+  /**
+   * 手上这份拓扑是不是**上一次成功**留下的旧快照。
+   *
+   * 它和 `phase === 'failed'` 不是一回事：phase 说的是最近一次请求怎么了，
+   * 这一位说的是屏幕上那两张表是什么时候的。
+   */
+  topologyStale: false,
+  /**
+   * 拓扑真正来自哪一台机器、什么时候来的。
+   *
+   * 和下面的表单字段**分开存**：地址栏是草稿，改一个字符就变；而顶栏那句
+   * 「已连 …」说的是事实。合成一个字段时，光在输入框里敲一个新地址，顶栏
+   * 就立刻宣称已经连上了那台新机器。
+   */
+  connectedHost: '',
+  connectedAt: null as number | null,
   /** 表单字段：辅测机地址 / 端口 / 共享令牌 / 网卡前缀过滤 */
   host: '',
-  port: 28801,
+  port: DEFAULT_AGENT_PORT,
   token: '',
   prefixes: [] as string[],
   /**
@@ -58,16 +84,46 @@ export const session = reactive({
   scanning: false,
   scanMessage: '',
   scanKind: '' as '' | 'ok' | 'bad',
+  /**
+   * `/api/bootstrap` 与 `/api/local` 各自的失败，**不共用一格**。
+   *
+   * 它们是两个独立请求：本机网卡不依赖辅测机。共用一格时，后落地的那个成功
+   * 会把先落地的那个错误擦掉——屏幕上一切正常，而其中一半的数据根本没拿到。
+   */
+  bootstrapError: '',
+  localError: '',
+  /** 本机信息最近一次成功读到的时刻；没读到过就是 null（显示「尚未同步」）。 */
+  localAt: null as number | null,
+  /**
+   * 上一次 bootstrap **回填进表单的那份值**。
+   *
+   * 存在的理由是「晚到回填不能盖掉用户已经敲进去的东西」。`/api/bootstrap` 在
+   * Windows 上要拉起 ipconfig / netsh，一两秒才回来；这段时间里用户完全可能
+   * 已经把地址改成了另一台机器。直接赋值的话，他敲的字会在某个说不清的时刻
+   * 被悄悄换掉——而且**只在慢的机器上出现**，快的机器上永远复现不了。
+   *
+   * 判据是「这一格还是不是我上次写进去的那个值」：是 → 用户没动过，可以回填；
+   * 不是 → 那是用户的输入，不碰。比另设一个 `touched` 标志可靠，因为不需要
+   * 每个输入框都记得去置位。
+   */
+  filled: { host: '', port: 0 },
 });
 
 export function reset(): void {
   session.phase = 'idle';
   session.error = '';
   session.bootstrap = null;
+  session.bootstrapError = '';
   session.local = null;
+  session.localError = '';
+  session.localAt = null;
   session.connection = null;
+  session.topologyStale = false;
+  session.connectedHost = '';
+  session.connectedAt = null;
+  session.filled = { host: '', port: 0 };
   session.host = '';
-  session.port = 28801;
+  session.port = DEFAULT_AGENT_PORT;
   session.token = '';
   session.prefixes = [];
   session.scanning = false;
@@ -107,16 +163,27 @@ export async function load(): Promise<void> {
   ]);
   if (bootstrap.status === 'fulfilled') {
     session.bootstrap = bootstrap.value;
-    session.host = bootstrap.value.agent_host;
-    session.port = bootstrap.value.agent_port;
-    session.prefixes = [...bootstrap.value.ipv4_prefixes];
+    session.bootstrapError = '';
+    // 只回填**用户没动过**的格子，判据见 `session.filled`。
+    if (session.host === session.filled.host) session.host = bootstrap.value.agent_host;
+    if (session.port === session.filled.port || session.port === DEFAULT_AGENT_PORT) {
+      session.port = bootstrap.value.agent_port;
+    }
+    if (session.prefixes.length === 0) session.prefixes = [...bootstrap.value.ipv4_prefixes];
+    session.filled = { host: session.host, port: session.port };
+  } else if (bootstrap.reason instanceof UnauthorizedError) {
+    session.phase = 'unauthorized';
   } else {
-    fail(bootstrap.reason);
+    session.bootstrapError = errorMessage(bootstrap.reason);
   }
   if (local.status === 'fulfilled') {
     session.local = local.value;
-  } else if (session.phase !== 'unauthorized') {
-    fail(local.reason);
+    session.localError = '';
+    session.localAt = Date.now();
+  } else if (local.reason instanceof UnauthorizedError) {
+    session.phase = 'unauthorized';
+  } else {
+    session.localError = errorMessage(local.reason);
   }
 }
 
@@ -145,10 +212,15 @@ export async function rescan(): Promise<void> {
     // 本机那一份总要刷：它是「还没连上」时唯一的来源，也是 iperf3 与版本号的来源。
     const local = await api.get<LocalOut>('/api/local');
     session.local = local;
+    session.localError = '';
+    session.localAt = Date.now();
     if (connected) {
       await connect();
       if (session.phase !== 'connected') {
-        session.scanMessage = `重新扫描失败：${session.error || '连接对端失败'}`;
+        // 重扫失败保留上一次成功的两张表（`connect()` 不清 connection），
+        // 只把它标成旧的。**不能**顺手把拓扑抹成空——那会让「分配链路」
+        // 那一页对着一份空拓扑去 reconcile，把用户的分配意图一起清掉。
+        session.scanMessage = `重新扫描失败：${session.error || '连接对端失败'}；下面仍是上次成功的网卡`;
         session.scanKind = 'bad';
         return;
       }
@@ -173,12 +245,9 @@ export async function rescan(): Promise<void> {
   }
 }
 
-/** 扫描完成的时刻。给的是**本地时钟**的时分秒，只用来回答「这份表是刚才的吗」。 */
+/** 扫描完成的时刻，与其它三处「这份是什么时候的」共用 `domain/freshness`。 */
 function stamp(): string {
-  const now = new Date();
-  return [now.getHours(), now.getMinutes(), now.getSeconds()]
-    .map((part) => String(part).padStart(2, '0'))
-    .join(':');
+  return clockStamp(Date.now());
 }
 
 export async function connect(): Promise<void> {
@@ -194,9 +263,14 @@ export async function connect(): Promise<void> {
       ipv4_prefixes: session.prefixes,
     };
     session.connection = await api.post<ConnectOut>('/api/connect', request);
+    // 身份只在**成功之后**落地：在这之前顶栏说的还是上一台机器，那是事实。
+    session.connectedHost = request.host;
+    session.connectedAt = Date.now();
+    session.topologyStale = false;
     session.phase = 'connected';
   } catch (error) {
-    session.connection = null;
+    // 保留上一份拓扑并标旧，不清空（理由见 `session.connection` 的注释）。
+    session.topologyStale = session.connection !== null;
     fail(error);
   }
 }
