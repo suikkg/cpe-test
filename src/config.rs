@@ -122,6 +122,19 @@ pub struct UniversalParams {
     /// 双向可分别配置 ab/ba；单向可用 forward。
     #[serde(default)]
     pub rate_targets_mbps: Option<RateTargets>,
+    /// **单向**单元专用的接收门限，按方向分别配置（`ab` / `ba`）。
+    ///
+    /// 和 `rate_targets_bidir_mbps` 对称，同样排在**单口覆盖之前**，理由也一样：
+    /// 它是唯一知道「这条腿是哪一对网口」的门限来源。按网口那张表只能给一块网卡
+    /// 填一个数，而同一块 SGMII2.5G 口，对端是 1G 口和对端是 10G 口时能收到的
+    /// 完全不是一个量级——1G 口做发送端时，收口上挂的 1800/2000 在这条路径上
+    /// 物理上就跑不到。`rate_check.rx_target_link_speed_ratio` 那道封顶只能把它
+    /// 压到线速的 95%（1G 口上是 950），压不出「这条链路该验收多少」。
+    ///
+    /// 留空 = 单向照旧走既有的兜底链（单口覆盖 → `rate_targets_mbps` → 内置推导），
+    /// 老配置行为不变。
+    #[serde(default)]
+    pub rate_targets_single_mbps: Option<RateTargets>,
     /// **双向并发**单元专用的接收门限，按方向分别配置（`ab` / `ba`）。
     ///
     /// 双向同时灌包时，两个方向的吞吐**不是相互独立的**：一个方向多占，
@@ -642,6 +655,19 @@ pub struct TestSpec {
     pub rate_mode: Option<RateMode>,
     #[serde(default)]
     pub rate_targets_mbps: Option<RateTargets>,
+    /// **单向**单元专用的接收门限，按方向分别配置（`ab` / `ba`）。
+    ///
+    /// 和 `rate_targets_bidir_mbps` 对称，同样排在**单口覆盖之前**，理由也一样：
+    /// 它是唯一知道「这条腿是哪一对网口」的门限来源。按网口那张表只能给一块网卡
+    /// 填一个数，而同一块 SGMII2.5G 口，对端是 1G 口和对端是 10G 口时能收到的
+    /// 完全不是一个量级——1G 口做发送端时，收口上挂的 1800/2000 在这条路径上
+    /// 物理上就跑不到。`rate_check.rx_target_link_speed_ratio` 那道封顶只能把它
+    /// 压到线速的 95%（1G 口上是 950），压不出「这条链路该验收多少」。
+    ///
+    /// 留空 = 单向照旧走既有的兜底链（单口覆盖 → `rate_targets_mbps` → 内置推导），
+    /// 老配置行为不变。
+    #[serde(default)]
+    pub rate_targets_single_mbps: Option<RateTargets>,
     /// **双向并发**单元专用的接收门限，按方向分别配置（`ab` / `ba`）。
     ///
     /// 双向同时灌包时，两个方向的吞吐**不是相互独立的**：一个方向多占，

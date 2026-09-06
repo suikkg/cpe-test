@@ -116,6 +116,11 @@
       "ab": null,
       "ba": null
     },
+    "rate_targets_single_mbps": {
+      "forward": null,
+      "ab": null,
+      "ba": null
+    },
     "rate_targets_bidir_mbps": {
       "forward": null,
       "ab": null,

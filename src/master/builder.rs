@@ -87,6 +87,8 @@ pub struct SpecNorm {
     pub udp_limit: bool,
     pub rate_mode: RateMode,
     pub rate_targets: RateTargets,
+    /// 单向单元专用的门限，按方向（ab/ba）。空则单向也走既有兜底链。
+    pub rate_targets_single: RateTargets,
     /// 双向并发单元专用的门限，按方向（ab/ba）。空则双向也走既有兜底链。
     pub rate_targets_bidir: RateTargets,
     /// 双向并发单元的「两端 RX 合计」门限。
@@ -537,6 +539,7 @@ pub fn spec_from_config(
         udp_limit: cfg.limit_udp_by_link_speed,
         rate_mode: t.rate_mode.unwrap_or(cfg.iperf.rate_check.mode),
         rate_targets: t.rate_targets_mbps.clone().unwrap_or_default(),
+        rate_targets_single: t.rate_targets_single_mbps.clone().unwrap_or_default(),
         rate_targets_bidir: t.rate_targets_bidir_mbps.clone().unwrap_or_default(),
         rate_target_bidir_total: t
             .rate_target_bidir_total_mbps
@@ -1629,6 +1632,7 @@ mod tests {
             udp_limit: true,
             rate_mode: RateMode::Auto,
             rate_targets: RateTargets::default(),
+            rate_targets_single: RateTargets::default(),
             rate_targets_bidir: RateTargets::default(),
             rate_target_bidir_total: None,
             rate_check: RateCheckCfg::default(),
@@ -2020,7 +2024,81 @@ mod tests {
         );
     }
 
-    /// 反过来：门限在路径上限之内时一个字节都不能动，提示也不能冒出来。
+    /// 同一条现场：封顶只能把 1800/2000 压到线速的 95%（950），压不出「这条
+    /// 链路该验收多少」——16 个单元实测 934~984 就骑在 950 上。真正缺的是
+    /// 「这条腿是哪一对网口」这一层：SGMII1G 做发送端时收口那个 1800/2000
+    /// 对本条路径根本不成立，而按网口那张表一块网卡只能填一个数。
+    /// 双向早就有这一层（`rate_targets_bidir`），单向此前没有。
+    #[test]
+    fn a_single_direction_pair_target_outranks_the_per_nic_threshold() {
+        let with_nic_policy = || {
+            let mut spec = base_spec();
+            spec.src = ep(Side::Master, "以太网 6", "SGMII1G", "192.168.0.101", 1000);
+            spec.dst = ep(Side::Agent, "以太网 18", "SGMII2.5G", "192.168.0.105", 2500);
+            spec.rate_mode = RateMode::Verify;
+            spec.link_profiles = LinkProfiles {
+                by_role: Vec::new(),
+                by_nic: vec![NicProfile {
+                    host: "agent".into(),
+                    name: "以太网 18".into(),
+                    ipv4: "192.168.0.105".into(),
+                    rx_target_mbps: Some(2000.0),
+                    udp_bandwidth: None,
+                    ..Default::default()
+                }],
+            };
+            spec
+        };
+
+        // 没填单向门限：还是按网口门限，并且被路径上限折算到 950。
+        let mut port = PORT_BASE;
+        let (units, _) = build_units(&[with_nic_policy()], true, &mut port);
+        assert_eq!(iperf_single_task(&units[0]).rx_target_mbps, Some(950.0));
+
+        // 填了就以它为准——按网口那个数对这条路径不成立，不该再参与判定。
+        let mut spec = with_nic_policy();
+        spec.rate_targets_single.ab = Some(850.0);
+        let unit = build_single_iperf_unit(spec, PORT_BASE);
+        let task = iperf_single_task(&unit);
+        assert_eq!(task.rx_target_mbps, Some(850.0));
+        assert_eq!(task.rate_mode, RateMode::Verify);
+        // 预览必须说清这个数来自哪一层，否则和界面上那张网口表对不上。
+        assert!(
+            unit.target_lines
+                .iter()
+                .any(|line| line.contains("850") && line.contains("单向方向门限")),
+            "{:?}",
+            unit.target_lines
+        );
+    }
+
+    /// 单向与双向各有一套配对门限，互不串台：双向同时灌包时两个方向互相抢，
+    /// 拿单向那个数去卡双向必然判 RATE_FAIL，反过来则是把双向的宽松值
+    /// 用到单向上，白放一批本该 FAIL 的链路。
+    #[test]
+    fn single_and_bidir_pair_targets_do_not_leak_into_each_other() {
+        let mut spec = base_spec();
+        spec.directions = vec!["ab".into(), "bidir".into()];
+        spec.rate_mode = RateMode::Verify;
+        spec.rate_targets_single.ab = Some(1800.0);
+        spec.rate_targets_bidir.ab = Some(850.0);
+        spec.rate_targets_bidir.ba = Some(850.0);
+
+        let mut port = PORT_BASE;
+        let (units, _) = build_units(&[spec], true, &mut port);
+        let single = units.iter().find(|unit| !unit.bidir).expect("单向单元");
+        assert_eq!(iperf_single_task(single).rx_target_mbps, Some(1800.0));
+
+        let bidir = units.iter().find(|unit| unit.bidir).expect("双向单元");
+        for leg in &bidir.legs {
+            let LegKind::IperfSingle(task) = &leg.kind else {
+                panic!("expected iperf legs");
+            };
+            assert_eq!(task.rx_target_mbps, Some(850.0), "{} 腿", leg.tag);
+        }
+    }
+
+    /// 反过来：门限在路径之内时一个字节都不能动，提示也不能冒出来。
     #[test]
     fn a_reachable_target_is_left_alone_by_the_path_ceiling() {
         let mut spec = base_spec();

@@ -577,6 +577,7 @@ fn an_implicitly_loaded_config_only_contributes_connection_identity() {
         udp_profiles: None,
         rate_mode: None,
         rate_targets_mbps: None,
+        rate_targets_single_mbps: None,
         rate_targets_bidir_mbps: None,
         rate_target_bidir_total_mbps: None,
         link_group: None,
@@ -1271,6 +1272,54 @@ fn quick_plan_applies_request_level_ping_defaults() {
     assert_eq!(ping.ping_payload_sizes, None);
 }
 
+/// 任务上的**单向**门限要一路走到 `TestSpec`，并且和双向那一套互不沾边。
+///
+/// 缺了这一层时，1G 口与快口之间的单向腿只能拿按网口门限那个 1800/2000——
+/// 那个数对这条路径物理上不成立，而界面上没有任何一格能改它。
+#[test]
+fn a_task_single_direction_target_reaches_the_spec_and_rejects_bad_input() {
+    let state = state_with_pair();
+
+    let mut req = suite_request();
+    let plan = req.ui_plan.as_mut().expect("suite plan");
+    plan.suites[0].tasks[0].rx_target_ab = "850".into();
+    plan.suites[0].tasks[1].rx_target_ba = "900".into();
+    let compiled = compile_request(&state, &req).expect("single-direction targets should validate");
+    assert_eq!(
+        compiled.cfg.tests[0]
+            .rate_targets_single_mbps
+            .as_ref()
+            .and_then(|targets| targets.ab),
+        Some(850.0)
+    );
+    assert_eq!(
+        compiled.cfg.tests[1]
+            .rate_targets_single_mbps
+            .as_ref()
+            .and_then(|targets| targets.ba),
+        Some(900.0)
+    );
+    assert!(
+        compiled.cfg.tests[0].rate_targets_bidir_mbps.is_none(),
+        "单向门限不得渗进双向那一套"
+    );
+
+    // 填了某个方向却没勾它：字段静默失效比报错难查得多——那一格在界面上
+    // 只在勾了方向时才出现，人看不到自己填过什么。
+    let mut wrong_direction = suite_request();
+    wrong_direction.ui_plan.as_mut().expect("suite plan").suites[0].tasks[0].rx_target_ba =
+        "850".into();
+    let error = validate_request(&state, &wrong_direction).expect_err("填了没勾的方向必须报错");
+    assert!(error.contains("单向门限但未选择该方向"), "{error}");
+
+    // 百分比按**接收网卡协商速率**换算，而这两格要压的恰恰是「收口协商速率
+    // 对这条路径不成立」，换个写法犯同一个错。
+    let mut percent = suite_request();
+    percent.ui_plan.as_mut().expect("suite plan").suites[0].tasks[0].rx_target_ab = "90%".into();
+    let error = validate_request(&state, &percent).expect_err("百分比必须报错");
+    assert!(error.contains("单向门限只能填绝对 Mbps"), "{error}");
+}
+
 #[test]
 fn quick_plan_rejects_ping_recipe_references_until_recipe_fields_exist() {
     let state = state_with_pair();
@@ -1420,6 +1469,7 @@ fn a_config_exported_by_the_old_encoder_still_traces_back() {
         udp_profiles: None,
         rate_mode: None,
         rate_targets_mbps: None,
+        rate_targets_single_mbps: None,
         rate_targets_bidir_mbps: None,
         rate_target_bidir_total_mbps: None,
         link_group: None,
@@ -4982,6 +5032,7 @@ fn importing_a_suite_derived_config_warns_that_the_suite_is_lost() {
             udp_profiles: None,
             rate_mode: None,
             rate_targets_mbps: None,
+            rate_targets_single_mbps: None,
             rate_targets_bidir_mbps: None,
             rate_target_bidir_total_mbps: None,
             link_group: None,

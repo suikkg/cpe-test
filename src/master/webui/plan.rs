@@ -927,6 +927,27 @@ pub(super) fn ui_task_bidir_total(task: &UiTask) -> Option<f64> {
         .and_then(rx_target_mbps)
 }
 
+/// 任务上填的**单向**每方向门限。
+///
+/// 与 [`ui_task_targets`] 同形，落在 `TestSpec::rate_targets_single_mbps` 上——
+/// 那一层排在按网口门限之前，所以这两格能盖掉收口网卡上那个对本条路径不成立
+/// 的数（例如 1G 口做发送端时收口的 1800/2000）。
+pub(super) fn ui_task_single_targets(task: &UiTask) -> Option<crate::config::RateTargets> {
+    let ab = parse_rx_target(&task.rx_target_ab)
+        .ok()
+        .flatten()
+        .and_then(rx_target_mbps);
+    let ba = parse_rx_target(&task.rx_target_ba)
+        .ok()
+        .flatten()
+        .and_then(rx_target_mbps);
+    (ab.is_some() || ba.is_some()).then_some(crate::config::RateTargets {
+        forward: None,
+        ab,
+        ba,
+    })
+}
+
 pub(super) fn ui_task_targets(task: &UiTask) -> Option<crate::config::RateTargets> {
     let ab = parse_rx_target(&task.rx_target_bidir_ab)
         .ok()
@@ -1019,6 +1040,7 @@ pub(super) fn ui_task_base_spec(
         udp_profiles: None,
         rate_mode: task.rate_mode,
         rate_targets_mbps: task.rate_targets_mbps.clone(),
+        rate_targets_single_mbps: ui_task_single_targets(task),
         rate_targets_bidir_mbps: ui_task_targets(task),
         rate_target_bidir_total_mbps: ui_task_bidir_total(task),
         link_group: None,
@@ -1372,6 +1394,8 @@ pub(super) fn specs_for_pair(
 
     let base = |name: String, transports: Vec<String>| TestSpec {
         name,
+        // 旧矩阵没有单向门限那两格：它整体只作请求兼容，新界面发的是 `ui_plan`。
+        rate_targets_single_mbps: None,
         rate_targets_bidir_mbps: bidir_targets.clone(),
         rate_target_bidir_total_mbps: bidir_total,
         src: pair.src.clone(),

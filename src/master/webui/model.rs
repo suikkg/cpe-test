@@ -253,6 +253,17 @@ pub(super) struct UiTask {
     pub(super) ip: Vec<String>,
     #[serde(alias = "recipe_ids", alias = "recipes")]
     pub(super) recipe_ids: Vec<String>,
+    /// **单向**腿的接收门限，按方向分开填（Mbps 绝对值文本）。
+    ///
+    /// 和下面那两格双向门限是两件事，不能共用一个数：双向同时灌包时两个方向
+    /// 互相抢，每个方向拿到的只有单向的一部分。
+    ///
+    /// 为什么门限要能挂在任务上、而不是只有「按网口门限」那一张表：那张表一块
+    /// 网卡只能填一个数，而同一块网卡对不同对端能收到的完全不是一个量级——
+    /// SGMII1G 做发送端时，收口上挂的 1800/2000 在这条路径上物理上跑不到。
+    /// 留空 = 走既有兜底链（按网口门限 → 频段/全局门限 → 内置推导）。
+    pub(super) rx_target_ab: String,
+    pub(super) rx_target_ba: String,
     pub(super) rx_target_bidir_ab: String,
     pub(super) rx_target_bidir_ba: String,
     /// 双向并发下「两端 RX 合计」门限；配了它这个任务的双向单元只按合计判定。

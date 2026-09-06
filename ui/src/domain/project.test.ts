@@ -74,6 +74,16 @@ describe('导入导出往返', () => {
     expect(back.plan!.link_sets).toEqual(plan.link_sets);
   });
 
+  it('任务上的单向门限跟着项目走', () => {
+    // 它决定 PASS/FAIL，掉在导出路上等于「同一份项目在两台机器上判得不一样」。
+    const plan = ensureDefaults(emptyPlan());
+    plan.suites[0].tasks[0].rx_target_ab = '850';
+    plan.suites[0].tasks[0].rx_target_ba = '900';
+    const back = parseProject(serializeProject(plan));
+    expect(back.plan!.suites[0].tasks[0].rx_target_ab).toBe('850');
+    expect(back.plan!.suites[0].tasks[0].rx_target_ba).toBe('900');
+  });
+
   it('项目导出带上执行设置、网口策略和 Wi-Fi 门限', () => {
     const plan = ensureDefaults(emptyPlan());
     const policies: UiNicPolicy[] = [

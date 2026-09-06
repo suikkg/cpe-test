@@ -12,6 +12,7 @@ import {
   removeTask,
   setTaskProtocol,
   taskUsesBidir,
+  taskUsesSingleDirection,
   toggleTaskDirection,
   toggleTaskIp,
   toggleTaskRecipe,
@@ -171,10 +172,15 @@ function onPingSizes(suiteId: string, taskId: string, event: Event): void {
   });
 }
 
-function onBidirTarget(
+function onRxTarget(
   suiteId: string,
   taskId: string,
-  field: 'rx_target_bidir_ab' | 'rx_target_bidir_ba' | 'rx_target_bidir_total',
+  field:
+    | 'rx_target_ab'
+    | 'rx_target_ba'
+    | 'rx_target_bidir_ab'
+    | 'rx_target_bidir_ba'
+    | 'rx_target_bidir_total',
   event: Event,
 ): void {
   plan.ui = updateTask(plan.ui, suiteId, taskId, {
@@ -422,6 +428,37 @@ function has(list: string[] | undefined, value: string): boolean {
               </label>
             </fieldset>
 
+            <fieldset
+              v-if="taskUsesSingleDirection(task, 'ab') || taskUsesSingleDirection(task, 'ba')"
+              class="wide"
+            >
+              <legend>单向的接收门限（Mbps）</legend>
+              <label v-if="taskUsesSingleDirection(task, 'ab')" class="inline">
+                <span>A→B 接收端</span>
+                <input
+                  type="text"
+                  placeholder="留空 = 走按网口门限"
+                  :value="task.rx_target_ab ?? ''"
+                  @input="onRxTarget(current.id, task.id, 'rx_target_ab', $event)"
+                />
+              </label>
+              <label v-if="taskUsesSingleDirection(task, 'ba')" class="inline">
+                <span>B→A 接收端</span>
+                <input
+                  type="text"
+                  placeholder="留空 = 走按网口门限"
+                  :value="task.rx_target_ba ?? ''"
+                  @input="onRxTarget(current.id, task.id, 'rx_target_ba', $event)"
+                />
+              </label>
+              <p class="muted small-hint">
+                填了这里就<strong>不再看「按网口门限」那张表</strong>：那张表一块网卡只能填一个数，
+                而同一块网卡对不同对端能收到的完全不是一个量级——1G 口做发送端时，
+                收口上挂的 1800/2000 在这条路径上物理上就跑不到。只能填绝对 Mbps。
+              </p>
+              <p class="muted small-hint">门限挂在任务上，作用于所有分配了本套件的链路集合。</p>
+            </fieldset>
+
             <fieldset v-if="taskUsesBidir(task)" class="wide">
               <legend>双向并发的接收门限（Mbps）</legend>
               <label class="inline">
@@ -430,7 +467,7 @@ function has(list: string[] | undefined, value: string): boolean {
                   type="text"
                   placeholder="留空 = 只显示实测"
                   :value="task.rx_target_bidir_total ?? ''"
-                  @input="onBidirTarget(current.id, task.id, 'rx_target_bidir_total', $event)"
+                  @input="onRxTarget(current.id, task.id, 'rx_target_bidir_total', $event)"
                 />
               </label>
               <p class="muted small-hint">
@@ -444,7 +481,7 @@ function has(list: string[] | undefined, value: string): boolean {
                     type="text"
                     placeholder="留空 = 走兜底判定"
                     :value="task.rx_target_bidir_ab ?? ''"
-                    @input="onBidirTarget(current.id, task.id, 'rx_target_bidir_ab', $event)"
+                    @input="onRxTarget(current.id, task.id, 'rx_target_bidir_ab', $event)"
                   />
                 </label>
                 <label class="inline">
@@ -453,7 +490,7 @@ function has(list: string[] | undefined, value: string): boolean {
                     type="text"
                     placeholder="留空 = 走兜底判定"
                     :value="task.rx_target_bidir_ba ?? ''"
-                    @input="onBidirTarget(current.id, task.id, 'rx_target_bidir_ba', $event)"
+                    @input="onRxTarget(current.id, task.id, 'rx_target_bidir_ba', $event)"
                   />
                 </label>
                 <p class="muted small-hint">两个方向各判一次；填了合计门限时这两格不参与判定。</p>

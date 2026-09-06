@@ -51,14 +51,17 @@ pub(super) fn note_rx_target(
 
 /// 这条腿要用的 RX 门限。
 ///
-/// 顺序：**双向配对门限 → 单口覆盖 → 场景 targets → 内置推导**。
+/// 顺序：**配对门限（按单向/双向各取一套）→ 单口覆盖 → 场景 targets → 内置推导**。
 ///
-/// 双向配对门限排在最前，因为它是唯一一个知道「这条腿属于哪一对网口、
-/// 而且两个方向正在同时灌」的来源。两个方向互相影响时这两件事缺一不可：
-/// 同一块 RNDIS 口，和 Wi-Fi 组双向、和 SGMII 组双向，能收到的速率
-/// 完全不是一个量级——挂在网卡上的那个数没法同时对这两组成立。
+/// 配对门限排在最前，因为它是唯一一个知道「这条腿属于哪一对网口」的来源。
+/// 挂在网卡上的那个数没法同时对这块口的所有对端成立：同一块 RNDIS 口，和
+/// Wi-Fi 组、和 SGMII 组，能收到的速率完全不是一个量级；同一块 SGMII2.5G 口，
+/// 对端是 1G 口时，收口上挂的 1800/2000 在这条路径上物理上就跑不到——
+/// `cap_rx_target_to_link_speed` 只能把它压到线速的 95%，压不出「这条链路
+/// 该验收多少」。
 ///
-/// 只在 `bidir` 为真时参与，所以单向单元的判定一个字节都没变。
+/// 单向与双向各有一套，不共用一个数：双向同时灌包时两个方向互相抢，每个方向
+/// 拿到的只有单向时的一部分，拿单向门限去卡双向必然判 `RATE_FAIL`。
 #[allow(clippy::too_many_arguments)]
 pub(super) fn leg_rx_target(
     spec: &SpecNorm,
@@ -78,6 +81,8 @@ pub(super) fn leg_rx_target(
         if let Some(target) = spec.rate_targets_bidir.for_direction(flow_direction) {
             return Some(target);
         }
+    } else if let Some(target) = spec.rate_targets_single.for_direction(flow_direction) {
+        return Some(target);
     }
     policy.rx_target_mbps.or_else(|| {
         rate::resolve_target_mbps(
@@ -103,9 +108,12 @@ pub(crate) enum RxTargetSource {
     BidirTotal,
     /// 双向单元的每方向门限（任务/配对填的，或旧频段规则迁移来的）。
     BidirDirection,
+    /// 单向单元的每方向门限（任务/配对填的）。
+    SingleDirection,
     /// 按网口门限与负载（含百分比换算）。
     NicPolicy,
-    /// 任务 / Wi-Fi 频段表 / 全局门限——它们最终都落在 `rate_targets` 上。
+    /// Wi-Fi 频段表 / 全局门限 / 旧项目带来的任务 targets——它们最终都落在
+    /// `rate_targets` 上（界面上那两格单向门限走的是 `SingleDirection`）。
     ScenarioTargets,
     /// 内置 EVB 推导。
     Derived,
@@ -118,6 +126,7 @@ impl RxTargetSource {
         match self {
             RxTargetSource::BidirTotal => "双向 RX 合计门限（本腿只测量）",
             RxTargetSource::BidirDirection => "双向方向门限",
+            RxTargetSource::SingleDirection => "单向方向门限",
             RxTargetSource::NicPolicy => "按网口门限",
             RxTargetSource::ScenarioTargets => "任务/频段/全局门限",
             RxTargetSource::Derived => "内置推导",
@@ -202,6 +211,15 @@ pub(super) fn leg_rate_plan(
     {
         let target = leg_rx_target(spec, policy, flow_direction, bidir, src, dst);
         return capped(target, RxTargetSource::BidirDirection);
+    }
+    if !bidir
+        && spec
+            .rate_targets_single
+            .for_direction(flow_direction)
+            .is_some()
+    {
+        let target = leg_rx_target(spec, policy, flow_direction, bidir, src, dst);
+        return capped(target, RxTargetSource::SingleDirection);
     }
     let target = leg_rx_target(spec, policy, flow_direction, bidir, src, dst);
     let source = if policy.rx_target_mbps.is_some() {

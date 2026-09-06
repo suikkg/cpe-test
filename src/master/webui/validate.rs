@@ -857,6 +857,38 @@ pub(super) fn validate_ui_plan(state: &UiState, plan: &UiPlan) -> Result<(), Str
                     suite.id, task.id
                 ));
             }
+            for (label, raw, dir) in [
+                ("A→B", &task.rx_target_ab, "ab"),
+                ("B→A", &task.rx_target_ba, "ba"),
+            ] {
+                if raw.trim().is_empty() {
+                    continue;
+                }
+                // 填了某个方向的单向门限却没勾那个方向，是个看不见的错：那一格
+                // 在界面上只在勾了方向时才出现，服务端不说的话字段就静默失效。
+                // `both` 是「两条独立单向腿」的旧写法，计划期展开成 ab + ba，
+                // 所以它同时覆盖两个方向。
+                if !task
+                    .directions
+                    .iter()
+                    .filter_map(|d| canonical_ui_direction(d))
+                    .any(|d| d == dir || d == "both")
+                {
+                    return Err(format!(
+                        "suite {} 的 task {} 填了 {label} 单向门限但未选择该方向",
+                        suite.id, task.id
+                    ));
+                }
+                // 百分比只在「按网口门限」那张表里有意义：那里换算的基准是接收
+                // 网卡自己的协商速率。这两格要压的恰恰是「收口协商速率对本条
+                // 路径不成立」的情形，按收口百分比换算等于换个写法犯同一个错。
+                if let Some(RxTarget::Percent(_)) = parse_rx_target(raw)? {
+                    return Err(format!(
+                        "suite {} 的 task {} 单向门限只能填绝对 Mbps",
+                        suite.id, task.id
+                    ));
+                }
+            }
             for (label, raw) in [
                 ("A→B", &task.rx_target_bidir_ab),
                 ("B→A", &task.rx_target_bidir_ba),

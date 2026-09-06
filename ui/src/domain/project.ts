@@ -266,6 +266,8 @@ function cleanTask(value: unknown): UiTask | null {
     directions: stringList(value.directions),
     ip: stringList(value.ip),
     recipe_ids: stringList(value.recipe_ids),
+    rx_target_ab: text(value.rx_target_ab),
+    rx_target_ba: text(value.rx_target_ba),
     rx_target_bidir_ab: text(value.rx_target_bidir_ab),
     rx_target_bidir_ba: text(value.rx_target_bidir_ba),
     rx_target_bidir_total: text(value.rx_target_bidir_total),

@@ -14,6 +14,7 @@ import {
   removeTask,
   setTaskProtocol,
   taskUsesBidir,
+  taskUsesSingleDirection,
   toggleBinding,
   toggleTaskDirection,
   toggleTaskIp,
@@ -176,6 +177,33 @@ describe('任务', () => {
     // 服务端会拒绝「填了双向门限却没选双向」，而那两个输入框这时已经不在界面上了。
     expect(plan.suites[0].tasks[0].rx_target_bidir_ab).toBe('');
     expect(plan.suites[0].tasks[0].rx_target_bidir_ba).toBe('');
+  });
+
+  it('取消某个单向方向时只清掉那一格的门限', () => {
+    let plan = planWithSet();
+    const suiteId = plan.suites[0].id;
+    const taskId = plan.suites[0].tasks[0].id;
+    expect(taskUsesSingleDirection(plan.suites[0].tasks[0], 'ab')).toBe(true);
+    plan = updateTask(plan, suiteId, taskId, {
+      rx_target_ab: '850',
+      rx_target_ba: '900',
+    });
+
+    plan = toggleTaskDirection(plan, suiteId, taskId, 'ab');
+    // 服务端会拒绝「填了门限却没选那个方向」，而那一格已经不在界面上了。
+    expect(plan.suites[0].tasks[0].rx_target_ab).toBe('');
+    // 另一个方向还勾着，它那一格不许被顺手清掉。
+    expect(plan.suites[0].tasks[0].rx_target_ba).toBe('900');
+  });
+
+  it('PING 没有吞吐门限，切成 PING 时单向那两格也清掉', () => {
+    let plan = planWithSet();
+    const suiteId = plan.suites[0].id;
+    const taskId = plan.suites[0].tasks[0].id;
+    plan = updateTask(plan, suiteId, taskId, { rx_target_ab: '850' });
+    plan = setTaskProtocol(plan, suiteId, taskId, 'ping');
+    expect(taskUsesSingleDirection(plan.suites[0].tasks[0], 'ab')).toBe(false);
+    expect(plan.suites[0].tasks[0].rx_target_ab).toBe('');
   });
 
   it('方向、IP、配置都是开关语义', () => {

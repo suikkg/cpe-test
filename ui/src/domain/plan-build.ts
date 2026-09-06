@@ -70,6 +70,19 @@ export interface UiTask {
   duration?: number;
   ping_count?: number;
   ping_payload_sizes?: number[];
+  /**
+   * **单向**腿的接收门限（Mbps 绝对值），按方向分开填。
+   *
+   * 和下面的双向门限是两件事，不能共用一个数：双向并发时两个方向互相抢，
+   * 每个方向拿到的只有单向的一部分。
+   *
+   * 为什么门限要能挂在任务上、而不是只有「按网口门限」那张表：那张表一块网卡
+   * 只能填一个数，而同一块网卡对不同对端能收到的完全不是一个量级——SGMII1G
+   * 做发送端时，收口上挂的 1800/2000 在这条路径上物理上就跑不到。
+   * 留空 = 走既有兜底链（按网口门限 → 频段/全局门限 → 内置推导）。
+   */
+  rx_target_ab?: string;
+  rx_target_ba?: string;
   rx_target_bidir_ab?: string;
   rx_target_bidir_ba?: string;
   /**
@@ -218,6 +231,8 @@ export function baselineSuite(): UiSuite {
         directions: ['ab', 'ba'],
         ip: ['v4', 'v6'],
         recipe_ids: ['recipe-tcp-default'],
+        rx_target_ab: '',
+        rx_target_ba: '',
         rx_target_bidir_ab: '',
         rx_target_bidir_ba: '',
         rx_target_bidir_total: '',
@@ -229,6 +244,8 @@ export function baselineSuite(): UiSuite {
         directions: ['ab', 'ba'],
         ip: ['v4', 'v6'],
         recipe_ids: ['recipe-udp-default'],
+        rx_target_ab: '',
+        rx_target_ba: '',
         rx_target_bidir_ab: '',
         rx_target_bidir_ba: '',
         rx_target_bidir_total: '',
@@ -489,6 +506,8 @@ function newTask(plan: UiPlan, protocol: UiProtocol): UiTask {
     directions: ['ab', 'ba'],
     ip: ['v4', 'v6'],
     recipe_ids: [],
+    rx_target_ab: '',
+    rx_target_ba: '',
     rx_target_bidir_ab: '',
     rx_target_bidir_ba: '',
     rx_target_bidir_total: '',
@@ -541,6 +560,8 @@ export function setTaskProtocol(
           recipe_ids: [],
           ...(protocol === 'ping'
             ? {
+                rx_target_ab: '',
+                rx_target_ba: '',
                 rx_target_bidir_ab: '',
                 rx_target_bidir_ba: '',
                 rx_target_bidir_total: '',
@@ -580,18 +601,23 @@ export function toggleTaskDirection(
 ): UiPlan {
   return mapTask(plan, suiteId, taskId, (task) => {
     const directions = toggleInList(task.directions, direction);
-    // 取消「双向并发」时把双向门限一起清掉：服务端会拒绝「填了双向门限却没选
-    // 双向」的任务，而那两个输入框这时已经从界面上消失了，人根本看不见是哪里错。
-    const stillBidir = directions.some((item) => canonicalDirection(item) === 'bidir');
-    return stillBidir
-      ? { ...task, directions }
-      : {
-          ...task,
-          directions,
-          rx_target_bidir_ab: '',
-          rx_target_bidir_ba: '',
-          rx_target_bidir_total: '',
-        };
+    // 取消一个方向时把挂在它上面的门限一起清掉：服务端会拒绝「填了门限却没选
+    // 对应方向」的任务，而那些输入框这时已经从界面上消失了，人根本看不见是
+    // 哪里错。单向两格各自跟着自己的方向，双向三格跟着「双向并发」。
+    const covers = (want: string) =>
+      directions.some((item) => {
+        const canonical = canonicalDirection(item);
+        return canonical === want || (canonical === 'both' && want !== 'bidir');
+      });
+    const cleared: Partial<UiTask> = {};
+    if (!covers('ab')) cleared.rx_target_ab = '';
+    if (!covers('ba')) cleared.rx_target_ba = '';
+    if (!covers('bidir')) {
+      cleared.rx_target_bidir_ab = '';
+      cleared.rx_target_bidir_ba = '';
+      cleared.rx_target_bidir_total = '';
+    }
+    return { ...task, directions, ...cleared };
   });
 }
 
@@ -609,6 +635,22 @@ export function toggleTaskRecipe(
     ...task,
     recipe_ids: toggleInList(task.recipe_ids, recipeId),
   }));
+}
+
+/**
+ * 这个任务会不会真的跑 `direction` 这条**单向**腿。
+ *
+ * `both` 是「两条独立单向腿」的旧写法（计划期展开成 ab + ba），所以它同时
+ * 覆盖两个方向——与后端 `normalized_ui_directions` 同一套词义。
+ */
+export function taskUsesSingleDirection(task: UiTask, direction: 'ab' | 'ba'): boolean {
+  return (
+    task.protocol !== 'ping' &&
+    (task.directions ?? []).some((raw) => {
+      const canonical = canonicalDirection(raw);
+      return canonical === direction || canonical === 'both';
+    })
+  );
 }
 
 export function taskUsesBidir(task: UiTask): boolean {

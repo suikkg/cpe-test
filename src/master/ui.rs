@@ -1122,6 +1122,10 @@ fn generate_specs_from_pairs(
             .as_ref()
             .and_then(|p| p.rate_targets_mbps.clone())
             .unwrap_or_default();
+        let rate_targets_single = default_params
+            .as_ref()
+            .and_then(|p| p.rate_targets_single_mbps.clone())
+            .unwrap_or_default();
         let rate_targets_bidir = default_params
             .as_ref()
             .and_then(|p| p.rate_targets_bidir_mbps.clone())
@@ -1154,6 +1158,7 @@ fn generate_specs_from_pairs(
             udp_limit: cfg.limit_udp_by_link_speed,
             rate_mode,
             rate_targets,
+            rate_targets_single,
             rate_targets_bidir,
             rate_target_bidir_total,
             rate_check: cfg.iperf.rate_check.clone(),
@@ -1386,6 +1391,7 @@ fn spec_from_params(
         rate_targets: cfg.iperf.rate_check.targets_mbps.clone(),
         // 双向门限按配对配置，这条「全局参数」兜底路径没有配对上下文；
         // 需要它的场景走 pairs / tests。
+        rate_targets_single: crate::config::RateTargets::default(),
         rate_targets_bidir: crate::config::RateTargets::default(),
         rate_target_bidir_total: None,
         rate_check: cfg.iperf.rate_check.clone(),
