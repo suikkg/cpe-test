@@ -299,7 +299,11 @@ impl NicDrift {
 
 /// 遍历单元里所有端点。任务类型增加时这里必须跟着加，否则新类型的端点
 /// 会静默漏掉刷新。
-fn for_each_endpoint_mut(unit: &mut Unit, mut f: impl FnMut(&mut Endpoint)) {
+///
+/// `pub(crate)` 是给 `master::plan` 用的：算计划指纹前要把「只影响显示」的
+/// 协商速率归一掉，而那件事必须走**同一个**遍历，否则新加的任务类型会在
+/// 刷新那边被想起、在指纹这边被漏掉。
+pub(crate) fn for_each_endpoint_mut(unit: &mut Unit, mut f: impl FnMut(&mut Endpoint)) {
     for leg in &mut unit.legs {
         match &mut leg.kind {
             LegKind::IperfSingle(task) => {
@@ -2096,6 +2100,63 @@ mod tests {
             };
             assert_eq!(task.rx_target_mbps, Some(850.0), "{} 腿", leg.tag);
         }
+    }
+
+    /// 现场回归：Wi-Fi 协商速率一抖，控制台就再也开不了跑。
+    ///
+    /// 预览走的是连接时缓存的拓扑，执行端开跑前重新扫描；而 5G 口的 PHY 速率
+    /// 在相邻两次扫描之间就会跳（本机实测 286 / 2401Mbps 交替）。那个数从
+    /// 端点、标题、`Unit.id` 三条路漏进 `plan_hash`，于是闸门把每一次带
+    /// Wi-Fi 口的运行都判成「计划已过期」——两次开跑的 `config_hash` 一模一样，
+    /// 变的只有单元指纹。
+    #[test]
+    fn a_wifi_rate_that_only_moved_the_displayed_number_keeps_the_plan_valid() {
+        let wifi_at = |speed: u64| {
+            let mut spec = base_spec();
+            spec.src = ep(Side::Master, "en0", "SGMII1G", "192.168.8.100", 1000);
+            spec.dst = ep(Side::Agent, "en1", "WIFI5G", "192.168.8.104", speed);
+            let mut port = PORT_BASE;
+            let (units, _) = build_units(&[spec], true, &mut port);
+            units
+        };
+        let fast = wifi_at(2401);
+        let slow = wifi_at(286);
+
+        // 跑的东西一模一样：Wi-Fi 的负载上限走的是固定档位，不跟协商速率
+        // （`rate::nic_payload_ceiling_mbps`），所以 -b 和门限都没变。
+        assert_eq!(
+            crate::master::plan::units_fingerprint(&fast),
+            crate::master::plan::units_fingerprint(&slow),
+            "只有显示数字变了，闸门不该拦"
+        );
+
+        // 而 RESUME identity **仍然**跟着协商速率走：换了链路速率的 PASS
+        // 不该被复用。这两件事分开，是这次归一有意保留的边界。
+        assert_ne!(fast[0].id, slow[0].id, "resume identity 仍然记着协商速率");
+    }
+
+    /// 反过来：协商速率**真的**改变了执行内容时，指纹必须变。
+    ///
+    /// RNDIS 是跟随协商速率裁剪的那一类（见 `rate::nic_payload_ceiling_mbps`
+    /// 里那条「RNDIS 报什么就按什么裁」），所以同一个 `-b 3G` 在 3750 和 1000
+    /// 两种协商下会被裁成不同的值——那是跑的东西变了，闸门必须拦。
+    #[test]
+    fn a_rate_that_actually_changes_the_offered_load_still_moves_the_fingerprint() {
+        let rndis_at = |speed: u64| {
+            let mut spec = base_spec();
+            spec.src = ep(Side::Master, "usb0", "RNDIS", "192.168.9.2", speed);
+            spec.dst = ep(Side::Agent, "eth0", "10GETH", "192.168.9.3", 10_000);
+            spec.transports = vec!["udp".into()];
+            spec.udp_profiles = vec![UdpProfile::bw("3G")];
+            let mut port = PORT_BASE;
+            let (units, _) = build_units(&[spec], true, &mut port);
+            units
+        };
+        assert_ne!(
+            crate::master::plan::units_fingerprint(&rndis_at(3750)),
+            crate::master::plan::units_fingerprint(&rndis_at(1000)),
+            "裁出来的 -b 不同 = 跑的东西不同"
+        );
     }
 
     /// 反过来：门限在路径之内时一个字节都不能动，提示也不能冒出来。

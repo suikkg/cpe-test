@@ -129,10 +129,48 @@ pub fn config_fingerprint(cfg: &Config) -> String {
 /// 派生，而这个哈希从不需要跨版本或跨进程稳定——预览和执行发生在同一个进程、
 /// 同一个二进制里，它要回答的只是「这两次推导出来的是不是同一批单元」。
 /// 把它当成可持久化的标识去用是错的，所以这里不提供任何存盘路径。
+/// 算指纹前的单元归一：抹掉**只影响显示、不影响执行**的东西。
+///
+/// 和 [`canonical_for_fingerprint`] 是同一件事的两半，坑也是同一个：让闸门
+/// 被「什么都没变」的差异拦下来。这一半的现场是 Wi-Fi。
+///
+/// 控制台预览用的是**连接时缓存的拓扑**，执行端开跑前**重新扫描**；而 Wi-Fi
+/// 的协商速率是 PHY 速率，相邻两次扫描之间就会跳（实测同一块 5G 口在
+/// 286 与 2401Mbps 之间来回，`rate::nic_payload_ceiling_mbps` 早就为此拒绝
+/// 跟随它）。这个数原本从三条路一起漏进 `plan_hash`：
+///
+/// 1. 端点的 `NicInfo.speed_mbps`；
+/// 2. 单元标题里那句 `en1(192.168.8.104, 2401Mbps, 5GHz)`；
+/// 3. `Unit.id`——它是 RESUME identity，而速率是**有意**记进去的
+///    （换了链路速率的 PASS 不该被复用）。
+///
+/// 于是闸门把**每一次**带 Wi-Fi 口的控制台运行都判成「计划已过期」：
+/// 实测两次开跑的 `config_hash` 完全相同、单元指纹却不同，日志固定停在
+/// 「执行计划与复核页确认的不一致」。功能没问题，全是被自己的闸门挡死的。
+///
+/// `topology_hash` 的注释早就写下了这条判断（「协商速率抖一下…只会在什么都
+/// 没变的情况下拦下运行」），只是那个数又从单元里绕了回来。
+///
+/// **归一掉的三样都不损失把关能力**：`title` / `target_lines` 是文档里写明的
+/// 纯展示字段；`id` 的输入除了速率之外，全部另有出处——端点与任务参数在下面
+/// 的 `{:?}` 里，`rate_check` 那些在 `config_hash` 里。反过来，速率**真的**
+/// 改变了执行内容时（例如 RNDIS 跟随协商速率裁剪 `-b`），变的是 `-b` 本身，
+/// 指纹照样会变。
+fn canonical_unit_for_fingerprint(unit: &Unit) -> Unit {
+    let mut unit = unit.clone();
+    unit.id.clear();
+    unit.title.clear();
+    unit.target_lines.clear();
+    crate::master::builder::for_each_endpoint_mut(&mut unit, |endpoint| {
+        endpoint.nic.speed_mbps = 0;
+    });
+    unit
+}
+
 pub fn units_fingerprint(units: &[Unit]) -> String {
     let mut buf = String::new();
     for unit in units {
-        buf.push_str(&format!("{unit:?}\n"));
+        buf.push_str(&format!("{:?}\n", canonical_unit_for_fingerprint(unit)));
     }
     md5_hex(&buf)
 }
