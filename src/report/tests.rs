@@ -30,6 +30,26 @@ fn an_oversized_raw_segment_keeps_both_ends() {
 use super::*;
 
 #[test]
+fn bidirectional_iperf_failure_keeps_runtime_evidence_instead_of_claiming_missing_tool() {
+    let mut summary = unit_summary("bidir-start-error", Verdict::SetupError);
+    summary.task = "双向 TCP".into();
+    summary.reason_code = crate::reason::ReasonCode::IperfExecFailed;
+    summary.reason_detail =
+        "iperf3: error - unable to start listener: Address already in use".into();
+    let mut ab = summary.clone();
+    ab.is_unit_summary = false;
+    ab.direction = RowDirection::Ab;
+    ab.sort_key = (0, 0, 0, 0);
+    let mut ba = ab.clone();
+    ba.direction = RowDirection::Ba;
+    ba.sort_key = (0, 1, 0, 0);
+    let html = render(vec![ab, ba, summary]);
+    assert!(html.contains("Address already in use"));
+    assert!(html.contains("端口占用"));
+    assert!(!html.contains("windows未设置iperf3环境变量"));
+}
+
+#[test]
 fn typed_tcp_names_cannot_move_the_unit_into_ping_or_udp() {
     for name in ["PING 对照", "UDP 对照"] {
         let mut row = unit_summary("typed-tcp", Verdict::Pass);

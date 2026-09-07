@@ -95,7 +95,9 @@ export function reconcileLinkSets(
       }
       // 自动集合跟着筛选走；手工集合不受筛选影响。
       if (set.auto && !matchesLinkFilter(found, filter)) continue;
-      refs.push({ id: found.id, src: found.src, dst: found.dst });
+      // 导入项目的 pair id 被绑定子集引用，且端点顺序决定 AB/BA；不能被候选的
+      // 枚举顺序覆盖。自动集合才使用候选生成的身份。
+      refs.push(set.auto ? { id: found.id, src: found.src, dst: found.dst } : ref);
       seen.add(pairKey(found.src, found.dst));
     }
     return { ...set, pair_refs: refs };

@@ -327,8 +327,11 @@ where
 pub fn disposition_advice(reason_code: ReasonCode) -> Option<&'static str> {
     let advice = match reason_code {
         // —— 环境/搭建类：不是 CPE 的问题，先修测试环境 ——
-        ReasonCode::IperfExecFailed | ReasonCode::IperfPreflightFailed => {
-            "windows未设置iperf3环境变量；两端都要放 iperf3 且版本可用。把 iperf3 放到程序同目录后重跑。"
+        ReasonCode::IperfExecFailed => {
+            "iperf3 执行未完成；请查看该方向的退出状态和原始输出，排查端口占用、绑定地址、连接及防火墙。执行失败不等于未安装 iperf3；用户中断也可能产生此结果。"
+        }
+        ReasonCode::IperfPreflightFailed => {
+            "iperf3 前置检查未通过；请按原因明细核对对应端的工具可用性或 agent 版本与能力。只有明确提示未找到工具时，才检查 iperf3 路径及配套 DLL。"
         }
         ReasonCode::CtsPreflightFailed
         | ReasonCode::CtsArgsInvalid
@@ -636,6 +639,17 @@ mod tests {
         }
         // 没有码时静默返回 None，不能 panic，也不能编个建议出来。
         assert!(disposition_advice(ReasonCode::None).is_none());
+    }
+
+    #[test]
+    fn iperf_execution_failure_does_not_claim_the_tool_is_missing() {
+        let execution = disposition_advice(ReasonCode::IperfExecFailed).unwrap();
+        assert!(execution.contains("退出状态"));
+        assert!(execution.contains("端口占用"));
+        assert!(!execution.contains("未设置iperf3环境变量"));
+        let preflight = disposition_advice(ReasonCode::IperfPreflightFailed).unwrap();
+        assert!(preflight.contains("agent 版本与能力"));
+        assert_ne!(execution, preflight);
     }
 
     /// 派生层不得改动任何既有原因码：码会进 RESUME 数据库和用户既有认知。

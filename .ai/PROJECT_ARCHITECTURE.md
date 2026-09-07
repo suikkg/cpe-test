@@ -446,6 +446,8 @@ Windows 文本适配器：`src/cmd/ipconfig.rs` 解析中英文 `ipconfig /all`�
 
 ### 11.1 必须保持
 
+- 项目导入通过 `domain/import-topology::reconcileImportedTopology` 区分未知快照与成功扫描的空网卡表；只清理确认缺失的端点，并提示被删除的集合/绑定。绑定的显式 `pair_ids` 清空时必须删除该绑定，不能变成整集合分配。手工集合协调保留 pair ID 和端点方向。待校验状态随草稿保存，并在取得可信拓扑后自动校验。
+
 - 报告分类在存在类型化协议/后端时不得再被任务名称覆盖；历史字段缺失才使用字符串兜底。HTML 与 Excel 在单元汇总缺失时通过 `report::model::verdict_row` 选择匹配聚合判定的原因来源，方向代表行评分共用 `direction_row_score`。
 
 - 主流程从 56000 开始递增分配端口，达到 65535 后回绕到 56000；TCP 使用一个 client 的 `-P`，UDP 多流使用独立进程/端口；bidir 始终是 `[ab,ba]` 两腿。

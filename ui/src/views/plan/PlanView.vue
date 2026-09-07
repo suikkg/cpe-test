@@ -203,8 +203,8 @@ onMounted(() => {
     </header>
 
     <p v-if="!topologyReady" class="warn" role="alert">
-      还没连上辅测机，没有可信的拓扑可对账。已保留你存下的集合原样——
-      连上之后会自动按当前网卡补齐。
+      双端网卡尚未全部就绪。导入时按已取得的扫描结果核对对应端点；未知端点暂时保留，
+      连接或重新扫描成功后继续核对。
     </p>
 
     <div class="bar project-tools">
@@ -231,6 +231,9 @@ onMounted(() => {
     </div>
 
     <p v-if="projectNotices.error" class="bad" role="alert">{{ projectNotices.error }}</p>
+    <p v-if="plan.pendingImportTopology" class="warn" role="status">
+      导入网口待校验：部分端点尚未取得可信扫描结果，暂时保留。连接或重新扫描成功后会自动移除确认缺失的网口对并提示。
+    </p>
     <p v-for="(n, i) in projectNotices.items" :key="i" class="warn">{{ n }}</p>
 
     <div class="summary" aria-label="当前计划概况">

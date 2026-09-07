@@ -14,6 +14,7 @@ import { buildCandidates, type Candidate, type LinkFilter } from '../domain/pair
 import { emptyPlan, ensureDefaults, type UiPlan } from '../domain/plan-build';
 import { parseProject, serializeProject, type ProjectSettings } from '../domain/project';
 import { parseRunRequest } from '../domain/rerun';
+import { reconcileImportedTopology } from '../domain/import-topology';
 import { agentNics, masterNics } from './inventory';
 import { session } from './session';
 
@@ -28,6 +29,7 @@ export const plan = reactive({
   linkSets: [] as ManagedLinkSet[],
   filter: 'all' as LinkFilter,
   stale: [] as Array<{ setId: string; pairId: string; src: string; dst: string }>,
+  pendingImportTopology: false,
   /** 草稿写入的可见状态，见 `DraftState`。 */
   draftState: 'idle' as DraftState,
   /** 最近一次真的写进去的时刻；没写成过就是 null。 */
@@ -57,6 +59,21 @@ export const candidates = computed<Candidate[]>(() =>
 const boundSetIds = computed(() => new Set(plan.ui.bindings.map((b) => b.link_set_id)));
 
 export function reconcile(): void {
+  if (plan.pendingImportTopology) {
+    const connected = !!session.connection && !session.topologyStale && !session.scanning;
+    const master = connected ? session.connection!.master.interfaces
+      : !session.connection && session.local && !session.localError ? session.local.host.interfaces : null;
+    const agent = connected ? session.connection!.agent.interfaces : null;
+    const checked = reconcileImportedTopology(plan.ui, master, agent);
+    plan.ui = checked.plan;
+    plan.linkSets = checked.plan.link_sets.map((set) => ({ ...set, auto: false }));
+    plan.pendingImportTopology = checked.pending > 0;
+    projectNotices.items.push(...checked.notices);
+    if (plan.pendingImportTopology) {
+      plan.stale = [];
+      return;
+    }
+  }
   const result = reconcileLinkSets(
     plan.linkSets,
     candidates.value,
@@ -71,6 +88,12 @@ export function reconcile(): void {
     result.linkSets,
   );
 }
+
+watch(
+  () => [session.connection, session.local, session.topologyStale, session.scanning, session.localError],
+  () => { if (plan.pendingImportTopology) reconcile(); },
+  { deep: true },
+);
 
 /**
  * 草稿的三种可见状态（方案 §11.3）。
@@ -104,6 +127,7 @@ function saveDraft(): void {
         globals: plan.globals,
         nicPolicies: plan.nicPolicies,
         masterConfig: plan.masterConfig,
+        pendingImportTopology: plan.pendingImportTopology,
       }),
     );
     plan.draftState = 'saved';
@@ -134,6 +158,7 @@ export function loadDraft(): boolean {
       globals?: UiGlobals;
       nicPolicies?: UiNicPolicy[];
       masterConfig?: Record<string, unknown> | null;
+      pendingImportTopology?: boolean;
     };
     if (!parsed.ui) return false;
     if (!Array.isArray(parsed.ui.suites) || !Array.isArray(parsed.ui.bindings)) return false;
@@ -152,6 +177,7 @@ export function loadDraft(): boolean {
       }
     }
     plan.ui = ensureDefaults(parsed.ui);
+    plan.pendingImportTopology = parsed.pendingImportTopology === true;
     plan.linkSets = Array.isArray(parsed.linkSets) ? parsed.linkSets : [];
     plan.filter = parsed.filter ?? 'all';
     if (typeof parsed.duration === 'number' && parsed.duration > 0) {
@@ -187,6 +213,7 @@ watch(
     plan.globals,
     plan.nicPolicies,
     plan.masterConfig,
+    plan.pendingImportTopology,
   ],
   () => {
     if (restoredThisTick) {
@@ -213,6 +240,7 @@ export function reset(): void {
   plan.linkSets = [];
   plan.filter = 'all';
   plan.stale = [];
+  plan.pendingImportTopology = false;
   plan.preview = null;
   plan.previewRequestFingerprint = '';
   plan.previewing = false;
@@ -227,6 +255,7 @@ export function reset(): void {
 }
 
 export function restoreDefaultProject(): void {
+  plan.pendingImportTopology = false;
   plan.ui = ensureDefaults(emptyPlan());
   plan.linkSets = [];
   plan.filter = 'all';
@@ -322,6 +351,8 @@ export function importProject(text: string): boolean {
   plan.nicPolicies = result.nicPolicies ?? [];
   // 老项目（v1/v2）没有这一块：保持 null，用目标主控自己的基线，行为与从前一致。
   plan.masterConfig = settings.masterConfig ?? null;
+  plan.pendingImportTopology = true;
+  plan.stale = [];
   reconcile();
   return true;
 }

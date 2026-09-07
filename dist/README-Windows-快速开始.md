@@ -1,8 +1,8 @@
 # CPE 测试工具 Windows 包
 
-> 如果你从 Git 仓库下载的是 `cpe_test-v6.3.1-windows-config-docs.zip`，那是一份只含
+> 如果你从 Git 仓库下载的是 `cpe_test-v6.3.2-windows-config-docs.zip`，那是一份只含
 > 配置、文档和启动脚本的资料包，不含 `cpe_test.exe`、`ctsTraffic.exe` 或 iperf3。
-> 开箱即用请下载 GitHub Release 的 `cpe_test-v6.3.1-windows-x86_64.zip`；也可以自行
+> 开箱即用请下载 GitHub Release 的 `cpe_test-v6.3.2-windows-x86_64.zip`；也可以自行
 > 编译程序后，把资料包内容与 exe 放到同一目录。
 
 将这个文件夹完整复制到**主控机**和**辅测机**。两台电脑必须使用同一个
@@ -11,7 +11,7 @@
 ## 包内文件与系统要求
 
 - `cpe_test.exe`：主控、agent、网卡扫描和监控共用的程序。
-- `ctsTraffic.exe`：Microsoft ctsTraffic 2.0.4.0 x64，随官方 v6.3.1 Windows 包固定捆绑并校验；仅支持 Windows 10 或更高版本。
+- `ctsTraffic.exe`：Microsoft ctsTraffic 2.0.4.0 x64，随官方 v6.3.2 Windows 包固定捆绑并校验；仅支持 Windows 10 或更高版本。
 - `start_*.bat`：双击启动脚本。`start_ui.bat` 是图形控制台，`start_master*.bat` 是命令行问答式。
 - `configs\`：SGMII、Wi-Fi、10GUSB 等具名配置。
 - `THIRD_PARTY_NOTICES.md` 及 CTS/WIL 许可文件：第三方归属和许可说明。
@@ -25,6 +25,10 @@ ctsTraffic 测试要求主控和辅测都是 Windows 10+，且两边都能在 `c
 Windows 7/8/8.1、版本无法确认以及 macOS/Linux 都不支持 CTS，但不会阻断已选的 iperf3/Ping。
 
 ## 使用（图形控制台，推荐）
+
+导入项目后，已确认缺失的网口对、空集合及失效分配会自动移除并提示；尚未连接或扫描失败的端点保留为“待校验”。连接或重扫成功后自动核对，套件和流量配置保留。
+
+双向 iperf3 执行失败不代表未安装：按报告中的退出状态与原始输出检查端口、绑定地址和连接；只有前置检查明确提示缺少工具时才检查程序路径及 DLL。
 
 监控更新失败会保留上次成功曲线并显示提示，恢复同步后自动清除；旧读数不能当作当前实时速率。
 

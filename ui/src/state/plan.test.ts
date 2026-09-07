@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it } from 'vitest';
+import { nextTick } from 'vue';
 import {
   buildRunRequest,
   exportProject,
@@ -8,11 +9,38 @@ import {
   projectNotices,
   reset,
 } from './plan';
-import { session } from './session';
+import { session, reset as resetSession } from './session';
 import bootstrapFixture from '../api/__fixtures__/bootstrap_out.json';
 import { emptyPlan, ensureDefaults } from '../domain/plan-build';
 import { serializeProject } from '../domain/project';
 import { emptyGlobals } from '../domain/globals';
+
+describe('离线导入的延后校验', () => {
+  beforeEach(() => { reset(); resetSession(); });
+  it('导入时未知不删除，成功扫描零网卡后自动清理并提示', async () => {
+    const source = ensureDefaults(emptyPlan());
+    source.link_sets = [{id:'imported',name:'旧网口',pair_refs:[{id:'p',src:'master:NAME=gone',dst:'agent:NAME=gone'}]}];
+    expect(importProject(serializeProject(source))).toBe(true);
+    expect(plan.pendingImportTopology).toBe(true);
+    expect(plan.ui.link_sets).toHaveLength(1);
+    session.connection = { master:{interfaces:[]},agent:{interfaces:[]} } as never;
+    await nextTick();
+    expect(plan.pendingImportTopology).toBe(false);
+    expect(plan.ui.link_sets).toEqual([]);
+    expect(projectNotices.items.join(' ')).toContain('已移除');
+    resetSession();
+  });
+  it('失败后保留的旧拓扑不能触发导入清理', () => {
+    session.connection = {master:{interfaces:[]},agent:{interfaces:[]}} as never;
+    session.topologyStale = true;
+    const source = ensureDefaults(emptyPlan());
+    source.link_sets = [{id:'old',name:'旧网口',pair_refs:[{id:'p',src:'master:NAME=gone',dst:'agent:NAME=gone'}]}];
+    expect(importProject(serializeProject(source))).toBe(true);
+    expect(plan.pendingImportTopology).toBe(true);
+    expect(plan.ui.link_sets).toHaveLength(1);
+    resetSession();
+  });
+});
 
 /**
  * 执行请求里那几项**跨套件生效**的设置必须真的发出去。

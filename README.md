@@ -2,6 +2,12 @@
 
 > 两台电脑间自动化 ping + iperf3 / Microsoft ctsTraffic 灌包测试，零 Python/零 PowerShell
 
+## v6.3.2
+
+- 双向 iperf3 执行失败不再统一提示未安装；按退出状态与原始输出区分端口、连接等运行问题，前置检查另给工具/agent 能力提示。
+- 导入项目后自动移除已确认缺失的网口对、空集合和失效绑定，并列出清理提示；未连接或扫描失败时保留为待校验，连接成功后再核对。
+- 有效导入网口对保持原 ID、方向和绑定子集，避免清理后误变成全选。
+
 ## v6.3.1
 
 - 修复首次访问时进度请求早于令牌初始化导致的 401。
@@ -619,7 +625,7 @@ CPE（Customer Premises Equipment）子网测试工具用于在**两台电脑之
 ```
 cpe_test.exe          ← 本工具（单文件）
 iperf3.exe            ← 从 iperf.fr 下载（只测 Ping/ctsTraffic 可不放）
-ctsTraffic.exe        ← v6.3.1 Windows Release 已捆绑（仅 Windows 10+）
+ctsTraffic.exe        ← v6.3.2 Windows Release 已捆绑（仅 Windows 10+）
 start_agent.bat       ← 辅测机双击
 start_ui.bat          ← 主控机双击（图形控制台，推荐）
 start_master.bat      ← 主控机双击（命令行问答式）
@@ -1416,7 +1422,7 @@ cargo build --release --locked
 
 自行编译后，把 `cpe_test.exe`、启动脚本和所需吞吐工具放到两台 Windows 电脑同一目录：
 iperf3 测试需要完整的 iperf3 Windows 发行包；ctsTraffic 测试需要 `ctsTraffic.exe`。
-官方 v6.3.1 Windows Release ZIP 已捆绑固定且校验过的 ctsTraffic 2.0.4.0，但由于发行包差异不内置 iperf3。
+官方 v6.3.2 Windows Release ZIP 已捆绑固定且校验过的 ctsTraffic 2.0.4.0，但由于发行包差异不内置 iperf3。
 
 ### GitHub Actions CI
 
@@ -1439,7 +1445,7 @@ Windows ZIP 包含启动脚本、四份配置、固定 CTS 二进制和第三方
 `tar.gz` 保留 `cpe_test` 可执行位。发布作业会再次核对资产名称、数量、内部结构和哈希。
 
 仓库同时跟踪一份不含可执行程序的
-[`cpe_test-v6.3.1-windows-config-docs.zip`](dist/cpe_test-v6.3.1-windows-config-docs.zip)，
+[`cpe_test-v6.3.2-windows-config-docs.zip`](dist/cpe_test-v6.3.2-windows-config-docs.zip)，
 便于直接从 Git 下载 Windows 配置、文档和启动脚本。其 SHA-256 位于同目录的
 `.zip.sha256` 文件；CI 会逐文件确认压缩包内容与仓库源文件一致。需要开箱即用的程序、
 固定版 ctsTraffic 和许可证全集时，仍应下载上面的正式 Windows Release ZIP。

@@ -1899,6 +1899,13 @@ mod tests {
     }
 
     #[test]
+    fn available_iperf_is_not_reported_missing_for_bidirectional_units() {
+        let mut unit = iperf_unit();
+        unit.direction = "bidir".into();
+        assert_eq!(iperf_preflight_block(&[unit], &ready_health(), true), None);
+    }
+
+    #[test]
     fn mixed_selection_collects_all_iperf_preflight_failures() {
         let health = HealthOut {
             version: "3.0.0".into(),
