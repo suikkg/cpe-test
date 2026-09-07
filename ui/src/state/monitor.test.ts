@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { MonitorPoint } from '../api/dto';
 import { monitor, reset, startPolling, startSession, stopPolling } from './monitor';
+import { reset as resetSession, session } from './session';
 
 /**
  * 监控会话表：**哪一批样本属于哪一路曲线**。
@@ -13,6 +14,9 @@ import { monitor, reset, startPolling, startSession, stopPolling } from './monit
 type FakeResponse = { status: number; ok: boolean; json: () => Promise<unknown> };
 function ok(data: unknown): FakeResponse {
   return { status: 200, ok: true, json: async () => ({ ok: true, data }) };
+}
+function unauthorized(): FakeResponse {
+  return { status: 401, ok: false, json: async () => ({ ok: false }) };
 }
 
 function point(t: number, rx: number): MonitorPoint {
@@ -27,6 +31,7 @@ let fetchMock: ReturnType<typeof vi.fn>;
 
 beforeEach(() => {
   reset();
+  resetSession();
   fetchMock = vi.fn();
   vi.stubGlobal('fetch', fetchMock);
 });
@@ -120,5 +125,32 @@ describe('监控会话', () => {
     stopPolling();
     expect(monitor.sessions[0].points).toHaveLength(before);
     expect(monitor.sessions[0].from).toBe(2);
+    expect(monitor.refreshError).toContain('请求没有得到应答');
+    fetchMock.mockResolvedValue(ok({ series: [series('a', [point(3, 30)], 3)] }));
+    startPolling();
+    await vi.waitFor(() => expect(monitor.refreshError).toBe(''));
+    expect(monitor.sessions[0].from).toBe(3);
+  });
+
+  it('口令失效停掉这条链，不是当断线一秒一拍地重试', async () => {
+    fetchMock.mockResolvedValue(ok({ session: 'a' }));
+    await startSession('master', 'eth0', 1000);
+    stopPolling();
+
+    // 401 和断线不是一回事：断线下一拍会好，口令失效永远不会。当断线处理的
+    // 表现是曲线静止不动、屏幕上一个字都不说，而后台在按秒刷 401——这台机器
+    // 此刻多半正在灌线速。
+    fetchMock.mockResolvedValue(unauthorized());
+    startPolling();
+    await vi.waitFor(() => expect(monitor.polling).toBe(false));
+
+    expect(session.phase).toBe('unauthorized');
+    // 曲线原样留着：把点清掉会让人以为设备掉了。
+    expect(monitor.sessions).toHaveLength(1);
+
+    // 链真的停了：再等一拍的时间，不许有新请求出去。
+    const calls = fetchMock.mock.calls.length;
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+    expect(fetchMock.mock.calls.length).toBe(calls);
   });
 });

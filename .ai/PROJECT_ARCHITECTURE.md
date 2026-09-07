@@ -446,6 +446,8 @@ Windows 文本适配器：`src/cmd/ipconfig.rs` 解析中英文 `ipconfig /all`�
 
 ### 11.1 必须保持
 
+- 报告分类在存在类型化协议/后端时不得再被任务名称覆盖；历史字段缺失才使用字符串兜底。HTML 与 Excel 在单元汇总缺失时通过 `report::model::verdict_row` 选择匹配聚合判定的原因来源，方向代表行评分共用 `direction_row_score`。
+
 - 主流程从 56000 开始递增分配端口，达到 65535 后回绕到 56000；TCP 使用一个 client 的 `-P`，UDP 多流使用独立进程/端口；bidir 始终是 `[ab,ba]` 两腿。
 - 稳定 ID 模板和字段顺序见 `builder.rs`；其输入构造还包括 `ep_id` TCP profile 名，以及 `config.rs`/`builder.rs` 的 UDP profile 名。改变模板、字段顺序或任一输入规范会让历史 RESUME 不再命中。
 - IPv4 同 /24 门禁只限制跨机 iperf；ping 不受限。IPv6 优先双端 link-local，其次 global；macOS 执行时加 zone，Windows 不加。

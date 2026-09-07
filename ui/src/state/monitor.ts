@@ -1,5 +1,6 @@
 import { reactive } from 'vue';
-import { api, errorMessage } from '../api/client';
+import { api, errorMessage, UnauthorizedError } from '../api/client';
+import { session } from './session';
 import type { MonitorPoint, MonitorSeriesOut } from '../api/dto';
 import { appendPoints } from '../domain/monitor-chart';
 import { isMonitored, pendingStarts, type MonitorSide } from '../domain/monitor-plan';
@@ -28,6 +29,7 @@ export const monitor = reactive({
   sessions: [] as MonitorSession[],
   starting: false,
   error: '',
+  refreshError: '',
   polling: false,
 });
 
@@ -36,6 +38,7 @@ export function reset(): void {
   monitor.sessions = [];
   monitor.starting = false;
   monitor.error = '';
+  monitor.refreshError = '';
 }
 
 let timer: ReturnType<typeof setTimeout> | undefined;
@@ -55,6 +58,7 @@ async function tick(): Promise<void> {
       const out = await api.post<{ series: MonitorSeriesOut[] }>('/api/monitor/samples', {
         cursors: monitor.sessions.map((s) => ({ session: s.session, from: s.from })),
       });
+      monitor.refreshError = '';
       for (const series of out.series ?? []) {
         const target = monitor.sessions.find((s) => s.session === series.session);
         if (!target) continue;
@@ -63,8 +67,18 @@ async function tick(): Promise<void> {
         target.running = series.running;
         target.error = series.error;
       }
-    } catch {
-      // 断线自愈：下一拍重试。
+    } catch (error) {
+      if (error instanceof UnauthorizedError) {
+        // 口令失效不是断线，**自愈不了**：继续按秒重试只会刷出一串 401，而屏幕
+        // 上什么都不会变——曲线就那么静止着，没有一处说它已经不再更新了。而这台
+        // 机器此刻多半正在灌线速，那串请求还得它自己扛。停掉这条链，交给全局
+        // 终态说话，和 `run.ts` 的进度轮询同一套处理。
+        session.phase = 'unauthorized';
+        stopPolling();
+        return;
+      }
+      // 其余的断线自愈：下一拍重试。
+      monitor.refreshError = errorMessage(error);
     }
   }
   if (monitor.polling) schedule();

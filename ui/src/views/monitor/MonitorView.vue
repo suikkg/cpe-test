@@ -153,6 +153,9 @@ async function addAll(): Promise<void> {
     </p>
 
     <p v-if="monitor.error" class="bad" role="alert">{{ monitor.error }}</p>
+    <p v-if="monitor.refreshError" class="bad" role="status">
+      监控更新失败，当前曲线为上次成功数据：{{ monitor.refreshError }}。正在等待重新同步。
+    </p>
 
     <div v-if="monitor.sessions.length === 0" class="empty">
       还没有在跑的监控。选一块网卡开始。

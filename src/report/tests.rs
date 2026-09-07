@@ -28,6 +28,21 @@ fn an_oversized_raw_segment_keeps_both_ends() {
 }
 
 use super::*;
+
+#[test]
+fn typed_tcp_names_cannot_move_the_unit_into_ping_or_udp() {
+    for name in ["PING 对照", "UDP 对照"] {
+        let mut row = unit_summary("typed-tcp", Verdict::Pass);
+        row.task = name.into();
+        row.kind_label = name.into();
+        row.protocol = RowProtocol::Tcp;
+        row.backend = RowBackend::Iperf3;
+        let rows = vec![row];
+        let groups = group_rows(&rows);
+        assert!(!group_is_ping(&groups[0]));
+        assert!(!group_is_udp(&groups[0]));
+    }
+}
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static REPORT_INDEX: AtomicUsize = AtomicUsize::new(0);

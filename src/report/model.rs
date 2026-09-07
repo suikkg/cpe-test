@@ -360,6 +360,18 @@ pub(super) fn group_verdict(group: &UnitGroup<'_>) -> Verdict {
     })
 }
 
+/// 汇总缺失时，选取与聚合判定一致的明细作为原因和指标的来源。
+pub(super) fn verdict_row<'a>(group: &UnitGroup<'a>) -> Option<&'a Row> {
+    group.summary.or_else(|| {
+        let verdict = group_verdict(group);
+        group
+            .details
+            .iter()
+            .copied()
+            .find(|row| row.verdict == verdict)
+    })
+}
+
 pub(super) fn group_execution_status(group: &UnitGroup<'_>) -> ExecutionStatus {
     group
         .summary
@@ -437,6 +449,12 @@ pub(super) fn normalized_direction_tag(tag: &str) -> String {
 }
 
 pub(super) fn row_is_ping(row: &Row) -> bool {
+    if row.protocol != RowProtocol::None {
+        return row.protocol == RowProtocol::Icmp;
+    }
+    if row.backend != RowBackend::None {
+        return row.backend == RowBackend::Ping;
+    }
     // 类型化字段优先；下面那串是历史数据的兜底（标题里含 "PING" 的 TCP 测试
     // 会被它误判，这正是 ADR-7 要把它降级的原因）。
     row.backend == RowBackend::Ping
@@ -449,6 +467,15 @@ pub(super) fn row_is_ping(row: &Row) -> bool {
 }
 
 pub(super) fn group_is_ping(group: &UnitGroup<'_>) -> bool {
+    let typed: Vec<_> = group
+        .summary
+        .into_iter()
+        .chain(group.details.iter().copied())
+        .filter(|row| row.protocol != RowProtocol::None || row.backend != RowBackend::None)
+        .collect();
+    if !typed.is_empty() {
+        return typed.into_iter().any(row_is_ping);
+    }
     group.summary.is_some_and(row_is_ping) || group.details.iter().any(|row| row_is_ping(row))
 }
 
@@ -639,6 +666,16 @@ pub(super) fn bidirectional_rx_average_sum(group: &UnitGroup<'_>) -> Option<f64>
 }
 
 pub(super) fn group_is_udp(group: &UnitGroup<'_>) -> bool {
+    let protocols: Vec<_> = group
+        .summary
+        .into_iter()
+        .chain(group.details.iter().copied())
+        .map(|row| row.protocol)
+        .filter(|protocol| *protocol != RowProtocol::None)
+        .collect();
+    if !protocols.is_empty() {
+        return protocols.contains(&RowProtocol::Udp);
+    }
     // 类型化字段优先。标题匹配是历史数据的兜底：一条名字里带 "UDP" 的 TCP
     // 测试就能把整组带偏，而报表上看不出来是带偏了。
     group

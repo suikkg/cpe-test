@@ -18,7 +18,8 @@
 //! 速率、丢包、覆盖率一律写成数字单元格而不是字符串。验收的人拿到 xlsx 是要
 //! 排序、筛选、做透视表的；写成字符串的话「930.5」会排在「1000」前面。
 use super::model::{
-    bidirectional_rx_average_sum, group_is_ping, group_rows, group_verdict, UnitGroup,
+    bidirectional_rx_average_sum, direction_row_score, group_is_ping, group_rows, group_verdict,
+    verdict_row, UnitGroup,
 };
 use super::{ReportMeta, Row, RowBackend, RowDirection, RowProtocol, RowSide};
 use crate::verdict::Verdict;
@@ -129,8 +130,8 @@ fn write_overview_sheet(
 
     let mut line = 1u32;
     for group in groups {
-        // 概览行优先取单元汇总行；没有汇总行就退到第一条明细。
-        let Some(row) = group.summary.or_else(|| group.details.first().copied()) else {
+        // 没有汇总行时选与聚合判定一致的明细，避免失败单元引用通过原因。
+        let Some(row) = verdict_row(group) else {
             continue;
         };
         let verdict = group_verdict(group);
@@ -283,16 +284,6 @@ struct LinkObservation<'a> {
     sender: &'a str,
     verdict: Verdict,
     rx_avg: Option<f64>,
-}
-
-/// 一条明细行作为「某方向代表行」的可取程度。
-///
-/// 与执行侧 `direction_summaries` 挑主行的口径同源：组合计行优先（UDP 的方向
-/// 结论在组合计上，逐流行的 RX 列本来就是空的），其次看指标齐不齐。
-fn direction_row_score(row: &Row) -> u8 {
-    u8::from(row.is_grouptotal) * 4
-        + u8::from(row.rx_p10.is_some()) * 2
-        + u8::from(row.rx_avg.is_some())
 }
 
 /// 把一个单元摊成若干条方向观测。
@@ -506,7 +497,7 @@ fn write_failures_sheet(
         ) {
             continue;
         }
-        let Some(row) = group.summary.or_else(|| group.details.first().copied()) else {
+        let Some(row) = verdict_row(group) else {
             continue;
         };
         sheet.write_number(line, 0, row.unit_seq.saturating_add(1) as f64)?;
@@ -587,6 +578,23 @@ mod tests {
             is_unit_summary: true,
             ..detail(unit, verdict, link_group)
         }
+    }
+
+    #[test]
+    fn interrupted_unit_uses_the_failing_detail_for_its_reason() {
+        let pass = detail(0, Verdict::Pass, "A");
+        let mut fail = detail(0, Verdict::RateFail, "A");
+        fail.sort_key = (0, 1, 0, 0);
+        fail.rx_avg = Some(10.0);
+        let rows = vec![pass, fail];
+        let groups = group_rows(&rows);
+        let row = verdict_row(&groups[0]).unwrap();
+        assert_eq!(row.verdict, Verdict::RateFail);
+        assert_eq!(row.rx_avg, Some(10.0));
+        assert!(super::super::reason::group_reason(&groups[0]).contains("RX_BELOW_TARGET"));
+        let path = temp_path("interrupted");
+        write_xlsx(&path, &rows, &ReportMeta::default()).unwrap();
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     /// 四张表都要在，而且能被真正的 xlsx 读者打开。

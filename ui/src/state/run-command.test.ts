@@ -65,6 +65,30 @@ afterEach(() => {
 });
 
 describe('运行状态的新鲜度', () => {
+  it('并发同步等待同一个请求，不会提前返回或重复请求', async () => {
+    let resolveResponse!: (value: FakeResponse) => void;
+    fetchMock.mockReturnValue(new Promise<FakeResponse>((resolve) => { resolveResponse = resolve; }));
+    const first = syncStatus();
+    const second = syncStatus();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    resolveResponse(progress('shared', false));
+    await Promise.all([first, second]);
+    expect(run.status.run_id).toBe('shared');
+    expect(run.synced).toBe(true);
+  });
+
+  it('重置之后迟到的旧响应不能覆盖新状态', async () => {
+    let resolveOld!: (value: FakeResponse) => void;
+    fetchMock.mockReturnValueOnce(new Promise<FakeResponse>((resolve) => { resolveOld = resolve; }));
+    const old = syncStatus();
+    reset();
+    fetchMock.mockResolvedValueOnce(progress('new', false));
+    await syncStatus();
+    resolveOld(progress('old', false));
+    await old;
+    expect(run.status.run_id).toBe('new');
+  });
+
   it('读到之前是「未同步」，读到之后才有时刻', async () => {
     expect(run.synced).toBe(false);
     expect(run.lastSyncAt).toBeNull();

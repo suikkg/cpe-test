@@ -1,12 +1,5 @@
 import { reactive } from 'vue';
-import {
-  api,
-  UnauthorizedError,
-  adoptTokenFromCookie,
-  adoptTokenFromUrl,
-  errorMessage,
-  hasToken,
-} from '../api/client';
+import { api, UnauthorizedError, errorMessage, hasToken } from '../api/client';
 import { clockStamp } from '../domain/freshness';
 import type { BootstrapOut, ConnectOut, ConnectReq, LocalOut } from '../api/dto';
 
@@ -153,10 +146,10 @@ function fail(error: unknown): void {
  * 对端，「本机」那一页也该是有内容的。两个请求并发发出，任一失败不拖垮另一个。
  */
 export async function load(): Promise<void> {
-  adoptTokenFromUrl();
-  // 地址栏没带口令时，退到服务端交付页面时下发的会话 cookie。刷新与「复制地址
-  // 到新标签打开」都走这一条——两者的 `GET /` 都是靠 cookie 认过的。
-  adoptTokenFromCookie();
+  // 口令的落地**不在这里**：它以前是本函数的副作用，于是任何排在 `load()`
+  // 之前的开场请求都会赶在口令之前出门（`App.vue` 的 `syncStatus()` 就这么撞过
+  // 一次 401）。现在归 `api/client.ts::adoptToken()`，由 `main.ts` 和每次读
+  // 口令时各兜一道，见那里的说明。
   const [bootstrap, local] = await Promise.allSettled([
     api.get<BootstrapOut>('/api/bootstrap'),
     api.get<LocalOut>('/api/local'),

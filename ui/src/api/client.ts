@@ -69,7 +69,7 @@ const SESSION_COOKIE = 'cpe_ui_session';
  * 用 sessionStorage 而不是 localStorage：关掉标签页就没了，符合「一次会话」的
  * 预期；控制台口令不该在这台机器上长期留存。
  */
-export function adoptTokenFromUrl(): void {
+function adoptTokenFromUrl(): void {
   try {
     const url = new URL(window.location.href);
     const token = url.searchParams.get('token');
@@ -94,7 +94,7 @@ export function adoptTokenFromUrl(): void {
  * 只在 sessionStorage 里没有时才用它：地址栏刚给过的口令是**更新**的那一份，
  * 换口令重启主控之后，旧 cookie 还可能挂在浏览器上。
  */
-export function adoptTokenFromCookie(): void {
+function adoptTokenFromCookie(): void {
   try {
     if (sessionStorage.getItem(TOKEN_KEY)) return;
     const found = document.cookie
@@ -109,7 +109,37 @@ export function adoptTokenFromCookie(): void {
   }
 }
 
+/**
+ * 把口令从「这次导航带来的东西」搬进 sessionStorage，**在发出任何请求之前**。
+ *
+ * 地址栏优先于 cookie：地址栏刚给过的那一份是更新的，换口令重启主控之后
+ * 浏览器上还可能挂着旧 cookie。
+ *
+ * # 为什么它必须是幂等的、而且由 `token()` 兜底
+ *
+ * 这一步以前埋在 `state/session.ts::load()` 里，也就是「开场那批请求」之一的
+ * **副作用**。于是它对调用顺序敏感：`App.vue` 的 `onMounted` 后来在 `load()`
+ * 之前插了一句 `syncStatus()`（先认一次「服务器上是不是已经有一轮在跑」），
+ * 那一发 `/api/progress` 就赶在口令落地之前出门，必然 401，界面直接进
+ * 「口令失效」这个全局终态——而随后成功的 `load()` 并不会把它翻回来。
+ * 表现正是「刚打开是无口令，过几秒刷新（sessionStorage 里已经有了）就好」。
+ *
+ * 靠「记得排在第一个」防不住这类错误：任何人再加一个开场请求就会重犯。所以
+ * 落点改成两处——`main.ts` 在挂载前显式调一次（地址栏该**立刻**抹掉，不能等到
+ * 第一个请求才抹），`token()` 每次读之前再兜一次，于是**没有任何一条请求路径
+ * 能跑在口令前面**。
+ *
+ * 不设「已经认过」的门闩：这两步本来就自带幂等（`?token=` 认完就被抹掉，
+ * cookie 那步在 sessionStorage 已有值时直接返回），一个门闩换不来什么，
+ * 却要为单测再开一个只在测试里用的复位出口。
+ */
+export function adoptToken(): void {
+  adoptTokenFromUrl();
+  adoptTokenFromCookie();
+}
+
 function token(): string {
+  adoptToken();
   try {
     return sessionStorage.getItem(TOKEN_KEY) ?? '';
   } catch {
@@ -171,7 +201,6 @@ async function request<T>(
     headers['X-CPE-Console'] = '1';
   }
 
-  let response: Response;
   // `AbortSignal.timeout` 在测试环境和老 WebView 里未必有，退回手搓的
   // controller；两条路的可观察行为一样——超时即 reject，落到 NetworkError。
   const timeoutMs = options?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -180,7 +209,7 @@ async function request<T>(
     ? setTimeout(() => controller.abort(new Error(`请求超过 ${timeoutMs}ms 未返回`)), timeoutMs)
     : undefined;
   try {
-    response = await fetch(path, {
+    const response = await fetch(path, {
       method,
       headers,
       body: method === 'POST' ? JSON.stringify(body ?? {}) : undefined,
@@ -188,30 +217,26 @@ async function request<T>(
       credentials: 'omit',
       cache: 'no-store',
       signal: controller?.signal,
-    });
-  } catch (reason) {
-    // fetch 只在**拿不到应答**时 reject（HTTP 500 也算 resolve）。这一层
-    // 单独成类，调用方才能区分「确定失败」和「结果未知」。超时走的也是这里：
-    // 对调用方来说「超时了」和「连不上」是同一件事——结果未知。
-    throw new NetworkError(reason);
+    }).catch((reason: unknown) => { throw new NetworkError(reason); });
+
+    if (response.status === 401) throw new UnauthorizedError();
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+    // 收到响应头不代表拿到了命令结果；正文中断、超时或无法解码都应按结果未知处理。
+    const payload = await response.json().catch((reason: unknown) => {
+      throw new NetworkError(reason);
+    }) as Resp<T>;
+    if (!payload || typeof payload.ok !== 'boolean') {
+      throw new NetworkError(new Error('服务端响应格式无效'));
+    }
+    if (!payload.ok) {
+      throw new Error(errorMessage(payload.error) || '服务端返回了失败但没有说明原因');
+    }
+    return payload.data as T;
   } finally {
+    // 包括读取正文在内的整个请求结束后才撤销超时。
     if (timer !== undefined) clearTimeout(timer);
   }
-
-  // 401 单独成一类：旧页面把它混进通用 toast，看到的人只会以为是网络抖动，
-  // 然后一直刷新。它需要的是「用带 ?token= 的完整地址重新打开」。
-  if (response.status === 401) {
-    throw new UnauthorizedError();
-  }
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status}`);
-  }
-
-  const payload = (await response.json()) as Resp<T>;
-  if (!payload.ok) {
-    throw new Error(errorMessage(payload.error) || '服务端返回了失败但没有说明原因');
-  }
-  return payload.data as T;
 }
 
 /**

@@ -164,6 +164,11 @@ pub(super) fn ping_pass_reason(
 }
 
 pub(super) fn group_reason(group: &UnitGroup<'_>) -> String {
+    if let Some(row) = super::model::verdict_row(group) {
+        if !row.reason_code.is_empty() || !row.reason_detail.is_empty() {
+            return report_reason(row.reason_code, &row.reason_detail);
+        }
+    }
     let reason = group
         .summary
         .filter(|row| !row.reason_code.is_empty() || !row.reason_detail.is_empty())

@@ -40,8 +40,8 @@ function status(runId: string, seqs: number[], total = 3): RunStatus {
   };
 }
 
-function tick(s: RunStatus, unitsFrom: number): ProgressOut {
-  return { running: true, from: 0, lines: [], report: '', units_from: unitsFrom, run: s };
+function tick(s: RunStatus, unitsFrom: number, report = ''): ProgressOut {
+  return { running: true, from: 0, lines: [], report, units_from: unitsFrom, run: s };
 }
 
 describe('applyProgress', () => {
@@ -75,5 +75,19 @@ describe('applyProgress', () => {
     // 新一轮真的开始。
     applyProgress(tick(status('run_new', [1]), 1));
     expect(run.units.map((u) => u.title)).toEqual(['run_new#1']);
+  });
+
+  it('换了一轮，上一轮的报告路径也不许留下来', () => {
+    applyProgress(tick(status('run_old', [1]), 1, 'runs/run_old/report.html'));
+    expect(run.report).toBe('runs/run_old/report.html');
+
+    // 别的标签页开了新一轮：进度已经是新一轮的，报告却还没产出。留着上一轮那份
+    // 路径的话，「打开报告」会在新一轮还什么都没有的时候就亮着。
+    applyProgress(tick(status('run_new', [1]), 1));
+    expect(run.report).toBe('');
+
+    // 新一轮自己报上来之后再亮。
+    applyProgress(tick(status('run_new', [2]), 2, 'runs/run_new/report.html'));
+    expect(run.report).toBe('runs/run_new/report.html');
   });
 });

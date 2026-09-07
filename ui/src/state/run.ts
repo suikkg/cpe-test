@@ -86,9 +86,8 @@ export const view = computed(() =>
 
 export function reset(): void {
   stopPolling();
-  // `inFlight` 也要清。它是模块级的，「断开连接 / 换辅测机」之后如果还留着
-  // 上一台机器那次挂死请求的 true，新连上的这台会被自己的闸门永久挡在门外。
-  inFlight = false;
+  generation += 1;
+  inFlight = undefined;
   run.running = false;
   run.synced = false;
   run.lastSyncAt = null;
@@ -127,14 +126,22 @@ function schedule(): void {
  * 于是「一秒一拍」在页面刚打开的几秒里变成两拍——而这台机器此刻正在灌线速。
  * `inFlight` 保证任何时刻最多一个在飞的请求。
  */
-let inFlight = false;
+let inFlight: Promise<boolean> | undefined;
+let generation = 0;
 
 /** 一拍进度的上限，见 `tick()` 里的说明。 */
 const PROGRESS_TIMEOUT_MS = 30_000;
 
-async function tick(): Promise<boolean> {
-  if (inFlight) return false;
-  inFlight = true;
+function tick(): Promise<boolean> {
+  if (inFlight) return inFlight;
+  const pending = readProgress(generation).finally(() => {
+    if (inFlight === pending) inFlight = undefined;
+  });
+  inFlight = pending;
+  return pending;
+}
+
+async function readProgress(epoch: number): Promise<boolean> {
   let ok = false;
   try {
     // 带上手上这份 `run_id`：单元游标只在一轮之内有意义。服务端对不上就
@@ -148,12 +155,14 @@ async function tick(): Promise<boolean> {
       // 「这份是旧的」显示出来，而不是无声地停在上一拍。
       { timeoutMs: PROGRESS_TIMEOUT_MS },
     );
+    if (epoch !== generation) return false;
     applyProgress(out);
     run.synced = true;
     run.lastSyncAt = Date.now();
     run.refreshError = '';
     ok = true;
   } catch (error) {
+    if (epoch !== generation) return false;
     if (error instanceof UnauthorizedError) {
       // 口令失效是**全局终态**：继续按秒轮询只会刷出一串 401，而屏幕上
       // 什么都不会变。停掉这条链，让全局提示接手。
@@ -165,8 +174,6 @@ async function tick(): Promise<boolean> {
       // 「这份是旧的」说出来，下一拍按原间隔自己重试。
       run.refreshError = errorMessage(error);
     }
-  } finally {
-    inFlight = false;
   }
   return ok;
 }
@@ -218,6 +225,11 @@ export function applyProgress(out: ProgressOut): void {
   run.unitCursor = out.units_from;
   run.status = out.run;
   run.units = mergeUnits(runChanged ? [] : run.units, out.run.done);
+  // 报告路径同样按轮次算。**换轮不清的话它会跨轮活下来**：别的标签页开了新
+  // 一轮，这个标签页手上还留着上一轮的路径，于是「打开报告」这个按钮在新一轮
+  // 还没产出任何报告时就亮着——而它旁边的进度说的是新一轮。清成空串，等新一轮
+  // 自己报上来。
+  if (runChanged) run.report = '';
   if (out.report) run.report = out.report;
   if (out.lines.length) {
     // 定长数组：旧页用 `textContent +=`，长测试后期是二次方开销。
