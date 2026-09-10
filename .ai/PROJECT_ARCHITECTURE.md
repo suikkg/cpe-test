@@ -424,7 +424,7 @@ Windows 文本适配器：`src/cmd/ipconfig.rs` 解析中英文 `ipconfig /all`�
 - 其他平台固定错误。
 - PNG 编码；测试在 解码回读 2x2 RGBA，而不只检查魔数。
 
-## 10. 测试覆盖索引（源码声明 52 项；macOS 52、Linux 51、Windows 50）
+## 10. 测试覆盖索引（当前 Rust 全量 771 项；下表列出按模块维护的覆盖面）
 
 | 区域 | 测试位置 | 覆盖 |
 |---|---|---|
@@ -438,6 +438,7 @@ Windows 文本适配器：`src/cmd/ipconfig.rs` 解析中英文 `ipconfig /all`�
 | Windows parser | `cmd/ipconfig.rs`、`cmd/netsh.rs` | 中英文适配器、WiFi 状态/频段 |
 | NIC 分类 | `nic/classify.rs` | 角色、排序、WiFi 名称；USB 4000/4001/8999/12000 与以太网 8999/9000/12001 分类样例 |
 | macOS NIC/监控 | `scan_macos.rs`、`monitor.rs` | ifconfig、netstat Ibytes |
+| ADB 内环 | `inner/tests.rs`、`inner/adb_client.rs`、`inner/receiver_server.rs`、`inner/remote.rs`、`inner/webui.rs` | 配置迁移、计划与稳定 ID、ADB/辅测机生命周期、双向并发、RX 判定来源、RESUME、报告原子写入与历史边界 |
 | HTTP/agent | `http_client.rs`、`agent/server.rs` | Content-Length/状态行解析、chunked 正常及非法大小、tiny_http POST 回环、空 body 默认请求、非法 JSON 错误单次包装 |
 | util | `util.rs` | 选择解析、同 /24、sanitize、run_cmd 成功/启动错误、非 Windows streaming 无尾换行 stdout 回调/收集及 stderr |
 | report/screenshot | `report.rs`、`screenshot.rs` | PASS/SKIP、转义、排序/组合计、截图链接；PNG 实际解码 |
@@ -446,7 +447,11 @@ Windows 文本适配器：`src/cmd/ipconfig.rs` 解析中英文 `ipconfig /all`�
 
 ### 11.1 必须保持
 
+- ADB 内环入口 `inner::run_cli` 与 `inner::webui::Controller` 共用 `inner::perform`，独立严格配置 `inner::config::InnerConfig`、项目标识 `cpe-inner-project` 与 schema `version: 2`，不混入子网 Config/Unit；内环单元有独立稳定身份和 24 小时 PASS RESUME，绝不命中子网历史。分层固定：`config` 定义 schema 与 v1→v2 迁移（`protocol`→`protocols`、`board_interface`→`board_rx_interface`，补 `enabled`/`measurement`/`repeats`/`resume`；顺序单向**绝不**迁成 `bidir`，策略保持 `nic_strict`）；`plan` 是**全仓唯一**的笛卡尔积，页面预览、执行器、进度和报告都消费它，展开顺序为 网口 → 协议 → 方向 → 轮次；`adb` 适配板侧设备（接口清单、桥成员、`/proc/net/dev` 与 sysfs 两条读取路径、按端口起 server）；`measure` 是纯策略层，来源选择与门限配对只在这里；`mod` 只负责按计划起流采样；`report`/`history` 输出与历史。`inner::remote` 根据链路 host 使用现有 agent client/monitor/owner cleanup 协议，令牌不序列化。`inner::adb` 仅经 ADB 确认自有 server 就绪，不要求主控能路由到被测 LAN；前台 shell 使用本次 PID、停止标记和有限租约回收，未确认回收时停止后续起流。发送端始终运行普通 client：上行 PC client → 板侧 server，下行板侧 client → PC server，不使用 `-R`；`inner::adb_client` 经公共 ProcessExecutor 复用 iperf 参数/重试/事件解析，`inner::receiver_server` 按方向管理本机/agent/板侧 server，server owner 与 client/monitor owner 隔离以便停止后先收日志；接收端按数据走向定（上行采板侧 RX，下行采网口所在电脑 RX），不按谁跑 client 推断。`enabled: false` 的网口保留配置但不执行、不预检，其引用的辅测机也不进连接门禁——无 agent 或 agent 离线都不阻断本机测试。`bidir` 是一个含两条腿的单元：两腿各占 `port` / `port+1`、独立 job 与日志、在作用域线程里同时起流，按两腿有效窗口的**交集**计算，一腿失败置位单元取消位停止对向并定向回收。`-P`/`-w`/`-b`/`-l` 按协议分开配置，`tcp_window` / `udp_length` 走 `config::size_token` 白名单、`board_rx_interface` 走 `config::iface_word` 白名单后才拼进命令行或 sysfs 路径。测量策略 `nic_strict` / `nic_preferred` / `tool` 决定来源：网卡口径始终单独留存并仍由 `rate_window::evaluate_rx_acceptance` 产出，字段语义不变；兜底整条腿只选一次来源并记录原因，**可信低速不触发兜底**，工具口径**不继承**网卡门限（无工具门限只出 MEASURED）；工具速率只认真正的 receiver 汇总（多流须有 `[SUM]`），不取 sender / interval 末行；双向合计只相加同来源层次的两端接收速率，配了合计门限才按合计判一次。`max_udp_loss_pct` 超限仅追加 `UDP_LOSS_HIGH`，不推翻速率判定。板侧 server 原文按首尾裁剪后随腿进报告。`inner` 与子网共用纯 `cmd::iperf_window` 和 `rate_window`，不调用子网执行器。`master::webui::http` 在既有鉴权后转发 `/api/inner/*`（含 `plan` 预览与 `runs*` 历史，历史目录名按白名单精确比对、不做路径拼接）；两类启动共用 run_gate 防止并发占线，但配置、运行状态和取消标志分开；组合入口 `/api/scenario/*` 按子网后内环顺序执行，并在 `scenarios/` 保存两份原始配置，历史恢复默认打开两段各自的 RESUME。内环输出 `inner_runs`（`report.html`/`result.json`/`summary.json`/`config.json`/`units.jsonl`），子网历史仍只读 `runs`；历史「装载配置」只回配置不直接开跑。前端 `state/inner`、`domain/inner`、`views/inner/*` 不读写子网计划/连接/运行状态；独立草稿键与导入导出，误导入不得改写另一模式的配置；计划预览来自后端，前端不自算笛卡尔积。
+
 - 项目导入通过 `domain/import-topology::reconcileImportedTopology` 区分未知快照与成功扫描的空网卡表；只清理确认缺失的端点，并提示被删除的集合/绑定。绑定的显式 `pair_ids` 清空时必须删除该绑定，不能变成整集合分配。手工集合协调保留 pair ID 和端点方向。待校验状态随草稿保存，并在取得可信拓扑后自动校验。
+
+- 组合场景的 `request.json.phase` 与内存状态同步：子网阶段完成、进入内环时立即持久化为 `inner`，收尾再写入最终 `finished`/`error`，历史列表不能在长运行期间显示陈旧阶段。
 
 - 报告分类在存在类型化协议/后端时不得再被任务名称覆盖；历史字段缺失才使用字符串兜底。HTML 与 Excel 在单元汇总缺失时通过 `report::model::verdict_row` 选择匹配聚合判定的原因来源，方向代表行评分共用 `direction_row_score`。
 
@@ -455,7 +460,7 @@ Windows 文本适配器：`src/cmd/ipconfig.rs` 解析中英文 `ipconfig /all`�
 - IPv4 同 /24 门禁只限制跨机 iperf；ping 不受限。IPv6 优先双端 link-local，其次 global；macOS 执行时加 zone，Windows 不加。
 - UDP 限流按每条腿的发送 NIC；WiFi/未知速率不裁剪；任一腿不能承载 profile 就跳过整个 Unit。
 - PASS 规则：ping 见 `ping.rs` 与 `executor.rs`；iperf core、单流、组内流、组汇总和 Unit 分别见 `executor.rs`；组合计行在 `executor.rs` 标记，并由 `report.rs` 排除在报告总数外。
-- RESUME 是 Unit 级；当前按 `age.num_hours() <= 24` 判断，过去记录实际可命中到不足 25 小时，并容忍未来时间 60 秒（`executor.rs`）。agent HTTP 线程池固定 16 worker，但 iperf3/CTS 的 client 作业各自跑在独立命名线程（`iperf-client-<id>`）上，`/iperf/client/start` 立即返回 job id，**并发流数不受 16 的限制**；每 30 秒 sweep，server/monitor 最大存活分别为 10/30 分钟（`agent/server.rs`）。
+- RESUME 是 Unit 级；当前由 `executor/db::resume_age_is_fresh` 按实际时长严格小于 24 小时判断，并容忍未来时间 60 秒。agent HTTP 线程池固定 16 worker，但 iperf3/CTS 的 client 作业各自跑在独立命名线程（`iperf-client-<id>`）上，`/iperf/client/start` 立即返回 job id，**并发流数不受 16 的限制**；每 30 秒 sweep，server/monitor 最大存活分别为 10/30 分钟（`agent/server.rs`）。
 - 对外 JSON 字段即使当前生产代码没有本地消费者，也属于协议兼容面；删除/重命名要同步所有端点和版本策略。
 - WebUI 的 Wi-Fi 门限以“主控频段 × 辅测频段”为一组，每组两个单向门限（主控→辅测、辅测→主控）加**一个双向 RX 合计门限**；界面只按当前两端实际频段组合去重显示。旧的两个「每方向双向门限」按两者之和迁移成合计，只填过一个方向的不推导。旧发送频段规则和具体网口覆盖只作 request.json 读取兼容，新项目不再创建。
 - 频段在**存储与比较**上一律是稳定枚举 `wifi_2_4g` / `wifi_5g` / `wifi_6g` / `unknown`（Rust `plan::canonical_wifi_band`，TS `canonicalWifiBand`），界面再渲染成 `2.4G / 5G / 6G`。展示文案是最容易被改的东西，而改完之后频段规则会**静默失效**——找不到规则不报错，只是门限没了。
@@ -470,6 +475,27 @@ Windows 文本适配器：`src/cmd/ipconfig.rs` 解析中英文 `ipconfig /all`�
   - **合并失败必须响亮**：`apply_master_config` 返回 `Result`，`config_from_request` / `ui_request_base_config` / `config_from_ui_plan` 一路上抛到 `/api/plan` 与 `/api/run`。它以前在两处 `Err` 上静默 `return`——项目里任何一处类型不符都会让整块 patch 悄悄消失，这一轮改用目标机器自己的基线跑完，而界面上看不出区别。守在 `a_master_config_that_cannot_be_merged_stops_the_run_instead_of_falling_back`。
   - 导出侧同样不许产出空壳：`master_config` 为空在后端等价于「没带」，所以 `exportProject()` 在拿不到基线时**返回 `null` 并留错误**，而不是导出一个结构完整、换台机器就静默改判定口径的文件。随包示例项目 `dist/projects/cpe-ui-project-full.json` 就这么发出去过一次，`shipped-project.test.ts` 现在断言它带着四个块且不含 `by_nic`。
   - 重跑（`parseRunRequest`）要还原 `master_config`，当时没带项目就显式置 `null`。不还原它，重跑用的既不是归档里那份也不是本机基线，而是内存里当前碰巧加载着的那份。
+
+- 内环双向无共同窗口时两腿均无有效判定；工具全程汇总仅在本腿窗口与共同窗口边界相差不超过 `cmd::iperf_window::WINDOW_COMPLETE_TOLERANCE_MS` 时参与双向验收，否则仅留作诊断。`LinkPreflight.counter_source` 可为空：严格策略拒绝，工具及优先网卡策略通过 `Sampler::Unavailable` 留存采样失败原因。板侧清单合并 sysfs、proc 与地址表，各读取路径独立降级。前端计划响应须同时匹配请求序号和当前配置快照才可落地。
+
+- 内环 UI 的统计口径：上行板侧桥（默认 `br0`）RX、下行所选 PC 网口 RX、双向两者各一腿。界面不提供板侧成员口映射或候选，桥名称保留可编辑以适配机型；历史配置字段保持兼容。
+
+- **防复发的三条机制**（2026-09-10 那轮横扫的产物；它们守的是「下一处」，不是已修的那几处）：
+  - 历史目录的类型判断只有一种形状——不跟随符号链接的那种。枚举/打包/落盘历史的
+    五个模块（`report/store`、`master/webui/runs`、`master/webui/scenario`、
+    `inner/history`、`inner/webui`）的生产代码里不许出现 `.is_dir()` / `.is_file()` /
+    `fs::metadata()`。守在 `history_modules_never_use_link_following_path_checks`。
+    这张表**之外**的地方仍可以用跟随版本，那是有意的：`master::ui::replay_report_into`
+    收的是人在命令行上敲的目录，把 run 目录做成软链再重放是合法用法。
+  - 前后端的四条白名单（`size_token` / `safe_word` / `iface_word` / `adb_program`）
+    与两个 HTTP 头长度上限，用例本身抽成 `src/inner/validation_corpus.json`，
+    Rust 与 TypeScript 各读一遍。改规则必须先改语料，两边一起变红。守在
+    `the_shared_validation_corpus_matches_the_rust_side` 与 `inner-corpus.test.ts`。
+  - 控制台的每条 HTTP 路由都要声明并发类别（gated / readonly / stateful）。
+    新增任何一条都会让 `every_console_route_declares_its_concurrency_class` 变红，
+    作者必须回答「它会不会起测/停测/占用被测资源」。`stateful` 那几条不加门的
+    **前提**是执行线程不回读 `console.state`（`api_run_impl` 起线程前已把 `cfg`
+    快照下来）；哪天执行线程开始回读，它们就必须搬进 `gated`。
 
 ### 11.2 常见修改入口
 
@@ -491,5 +517,11 @@ Windows 文本适配器：`src/cmd/ipconfig.rs` 解析中英文 `ipconfig /all`�
 - 本次重构前 Rust 物理行数：；生产区（每文件首个 `#[cfg(test)]` 前）。
 - 最终 Rust 物理行数：；生产物理行数：；生产区净减少 行，全部 Rust 净减少 行。
 - 测试从基线 增加到，没有通过删除测试获得减量。
-- 已验证：`cargo fmt --all -- --check`、`cargo test --all-targets --locked`（52/52）、本机严格 Clippy、Windows GNU/MSVC 严格 Clippy、`git diff --check`。
+- 已验证：`cargo fmt --all -- --check`、`cargo test --all-targets --locked`（当前 771 项）、本机与 `x86_64-pc-windows-msvc` 严格 Clippy、Linux target check、`git diff --check`。
 - 旧说明 `使用说明.md:276-277` 关于 iperf server `-1`/netstat LISTEN 探测已过时；当前实现是无 `-1`、主动 stop、TCP connect ready 探测（`cmd/iperf.rs`）。维护 AI 文档时以当前实现为准。
+
+### 内环进度与产物一致性补充
+
+- `inner::webui::Controller::status` 以 `run_id` 和 `units_from` 配对续传；缺失或跨轮标识、越界游标均回完整列表，不能将上一轮的行数当作新一轮的游标。
+- `inner::report::write_atomic` 同目录写完再替换，保证并发下载只看到完整旧版或新版。`save_progress` 每单元追加 JSONL、刷新摘要；重产物在单元边界按 30 秒间隔节流，`save` 收尾必写。这不是每 30 秒的后台定时刷新，最长陈旧时间受下一单元耗时影响。
+- `history::Summary::finished` 为可选字段；新记录明确区分收尾与中间态，旧记录未知，不能从 `error == None` 推断完成。内环目前只提供 HTML/JSON，无 Excel 出口；子网 Excel 继续由 `report::xlsx` 输出。

@@ -4,6 +4,7 @@ pub mod ctstraffic;
 #[cfg(any(windows, test))]
 pub mod ipconfig;
 pub mod iperf;
+pub mod iperf_window;
 #[cfg(any(windows, test))]
 pub mod netsh;
 pub mod tools;

@@ -33,6 +33,10 @@ use std::path::PathBuf;
 /// `runs/` 目录名。与 `master/ui.rs` 的 `RUNS_DIR` 是同一个约定。
 const RUNS_DIR: &str = "runs";
 
+fn regular_dir(path: &std::path::Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_dir())
+}
+
 #[derive(Debug, Serialize)]
 pub(super) struct RunEntry {
     /// 目录名，同时也是 `bundle.zip` 的入参和 `cpe_test report` 的入参。
@@ -75,7 +79,7 @@ pub(super) struct RunEntry {
 /// 信任边界：`--ui-bind` 之后控制台在局域网上，「本地写一个链接」被放大成
 /// 「远程凭口令读任意文件」。这个工具自己从不在 `runs/` 里建链接，挡它零代价。
 pub(super) fn resolve_run_dir(id: &str) -> Option<std::path::PathBuf> {
-    if id.is_empty() {
+    if id.is_empty() || !regular_dir(std::path::Path::new(RUNS_DIR)) {
         return None;
     }
     std::fs::read_dir(RUNS_DIR)
@@ -83,21 +87,34 @@ pub(super) fn resolve_run_dir(id: &str) -> Option<std::path::PathBuf> {
         .flatten()
         .find(|entry| {
             entry.file_name() == std::ffi::OsStr::new(id)
-                // `file_type()` 不跟随链接，`is_dir()` 跟随——两者都要过。
-                && entry.file_type().is_ok_and(|kind| kind.is_dir())
-                && entry.path().is_dir()
+            // `file_type()` 直接来自目录项且不跟随链接。
+            && entry.file_type().is_ok_and(|kind| kind.is_dir())
         })
         .map(|entry| entry.path())
 }
 
+fn regular_file(dir: &std::path::Path, name: &str) -> bool {
+    std::fs::symlink_metadata(dir.join(name)).is_ok_and(|metadata| metadata.file_type().is_file())
+}
+
 fn dir_size(dir: &std::path::Path) -> u64 {
+    // 与 collect_files 一样，递归入口不能跟随目录项在两次枚举之间被替换
+    // 成的符号链接；否则历史列表的大小也会把 run 外的目录算进去。
+    if !regular_dir(dir) {
+        return 0;
+    }
     let mut total = 0u64;
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
     };
     for entry in entries.flatten() {
-        let Ok(meta) = entry.metadata() else { continue };
-        if meta.is_dir() {
+        let Ok(meta) = std::fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        if meta.file_type().is_dir() {
             total = total.saturating_add(dir_size(&entry.path()));
         } else {
             total = total.saturating_add(meta.len());
@@ -107,9 +124,12 @@ fn dir_size(dir: &std::path::Path) -> u64 {
 }
 
 fn modified_label(dir: &std::path::Path) -> String {
-    let Ok(meta) = std::fs::metadata(dir) else {
+    let Ok(meta) = std::fs::symlink_metadata(dir) else {
         return String::new();
     };
+    if !meta.file_type().is_dir() {
+        return String::new();
+    }
     let Ok(time) = meta.modified() else {
         return String::new();
     };
@@ -125,22 +145,22 @@ fn modified_label(dir: &std::path::Path) -> String {
 /// 一个功能的两半（ADR-15）。
 pub(super) fn api_runs() -> Result<serde_json::Value, String> {
     let root = std::path::Path::new(RUNS_DIR);
-    if !root.is_dir() {
+    if !regular_dir(root) {
         return serde_json::to_value(Vec::<RunEntry>::new()).map_err(|e| e.to_string());
     }
     let mut entries: Vec<RunEntry> = std::fs::read_dir(root)
         .map_err(|error| format!("读不到 {RUNS_DIR}/：{error}"))?
         .flatten()
-        .filter(|entry| entry.path().is_dir())
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
         .map(|entry| {
             let dir = entry.path();
             RunEntry {
                 id: entry.file_name().to_string_lossy().into_owned(),
                 modified: modified_label(&dir),
-                has_report: dir.join("report.html").is_file(),
-                has_rows: dir.join(crate::report::store::ROWS_FILE).is_file(),
-                has_xlsx: dir.join("summary.xlsx").is_file(),
-                has_request: crate::report::store::request_path(&dir).is_file(),
+                has_report: regular_file(&dir, "report.html"),
+                has_rows: regular_file(&dir, crate::report::store::ROWS_FILE),
+                has_xlsx: regular_file(&dir, "summary.xlsx"),
+                has_request: regular_file(&dir, crate::report::store::REQUEST_FILE),
                 bytes: dir_size(&dir),
             }
         })
@@ -211,19 +231,29 @@ pub(super) fn api_run_replay(
 // ---------------------------------------------------------------------------
 
 fn collect_files(dir: &std::path::Path, base: &std::path::Path, out: &mut Vec<(String, PathBuf)>) {
+    // 递归入口也要重新确认：上一级枚举之后，目录项可能已经被替换成链接。
+    // `read_dir` 会跟随这种链接；不在这里挡住，下面的「不打包符号链接」只
+    // 保护了静态快照，没有保护目录替换发生在两次枚举之间的窗口。
+    if !regular_dir(dir) {
+        return;
+    }
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     // 同 `resolve_run_dir`：run 目录**里面**的符号链接也不打包。跟着走会把
     // 链接目标塞进 zip，而 zip 里的路径仍是 `run_xxx/...`，看不出内容来自别处。
+    // 特殊文件（FIFO、设备节点等）也跳过：它们不是工具会写出的报告产物，
+    // 对它们调用 `File::open` 可能阻塞下载线程，甚至把设备内容读进包里。
     let mut paths: Vec<_> = entries
         .flatten()
-        .filter(|entry| entry.file_type().is_ok_and(|kind| !kind.is_symlink()))
-        .map(|e| e.path())
+        .filter_map(|entry| {
+            let kind = entry.file_type().ok()?;
+            (kind.is_dir() || kind.is_file()).then_some((entry.path(), kind.is_dir()))
+        })
         .collect();
-    paths.sort();
-    for path in paths {
-        if path.is_dir() {
+    paths.sort_by(|(left, _), (right, _)| left.cmp(right));
+    for (path, is_dir) in paths {
+        if is_dir {
             collect_files(&path, base, out);
         } else if let Ok(rel) = path.strip_prefix(base) {
             // zip 内路径一律用 `/`，Windows 上解压才不会出一层怪目录。

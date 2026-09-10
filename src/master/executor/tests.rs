@@ -1071,6 +1071,37 @@ fn test_result_db() {
     let _ = std::fs::remove_file(&p);
 }
 
+#[cfg(unix)]
+#[test]
+fn result_db_save_does_not_follow_a_symlinked_temp_file() {
+    let nonce = RESOURCE_OWNER_SEQ.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!(
+        "cpe_db_symlink_test_{}_{}",
+        std::process::id(),
+        nonce
+    ));
+    let outside = std::env::temp_dir().join(format!(
+        "cpe_db_symlink_outside_{}_{}",
+        std::process::id(),
+        nonce
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    let path = dir.join("task_results.json");
+    let target = outside.join("do-not-overwrite");
+    std::fs::write(&target, "keep").unwrap();
+    std::os::unix::fs::symlink(&target, dir.join("task_results.tmp")).unwrap();
+
+    let mut db = ResultDb::load(path.clone());
+    db.set("agent", true, "test");
+    db.save();
+
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep");
+    assert!(ResultDb::load(path).fresh_pass("agent").is_some());
+    let _ = std::fs::remove_dir_all(dir);
+    let _ = std::fs::remove_dir_all(outside);
+}
+
 #[test]
 fn resume_freshness_uses_exact_24_hour_boundary() {
     assert!(resume_age_is_fresh(
@@ -4737,6 +4768,9 @@ fn resumed_ctstraffic_pass_counts_as_usable_traffic_measurement() {
     assert!(skip.reason_detail.contains("正式 PASS"));
     assert!(skip.reason_detail.contains("resume"));
     assert!(skip.reason_detail.contains("24 小时"));
+    let persisted = std::fs::read_to_string(ctx.run_dir.join(crate::report::store::ROWS_FILE))
+        .expect("RESUME 跳过也必须进入增量 JSONL");
+    assert!(persisted.contains("RESUME_FRESH_PASS"));
     drop(rows);
     let _ = std::fs::remove_file(db_path);
 }
@@ -5312,6 +5346,57 @@ fn nested_run_artifact_keeps_report_relative_link() {
     );
     let _ = std::fs::remove_dir_all(run_dir);
     let _ = std::fs::remove_file(db_path);
+}
+
+#[cfg(unix)]
+#[test]
+fn output_artifact_does_not_follow_a_symlinked_temp_file() {
+    let nonce = RESOURCE_OWNER_SEQ.fetch_add(1, Ordering::SeqCst);
+    let run_dir = std::env::temp_dir().join(format!(
+        "cpe_run_artifact_symlink_test_{}_{}",
+        std::process::id(),
+        nonce
+    ));
+    let outdir = run_dir.join("iperf_outputs");
+    let outside = std::env::temp_dir().join(format!(
+        "cpe_run_artifact_symlink_outside_{}_{}",
+        std::process::id(),
+        nonce
+    ));
+    std::fs::create_dir_all(&outdir).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    let target = outside.join("do-not-overwrite");
+    std::fs::write(&target, "keep").unwrap();
+    std::os::unix::fs::symlink(&target, outdir.join(".artifact.log.tmp")).unwrap();
+
+    let (mut ctx, db_path) = isolated_ctx(0);
+    ctx.outdir = outdir.clone();
+    let link = ctx.write_output_artifact("artifact.log", "new", "测试附件");
+
+    assert_eq!(link, "./iperf_outputs/artifact.log");
+    assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep");
+    assert_eq!(
+        std::fs::read_to_string(outdir.join("artifact.log")).unwrap(),
+        "new"
+    );
+    let _ = std::fs::remove_dir_all(run_dir);
+    let _ = std::fs::remove_dir_all(outside);
+    let _ = std::fs::remove_file(db_path);
+}
+
+#[test]
+fn screenshot_filenames_have_a_process_local_sequence_beyond_second_precision() {
+    let first = screenshot_filename(
+        "task",
+        Side::Master,
+        SCREENSHOT_SEQ.fetch_add(1, Ordering::Relaxed),
+    );
+    let second = screenshot_filename(
+        "task",
+        Side::Master,
+        SCREENSHOT_SEQ.fetch_add(1, Ordering::Relaxed),
+    );
+    assert_ne!(first, second);
 }
 
 #[test]
@@ -5916,11 +6001,28 @@ fn a_resume_hit_needs_a_pass_a_parseable_time_and_an_age_inside_the_window() {
 /// 字面量」。判定优先级、速率口径、判定→计数三处都用同样的手法守着唯一入口。
 #[test]
 fn every_transport_shares_one_window_completeness_tolerance() {
-    let source = include_str!("window.rs");
-    let production = source.split("#[cfg(test)]").next().unwrap_or(source);
-    let code: String = production
-        .lines()
-        .filter(|line| !line.trim_start().starts_with("//"))
+    // **两个文件都要扫**：iperf/TCP 那条窗口推导已经搬到
+    // `src/cmd/iperf_window.rs`（子网与内环共用），只读 window.rs 的话，这条
+    // 守卫看得见的就只剩 CTS 两处加 UDP 一处——`uses >= 3` 靠巧合继续通过，
+    // 而它本来要护的 iperf 链一行都没被检查。往 iperf_window.rs 里写死一个
+    // `saturating_add(150)`，整条断言照样绿。
+    let sources = [
+        include_str!("window.rs"),
+        include_str!("../../cmd/iperf_window.rs"),
+        // 第四处：内环双向单元的重叠窗口（`overlap_window`）。它和三条链路
+        // 推出来的窗口拿同一把尺子量「跑满没有」，量歪了同样是 PASS 对
+        // EFFECTIVE_WINDOW_SHORT 的差别，只不过发生在双向单元和它自己的
+        // 两条腿之间。
+        include_str!("../../inner/mod.rs"),
+    ];
+    let code: String = sources
+        .iter()
+        .map(|source| source.split("#[cfg(test)]").next().unwrap_or(source))
+        .flat_map(|production| {
+            production
+                .lines()
+                .filter(|line| !line.trim_start().starts_with("//"))
+        })
         .collect::<Vec<_>>()
         .join("\n");
 
@@ -5929,15 +6031,19 @@ fn every_transport_shares_one_window_completeness_tolerance() {
     assert!(
         uses >= 3,
         "只有 {uses} 处用到 WINDOW_COMPLETE_TOLERANCE_MS；\
-         TCP/UDP/CTS 三条窗口推导本该共用它"
+         TCP/UDP/CTS 三条窗口推导本该共用它（window.rs + cmd/iperf_window.rs 一起数）"
     );
 
     // 不许有人另起一个数。只看**和 required 比较**的那些式子：
     // 别处的 `saturating_add(1_000)` 是扫描循环的一秒步进，与容差无关。
     //
     // 比较可能跨行写（rustfmt 会折），所以按语句而不是按行切。
+    // 「和要求时长比较」不止 `required_ms` 一种写法：内环那处写的是
+    // `required_secs.saturating_mul(1_000)`。只认前者的话，把文件加进来也白加。
     for statement in code.split(';') {
-        if !statement.contains("required_ms") || !statement.contains("saturating_add(") {
+        let compares_required =
+            statement.contains("required_ms") || statement.contains("required_secs");
+        if !compares_required || !statement.contains("saturating_add(") {
             continue;
         }
         for piece in statement.split("saturating_add(").skip(1) {
@@ -5945,7 +6051,7 @@ fn every_transport_shares_one_window_completeness_tolerance() {
             let is_literal = !arg.is_empty() && arg.chars().all(|c| c.is_ascii_digit() || c == '_');
             assert!(
                 !is_literal,
-                "window.rs 里出现了写死的毫秒容差 `saturating_add({arg})`，\
+                "窗口推导里出现了写死的毫秒容差 `saturating_add({arg})`，\
                  而这条式子正在和 required_ms 比较。三条链路必须共用 \
                  WINDOW_COMPLETE_TOLERANCE_MS——各写一个数的话，同一条链路上 TCP 判\
                  「完整」而 UDP 判「不足」，两边给出的是不同的 verdict，不是显示差异。\
@@ -5954,4 +6060,115 @@ fn every_transport_shares_one_window_completeness_tolerance() {
             );
         }
     }
+}
+
+/// 网卡在开跑前消失：判死、落盘、通知，三件事一件都不能少。
+///
+/// 这条路径此前**完全没有测试**——`isolated_ctx` 里 `topology: None`，整条拓扑
+/// 刷新分支从来没被执行过。它和 RESUME 跳过是同一种形状：`continue` 掉了，
+/// 绕过下面那个统一的单元收尾，所以增量落盘和 `unit_finished` 都得在原地补一次。
+/// 少了落盘，长队列跑到一半崩溃时重放报告会漏掉这条「网卡消失」；
+/// 少了通知，进度页会永远停在这个单元上。
+#[test]
+fn a_unit_whose_nic_vanished_is_judged_persisted_and_announced() {
+    /// 拓扑里一块网卡都不剩：单元引用的每个端点都会被判成 Gone。
+    struct EverythingGone;
+    impl TopologySource for EverythingGone {
+        fn snapshot(&self) -> Result<(HostInfo, HostInfo), String> {
+            let empty = || HostInfo {
+                hostname: "gone".into(),
+                os: "test".into(),
+                interfaces: Vec::new(),
+            };
+            Ok((empty(), empty()))
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct Seen {
+        finished: Mutex<Vec<(String, String)>>,
+    }
+    impl RunObserver for Seen {
+        fn unit_finished(&self, status: UnitStatus, _remaining_est_secs: u64) {
+            lock_recover(&self.finished).push((status.verdict.clone(), status.reason_code.clone()));
+        }
+    }
+
+    let unit = ctstraffic_unit("nic-gone", false);
+    let (mut ctx, db_path) = isolated_ctx(0);
+    ctx.topology = Some(Arc::new(EverythingGone));
+    let seen = Arc::new(Seen::default());
+    ctx.observer = Some(seen.clone());
+
+    let summary = ctx.run_all_with_preflight_blocks(&[unit], &HashMap::new());
+
+    // 1. 当场判死，不照跑。
+    assert_eq!(
+        summary.traffic_setup_errors, 1,
+        "网卡消失必须记成 setup error"
+    );
+    assert_eq!(summary.skip, 0, "这不是跳过，是判死");
+    let rows = ctx.rows.lock().unwrap();
+    let dead = rows
+        .iter()
+        .find(|row| row.reason_code == ReasonCode::NicDisappeared)
+        .expect("应有一行网卡消失");
+    assert_eq!(dead.verdict, Verdict::SetupError);
+    assert_eq!(dead.execution_status, ExecutionStatus::Error);
+    assert!(dead.reason_detail.contains("已消失"));
+    assert!(dead.reason_detail.contains("无法采样"));
+    drop(rows);
+
+    // 2. 已经落进增量 JSONL——这条 `continue` 绕过了统一收尾，落盘必须就地补。
+    let persisted = std::fs::read_to_string(ctx.run_dir.join(crate::report::store::ROWS_FILE))
+        .expect("网卡消失也必须进入增量 JSONL，否则中途崩溃后重放会漏掉它");
+    assert!(
+        persisted.contains("NIC_DISAPPEARED"),
+        "增量 JSONL 里没有这条网卡消失记录：{persisted}"
+    );
+
+    // 3. 进度页收到了收尾通知，不会永远停在这个单元上。
+    let finished = lock_recover(&seen.finished);
+    assert_eq!(finished.len(), 1, "这个单元只该收尾一次");
+    assert_eq!(finished[0].1, ReasonCode::NicDisappeared.as_str());
+
+    let _ = std::fs::remove_file(db_path);
+}
+
+/// 产物文件名不能被用户配置撑爆 Windows 的 260 字符上限。
+///
+/// `label` 是 `unit.title`，由配置里的链路名拼出来，长度不设限；其余拼进文件名的
+/// 部分（`owner_id`、方向 tag、网卡名）都是有界的。Windows 上没开长路径支持时，
+/// 整条路径超过 260 个字符 `CreateFileW` 就失败——而 `write_output_artifact`
+/// 只记一行日志、返回空串，判定照常。于是现场表现是「Windows 上截图少了几张」，
+/// 而开发机是 macOS，`PATH_MAX` 1024，永远复现不出来。
+#[test]
+fn artifact_filenames_stay_short_enough_for_windows_max_path() {
+    let monster = "链路".repeat(200);
+    for side in [Side::Master, Side::Agent] {
+        let name = screenshot_filename(&monster, side, 7);
+        assert!(
+            name.len() <= 140,
+            "截图文件名 {} 字符，Windows 上留给目录的余量不够：{name}",
+            name.len()
+        );
+        assert!(name.starts_with("screenshot_"));
+        assert!(name.ends_with("_7.png"), "序号必须留着，截断不能造成撞名");
+    }
+    // 截断只砍标签，同一秒内不同 seq 仍然互不相同。
+    assert_ne!(
+        screenshot_filename(&monster, Side::Master, 1),
+        screenshot_filename(&monster, Side::Master, 2)
+    );
+
+    // 其余几个输入本来就有界，这里把这个前提也钉住：owner_id 由
+    // `unit_resource_owner` 生成（pid/序号/nonce/时间戳/8 位 md5），方向 tag 是
+    // ab/ba/oneway。哪天它们也变成用户可控的，这条会先红。
+    let unit = ctstraffic_unit("bounded", false);
+    let owner = unit_resource_owner(&unit, 3);
+    assert!(
+        owner.len() <= 80,
+        "owner_id 变长了（{}），它也进文件名：{owner}",
+        owner.len()
+    );
 }

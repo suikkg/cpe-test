@@ -102,7 +102,55 @@ pub(super) struct ImportOut {
 /// 有意不要求先连上辅测机：全局参数和网口策略不依赖连接，配对选择留给页面在
 /// 连上之后按端点名匹配（对不上的行会在 `notices` 里点名）。
 pub(super) fn api_import(console: &Arc<Console>, body: &str) -> Result<serde_json::Value, String> {
-    let incoming: Config = serde_json::from_str(body)
+    let raw: serde_json::Value = serde_json::from_str(body)
+        .map_err(|error| format!("这不是一份能解析的 config.json：{error}"))?;
+    // 内环的三种形态都要认出来：项目文件（带 `kind`）、含 adb 字段的裸配置，
+    // 以及**一个 adb 字段都没写**的裸配置——`InnerConfig` 是 `#[serde(default)]`，
+    // 只写 protocols/directions/links/agents 也是一份合法的内环配置。
+    //
+    // 那种文件其实已经进不来（下面的 `recognized` 会拒：这些键和 `Config` 零
+    // 交集），但报出来的是「没有任何可识别的配置项」这句泛泛的话，而不是
+    // 「你导错地方了」。内环侧认子网用的是 11 个键的 `SUBNET_ONLY_KEYS`，
+    // 这边只认 3 个，说不上对称——补齐之后两边给的提示才一样准。
+    const INNER_ONLY_KEYS: [&str; 9] = [
+        "adb_path",
+        "board_iperf",
+        "serial",
+        "protocols",
+        "directions",
+        "links",
+        "agents",
+        "duration_secs",
+        "repeats",
+    ];
+    if raw.get("kind").and_then(|v| v.as_str()) == Some(crate::inner::config::PROJECT_KIND)
+        || INNER_ONLY_KEYS.iter().any(|key| raw.get(key).is_some())
+    {
+        return Err("这是内环配置，请在左侧内环测试中导入".into());
+    }
+    // 「文件里写没写这一项」和「写了个默认值」是两件事，而 `Config` 是
+    // `#[serde(default)]`：解析完就分不出来了。连接身份要按前者决定沿用还是
+    // 覆盖，所以趁 `raw` 还在，先把键的有无记下来。
+    let has_agent_port = raw.get("agent_port").is_some();
+    // 一个键都对不上的 JSON 不是 config.json。`Config` 不拒未知字段（`_说明`
+    // 这类注释键要能留着），于是 `{"nonsense":1}` 以前会**解析成功**：一份
+    // 毫不相干的文件被当成配置导入，返回 200，把整份配置刷成出厂默认值，
+    // 而界面上没有任何一句话提过。已知键取自 `Config` 自身的序列化结果，
+    // 加字段不用回来改这里。
+    let known_keys = match serde_json::to_value(Config::default()) {
+        Ok(serde_json::Value::Object(map)) => map,
+        _ => serde_json::Map::new(),
+    };
+    let recognized = raw
+        .as_object()
+        .is_some_and(|map| map.keys().any(|key| known_keys.contains_key(key)));
+    if !recognized {
+        return Err(
+            "这不是一份 config.json：里面没有任何可识别的配置项（至少要有 agent_host / iperf / tests 之类的一项）"
+                .into(),
+        );
+    }
+    let incoming: Config = serde_json::from_value(raw)
         .map_err(|error| format!("这不是一份能解析的 config.json：{error}"))?;
     let problems = incoming.validate();
     if !problems.is_empty() {
@@ -122,11 +170,36 @@ pub(super) fn api_import(console: &Arc<Console>, body: &str) -> Result<serde_jso
     let agent_token = state.cfg.agent_token.clone();
     let master = state.master.clone();
     let agent = state.agent.clone();
+    // 地址和端口是**一对**，得按同一条规矩处理：文件里没写就沿用当前值。
+    //
+    // 以前只有 host 有兜底（而且兜的是 `state.agent_host`，`cfg.agent_host`
+    // 照样被空串冲掉），port 什么都没有——导入一份手写 config.json（多半只写
+    // `agent_host` + `iperf`，见 config.minimal.json）就把端口悄悄打回默认
+    // 28801，host 却还是对的。下一轮测试报 `连接 127.0.0.1:28801 失败:
+    // Connection refused`，指着一个用户从没填过的端口，提示还让人去查防火墙。
+    let kept_host = state.cfg.agent_host.clone();
+    let kept_port = state.cfg.agent_port;
 
     state.cfg = Config {
         agent_token,
         ..incoming
     };
+    // 地址按**空不空**判断，不按键在不在：「没写这一项」和「写了个空串」对使用
+    // 者是同一件事（agent_token 早就是这么处理的）。只挡住前者的话，一份写了
+    // `"agent_host": ""` 的文件仍会把 cfg 清空，而下面那个 `if` 又让
+    // state.agent_host 留着旧值——界面显示的地址和真正拿去跑的地址不是一个，
+    // 正是这段注释要消除的分叉。
+    if state.cfg.agent_host.trim().is_empty() && !kept_host.trim().is_empty() {
+        state.cfg.agent_host = kept_host;
+        notices.push("文件里没有可用的 agent_host，沿用当前的辅测机地址。".into());
+    }
+    if !has_agent_port && kept_port != state.cfg.agent_port {
+        notices.push(format!(
+            "文件里没有 agent_port，沿用当前的辅测机端口 {kept_port}（未回落到默认 {}）。",
+            state.cfg.agent_port
+        ));
+        state.cfg.agent_port = kept_port;
+    }
     if !state.cfg.agent_host.trim().is_empty() {
         state.agent_host = state.cfg.agent_host.trim().to_string();
     }

@@ -54,6 +54,9 @@ pub fn read_counters(iface: &str) -> Result<(u64, u64), String> {
     }
     #[cfg(target_os = "linux")]
     {
+        if !linux_iface_component(iface) {
+            return Err(format!("Linux 网卡名 {iface:?} 不是安全的路径组件"));
+        }
         let base = std::path::Path::new("/sys/class/net")
             .join(iface)
             .join("statistics");
@@ -74,6 +77,16 @@ pub fn read_counters(iface: &str) -> Result<(u64, u64), String> {
         let _ = iface;
         Err("平台不支持网卡计数器".into())
     }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_iface_component(iface: &str) -> bool {
+    !iface.is_empty()
+        && iface.len() <= 15
+        && iface != "."
+        && iface != ".."
+        && !iface.chars().any(char::is_control)
+        && !iface.contains(['/', '\\'])
 }
 
 pub fn read_rx_bytes(iface: &str) -> Result<u64, String> {
@@ -1279,6 +1292,21 @@ en0        1500  192.168.8     192.168.8.100     9219567     - 9083840014  52962
             .unwrap_err();
         assert!(error.contains("lease_secs"));
         assert!(error.contains("过大"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_counter_reader_rejects_path_like_interface_names() {
+        for iface in ["../etc", "/proc", "a\\b", "..", ""] {
+            assert!(
+                !super::linux_iface_component(iface),
+                "{iface:?} must not be a sysfs path component"
+            );
+        }
+        assert!(super::linux_iface_component("eth0"));
+        assert!(super::read_counters("../etc")
+            .unwrap_err()
+            .contains("安全的路径组件"));
     }
 
     #[test]

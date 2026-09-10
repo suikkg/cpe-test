@@ -12,12 +12,15 @@ import PlanView from './views/plan/PlanView.vue';
 import RunView from './views/run/RunView.vue';
 import ProgressView from './views/progress/ProgressView.vue';
 import MonitorView from './views/monitor/MonitorView.vue';
+import InnerView from './views/inner/InnerView.vue';
+import { inner, loadInnerDraft, syncInnerStatus } from './state/inner';
 import RunsView from './views/runs/RunsView.vue';
 
 // 各区域的实时角标。旧页用「第几步」的编号来暗示进度，但那个编号是假的：
 // 「本机」不编号却常驻，第 3 步内部又自带一套 1·2·3·4。改成状态角标之后，
 // 导航栏说的是**现在是什么情况**，而不是**你应该走到第几步**。
 const badges = computed<Partial<Record<RegionId, string>>>(() => ({
+  inner: inner.status.running ? `${inner.status.completed}/${inner.status.total}` : '',
   local: masterNics.value.length ? `${masterNics.value.length} 网卡` : '',
   agent: agentNics.value.length ? `${agentNics.value.length} 网卡` : '',
   plan: plan.ui.bindings.length ? `${plan.ui.bindings.length} 项分配` : '',
@@ -46,14 +49,17 @@ const runLabel = computed(() => {
 });
 
 const navigationGroups = [
-  { label: '测试流程', regions: REGIONS.filter((r) => r.group === 'flow') },
+  { label: '子网测试', regions: REGIONS.filter((r) => r.group === 'flow') },
+  { label: '内环测试', regions: REGIONS.filter((r) => r.group === 'inner') },
   { label: '工具与记录', regions: REGIONS.filter((r) => r.group === 'tool') },
 ];
 const regionDescriptions: Record<RegionId, string> = {
+  inner: 'ADB 板侧与多电脑网口',
   local: '网卡与工具检查', agent: '连接与双端扫描', plan: '链路、配置与套件',
   run: '预览并开始测试', progress: '当前任务与日志', monitor: '实时网卡吞吐', runs: '报告与重新执行',
 };
 const regionIcons: Record<RegionId, string> = {
+  inner: 'M5 7h14 M15 3l4 4-4 4 M19 17H5 M9 13l-4 4 4 4',
   local: 'M3 4h18v12H3z M8 21h8 M12 16v5',
   agent: 'M5 3h14v6H5z M5 15h14v6H5z M12 9v6 M8 6h.01 M8 18h.01',
   plan: 'M9 5h12 M9 12h12 M9 19h12 M3 4h2v2H3z M3 11h2v2H3z M3 18h2v2H3z',
@@ -77,6 +83,8 @@ onMounted(() => {
   // 上，于是不路过那一页就永远不恢复：刷新之后直接点「执行」，看到的是一份
   // 出厂默认计划，而右边导航的角标还显示着上次的分配数。
   loadDraft();
+  loadInnerDraft();
+  void syncInnerStatus();
   // 先认一次「服务器上是不是已经有一轮在跑」。走的是轮询那同一个出口，
   // 不新开第二条链、不提高频率；读到在跑才把轮询接上。
   void syncStatus();
@@ -94,15 +102,16 @@ onMounted(() => {
       <div class="brand">
         <span class="brand-mark" aria-hidden="true">CPE</span>
         <div>
-          <h1>CPE 子网测试控制台</h1>
-          <p>双机链路测试 <span>Ping / iperf3</span></p>
+          <h1>{{ ui.region === 'inner' ? 'CPE 内环测试控制台' : 'CPE 子网测试控制台' }}</h1>
+          <p v-if="ui.region === 'inner'">板侧 LAN 吞吐测试 <span>ADB / iperf3</span></p><p v-else>双机链路测试 <span>Ping / iperf3</span></p>
         </div>
       </div>
       <div class="header-status">
-        <span class="status-readout" :class="{ connected: session.phase === 'connected' }">
+        <span v-if="ui.region !== 'inner'" class="status-readout" :class="{ connected: session.phase === 'connected' }">
           <i aria-hidden="true"></i>{{ connectionLabel }}
         </span>
-        <button type="button" class="run-status" :class="{ live: run.running }" @click="goto('progress')">
+        <span v-if="ui.region === 'inner'" class="status-readout">{{ inner.status.running ? '内环运行中' : inner.synced ? '内环空闲' : '内环状态待同步' }}</span>
+        <button v-else type="button" class="run-status" :class="{ live: run.running }" @click="goto('progress')">
           <i aria-hidden="true"></i>{{ runLabel }}
         </button>
         <button type="button" class="ghost theme-toggle" :aria-label="`切换主题，当前${themeLabel}`" @click="cycleTheme">
@@ -152,6 +161,7 @@ onMounted(() => {
         <ProgressView v-else-if="ui.region === 'progress'" />
         <MonitorView v-else-if="ui.region === 'monitor'" />
         <RunsView v-else-if="ui.region === 'runs'" />
+        <InnerView v-else-if="ui.region === 'inner'" />
       </main>
     </div>
   </div>

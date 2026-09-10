@@ -15,6 +15,8 @@ pub(super) struct UiState {
 }
 
 pub(super) struct Console {
+    pub(super) inner: crate::inner::webui::Controller,
+    pub(super) scenario: super::scenario::Controller,
     pub(super) state: Mutex<UiState>,
     pub(super) running: AtomicBool,
     /// 串行化新一轮的取消状态 reset 与停止请求，避免二者竞态覆盖。

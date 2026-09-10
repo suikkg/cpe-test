@@ -4,6 +4,32 @@
 //! 所以格式改动必须是自觉的——单独成模块就是为了让改动看得见。
 
 use super::*;
+use std::io::Write;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+pub(super) static SCREENSHOT_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+/// 标签部分的上限。
+///
+/// 主战场是 Windows，那里没开长路径支持时 `CreateFileW` 卡在整条路径 260 个字符。
+/// 这里的 `label` 是 `unit.title`——它由用户配置里的链路名拼出来，没有上限，
+/// 而其余几个拼进文件名的部分（`owner_id`、`tag`、`iface`）都是有界的。
+/// 名字太长时 `write_output_artifact` 只会记一行日志然后跳过，判定不受影响，
+/// 于是现场看到的是「Windows 上截图莫名其妙少了几张」，在 macOS 上永远复现不出来。
+///
+/// 截断不会撞名：文件名里带着进程内自增的 `seq`。
+const MAX_LABEL_IN_FILENAME: usize = 80;
+
+pub(super) fn screenshot_filename(label: &str, side: Side, seq: usize) -> String {
+    let tag = match side {
+        Side::Master => "_master",
+        Side::Agent => "_agent",
+    };
+    // `sanitize` 的输出是纯 ASCII（非 ASCII 一律换成 `_`），按字节截断即可。
+    let mut label = sanitize(label);
+    label.truncate(MAX_LABEL_IN_FILENAME);
+    format!("screenshot_{}{}_{}_{}.png", label, tag, now_compact(), seq)
+}
 
 pub(super) struct IperfRawArtifact<'a> {
     pub(super) owner_id: &'a str,
@@ -151,9 +177,17 @@ impl Ctx {
         }
         let full = self.outdir.join(filename);
         let tmp = self.outdir.join(format!(".{filename}.tmp"));
-        if let Err(error) =
-            std::fs::write(&tmp, contents).and_then(|_| std::fs::rename(&tmp, &full))
-        {
+        // 临时名可被本地进程预先放成符号链接；`std::fs::write` 会跟随它，
+        // 把一条普通的报告写入变成对任意目标文件的覆盖。先删掉旧临时项，
+        // 再用 create_new 建立新文件，竞争时宁可这条旁路产物失败，也不跟链。
+        let _ = std::fs::remove_file(&tmp);
+        let result = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .and_then(|mut file| file.write_all(contents.as_bytes()))
+            .and_then(|_| std::fs::rename(&tmp, &full));
+        if let Err(error) = result {
             let _ = std::fs::remove_file(&tmp);
             logln(&format!(
                 "    [{label}] 写入失败 {}: {error}",
@@ -291,18 +325,21 @@ impl Ctx {
                     }
                 }
             };
-            let (tag, ref mut out_path) = match side {
-                Side::Master => ("_master", &mut master),
-                Side::Agent => ("_agent", &mut agent),
+            let out_path = match side {
+                Side::Master => &mut master,
+                Side::Agent => &mut agent,
             };
-            let fname = format!(
-                "screenshot_{}{}_{}.png",
-                sanitize(label),
-                tag,
-                now_compact()
-            );
+            let fname =
+                screenshot_filename(label, *side, SCREENSHOT_SEQ.fetch_add(1, Ordering::Relaxed));
             let full = self.outdir.join(&fname);
-            if let Err(e) = std::fs::write(&full, &png) {
+            // 截图名由当前时间组成但仍是可预测的；create_new 不会跟随同名
+            // 符号链接。截图属于旁路证据，冲突时跳过而不影响测试判定。
+            let write_result = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&full)
+                .and_then(|mut file| file.write_all(&png));
+            if let Err(e) = write_result {
                 logln(&format!(
                     "    [截图] {}端截图写入失败 {}: {e}",
                     side.cn(),

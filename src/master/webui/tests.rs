@@ -1962,6 +1962,8 @@ fn bootstrap_reports_token_presence_without_exposing_the_secret() {
     let mut state = state_with_pair();
     state.cfg.agent_token = "do-not-send-to-the-page".into();
     let console = Arc::new(Console {
+        inner: Default::default(),
+        scenario: Default::default(),
         state: Mutex::new(state),
         running: AtomicBool::new(false),
         run_gate: Mutex::new(()),
@@ -1974,6 +1976,37 @@ fn bootstrap_reports_token_presence_without_exposing_the_secret() {
     assert_eq!(value["token_configured"], true);
     assert!(value.get("agent_token").is_none());
     assert!(!value.to_string().contains("do-not-send-to-the-page"));
+}
+
+#[test]
+fn connect_rejects_an_invalid_agent_token_before_changing_state() {
+    let state = state_with_pair();
+    let console = Arc::new(Console {
+        inner: Default::default(),
+        scenario: Default::default(),
+        state: Mutex::new(state),
+        running: AtomicBool::new(false),
+        run_gate: Mutex::new(()),
+        report: Mutex::new(String::new()),
+        ui_token: String::new(),
+        monitors: Mutex::new(HashMap::new()),
+        run_status: Arc::new(RunStatusRecorder::new()),
+    });
+
+    let error = api_connect(&console, r#"{"host":"10.0.0.2","token":"bad\n"}"#)
+        .expect_err("控制字符令牌应在联网前被拒绝");
+    assert!(error.contains("控制字符"), "{error}");
+    assert_eq!(lock_recover(&console.state).cfg.agent_token, "cpetest");
+
+    let error = api_connect(
+        &console,
+        r#"{"host":"10.0.0.2\nHost: injected","token":"ok"}"#,
+    )
+    .expect_err("控制字符地址应在联网前被拒绝");
+    assert!(
+        error.contains("agent_host") && error.contains("控制字符"),
+        "{error}"
+    );
 }
 
 /// 界面留空不能把配置文件里的既有档位清成空列表。
@@ -2196,6 +2229,8 @@ fn the_console_decides_clipping_regardless_of_the_config_file() {
 
 fn console_with(state: UiState) -> Arc<Console> {
     Arc::new(Console {
+        inner: Default::default(),
+        scenario: Default::default(),
         state: Mutex::new(state),
         running: AtomicBool::new(false),
         run_gate: Mutex::new(()),
@@ -2208,6 +2243,26 @@ fn console_with(state: UiState) -> Arc<Console> {
 
 fn console_for_monitor_tests() -> Arc<Console> {
     console_with(state_with_pair())
+}
+
+#[test]
+fn inner_import_and_stop_leave_the_subnet_configuration_and_run_untouched() {
+    let console = console_for_monitor_tests();
+    let before = serde_json::to_string(&lock_recover(&console.state).cfg).unwrap();
+    let error = api_import(&console, include_str!("../../../inner.example.json")).unwrap_err();
+    assert!(error.contains("内环"));
+    assert_eq!(
+        before,
+        serde_json::to_string(&lock_recover(&console.state).cfg).unwrap()
+    );
+    console.running.store(true, Ordering::SeqCst);
+    console.inner.stop();
+    assert!(console.running.load(Ordering::SeqCst));
+    console.running.store(false, Ordering::SeqCst);
+    console.inner.set_running_for_test(true);
+    assert!(api_run(&console, "{}").unwrap_err().contains("内环"));
+    console.inner.set_running_for_test(false);
+    assert!(!console.inner.is_running());
 }
 
 /// 环形缓冲挤掉旧点之后，游标必须还指得对。
@@ -2357,6 +2412,8 @@ fn monitoring_starts_while_a_run_is_in_flight_and_reports_a_bad_interface() {
 #[test]
 fn the_console_token_gate_covers_both_the_page_and_the_api() {
     let console = Arc::new(Console {
+        inner: Default::default(),
+        scenario: Default::default(),
         state: Mutex::new(state_with_pair()),
         running: AtomicBool::new(false),
         run_gate: Mutex::new(()),
@@ -2445,6 +2502,8 @@ fn raw_get(port: u16, path: &str, headers: &[(&str, &str)]) -> (u16, String) {
 #[test]
 fn refreshing_the_console_page_keeps_the_session_but_the_api_still_needs_the_header() {
     let console = Arc::new(Console {
+        inner: Default::default(),
+        scenario: Default::default(),
         state: Mutex::new(state_with_pair()),
         running: AtomicBool::new(false),
         run_gate: Mutex::new(()),
@@ -3797,6 +3856,109 @@ fn importing_a_file_without_a_token_keeps_the_loaded_one() {
     cfg.agent_token = "from-file".into();
     api_import(&console, &serde_json::to_string(&cfg).unwrap()).unwrap();
     assert_eq!(lock_recover(&console.state).cfg.agent_token, "from-file");
+}
+
+/// 连接身份是**一对**：文件里没写地址和端口时，两个都得沿用当前值。
+///
+/// 回归的是一次真实事故：连上 28899 之后导入一份手写 config.json（只写了
+/// `agent_host` + `iperf`，就是 config.minimal.json 的样子），端口被悄悄打回
+/// 默认 28801，host 却还是对的。下一轮测试报 `Connection refused`，指着一个
+/// 用户从没填过的端口，提示还让人去查防火墙——错的地方和被指的地方对不上。
+#[test]
+fn importing_a_file_without_a_port_keeps_the_connected_one() {
+    let mut state = state_with_pair();
+    state.cfg.agent_host = "10.0.0.2".into();
+    state.cfg.agent_port = 28899;
+    let console = console_with(state);
+
+    let out = api_import(
+        &console,
+        r#"{"agent_host":"10.0.0.2","iperf":{"duration":180}}"#,
+    )
+    .expect("最小配置要能导入");
+    assert_eq!(
+        lock_recover(&console.state).cfg.agent_port,
+        28899,
+        "文件里没有 agent_port，不能把已连上的端口打回默认值"
+    );
+    assert!(
+        out["notices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|n| n.as_str().unwrap().contains("agent_port")),
+        "沿用旧端口要说一声，别让人以为文件里写了什么"
+    );
+
+    // 文件里写了端口就以文件为准：那才是这份配置连得上的那台。
+    api_import(&console, r#"{"agent_host":"10.0.0.2","agent_port":28777}"#).unwrap();
+    assert_eq!(lock_recover(&console.state).cfg.agent_port, 28777);
+
+    // 地址同理，而且 cfg 和 state 两处都要留住（以前只兜住了 state 那份）。
+    // 「没写这一项」和「写了个空串」必须同样对待：只挡住前者的话，cfg 被清空
+    // 而 state 留着旧值，界面显示的地址和真正拿去跑的地址就不是一个了。
+    for body in [
+        r#"{"iperf":{"duration":180}}"#,
+        r#"{"agent_host":"","iperf":{"duration":180}}"#,
+        r#"{"agent_host":"   ","iperf":{"duration":180}}"#,
+    ] {
+        api_import(&console, body).unwrap();
+        let state = lock_recover(&console.state);
+        assert_eq!(
+            state.cfg.agent_host, "10.0.0.2",
+            "cfg 里的地址不能被冲掉：{body}"
+        );
+        assert_eq!(state.agent_host, "10.0.0.2", "{body}");
+    }
+}
+
+/// 内环的裸配置也要被认出来，而不是掉进「没有任何可识别的配置项」那句泛话。
+///
+/// `InnerConfig` 是 `#[serde(default)]`，一份只写 protocols/directions/links
+/// 的文件同样是合法内环配置；它的键和 `Config` 零交集，所以本来也进不来，
+/// 但提示得说清楚是导错了地方，跟内环侧认子网的那 11 个键对称。
+#[test]
+fn a_bare_inner_config_is_named_as_such_not_dismissed_as_unrecognizable() {
+    let console = console_with(state_with_pair());
+    for body in [
+        r#"{"protocols":["tcp"],"directions":["upload"],"links":[],"agents":[]}"#,
+        r#"{"duration_secs":20,"repeats":3}"#,
+        r#"{"adb_path":"adb"}"#,
+        r#"{"serial":"0123456789ABCDEF"}"#,
+    ] {
+        let error = api_import(&console, body).expect_err("内环配置不能进子网");
+        assert!(error.contains("内环"), "{body} → {error}");
+    }
+    // 子网自己的配置不能被这套形状判断误伤。
+    let cfg = config_from_request(&state_with_pair(), &request()).expect("配置应能合并");
+    api_import(&console, &serde_json::to_string(&cfg).unwrap()).expect("子网配置照常导入");
+}
+
+/// 一个键都对不上的 JSON 不是配置文件，不能「导入成功」还顺手刷成默认值。
+#[test]
+fn importing_an_unrelated_json_is_refused_instead_of_resetting_everything() {
+    let mut state = state_with_pair();
+    state.cfg.agent_port = 28899;
+    let console = console_with(state);
+
+    for body in [r#"{"nonsense":1}"#, "{}", r#"{"名字":"张三","年龄":30}"#] {
+        let error = api_import(&console, body).expect_err("不相干的 JSON 必须拒绝");
+        assert!(error.contains("config.json"), "{error}");
+        assert_eq!(
+            lock_recover(&console.state).cfg.agent_port,
+            28899,
+            "被拒的导入不能动现有状态：{body}"
+        );
+    }
+
+    // `_说明` 这类注释键不算「可识别」，但只要还有一个真配置项就照收——
+    // config.minimal.json 就长这样。
+    api_import(
+        &console,
+        r#"{"_说明":"最小可用配置","agent_host":"10.0.0.9"}"#,
+    )
+    .expect("带注释键的最小配置仍要能导入");
+    assert_eq!(lock_recover(&console.state).cfg.agent_host, "10.0.0.9");
 }
 
 /// 导入的是**配置**，不是「一份差不多的 JSON」。看不懂要当场说清。
@@ -5663,6 +5825,7 @@ fn a_symlink_in_the_runs_directory_is_not_a_run() {
     std::os::unix::fs::symlink(&outside, &link).unwrap();
 
     let resolved = resolve_run_dir(&name);
+    let listed = super::runs::api_runs().expect("列历史不该失败");
     let _ = std::fs::remove_file(&link);
     let _ = std::fs::remove_dir_all(&outside);
 
@@ -5670,6 +5833,14 @@ fn a_symlink_in_the_runs_directory_is_not_a_run() {
         resolved.is_none(),
         "`runs/` 下的符号链接被当成了 run 目录（解析到 {resolved:?}）。\
          下载报告包会把链接目标整个打进 zip——本地写一个链接就换来远程读任意文件"
+    );
+    assert!(
+        !listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["id"] == name),
+        "历史列表不应把 runs/ 下的符号链接列成运行记录：{listed:?}"
     );
 }
 
@@ -5691,6 +5862,19 @@ fn a_symlink_inside_a_run_directory_is_not_bundled() {
     std::fs::write(dir.join("report.html"), "<html>真实产物</html>").unwrap();
     std::os::unix::fs::symlink(&outside, dir.join("escape")).unwrap();
     std::os::unix::fs::symlink(outside.join("secret.txt"), dir.join("secret-link.txt")).unwrap();
+
+    let listed = super::runs::api_runs().expect("列历史不该失败");
+    let entry = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["id"] == name)
+        .expect("真实 run 目录必须出现在历史列表");
+    assert_eq!(
+        entry["bytes"],
+        std::fs::metadata(dir.join("report.html")).unwrap().len(),
+        "历史大小不能跟随目录内的链接统计外部文件"
+    );
 
     let bundle = super::runs::build_bundle(&dir, &name).expect("真实 run 目录应能打包");
     let names: Vec<String> = {
@@ -5743,6 +5927,8 @@ fn raw_post(port: u16, path: &str, token: &str, body: &str) -> (u16, String) {
 
 fn spawn_console(token: &str) -> (u16, Arc<Server>, std::thread::JoinHandle<()>) {
     let console = Arc::new(Console {
+        inner: Default::default(),
+        scenario: Default::default(),
         state: Mutex::new(state_with_pair()),
         running: AtomicBool::new(false),
         run_gate: Mutex::new(()),
@@ -5761,6 +5947,45 @@ fn spawn_console(token: &str) -> (u16, Arc<Server>, std::thread::JoinHandle<()>)
         }
     });
     (port, server, thread)
+}
+
+#[test]
+fn unauthenticated_posts_are_rejected_before_requesting_the_body() {
+    use std::io::{BufRead, Write};
+    let (port, server, thread) = spawn_console("unit-secret");
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    // 旧实现会先发 100 Continue 并等待正文，占住一个控制台 worker。
+    stream.write_all(b"POST /api/inner/run HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1000000\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n").unwrap();
+    let mut reader = std::io::BufReader::new(stream);
+    let mut line = String::new();
+    let result = reader.read_line(&mut line);
+    drop(reader);
+    server.unblock();
+    thread.join().unwrap();
+    result.unwrap();
+    assert!(line.contains("401"), "必须先拒绝鉴权，实际响应：{line}");
+}
+
+#[test]
+fn invalid_utf8_request_bodies_are_rejected_instead_of_running_an_empty_command() {
+    use std::io::{Read, Write};
+    let (port, server, thread) = spawn_console("unit-secret");
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    stream.write_all(b"POST /api/stop HTTP/1.1\r\nHost: localhost\r\nX-CPE-Token: unit-secret\r\nX-CPE-Console: 1\r\nContent-Length: 1\r\nConnection: close\r\n\r\n\xff").unwrap();
+    let mut text = String::new();
+    let result = stream.read_to_string(&mut text);
+    drop(stream);
+    server.unblock();
+    thread.join().unwrap();
+    result.unwrap();
+    assert!(text.starts_with("HTTP/1.1 400"), "{text}");
+    assert!(text.contains("读取请求体失败"));
 }
 
 /// **请求体上限：刚好能用，超了要说清，而且绝不按截断后的内容动手**
@@ -5914,4 +6139,219 @@ fn a_post_without_the_console_header_is_refused_before_it_reaches_any_route() {
 
     server.unblock();
     let _ = thread.join();
+}
+
+/// 控制台的 HTTP 面必须**逐条**声明它的并发类别。
+///
+/// 起测/停测/探测这几类入口共用 `console.run_gate`；历史上漏过三处——普通内环
+/// `stop`、内环 `probe`、Ctrl+C 收尾——每一处都表现为「停止信号被下一轮吞掉」
+/// 或「探测进行中被另一请求拉起控制器」。这类漏洞普通测试抓不到：单独调用每个
+/// 端点都正常，只有在两个请求恰好交错时才错。
+///
+/// 所以把清单钉死：**新增任何一条路由都会让这个测试变红**，作者必须回答一句
+/// 「它属于哪一类」，而不是默认落进「不需要门」。这跟
+/// `every_config_field_is_either_snapshotted_or_deliberately_local` 是同一招。
+#[test]
+fn every_console_route_declares_its_concurrency_class() {
+    // gated：会启动/停止/占用被测资源，必须在 `console.run_gate` 里做 admission check。
+    let gated = [
+        "/api/run",
+        "/api/stop",
+        "/api/inner/run",
+        "/api/inner/stop",
+        "/api/inner/probe",
+        "/api/scenario/run",
+        "/api/scenario/stop",
+    ];
+    // readonly：只读当前状态或历史，与门无关。
+    let readonly = [
+        "/api/bootstrap",
+        "/api/local",
+        "/api/progress",
+        "/api/open-report",
+        "/api/monitor/samples",
+        "/api/runs",
+        "/api/runs/",
+        "/api/runs/request",
+        "/api/runs/report",
+        "/api/inner/status",
+        "/api/inner/report",
+        "/api/inner/runs",
+        "/api/inner/runs/report",
+        "/api/inner/runs/config",
+        "/api/inner/plan",
+        "/api/scenario/status",
+        "/api/scenario/runs",
+        "/api/scenario/runs/request",
+    ];
+    // stateful：改控制台状态但不起测。跑测期间改这些只影响界面显示——
+    // `api_run_impl` 在起线程前就把 `cfg` 快照下来了，执行线程不再读 `console.state`。
+    // 这条注释是这几个端点不加门的**理由**；哪天执行线程开始回读 state，
+    // 它们就必须搬进 `gated`。
+    let stateful = [
+        "/api/connect",
+        "/api/config",
+        "/api/import",
+        "/api/plan",
+        "/api/monitor/start",
+        "/api/monitor/stop",
+    ];
+    // 路由前缀，不是端点本身。
+    let prefixes = ["/api/inner/"];
+
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/master/webui/http.rs");
+    let text = std::fs::read_to_string(&source).expect("读 http.rs");
+    let production = text
+        .split_once("#[cfg(test)]")
+        .map(|(head, _)| head)
+        .unwrap_or(&text);
+
+    let mut found: Vec<String> = Vec::new();
+    let mut rest = production;
+    while let Some(start) = rest.find("\"/api/") {
+        let after = &rest[start + 1..];
+        if let Some(end) = after.find('"') {
+            found.push(after[..end].to_string());
+            rest = &after[end..];
+        } else {
+            break;
+        }
+    }
+    found.sort();
+    found.dedup();
+
+    let mut declared: Vec<String> = gated
+        .iter()
+        .chain(readonly.iter())
+        .chain(stateful.iter())
+        .chain(prefixes.iter())
+        .map(|s| s.to_string())
+        .collect();
+    declared.sort();
+    declared.dedup();
+
+    let undeclared: Vec<_> = found.iter().filter(|r| !declared.contains(r)).collect();
+    assert!(
+        undeclared.is_empty(),
+        "新路由没有声明并发类别：{undeclared:#?}\n\
+         它会起测/停测/占用被测资源吗？会 → 放进 gated 并在 run_gate 里做 admission check；\n\
+         只读 → readonly；只改控制台状态 → stateful（并确认执行线程不回读 state）。"
+    );
+    let vanished: Vec<_> = declared.iter().filter(|r| !found.contains(r)).collect();
+    assert!(
+        vanished.is_empty(),
+        "清单里的路由在 http.rs 里没有了：{vanished:#?}"
+    );
+
+    // 清单本身不能只是文档：实现这道门的三个文件必须都还引用着 run_gate。
+    // 门不全在 http.rs——`/api/run`、`/api/stop` 的在 `api.rs`，
+    // `/api/scenario/*` 的在 `scenario.rs`，所以按文件逐个查，不数总次数。
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/master/webui");
+    for (file, why) in [
+        (
+            "http.rs",
+            "内环 run/stop/probe 与 scenario/run 的 admission check",
+        ),
+        ("api.rs", "子网 /api/run 与 /api/stop 的 admission check"),
+        ("scenario.rs", "组合场景 start/stop 的互斥"),
+    ] {
+        let text = std::fs::read_to_string(root.join(file)).expect("读 webui 源码");
+        let production = text
+            .split_once("#[cfg(test)]")
+            .map(|(head, _)| head)
+            .unwrap_or(&text);
+        assert!(
+            production.contains("run_gate"),
+            "{file} 的生产代码里不再引用 run_gate —— {why} 没了"
+        );
+    }
+}
+
+/// 采样线程起不来时，不能留下一条**永远回收不掉**的会话。
+///
+/// `reap_dead_monitors` 的规则是「`running == true` 就留着」——它假设总有一条
+/// 线程在结束时把这个标记翻成 false。会话记录以前在 `Builder::spawn` 之前就填好了
+/// `running: true`，而两个 spawn helper 都写成 `let _ = ...`，把失败吞掉之后照样
+/// 注册会话并回 `started`。线程真起不来时（灌线速的机器上线程耗尽不是假设——
+/// AGENTS.md 里写着「跑测试时机器正在灌线速」），那条会话就永久占着 8 个槽位
+/// 里的一个，界面上还显示「运行中、没有错误」。
+///
+/// 现在起线程失败会在注册之前直接报错。这个测试守的是**顺序**：任何一条
+/// 起不来的路径都不许在 `console.monitors` 里留下痕迹。
+#[test]
+fn a_monitor_that_cannot_start_leaves_no_unreapable_session() {
+    let console = console_for_monitor_tests();
+    for (body, why) in [
+        (r#"{"side":"nowhere","iface":"eth0"}"#, "未知的监控端"),
+        (r#"{"side":"master","iface":"  "}"#, "空网卡名"),
+    ] {
+        let error = api_monitor_start(&console, body).unwrap_err();
+        assert!(!error.is_empty(), "{why} 应该报错");
+        assert!(
+            lock_recover(&console.monitors).is_empty(),
+            "{why}：起不来的会话不许进 monitors，否则 reap_dead_monitors 永远清不掉它"
+        );
+    }
+
+    // 两个 spawn helper 必须把 `Builder::spawn` 的失败交出来。写回 `let _ =`
+    // 不会让任何普通测试变红——它只是把上面那条顺序悄悄废掉。
+    let source =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/master/webui/monitor.rs");
+    let text = std::fs::read_to_string(&source).expect("读 monitor.rs");
+    let production = text
+        .split_once("#[cfg(test)]")
+        .map(|(head, _)| head)
+        .unwrap_or(&text);
+    for helper in ["fn spawn_local_monitor", "fn spawn_agent_monitor"] {
+        let at = production
+            .find(helper)
+            .unwrap_or_else(|| panic!("{helper} 没了"));
+        let head = &production[at..];
+        let signature_end = head.find('{').unwrap_or(head.len());
+        assert!(
+            head[..signature_end].contains("std::io::Result<()>"),
+            "{helper} 必须把起线程的失败返回给调用方，不能吞成 ()"
+        );
+    }
+}
+
+/// 受理新场景时清取消位，必须发生在互斥检查**之后**。
+///
+/// 背景：子网阶段的「停止」和 Ctrl+C 共用同一枚进程级取消位，它是单向信号，
+/// 一轮结束后不会自动清零。场景线程在启动第一阶段前会检查这枚位，所以不清
+/// 就会让下一个场景一起步就被判成「已取消」。修法是在正式受理时 `reset()`。
+///
+/// 但顺序要紧：`reset()` 若跑到互斥检查前面，一次**被拒绝**的启动
+/// （已有测试在跑）就会顺手把正在进行中的那次停止信号抹掉——按停止的人
+/// 会看到测试若无其事地跑下去。
+///
+/// 为什么是源码顺序断言而不是行为测试：取消位是进程级全局量，而这里 770 个
+/// 测试是并行跑的。在测试里把它置起来，会让同时在跑的 executor 用例随机看到
+/// 「已取消」而提前收尾——用一条会制造随机失败的测试去守一条并发不变量，
+/// 得不偿失。
+#[test]
+fn accepting_a_scenario_clears_the_stale_cancel_bit_only_after_the_mutex_check() {
+    let source =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/master/webui/scenario.rs");
+    let text = std::fs::read_to_string(&source).expect("读 scenario.rs");
+    let production = text
+        .split_once("#[cfg(test)]")
+        .map(|(head, _)| head)
+        .unwrap_or(&text);
+    let start_at = production
+        .find("pub(super) fn start")
+        .or_else(|| production.find("fn start"))
+        .expect("scenario::start 没了");
+    let body = &production[start_at..];
+
+    let guard = body
+        .find("return Err(\"已有测试或组合场景正在运行\".into());")
+        .expect("互斥检查的错误分支没了——它是这条顺序的锚点");
+    let reset = body
+        .find("crate::cancel::reset();")
+        .expect("受理新场景时不再清取消位：下一个场景会一起步就被判成「已取消」");
+    assert!(
+        guard < reset,
+        "cancel::reset() 跑到了互斥检查前面：一次被拒绝的启动会抹掉正在进行中的停止信号"
+    );
 }

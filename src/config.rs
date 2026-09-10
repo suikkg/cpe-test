@@ -18,10 +18,41 @@ use std::path::{Path, PathBuf};
 /// 两条启动路径行为不一致。
 pub const DEFAULT_TOKEN: &str = "cpetest";
 
+/// agent 令牌最终会进入 HTTP `Authorization` 头；上限防止误填超长值把
+/// 每次控制请求膨胀成无意义的大头部，控制字符则不能穿过 HTTP 头边界。
+pub(crate) const MAX_AGENT_TOKEN_BYTES: usize = 4096;
+pub(crate) const MAX_AGENT_ADDRESS_BYTES: usize = 256;
+
+pub(crate) fn validate_agent_address_for_http(address: &str) -> Result<(), String> {
+    if address.len() > MAX_AGENT_ADDRESS_BYTES {
+        return Err(format!(
+            "agent_host 超过 HTTP 主机地址上限（{} 字节）",
+            MAX_AGENT_ADDRESS_BYTES
+        ));
+    }
+    if address.chars().any(char::is_control) {
+        return Err("agent_host 不能包含控制字符（含换行、回车或 NUL）".into());
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_agent_token_for_http(token: &str) -> Result<(), String> {
+    if token.len() > MAX_AGENT_TOKEN_BYTES {
+        return Err(format!(
+            "agent_token 超过 HTTP 令牌上限（{} 字节）",
+            MAX_AGENT_TOKEN_BYTES
+        ));
+    }
+    if token.chars().any(char::is_control) {
+        return Err("agent_token 不能包含控制字符（含换行、回车或 NUL）".into());
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    /// 辅测机管理口 IP（留空则交互询问）
+    /// 辅测机管理口 IP（留空则交互询问）；发往 agent 的 Host 头最多 256 字节，不能含控制字符。
     pub agent_host: String,
     pub agent_port: u16,
     /// 与辅测 agent 之间的共享访问令牌。默认 [`DEFAULT_TOKEN`]。
@@ -32,6 +63,7 @@ pub struct Config {
     /// 显式写成空串才会关闭认证（仅建议完全隔离的测试网）。注意 serde 的
     /// `default` 只在**字段缺失**时生效：配置文件里写了 `"agent_token": ""`
     /// 就是明确要求关闭认证，不会回落到默认口令。
+    /// 令牌最多 4096 字节且不能含控制字符，否则不会发出 HTTP 请求。
     #[serde(default)]
     pub agent_token: String,
     /// agent 监听地址；默认 0.0.0.0。可设为 127.0.0.1 或测试网卡 IP 收紧暴露面。
@@ -821,6 +853,13 @@ impl Config {
         let rc = &self.iperf.rate_check;
         let duration = self.iperf.duration;
 
+        if let Err(problem) = validate_agent_address_for_http(&self.agent_host) {
+            problems.push(problem);
+        }
+        if let Err(problem) = validate_agent_token_for_http(&self.agent_token) {
+            problems.push(problem);
+        }
+
         if self.agent_port == 0 {
             problems.push("agent_port 必须在 1..=65535 之间，不能为 0".into());
         }
@@ -1270,6 +1309,25 @@ mod tests {
             .validate()
             .iter()
             .any(|p| p.contains("cpe_path_ceiling_mbps")));
+
+        let bad_host = Config {
+            agent_host: "bad\r\nHost: injected".into(),
+            ..Config::default()
+        };
+        assert!(bad_host
+            .validate()
+            .iter()
+            .any(|p| p.contains("agent_host") && p.contains("控制字符")));
+        let bad_token = Config {
+            agent_token: "bad\r\n".into(),
+            ..Config::default()
+        };
+        assert!(bad_token.validate().iter().any(|p| p.contains("控制字符")));
+        let too_long_token = Config {
+            agent_token: "x".repeat(MAX_AGENT_TOKEN_BYTES + 1),
+            ..Config::default()
+        };
+        assert!(too_long_token.validate().iter().any(|p| p.contains("上限")));
     }
 
     #[test]

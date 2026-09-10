@@ -340,15 +340,31 @@ fn handle(mut rq: Request, st: &Arc<AgentState>) {
     // 超限请求会被**静默截断**，而截断后的 JSON 未必不合法——那时 agent 会按一份
     // 它没读完的请求去起进程。主控侧同一个写法已经证实能让 `/api/import` 静默
     // 导入截断后的配置，这里的后果是启停指令本身被改写。
-    let (body, oversized) = {
+    let (body, oversized, read_error) = {
         let mut limited = rq.as_reader().take(MAX_BODY + 1);
         let mut bytes = Vec::new();
-        let _ = limited.read_to_end(&mut bytes);
+        let read_error = limited.read_to_end(&mut bytes).err();
         let oversized = bytes.len() as u64 > MAX_BODY;
         let text = String::from_utf8(bytes)
             .unwrap_or_else(|error| String::from_utf8_lossy(error.as_bytes()).into_owned());
-        (text, oversized)
+        (text, oversized, read_error)
     };
+    if let Some(error) = read_error {
+        let resp_body = err_json(&format!("读取请求体失败: {error}"));
+        st.activity
+            .record(&peer, url.split('?').next().unwrap_or(&url), false);
+        let header = Header::from_bytes(
+            &b"Content-Type"[..],
+            &b"application/json; charset=utf-8"[..],
+        )
+        .expect("header");
+        let _ = rq.respond(
+            Response::from_data(resp_body.into_bytes())
+                .with_status_code(400)
+                .with_header(header),
+        );
+        return;
+    }
     if oversized {
         let resp_body = err_json(&format!(
             "请求体超过 {} MiB 上限，已拒绝；没有按截断后的内容执行任何操作",

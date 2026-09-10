@@ -5,6 +5,10 @@ use crate::clock::MonotonicClock;
 use crate::clock::{ManualClock, SystemClock};
 use crate::cmd::ctstraffic;
 use crate::cmd::iperf::{self, IperfClientJobMgr, IperfServerMgr};
+use crate::cmd::iperf_window::{
+    iperf_active_interval, iperf_baseline_cutoff_ms, iperf_effective_window, iperf_interval_ms,
+    WINDOW_COMPLETE_TOLERANCE_MS,
+};
 use crate::cmd::tools::{find_ctstraffic, find_iperf3};
 use crate::config::{Config, RateCheckCfg, RateMode};
 use crate::http_client;
@@ -41,17 +45,6 @@ use std::time::{Duration, Instant};
 /// 放在 builder 里会让人以为它参与单元展开或 resume identity（都不参与）。
 const SINGLE_UDP_MIN_ATTEMPTS: u64 = 3;
 const UDP_SERVER_START_RETRIES: usize = 1;
-/// 认定「这条流还活着」时允许的事件间隔。与窗口完整性无关，别混用。
-const FLOW_TIMELINE_TOLERANCE_MS: u64 = 2_000;
-/// **有效窗口是否算完整**时允许的收尾误差，三条链共用（ADR-12）。
-///
-/// 名字里没有后端：它以前叫 `CTS_TIMELINE_TOLERANCE_MS`，而 iperf 路径也在用
-/// 它——「iperf 用着一个名叫 CTS 的常量」本身就是这层已经分叉的症状。
-///
-/// 更要紧的是 UDP 路径**根本没用它**（零容差）：一条跑了 179.95 秒、要求 180 秒
-/// 的 UDP 腿判 `EFFECTIVE_WINDOW_SHORT`，而同样的 TCP 腿 PASS。50 毫秒的收尾
-/// 差异不是测量事实的差异，是三条链各自决定容差的结果。
-const WINDOW_COMPLETE_TOLERANCE_MS: u64 = 100;
 const RESOURCE_LEASE_GRACE_SECS: u64 = 300;
 const RELIABLE_HTTP_ATTEMPTS: usize = 3;
 const RELIABLE_HTTP_RETRY_DELAY: Duration = Duration::from_millis(250);
@@ -601,6 +594,10 @@ impl Ctx {
                                 reason_detail: detail,
                                 ..unit_row(unit, useq, "跳过(网卡已消失)")
                             });
+                            // 这条路径不会进入下面的普通 unit 收尾，但它已经是一个
+                            // 完整的处理结果；否则进程若此刻退出，增量 JSONL 会漏掉
+                            // 这条「网卡消失」记录，重放报告与进度页不一致。
+                            self.persist_new_rows();
                             // 同上：这条 `continue` 也绕过了 unit_finished。
                             self.notify(|observer| {
                                 observer.unit_finished(
@@ -650,6 +647,9 @@ impl Ctx {
                         ),
                         ..unit_row(unit, useq, format!("跳过(上次PASS: {t})"))
                     });
+                    // RESUME 跳过也是已经处理完的单元；不能因为没有起流就让
+                    // 增量 JSONL 少这一行，尤其是长队列中途崩溃时。
+                    self.persist_new_rows();
                     // 这条路径 `continue` 掉了，不会走到下面那个 unit_finished，
                     // 所以在这里补一次——进度页上「跳过」也是一个已完成单元。
                     self.notify(|observer| {

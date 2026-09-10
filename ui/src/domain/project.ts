@@ -1,3 +1,4 @@
+import { INNER_KIND } from './inner';
 import { ensureDefaults, type UiPlan, type UiRecipe, type UiRecipeProfile } from './plan-build';
 import type { UiBinding, UiLinkSet, UiPairRef, UiSuite, UiTask } from './plan-build';
 import {
@@ -578,6 +579,9 @@ export function parseProject(text_: string): ParseResult {
     return { ok: false, error: '项目文件的顶层必须是一个对象', notices };
   }
   const file = raw as Record<string, unknown>;
+  if (file.kind === INNER_KIND || 'adb_path' in file || 'board_iperf' in file) {
+    return { ok: false, error: '这是内环配置，请在左侧内环测试中导入', notices };
+  }
 
   if (typeof file.project_version !== 'number' || !Number.isFinite(file.project_version)) {
     return { ok: false, error: '缺少 project_version', notices };

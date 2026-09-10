@@ -3,13 +3,13 @@ import type { VerdictFilter } from '../domain/progress';
 
 /** 左侧导航的区域标识。旧页用 1–5 的向导编号，但流程本来就不是严格线性的
  *  （「本机」不编号却常驻，第 3 步内部又自带 1·2·3·4），所以这里改用具名区域。 */
-export type RegionId = 'local' | 'agent' | 'plan' | 'run' | 'progress' | 'monitor' | 'runs';
+export type RegionId = 'local' | 'agent' | 'plan' | 'run' | 'progress' | 'monitor' | 'runs' | 'inner';
 
 export interface RegionDef {
   id: RegionId;
   label: string;
   /** 分组：测试流程 / 独立工具。监控和「一轮测试」正交，不属于流程。 */
-  group: 'flow' | 'tool';
+  group: 'flow' | 'tool' | 'inner';
 }
 
 export const REGIONS: readonly RegionDef[] = [
@@ -18,6 +18,7 @@ export const REGIONS: readonly RegionDef[] = [
   { id: 'plan', label: '测试计划', group: 'flow' },
   { id: 'run', label: '执行', group: 'flow' },
   { id: 'progress', label: '进度', group: 'flow' },
+  { id: 'inner', label: '内环测试', group: 'inner' },
   { id: 'monitor', label: '监控', group: 'tool' },
   { id: 'runs', label: '历史运行', group: 'tool' },
 ];

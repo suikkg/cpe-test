@@ -180,6 +180,8 @@ pub(super) fn configured_nic_policies(
 
 pub(super) fn api_connect(console: &Arc<Console>, body: &str) -> Result<serde_json::Value, String> {
     let req: ConnectReq = serde_json::from_str(body).map_err(|e| format!("参数解析失败: {e}"))?;
+    crate::config::validate_agent_address_for_http(req.host.trim())?;
+    crate::config::validate_agent_token_for_http(&req.token)?;
     let mut state = lock_recover(&console.state);
     if !req.host.trim().is_empty() {
         state.agent_host = req.host.trim().to_string();
@@ -304,8 +306,31 @@ pub(super) fn api_config(console: &Arc<Console>, body: &str) -> Result<serde_jso
 }
 
 pub(super) fn api_run(console: &Arc<Console>, body: &str) -> Result<serde_json::Value, String> {
+    api_run_impl(console, body, false)
+}
+
+/// 组合场景的第一阶段复用同一套编译、计划哈希和 executor 路径；唯一额外
+/// 的区别是它已经持有组合场景的状态闸门，不能被普通 `/api/run` 再挡一次。
+pub(super) fn api_run_for_scenario(
+    console: &Arc<Console>,
+    body: &str,
+) -> Result<serde_json::Value, String> {
+    api_run_impl(console, body, true)
+}
+
+fn api_run_impl(
+    console: &Arc<Console>,
+    body: &str,
+    from_scenario: bool,
+) -> Result<serde_json::Value, String> {
     let req: RunRequest = serde_json::from_str(body).map_err(|e| format!("参数解析失败: {e}"))?;
     let run_gate = lock_recover(&console.run_gate);
+    if console.scenario.is_running() && !from_scenario {
+        return Err("组合场景正在运行，请结束后再启动子网测试".into());
+    }
+    if console.inner.is_running() {
+        return Err("内环测试正在运行，请结束后再启动子网测试".into());
+    }
     if crate::cancel::is_shutdown_requested() {
         return Err("控制台正在退出，不能开始新的测试".into());
     }

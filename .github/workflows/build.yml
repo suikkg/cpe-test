@@ -61,7 +61,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 -c 'import glob, json; files = ["config.example.json", "config.minimal.json", *sorted(glob.glob("dist/configs/*.json"))]; [json.load(open(path, encoding="utf-8")) for path in files]; print(f"validated {len(files)} JSON files")'
+          python3 -c 'import glob, json; files = ["config.example.json", "config.minimal.json", "inner.example.json", *sorted(glob.glob("dist/configs/*.json"))]; [json.load(open(path, encoding="utf-8")) for path in files]; print(f"validated {len(files)} JSON files")'
 
       - name: Validate tracked Windows configuration and documentation bundle
         shell: bash
@@ -96,6 +96,7 @@ jobs:
               "UDP并发灌包验收场景.md": Path("UDP并发灌包验收场景.md"),
               "config.minimal.json": Path("config.minimal.json"),
               "config.example.json": Path("config.example.json"),
+              "inner.example.json": Path("inner.example.json"),
               "configs/config-sgmii.json": Path("dist/configs/config-sgmii.json"),
               "configs/config-wifi5g.json": Path("dist/configs/config-wifi5g.json"),
               "configs/config-10gusb.json": Path("dist/configs/config-10gusb.json"),
@@ -278,6 +279,7 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           $files = @((Resolve-Path 'config.example.json').Path)
+          $files += (Resolve-Path 'inner.example.json').Path
           $files += (Get-ChildItem 'dist/configs/*.json').FullName
           foreach ($file in $files) {
             Get-Content -LiteralPath $file -Raw -Encoding UTF8 | ConvertFrom-Json | Out-Null

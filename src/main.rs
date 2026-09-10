@@ -13,6 +13,7 @@ mod cmd;
 mod config;
 mod console;
 mod http_client;
+mod inner;
 mod master;
 mod nic;
 #[cfg(test)]
@@ -53,6 +54,7 @@ fn main() {
 fn real_main(args: Vec<String>) -> i32 {
     let mode = args.first().map(|s| s.as_str()).unwrap_or("");
     match mode {
+        "inner" => inner::run_cli(&args[1..]),
         "__cpe-watchdog" => {
             let Some(pid) = args.get(1).and_then(|value| value.parse::<u32>().ok()) else {
                 return 2;
@@ -353,6 +355,13 @@ fn print_help() {
       --resume                24小时内已 PASS 的任务跳过
       --no-open               结束后不自动打开报告
       --prefix A.,B.          临时指定 IPv4 前缀过滤
+  cpe_test inner --config FILE  ADB 内环测速（PC 网卡 ↔ 板侧 LAN 地址）
+      --probe                 只检查设备能力和列出接口，不启动灌包
+      --resume                跳过 24 小时内已 PASS 的同一内环单元
+      辅测机可选，只挂本机的网口能独立跑；未被勾选的网口引用的 agent 不连接
+      方向含上行/下行/双向并发；双向是一个两腿同时跑的单元，占 port 与 port+1
+      配置示例: inner.example.json（schema v2，旧的 v1 文件导入时自动升级）
+      结果在 inner_runs/inner_<时间>_<进程号>_<纳秒>/
    cpe_test report <run目录>    从已有运行目录重放报告
        用途: 主控崩溃后把已完成部分的完整报告放出来（结果每个单元都已落盘），
              或改了报告模板后拿历史数据重渲染。例: cpe_test report runs/run_20260830_101112_1234

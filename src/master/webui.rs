@@ -113,6 +113,8 @@ pub fn run(opts: UiOpts) -> i32 {
         cfg.agent_host.clone()
     };
     let console = Arc::new(Console {
+        inner: Default::default(),
+        scenario: Default::default(),
         state: Mutex::new(UiState {
             cfg,
             agent_host,
@@ -201,6 +203,7 @@ mod model;
 mod monitor;
 mod plan;
 mod runs;
+mod scenario;
 mod state;
 mod validate;
 

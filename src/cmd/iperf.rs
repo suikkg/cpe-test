@@ -202,7 +202,10 @@ fn supports_forceflush(bin: &str) -> bool {
     *SUPPORTED.get_or_init(|| supports_forceflush_with(&SystemProcessExecutor, bin))
 }
 
-fn supports_forceflush_with<E: ProcessExecutor + ?Sized>(executor: &E, bin: &str) -> bool {
+pub(crate) fn supports_forceflush_with<E: ProcessExecutor + ?Sized>(
+    executor: &E,
+    bin: &str,
+) -> bool {
     run_cmd_with_executor(executor, bin, &["--help"], Duration::from_secs(8))
         .merged()
         .contains("--forceflush")
@@ -1105,7 +1108,7 @@ fn wait_cancelable(duration: Duration, cancel: Option<&AtomicBool>) -> bool {
 
 /// 执行 iperf3 client，逐行回调并上报结构化事件。
 /// cancel 用于异步 job 主动终止，瞬态连接错误仍保留原有自动重试。
-fn run_client_controlled_inner<P, F, E>(
+pub(crate) fn run_client_controlled_inner<P, F, E>(
     executor: &P,
     forceflush_supported: bool,
     bin: &str,

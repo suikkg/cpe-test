@@ -100,7 +100,11 @@ pub(super) fn api_monitor_start(
     let stop = Arc::new(AtomicBool::new(false));
     let session = next_monitor_session_id();
 
-    match req.side.as_str() {
+    // 起线程失败必须在**注册会话之前**报错。`reap_dead_monitors` 对
+    // `running == true` 的会话永不回收，而这条会话没有线程去把它翻成 false——
+    // 于是它会永久占着 8 个槽位里的一个，界面上还显示「运行中、无错误」，
+    // 除非有人恰好知道该对这个 session id 调一次 /api/monitor/stop。
+    let spawned = match req.side.as_str() {
         "master" => spawn_local_monitor(iface.clone(), interval_ms, &stop, &data),
         "agent" => {
             let (host, port, token) = {
@@ -123,9 +127,12 @@ pub(super) fn api_monitor_start(
                 session.clone(),
                 &stop,
                 &data,
-            );
+            )
         }
         other => return Err(format!("未知的监控端: {other}")),
+    };
+    if let Err(error) = spawned {
+        return Err(format!("无法启动采样线程: {error}"));
     }
 
     lock_recover(&console.monitors).insert(
@@ -232,10 +239,10 @@ pub(super) fn spawn_local_monitor(
     interval_ms: u64,
     stop: &Arc<AtomicBool>,
     data: &Arc<Mutex<MonitorData>>,
-) {
+) -> std::io::Result<()> {
     let stop = Arc::clone(stop);
     let data = Arc::clone(data);
-    let _ = std::thread::Builder::new()
+    std::thread::Builder::new()
         .name("cpe-ui-monitor-local".into())
         .spawn(move || {
             let started = std::time::Instant::now();
@@ -276,7 +283,9 @@ pub(super) fn spawn_local_monitor(
                 }
             }
             lock_recover(&data).running = false;
-        });
+        })
+        // 线程句柄不用 join：停止靠 `stop` 标记，这里只关心它有没有起来。
+        .map(|_| ())
 }
 
 /// 辅测机采样：复用 agent 已有的 `/monitor/*`，只是换一个独立的 owner_id。
@@ -290,10 +299,10 @@ pub(super) fn spawn_agent_monitor(
     session: String,
     stop: &Arc<AtomicBool>,
     data: &Arc<Mutex<MonitorData>>,
-) {
+) -> std::io::Result<()> {
     let stop = Arc::clone(stop);
     let data = Arc::clone(data);
-    let _ = std::thread::Builder::new()
+    std::thread::Builder::new()
         .name("cpe-ui-monitor-agent".into())
         .spawn(move || {
             let started = std::time::Instant::now();
@@ -371,5 +380,7 @@ pub(super) fn spawn_agent_monitor(
                 &token,
             );
             lock_recover(&data).running = false;
-        });
+        })
+        // 线程句柄不用 join：停止靠 `stop` 标记，这里只关心它有没有起来。
+        .map(|_| ())
 }

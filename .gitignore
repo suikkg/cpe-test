@@ -1,5 +1,12 @@
 /target
 /runs/
+/inner_runs/
+/scenarios/
+# 本机调试用的配置：`.local.` 一律不进仓库。
+# inner.local.example.json 里是某台开发机的网卡名（en0/en1）和绝对路径，
+# 既没进 CI 的 JSON 校验，也没进 dist 的文档包——那两处只认 inner.example.json。
+*.local.json
+*.local.example.json
 report_*.html
 master_*.log
 task_results.json

@@ -9,7 +9,7 @@ describe('导航区域表', () => {
     // 这两处是分开写的：类型是给编译器看的，表是给渲染用的。少一条的后果不是
     // 报错，而是**导航栏里那个区域根本画不出来**——用户会以为功能没做。
     // 下面这个字面量数组是 RegionId 的穷举，加了新区域忘了进表，这里就红。
-    const all: RegionId[] = ['local', 'agent', 'plan', 'run', 'progress', 'monitor', 'runs'];
+    const all: RegionId[] = ['local', 'agent', 'plan', 'run', 'progress', 'monitor', 'runs', 'inner'];
     expect(REGIONS.map((r) => r.id).sort()).toEqual([...all].sort());
   });
 
@@ -21,7 +21,7 @@ describe('导航区域表', () => {
   it('每个区域都有非空标签和合法分组', () => {
     for (const region of REGIONS) {
       expect(region.label.trim()).not.toBe('');
-      expect(['flow', 'tool']).toContain(region.group);
+      expect(['flow', 'tool', 'inner']).toContain(region.group);
     }
   });
 

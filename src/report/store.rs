@@ -119,14 +119,32 @@ pub fn request_path(dir: &Path) -> PathBuf {
     dir.join(REQUEST_FILE)
 }
 
+fn existing_regular_file(path: &Path) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_file() => Ok(()),
+        Ok(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{} 不是普通文件", path.display()),
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 /// 落一份控制台请求原文。**调用方把失败降级成警告**：写不出它不该弄死测试。
 pub fn write_console_request(dir: &Path, body: &str) -> std::io::Result<()> {
+    existing_regular_file(&request_path(dir))?;
     std::fs::write(request_path(dir), body)
 }
 
 /// 读回控制台请求原文；没有这个文件时返回 `None`（命令行跑出来的目录就是这样）。
 pub fn load_console_request(dir: &Path) -> Option<String> {
-    std::fs::read_to_string(request_path(dir)).ok()
+    let path = request_path(dir);
+    let metadata = std::fs::symlink_metadata(&path).ok()?;
+    metadata
+        .file_type()
+        .is_file()
+        .then(|| std::fs::read_to_string(path).ok())?
 }
 
 /// 把若干行追加进 `rows.jsonl`。
@@ -138,10 +156,12 @@ pub fn append_rows(dir: &Path, rows: &[Row]) -> std::io::Result<()> {
     if rows.is_empty() {
         return Ok(());
     }
+    let path = rows_path(dir);
+    existing_regular_file(&path)?;
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(rows_path(dir))?;
+        .open(path)?;
     // 一次拼好再写：中途 panic 顶多让最后一行不完整，而不是让几行交错。
     let mut buf = String::new();
     for row in rows {
@@ -169,7 +189,9 @@ pub fn append_rows(dir: &Path, rows: &[Row]) -> std::io::Result<()> {
 /// 而前面那些行是完好的十小时测量数据。为一行不完整的记录放弃全部，
 /// 恰好是这个模块想避免的那种损失。返回值第二项是被跳过的行数。
 pub fn load_rows(dir: &Path) -> std::io::Result<(Vec<Row>, usize)> {
-    let file = std::fs::File::open(rows_path(dir))?;
+    let path = rows_path(dir);
+    existing_regular_file(&path)?;
+    let file = std::fs::File::open(path)?;
     let mut rows = Vec::new();
     let mut skipped = 0usize;
     for line in BufReader::new(file).lines() {
@@ -188,11 +210,15 @@ pub fn load_rows(dir: &Path) -> std::io::Result<(Vec<Row>, usize)> {
 pub fn write_meta(dir: &Path, meta: &RunMeta) -> std::io::Result<()> {
     let text = serde_json::to_string_pretty(meta)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-    std::fs::write(meta_path(dir), text)
+    let path = meta_path(dir);
+    existing_regular_file(&path)?;
+    std::fs::write(path, text)
 }
 
 pub fn load_meta(dir: &Path) -> std::io::Result<RunMeta> {
-    let text = std::fs::read_to_string(meta_path(dir))?;
+    let path = meta_path(dir);
+    existing_regular_file(&path)?;
+    let text = std::fs::read_to_string(path)?;
     serde_json::from_str(&text)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
@@ -391,6 +417,30 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn history_store_never_follows_symlinked_request_rows_or_meta_files() {
+        let dir = temp_dir("symlink");
+        let outside = temp_dir("symlink-outside");
+        std::fs::write(outside.join(REQUEST_FILE), r#"{"secret":true}"#).unwrap();
+        std::fs::write(outside.join(ROWS_FILE), "{}").unwrap();
+        std::fs::write(outside.join(META_FILE), r#"{"run_id":"outside"}"#).unwrap();
+
+        std::os::unix::fs::symlink(outside.join(REQUEST_FILE), request_path(&dir)).unwrap();
+        std::os::unix::fs::symlink(outside.join(ROWS_FILE), rows_path(&dir)).unwrap();
+        std::os::unix::fs::symlink(outside.join(META_FILE), meta_path(&dir)).unwrap();
+
+        assert!(load_console_request(&dir).is_none());
+        assert!(write_console_request(&dir, "{}").is_err());
+        assert!(load_rows(&dir).is_err());
+        assert!(append_rows(&dir, &[sample_row(1, Verdict::Pass)]).is_err());
+        assert!(load_meta(&dir).is_err());
+        assert!(write_meta(&dir, &RunMeta::default()).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
     /// meta.json 往返；未知字段不该让读取失败。
     #[test]
     fn meta_round_trips_and_tolerates_unknown_fields() {
@@ -485,5 +535,92 @@ mod tests {
         for d in [dir, empty, blanks] {
             let _ = std::fs::remove_dir_all(&d);
         }
+    }
+
+    /// 历史目录的类型判断**只有一种形状**：不跟随符号链接的那种。
+    ///
+    /// 这条不是风格偏好，是一次横扫的固化。历史上这些模块里散落着
+    /// `path.is_dir()` / `path.is_file()` / `fs::metadata()`——它们全都跟随链接，
+    /// 于是「已经确认过是普通目录」之后再复判一次，等于把刚关上的替换窗口
+    /// 重新打开；`dir_size` 这类递归入口更会直接把外部目录统计进 run 大小。
+    /// 逐处改完之后，真正的风险是**下一处**：新加一个 `entry.path().is_dir()`
+    /// 不会有任何测试变红，因为它在正常情况下行为完全一致。
+    ///
+    /// 所以照 `verdict_priority_has_exactly_one_definition_in_the_tree` 的样子，
+    /// 在源码层面把门关上，粒度到文件为止。
+    ///
+    /// 不在这张表里的地方仍可以用跟随版本，那是**有意**的：
+    /// `master::ui::replay_report_into` 收的是人在命令行上自己敲的目录，
+    /// 「把 run 目录做成软链再重放」是合法用法；`webui::api_open_report`
+    /// 打开的是本程序自己刚写出来的报告路径。两者都不枚举历史目录。
+    #[test]
+    fn history_modules_never_use_link_following_path_checks() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        // 枚举/打包/落盘历史目录的全部模块。新增同类模块请加进来。
+        let watched = [
+            "report/store.rs",
+            "master/webui/runs.rs",
+            "master/webui/scenario.rs",
+            "inner/history.rs",
+            "inner/webui.rs",
+        ];
+        // 只跟随链接的写法要禁；带 `file_type()` 快照的写法是允许的那一种。
+        let allowed = [
+            "file_type().is_dir()",
+            "file_type().is_file()",
+            "kind.is_dir()",
+            "kind.is_file()",
+        ];
+        let banned = [
+            (
+                ".is_dir()",
+                "会跟随符号链接，用 symlink_metadata()?.file_type().is_dir()",
+            ),
+            (
+                ".is_file()",
+                "会跟随符号链接，用 symlink_metadata()?.file_type().is_file()",
+            ),
+            ("fs::metadata(", "会跟随符号链接，用 fs::symlink_metadata()"),
+        ];
+
+        let mut offenders = Vec::new();
+        for rel in watched {
+            let path = src.join(rel);
+            let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+                panic!("{} 读不到：{e}（模块改名了就同步这张表）", path.display())
+            });
+            // 只看生产代码：测试可以自由构造这些场景。
+            let production = text
+                .split_once("#[cfg(test)]")
+                .map(|(head, _)| head)
+                .unwrap_or(&text);
+            // rustfmt 会把 `x.file_type()` 和 `.is_file()` 折成两行，所以先把以 `.`
+            // 开头的续行折回它所属的逻辑行，否则允许的写法会被误判成违规。
+            let mut logical: Vec<(usize, String)> = Vec::new();
+            for (lineno, line) in production.lines().enumerate() {
+                if line.trim_start().starts_with('.') {
+                    if let Some(last) = logical.last_mut() {
+                        last.1.push_str(line.trim_start());
+                        continue;
+                    }
+                }
+                logical.push((lineno + 1, line.to_string()));
+            }
+            for (lineno, line) in logical {
+                let mut rest = line.clone();
+                for ok in allowed {
+                    rest = rest.replace(ok, "");
+                }
+                for (marker, why) in banned {
+                    if rest.contains(marker) {
+                        offenders.push(format!("{rel}:{lineno}: {marker} —— {why}"));
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "历史目录里出现了跟随符号链接的类型判断：{offenders:#?}"
+        );
     }
 }

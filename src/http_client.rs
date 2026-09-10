@@ -836,11 +836,21 @@ pub fn request_with_transport<T: Transport + ?Sized>(
     timeout: Duration,
 ) -> Result<(u16, String), String> {
     let request = HttpRequest::new(method, host, port, path, body, token);
+    validate_wire_request(&request)?;
     let response = transport.send(&request, timeout)?;
     Ok((response.status, response.body))
 }
 
+fn validate_wire_request(request: &HttpRequest) -> Result<(), String> {
+    crate::config::validate_agent_address_for_http(&request.host)?;
+    if let Some(token) = request.token.as_deref() {
+        crate::config::validate_agent_token_for_http(token)?;
+    }
+    Ok(())
+}
+
 fn tcp_request(request: &HttpRequest, timeout: Duration) -> Result<HttpResponse, String> {
+    validate_wire_request(request)?;
     let addr_str = format!("{}:{}", request.host, request.port);
     let addrs: Vec<_> = addr_str
         .to_socket_addrs()
@@ -1381,5 +1391,56 @@ mod tests {
         assert!(wire.contains("Authorization: Bearer token\r\n"));
         assert!(wire.contains("Content-Length: 6\r\n"));
         assert!(wire.ends_with("\r\n\r\n中文"));
+    }
+
+    #[test]
+    fn malformed_auth_tokens_are_rejected_before_transport() {
+        let transport = ScriptedTransport::new();
+        transport.push(ScriptedExchange::response(200, "should not be consumed"));
+
+        let error = request_with_transport(
+            &transport,
+            "GET",
+            "agent\r\nX-Injected: yes",
+            28801,
+            "/health",
+            None,
+            Some("valid"),
+            Duration::from_secs(1),
+        )
+        .expect_err("控制字符地址不能进入 Host 头");
+        assert!(
+            error.contains("agent_host") && error.contains("控制字符"),
+            "{error}"
+        );
+
+        for token in ["bad\r\nX-Injected: yes", "bad\n", "bad\0"] {
+            let error = request_with_transport(
+                &transport,
+                "GET",
+                "agent.test",
+                28801,
+                "/health",
+                None,
+                Some(token),
+                Duration::from_secs(1),
+            )
+            .expect_err("控制字符令牌不能进入 HTTP 头");
+            assert!(error.contains("控制字符"), "{error}");
+        }
+        let too_long = "x".repeat(crate::config::MAX_AGENT_TOKEN_BYTES + 1);
+        let error = request_with_transport(
+            &transport,
+            "GET",
+            "agent.test",
+            28801,
+            "/health",
+            None,
+            Some(&too_long),
+            Duration::from_secs(1),
+        )
+        .expect_err("超长令牌不能进入 HTTP 头");
+        assert!(error.contains("上限"), "{error}");
+        assert_eq!(transport.requests().len(), 0, "拒绝应发生在 transport 之前");
     }
 }

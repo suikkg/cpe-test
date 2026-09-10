@@ -207,6 +207,12 @@ struct RunPaths {
 fn create_run_paths(root: &Path) -> io::Result<RunPaths> {
     let runs_dir = root.join(RUNS_DIR);
     std::fs::create_dir_all(&runs_dir)?;
+    // 只认 `symlink_metadata` 这一次快照：再补一次 `runs_dir.is_dir()` 不增加任何
+    // 保证（它跟随链接，链接指向真目录时照样为真），却重新打开一个替换窗口。
+    let metadata = std::fs::symlink_metadata(&runs_dir)?;
+    if !metadata.file_type().is_dir() {
+        return Err(io::Error::other("runs 根目录不是普通目录"));
+    }
     let base = format!("run_{}_{}", now_compact(), std::process::id());
 
     for attempt in 0..1000u32 {
@@ -306,8 +312,6 @@ pub fn run_master(opts: MasterOpts) -> i32 {
             }
         }
     }
-    let _ = std::fs::write(LAST_AGENT_FILE, &agent_host);
-
     // ---- 连接辅测机 ----
     let health = loop {
         logln(&format!(
@@ -329,6 +333,9 @@ pub fn run_master(opts: MasterOpts) -> i32 {
             }
         }
     };
+    // 只记住真正连通的地址。把输入值提前写入会让一次输错/连不上污染下次
+    // 回车默认值，也违背 LAST_AGENT_FILE「上一次实际连上的地址」的约定。
+    let _ = std::fs::write(LAST_AGENT_FILE, &agent_host);
     logln(&format!(
         "辅测机已连接: {} ({}) agent v{} iperf3: {} ctsTraffic: {}",
         health.hostname,

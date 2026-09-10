@@ -1,0 +1,68 @@
+{
+  "kind": "cpe-inner-project",
+  "version": 2,
+  "config": {
+    "adb_path": "adb",
+    "serial": "",
+    "board_iperf": "iperf3",
+    "duration_secs": 20,
+    "parallel": 1,
+    "protocols": [
+      "tcp"
+    ],
+    "directions": [
+      "upload",
+      "download"
+    ],
+    "tcp_streams": null,
+    "udp_streams": null,
+    "tcp_window": null,
+    "udp_mbps": null,
+    "udp_length": null,
+    "max_udp_loss_pct": null,
+    "port": 56190,
+    "repeats": 1,
+    "resume": false,
+    "links": [
+      {
+        "name": "ETH",
+        "host": "master",
+        "enabled": true,
+        "local_interface": "以太网",
+        "local_ip": "192.168.8.100",
+        "gateway": "192.168.8.1",
+        "board_rx_interface": "",
+        "measurement": "nic_strict",
+        "upload_min_mbps": null,
+        "download_min_mbps": null,
+        "bidir_total_min_mbps": null,
+        "tool_upload_min_mbps": null,
+        "tool_download_min_mbps": null,
+        "tool_bidir_total_min_mbps": null
+      },
+      {
+        "name": "Wi-Fi",
+        "host": "agent1",
+        "enabled": true,
+        "local_interface": "WLAN",
+        "local_ip": "192.168.8.101",
+        "gateway": "192.168.8.1",
+        "board_rx_interface": "",
+        "measurement": "nic_strict",
+        "upload_min_mbps": null,
+        "download_min_mbps": null,
+        "bidir_total_min_mbps": null,
+        "tool_upload_min_mbps": null,
+        "tool_download_min_mbps": null,
+        "tool_bidir_total_min_mbps": null
+      }
+    ],
+    "agents": [
+      {
+        "id": "agent1",
+        "address": "192.168.8.101",
+        "port": 28801
+      }
+    ]
+  }
+}

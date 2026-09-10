@@ -98,9 +98,19 @@ pub(super) fn serve(server: &Server, console: &Arc<Console>, shutdown: &AtomicBo
         match server.recv_timeout(SHUTDOWN_POLL) {
             Ok(Some(request)) => handle(request, console),
             Ok(None) => {
+                if crate::cancel::is_shutdown_requested() {
+                    // 场景停止自身会持有 run_gate；先让它完成，再单独
+                    // 用同一把 gate 停普通内环，避免 shutdown 与 inner/run
+                    // 交错时把停止信号丢在 start() 清除 cancel 位之前。
+                    console.scenario.stop(console);
+                    let _gate = lock_recover(&console.run_gate);
+                    console.inner.stop();
+                }
                 if should_shut_down(
                     crate::cancel::is_shutdown_requested(),
-                    console.running.load(Ordering::SeqCst),
+                    console.running.load(Ordering::SeqCst)
+                        || console.inner.is_running()
+                        || console.scenario.is_running(),
                 ) {
                     shutdown.store(true, Ordering::SeqCst);
                 }
@@ -351,23 +361,6 @@ pub(super) fn handle(mut request: Request, console: &Arc<Console>) {
         .map(|(_, q)| q.to_string())
         .unwrap_or_default();
     let trusted_post = *request.method() != Method::Post || has_console_request_header(&request);
-    let mut body = String::new();
-    // **多读一个字节**，这样「刚好到上限」和「超了」分得开。
-    //
-    // 只 `take(MAX_BODY_BYTES)` 的话超限请求会被**静默截断**，而截断后的内容
-    // 未必不合法：一份尾部带空白的 config.json 截掉最后一个空格仍是合法 JSON，
-    // 于是 `/api/import` 返回 200 并**按截断后的内容执行了导入**——用户手上的
-    // 文件和实际生效的配置不是一份东西，而没有任何地方说过。截断到内容里时
-    // 表现同样糟：报出来的是「这不是一份能解析的 config.json」，真因却是请求
-    // 体超限，人会去查自己的文件。
-    let oversized = if *request.method() == Method::Post {
-        let mut limited = request.as_reader().take(MAX_BODY_BYTES + 1);
-        let _ = limited.read_to_string(&mut body);
-        body.len() as u64 > MAX_BODY_BYTES
-    } else {
-        false
-    };
-
     // 鉴权先于一切，页面本身也不例外：页面里带着给 API 用的口令，
     // 放行未认证的 GET / 等于把口令发给任何来问的人。
     let header_token = header_value(&request, "X-CPE-Token");
@@ -379,7 +372,12 @@ pub(super) fn handle(mut request: Request, console: &Arc<Console>) {
     // 页面（文档请求）额外认会话 cookie：抹掉地址栏 `?token=` 之后，F5 发出的
     // 导航请求什么凭据都带不上，撞 401 的是**刷新**这个最普通的动作。
     // API 不认 cookie，见 `page_request_is_authorized` / `page_response`。
-    let is_page = path == "/" || path == "/index.html";
+    // GET 和 HEAD 都是取页面：浏览器、链接预览和一些代理会先发 HEAD，那个请求
+    // 带得上会话 cookie，却没有 `X-CPE-Token` 也没有 `?token=`。只认 GET 的话它
+    // 落到 `request_is_authorized`（有意不认 cookie）上，撞 401。
+    // 这里要挡的是 `POST /` 被当成页面，`GET | HEAD` 已经够了。
+    let is_page = matches!(*request.method(), Method::Get | Method::Head)
+        && (path == "/" || path == "/index.html");
     let authorized = if is_page {
         page_request_is_authorized(
             &console.ui_token,
@@ -408,6 +406,38 @@ pub(super) fn handle(mut request: Request, console: &Arc<Console>) {
         let _ = request.respond(page_response(&console.ui_token));
         return;
     }
+
+    if !trusted_post {
+        let _ = request.respond(json_response(crate::protocol::err_json(
+            "拒绝跨站请求：缺少 X-CPE-Console 请求头",
+        )));
+        return;
+    }
+
+    let mut body = String::new();
+    // **多读一个字节**，这样「刚好到上限」和「超了」分得开。
+    //
+    // 只 `take(MAX_BODY_BYTES)` 的话超限请求会被**静默截断**，而截断后的内容
+    // 未必不合法：一份尾部带空白的 config.json 截掉最后一个空格仍是合法 JSON，
+    // 于是 `/api/import` 返回 200 并**按截断后的内容执行了导入**——用户手上的
+    // 文件和实际生效的配置不是一份东西，而没有任何地方说过。截断到内容里时
+    // 表现同样糟：报出来的是「这不是一份能解析的 config.json」，真因却是请求
+    // 体超限，人会去查自己的文件。
+    let oversized = if *request.method() == Method::Post {
+        let mut limited = request.as_reader().take(MAX_BODY_BYTES + 1);
+        if let Err(error) = limited.read_to_string(&mut body) {
+            let _ = request.respond(
+                json_response(crate::protocol::err_json(&format!(
+                    "读取请求体失败: {error}"
+                )))
+                .with_status_code(400),
+            );
+            return;
+        }
+        body.len() as u64 > MAX_BODY_BYTES
+    } else {
+        false
+    };
 
     // 超限的请求体一律不进业务分支：截断过的内容不能拿来做任何决定。
     // 放在鉴权之后是有意的——先认人再谈请求内容（铁律三）。
@@ -474,8 +504,59 @@ pub(super) fn handle(mut request: Request, console: &Arc<Console>) {
             }
         }
     }
-    let out = if !trusted_post {
-        Err("拒绝跨站请求：缺少 X-CPE-Console 请求头".to_string())
+    let out = if path.starts_with("/api/inner/") {
+        match (is_get, is_post, path.as_str()) {
+            (true, _, "/api/inner/status") => Ok(console.inner.status(
+                query
+                    .split('&')
+                    .find_map(|kv| kv.strip_prefix("units_from="))
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .unwrap_or(0),
+                query.split('&').find_map(|kv| kv.strip_prefix("run_id=")),
+            )),
+            (true, _, "/api/inner/report") => console.inner.report(),
+            (true, _, "/api/inner/runs") => console.inner.runs(),
+            (_, true, "/api/inner/runs/report") => console.inner.run_report(&body),
+            (_, true, "/api/inner/runs/config") => console.inner.run_config(&body),
+            (_, true, "/api/inner/plan") => console.inner.plan(&body),
+            (_, true, "/api/inner/probe") => {
+                // 探测会占用 ADB 和板侧资源；它和启动必须在同一把门里
+                // 做 admission check，否则 probe 先检查到 idle 后，run
+                // 可以在探测仍进行时把控制器拉起来。
+                let _gate = lock_recover(&console.run_gate);
+                if console.scenario.is_running() {
+                    Err("组合场景正在运行，请结束后再检查内环设备".into())
+                } else {
+                    console.inner.probe(&body)
+                }
+            }
+            (_, true, "/api/inner/stop") => {
+                // 组合场景的停止必须同时结束当前子网/内环阶段并封住下一阶段；
+                // 只停 inner controller 会让场景线程把「内环已停」误认为正常收尾。
+                if console.scenario.is_running() {
+                    Ok(console.scenario.stop(console))
+                } else {
+                    // `/api/inner/run` 也用这把 gate。普通内环停止必须和启动
+                    // 共用它，否则 stop 可能落在 start 的互斥检查与清除本地
+                    // cancel 位之间，随后新一轮会把停止信号吞掉。
+                    let _gate = lock_recover(&console.run_gate);
+                    Ok(console.inner.stop())
+                }
+            }
+            (_, true, "/api/inner/run") => {
+                let _gate = lock_recover(&console.run_gate);
+                if crate::cancel::is_shutdown_requested() {
+                    Err("控制台正在退出".into())
+                } else if console.scenario.is_running() {
+                    Err("组合场景正在运行，请结束后再启动内环测试".into())
+                } else if console.running.load(Ordering::SeqCst) {
+                    Err("子网测试正在运行，请结束后再启动内环测试".into())
+                } else {
+                    console.inner.start(&body)
+                }
+            }
+            _ => Err("未知内环接口或请求方法".into()),
+        }
     } else if is_get && path == "/api/bootstrap" {
         api_bootstrap(console)
     } else if is_get && path == "/api/local" {
@@ -490,6 +571,21 @@ pub(super) fn handle(mut request: Request, console: &Arc<Console>) {
         api_import(console, &body)
     } else if is_post && path == "/api/run" {
         api_run(console, &body)
+    } else if is_post && path == "/api/scenario/run" {
+        let _gate = lock_recover(&console.run_gate);
+        if crate::cancel::is_shutdown_requested() {
+            Err("控制台正在退出".into())
+        } else {
+            console.scenario.start(console, &body)
+        }
+    } else if is_get && path == "/api/scenario/status" {
+        Ok(console.scenario.status())
+    } else if is_post && path == "/api/scenario/stop" {
+        Ok(console.scenario.stop(console))
+    } else if is_get && path == "/api/scenario/runs" {
+        console.scenario.runs()
+    } else if is_post && path == "/api/scenario/runs/request" {
+        console.scenario.request(&body)
     } else if is_post && path == "/api/stop" {
         api_stop(console)
     } else if is_post && path == "/api/open-report" {

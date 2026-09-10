@@ -30,6 +30,7 @@ LAYOUT = {
     "UDP并发灌包验收场景.md": "UDP并发灌包验收场景.md",
     "config.minimal.json": "config.minimal.json",
     "config.example.json": "config.example.json",
+    "inner.example.json": "inner.example.json",
     "configs/config-sgmii.json": "dist/configs/config-sgmii.json",
     "configs/config-wifi5g.json": "dist/configs/config-wifi5g.json",
     "configs/config-10gusb.json": "dist/configs/config-10gusb.json",
