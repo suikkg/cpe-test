@@ -321,3 +321,63 @@ wifi 产物：`/Users/kk/uv/cpe_test/main/inner_runs/inner_20260910_072820_69901
 - 本地 `runs/`、`inner_runs/` 目录的符号链接 TOCTOU：攻击者要能往这些目录写东西，
   前提是已有本机写权限，那时换掉 exe 更省事。上一轮已按这条线扫过一遍，
   不再继续扩大改动面。
+
+---
+
+## 2026-09-10 发版验收轮：v6.4.0（Claude）
+
+这一轮的目标是发版前验收，不是继续横扫。**开场时四条门禁在开发机上全绿，
+而仓库处于「新克隆连测试都编译不出来」的状态**——这正是 CLAUDE.md 第 3 条
+说的那种绿灯：它只证明没退回去。
+
+### 发版阻断项（1 个）
+
+`src/inner/tests.rs` 编译期 `include_str!` 读 `inner.local.example.json`，
+而同一轮里 `.gitignore` 的 `*.local.example.json` 有意把这类本机配置挡在仓库外
+（它们可能带 `agent_token`）。`git archive HEAD` 里该文件 0 个匹配，CI 的
+checkout 和任何新贡献者都编不过。两个决定各自都对，凑一起就是编译失败——
+这是上一轮修复 29「按本地文件 gitignore」只做了一半留下的。
+
+处置：去掉编译期依赖而不是把本机配置塞进公开仓库（`.gitignore` 那条约定是对的）。
+该测试的覆盖没有损失——`V1_PROJECT` 就是一份全本机、无 `agents` 的 JSON 字面量，
+另有多处 `agents.clear()`。README 里指向该文件的那句一并删掉：公开 README 不该
+指着仓库里没有的文件。
+
+同时把这一整类静态扫了一遍：所有 `include_str!` / `include_bytes!` 的数据文件、
+测试里走 `CARGO_MANIFEST_DIR` 读的路径、前端测试跨目录 import 的两个 JSON——
+只有这一处。
+
+### 第四条防复发机制
+
+`no_compile_time_include_depends_on_a_gitignored_local_file`（`src/config.rs`）：
+`include_str!` / `include_bytes!` 的实参不许命中 `.gitignore` 里 `*.后缀` 那类
+本机配置规则。忽略规则从 `.gitignore` 现读，改规则不用回来改测试。
+注入验证：加回那行立刻红，去掉即绿。
+
+（写这条守卫时它先红了一次，抓的是它自己文档注释里引用的那行原文——
+说明匹配确实生效，也说明这类自指要避开。）
+
+### 干净树 + 真机验收
+
+- 按 `git ls-files` 重建只含版本控制里实际有的文件的树（232 个），从零全量编译：
+  `cargo test --locked` **772 passed**，`cargo build --release` 出 6.79 MB 二进制。
+- 用该二进制对真实自研 CPE（OpenWrt aarch64，`br0` 192.168.8.1，iperf3 3.10.1）
+  跑通整轮内环：TCP + UDP × 上行/下行/双向并发 **6 个单元全部 MEASURED**，71 秒，
+  产物齐全（`finished: true`、6 行 JSONL、双向单元两条腿日志各一份、报告零外链）。
+- 运行期冒烟：控制台鉴权三态、会话 cookie 的「只」字（只带 cookie 刷新页面 200 /
+  打 API 401）、CSRF 头、8 条只读端点、`/api/inner/plan` 预览、agent 的
+  `Authorization: Bearer` 三态与非法 JSON 单次包装，两侧日志 panic 计数 0。
+
+### 核实过、判定不是缺陷的现象
+
+6 秒时长下网卡口径系统性低于工具口径（上行 867.91 vs 901.00，差 3.7%）。
+查 `rx` 明细为 `median 918.77 / min 640.54`——TCP 慢启动那一秒把 6 秒窗口的
+均值拖了下去。改回文档默认的 20 秒复测：上行差 0.9%，下行网卡 945.47 **高于**
+工具 920.00（网卡计以太帧头，本该略高）。测量层没有系统性偏差。
+
+冒烟脚本首轮报的 8 条"失败"逐条核实**全部是脚本自身前提错误**，不是产品缺陷。
+
+### 未覆盖
+
+真实 Windows 双机、ctsTraffic 全链路、Windows 默认预设与 24 小时长稳。
+Windows 原生测试与三平台打包由发布 CI 承担。

@@ -410,10 +410,6 @@ fn v1_projects_migrate_without_inventing_a_bidirectional_test_or_a_new_verdict_r
 #[test]
 fn config_rejects_unknown_keys_and_unsafe_remote_words() {
     example().validate().unwrap();
-    config::parse_config(include_str!("../../inner.local.example.json"))
-        .unwrap()
-        .validate()
-        .unwrap();
     assert!(serde_json::from_str::<InnerConfig>(r#"{"duraton_secs":20}"#).is_err());
     for bad in ["iperf3; reboot", "$(reboot)", "'", "-s", "\niperf3", ""] {
         let mut cfg = example();

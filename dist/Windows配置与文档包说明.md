@@ -1,13 +1,13 @@
-# cpe_test v6.3.2 Windows 配置与文档包
+# cpe_test v6.4.0 Windows 配置与文档包
 
-仓库中的 `cpe_test-v6.3.2-windows-config-docs.zip` 是便于从 Git 直接下载的
+仓库中的 `cpe_test-v6.4.0-windows-config-docs.zip` 是便于从 Git 直接下载的
 Windows 配置、说明文档和启动脚本资料包。包内文件由仓库当前版本生成，并由 CI
 逐文件与源码副本比对，避免配置或文档过期。
 
 这个资料包**不包含可执行程序或吞吐工具**：
 
 - 不包含 `cpe_test.exe`；请从 GitHub Release 下载正式
-  `cpe_test-v6.3.2-windows-x86_64.zip`，或自行编译。
+  `cpe_test-v6.4.0-windows-x86_64.zip`，或自行编译。
 - 不包含 `ctsTraffic.exe`；正式 Windows Release ZIP 会捆绑固定并校验过的
   Microsoft ctsTraffic 2.0.4.0 x64。
 - 不包含 `iperf3.exe` 及其 DLL；需要 iperf3 测试时，请放入完整的 Windows
@@ -27,6 +27,10 @@ Windows 配置、说明文档和启动脚本资料包。包内文件由仓库当
   换一台主控导入不会改判定口径。Wi-Fi 门限按实际频段组合保存两个单向门限和一个双向 RX 合计门限。
 - `start_ui.bat`（图形控制台）、`start_agent.bat`、`start_master.bat`、`start_master_select_config.bat`。
 - iperf3/ctsTraffic 放置说明、MIT 许可证和第三方声明。
+
+## v6.4.0 行为要点
+
+新增 ADB 内环测速（控制台左侧「内环测试」，或 `cpe_test.exe inner --config`）与「子网 → 内环」组合场景。修复监控采样线程起不来仍占用会话槽位、长任务名的截图文件名撞 Windows MAX_PATH、以及跑测期间还能改辅测机连接。内环报告在 `inner_runs`，组合场景记录在 `scenarios`，与子网 `runs` 分开。
 
 ## v6.3.2 行为要点
 

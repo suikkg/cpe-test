@@ -1252,6 +1252,70 @@ mod tests {
         assert_eq!(same_host, 4, "应当有 4 对同机组合（主控 1 对 + 辅测 3 对）");
     }
 
+    /// 编译期读的文件必须在仓库里，不能是 `.gitignore` 排掉的本机配置。
+    ///
+    /// 守的是「本机四条门禁全绿、干净克隆连测试都编译不出来」这一类。
+    /// `include_str!` 在编译期读盘：文件躺在开发机上，`cargo test` 就全绿，
+    /// 而 CI 的 checkout 和任何新克隆里根本没有它。绿灯在这里完全没有分辨力。
+    ///
+    /// 历史实例：`src/inner/tests.rs` 曾在编译期直接读 `inner.local.example.json`，
+    /// 而 `.gitignore` 的 `*.local.example` 加 `.json` 有意把这类本机配置挡在仓库外
+    /// （它们可能带 agent_token）。两个决定各自都对，凑一起就是编译不过。
+    ///
+    /// 忽略规则从 `.gitignore` 现读，只认 `*.后缀` 这种简单通配——那正是
+    /// 「本机配置」这条约定的写法。前缀通配（`report_*.html`）不在射程内，
+    /// 因为编译期不会去 include 运行产物。
+    #[test]
+    fn no_compile_time_include_depends_on_a_gitignored_local_file() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let ignored_suffixes: Vec<String> = std::fs::read_to_string(root.join(".gitignore"))
+            .expect("读 .gitignore")
+            .lines()
+            .map(str::trim)
+            .filter_map(|line| line.strip_prefix("*."))
+            .filter(|rest| !rest.is_empty() && !rest.contains('*') && !rest.contains('/'))
+            .map(|rest| format!(".{rest}"))
+            .collect();
+        assert!(
+            !ignored_suffixes.is_empty(),
+            ".gitignore 里已经没有 `*.后缀` 形式的本机配置规则，这条守卫会永远为真——\
+             要么把规则加回去，要么连这条测试一起删，不要留一个不会红的守卫"
+        );
+
+        let mut offenders = Vec::new();
+        let mut stack = vec![root.join("src")];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read src dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).expect("read source");
+                for macro_call in ["include_str!(", "include_bytes!("] {
+                    for chunk in text.split(macro_call).skip(1) {
+                        let Some(arg) = chunk.split('"').nth(1) else {
+                            continue;
+                        };
+                        if let Some(hit) = ignored_suffixes.iter().find(|s| arg.ends_with(&***s)) {
+                            offenders.push(format!(
+                                "{}: {macro_call}{arg:?} 命中 .gitignore 的 *{hit}",
+                                path.display()
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "编译期依赖了不在版本控制里的文件，干净克隆会编译失败: {offenders:#?}"
+        );
+    }
+
     #[test]
     fn validate_flags_settings_that_would_silently_kill_every_traffic_unit() {
         let ok = Config::default();

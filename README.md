@@ -24,9 +24,20 @@
 
 页面的“导入内环配置 / 导出内环配置”使用 `cpe-inner-project.json`，格式标识 `kind: cpe-inner-project`，当前版本为 **2**。版本 1 的旧文件导入时自动升级（`protocol` → `protocols`、`board_interface` → `board_rx_interface`，补上勾选、策略和 `resume`），**原来的“先上行再下行”仍然是两个单向单元，不会变成双向并发**，测量策略也保持严格网卡口径。版本高于 2 的文件拒绝导入且不改动当前配置。ADB 配置、辅测机列表、网口、停止状态和报告均独立；导入错误类型会拒绝，辅测机地址最多 256 字节、令牌最多 4096 字节且不写入导出、草稿或历史文件。两类测试不能同时开跑，以免彼此占用被测链路；结束后可切换运行。
 
-命令行也可使用：`cpe_test.exe inner --config inner.example.json --probe` 仅检查设备，去掉 `--probe` 按计划逐个单元测。Windows 示例 `inner.example.json` 包含主控 ETH 与辅测机 Wi-Fi，需修改为实际地址；本机自研 CPE 示例为 `inner.local.example.json`（macOS en0 / en1，192.168.8.1）。详细字段见《使用说明》的“ADB 内环测速”。
+命令行也可使用：`cpe_test.exe inner --config inner.example.json --probe` 仅检查设备，去掉 `--probe` 按计划逐个单元测。Windows 示例 `inner.example.json` 包含主控 ETH 与辅测机 Wi-Fi，需修改为实际地址。详细字段见《使用说明》的“ADB 内环测速”。
 
 结果保存在 `inner_runs/inner_*/` 下的 `report.html`、`result.json`、`summary.json`、`config.json` 与 `units.jsonl`，不进入子网 `runs`。页面下方的“内环历史”可以列出历次运行、下载报告，或把当时的配置装载回控制台重新生成计划——装载配置后默认打开内环 RESUME，仍需重新预览并点击开始；隔夜的网口拓扑可能已经变了，该看到的是预览里的差异。组合场景记录保存在 `scenarios/`，可载入子网计划与内环配置后再次执行。退出码 0 表示完成且 PASS/MEASURED（探测模式为能力探测成功），1 表示 RATE_FAIL/NOT_EVALUATED，2 表示配置、环境、取消或回收失败。内环使用自己的 HTML/JSON 报告，目前没有 Excel 出口；内环 RESUME 与子网 RESUME 分开计算。每单元追加 JSONL 并更新摘要；HTML/完整 JSON 在单元结束时按 30 秒间隔节流更新，收尾必写，因此运行中的下载可能落后于界面已完成数量。历史记录显示明确的收尾状态，旧记录未提供状态时显示未知。
+
+## v6.4.0
+
+- **新增 ADB 内环测速**：PC 网卡 ↔ 自研 CPE 板侧 LAN 地址直接对测，不需要第二台电脑。上行、下行与双向并发三种方向（双向是一个两条腿同时起流的单元，两次顺序单向不算双向），网卡计数与 iperf3 工具汇总两套口径各自独立设门限，`nic_strict` / `nic_preferred` / `tool` 三档策略决定来源与兜底——**可信的低速不触发兜底**，工具口径也不继承网卡门限。独立的稳定身份、24 小时 RESUME、`inner_runs/` 历史与自包含 HTML/JSON 报告，与子网测试完全分开，绝不命中彼此的历史。控制台左侧新增「内环测试」页面，命令行为 `cpe_test inner --config inner.example.json [--probe]`。
+- **新增组合场景**：一次提交按「子网 → 内环」顺序跑完两段，各自跳过自己历史里的 PASS；两份原始配置存在 `scenarios/`，可再次载入执行。
+- **修：采样线程起不来时监控会话仍被登记**。`reap_dead_monitors` 永不回收 `running == true` 的会话，而这条会话没有线程去把它翻成 false——它会永久占住 8 个槽位之一，界面上还显示「运行中、无错误」。现在起线程失败发生在登记**之前**。
+- **修：截图文件名可能撞 Windows MAX_PATH**。长任务名进文件名后整条路径可能超过 260 字符，表现是报告里的截图链接指向一个根本没写成功的文件。文件名中的标签现在截断到 80 字符。
+- **修：`runs/` 根目录的类型判断还剩一处跟随符号链接**。紧接着的 `symlink_metadata` 快照本身是安全的，但那次多余的重查重新打开了一个替换窗口。
+- **修：跑测期间界面仍能改辅测机连接**，会让页面显示的辅测机和实际被测的那台对不上。「连接」与「重新扫描」现在在任一测试运行中时禁用并写明原因。这是 UX 门不是安全门——后端有意不拦，`cfg` 在起执行线程前已经快照。
+- **四条防复发结构守卫**（都做过变异验证：把闸门改坏，测试必须立刻红）：历史目录只准用不跟随链接的类型判断；前后端四条白名单与两个长度上限共用一份 `validation_corpus.json`，改规则必须先改语料；控制台每条 HTTP 路由都要声明并发类别；编译期 `include_str!` 不许指向被 `.gitignore` 排除的本机配置——最后这条防的是「开发机四条门禁全绿、干净克隆连测试都编译不出来」，绿灯对这一类完全没有分辨力。
+- **回归验证**：按仓库实际跟踪的文件重建干净树、从零全量编译，Rust 772 项、前端 368 项、双目标严格 Clippy、产物溯源戳与配置文档包校验全部通过；并对真实自研 CPE 跑通 TCP/UDP × 上行/下行/双向并发共 6 个内环单元，网卡口径与工具口径互相印证。**真实 Windows 双机、ctsTraffic 全链路与 24 小时长稳仍未在本轮执行。**
 
 ## v6.3.2
 
@@ -652,7 +663,7 @@ CPE（Customer Premises Equipment）子网测试工具用于在**两台电脑之
 ```
 cpe_test.exe          ← 本工具（单文件）
 iperf3.exe            ← 从 iperf.fr 下载（只测 Ping/ctsTraffic 可不放）
-ctsTraffic.exe        ← v6.3.2 Windows Release 已捆绑（仅 Windows 10+）
+ctsTraffic.exe        ← v6.4.0 Windows Release 已捆绑（仅 Windows 10+）
 start_agent.bat       ← 辅测机双击
 start_ui.bat          ← 主控机双击（图形控制台，推荐）
 start_master.bat      ← 主控机双击（命令行问答式）
@@ -1449,7 +1460,7 @@ cargo build --release --locked
 
 自行编译后，把 `cpe_test.exe`、启动脚本和所需吞吐工具放到两台 Windows 电脑同一目录：
 iperf3 测试需要完整的 iperf3 Windows 发行包；ctsTraffic 测试需要 `ctsTraffic.exe`。
-官方 v6.3.2 Windows Release ZIP 已捆绑固定且校验过的 ctsTraffic 2.0.4.0，但由于发行包差异不内置 iperf3。
+官方 v6.4.0 Windows Release ZIP 已捆绑固定且校验过的 ctsTraffic 2.0.4.0，但由于发行包差异不内置 iperf3。
 
 ### GitHub Actions CI
 
@@ -1472,7 +1483,7 @@ Windows ZIP 包含启动脚本、四份配置、固定 CTS 二进制和第三方
 `tar.gz` 保留 `cpe_test` 可执行位。发布作业会再次核对资产名称、数量、内部结构和哈希。
 
 仓库同时跟踪一份不含可执行程序的
-[`cpe_test-v6.3.2-windows-config-docs.zip`](dist/cpe_test-v6.3.2-windows-config-docs.zip)，
+[`cpe_test-v6.4.0-windows-config-docs.zip`](dist/cpe_test-v6.4.0-windows-config-docs.zip)，
 便于直接从 Git 下载 Windows 配置、文档和启动脚本。其 SHA-256 位于同目录的
 `.zip.sha256` 文件；CI 会逐文件确认压缩包内容与仓库源文件一致。需要开箱即用的程序、
 固定版 ctsTraffic 和许可证全集时，仍应下载上面的正式 Windows Release ZIP。
