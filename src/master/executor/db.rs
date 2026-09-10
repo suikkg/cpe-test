@@ -3,6 +3,7 @@
 //! 只回答一个问题：这个单元先前跑过、结果还新鲜吗？
 
 use super::*;
+use std::io::Write;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct DbEnt {
@@ -58,12 +59,25 @@ impl ResultDb {
         );
     }
 
-    /// 原子写（tmp + rename）
+    /// 原子写（tmp + rename）。
+    ///
+    /// tmp 用 `create_new` 打开：目标名若被预置成符号链接就直接失败，不跟着写到目录外。
+    /// 覆盖用 `std::fs::rename` 就够——Windows 上 std 内部走的就是
+    /// `MoveFileExW(.., MOVEFILE_REPLACE_EXISTING)`，并且在 `ERROR_ACCESS_DENIED` 时
+    /// 还会用 `FileRenameInfoEx` 兜住只读属性。**不要在这里手写 `MoveFileExW`**：
+    /// 那样既不会多出覆盖语义，还会把 std 的只读兜底丢掉。
     pub fn save(&self) {
         let tmp = self.path.with_extension("tmp");
         if let Ok(text) = serde_json::to_string_pretty(&self.map) {
-            if std::fs::write(&tmp, text).is_ok() {
-                let _ = std::fs::rename(&tmp, &self.path);
+            let _ = std::fs::remove_file(&tmp);
+            let result = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)
+                .and_then(|mut file| file.write_all(text.as_bytes()))
+                .and_then(|_| std::fs::rename(&tmp, &self.path));
+            if result.is_err() {
+                let _ = std::fs::remove_file(&tmp);
             }
         }
     }
