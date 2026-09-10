@@ -4,6 +4,8 @@ import NicTable from '../../components/NicTable.vue';
 import { agentHostname, agentNics, masterNics } from '../../state/inventory';
 import { freshnessLabel } from '../../domain/freshness';
 import { connect, rescan, session } from '../../state/session';
+import { inner } from '../../state/inner';
+import { run } from '../../state/run';
 import { goto } from '../../state/ui';
 
 /**
@@ -20,6 +22,26 @@ const prefixText = computed({
 });
 const showToken = ref(false);
 const busy = computed(() => session.phase === 'connecting');
+/**
+ * 正在跑测时锁住「连接」和「重新扫描」。
+ *
+ * 两个按钮都发 `/api/connect`，它会改掉 `state` 里的辅测机地址、端口、令牌和
+ * 前缀，并把两端网卡表整个换掉。后端**不拦**这件事，而且拦不得——`api_run_impl`
+ * 在起线程前就把 `cfg` 快照下来了，执行线程不再回读 `state`，所以正在跑的那一轮
+ * 不会被改坏。真正的问题在界面：页面上显示的辅测机和网卡表，会和实际正在被测的
+ * 那一台对不上，而进度页照常在跑，看不出任何异常。
+ *
+ * 所以这道门是 UX 门，不是安全门：判定口径由后端的 run_gate 保证，这里只保证
+ * 「屏幕上写的就是正在测的」。三个进行中状态都要算——子网、内环、组合场景在
+ * 后端本来就是互斥的（`api_run_impl` / `/api/inner/run` / `/api/scenario/run`
+ * 互相拒绝），任一在跑都意味着有一轮测试正在用当前这份连接身份。
+ */
+const testInFlight = computed(
+  () => run.running || inner.status.running || inner.scenario.running,
+);
+const lockHint = computed(() =>
+  testInFlight.value ? '测试进行中，改连接会让页面显示的辅测机与实际被测的那台对不上' : undefined,
+);
 /** 旧快照标注用的时刻；从没连上过时是「尚未同步」，不填页面打开时间。 */
 const connectedStamp = computed(() => freshnessLabel(session.connectedAt));
 const connected = computed(() => session.phase === 'connected');
@@ -96,7 +118,11 @@ async function onRescan(): Promise<void> {
       </label>
       <div class="form-actions">
       <p id="prefix-help" class="hint">多个前缀用英文逗号分隔，对两端同时生效。留空显示全部网卡。</p>
-      <button type="submit" class="primary" :disabled="busy || session.scanning">
+      <p v-if="testInFlight" class="hint" role="status">
+        测试进行中，暂时不能改连接：正在跑的那一轮用的是开跑时的配置快照，
+        这里改了只会让页面显示的辅测机与实际被测的那台对不上。停止后再改。
+      </p>
+      <button type="submit" class="primary" :disabled="busy || session.scanning || testInFlight" :title="lockHint">
         {{ busy ? '连接中…' : '连接' }}
       </button>
       </div>
@@ -129,8 +155,8 @@ async function onRescan(): Promise<void> {
       <button
         type="button"
         class="ghost"
-        :disabled="session.scanning || busy"
-        title="沿用上面的地址、令牌和前缀，把两端的网卡重扫一遍"
+        :disabled="session.scanning || busy || testInFlight"
+        :title="lockHint ?? '沿用上面的地址、令牌和前缀，把两端的网卡重扫一遍'"
         @click="onRescan"
       >
         {{ session.scanning ? '扫描中…' : '重新扫描' }}

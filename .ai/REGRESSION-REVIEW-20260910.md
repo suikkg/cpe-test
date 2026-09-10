@@ -308,6 +308,16 @@ wifi 产物：`/Users/kk/uv/cpe_test/main/inner_runs/inner_20260910_072820_69901
 - `/api/connect`、`/api/config`、`/api/import` 在跑测期间能改控制台状态。执行线程用的是
   `api_run_impl` 起线程前的 `cfg` 快照，所以**不影响正在跑的那一轮**，只是界面显示与
   实际被测对象可能不一致。已在路由清单里记成 `stateful` 并写明这个前提。
+
+  **后续补正**：先前记录说这只有直接调 API 才碰得到，不对。前端确实没拦——
+  `AgentView` 的连接按钮此前只按 `session.phase === 'connecting'` 和 `session.scanning`
+  禁用，没读任何「进行中」状态。（`/api/config`、`/api/import` 则前端根本不调，
+  实际界面可达的只有 `/api/connect`，连接与重新扫描两个按钮都走它。）
+  已在 `AgentView.vue` 上加门：`run.running || inner.status.running || inner.scenario.running`
+  任一为真就禁用这两个按钮，并给出可见理由（不是只挂 `title`）。
+  这是 **UX 门不是安全门**——判定口径仍由后端 run_gate 保证，前端只保证
+  「屏幕上写的就是正在测的」。后端保持不拦，因为拦不得：快照已经取走，
+  拦了只会让人在跑测时改不了辅测机地址。
 - 本地 `runs/`、`inner_runs/` 目录的符号链接 TOCTOU：攻击者要能往这些目录写东西，
   前提是已有本机写权限，那时换掉 exe 更省事。上一轮已按这条线扫过一遍，
   不再继续扩大改动面。

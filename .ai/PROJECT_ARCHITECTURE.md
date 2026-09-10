@@ -496,6 +496,10 @@ Windows 文本适配器：`src/cmd/ipconfig.rs` 解析中英文 `ipconfig /all`�
     作者必须回答「它会不会起测/停测/占用被测资源」。`stateful` 那几条不加门的
     **前提**是执行线程不回读 `console.state`（`api_run_impl` 起线程前已把 `cfg`
     快照下来）；哪天执行线程开始回读，它们就必须搬进 `gated`。
+    界面侧另有一道 **UX 门**：`AgentView` 的「连接」「重新扫描」（两者都发
+    `/api/connect`）在 `run.running || inner.status.running || inner.scenario.running`
+    任一为真时禁用，理由是页面显示的辅测机会和实际被测的那台对不上。
+    它不替代后端门禁，后端也有意不拦这三个端点。
 
 ### 11.2 常见修改入口
 
