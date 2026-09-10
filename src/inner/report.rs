@@ -349,29 +349,25 @@ pub(super) fn write_atomic(path: &Path, data: &[u8]) -> Result<(), String> {
     result.map_err(|e| format!("写入 {} 失败: {e}", path.display()))
 }
 
-#[cfg(not(windows))]
+/// 覆盖式替换。**两个平台都用 `std::fs::rename`，不要在这里手写 `MoveFileExW`。**
+///
+/// 这里曾经有一份手写的 `MoveFileExW(.., MOVEFILE_REPLACE_EXISTING)`，理由写的是
+/// 「Windows 对已有目标返回 AlreadyExists」。那条前提是**假的**：std 在
+/// `library/std/src/sys/fs/windows.rs` 里做的第一件事就是同一个
+/// `MoveFileExW(.., MOVEFILE_REPLACE_EXISTING)`，逐字一样。
+///
+/// 手写版真正的区别是**少了 std 的兜底**：`MoveFileExW` 返回
+/// `ERROR_ACCESS_DENIED` 时，std 会改用
+/// `SetFileInformationByHandle(FileRenameInfoEx)`，带
+/// `FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS` 重试；
+/// POSIX 语义那一位正好能在**目标仍被别人打开着**的时候完成替换。
+///
+/// 代价不是抽象的：内环每跑完一个单元都要重写 `report.html` / `result.json`，
+/// 而这些文件恰恰会被人下载、被浏览器打开、被杀软扫描。手写版在 Windows CI 上
+/// 就是这么挂的——`os error 5` 即 `ERROR_ACCESS_DENIED`，写进度直接失败。
+///
+/// 同样的假前提在 `master::executor::db::save` 上出现过一次，这是第二次。
+/// 由 `no_hand_rolled_move_file_ex_in_the_tree` 看着，别再写第三次。
 fn replace_file(temp: &Path, path: &Path) -> std::io::Result<()> {
     std::fs::rename(temp, path)
-}
-
-#[cfg(windows)]
-fn replace_file(temp: &Path, path: &Path) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn MoveFileExW(existing: *const u16, new: *const u16, flags: u32) -> i32;
-    }
-
-    const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
-    let existing: Vec<u16> = temp.as_os_str().encode_wide().chain(Some(0)).collect();
-    let new: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-    // Windows 的 MoveFileExW 带 REPLACE_EXISTING，保证旧文件被完整的新文件替换；
-    // 不能用 std::fs::rename 直接覆盖，因为 Windows 对已有目标返回 AlreadyExists。
-    let ok = unsafe { MoveFileExW(existing.as_ptr(), new.as_ptr(), MOVEFILE_REPLACE_EXISTING) };
-    if ok == 0 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
 }

@@ -1855,6 +1855,53 @@ fn concurrent_report_downloads_never_read_a_truncated_generation() {
     std::fs::remove_dir_all(dir).unwrap();
 }
 
+/// 生产代码不许手写 `MoveFileExW`——覆盖式重命名一律走 `std::fs::rename`。
+///
+/// 这条前提在本仓库出现过两次，两次都写着「Windows 对已有目标返回 AlreadyExists，
+/// 所以要自己调 `MoveFileExW`」，两次都是假的：std 的 `rename` 第一步就是同一个
+/// `MoveFileExW(.., MOVEFILE_REPLACE_EXISTING)`。手写版唯一的实际区别是**丢掉了
+/// std 在 `ERROR_ACCESS_DENIED` 上的兜底**（改用 `FileRenameInfoEx` +
+/// `REPLACE_IF_EXISTS | POSIX_SEMANTICS` 重试，目标被别人打开着也能替换）。
+///
+/// 第一次在 `master::executor::db::save`，靠人读出来；第二次在
+/// `inner::report::replace_file`，靠 Windows CI 上 `os error 5` 咬出来——
+/// 本机 macOS/Linux 全绿，因为那段代码在 `#[cfg(windows)]` 里，压根没编译。
+/// 「平台分支里的代码」正是本地门禁最没有分辨力的地方，所以这里用源码扫描。
+///
+/// 只看代码，不看注释：上面那两处的说明文字里就带着这个符号名。
+#[test]
+fn no_hand_rolled_move_file_ex_in_the_tree() {
+    // 拼出来，免得这条测试自己的源码把自己扫红。
+    let needle = concat!("MoveFile", "ExW");
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut offenders = Vec::new();
+    let mut stack = vec![root];
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read src dir") {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("read source");
+            for (index, line) in text.lines().enumerate() {
+                let code = line.split("//").next().unwrap_or("");
+                if code.contains(needle) {
+                    offenders.push(format!("{}:{}", path.display(), index + 1));
+                }
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "覆盖式重命名一律用 std::fs::rename；手写 {needle} 会丢掉 std 在 \
+         ERROR_ACCESS_DENIED 上的 FileRenameInfoEx 兜底: {offenders:#?}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn atomic_report_write_never_follows_a_symlinked_pending_file() {

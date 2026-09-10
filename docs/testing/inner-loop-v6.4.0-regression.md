@@ -71,3 +71,46 @@ JSON 字面量和多处 `agents.clear()` 承担，无独占损失），删掉 RE
 
 真实 Windows 双机、ctsTraffic 全链路、Windows 默认预设与 24 小时长稳未在本轮
 执行。Windows 原生测试与三平台打包由发布 CI 承担。
+
+---
+
+## 补记：Windows CI 咬出第二处同样的假前提
+
+首次打 tag 后 CI 在 **Windows 构建**上失败，`release` 作业被跳过——没有任何
+二进制公开发布，门禁按设计拦住了。
+
+```
+inner::tests::concurrent_report_downloads_never_read_a_truncated_generation
+写入 ...\cpe-inner-atomic-7588\report.html 失败: Access is denied. (os error 5)
+```
+
+根因：`inner::report::replace_file` 手写了一份
+`MoveFileExW(.., MOVEFILE_REPLACE_EXISTING)`，注释理由是「不能用
+`std::fs::rename` 直接覆盖，因为 Windows 对已有目标返回 AlreadyExists」。
+
+**这条前提从 std 源码逐行证伪**（`library/std/src/sys/fs/windows.rs:1311`）：
+
+1. `std::fs::rename` 的第一步就是同一个
+   `MoveFileExW(old, new, MOVEFILE_REPLACE_EXISTING)`，逐字一样——所以
+   「返回 AlreadyExists」不成立；
+2. 它在 `ERROR_ACCESS_DENIED` 上还有一层兜底：改用
+   `SetFileInformationByHandle(FileRenameInfoEx)`，带
+   `FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS`。
+   POSIX 语义那一位正是「目标仍被别人打开着也能替换」。
+
+手写版有第 1 步、没有第 2 步。`os error 5` 就是 `ERROR_ACCESS_DENIED`。
+
+**不是测试专属问题。** 内环每跑完一个单元都要重写 `report.html` /
+`result.json`，而这些文件恰恰会被人从控制台历史页下载、被浏览器打开、被
+Defender 扫描。Windows 是主战场，命中就是跑到一半保存失败。
+
+这是同一条假前提在本仓库的第二次出现——第一次在
+`master::executor::db::save`，上一轮靠人读出来并写进了 CLAUDE.md 当反例；
+这一次躲过了同一个人的复查，因为**它在 `#[cfg(windows)]` 里，本机 macOS 上
+四条门禁一次都没编译到它**。这正好补上了「绿灯没有分辨力」的第二种形状：
+第一种是文件不在仓库里，第二种是代码不在本平台编译。
+
+处置：两个平台统一 `std::fs::rename`，并加第五条守卫
+`no_hand_rolled_move_file_ex_in_the_tree`——扫描源码（只看代码不看注释，
+因为两处的说明文字里就带这个符号名），禁止生产代码手写该调用。
+注入验证：加回去立刻红并点名行号，去掉即绿。

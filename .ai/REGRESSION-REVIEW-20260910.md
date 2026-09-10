@@ -381,3 +381,26 @@ checkout 和任何新贡献者都编不过。两个决定各自都对，凑一�
 
 真实 Windows 双机、ctsTraffic 全链路、Windows 默认预设与 24 小时长稳。
 Windows 原生测试与三平台打包由发布 CI 承担。
+
+### 补记：Windows CI 咬出第二处 MoveFileExW 假前提
+
+打 tag 后 CI 的 Windows 构建失败（`release` 作业跳过，未公开发布任何二进制）：
+`concurrent_report_downloads_never_read_a_truncated_generation` 报
+`Access is denied. (os error 5)`。
+
+根因是 `inner::report::replace_file` 里第二份手写 `MoveFileExW`，理由与
+`db.rs` 那次一模一样、同样是假的。从 std 源码
+（`library/std/src/sys/fs/windows.rs:1311`）逐行证伪：std 第一步就是同一个
+`MoveFileExW(.., MOVEFILE_REPLACE_EXISTING)`，且在 `ERROR_ACCESS_DENIED` 上
+多一层 `FileRenameInfoEx` + `REPLACE_IF_EXISTS | POSIX_SEMANTICS` 兜底，
+后者正好覆盖「目标仍被别人打开着」。手写版少的就是这一层。
+
+**为什么上一轮的复查没抓到**：上一轮我确实按「同类还有没有第二处」扫过一遍，
+但扫的是 `.is_dir()` / `.is_file()` 那条线，没有扫 `MoveFileExW` 本身；
+而且这段代码在 `#[cfg(windows)]` 里，本机 macOS 的 `cargo test` /
+`cargo clippy` 一次都没编译到它——**`cargo clippy --target
+x86_64-pc-windows-msvc` 会编译它，但它当时没有语法或 lint 问题，只有语义问题。**
+
+由此补上第五条守卫 `no_hand_rolled_move_file_ex_in_the_tree`（源码扫描，
+只看代码不看注释）。绿灯没有分辨力的第二种形状记下来：**代码不在本平台编译**，
+第一种是**文件不在仓库里**。

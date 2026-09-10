@@ -30,7 +30,7 @@ Windows 配置、说明文档和启动脚本资料包。包内文件由仓库当
 
 ## v6.4.0 行为要点
 
-新增 ADB 内环测速（控制台左侧「内环测试」，或 `cpe_test.exe inner --config`）与「子网 → 内环」组合场景。修复监控采样线程起不来仍占用会话槽位、长任务名的截图文件名撞 Windows MAX_PATH、以及跑测期间还能改辅测机连接。内环报告在 `inner_runs`，组合场景记录在 `scenarios`，与子网 `runs` 分开。
+新增 ADB 内环测速（控制台左侧「内环测试」，或 `cpe_test.exe inner --config`）与「子网 → 内环」组合场景。修复 Windows 上内环写报告可能撞「Access is denied」（报告文件正被下载或被杀软扫描时保存失败）、监控采样线程起不来仍占用会话槽位、长任务名的截图文件名撞 Windows MAX_PATH、以及跑测期间还能改辅测机连接。内环报告在 `inner_runs`，组合场景记录在 `scenarios`，与子网 `runs` 分开。
 
 ## v6.3.2 行为要点
 

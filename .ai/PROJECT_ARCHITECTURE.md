@@ -424,7 +424,7 @@ Windows 文本适配器：`src/cmd/ipconfig.rs` 解析中英文 `ipconfig /all`�
 - 其他平台固定错误。
 - PNG 编码；测试在 解码回读 2x2 RGBA，而不只检查魔数。
 
-## 10. 测试覆盖索引（当前 Rust 全量 772 项；下表列出按模块维护的覆盖面）
+## 10. 测试覆盖索引（当前 Rust 全量 773 项；下表列出按模块维护的覆盖面）
 
 | 区域 | 测试位置 | 覆盖 |
 |---|---|---|
@@ -480,7 +480,7 @@ Windows 文本适配器：`src/cmd/ipconfig.rs` 解析中英文 `ipconfig /all`�
 
 - 内环 UI 的统计口径：上行板侧桥（默认 `br0`）RX、下行所选 PC 网口 RX、双向两者各一腿。界面不提供板侧成员口映射或候选，桥名称保留可编辑以适配机型；历史配置字段保持兼容。
 
-- **防复发的四条机制**（2026-09-10 那轮横扫的产物；它们守的是「下一处」，不是已修的那几处）：
+- **防复发的五条机制**（2026-09-10 那轮横扫的产物；它们守的是「下一处」，不是已修的那几处）：
   - 历史目录的类型判断只有一种形状——不跟随符号链接的那种。枚举/打包/落盘历史的
     五个模块（`report/store`、`master/webui/runs`、`master/webui/scenario`、
     `inner/history`、`inner/webui`）的生产代码里不许出现 `.is_dir()` / `.is_file()` /
@@ -509,6 +509,14 @@ Windows 文本适配器：`src/cmd/ipconfig.rs` 解析中英文 `ipconfig /all`�
     `inner.local.example.json`，同一轮里另一个决定又把这类文件 gitignore 掉了，
     两个决定各自都对，凑一起就是新克隆编不过。规则从 `.gitignore` 现读，
     改忽略规则不用回来改测试。
+  - 覆盖式重命名一律 `std::fs::rename`，生产代码不许手写 `MoveFileExW`。守在
+    `no_hand_rolled_move_file_ex_in_the_tree`（`src/inner/tests.rs`）。
+    「Windows 对已有目标返回 AlreadyExists」是假前提——std 第一步就是同一个
+    `MoveFileExW(.., MOVEFILE_REPLACE_EXISTING)`；手写版唯一的实际区别是丢掉
+    std 在 `ERROR_ACCESS_DENIED` 上的 `FileRenameInfoEx` 兜底。这条前提在本仓库
+    出现过两次：`master::executor::db::save` 靠人读出来，
+    `inner::report::replace_file` 靠 Windows CI 的 `os error 5` 咬出来——
+    **它在 `#[cfg(windows)]` 里，本机 macOS/Linux 的四条门禁压根没编译到它**。
 
 ### 11.2 常见修改入口
 
@@ -530,7 +538,7 @@ Windows 文本适配器：`src/cmd/ipconfig.rs` 解析中英文 `ipconfig /all`�
 - 本次重构前 Rust 物理行数：；生产区（每文件首个 `#[cfg(test)]` 前）。
 - 最终 Rust 物理行数：；生产物理行数：；生产区净减少 行，全部 Rust 净减少 行。
 - 测试从基线 增加到，没有通过删除测试获得减量。
-- 已验证：`cargo fmt --all -- --check`、`cargo test --all-targets --locked`（当前 772 项）、本机与 `x86_64-pc-windows-msvc` 严格 Clippy、Linux target check、`git diff --check`。
+- 已验证：`cargo fmt --all -- --check`、`cargo test --all-targets --locked`（当前 773 项）、本机与 `x86_64-pc-windows-msvc` 严格 Clippy、Linux target check、`git diff --check`。
 - 旧说明 `使用说明.md:276-277` 关于 iperf server `-1`/netstat LISTEN 探测已过时；当前实现是无 `-1`、主动 stop、TCP connect ready 探测（`cmd/iperf.rs`）。维护 AI 文档时以当前实现为准。
 
 ### 内环进度与产物一致性补充
