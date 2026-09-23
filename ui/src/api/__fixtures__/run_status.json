@@ -20,9 +20,11 @@
       "link_group": "SGMII ↔ WLAN",
       "reason_code": "RX_TARGET_MET",
       "reason_detail": "网卡 RX 平均 2310.500Mbps 达到目标 2000.000Mbps",
+      "rx_avg": 2310.5,
       "secs": 182,
       "seq": 1,
       "skipped": false,
+      "target_mbps": 2000.0,
       "title": "IPERF V4 TCP -w 4m -P 10 | 主控 eth0 -> 辅测 eth0",
       "verdict": "PASS"
     }

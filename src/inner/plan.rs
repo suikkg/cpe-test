@@ -36,6 +36,7 @@ pub struct Unit {
     pub link: usize,
     pub link_name: String,
     pub host: String,
+    pub ip_version: u8,
     pub protocol: Protocol,
     pub direction: Direction,
     pub streams: u32,
@@ -67,9 +68,10 @@ impl Unit {
     }
     pub fn title(&self) -> String {
         format!(
-            "{} / {} / {} / {}",
+            "{} / {} / IPv{} / {} / {}",
             self.host,
             self.link_name,
+            self.ip_version,
             self.protocol.label(),
             self.direction.label()
         )
@@ -130,6 +132,7 @@ fn push_id_field(out: &mut String, name: &str, value: impl std::fmt::Display) {
 fn unit_id(
     cfg: &InnerConfig,
     link: &Link,
+    ip_version: u8,
     protocol: Protocol,
     direction: Direction,
     repeat: u32,
@@ -155,7 +158,14 @@ fn unit_id(
             push_id_field(&mut raw, "agent_port", agent.port);
         }
     }
-    push_id_field(&mut raw, "measurement", format!("{link:?}"));
+    // v1/v2 曾将完整 Link 的 Debug 文本混进身份。新增字段不能使既有 IPv4
+    // PASS 全失效，因此固定旧字段和顺序；IPv6 单独加入实际地址与版本。
+    push_id_field(&mut raw, "measurement", legacy_link_identity(link));
+    if ip_version == 6 {
+        push_id_field(&mut raw, "ip_version", ip_version);
+        push_id_field(&mut raw, "local_ipv6", link.local_address(ip_version));
+        push_id_field(&mut raw, "gateway_ipv6", link.board_address(ip_version));
+    }
     push_id_field(&mut raw, "protocol", format!("{protocol:?}"));
     push_id_field(&mut raw, "direction", format!("{direction:?}"));
     push_id_field(&mut raw, "repeat", repeat);
@@ -194,7 +204,17 @@ fn unit_id(
     crate::util::md5_hex(&raw)
 }
 
-/// 展开计划。顺序即执行顺序：**网口 → 协议 → 方向 → 重复轮次**。
+fn legacy_link_identity(link: &Link) -> String {
+    format!(
+        "Link {{ name: {:?}, host: {:?}, enabled: {:?}, local_interface: {:?}, local_ip: {:?}, gateway: {:?}, board_rx_interface: {:?}, measurement: {:?}, upload_min_mbps: {:?}, download_min_mbps: {:?}, bidir_total_min_mbps: {:?}, tool_upload_min_mbps: {:?}, tool_download_min_mbps: {:?}, tool_bidir_total_min_mbps: {:?} }}",
+        link.name, link.host, link.enabled, link.local_interface, link.local_ip, link.gateway,
+        link.board_rx_interface, link.measurement, link.upload_min_mbps, link.download_min_mbps,
+        link.bidir_total_min_mbps, link.tool_upload_min_mbps, link.tool_download_min_mbps,
+        link.tool_bidir_total_min_mbps,
+    )
+}
+
+/// 展开计划。顺序即执行顺序：**网口 → IP 版本 → 协议 → 方向 → 重复轮次**。
 ///
 /// 外层永远按用户排定的网口顺序串行，只有双向单元内部并发。不同网口
 /// 绝不同时灌包——板侧桥计数器会把两条链路的流量混在一起。
@@ -204,48 +224,53 @@ pub fn build(cfg: &InnerConfig) -> Result<Plan, String> {
     let mut units = Vec::new();
     for &link_index in &links {
         let link = &cfg.links[link_index];
-        for &protocol in &cfg.protocols {
-            for &direction in &cfg.directions {
-                for repeat in 1..=cfg.repeats {
-                    let legs = direction
-                        .flows()
-                        .iter()
-                        .enumerate()
-                        .map(|(offset, &flow)| {
-                            let port = cfg.port.checked_add(offset as u16).ok_or_else(|| {
-                                "板侧端口加一后越界，请把起始端口调低".to_string()
-                            })?;
-                            Ok(leg_plan(link, flow, port))
-                        })
-                        .collect::<Result<Vec<_>, String>>()?;
-                    units.push(Unit {
-                        id: unit_id(
-                            cfg,
-                            link,
+        for &ip_version in &cfg.ip_versions {
+            for &protocol in &cfg.protocols {
+                for &direction in &cfg.directions {
+                    for repeat in 1..=cfg.repeats {
+                        let legs = direction
+                            .flows()
+                            .iter()
+                            .enumerate()
+                            .map(|(offset, &flow)| {
+                                let port =
+                                    cfg.port.checked_add(offset as u16).ok_or_else(|| {
+                                        "板侧端口加一后越界，请把起始端口调低".to_string()
+                                    })?;
+                                Ok(leg_plan(link, flow, port))
+                            })
+                            .collect::<Result<Vec<_>, String>>()?;
+                        units.push(Unit {
+                            id: unit_id(
+                                cfg,
+                                link,
+                                ip_version,
+                                protocol,
+                                direction,
+                                repeat,
+                                cfg.streams(protocol),
+                            ),
+                            index: units.len() + 1,
+                            link: link_index,
+                            link_name: link.name.clone(),
+                            host: link.host.clone(),
+                            ip_version,
                             protocol,
                             direction,
+                            streams: cfg.streams(protocol),
+                            measurement: link.measurement,
                             repeat,
-                            cfg.streams(protocol),
-                        ),
-                        index: units.len() + 1,
-                        link: link_index,
-                        link_name: link.name.clone(),
-                        host: link.host.clone(),
-                        protocol,
-                        direction,
-                        streams: cfg.streams(protocol),
-                        measurement: link.measurement,
-                        repeat,
-                        legs,
-                        nic_total_target_mbps: direction
-                            .is_bidir()
-                            .then(|| link.total_target(false))
+                            legs,
+                            nic_total_target_mbps: direction
+                                .is_bidir()
+                                .then(|| link.total_target(false))
+                                .flatten(),
+                            tool_total_target_mbps: (direction.is_bidir()
+                                && link.measurement.uses_tool())
+                            .then(|| link.total_target(true))
                             .flatten(),
-                        tool_total_target_mbps: (direction.is_bidir()
-                            && link.measurement.uses_tool())
-                        .then(|| link.total_target(true))
-                        .flatten(),
-                    });
+                        });
+                    }
                 }
             }
         }
@@ -299,6 +324,7 @@ pub struct PreviewRow {
     pub id: String,
     pub link: String,
     pub host: String,
+    pub ip_version: u8,
     pub protocol: Protocol,
     pub direction: Direction,
     pub repeat: u32,
@@ -381,6 +407,7 @@ pub fn preview_with_resumed(
                 id: unit.id.clone(),
                 link: unit.link_name.clone(),
                 host: unit.host.clone(),
+                ip_version: unit.ip_version,
                 protocol: unit.protocol,
                 direction: unit.direction,
                 repeat: unit.repeat,
@@ -395,7 +422,10 @@ pub fn preview_with_resumed(
                         port: leg.port,
                         receiver: if leg.flow.receiver_is_board() {
                             if link.board_rx_interface.is_empty() {
-                                format!("板侧（按 {} 归属自动识别）", link.gateway)
+                                format!(
+                                    "板侧（按 {} 归属自动识别）",
+                                    link.board_address(unit.ip_version)
+                                )
                             } else {
                                 format!("板侧 {}", link.board_rx_interface)
                             }

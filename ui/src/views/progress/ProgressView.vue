@@ -5,12 +5,14 @@ import {
   failuresByLinkGroup,
   filterByVerdict,
   humanDuration,
+  unitRateLabel,
+  unitRateTone,
   unitSearchFields,
   verdictTone,
 } from '../../domain/progress';
 import type { VerdictFilter } from '../../domain/progress';
 import { filterByQuery, visibleCountLabel } from '../../domain/search';
-import { LOG_MAX_LINES, openReport, run, startPolling, stop, syncStatus, view } from '../../state/run';
+import { LOG_MAX_LINES, openReport, run, skipUnit, startPolling, stop, syncStatus, view } from '../../state/run';
 import { goto, syncProgressRun, ui } from '../../state/ui';
 
 /**
@@ -103,7 +105,7 @@ function jumpToLatest(): void {
   hasNewLines.value = false;
 }
 watch(
-  () => run.lines.length,
+  () => run.lines,
   async () => {
     if (!following.value) {
       hasNewLines.value = true;
@@ -118,6 +120,18 @@ watch(
 function pickUnit(seq: number): void {
   ui.progress.selected = ui.progress.selected === String(seq) ? '' : String(seq);
 }
+
+/**
+ * 「跳过当前单元」按钮的说法，同样按**确知程度**给，不按点击给。
+ *
+ * HTTP 200 只说明请求被受理，当前单元还要等工具退出、结果落盘。
+ */
+const skipLabel = computed(() => {
+  if (run.skipPhase === 'sending') return '正在请求跳过…';
+  if (run.skipPhase === 'accepted') return '已请求跳过';
+  if (run.skipPhase === 'unknown') return '跳过结果未确认';
+  return '跳过当前单元';
+});
 
 const stopLabel = computed(() => {
   if (run.stopPhase === 'sending') return '正在请求停止…';
@@ -147,7 +161,7 @@ onMounted(startPolling);
       <button type="button" class="ghost" @click="syncStatus">同步运行状态</button>
     </div>
 
-    <div v-else-if="!run.status.run_id && !run.running" class="empty">
+    <div v-else-if="!run.status.run_id && !run.running && !run.startError && !run.lines.length" class="empty">
       <strong>等待开始第一轮测试</strong>
       <p>在「执行」页预览并开始测试后，这里会显示实时进度与结果。</p>
       <button type="button" @click="goto('run')">前往执行</button>
@@ -158,17 +172,25 @@ onMounted(startPolling);
         <div class="run-heading">
           <div>
             <span class="run-state" :class="{ running: run.running, aborted: view.aborted }">
-              {{ view.aborted ? '已中止' : run.running ? '正在执行' : view.finished ? '本轮结束' : '等待状态更新' }}
+              {{ view.aborted ? '已中止' : run.running ? '正在执行' : view.finished ? '本轮结束' : run.startError ? '启动未完成，请查看运行日志' : '等待状态更新' }}
             </span>
             <div v-if="run.status.run_id" class="run-id mono">{{ run.status.run_id }}</div>
           </div>
           <div class="run-actions">
             <span class="freshness muted mono" :title="'最近一次成功读到运行状态的时刻'">{{ freshness }}</span>
             <button
+              v-if="run.running && run.stopPhase === 'idle'"
+              type="button"
+              class="ghost"
+              :disabled="!run.status.run_id || !run.status.current || run.skipPhase !== 'idle'"
+              title="掐断当前这一个单元，队列继续跑下一个。已请求停止整轮时这个按钮不出现。"
+              @click="skipUnit"
+            >{{ skipLabel }}</button>
+            <button
               v-if="run.running || run.stopPhase !== 'idle'"
               type="button"
               class="ghost"
-              :disabled="run.stopPhase === 'sending'"
+              :disabled="run.stopPhase !== 'idle'"
               @click="stop"
             >{{ stopLabel }}</button>
             <button v-if="view.finished && run.report" type="button" @click="openReport">打开报告</button>
@@ -213,6 +235,15 @@ onMounted(startPolling);
         </p>
         <button type="button" class="ghost" @click="syncStatus">同步运行状态</button>
       </div>
+      <p v-if="run.skipPhase === 'accepted'" class="warn" role="status">
+        已请求跳过当前单元，等待收尾。诊断会标记「被操作员手动跳过」，
+        是否取得有效测量、能否判定，以最终结果为准。
+      </p>
+      <p v-if="run.skipPhase === 'unknown'" class="warn" role="alert">
+        跳过请求没有拿到应答，无法确认它有没有到达主控。<strong>不会自动重发</strong>——
+        重发有可能把下一个单元也跳掉。请先同步一次运行状态再决定。
+      </p>
+      <p v-if="run.skipError" class="bad" role="alert">跳过失败：{{ run.skipError }}</p>
       <p v-if="run.stopError" class="bad" role="alert">停止失败：{{ run.stopError }}</p>
       <p v-if="run.reportError" class="bad" role="alert">打开报告失败：{{ run.reportError }}</p>
       <p v-if="run.startError" class="bad" role="alert">{{ run.startError }}</p>
@@ -249,6 +280,9 @@ onMounted(startPolling);
               <span class="seq mono">#{{ unit.seq }}</span>
               <span class="verdict" :class="verdictTone(unit.verdict)">{{ unit.verdict }}</span>
               <span class="fail-title">{{ unit.title }}</span>
+              <!-- 「差多少」是看到 RATE_FAIL 之后的第一个问题：差 2% 和差一个
+                   数量级对应完全不同的处置。 -->
+              <small v-if="unitRateLabel(unit)" class="rate mono under">{{ unitRateLabel(unit) }}</small>
               <small v-if="unit.reason_code" class="reason muted mono">{{ unit.reason_code }}</small>
             </li>
           </ul>
@@ -291,13 +325,18 @@ onMounted(startPolling);
         <p class="unit-detail-title">{{ selectedUnit.title }}</p>
         <dl>
           <dt>链路集合</dt><dd>{{ selectedUnit.link_group || '—' }}</dd>
+          <dt>实测 / 门限</dt>
+          <dd class="mono" :class="unitRateTone(selectedUnit) ?? ''">
+            {{ unitRateLabel(selectedUnit) || '—' }}
+          </dd>
           <dt>耗时</dt><dd class="mono">{{ humanDuration(selectedUnit.secs) }}</dd>
           <dt>原因码</dt><dd class="mono">{{ selectedUnit.reason_code || '—' }}</dd>
           <dt>原因</dt><dd>{{ selectedUnit.reason_detail || '—' }}</dd>
         </dl>
         <p class="muted small">
-          <!-- 进度回包里**没有**每单元的 RX / P10 / 目标值。缺就说缺，不能凭空补数字。 -->
-          这一页只有运行状态里已有的字段。要看这条腿的 RX 平均、P10 与门限，
+          <!-- 单元级的 RX 平均与门限现在在运行状态里（与报告汇总行同源）。
+               P10、采样覆盖率、逐样本 CSV 仍然只在报告里——缺的照旧说缺。 -->
+          这里的实测值就是判定用的那个数。要看 P10、采样覆盖率和逐样本曲线，
           等本轮结束后打开报告。
         </p>
       </div>
@@ -310,7 +349,7 @@ onMounted(startPolling);
         <table>
           <thead>
             <tr>
-              <th scope="col">#</th><th scope="col">判定</th><th scope="col">标题</th><th scope="col">链路集合</th><th scope="col" class="num">耗时</th>
+              <th scope="col">#</th><th scope="col">判定</th><th scope="col">标题</th><th scope="col">链路集合</th><th scope="col" class="num">实测 / 门限</th><th scope="col" class="num">耗时</th>
             </tr>
           </thead>
           <tbody>
@@ -327,6 +366,7 @@ onMounted(startPolling);
               <td><span class="verdict" :class="verdictTone(unit.verdict)">{{ unit.verdict }}</span></td>
               <td class="result-title">{{ unit.title }}</td>
               <td class="muted">{{ unit.link_group || '—' }}</td>
+              <td class="num mono rate" :class="unitRateTone(unit) ?? ''">{{ unitRateLabel(unit) || '—' }}</td>
               <td class="num mono">{{ humanDuration(unit.secs) }}</td>
             </tr>
           </tbody>
@@ -400,6 +440,11 @@ onMounted(startPolling);
 .fail-group li + li { border-top: 1px solid var(--line); }
 .fail-title { flex: 1 1 auto; min-width: 0; overflow-wrap: anywhere; }
 .reason { overflow-wrap: anywhere; }
+/* 实测值的着色只在**有门限可比**时出现：Observe 模式没有门限，
+   满屏绿色会被读成「全部达标」。不上色就是「这一格没有可比对象」。 */
+.rate { white-space: nowrap; font-variant-numeric: tabular-nums; }
+.rate.over { color: var(--ok); }
+.rate.under { color: var(--bad); }
 .seq { flex: 0 0 38px; color: var(--muted); font-size: 12px; }
 .hint { margin: 0 0 12px; font-size: 12.5px; max-width: 80ch; }
 .section-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin: 22px 0 10px; }

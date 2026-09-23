@@ -1,8 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { defaultInnerConfig, innerLink, serializeInnerProject } from '../domain/inner';
-import type { InnerLink } from '../domain/inner';
+import { defaultInnerConfig, innerLink, parseInnerProject, serializeInnerProject } from '../domain/inner';
+import type { InnerConfig, InnerLink } from '../domain/inner';
+import type { InnerCapability } from '../domain/inner';
+import { innerNicChoices } from '../domain/inner-setup';
 import {
-  addInnerLink, applyInnerBatch, importInner, inner, moveInnerLinkTo, probeInner, refreshInnerPlan,
+  addInnerLink, addInnerScannedLinks, applyInnerBatch, importInner, inner, moveInnerLinkTo, probeInner, refreshInnerPlan,
   setInnerLinkEnabled, startInner, startSubnetThenInner, stopInner, syncInnerStatus, syncScenarioStatus,
   loadInnerRunConfig,
 } from './inner';
@@ -25,6 +27,22 @@ describe('内环独立状态与 API', () => {
     subnetPlan.preview = null; subnetPlan.previewRequestFingerprint = '';
     vi.mocked(api.get).mockResolvedValue(inner.status);
   });
+  it('扫描选口只添加明确勾选的项，重复添加不覆盖配置也不启动测试', () => {
+    inner.capability = { local: { interfaces: [
+      { name: 'ETH 1', ipv4: '192.168.0.100' },
+      { name: 'ETH 2', ipv4: '192.168.0.101' },
+    ] }, agents: [] } as unknown as InnerCapability;
+    const selected = innerNicChoices(inner.capability)[1]!;
+    const added = addInnerScannedLinks([selected.key]);
+    expect(added).toHaveLength(1);
+    expect(inner.config.links[0]).toMatchObject({ local_interface: 'ETH 2', local_ip: '192.168.0.101' });
+    inner.config.links[0]!.enabled = false;
+    inner.config.links[0]!.gateway = '192.168.0.9';
+    expect(addInnerScannedLinks([selected.key])).toEqual([]);
+    expect(inner.config.links[0]).toMatchObject({ enabled: false, gateway: '192.168.0.9' });
+    expect(api.post).not.toHaveBeenCalled();
+    inner.capability = null;
+  });
   it('扫描、开跑、停止只访问内环命名空间', async () => {
     await probeInner();
     inner.config.links = [link()];
@@ -34,6 +52,116 @@ describe('内环独立状态与 API', () => {
     expect(vi.mocked(api.post).mock.calls.map(([path]) => path)).toEqual(['/api/inner/probe', '/api/inner/run', '/api/inner/stop']);
     // 带上了 units_from 游标，所以按前缀断言；要守的是「只碰内环命名空间」。
     expect(vi.mocked(api.get).mock.calls.every(([path]) => path.startsWith('/api/inner/status'))).toBe(true);
+  });
+  it.each<[string, Partial<InnerConfig>]>([
+    ['UDP 速率未填写', { protocols: ['udp'], udp_mbps: null }],
+    ['时长和数字参数正在清空编辑', { duration_secs: '' as never, parallel: 0, port: 0, repeats: 0 }],
+    ['协议参数未填写完整', { tcp_streams: 0, tcp_window: '待填写', udp_length: '待填写', max_udp_loss_pct: -1 }],
+    ['协议和方向暂未选择', { protocols: [], directions: [] }],
+  ])('扫描不受%s影响，也不改写正在编辑的测试配置', async (_label, unfinished) => {
+    inner.config = {
+      ...defaultInnerConfig(), ...unfinished,
+      adb_path: 'C:\\Program Files\\platform-tools\\adb.exe',
+      serial: 'cpe-device-02', board_iperf: '/data/local/tmp/iperf3',
+      agents: [
+        { id: 'agent-a', address: ' 192.168.8.200 ', port: 28801, token: 'probe-token-a' },
+        { id: 'agent-b', address: '192.168.8.201', port: 28802, token: 'probe-token-b' },
+      ],
+      // 新网口还没指定源 IP，甚至可以有未勾选的旧配置；扫描必须都不受影响。
+      links: [innerLink(), { ...innerLink('agent-b'), enabled: false }],
+    };
+    const before = JSON.parse(JSON.stringify(inner.config));
+    const capability = { serial: 'cpe-device-02' } as InnerCapability;
+    vi.mocked(api.post).mockImplementationOnce(async (_path, body) => {
+      // 扫描端点也会校验完整配置：mock 不能无条件成功掩盖无效请求。
+      parseInnerProject(JSON.stringify(body));
+      return capability;
+    });
+
+    await probeInner();
+
+    expect(inner.error).toBe('');
+    expect(inner.capability).toEqual(capability);
+    expect(inner.busy).toBe(false);
+    expect(inner.config).toEqual(before);
+    expect(api.post).toHaveBeenCalledExactlyOnceWith('/api/inner/probe', {
+      ...defaultInnerConfig(),
+      adb_path: before.adb_path, serial: before.serial, board_iperf: before.board_iperf,
+      agents: before.agents.map((agent: InnerConfig['agents'][number]) => ({
+        ...agent, address: agent.address.trim(),
+      })),
+    });
+  });
+  it('扫描连接参数用独立快照，保留全部辅测机及内存令牌', async () => {
+    inner.config.agents = [{ id: 'agent-a', address: '192.168.8.200', port: 28801, token: 'first-token' }];
+    let finish!: (value: unknown) => void;
+    vi.mocked(api.post).mockImplementationOnce(() => new Promise((resolve) => { finish = resolve; }));
+    const pending = probeInner();
+    const request = vi.mocked(api.post).mock.calls[0]?.[1] as InnerConfig;
+    inner.config.agents[0].address = '192.168.8.201';
+    inner.config.agents[0].token = 'edited-token';
+    expect(request.agents).toEqual([
+      { id: 'agent-a', address: '192.168.8.200', port: 28801, token: 'first-token' },
+    ]);
+    finish({ serial: 'device' });
+    await pending;
+    expect(inner.config.agents[0].token).toBe('edited-token');
+    expect(inner.capability).toBeNull();
+    expect(inner.busy).toBe(false);
+  });
+  it.each<[string, (config: InnerConfig) => void]>([
+    ['ADB 路径', (cfg) => { cfg.adb_path = '/opt/adb'; }],
+    ['ADB 序列号', (cfg) => { cfg.serial = 'another-device'; }],
+    ['板侧工具', (cfg) => { cfg.board_iperf = '/data/iperf3'; }],
+    ['辅测机标识', (cfg) => { cfg.agents[0].id = 'agent-b'; }],
+    ['辅测机地址', (cfg) => { cfg.agents[0].address = '192.168.8.201'; }],
+    ['辅测机端口', (cfg) => { cfg.agents[0].port = 28802; }],
+    ['辅测机令牌', (cfg) => { cfg.agents[0].token = 'updated-token'; }],
+    ['移除辅测机', (cfg) => { cfg.agents.splice(0, 1); }],
+  ])('扫描成功后修改%s立即清除旧扫描结果', async (_label, change) => {
+    inner.config.agents = [{ id: 'agent-a', address: '192.168.8.200', port: 28801, token: 'token' }];
+    vi.mocked(api.post).mockResolvedValueOnce({ serial: 'device' });
+    await probeInner();
+    expect(inner.capability?.serial).toBe('device');
+    change(inner.config);
+    expect(inner.capability).toBeNull();
+  });
+  it('调整打流参数、网口设置和连接地址两端空格保留扫描结果', async () => {
+    inner.config.agents = [{ id: 'agent-a', address: '192.168.8.200', port: 28801, token: 'token' }];
+    vi.mocked(api.post).mockResolvedValueOnce({ serial: 'device' });
+    await probeInner();
+    inner.config.duration_secs = 30;
+    inner.config.links = [link()];
+    inner.config.links[0].gateway = '192.168.8.2';
+    inner.config.agents[0].address = ' 192.168.8.200 ';
+    expect(inner.capability?.serial).toBe('device');
+  });
+  it.each([false, true])('设备修改后即使改回原值，也不接收旧扫描的%s响应', async (fail) => {
+    let finish!: (value: unknown) => void;
+    let reject!: (reason: Error) => void;
+    vi.mocked(api.post).mockImplementationOnce(() => new Promise((resolve, rejectPromise) => {
+      finish = resolve; reject = rejectPromise;
+    }));
+    const pending = probeInner();
+    inner.config.serial = 'another-device';
+    inner.config.serial = '';
+    if (fail) reject(new Error('旧设备连接失败')); else finish({ serial: 'old-device' });
+    await pending;
+    expect(inner.capability).toBeNull();
+    expect(inner.error).toBe('');
+    expect(inner.busy).toBe(false);
+  });
+  it('扫描仍暴露设备连接错误，不会偷偷替换辅测机或 ADB 设置', async () => {
+    inner.config.agents = [{ id: 'agent-a', address: '', port: 28801, token: 'keep-token' }];
+    vi.mocked(api.post).mockImplementationOnce(async (_path, body) => {
+      parseInnerProject(JSON.stringify(body));
+      return { serial: 'unexpected' };
+    });
+    await probeInner();
+    expect(inner.error).toContain('辅测机');
+    expect(inner.capability).toBeNull();
+    expect(inner.busy).toBe(false);
+    expect(inner.config.agents[0]).toEqual({ id: 'agent-a', address: '', port: 28801, token: 'keep-token' });
   });
   it('计划预览来自后端，配置改动后先失效再刷新', async () => {
     inner.config.links = [link()];

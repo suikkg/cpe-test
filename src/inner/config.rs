@@ -1,9 +1,9 @@
 use serde::{Deserialize, Serialize};
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 /// 内环项目当前 schema 版本。版本 1 是「固定上下行、板侧统计接口绑死在
 /// 网关归属口、只有网卡口径」那一代，导入时按 [`migrate_v1`] 升级。
-pub const PROJECT_VERSION: u32 = 2;
+pub const PROJECT_VERSION: u32 = 3;
 pub const PROJECT_KIND: &str = "cpe-inner-project";
 /// 地址最终进入 HTTP Host 头；DNS 名称的协议上限是 253 字节，给 IP/端口解析
 /// 和实现留一点余量，但不接受把整份请求体塞进一个主机名字段。
@@ -27,6 +27,8 @@ pub struct InnerConfig {
     /// 之前这里是单个 `protocol`，一轮只能测一种——想同时要 TCP 和 UDP 的结论
     /// 必须跑两轮、拿到两份互不相干的报告，链路和板侧状态也不再是同一时刻的。
     pub protocols: Vec<Protocol>,
+    /// 每个版本独立展开测试单元；旧配置缺省只测 IPv4。
+    pub ip_versions: Vec<u8>,
     /// 本轮要跑的方向。上行、下行是两个独立的单向单元；双向并发是一个
     /// 含两条腿的单元。三者可同时勾选，各自出结果，两次顺序单向不算双向。
     pub directions: Vec<Direction>,
@@ -65,6 +67,7 @@ impl Default for InnerConfig {
             duration_secs: 20,
             parallel: 1,
             protocols: vec![Protocol::Tcp],
+            ip_versions: vec![4],
             directions: vec![Direction::Upload, Direction::Download],
             tcp_streams: None,
             udp_streams: None,
@@ -201,9 +204,16 @@ pub struct Link {
     #[serde(default = "enabled_default")]
     pub enabled: bool,
     pub local_interface: String,
+    #[serde(default = "unspecified_v4")]
     pub local_ip: Ipv4Addr,
     /// 板侧 LAN 地址：上行 server 绑定/目标，下行 client 源地址，同时校验板侧归属。
+    #[serde(default = "unspecified_v4")]
     pub gateway: Ipv4Addr,
+    /// IPv6 地址不接受 zone；执行端根据已核实的接口身份附加作用域。
+    #[serde(default)]
+    pub local_ipv6: Option<Ipv6Addr>,
+    #[serde(default)]
+    pub gateway_ipv6: Option<Ipv6Addr>,
     /// 板侧 **RX 采样接口**，与 `gateway` 的地址归属解耦。
     ///
     /// 留空按地址归属自动识别；填写时可以是经过确认的桥、桥成员或别的
@@ -233,6 +243,21 @@ pub struct Link {
 }
 
 impl Link {
+    pub fn local_address(&self, ip_version: u8) -> IpAddr {
+        if ip_version == 6 {
+            self.local_ipv6.unwrap_or(Ipv6Addr::UNSPECIFIED).into()
+        } else {
+            self.local_ip.into()
+        }
+    }
+    pub fn board_address(&self, ip_version: u8) -> IpAddr {
+        if ip_version == 6 {
+            self.gateway_ipv6.unwrap_or(Ipv6Addr::UNSPECIFIED).into()
+        } else {
+            self.gateway.into()
+        }
+    }
+
     /// 本腿在指定口径下的单向门限。
     pub fn leg_target(&self, flow: Flow, tool: bool) -> Option<f64> {
         match (flow, tool) {
@@ -257,6 +282,9 @@ fn master_host() -> String {
 }
 fn enabled_default() -> bool {
     true
+}
+fn unspecified_v4() -> Ipv4Addr {
+    Ipv4Addr::UNSPECIFIED
 }
 
 /// 解析内环项目或裸配置。
@@ -330,7 +358,7 @@ pub fn parse_config(text: &str) -> Result<InnerConfig, String> {
             .cloned()
             .filter(serde_json::Value::is_object)
             .ok_or("内环项目缺少 config 对象")?;
-        if version < PROJECT_VERSION as u64 {
+        if version < 2 {
             migrate_v1(&mut config)?;
         }
         config
@@ -537,6 +565,15 @@ impl InnerConfig {
         if !unique(&self.protocols) || !unique(&self.directions) {
             return Err("协议和方向不能重复选择".into());
         }
+        if self.ip_versions.is_empty()
+            || !unique(&self.ip_versions)
+            || self
+                .ip_versions
+                .iter()
+                .any(|version| ![4, 6].contains(version))
+        {
+            return Err("IP 版本至少选择 IPv4 或 IPv6，且不能重复".into());
+        }
         for streams in [self.tcp_streams, self.udp_streams].into_iter().flatten() {
             if !(1..=16).contains(&streams) {
                 return Err("按协议覆盖的并发流数需为 1..16，留空则沿用 parallel".into());
@@ -611,28 +648,64 @@ impl InnerConfig {
                     link.name
                 ));
             }
-            for ip in [link.local_ip, link.gateway] {
-                if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() || ip.is_broadcast()
-                {
-                    return Err(format!("{}: 需要实际 LAN 单播地址", link.name));
+            if link.enabled && self.ip_versions.contains(&4) {
+                for ip in [link.local_ip, link.gateway] {
+                    if ip.is_unspecified()
+                        || ip.is_loopback()
+                        || ip.is_multicast()
+                        || ip.is_broadcast()
+                    {
+                        return Err(format!("{}: 需要实际 LAN IPv4 单播地址", link.name));
+                    }
+                }
+                if link.local_ip == link.gateway {
+                    return Err(format!("{}: 本机 IP 不能等于板侧地址", link.name));
                 }
             }
-            if link.local_ip == link.gateway {
-                return Err(format!("{}: 本机 IP 不能等于板侧地址", link.name));
+            for ip in [link.local_ipv6, link.gateway_ipv6].into_iter().flatten() {
+                if ip.is_unspecified()
+                    || ip.is_loopback()
+                    || ip.is_multicast()
+                    || ip.to_ipv4_mapped().is_some()
+                {
+                    return Err(format!(
+                        "{}: 需要实际 LAN IPv6 单播地址，不能使用 IPv4 映射地址",
+                        link.name
+                    ));
+                }
+            }
+            if link.enabled && self.ip_versions.contains(&6) {
+                let (Some(local), Some(board)) = (link.local_ipv6, link.gateway_ipv6) else {
+                    return Err(format!(
+                        "{}: 已选择 IPv6，请填写电脑 IPv6 和 CPE LAN IPv6 地址",
+                        link.name
+                    ));
+                };
+                if local == board {
+                    return Err(format!("{}: 电脑 IPv6 不能等于板侧 IPv6 地址", link.name));
+                }
+                if local.is_unicast_link_local() != board.is_unicast_link_local() {
+                    return Err(format!(
+                        "{}: 两端 IPv6 须同为链路本地地址或同为非链路本地地址",
+                        link.name
+                    ));
+                }
             }
             // 同一台电脑上的同一个「网口 + 源 IP」重复出现，两条链路会抢同一
             // 块网卡的计数器，谁也说不清结果算谁的。
-            if link.enabled
-                && !endpoints.insert((
-                    link.host.as_str(),
-                    link.local_interface.as_str(),
-                    link.local_ip,
-                ))
-            {
-                return Err(format!(
-                    "{}: 与另一条参与本轮的链路使用了同一台电脑的同一网口和源 IP",
-                    link.name
-                ));
+            if link.enabled {
+                for &version in &self.ip_versions {
+                    if !endpoints.insert((
+                        link.host.as_str(),
+                        link.local_interface.as_str(),
+                        link.local_address(version),
+                    )) {
+                        return Err(format!(
+                            "{}: 与另一条参与本轮的链路使用了同一台电脑的同一网口和源 IP",
+                            link.name
+                        ));
+                    }
+                }
             }
             for target in [
                 link.upload_min_mbps,

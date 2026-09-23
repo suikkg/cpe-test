@@ -9,7 +9,7 @@ use crate::cmd::tools::{
 use crate::config::{load_config, Config};
 use crate::console::{ask, open_path, parse_selection};
 use crate::http_client;
-use crate::master::builder::{self, build_units, Endpoint, LegKind, Side, SpecNorm, Unit};
+use crate::master::builder::{self, build_units_repeated, Endpoint, LegKind, Side, SpecNorm, Unit};
 use crate::master::executor::{Ctx, IperfPreflightBlock, ResultDb};
 use crate::master::plan::{topology_fingerprint, ExecutionPlan};
 use crate::nic::monitor::MonitorMgr;
@@ -131,6 +131,109 @@ pub fn replay_report_into(dir: &Path) -> Result<ReplayOutcome, String> {
         skipped,
         warnings,
     })
+}
+
+/// 一次对比的产物与计数，供命令行和控制台两条路共用。
+pub struct CompareOutcome {
+    pub report: std::path::PathBuf,
+    pub same_plan: bool,
+    /// 有没有值得拦下来的变化。**由 `RunComparison::has_regression` 算，
+    /// 这里只搬运**——「什么算回归」只能有一处定义，命令行的退出码和控制台的
+    /// 提示语必须说同一件事。
+    pub has_regression: bool,
+    pub regressed: usize,
+    pub slower: usize,
+    pub fixed: usize,
+    pub added: usize,
+    pub disappeared: usize,
+    pub unchanged: usize,
+}
+
+/// 对比两个 run 目录，把差异报告写进**新的那一轮**的目录里。
+///
+/// 输出落在本轮目录（`compare_vs_<基线目录名>.html`）：一份对比属于它比较的
+/// 那次运行，跟着它一起归档、一起打包、一起被保留策略清理。
+pub fn compare_runs_into(baseline: &Path, current: &Path) -> Result<CompareOutcome, String> {
+    use crate::report::compare::DeltaKind;
+
+    let load = |dir: &Path| -> Result<(Vec<crate::report::Row>, ReportMeta, String), String> {
+        let (rows, skipped) = crate::report::store::load_rows(dir)
+            .map_err(|error| format!("读不到 {} 的结果明细: {error}", dir.display()))?;
+        if rows.is_empty() {
+            return Err(format!(
+                "{} 里没有可用的结果明细（rows.jsonl 缺失或为空），无法参与对比",
+                dir.display()
+            ));
+        }
+        if skipped > 0 {
+            eprintln!(
+                "提示: {} 跳过了 {skipped} 行无法解析的记录（通常是崩溃时写了一半的最后一行）",
+                dir.display()
+            );
+        }
+        let meta = crate::report::store::load_meta(dir).ok();
+        let plan_hash = meta
+            .as_ref()
+            .map(|m| m.plan_hash.clone())
+            .unwrap_or_default();
+        let report_meta = meta.map(|m| m.report.into()).unwrap_or_default();
+        Ok((rows, report_meta, plan_hash))
+    };
+    let (before_rows, before_meta, before_hash) = load(baseline)?;
+    let (after_rows, after_meta, after_hash) = load(current)?;
+    // 两边都读不到 plan_hash 时按「不同」处理：**不知道就不许说一样**，
+    // 否则那句「本轮新增说的是计划差异」的提示会在最需要它的时候消失。
+    let same_plan = !before_hash.is_empty() && before_hash == after_hash;
+
+    let diff = crate::report::compare::compare(&before_rows, &after_rows, same_plan);
+    let baseline_name = baseline
+        .file_name()
+        .map(|name| crate::util::sanitize(&name.to_string_lossy()))
+        .unwrap_or_else(|| "baseline".into());
+    let report = current.join(format!("compare_vs_{baseline_name}.html"));
+    let html = crate::report::compare::render_html(&diff, &before_meta, &after_meta);
+    std::fs::write(&report, html).map_err(|error| format!("对比报告写入失败: {error}"))?;
+    Ok(CompareOutcome {
+        report,
+        same_plan,
+        has_regression: diff.has_regression(),
+        regressed: diff.count(DeltaKind::Regressed),
+        slower: diff.count(DeltaKind::SlowerButStillSameVerdict),
+        fixed: diff.count(DeltaKind::Fixed),
+        added: diff.count(DeltaKind::Added),
+        disappeared: diff.count(DeltaKind::Disappeared),
+        unchanged: diff.count(DeltaKind::Unchanged),
+    })
+}
+
+/// 命令行入口。**发现回归就返回非 0**，这样它可以直接接在 CI 里当一道门。
+///
+/// 判定变坏或明显掉速都算回归；「本轮新增/缺失」不算——那多半是计划变了。
+pub fn compare_runs(baseline: &Path, current: &Path) -> i32 {
+    match compare_runs_into(baseline, current) {
+        Ok(outcome) => {
+            println!("对比报告已生成: {}", outcome.report.display());
+            println!(
+                "判定变坏 {} · 速率下降 {} · 判定转好 {} · 本轮新增 {} · 本轮缺失 {} · 无实质变化 {}",
+                outcome.regressed,
+                outcome.slower,
+                outcome.fixed,
+                outcome.added,
+                outcome.disappeared,
+                outcome.unchanged,
+            );
+            if !outcome.same_plan {
+                println!(
+                    "提示: 两轮的 plan_hash 不同，「新增/缺失」说的是计划差异，不是设备表现。"
+                );
+            }
+            i32::from(outcome.has_regression)
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            2
+        }
+    }
 }
 
 /// 从一个已有的 run 目录重放报告（ADR-3）——命令行入口。
@@ -451,8 +554,30 @@ pub fn run_master(opts: MasterOpts) -> i32 {
 
     // ---- 生成任务单元 ----
     let mut next_port = builder::PORT_BASE;
-    let (built_units, notices) =
-        build_units(&specs, cfg.require_same_subnet_for_iperf, &mut next_port);
+    // 套件控制台会把原始请求随运行保存；只有这一入口采用套件的保序去重。
+    // CLI 显式重复的测试（包括从控制台导出的 config）仍保留原有执行语义。
+    let suite_console_run = opts.console_request.as_deref().is_some_and(|request| {
+        serde_json::from_str::<serde_json::Value>(request)
+            .ok()
+            .and_then(|value| value.get("ui_plan").map(serde_json::Value::is_object))
+            .unwrap_or(false)
+    });
+    let (built_units, notices) = if suite_console_run {
+        let built = builder::build_ui_units_repeated(
+            &specs,
+            cfg.require_same_subnet_for_iperf,
+            &mut next_port,
+            cfg.rounds,
+        );
+        (built.units, built.notices)
+    } else {
+        build_units_repeated(
+            &specs,
+            cfg.require_same_subnet_for_iperf,
+            &mut next_port,
+            cfg.rounds,
+        )
+    };
     let plan = ExecutionPlan::new(
         &cfg,
         topology_fingerprint(&master_info, &agent_info),
@@ -583,7 +708,14 @@ pub fn run_master(opts: MasterOpts) -> i32 {
     // ---- 注册 Ctrl+C 处理器（Windows 上阻止 cmd.exe 弹出提示，非 Windows 用 ctrlc crate）
     crate::cancel::setup_cancel_handler();
 
+    // 能力位在建 Ctx 时定死一次：执行期再去问一遍等于把「这一轮按什么能力跑」
+    // 变成一个会中途改变的东西。
+    let agent_ping_df = health
+        .capabilities
+        .iter()
+        .any(|capability| capability == crate::protocol::PING_DF_CAPABILITY);
     let ctx = Ctx {
+        agent_ping_df,
         agent_host: agent_host.clone(),
         agent_port: cfg.agent_port,
         cfg: cfg.clone(),
@@ -670,6 +802,8 @@ pub fn run_master(opts: MasterOpts) -> i32 {
             plan_hash: plan.plan_hash.clone(),
             report: (&meta).into(),
             total_units: units.len(),
+            // 从**同一批行**上算，和下面 `write_report` 顶部那八个格子同源。
+            verdict_totals: crate::report::verdict_totals(&rows),
         };
         if let Err(error) = crate::report::store::write_meta(&run_paths.dir, &run_meta) {
             logln(&format!("!! meta.json 写入失败（不影响本轮报告）: {error}"));
@@ -691,6 +825,19 @@ pub fn run_master(opts: MasterOpts) -> i32 {
         match crate::report::xlsx::write_xlsx(&xlsx_path, &rows, &meta) {
             Ok(()) => logln(&format!("Excel 汇总: {}", xlsx_path.display())),
             Err(error) => logln(&format!("(Excel 汇总生成失败，不影响报告: {error})")),
+        }
+    }
+    // 保留策略在**报告都写完之后**执行：清理是收尾动作，失败一律只打一行提示。
+    // 本轮目录是最新的一个，按目录名排序永远排在最后，所以不可能被自己删掉。
+    if cfg.keep_runs > 0 {
+        let removed = crate::report::retention::enforce(&run_paths.dir.join(".."), cfg.keep_runs);
+        if !removed.is_empty() {
+            logln(&format!(
+                "按 keep_runs={} 清理了 {} 个最旧的历史目录: {}",
+                cfg.keep_runs,
+                removed.len(),
+                removed.join("、")
+            ));
         }
     }
     if let Some(observer) = opts.observer.as_ref() {
@@ -1587,6 +1734,7 @@ mod tests {
                     ..Default::default()
                 },
                 total_units: 10,
+                verdict_totals: Default::default(),
             },
         )
         .expect("meta");
@@ -1668,6 +1816,7 @@ mod tests {
         let master = endpoint(Side::Master, "master0");
         let agent = endpoint(Side::Agent, "agent0");
         Unit {
+            round: 1,
             id: "ping-only".into(),
             title: "ping-only".into(),
             link_group: String::new(),
@@ -1694,6 +1843,7 @@ mod tests {
         let master = endpoint(Side::Master, "master0");
         let agent = endpoint(Side::Agent, "agent0");
         Unit {
+            round: 1,
             id: "iperf".into(),
             title: "iperf".into(),
             link_group: String::new(),
@@ -1727,6 +1877,7 @@ mod tests {
         let master = endpoint(Side::Master, "master0");
         let agent = endpoint(Side::Agent, "agent0");
         Unit {
+            round: 1,
             id: "ctstraffic".into(),
             title: "ctstraffic".into(),
             link_group: String::new(),

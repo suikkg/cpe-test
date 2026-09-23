@@ -7,6 +7,8 @@ import {
   humanDuration,
   mergeUnits,
   progressView,
+  unitRateLabel,
+  unitRateTone,
   verdictTone,
 } from './progress';
 
@@ -187,5 +189,42 @@ describe('进度展示模型', () => {
   it('熔断中止能被看出来', () => {
     const view = progressView(run({ aborted_at_unit: 7 }), false, 7);
     expect(view.aborted).toBe(true);
+  });
+});
+
+describe('unitRateLabel / unitRateTone', () => {
+  const base: UnitStatus = {
+    seq: 1,
+    title: 'IPERF V4 TCP',
+    verdict: 'PASS',
+    reason_code: '',
+    reason_detail: '',
+    skipped: false,
+    secs: 180,
+    link_group: 'SGMII ↔ WLAN',
+  };
+
+  it('有实测有门限时给「实测 / 门限」', () => {
+    expect(unitRateLabel({ ...base, rx_avg: 1850.24, target_mbps: 1800 })).toBe(
+      '1850 / 1800 Mbps',
+    );
+    expect(unitRateTone({ ...base, rx_avg: 1850.24, target_mbps: 1800 })).toBe('over');
+    expect(unitRateTone({ ...base, rx_avg: 940, target_mbps: 1800 })).toBe('under');
+  });
+
+  it('没有门限时只报实测，不编一个门限出来', () => {
+    // Observe / Discover 模式没有门限。补一个 0 或把实测当门限，
+    // 屏幕上会变成「刚好达标」，而实际上这一轮压根没有验收目标。
+    expect(unitRateLabel({ ...base, rx_avg: 2310.5, target_mbps: null })).toBe('2311 Mbps');
+    expect(unitRateTone({ ...base, rx_avg: 2310.5, target_mbps: null })).toBeNull();
+  });
+
+  it('没起过流的单元留空，不显示 0', () => {
+    expect(unitRateLabel({ ...base, verdict: 'SKIP', skipped: true })).toBe('');
+    expect(unitRateTone({ ...base, verdict: 'SKIP', skipped: true })).toBeNull();
+  });
+
+  it('小数位跟着量级走：低速率保留一位', () => {
+    expect(unitRateLabel({ ...base, rx_avg: 12.34, target_mbps: 10 })).toBe('12.3 / 10.0 Mbps');
   });
 });

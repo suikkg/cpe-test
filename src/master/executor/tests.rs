@@ -107,6 +107,7 @@ fn ctstraffic_task(udp: bool) -> CtsTrafficTask {
 
 fn ctstraffic_unit(id: &str, udp: bool) -> Unit {
     Unit {
+        round: 1,
         id: id.into(),
         title: if udp {
             "CTS UDP test".into()
@@ -146,6 +147,7 @@ fn a_unit_summary_row_carries_the_protocol_and_backend_of_its_legs() {
     );
 
     let ping = Unit {
+        round: 1,
         id: "ping".into(),
         title: "PING".into(),
         link_group: String::new(),
@@ -226,6 +228,7 @@ fn isolated_ctx(agent_port: u16) -> (Ctx, PathBuf) {
     let run_dir = std::env::temp_dir().join(format!("cpe_test_run_{}_{}", std::process::id(), seq));
     let _ = std::fs::create_dir_all(&run_dir);
     let ctx = Ctx {
+        agent_ping_df: true,
         topology: None,
         agent_host: "127.0.0.1".into(),
         agent_port,
@@ -247,6 +250,25 @@ fn isolated_ctx(agent_port: u16) -> (Ctx, PathBuf) {
         db: Mutex::new(ResultDb::load(db_path.clone())),
     };
     (ctx, db_path)
+}
+
+/// **IPv6 上不做路径 MTU 探测。**
+///
+/// IPv6 协议层面没有 DF 位，路由器一律不分片。`ping -f`（Windows，文档标注
+/// IPv4-only）和 `ping6 -D`（macOS，ping6 不认）都给不出可信结果，据此得到的
+/// 「大包能过」和旧 agent 静默忽略 DF 位是同一个错答案——而 `PING_DF_CAPABILITY`
+/// 只认版本，认不出这一类。宁可没有结果。
+#[test]
+fn path_mtu_probing_refuses_ipv6_instead_of_returning_a_number_it_cannot_trust() {
+    let (ctx, db_path) = isolated_ctx(1);
+    let src = endpoint(Side::Master, "en0", "192.168.1.2");
+    let dst = endpoint(Side::Agent, "en1", "192.168.1.3");
+    // `capable = true`：能力标记这一关是过的，拦住它的只能是 IPv6 本身。
+    let error = ctx
+        .probe_path_mtu(&src, &dst, true, true)
+        .expect_err("IPv6 不该给出一个 MTU 数字");
+    assert!(error.contains("IPv6"), "错误要说清楚为什么不测：{error}");
+    let _ = std::fs::remove_file(db_path);
 }
 
 #[test]
@@ -478,6 +500,115 @@ fn acc_start_req(request_id: &str, port: u16) -> IperfClientStartReq {
         owner_id: "owner-acc".into(),
         lease_secs: 0,
     }
+}
+
+#[test]
+fn explicit_user_cancellation_survives_successful_remote_cleanup() {
+    // 取消位是进程级共享状态；在独立测试进程驱动真实 RPC 分支，避免影响
+    // 同时运行的吞吐测试，也不靠静态源码匹配代替行为验证。
+    const CHILD_ENV: &str = "CPE_TEST_EXECUTOR_CANCEL_CHILD";
+    if std::env::var(CHILD_ENV).as_deref() != Ok("1") {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "master::executor::tests::explicit_user_cancellation_survives_successful_remote_cleanup",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .output()
+            .expect("启动独立取消测试进程");
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    for skip_current_unit in [false, true] {
+        for cts in [false, true] {
+            crate::cancel::reset();
+            let clock = Arc::new(ManualClock::new());
+            let transport =
+                http_client::ScriptedTransport::with_handler(clock.clone(), move |request| {
+                    let body = if request.path.ends_with("/start") {
+                        if skip_current_unit {
+                            crate::cancel::request_skip_unit();
+                        } else {
+                            crate::cancel::request_cancel();
+                        }
+                        ok_json(IperfClientStartOut {
+                            id: "cancel-job".into(),
+                            elapsed_ms: 0,
+                        })
+                    } else if request.path.ends_with("/stop") {
+                        ok_json(IperfClientStopOut {
+                            existed: true,
+                            was_done: false,
+                            terminated: true,
+                            result: Some(IperfClientOut {
+                                ok: true,
+                                process_started: Some(true),
+                                cleanup_confirmed: Some(true),
+                                output: "已采集的部分输出".into(),
+                                ..Default::default()
+                            }),
+                        })
+                    } else {
+                        return Err(format!("取消后不应继续调用 {}", request.path));
+                    };
+                    Ok(http_client::HttpResponse::new(200, body))
+                });
+            transport.push(http_client::ScriptedExchange::handler_response());
+            transport.push(http_client::ScriptedExchange::handler_response());
+            let (mut ctx, db_path) = isolated_ctx(0);
+            ctx.transport = Arc::new(transport.clone());
+            ctx.clock = clock;
+            let client = if cts {
+                let run = ctx.cts_client_run_tracked(
+                    Side::Agent,
+                    CtsTrafficStartReq {
+                        request_id: "cancel-job".into(),
+                        ..Default::default()
+                    },
+                    |_| {},
+                );
+                assert!(run.cleanup_confirmed);
+                assert_eq!(
+                    run.setup_error.unwrap().0,
+                    ReasonCode::CtsClientUserCancelled
+                );
+                run.client
+            } else {
+                ctx.client_run_tracked(
+                    Side::Agent,
+                    &IperfClientReq::default(),
+                    "cancel-owner",
+                    "cancel-job",
+                    0,
+                    |_| {},
+                )
+            };
+            assert!(client.cancelled, "cts={cts}, skip={skip_current_unit}");
+            assert!(!client.ok);
+            assert!(!client.timed_out, "显式取消不能冒充执行超时");
+            assert_eq!(client.cleanup_confirmed, Some(true), "{client:?}");
+            assert!(client.output.contains("已采集的部分输出"));
+            assert!(client.output.contains("用户中断"));
+            assert_eq!(transport.requests().len(), 2, "只允许启动和确认回收");
+            assert_eq!(crate::cancel::is_stop_requested(), !skip_current_unit);
+            if skip_current_unit {
+                assert!(crate::cancel::take_skip_unit());
+                assert!(crate::cancel::resume_after_skip());
+            } else {
+                assert!(!crate::cancel::resume_after_skip());
+                assert!(crate::cancel::is_cancelled());
+            }
+            let _ = std::fs::remove_file(db_path);
+            let _ = std::fs::remove_dir_all(&ctx.run_dir);
+        }
+    }
+    crate::cancel::reset();
 }
 
 /// P1 第一条验收测试：丢 start 响应不能重复创建 job。
@@ -1861,6 +1992,7 @@ fn bidir_udp_unit(ab_port: u16, ba_port: u16, streams: usize) -> (Unit, Vec<UdpL
     };
     let plans = vec![mk(0, "ab", &a, &b, ab_port), mk(1, "ba", &b, &a, ba_port)];
     let unit = Unit {
+        round: 1,
         id: format!("udp-orch-{ab_port}-{ba_port}"),
         title: "★双向 IPERF V4 UDP -b 500m".into(),
         link_group: String::new(),
@@ -2416,6 +2548,7 @@ fn ctstraffic_builder_setup_error_returns_before_agent_or_cts_start() {
     let builder_error = "CTS UDP socket buffer synthetic-invalid 无法解析";
     task.setup_error = Some(builder_error.into());
     let unit = Unit {
+        round: 1,
         id: "cts-builder-setup-error".into(),
         title: "CTS builder setup error".into(),
         link_group: String::new(),
@@ -3044,6 +3177,73 @@ fn test_effective_window_supports_five_second_monitor_interval() {
         windows.per_leg[0].end_ms - windows.per_leg[0].start_ms,
         180_000
     );
+}
+
+#[test]
+fn udp_effective_window_keeps_exact_flow_and_monitor_boundaries() {
+    let master = endpoint(Side::Master, "master0", "192.168.1.2");
+    let agent = endpoint(Side::Agent, "agent0", "192.168.1.3");
+    let plans = vec![udp_plan(0, "ab", 1, &master, &agent, 10)];
+    let task = &plans[0].streams[0];
+    for (start, end, monitor_end, expected_start, expected_end, complete) in [
+        // 差 200ms 确实短；不能通过 1 秒网格补成完整十秒。
+        (1_000, 15_800, 20_000, 6_000, 15_800, false),
+        // 差 50ms 可认完整，但测量终点仍不能超出实际起流区间。
+        (1_000, 15_950, 20_000, 6_000, 15_950, true),
+        // 起点同样保留毫秒，不丢掉起流后的前 750ms。
+        (1_250, 17_100, 20_000, 6_250, 16_250, true),
+        // monitor 已结束，不能凭空在最后一个样本后补一秒。
+        (1_000, 19_000, 15_000, 6_000, 15_000, false),
+    ] {
+        let results = vec![udp_flow(0, 0, task, start, end, true)];
+        let monitors = HashMap::from([(agent.key(), monitor_until(monitor_end, 1_000.0, 1_000.0))]);
+        let windows =
+            select_udp_effective_windows(&plans, &results, &monitors, &RateCheckCfg::default());
+        let window = &windows.per_leg[0];
+        assert_eq!(
+            (window.start_ms, window.end_ms, window.complete),
+            (expected_start, expected_end, complete),
+            "flow={start}..{end}, monitor_end={monitor_end}"
+        );
+        assert!(window.end_ms <= end.min(monitor_end));
+    }
+}
+
+#[test]
+fn udp_window_sample_index_preserves_gaps_despite_duplicates_and_reordering() {
+    let master = endpoint(Side::Master, "master0", "192.168.1.2");
+    let agent = endpoint(Side::Agent, "agent0", "192.168.1.3");
+    let plans = vec![udp_plan(0, "ab", 1, &master, &agent, 20)];
+    let results = vec![udp_flow(0, 0, &plans[0].streams[0], 1_250, 32_100, true)];
+    let mut ordered = monitor_until(35_000, 1_000.0, 1_000.0);
+    for sample in &mut ordered.samples {
+        sample.valid = !(10_000..=17_000).contains(&sample.elapsed_ms);
+    }
+    let mut duplicated_and_reordered = ordered.clone();
+    duplicated_and_reordered
+        .samples
+        .extend(ordered.samples.clone());
+    duplicated_and_reordered.samples.reverse();
+    let mut absent = ordered.clone();
+    absent.samples.retain(|sample| sample.valid);
+    let empty = MonitorStopOut::default();
+    for (monitor, expected) in [
+        (ordered, (21_000, 32_100, 11.1)),
+        (duplicated_and_reordered, (21_000, 32_100, 11.1)),
+        (absent, (21_000, 32_100, 11.1)),
+        (empty, (0, 0, 0.0)),
+    ] {
+        let monitors = HashMap::from([(agent.key(), monitor)]);
+        let windows =
+            select_udp_effective_windows(&plans, &results, &monitors, &RateCheckCfg::default());
+        let window = &windows.per_leg[0];
+        assert_eq!(
+            (window.start_ms, window.end_ms, window.available_secs),
+            expected,
+            "9s 与 18s 样本之间的缺口超出 2s 容差；后半段从 16s 起、21s 完成 settle"
+        );
+        assert!(!window.complete);
+    }
 }
 
 /// 接收端 monitor 缺失只能让**这一条腿**没结论。
@@ -3684,7 +3884,7 @@ fn the_abort_gate_runs_before_any_early_continue() {
     let loop_body = &source[loop_start..loop_end];
 
     let gate = loop_body
-        .find("self.cfg.abort_after_dead_traffic_units")
+        .find("breaker.should_abort_all()")
         .expect("熔断检查必须在单元循环内");
     let first_continue = loop_body.find("continue;").unwrap_or(usize::MAX);
     assert!(
@@ -3692,12 +3892,75 @@ fn the_abort_gate_runs_before_any_early_continue() {
         "熔断检查必须排在任何 continue 之前，否则提前退出的路径会绕过它"
     );
     assert_eq!(
-        loop_body
-            .matches("self.cfg.abort_after_dead_traffic_units")
-            .count(),
+        loop_body.matches("breaker.should_abort_all()").count(),
         1,
         "只能有一处熔断检查；两处必然会漂移"
     );
+    // 阈值只能从一处读进状态机。执行循环里再读一次 `self.cfg` 就是又开了一条
+    // 旁路——这正是分组那一层被漏掉之前的形状。
+    assert_eq!(
+        source
+            .matches("self.cfg.abort_after_dead_traffic_units")
+            .count(),
+        1,
+        "阈值只能在构造 DeadTrafficBreaker 时读一次"
+    );
+}
+
+/// 分组熔断的状态机穷举。
+///
+/// 这一层**行为上测不到**：它和全局那一层的区别只在「还有链路活着」时才显现，
+/// 而那需要真实流量。所以把它做成纯状态机，在这里把四象限走一遍。
+#[test]
+fn the_dead_traffic_breaker_drops_one_link_without_stopping_the_others() {
+    let mut breaker = DeadTrafficBreaker::new(2);
+
+    // A 连着两个空跑 → 只放弃 A。B 一直在出数，全局计数被它清零。
+    assert!(!breaker.record_dead("A"), "第一个空跑还不到阈值");
+    breaker.record_usable("B");
+    assert!(breaker.record_dead("A"), "A 的第二个空跑刚好越过阈值");
+    assert!(breaker.is_abandoned("A"));
+    assert!(!breaker.is_abandoned("B"), "B 一直在出数，不该被牵连");
+    assert!(
+        !breaker.should_abort_all(),
+        "只有一条链路坏掉时，整队不许停——这正是分组要解决的那件事"
+    );
+
+    // 「刚好越过」只报一次：每个单元都刷一行日志等于没有日志。
+    assert!(!breaker.record_dead("A"), "已经放弃的链路不再重复报告");
+
+    // B 也跟着死够两个 → 全局那一层接住，整队停。
+    breaker.record_dead("B");
+    breaker.record_dead("B");
+    assert!(breaker.is_abandoned("B"));
+    assert!(
+        breaker.should_abort_all(),
+        "所有链路都死掉时，全局那一层必须中止整队"
+    );
+}
+
+#[test]
+fn a_zero_threshold_keeps_both_layers_off_and_still_counts_for_the_report() {
+    // 默认值 0 = 只告警不中止。两层都不许动，但报告顶部的「最长空跑连击」
+    // 仍然要数——那句话是靠它写出来的。
+    let mut breaker = DeadTrafficBreaker::new(0);
+    for _ in 0..10 {
+        breaker.record_dead("A");
+    }
+    assert!(!breaker.should_abort_all());
+    assert!(!breaker.is_abandoned("A"));
+    assert_eq!(breaker.max_global_streak(), 10);
+}
+
+#[test]
+fn an_empty_link_key_never_becomes_a_group_of_its_own() {
+    // 键为空意味着分不出组。拿它当一个组，会把一批互不相干的链路一起放弃。
+    let mut breaker = DeadTrafficBreaker::new(2);
+    assert!(!breaker.record_dead(""));
+    assert!(!breaker.record_dead(""));
+    assert!(!breaker.is_abandoned(""), "空键永远不算被放弃");
+    // 但全局那一层照数不误：整台设备掉线时，链路键是不是空的无关紧要。
+    assert!(breaker.should_abort_all());
 }
 
 /// 结构断言：三条灌包路径挂 RX 样本的地方，都要同样挂上 TX 样本。
@@ -4279,6 +4542,7 @@ fn preflight_block_marks_iperf_without_touching_ping_legs() {
         offered_per_stream_mbps: None,
     };
     let unit = Unit {
+        round: 1,
         id: "blocked".into(),
         title: "blocked".into(),
         link_group: String::new(),
@@ -4309,6 +4573,7 @@ fn missing_ab_row_is_restored_without_duplicating_existing_ba_row() {
     let master = endpoint(Side::Master, "master0", "192.168.1.2");
     let agent = endpoint(Side::Agent, "agent0", "192.168.1.3");
     let unit = Unit {
+        round: 1,
         id: "partial-bidir-tcp".into(),
         title: "partial bidirectional TCP".into(),
         link_group: String::new(),
@@ -4379,6 +4644,7 @@ fn unit_panic_is_expanded_to_both_direction_rows_without_generic_duplicate() {
     let master = endpoint(Side::Master, "master0", "192.168.1.2");
     let agent = endpoint(Side::Agent, "agent0", "192.168.1.3");
     let unit = Unit {
+        round: 1,
         id: "panic-bidir-tcp".into(),
         title: "panic bidirectional TCP".into(),
         link_group: String::new(),
@@ -4429,6 +4695,7 @@ fn unit_panic_reuses_a_committed_ab_row_and_only_fills_missing_ba() {
     let master = endpoint(Side::Master, "master0", "192.168.1.2");
     let agent = endpoint(Side::Agent, "agent0", "192.168.1.3");
     let unit = Unit {
+        round: 1,
         id: "partial-row-then-panic".into(),
         title: "partial row then unit panic".into(),
         link_group: String::new(),
@@ -4502,6 +4769,7 @@ fn bidirectional_preflight_keeps_both_ab_and_ba_detail_rows() {
     let master = endpoint(Side::Master, "master0", "192.168.1.2");
     let agent = endpoint(Side::Agent, "agent0", "192.168.1.3");
     let unit = Unit {
+        round: 1,
         id: "blocked-bidir-tcp".into(),
         title: "blocked bidirectional TCP".into(),
         link_group: String::new(),
@@ -4632,6 +4900,7 @@ fn ctstraffic_preflight_remains_per_leg_when_only_one_direction_has_args_error()
     normal.port += 1;
     normal.setup_error = None;
     let unit = Unit {
+        round: 1,
         id: "cts-mixed-args-preflight".into(),
         title: "CTS mixed args/preflight".into(),
         link_group: String::new(),
@@ -4698,6 +4967,7 @@ fn ctstraffic_two_invalid_directions_keep_two_detail_rows_under_preflight() {
     ba.port += 1;
     ba.setup_error = Some("invalid ba".into());
     let unit = Unit {
+        round: 1,
         id: "cts-two-invalid-preflight".into(),
         title: "CTS two invalid directions".into(),
         link_group: String::new(),
@@ -4780,6 +5050,7 @@ fn preflight_block_takes_priority_over_resume_pass() {
     let master = endpoint(Side::Master, "master0", "192.168.1.2");
     let agent = endpoint(Side::Agent, "agent0", "192.168.1.3");
     let unit = Unit {
+        round: 1,
         id: "blocked-resume".into(),
         title: "blocked-resume".into(),
         link_group: String::new(),
@@ -4820,6 +5091,7 @@ fn preflight_block_takes_priority_over_resume_pass() {
         ..Default::default()
     };
     let ctx = Ctx {
+        agent_ping_df: true,
         topology: None,
         agent_host: "127.0.0.1".into(),
         agent_port: 1,
@@ -4883,6 +5155,7 @@ round-trip min/avg/max/stddev = 1.250/2.500/3.750/1.021 ms
         request.respond(response).expect("respond to agent ping");
     });
     let unit = Unit {
+        round: 1,
         id: "agent-ping-success".into(),
         title: "PING V4 -l 1400 n=3".into(),
         link_group: String::new(),
@@ -4953,6 +5226,7 @@ fn missing_gateway_is_not_reported_as_network_packet_loss() {
         },
     };
     let unit = Unit {
+        round: 1,
         id: "gateway-missing".into(),
         title: "gateway-missing".into(),
         link_group: String::new(),
@@ -4990,6 +5264,7 @@ fn missing_gateway_is_not_reported_as_network_packet_loss() {
 #[test]
 fn agent_ping_http_failure_is_setup_error_not_one_hundred_percent_loss() {
     let unit = Unit {
+        round: 1,
         id: "agent-ping-http-error".into(),
         title: "agent-ping-http-error".into(),
         link_group: String::new(),
@@ -5027,6 +5302,7 @@ fn agent_ping_http_failure_is_setup_error_not_one_hundred_percent_loss() {
 #[test]
 fn mixed_preflight_failure_still_runs_independent_ping_unit() {
     let iperf_unit = Unit {
+        round: 1,
         id: "mixed-iperf".into(),
         title: "mixed-iperf".into(),
         link_group: String::new(),
@@ -5055,6 +5331,7 @@ fn mixed_preflight_failure_still_runs_independent_ping_unit() {
         est_secs: 1,
     };
     let ping_unit = Unit {
+        round: 1,
         id: "mixed-ping".into(),
         title: "mixed-ping".into(),
         link_group: String::new(),
@@ -6170,5 +6447,65 @@ fn artifact_filenames_stay_short_enough_for_windows_max_path() {
         owner.len() <= 80,
         "owner_id 变长了（{}），它也进文件名：{owner}",
         owner.len()
+    );
+}
+
+/// **「质量」列的三个指标必须一起上单元汇总行。**
+///
+/// `report::model::verdict_row` 优先返回单元汇总行，HTML 概览和 summary.xlsx
+/// 的「质量」列都从它取数。汇总行只填 `udp_loss` / `ping_loss` 而漏掉
+/// `tcp_retransmits` 的话，TCP 那一格对**每一行**都是空的——没有任何测试会红，
+/// 用户打开 Excel 想回答「是在丢包还是窗口没喂饱」，看到的是一整列空白。
+/// 这正是 ADR-7 为协议/后端两列记下的那类静默空列。
+#[test]
+fn the_unit_summary_row_carries_every_quality_metric_not_just_two_of_them() {
+    let text = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/master/executor.rs"),
+    )
+    .expect("read executor.rs");
+    // 汇总行是唯一一处从 `single_direction` 取 `ping_loss` 的地方。
+    let at = text
+        .find("ping_loss: single_direction")
+        .expect("单元汇总行的构造点不见了——这条断言要跟着搬");
+    let window = &text[at.saturating_sub(2_000)..at];
+    for field in ["udp_loss", "tcp_retransmits"] {
+        assert!(
+            window.contains(&format!("{field}: single_direction")),
+            "单元汇总行漏了 {field}：它和 udp_loss / ping_loss 平级，\
+             一起进「质量」列，漏一个就是一整列空白"
+        );
+    }
+}
+
+/// **灌包单元的计数要在「链路已放弃」那条早退分支之前加。**
+///
+/// 放在后面的话，被放弃的单元只进 `traffic_setup_errors` 不进 `traffic_units`，
+/// 两个计数器发散：50 个单元的链路被放弃时，`ui.rs` 的收尾文案会打出
+/// 「本轮 2 个灌包单元没有产生任何有效速率测量（其中 SETUP_ERROR=50）」——
+/// 一句自相矛盾的话。`needs_traffic_failure_diagnostics()` 也跟着少数，
+/// 于是本该自动补跑的 Ping 诊断不跑了。
+///
+/// 断言写成「谁在前」而不是跑一轮看计数：那条分支要真实流量连续失败才进得去，
+/// 行为上测不到。
+#[test]
+fn traffic_units_are_counted_before_the_abandoned_link_shortcut() {
+    let text = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/master/executor.rs"),
+    )
+    .expect("read executor.rs");
+    assert_eq!(
+        text.matches("sum.traffic_units += 1;").count(),
+        1,
+        "这个计数只该有一处；多出一处就说明有人又在早退分支里补了一次"
+    );
+    let counted_at = text
+        .find("sum.traffic_units += 1;")
+        .expect("灌包单元计数不见了");
+    let shortcut_at = text
+        .find("breaker.is_abandoned(&link_key)")
+        .expect("链路放弃分支不见了——这条断言要跟着搬");
+    assert!(
+        counted_at < shortcut_at,
+        "灌包单元计数排在早退分支之后，被放弃的单元不会进 traffic_units"
     );
 }

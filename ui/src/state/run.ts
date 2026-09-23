@@ -2,7 +2,7 @@ import { computed, reactive } from 'vue';
 import { api, errorMessage, NetworkError, UnauthorizedError } from '../api/client';
 import type { ProgressOut, RunStatus, UnitStatus } from '../api/dto';
 import { mergeUnits, progressView } from '../domain/progress';
-import { buildRunRequest, plan, previewIsCurrent } from './plan';
+import { buildRunRequest, invalidatePreview, plan, previewIsCurrent } from './plan';
 import { session } from './session';
 
 /**
@@ -75,18 +75,26 @@ export const run = reactive({
   startPhase: 'idle' as CommandPhase,
   /** 「停止」这条命令的确知程度。受理 ≠ 已经停下来，收尾还要跑一会儿。 */
   stopPhase: 'idle' as CommandPhase,
+  /** 「跳过当前单元」的确知程度。和 stopPhase 分开：一个是终态，一个是一次性动作。 */
+  skipPhase: 'idle' as CommandPhase,
+  skipError: '',
   stopError: '',
   reportError: '',
   polling: false,
 });
 
 export const view = computed(() =>
-  progressView(run.status, run.running, run.units.length, new Date()),
+  progressView(
+    run.status, run.running,
+    Object.values(run.status.counts).reduce((total, count) => total + count, 0),
+    new Date(),
+  ),
 );
 
 export function reset(): void {
   stopPolling();
   generation += 1;
+  startRequest += 1;
   inFlight = undefined;
   run.running = false;
   run.synced = false;
@@ -102,8 +110,11 @@ export function reset(): void {
   run.startError = '';
   run.startPhase = 'idle';
   run.stopPhase = 'idle';
+  run.skipPhase = 'idle';
+  run.skipError = '';
   run.stopError = '';
   run.reportError = '';
+  skipTarget = null;
 }
 
 let timer: ReturnType<typeof setTimeout> | undefined;
@@ -128,6 +139,8 @@ function schedule(): void {
  */
 let inFlight: Promise<boolean> | undefined;
 let generation = 0;
+let startRequest = 0;
+let skipTarget: { runId: string; seq: number } | null = null;
 
 /** 一拍进度的上限，见 `tick()` 里的说明。 */
 const PROGRESS_TIMEOUT_MS = 30_000;
@@ -196,6 +209,14 @@ export async function syncStatus(): Promise<void> {
   if (ok && run.running) startPolling();
 }
 
+/** 命令之后的核对必须晚于命令，不能复用命令发出前已在飞的旧快照。 */
+async function syncAfterCommand(): Promise<void> {
+  const epoch = generation;
+  if (inFlight) await inFlight;
+  if (epoch !== generation) return;
+  await syncStatus();
+}
+
 /** 把一拍回包并进本地状态。导出是为了能被单测直接喂数据。 */
 export function applyProgress(out: ProgressOut): void {
   // **换了一轮就把攒的单元丢掉。** 服务端一侧已经会把越界游标自愈成 0
@@ -220,6 +241,17 @@ export function applyProgress(out: ProgressOut): void {
   // 不在跑了，「已请求停止 / 停止结果未确认」这两句话就没有意义了，留着只会
   // 让结束之后的界面上还挂着一个悬而未决的动作。
   if (!out.running && run.stopPhase !== 'sending') run.stopPhase = 'idle';
+  // 旧单元的迟到增量不能解除当前单元的跳过状态；未知应答也在目标离开后收回。
+  if (run.skipPhase !== 'sending' && (
+    !out.running || runChanged || (skipTarget && (
+      out.run.run_id !== skipTarget.runId
+      || out.run.done.some((unit) => unit.seq === skipTarget?.seq)
+      || (out.run.current !== null && out.run.current.seq !== skipTarget.seq)
+    ))
+  )) {
+    run.skipPhase = 'idle';
+    skipTarget = null;
+  }
   run.running = out.running;
   run.logCursor = out.from;
   run.unitCursor = out.units_from;
@@ -261,7 +293,9 @@ export function stopPolling(): void {
 export async function start(): Promise<void> {
   // 重复提交在这台机器上不是「多发一个请求」：每一轮都会真的去灌包。
   // 按钮的 disabled 挡不住连点与回车重复触发，闸门放在这里。
-  if (run.starting) return;
+  if (run.starting || run.running || run.startPhase === 'unknown') return;
+  const epoch = generation;
+  const requestId = ++startRequest;
   run.starting = true;
   run.startError = '';
   run.startPhase = 'sending';
@@ -274,30 +308,53 @@ export async function start(): Promise<void> {
       throw new Error('计划或运行参数在预览后有改动，请重新预览再开始');
     }
     await api.post('/api/run', { ...buildRunRequest(), plan_hash: hash });
+    if (epoch !== generation) return;
+    // 开始前在飞的 GET 仍可能带着上一轮结果；等它结束，但不再接受其内容。
+    generation += 1;
     // 起跑成功就把上一轮的残留清掉，但**保留轮询**。
     run.units = [];
     run.lines = [];
     run.logCursor = 0;
     run.unitCursor = 0;
     run.report = '';
+    run.status = emptyRun();
+    run.stopPhase = 'idle';
+    run.skipPhase = 'idle';
+    run.stopError = '';
+    run.skipError = '';
+    run.reportError = '';
+    skipTarget = null;
     run.running = true;
     run.startPhase = 'accepted';
     startPolling();
   } catch (error) {
+    if (epoch !== generation) return;
     if (error instanceof NetworkError) {
       // **不能再发一遍。** 没拿到应答不等于没执行；这一轮可能已经在对面
       // 起跑了，再发一次就是两轮同时灌包。只能去读状态，由服务器说了算。
       run.startPhase = 'unknown';
       run.startError = '';
-      void syncStatus();
+      generation += 1;
+      // 开始前的空闲快照不能用于人工恢复；先等命令之后的新状态落地。
+      run.synced = false;
+      run.lastSyncAt = null;
+      void syncAfterCommand();
     } else {
       // 服务端答了「失败」：这一轮确定没起来，计划和表单原样留着，就地重试。
       run.startPhase = 'idle';
       run.startError = errorMessage(error);
     }
   } finally {
-    run.starting = false;
+    if (requestId === startRequest) run.starting = false;
   }
+}
+
+/** 操作员明确核对主控后才能退出未知态；恢复只清准备信息，下一次仍须重新预览。 */
+export function prepareAfterUnknownStart(): void {
+  if (run.startPhase !== 'unknown' || !run.synced || run.running || run.refreshError) return;
+  run.startPhase = 'idle';
+  run.startError = '';
+  invalidatePreview();
 }
 
 /**
@@ -306,18 +363,55 @@ export async function start(): Promise<void> {
  * 收尾要等当前单元的工具退出、报告落盘，可能还有几十秒。把受理直接当成
  * 结束，屏幕会先说「本轮已结束」，随后轮询又把它翻回「运行中」。
  */
+/**
+ * 跳过当前正在跑的那个单元，队列继续。
+ *
+ * **和「停止」是两件事**，所以用独立的状态位：停止是终态（点了就等收尾），
+ * 跳过是一次性动作（下一个单元照跑）。共用一个状态位的话，跳过一次之后
+ * 界面会一直显示「已请求停止」。
+ *
+ * 和 `stop` 同样**不自动重发**：请求可能已经到了，重发会把下一个单元也跳掉。
+ */
+export async function skipUnit(): Promise<void> {
+  if (!run.running || !run.status.run_id || !run.status.current || run.skipPhase !== 'idle') return;
+  const epoch = generation;
+  skipTarget = { runId: run.status.run_id, seq: run.status.current.seq };
+  run.skipPhase = 'sending';
+  run.skipError = '';
+  try {
+    await api.post('/api/skip-unit', {});
+    if (epoch !== generation) return;
+    run.skipPhase = 'accepted';
+    // 收尾要等当前单元的工具退出，进度页靠轮询把结果带回来。
+    void syncAfterCommand();
+  } catch (error) {
+    if (epoch !== generation) return;
+    if (error instanceof NetworkError) {
+      run.skipPhase = 'unknown';
+      void syncAfterCommand();
+    } else {
+      run.skipPhase = 'idle';
+      skipTarget = null;
+      run.skipError = errorMessage(error);
+    }
+  }
+}
+
 export async function stop(): Promise<void> {
-  if (run.stopPhase === 'sending') return;
+  if (!run.running || run.stopPhase !== 'idle') return;
+  const epoch = generation;
   run.stopPhase = 'sending';
   run.stopError = '';
   try {
     await api.post('/api/stop', {});
+    if (epoch !== generation) return;
     run.stopPhase = 'accepted';
   } catch (error) {
+    if (epoch !== generation) return;
     if (error instanceof NetworkError) {
       // 同样不重发：停止请求可能已经到了。去读状态，别凭超时认定已停。
       run.stopPhase = 'unknown';
-      void syncStatus();
+      void syncAfterCommand();
     } else {
       run.stopPhase = 'idle';
       run.stopError = errorMessage(error);

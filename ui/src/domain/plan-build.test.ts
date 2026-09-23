@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   baselineSuite,
+  bindingSelectionState,
   canonicalDirection,
   defaultTcpRecipe,
   defaultUdpRecipe,
@@ -100,6 +101,75 @@ describe('分配表整列开关', () => {
     // 不会静默当成替换。前端就不该造出这种绑定。
     const plan = toggleSuiteColumn(planWithSets(2), 'suite-baseline');
     expect(plan.bindings.every((b) => b.mode === 'replace')).toBe(true);
+  });
+
+  it('每个集合都有绑定但只选了部分网口时，整列操作补全而不是全撤', () => {
+    let plan = planWithSets(2);
+    const suiteId = plan.suites[0].id;
+    for (const set of plan.link_sets) {
+      set.pair_refs.push({ id: `${set.id}-extra`, src: 'master:NAME=c', dst: 'agent:NAME=d' });
+    }
+    plan = toggleSuiteColumn(plan, suiteId);
+    plan.bindings = plan.bindings.map((binding) => ({
+      ...binding, pair_ids: [plan.link_sets.find((set) => set.id === binding.link_set_id)!.pair_refs[1].id],
+    }));
+    const before = structuredClone(plan);
+    const all = toggleSuiteColumn(plan, suiteId);
+    expect(all.bindings.map((binding) => binding.id)).toEqual(before.bindings.map((binding) => binding.id));
+    expect(all.bindings.every((binding) => binding.pair_ids.length === 0)).toBe(true);
+    expect(all.link_sets).toEqual(before.link_sets);
+    expect(plan).toEqual(before);
+    expect(toggleSuiteColumn(all, suiteId).bindings).toEqual([]);
+  });
+
+  it('单格部分选择显示 some，点击补全保留绑定 ID 与位置，再点击才撤销', () => {
+    const plan = planWithSets(1);
+    const suiteId = plan.suites[0].id;
+    plan.link_sets[0].pair_refs.push({ id: 'pair-extra', src: 'agent:NAME=c', dst: 'master:NAME=d' });
+    plan.suites.push({ ...plan.suites[0], id: 'other-suite' });
+    plan.bindings = [
+      { id: 'other-binding', link_set_id: 'set-0', suite_id: 'other-suite', pair_ids: [], mode: 'replace' },
+      { id: 'keep-id', link_set_id: 'set-0', suite_id: suiteId, pair_ids: ['pair-extra'], mode: 'replace' },
+    ];
+    expect(bindingSelectionState(plan, 'set-0', suiteId)).toBe('some');
+    const all = toggleBinding(plan, 'set-0', suiteId);
+    expect(bindingSelectionState(all, 'set-0', suiteId)).toBe('all');
+    expect(all.bindings).toEqual([
+      plan.bindings[0], { ...plan.bindings[1], pair_ids: [] },
+    ]);
+    expect(all.link_sets).toEqual(plan.link_sets);
+    const none = toggleBinding(all, 'set-0', suiteId);
+    expect(bindingSelectionState(none, 'set-0', suiteId)).toBe('none');
+    expect(none.bindings).toEqual([plan.bindings[0]]);
+  });
+
+  it('整列补全保留已全选的显式网口顺序，其它套件原样保留', () => {
+    const plan = planWithSets(2);
+    const suiteId = plan.suites[0].id;
+    plan.link_sets[0].pair_refs.push({ id: 'pair-extra', src: 'agent:NAME=c', dst: 'master:NAME=d' });
+    plan.bindings = [
+      { id: 'other-binding', link_set_id: 'set-1', suite_id: 'other-suite', pair_ids: [], mode: 'replace' },
+      { id: 'keep-order', link_set_id: 'set-0', suite_id: suiteId, pair_ids: ['pair-extra', 'pair-0'], mode: 'replace' },
+    ];
+    expect(bindingSelectionState(plan, 'set-0', suiteId)).toBe('all');
+    const all = toggleSuiteColumn(plan, suiteId);
+    expect(all.bindings.slice(0, 2)).toEqual(plan.bindings);
+    expect(bindingSelectionState(all, 'set-1', suiteId)).toBe('all');
+    expect(toggleSuiteColumn(all, suiteId).bindings).toEqual([plan.bindings[0]]);
+  });
+
+  it('失效的显式网口不计作选中，多个绑定的子集合按有效网口合并判断', () => {
+    const plan = planWithSets(1);
+    const suiteId = plan.suites[0].id;
+    plan.link_sets[0].pair_refs.push({ id: 'pair-extra', src: 'agent:NAME=c', dst: 'master:NAME=d' });
+    plan.bindings = [
+      { id: 'one', link_set_id: 'set-0', suite_id: suiteId, pair_ids: ['gone'], mode: 'replace' },
+    ];
+    expect(bindingSelectionState(plan, 'set-0', suiteId)).toBe('none');
+    plan.bindings[0].pair_ids = ['pair-extra', 'gone'];
+    expect(bindingSelectionState(plan, 'set-0', suiteId)).toBe('some');
+    plan.bindings.push({ ...plan.bindings[0], id: 'two', pair_ids: ['pair-0'] });
+    expect(bindingSelectionState(plan, 'set-0', suiteId)).toBe('all');
   });
 });
 

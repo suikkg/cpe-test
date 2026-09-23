@@ -3,6 +3,7 @@
 use crate::reason::ReasonCode;
 use crate::verdict::{aggregate_verdict, disposition_advice};
 pub use crate::verdict::{ExecutionStatus, Verdict};
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 const NOT_APPLICABLE: &str = "—（不适用）";
@@ -12,6 +13,89 @@ const NOT_APPLICABLE: &str = "—（不适用）";
 const NIC_ON_GROUPTOTAL: &str = "—（按方向统计，见组合计行）";
 const NOT_COLLECTED: &str = "未采集";
 const INSUFFICIENT_SAMPLES: &str = "样本不足";
+
+/// 报告渲染期从 run 目录读回来的逐样本数据，按 CSV 相对路径缓存。
+///
+/// **一次性读完再渲染**，理由有两条：同一份 CSV 会被概览和明细各用一次，
+/// 读两遍纯属浪费；更重要的是渲染函数因此不必各自持有一个目录句柄，
+/// 「报告只消费数据、不做 IO」这条边只在这一处被打开。
+///
+/// 读不到就是读不到（`None`）：ping 单元没有网卡采样，重放旧目录时 CSV
+/// 可能已经被清掉，跨平台自测时采样也可能整段失败。这些都是正常路径，
+/// 对应的那一格不画图，**不报错、不留占位**。
+pub(super) struct Charts {
+    by_path: std::collections::HashMap<String, Vec<chart::RateSample>>,
+}
+
+impl Charts {
+    /// `dir` 是 run 目录（报告文件所在目录）。`None` 时整个功能关闭——
+    /// 单元测试里 `write_report` 写进临时目录，那里本来就没有 CSV。
+    fn load(dir: Option<&Path>, rows: &[Row]) -> Self {
+        let mut by_path = std::collections::HashMap::new();
+        let Some(dir) = dir else {
+            return Self { by_path };
+        };
+        for row in rows {
+            let rel = row.nic_samples_rx.trim();
+            if rel.is_empty() || by_path.contains_key(rel) {
+                continue;
+            }
+            // 相对路径来自本工具自己写出来的产物名，不是用户输入；即便如此也
+            // 只在 run 目录下拼一次，不跟随符号链接的判断交给 `read_to_string`
+            // 自己的失败路径——读不到就是不画。
+            let Ok(text) = std::fs::read_to_string(dir.join(rel)) else {
+                continue;
+            };
+            by_path.insert(rel.to_string(), chart::parse_samples_csv(&text, "rx_mbps"));
+        }
+        Self { by_path }
+    }
+
+    fn samples(&self, rel: &str) -> Option<&[chart::RateSample]> {
+        let rel = rel.trim();
+        if rel.is_empty() {
+            return None;
+        }
+        self.by_path
+            .get(rel)
+            .map(Vec::as_slice)
+            .filter(|samples| !samples.is_empty())
+    }
+
+    /// 明细里的全尺寸图：带门限线、判定窗口阴影和两条轴的刻度。
+    pub(super) fn full(&self, row: &Row) -> String {
+        let Some(samples) = self.samples(&row.nic_samples_rx) else {
+            return String::new();
+        };
+        chart::render_svg(chart::ChartInput {
+            samples,
+            target_mbps: row.target_mbps,
+            window_start_ms: row.window_start_ms,
+            window_end_ms: row.window_end_ms,
+            caption: &format!(
+                "接收端 RX 速率曲线：{}，共 {} 个采样点",
+                row.kind_label,
+                samples.len()
+            ),
+            compact: false,
+        })
+    }
+
+    /// 概览里的缩略图：只要曲线和门限线，一眼看出中间有没有塌下去。
+    pub(super) fn compact(&self, summary: &DirectionSummary) -> String {
+        let Some(samples) = self.samples(&summary.nic_samples_rx) else {
+            return String::new();
+        };
+        chart::render_svg(chart::ChartInput {
+            samples,
+            target_mbps: summary.target_mbps,
+            window_start_ms: None,
+            window_end_ms: None,
+            caption: &format!("接收端 RX 速率曲线：{} 方向", summary.tag),
+            compact: true,
+        })
+    }
+}
 
 /// 分节标题本身就是折叠开关。
 ///
@@ -34,7 +118,7 @@ fn push_protocol_section_open(h: &mut String, prefix: &str, section: &ReportSect
 ///
 /// 分节而不是加一列「协议」：读报告的人是按「这次 UDP 怎么样」来找的，
 /// 而不是先扫完 120 行再自己过滤。空分类不出现，见 [`sectioned`]。
-fn push_overview(h: &mut String, groups: &[UnitGroup<'_>]) {
+fn push_overview(h: &mut String, groups: &[UnitGroup<'_>], charts: &Charts) {
     h.push_str(
         "<section class=\"overview-section\" aria-labelledby=\"overview-heading\">\
          <details class=\"top-section\" open><summary class=\"top-toggle\">\
@@ -42,13 +126,13 @@ fn push_overview(h: &mut String, groups: &[UnitGroup<'_>]) {
     );
     for (section, picked) in sectioned(groups) {
         push_protocol_section_open(h, "overview", &section, picked.len());
-        push_overview_table(h, &picked);
+        push_overview_table(h, &picked, charts);
         h.push_str("</details>\n");
     }
     h.push_str("</details></section>\n");
 }
 
-fn push_overview_table(h: &mut String, groups: &[&UnitGroup<'_>]) {
+fn push_overview_table(h: &mut String, groups: &[&UnitGroup<'_>], charts: &Charts) {
     // 先把方向汇总物化一遍：既用来决定是否需要「截图」列，也避免在渲染循环里
     // 重复推导。整表宽度按“常见 1440 宽屏不横向滚动”来配，判定原因单独占一行。
     let rendered: Vec<(&UnitGroup<'_>, Verdict, Vec<DirectionSummary>)> = groups
@@ -74,7 +158,14 @@ fn push_overview_table(h: &mut String, groups: &[&UnitGroup<'_>]) {
             !direction.screenshot_master.is_empty() || !direction.screenshot_agent.is_empty()
         })
     });
-    let column_count = if has_shots { 13 } else { 12 };
+    // 曲线列与截图列同一个做法：整列都画不出来时（纯 Ping 报告、重放旧目录、
+    // CSV 已清掉）就不渲染，免得白占一列宽度。
+    let has_charts = rendered.iter().any(|(_, _, directions)| {
+        directions
+            .iter()
+            .any(|direction| !charts.compact(direction).is_empty())
+    });
+    let column_count = 12 + usize::from(has_shots) + usize::from(has_charts);
 
     h.push_str(
         "<div class=\"overview-scroll\" role=\"region\" aria-labelledby=\"overview-heading\" tabindex=\"0\"><table class=\"overview-table\"><caption class=\"sr-only\">按测试单元和方向展示接收端网卡 RX 判定指标、发送端 TX 参考值、截图与判定原因</caption><colgroup><col class=\"c-seq\"><col class=\"c-verdict\"><col class=\"c-unit\"><col class=\"c-dir\"><col class=\"c-endpoints\"><col class=\"c-streams\"><col class=\"c-rate\"><col class=\"c-rate\"><col class=\"c-rate\"><col class=\"c-target\">",
@@ -82,11 +173,17 @@ fn push_overview_table(h: &mut String, groups: &[&UnitGroup<'_>]) {
     if has_shots {
         h.push_str("<col class=\"c-shot\">");
     }
+    if has_charts {
+        h.push_str("<col class=\"c-chart\">");
+    }
     h.push_str(
         "<col class=\"c-coverage\"><col class=\"c-quality\"></colgroup><thead><tr><th scope=\"col\">#</th><th scope=\"col\">结果</th><th scope=\"col\">测试单元</th><th scope=\"col\">方向</th><th scope=\"col\">源端 → 接收端</th><th scope=\"col\">请求/活跃/要求流</th><th scope=\"col\">接收端 RX 平均</th><th scope=\"col\">接收端 RX-P10</th><th scope=\"col\">发送端 TX 平均</th><th scope=\"col\">目标</th>",
     );
     if has_shots {
         h.push_str("<th scope=\"col\">截图</th>");
+    }
+    if has_charts {
+        h.push_str("<th scope=\"col\">RX 曲线</th>");
     }
     h.push_str(
         "<th scope=\"col\">采样覆盖率</th><th scope=\"col\">质量指标</th></tr></thead><tbody>\n",
@@ -143,8 +240,19 @@ fn push_overview_table(h: &mut String, groups: &[&UnitGroup<'_>]) {
             } else {
                 String::new()
             };
+            // 缩略曲线是**未转义直出的 SVG**：它由 `chart::render_svg` 自己生成，
+            // 里面唯一的外来文本（caption）在那边已经过 `esc`。这里再转一次会
+            // 把标签变成可见的尖括号。
+            let chart_cell = if has_charts {
+                format!(
+                    "<td class=\"chart-cell\">{}</td>",
+                    charts.compact(direction)
+                )
+            } else {
+                String::new()
+            };
             h.push_str(&format!(
-                "<tr class=\"{}\" data-unit-id=\"{}\" data-direction=\"{}\"><td class=\"num seq-col\">{}</td><td><strong class=\"status {}\">{}</strong><br><small>{}</small></td><td>{}</td><td><strong>{}</strong></td><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td>{}<td class=\"num\">{}</td><td>{}</td></tr>\n",
+                "<tr class=\"{}\" data-unit-id=\"{}\" data-direction=\"{}\"><td class=\"num seq-col\">{}</td><td><strong class=\"status {}\">{}</strong><br><small>{}</small></td><td>{}</td><td><strong>{}</strong></td><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td>{}{}<td class=\"num\">{}</td><td>{}</td></tr>\n",
                 if index == 0 { "unit-first" } else { "unit-cont" },
                 esc(&group.key),
                 esc(&tag),
@@ -165,9 +273,11 @@ fn push_overview_table(h: &mut String, groups: &[&UnitGroup<'_>]) {
                 esc(&tx_avg_text(direction.tx_avg, is_ping)),
                 esc(&target_text(direction.target_mbps)),
                 shot_cell,
+                chart_cell,
                 esc(&coverage_text(direction.sample_coverage, is_ping)),
                 esc(&quality_text(
                     direction.udp_loss,
+                    direction.tcp_retransmits,
                     direction.ping_loss,
                     direction.ping_min,
                     direction.ping_avg,
@@ -244,9 +354,9 @@ fn report_mixes_traffic_backends(groups: &[UnitGroup<'_>]) -> bool {
     iperf && cts
 }
 
-fn push_detail_row(h: &mut String, row: &Row, group_title: &str) {
+fn push_detail_row(h: &mut String, row: &Row, group_title: &str, charts: &Charts) {
     let is_ping = row_is_ping(row);
-    let direction = infer_direction_tag(row);
+    let direction = direction_tag(row);
     let kind = if row.kind_label.is_empty() {
         NOT_APPLICABLE
     } else {
@@ -297,6 +407,7 @@ fn push_detail_row(h: &mut String, row: &Row, group_title: &str) {
         )),
         esc(&quality_text(
             row.udp_loss,
+            row.tcp_retransmits,
             row.ping_loss,
             row.ping_min,
             row.ping_avg,
@@ -304,7 +415,13 @@ fn push_detail_row(h: &mut String, row: &Row, group_title: &str) {
             is_ping,
         )),
     ));
-    push_row_diagnostics(h, row, is_ping, &format!("{group_title} {direction}"));
+    push_row_diagnostics(
+        h,
+        row,
+        is_ping,
+        &format!("{group_title} {direction}"),
+        &charts.full(row),
+    );
     h.push_str("</td></tr>\n");
     // 与概览同一处理：判定原因是最长的一段文字，挤进定宽列会被压成一列一个字。
     if !reason.is_empty() && reason != NOT_APPLICABLE {
@@ -425,7 +542,7 @@ fn push_bidirectional_summary(h: &mut String, group: &UnitGroup<'_>) {
     h.push_str("</div>");
 }
 
-fn push_unit_details(h: &mut String, groups: &[UnitGroup<'_>]) {
+fn push_unit_details(h: &mut String, groups: &[UnitGroup<'_>], charts: &Charts) {
     let detail_count: usize = groups.iter().map(|group| group.details.len()).sum();
     h.push_str(&format!(
         "<section class=\"details-section\" aria-labelledby=\"details-heading\">\
@@ -439,13 +556,13 @@ fn push_unit_details(h: &mut String, groups: &[UnitGroup<'_>]) {
     }
     for (section, picked) in sectioned(groups) {
         push_protocol_section_open(h, "details", &section, picked.len());
-        push_unit_list(h, &picked);
+        push_unit_list(h, &picked, charts);
         h.push_str("</details>\n");
     }
     h.push_str("</details></section>\n");
 }
 
-fn push_unit_list(h: &mut String, groups: &[&UnitGroup<'_>]) {
+fn push_unit_list(h: &mut String, groups: &[&UnitGroup<'_>], charts: &Charts) {
     h.push_str("<div class=\"unit-list\">\n");
     for group in groups {
         let group = *group;
@@ -480,7 +597,7 @@ fn push_unit_list(h: &mut String, groups: &[&UnitGroup<'_>]) {
                 esc(title),
             ));
             for row in &group.details {
-                push_detail_row(h, row, title);
+                push_detail_row(h, row, title, charts);
             }
             h.push_str("</tbody></table></div>");
         }
@@ -489,37 +606,83 @@ fn push_unit_list(h: &mut String, groups: &[&UnitGroup<'_>]) {
     h.push_str("</div>\n");
 }
 
+/// 一轮运行的单元级判定统计。
+///
+/// **报告顶部那八个格子和 `meta.json` 里的计数是同一处算出来的**。分成两处算
+/// 的代价很具体：历史列表说「28 通过」、点进去报告说「27 通过」，而两边各自
+/// 都没错——一边按单元聚合、一边按行聚合。哪个数对，没人分得清。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VerdictTotals {
+    /// 参与统计的单元数，**不含 SKIP**（与报告顶部的「总数」一致）。
+    pub total: usize,
+    pub pass: usize,
+    pub rate_fail: usize,
+    pub measured: usize,
+    pub not_evaluated: usize,
+    pub setup_error: usize,
+    pub skipped: usize,
+}
+
+impl VerdictTotals {
+    /// 通过率 = PASS / (PASS + RATE_FAIL)。
+    ///
+    /// 分母**只有下过结论的那两类**：MEASURED（没门限）和 NOT_EVALUATED
+    /// （采样不可信）都不是「没通过」，把它们算进分母等于把「没测」记成「没过」。
+    /// 与报告顶部那个百分比是同一个算式。
+    pub fn pass_rate_pct(&self) -> f64 {
+        let judged = self.pass + self.rate_fail;
+        if judged == 0 {
+            0.0
+        } else {
+            self.pass as f64 * 100.0 / judged as f64
+        }
+    }
+}
+
+/// 按单元聚合统计一轮的判定分布。
+///
+/// 内部按 `group_rows` 分组、用 `group_verdict` 取每个单元的结论——两者都是
+/// `write_report` 渲染概览时用的那一份，所以这里不产生第二个「什么算 PASS」
+/// 的权威。
+///
+/// **刻意不写成 `match verdict => field += 1`**：那个形状是
+/// `RunSummary::bump` / `RunCounts::bump` 的专利，`the_verdict_to_counter_mapping_has_no_third_copy`
+/// 明确禁止第三份。这里要的只是「等于某个值的有几个」，等值计数就够，
+/// 也不会在将来被误当成一张可以各自演化的映射表。
+pub fn verdict_totals(rows: &[Row]) -> VerdictTotals {
+    let groups = group_rows(rows);
+    let count_of = |wanted: Verdict| {
+        groups
+            .iter()
+            .filter(|group| group_verdict(group) == wanted)
+            .count()
+    };
+    let skipped = count_of(Verdict::Skip);
+    VerdictTotals {
+        total: groups.len() - skipped,
+        pass: count_of(Verdict::Pass),
+        rate_fail: count_of(Verdict::RateFail),
+        measured: count_of(Verdict::Measured),
+        not_evaluated: count_of(Verdict::NotEvaluated),
+        setup_error: count_of(Verdict::SetupError),
+        skipped,
+    }
+}
+
 pub fn write_report(path: &Path, rows: &mut [Row], meta: &ReportMeta) -> std::io::Result<()> {
     rows.sort_by_key(|row| row.sort_key);
     let groups = group_rows(rows);
-    let total = groups
-        .iter()
-        .filter(|group| group_verdict(group) != Verdict::Skip)
-        .count();
-    let pass = groups
-        .iter()
-        .filter(|group| group_verdict(group) == Verdict::Pass)
-        .count();
-    let rate_fail = groups
-        .iter()
-        .filter(|group| group_verdict(group) == Verdict::RateFail)
-        .count();
-    let measured = groups
-        .iter()
-        .filter(|group| group_verdict(group) == Verdict::Measured)
-        .count();
-    let not_evaluated = groups
-        .iter()
-        .filter(|group| group_verdict(group) == Verdict::NotEvaluated)
-        .count();
-    let setup_error = groups
-        .iter()
-        .filter(|group| group_verdict(group) == Verdict::SetupError)
-        .count();
-    let skipped = groups
-        .iter()
-        .filter(|group| group_verdict(group) == Verdict::Skip)
-        .count();
+    let totals = verdict_totals(rows);
+    let VerdictTotals {
+        total,
+        pass,
+        rate_fail,
+        measured,
+        not_evaluated,
+        setup_error,
+        skipped,
+    } = totals;
     // UNSTABLE 已经不再产出（掉速统一归 RATE_FAIL，靠原因码区分严重程度），
     // 概览里那格恒为 0 的统计块跟着一起删了——一格永远是 0 的指标会被读成
     // 「这轮没有不稳定的」，而实际上是「这个分类已经不存在了」。
@@ -528,12 +691,8 @@ pub fn write_report(path: &Path, rows: &mut [Row], meta: &ReportMeta) -> std::io
     // 一行小字里、没有统计格。整轮 NOT_EVALUATED 的报告因此顶部五格全是 0，
     // 看上去像「什么都没跑」，而实际上是「跑了但采样不可信、一条都不能下结论」。
     // 这两格补上之后，八格加起来正好覆盖 Verdict 的全部六个取值。
-    let judged = pass + rate_fail;
-    let rate = if judged > 0 {
-        pass as f64 * 100.0 / judged as f64
-    } else {
-        0.0
-    };
+    // 通过率也走同一个方法：报告顶部、meta.json、历史列表三处说的是同一个数。
+    let rate = totals.pass_rate_pct();
 
     let mut h = String::with_capacity(80 * 1024);
     h.push_str(
@@ -592,6 +751,7 @@ h2 { margin: 28px 0 10px; font-size: 17px; line-height: 1.3; }
 .overview-table col.c-rate { width: 6.892%; }
 .overview-table col.c-target { width: 6.372%; }
 .overview-table col.c-shot { width: 11.834%; }
+.overview-table col.c-chart { width: 13%; }
 .overview-table col.c-coverage { width: 5.072%; }
 .overview-table col.c-quality { width: 7.932%; }
 /* 序号只写在单元首行，续行留空；加粗让它在长表里可扫。 */
@@ -651,6 +811,7 @@ details.proto-section > summary.proto-toggle::marker { color: #1769aa; }
 .direction-summary-reason { flex: 1 1 100%; color: var(--muted); overflow-wrap: anywhere; }
 .direction-summary-shots { flex: 0 0 auto; }
 .shot-col { vertical-align: middle; }
+.chart-cell { vertical-align: middle; }
 /* 两张缩略图必须并排放进 182px 的截图列（80+80+6+2×8 内边距 = 182）；一旦换行
    堆叠，行高会从约 75px 涨到约 175px，一屏就只剩三四个测试项。窄屏等比压缩时
    两张图跟着一起缩，绝不能溢出去盖住右边的采样覆盖率。 */
@@ -772,8 +933,15 @@ summary:focus-visible, a:focus-visible, .table-scroll:focus-visible, .overview-s
     .raw-section, .shot, .row-diagnostics { display: none; }
     /* 「展开全部/收起全部」是交互控件，纸上没有意义。 */
     .report-tools { display: none; }
+    /* 曲线要能打印：它是「中途掉没掉速」唯一一眼看得见的证据。 */
+    .rate-chart { display: block; }
 }
-</style></head><body><main class="report">
+"#,
+    );
+    // 曲线的样式跟着画它的模块走：改了 SVG 的类名不用回来翻这张几百行的样式表。
+    h.push_str(chart::CHART_CSS);
+    h.push_str(
+        r#"</style></head><body><main class="report">
 <h1>CPE 子网测试报告</h1>
 "#,
     );
@@ -796,7 +964,7 @@ summary:focus-visible, a:focus-visible, .table-scroll:focus-visible, .overview-s
         "<p class=\"summary-note\">测试单元: {total}（不含 SKIP） · 判定通过率: <strong>{pass}/{judged} = {rate:.1}%</strong>。分母只算 PASS 与 RATE_FAIL——MEASURED 没有验收目标可比，NOT_EVALUATED 是采样不可信不能下结论，SETUP_ERROR 没跑成，SKIP 是上一轮已经过了。</p>\n",
         total = total,
         pass = pass,
-        judged = judged,
+        judged = pass + rate_fail,
         rate = rate,
     ));
 
@@ -819,8 +987,11 @@ summary:focus-visible, a:focus-visible, .table-scroll:focus-visible, .overview-s
          <button type=\"button\" data-toggle-all=\"close\">收起全部</button>\
          <span class=\"tools-hint\">对本页所有可折叠区块生效（测试概览 / 逐行明细 / 原始输出，各自的 Ping·UDP·TCP 分节、每个单元、每段原始输出）</span></div>\n",
     );
-    push_overview(&mut h, &groups);
-    push_unit_details(&mut h, &groups);
+    // 逐样本 CSV 就在报告文件旁边的 run 目录里。读不到就不画图——
+    // 单元测试写进临时目录、重放旧目录时 CSV 已被清掉，都是正常路径。
+    let charts = Charts::load(path.parent(), rows);
+    push_overview(&mut h, &groups, &charts);
+    push_unit_details(&mut h, &groups, &charts);
 
     let raw_rows = rows
         .iter()
@@ -871,7 +1042,7 @@ summary:focus-visible, a:focus-visible, .table-scroll:focus-visible, .overview-s
         // AB/BA 的话，一个双向单元会出现四条一模一样的标题，只有行尾的
         // 「N 段内嵌输出 · M 个原始文件」不同——那不是给人扫的。
         let row_kind = if r.kind_label.is_empty() {
-            infer_direction_tag(r)
+            direction_tag(r)
         } else {
             r.kind_label.clone()
         };
@@ -929,10 +1100,13 @@ summary:focus-visible, a:focus-visible, .table-scroll:focus-visible, .overview-s
     std::fs::write(path, h)
 }
 
+mod chart;
+pub mod compare;
 mod diagnostics;
 mod format;
 mod model;
 mod reason;
+pub mod retention;
 pub mod store;
 pub mod xlsx;
 

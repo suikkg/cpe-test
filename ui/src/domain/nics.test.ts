@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { NicInfo } from '../api/dto';
 import { filterByQuery } from './search';
-import { nicKey, nicLinkLocal, nicSearchFields, nicSpeedLabel } from './nics';
+import { nicKey, nicLinkLocal, nicSearchFields, nicSpeedLabel, nicWifiContext } from './nics';
 
 function nic(patch: Partial<NicInfo>): NicInfo {
   return {
@@ -48,5 +48,48 @@ describe('网卡展示规则', () => {
     expect(hit('8.104')).toEqual(['en1']);
     expect(hit('fe80::1813')).toEqual(['en0']);
     expect(hit('5ghz')).toEqual(['en1']);
+  });
+});
+
+describe('nicWifiContext', () => {
+  const base: NicInfo = {
+    name: 'WLAN',
+    description: 'Intel Wi-Fi 6',
+    role: 'WIFI5G',
+    ipv4: '192.168.1.2',
+    gateway_v4: '',
+    ipv6_ll: '',
+    ipv6_global: '',
+    zone: '',
+    speed_mbps: 2402,
+    is_wifi: true,
+    wifi_band: '5GHz',
+    ifindex: 7,
+  };
+
+  it('把 SSID、信道、信号与无线电类型串成一行', () => {
+    expect(
+      nicWifiContext({
+        ...base,
+        wifi_ssid: 'CPE_TEST_5G',
+        wifi_channel: 149,
+        wifi_signal_pct: 99,
+        wifi_radio: '802.11ax',
+      }),
+    ).toBe('CPE_TEST_5G · 信道 149 · 信号 99% · 802.11ax');
+  });
+
+  it('有线口一个字都不出', () => {
+    expect(nicWifiContext({ ...base, is_wifi: false, wifi_ssid: 'x' })).toBe('');
+  });
+
+  it('旧版 agent 没上报这几项时返回空串，而不是一串占位符', () => {
+    expect(nicWifiContext(base)).toBe('');
+  });
+
+  it('信号 0% 是真实读数，必须照样显示', () => {
+    // 断在边缘的链路信号就是 0%。把它当成「没读到」滤掉，屏幕上会显示成
+    // 一块信号正常的网卡，而那正是要查的现象。
+    expect(nicWifiContext({ ...base, wifi_signal_pct: 0 })).toBe('信号 0%');
   });
 });

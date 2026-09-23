@@ -2,7 +2,7 @@
   "est_full_secs": 158,
   "est_total_secs": 158,
   "notices": [],
-  "plan_hash": "6270b876eeadb96d9fc8bf954300eeb0",
+  "plan_hash": "4aeb8fda5f868721ad006f1c18b8a722",
   "sections": [
     {
       "link_set_id": "set-a",
@@ -23,7 +23,7 @@
       ]
     }
   ],
-  "topology_fingerprint": "3351dfd16b090cb6e319ee9c72342eef",
+  "topology_fingerprint": "b3ed8b704480169def55ef3c8abd1608",
   "trace": [
     {
       "direction": "ab",

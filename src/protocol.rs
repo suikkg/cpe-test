@@ -8,6 +8,14 @@ pub const LIVE_NIC_PROGRESS_CAPABILITY: &str = "live_nic_progress_v1";
 /// agent 支持 ctsTraffic 异步生命周期与简化参数映射。
 pub const CTS_TRAFFIC_CAPABILITY: &str = "ctstraffic_v1";
 
+/// agent 认得 [`PingReq::dont_fragment`]，会真的带 DF 位发包。
+///
+/// **必须有这枚标记**：旧版 agent 收到 `dont_fragment` 会静默忽略它、然后
+/// 照常分片发出去并报成功——主控据此得出「1500 字节能过」，而其实根本没带
+/// DF 测过。那是一个**听上去很确定的错答案**，比拿不到结果糟得多。
+/// 没有这枚标记时，路径 MTU 探测直接判 SETUP_ERROR。
+pub const PING_DF_CAPABILITY: &str = "ping_df_v1";
+
 /// 一张网卡的信息（两端通用）
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct NicInfo {
@@ -40,6 +48,29 @@ pub struct NicInfo {
     /// WiFi 频段："2.4GHz" / "5GHz" / "6GHz" / ""
     #[serde(default)]
     pub wifi_band: String,
+    /// 当前关联的 SSID；非 Wi-Fi 或读不到时为空。
+    ///
+    /// 这一组无线上下文字段解决的是**结果不可复现**：Wi-Fi 那条腿今天跑出
+    /// 1400Mbps、下周跑出 900Mbps，只有频段的话看不出是换了信道、信号弱了，
+    /// 还是设备真的退化了。`netsh wlan show interfaces` 这一条命令本来就在跑，
+    /// SSID 早就解析出来了却被丢掉（`cmd::netsh::WlanInfo.ssid` 一度没有消费者）。
+    ///
+    /// 全部 `#[serde(default)]`：旧版 agent 不上报这些字段，收到就是空值，
+    /// 行为与加它们之前一致。
+    #[serde(default)]
+    pub wifi_ssid: String,
+    /// Wi-Fi 信号质量百分比（0..=100）；`None` = 没读到。
+    ///
+    /// 用 `Option` 而不是 `0` 兜底：0% 是一个真实可能的读数（信号断在边缘），
+    /// 把「没读到」写成 0 会让报告声称信号已经归零。
+    #[serde(default)]
+    pub wifi_signal_pct: Option<u32>,
+    /// 当前信道号；`None` = 没读到。
+    #[serde(default)]
+    pub wifi_channel: Option<u32>,
+    /// 无线电类型原文（`802.11ax` / `802.11be` …）。
+    #[serde(default)]
+    pub wifi_radio: String,
     #[serde(default)]
     pub ifindex: u32,
 }
@@ -55,6 +86,35 @@ impl NicInfo {
             extra.push_str(&format!(", {}", self.wifi_band));
         }
         format!("{}({}{})", self.name, self.ipv4, extra)
+    }
+
+    /// 无线上下文的一行摘要，例如 `CPE_TEST_5G · 信道 149 · 信号 99% · 802.11ax`。
+    ///
+    /// 非 Wi-Fi、或一项都没读到时返回空串——空串在报告里就是「这一格不适用」，
+    /// 不必再造一个「未知」的占位词。
+    ///
+    /// **刻意不并进 [`NicInfo::brief`]**：`brief()` 参与 `Unit.title` 的拼装，
+    /// 而标题进了 `the_full_unit_expansion_is_byte_stable` 的全量快照，也进了
+    /// 每一份历史报告的抬头。往里塞一个会随信号强度逐轮变化的数，等于让
+    /// 「同一个计划的标题」每次跑都不一样。
+    pub fn wifi_context(&self) -> String {
+        if !self.is_wifi {
+            return String::new();
+        }
+        let mut parts: Vec<String> = Vec::new();
+        if !self.wifi_ssid.is_empty() {
+            parts.push(self.wifi_ssid.clone());
+        }
+        if let Some(channel) = self.wifi_channel {
+            parts.push(format!("信道 {channel}"));
+        }
+        if let Some(signal) = self.wifi_signal_pct {
+            parts.push(format!("信号 {signal}%"));
+        }
+        if !self.wifi_radio.is_empty() {
+            parts.push(self.wifi_radio.clone());
+        }
+        parts.join(" · ")
     }
 }
 
@@ -108,6 +168,13 @@ pub struct PingReq {
     pub count: u32,
     /// 负载字节数（-l / -s）
     pub payload: u32,
+    /// 带「不分片」位发包（Windows `-f`、macOS/BSD `-D`、Linux `-M do`）。
+    ///
+    /// 路径 MTU 探测靠它：包太大时链路会回「需要分片但设置了 DF」，
+    /// 而不是默默拆开发过去。旧版 agent 不认这个字段（`#[serde(default)]`
+    /// 收成 `false`），所以主控必须先看 [`PING_DF_CAPABILITY`]。
+    #[serde(default)]
+    pub dont_fragment: bool,
     #[serde(default)]
     pub v6: bool,
 }
@@ -715,6 +782,7 @@ mod tests {
                 count: 100_000,
                 payload: 65_500,
                 v6: true,
+                dont_fragment: true,
             })
             .unwrap(),
         );

@@ -92,15 +92,26 @@ async function onRescan(): Promise<void> {
       <p class="muted">输入辅测机地址，连接后获取两端网卡，再配置测试计划。</p>
     </header>
 
+    <section class="agent-setup" aria-labelledby="agent-setup-title">
+      <h3 id="agent-setup-title">第一次连接，先在辅测机上做这三步</h3>
+      <ol>
+        <li><strong>启动辅测服务。</strong>在另一台电脑上打开同版本程序，双击 <code>cpe_test.exe</code> 后输入 <strong>3</strong>，选择「辅测 agent」。也可在程序目录运行 <code>cpe_test.exe agent</code>。</li>
+        <li><strong>找到连接地址。</strong>在辅测机窗口的「本机网卡详情」中，找到主控能访问的网卡 IPv4，填到下方「辅测机地址」。多块网卡时选择主控能连通的那一块。</li>
+        <li><strong>保持窗口打开。</strong>看到「等待主控连接」后，回到本页点「连接」。首次运行若弹出防火墙提示，请允许辅测程序通过。</li>
+      </ol>
+    </section>
+
     <form class="form" @submit.prevent="onConnect">
-      <div class="form-heading"><h3>连接设置</h3><span class="hint">请先在对端启动辅测机服务</span></div>
+      <div class="form-heading"><h3>连接设置</h3><span class="hint">按辅测机窗口和启动配置填写</span></div>
       <label>
-        <span>地址</span>
-        <input v-model="session.host" type="text" placeholder="192.168.1.3" autocomplete="off" required />
+        <span>辅测机地址</span>
+        <input v-model="session.host" type="text" placeholder="如 192.168.1.3" autocomplete="off" aria-describedby="agent-address-help" required />
+        <small id="agent-address-help" class="hint">填写另一台电脑的网卡 IP，可在辅测机窗口的「本机网卡详情」中找到。</small>
       </label>
       <label class="narrow">
-        <span>端口</span>
-        <input v-model.number="session.port" type="number" min="1" max="65535" required />
+        <span>服务端口</span>
+        <input v-model.number="session.port" type="number" min="1" max="65535" aria-describedby="agent-port-help" required />
+        <small id="agent-port-help" class="hint">默认 28801；以辅测机窗口「监听」后的端口为准。</small>
       </label>
       <div class="token-field">
         <label for="agent-token">共享令牌</label>
@@ -108,9 +119,11 @@ async function onRescan(): Promise<void> {
           id="agent-token"
           v-model="session.token"
           :type="showToken ? 'text' : 'password'"
-          placeholder="与 agent --token 一致"
+          placeholder="留空沿用主控当前令牌"
           autocomplete="off"
+          aria-describedby="agent-token-help"
         /><button type="button" class="ghost token-toggle" :aria-pressed="showToken" aria-controls="agent-token" :aria-label="showToken ? '隐藏共享令牌' : '显示共享令牌'" @click="showToken = !showToken">{{ showToken ? '隐藏' : '显示' }}</button></div>
+        <small id="agent-token-help" class="hint">默认配置的共享令牌为 <code>cpetest</code>。若辅测机使用了 <code>--token</code> 或配置文件中的 <code>agent_token</code>，填写同一个值。留空沿用主控当前令牌（含此前输入的值），不会关闭辅测机认证。</small>
       </div>
       <label class="prefix-field">
         <span>IPv4 前缀过滤</span>
@@ -175,7 +188,13 @@ async function onRescan(): Promise<void> {
 </template>
 
 <style scoped>
-.form { display: grid; grid-template-columns: minmax(0, 2fr) 110px minmax(0, 2fr); align-items: end; gap: 20px 16px; margin: 0 0 20px; padding: 22px; border: 1px solid var(--line); border-radius: 9px; background: var(--panel-2); }
+.agent-setup { margin: 0 0 20px; padding: 18px 22px; border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: 6px; background: var(--surface); }
+.agent-setup h3 { margin: 0 0 12px; font-size: 15px; }
+.agent-setup ol { margin: 0; padding-left: 22px; max-width: 85ch; }
+.agent-setup li { padding: 4px 0; font-size: 13px; line-height: 1.75; color: var(--muted); }
+.agent-setup strong { color: var(--ink); }
+.form { display: grid; grid-template-columns: minmax(0, 2fr) 140px minmax(0, 2fr); align-items: start; gap: 20px 16px; margin: 0 0 20px; padding: 22px; border: 1px solid var(--line); border-radius: 9px; background: var(--panel-2); }
+.form small.hint { line-height: 1.65; }
 .form-heading { grid-column: 1 / -1; display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; }
 .form-heading h3 { margin: 0; }
 .form > label { display: flex; flex-direction: column; gap: 7px; min-width: 0; }

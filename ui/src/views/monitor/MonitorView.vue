@@ -153,6 +153,7 @@ async function addAll(): Promise<void> {
     </p>
 
     <p v-if="monitor.error" class="bad" role="alert">{{ monitor.error }}</p>
+    <p v-if="monitor.notice" class="hint" role="status">{{ monitor.notice }}</p>
     <p v-if="monitor.refreshError" class="bad" role="status">
       监控更新失败，当前曲线为上次成功数据：{{ monitor.refreshError }}。正在等待重新同步。
     </p>
@@ -177,6 +178,7 @@ async function addAll(): Promise<void> {
           <span class="session-name">
             {{ s.side === 'master' ? '主控' : '辅测' }} · {{ s.iface }}
           </span>
+          <span class="session-meta">{{ s.host }}</span>
           <span class="session-meta mono">{{ sessionReadout(s) }}</span>
           <span v-if="s.error" class="session-meta err">{{ s.error }}</span>
           <span v-else-if="!s.running" class="session-meta muted">已停止</span>
@@ -186,6 +188,7 @@ async function addAll(): Promise<void> {
       <div v-if="current" class="session-detail">
         <div class="panel-head">
           <strong>{{ current.side === 'master' ? '主控' : '辅测' }} · {{ current.iface }}</strong>
+          <span class="muted">{{ current.host }}</span>
           <span v-if="current.error" class="err">{{ current.error }}</span>
           <span v-else-if="!current.running" class="muted">已停止</span>
           <button type="button" class="ghost small" @click="stopSession(current.session)">

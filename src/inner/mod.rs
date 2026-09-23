@@ -31,6 +31,7 @@ use config::{Direction, Flow, InnerConfig, Link, Measurement, Protocol};
 use measure::{LegMeasurement, NicView, Source, ToolOrigin, ToolView};
 use plan::{LegPlan, Unit};
 use serde::Serialize;
+use std::net::{IpAddr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -185,6 +186,7 @@ struct UnitRow {
     index: usize,
     link: String,
     host: String,
+    ip_version: u8,
     protocol: Protocol,
     direction: Direction,
     streams: u32,
@@ -315,7 +317,7 @@ fn perform(
     }
     std::fs::create_dir(&dir).map_err(|e| e.to_string())?;
     let mut report = RunReport {
-        schema_version: 2,
+        schema_version: 3,
         current: "正在检查 ADB 和本轮引用的电脑".into(),
         created_at: crate::util::now_full(),
         config: cfg,
@@ -358,7 +360,7 @@ fn probe(adb: &Adb, cfg: &InnerConfig, required: Option<&[String]>) -> Result<Ca
     if !help.contains("--client") || !help.contains("--server") || !help.contains("--bind") {
         return Err("板侧工具缺少 iperf3 server/client/bind 能力，请检查 board_iperf 路径".into());
     }
-    let addresses = adb.shell("ip -o -4 addr show")?;
+    let addresses = adb.shell("ip -o addr show")?;
     let counters = adb.shell("cat /proc/net/dev").unwrap_or_default();
     // 接口清单是「有更好、没有也能跑」：老板子没有 sysfs 时仍可只靠
     // /proc/net/dev 工作，不能因为清单读不出来就整轮不给测。
@@ -421,27 +423,109 @@ fn probe(adb: &Adb, cfg: &InnerConfig, required: Option<&[String]>) -> Result<Ca
 struct LinkPreflight {
     board_iface: String,
     counter_source: Option<CounterSource>,
+    addresses: TrafficAddresses,
 }
 
+/// 同一对 link-local 地址在两台电脑上的作用域不同，目标地址必须使用发送端的接口。
+#[derive(Debug)]
+struct TrafficAddresses {
+    ip_version: u8,
+    pc_bind: String,
+    board_bind: String,
+    up_target: String,
+    down_target: String,
+}
+
+impl TrafficAddresses {
+    fn ipv4(link: &Link) -> Self {
+        Self {
+            ip_version: 4,
+            pc_bind: link.local_ip.to_string(),
+            board_bind: link.gateway.to_string(),
+            up_target: link.gateway.to_string(),
+            down_target: link.local_ip.to_string(),
+        }
+    }
+    fn ipv6(link: &Link, nic: &crate::protocol::NicInfo, os: &str, board_interface: &str) -> Self {
+        let local = link.local_ipv6.unwrap_or(Ipv6Addr::UNSPECIFIED);
+        let board = link.gateway_ipv6.unwrap_or(Ipv6Addr::UNSPECIFIED);
+        // Windows 沿用子网 v6_addrs 的绑定策略；POSIX 与板侧用已核实的接口 zone。
+        let pc_zone = if os.eq_ignore_ascii_case("windows") {
+            ""
+        } else if !nic.zone.is_empty() {
+            &nic.zone
+        } else {
+            &nic.name
+        };
+        let scoped = |ip: Ipv6Addr, zone: &str| {
+            if ip.is_unicast_link_local() && !zone.is_empty() {
+                format!("{ip}%{zone}")
+            } else {
+                ip.to_string()
+            }
+        };
+        Self {
+            ip_version: 6,
+            pc_bind: scoped(local, pc_zone),
+            board_bind: scoped(board, board_interface),
+            up_target: scoped(board, pc_zone),
+            down_target: scoped(local, board_interface),
+        }
+    }
+}
+
+#[cfg(test)]
 fn preflight_link(link: &Link, capability: &Capability) -> Result<LinkPreflight, String> {
+    preflight_version(link, capability, 4)
+}
+
+fn preflight_version(
+    link: &Link,
+    capability: &Capability,
+    ip_version: u8,
+) -> Result<LinkPreflight, String> {
     let host = capability
         .host(&link.host)
         .map_err(|error| format!("{}: {error}", link.name))?;
-    let found = host
+    let found: Vec<_> = host
         .interfaces
         .iter()
-        .filter(|nic| nic.name == link.local_interface && nic.ipv4 == link.local_ip.to_string())
-        .count();
-    if found != 1 {
+        .filter(|nic| {
+            nic.name == link.local_interface
+                && if ip_version == 6 {
+                    [&nic.ipv6_ll, &nic.ipv6_global]
+                        .iter()
+                        .any(|address| address.parse::<Ipv6Addr>().ok() == link.local_ipv6)
+                } else {
+                    nic.ipv4 == link.local_ip.to_string()
+                }
+        })
+        .collect();
+    if found.len() != 1 {
         return Err(format!(
             "{}: 电脑 {} 的接口 {} 未唯一匹配 IP {}，请先扫描核实",
-            link.name, link.host, link.local_interface, link.local_ip
+            link.name,
+            link.host,
+            link.local_interface,
+            link.local_address(ip_version)
         ));
     }
     // LAN 地址仍然必须唯一归属板侧某个接口——它是上行目标及下行源地址。
     // 但统计接口不必是同一个。
-    let gateway_iface = adb::address_interface(&capability.board_addresses, link.gateway)
-        .map_err(|error| format!("{}: {error}", link.name))?;
+    let gateway_iface = match link.board_address(ip_version) {
+        IpAddr::V4(ip) => adb::address_interface(&capability.board_addresses, ip),
+        IpAddr::V6(ip) => adb::lan_interface_v6(
+            &capability.board_addresses,
+            ip,
+            &capability.board_interfaces,
+        ),
+    }
+    .map_err(|error| format!("{}: {error}", link.name))?;
+    let addresses = if ip_version == 6 {
+        TrafficAddresses::ipv6(link, found[0], &host.os, &gateway_iface)
+    } else {
+        TrafficAddresses::ipv4(link)
+    };
     let resolved = adb::resolve_rx_interface(
         &link.board_rx_interface,
         &gateway_iface,
@@ -468,6 +552,7 @@ fn preflight_link(link: &Link, capability: &Capability) -> Result<LinkPreflight,
     Ok(LinkPreflight {
         board_iface,
         counter_source,
+        addresses,
     })
 }
 
@@ -596,12 +681,18 @@ fn execute(
         return Err("本机未找到 iperf3".into());
     }
     // 先把所有参与链路验完，防止跑了一半才发现后面的网卡填错。
-    let preflight: std::collections::HashMap<usize, LinkPreflight> = needed_links
+    let needed_versions: std::collections::HashSet<_> = built
+        .units
         .iter()
-        .map(|&index| {
+        .filter(|unit| !resumed.contains(&unit.id))
+        .map(|unit| (unit.link, unit.ip_version))
+        .collect();
+    let preflight: std::collections::HashMap<(usize, u8), LinkPreflight> = needed_versions
+        .iter()
+        .map(|&(index, version)| {
             Ok((
-                index,
-                preflight_link(&report.config.links[index], capability)?,
+                (index, version),
+                preflight_version(&report.config.links[index], capability, version)?,
             ))
         })
         .collect::<Result<_, String>>()?;
@@ -617,7 +708,6 @@ fn execute(
         report.current = format!("{}/{} · {}", unit.index, built.units.len(), unit.title());
         observer(report, dir);
         let link = &report.config.links[unit.link];
-        let preflight = &preflight[&unit.link];
         if resumed.contains(&unit.id) {
             let row = resumed_row(unit);
             report.units.push(row);
@@ -625,6 +715,7 @@ fn execute(
             observer(report, dir);
             continue;
         }
+        let preflight = &preflight[&(unit.link, unit.ip_version)];
         println!("{} · 第 {} 轮", unit.title(), unit.repeat);
         let row = run_unit(
             &UnitContext {
@@ -686,6 +777,7 @@ fn resumed_row(unit: &Unit) -> UnitRow {
         index: unit.index,
         link: unit.link_name.clone(),
         host: unit.host.clone(),
+        ip_version: unit.ip_version,
         protocol: unit.protocol,
         direction: unit.direction,
         streams: unit.streams,
@@ -883,7 +975,13 @@ fn run_legs(
                 .iter()
                 .zip(owners)
                 .map(|(leg, owner)| {
-                    let request = client_request(cfg, link, unit.protocol, leg.flow, leg.port);
+                    let request = client_request_for_addresses(
+                        cfg,
+                        &preflight.addresses,
+                        unit.protocol,
+                        leg.flow,
+                        leg.port,
+                    );
                     let remote = remote.clone();
                     scope.spawn(move || {
                         let out = if leg.flow.receiver_is_board() {
@@ -1301,6 +1399,7 @@ fn assemble_unit(
         index: unit.index,
         link: unit.link_name.clone(),
         host: unit.host.clone(),
+        ip_version: unit.ip_version,
         protocol: unit.protocol,
         direction: unit.direction,
         streams: unit.streams,
@@ -1595,9 +1694,20 @@ fn udp_loss_diagnostics(
     out
 }
 
+#[cfg(test)]
 fn client_request(
     cfg: &InnerConfig,
     link: &Link,
+    protocol: Protocol,
+    flow: Flow,
+    port: u16,
+) -> IperfClientReq {
+    client_request_for_addresses(cfg, &TrafficAddresses::ipv4(link), protocol, flow, port)
+}
+
+fn client_request_for_addresses(
+    cfg: &InnerConfig,
+    addresses: &TrafficAddresses,
     protocol: Protocol,
     flow: Flow,
     port: u16,
@@ -1622,21 +1732,21 @@ fn client_request(
     }
     IperfClientReq {
         dst: if flow.receiver_is_board() {
-            link.gateway
+            &addresses.up_target
         } else {
-            link.local_ip
+            &addresses.down_target
         }
-        .to_string(),
+        .clone(),
         bind_ip: if flow.receiver_is_board() {
-            link.local_ip
+            &addresses.pc_bind
         } else {
-            link.gateway
+            &addresses.board_bind
         }
-        .to_string(),
+        .clone(),
         port,
         duration: cfg.duration_secs,
         udp: protocol.is_udp(),
-        v6: false,
+        v6: addresses.ip_version == 6,
         extra,
     }
 }

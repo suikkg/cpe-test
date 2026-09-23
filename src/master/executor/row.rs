@@ -55,19 +55,31 @@ impl RowIdentity<'_> {
     /// **永远不用主机名**：Arch 机自报 `UNKNOWN-PC`，拿它当键会把一整批不相干的
     /// 链路并成一组，而报表上看不出来是并错了。
     fn link_group(&self) -> String {
-        if !self.unit.link_group.trim().is_empty() {
-            return self.unit.link_group.trim().to_string();
-        }
-        let ifaces = (self.src.nic.name.trim(), self.dst.nic.name.trim());
-        if !ifaces.0.is_empty() && !ifaces.1.is_empty() {
-            return format!("{} ↔ {}", ifaces.0, ifaces.1);
-        }
-        let roles = (self.src.nic.role.trim(), self.dst.nic.role.trim());
-        if !roles.0.is_empty() && !roles.1.is_empty() {
-            return format!("{} ↔ {}", roles.0, roles.1);
-        }
-        String::new()
+        link_group_key(self.unit, Some((self.src, self.dst)))
     }
+}
+
+/// [`RowIdentity::link_group`] 的实现本体，也是**分组熔断**用的那把键。
+///
+/// 抽出来是因为熔断要在造 `Row` **之前**就知道这个单元属于哪条链路——
+/// 而「链路怎么分组」只能有一份定义：报表按 A 分组、熔断按 B 分组的话，
+/// 报告上会出现「这一组全被放弃了」而那一组里明明还有跑过的单元。
+pub(super) fn link_group_key(unit: &Unit, endpoints: Option<(&Endpoint, &Endpoint)>) -> String {
+    if !unit.link_group.trim().is_empty() {
+        return unit.link_group.trim().to_string();
+    }
+    let Some((src, dst)) = endpoints.or_else(|| unit_endpoints(unit)) else {
+        return String::new();
+    };
+    let ifaces = (src.nic.name.trim(), dst.nic.name.trim());
+    if !ifaces.0.is_empty() && !ifaces.1.is_empty() {
+        return format!("{} ↔ {}", ifaces.0, ifaces.1);
+    }
+    let roles = (src.nic.role.trim(), dst.nic.role.trim());
+    if !roles.0.is_empty() && !roles.1.is_empty() {
+        return format!("{} ↔ {}", roles.0, roles.1);
+    }
+    String::new()
 }
 
 pub(super) fn row_side(side: Side) -> RowSide {
@@ -95,7 +107,13 @@ pub(super) fn base_row(id: RowIdentity<'_>) -> Row {
         dst_pc: id.dst.pc.clone(),
         dst_iface: id.dst.nic.name.clone(),
         dst_ip: id.dst.nic.ipv4.clone(),
+        // 无线上下文在这里取，而不是在 10 个构造点各抄一遍：`Endpoint` 本来
+        // 就带着完整的 `NicInfo`，源头只有一处，抄第二遍只会让某一处漂掉。
+        src_wifi: id.src.nic.wifi_context(),
+        dst_wifi: id.dst.nic.wifi_context(),
         kind_label: id.kind_label,
+        // 轮次从 `Unit` 直接取，不在 10 个构造点各抄一遍——和 `src_wifi` 同一个道理。
+        round: id.unit.round,
         unit_seq: id.unit_seq,
         direction: RowDirection::from_leg_tag(id.leg_tag),
         protocol: id.protocol,

@@ -406,7 +406,7 @@ pub(super) const MASTER_CONFIG_KEYS: [&str; 4] = ["link_profiles", "iperf", "cts
 /// UDP 裁剪开关——前三个由 `RunRequest` 单独携带，是界面上的控件）、
 /// 以及命令行的测试矩阵（控制台用自己的 `ui_plan`）。
 #[cfg(test)]
-pub(super) const MASTER_CONFIG_LOCAL_KEYS: [&str; 11] = [
+pub(super) const MASTER_CONFIG_LOCAL_KEYS: [&str; 13] = [
     "agent_host",
     "agent_port",
     "agent_token",
@@ -418,6 +418,12 @@ pub(super) const MASTER_CONFIG_LOCAL_KEYS: [&str; 11] = [
     "resume",
     "open_report",
     "abort_after_dead_traffic_units",
+    // 「这台机器上留几份历史」是磁盘管理，不是测试参数。跟着项目走的话，
+    // 别人导入这份项目会连带把自己的历史目录删掉——而项目文件里看不出来。
+    "keep_runs",
+    // 「这一轮跑几遍」和 `resume` / `screenshot` 是同一类：一次运行的选择，
+    // 由界面每次现给，不是跟着项目走的判定参数。
+    "rounds",
 ];
 
 /// 命令行专用的测试矩阵；控制台有自己的 `ui_plan`，两者不共存。
@@ -544,11 +550,16 @@ pub(super) fn config_from_request(state: &UiState, req: &RunRequest) -> Result<C
     cfg.screenshot = req.screenshot;
     cfg.limit_udp_by_link_speed = req.limit_udp_by_link_speed;
     cfg.resume = req.resume;
+    cfg.rounds = req.rounds.clamp(1, builder::MAX_ROUNDS);
     cfg.iperf.duration = req.duration.clamp(1, 86_400);
     cfg.pairs = None;
     cfg.universal_params = None;
     cfg.link_profiles.by_nic.clear();
     apply_master_config(&mut cfg, req)?;
+    // 探针开关走界面这一路：项目文件里 `master_config.ping` 带来的值先落位，
+    // 界面上的勾选**在它之后**覆盖——屏幕上写的就是这一轮真会跑的。
+    cfg.ping.probe_during_traffic = req.probe_during_traffic;
+    cfg.ping.probe_path_mtu = req.probe_path_mtu;
     apply_ping_policy_overrides(&mut cfg.ping, req);
 
     let windows = non_empty(&req.tcp_windows, &cfg.iperf.tcp_windows);
@@ -635,6 +646,11 @@ pub(super) fn config_from_request(state: &UiState, req: &RunRequest) -> Result<C
             specs
         })
         .collect();
+    // `pairs` 这条路同样要盖强制档位。漏掉的后果是安静的：请求里带着
+    // `force_udp_bandwidth: "500m"`，`request.json` 也如实记了 500m，实际跑的
+    // 却是套件自己的档位——「重新执行这一轮」和归档下来的计划对不上，
+    // 而两处都不会报错。
+    apply_force_overrides(&mut cfg, req);
     Ok(cfg)
 }
 
@@ -643,6 +659,10 @@ pub(super) fn ui_request_base_config(state: &UiState, req: &RunRequest) -> Resul
     cfg.screenshot = req.screenshot;
     cfg.limit_udp_by_link_speed = req.limit_udp_by_link_speed;
     cfg.resume = req.resume;
+    // 两条 config 组装路径都要带上轮次：只在一条里加，`/api/plan` 预览出 N 轮
+    // 而 `/api/run` 只跑一轮（或者反过来），而 plan_hash 闸门恰好放行——
+    // 因为两边看到的是同一个 `RunRequest`。
+    cfg.rounds = req.rounds.clamp(1, builder::MAX_ROUNDS);
     cfg.iperf.duration = req.duration.clamp(1, 86_400);
     cfg.pairs = None;
     cfg.universal_params = None;
@@ -679,6 +699,9 @@ pub(super) fn ui_request_base_config(state: &UiState, req: &RunRequest) -> Resul
             cfg.link_profiles.by_nic.push(profile);
         }
     }
+    // **这里不盖强制档位**：本函数只产出「还没有任何测试的基线」，`cfg.tests`
+    // 此刻是空的，盖上去一条也改不到。真正的覆盖点在 `config_from_ui_plan`
+    // 装配完全部 `TestSpec` 之后——理由见 `apply_force_overrides` 的文档。
     Ok(cfg)
 }
 
@@ -1325,7 +1348,72 @@ pub(super) fn config_from_ui_plan(
         }
     }
     cfg.tests = tests;
+    apply_force_overrides(&mut cfg, req);
     Ok(cfg)
+}
+
+/// 只给测试用的转发口（本函数是私有的）。
+#[cfg(test)]
+pub(super) fn apply_force_overrides_for_test(cfg: &mut Config, req: &RunRequest) {
+    apply_force_overrides(cfg, req);
+}
+
+/// 「仅本轮覆盖」：把这一轮的强制档位盖到**每一条**测试上。
+///
+/// # 为什么需要
+///
+/// 「就这一轮，把带宽压一档试试」是复现问题时最高频的动作，而在此之前它要
+/// 下钻三层（计划 → 编辑流量配置 → 找到那条配置 → 改），而且改完就写回套件了——
+/// 下次跑还是那个值。
+///
+/// # 为什么盖在这里
+///
+/// 必须在**每条 `TestSpec` 都装配完之后**：套件里的任务配置（`spec.udp_profiles`
+/// / `spec.tcp_windows`）本身就是覆盖项，全局默认值只是它们的兜底。要「强制」
+/// 就得排在它们后面，否则配了配置的那些任务根本不受影响——而那正是要覆盖的对象。
+///
+/// # 三条纪律
+///
+/// 1. **空值 = 不覆盖**，不是「覆盖成空」。留空是最常见的状态。
+/// 2. 覆盖值**进 `request.json`**（它就在 `RunRequest` 里）：不然「重新执行这一轮」
+///    跑出来的和这一轮不是同一件事，而那正是那个按钮存在的理由。
+/// 3. 它照样走 `/api/plan` → `plan_hash` → `/api/run` 那道闸门：预览里逐单元
+///    显示的就是覆盖后的参数，「界面上确认的东西 == 实际跑的东西」不破。
+fn apply_force_overrides(cfg: &mut Config, req: &RunRequest) {
+    let window = req.force_tcp_window.trim();
+    let bandwidth = req.force_udp_bandwidth.trim();
+    if window.is_empty() && bandwidth.is_empty() {
+        return;
+    }
+    for test in &mut cfg.tests {
+        if !window.is_empty() {
+            test.tcp_windows = Some(vec![window.to_string()]);
+        }
+        if !bandwidth.is_empty() {
+            // 只换 `-b`，**保留原档位的 `-l` / `-w`**：压带宽试一把的时候，
+            // 报文长度和 socket buffer 换掉的话，测的就不是同一件事了。
+            let base = test
+                .udp_profiles
+                .clone()
+                .unwrap_or_else(|| cfg.iperf.udp_profiles.clone());
+            test.udp_profiles = Some(if base.is_empty() {
+                vec![crate::config::UdpProfile::bw(bandwidth)]
+            } else {
+                base.into_iter()
+                    .map(|mut profile| {
+                        profile.bandwidth = bandwidth.to_string();
+                        profile
+                    })
+                    // 换完 `-b` 之后多个档位可能塌成同一个，去重免得白跑。
+                    .fold(Vec::new(), |mut acc, profile| {
+                        if !acc.contains(&profile) {
+                            acc.push(profile);
+                        }
+                        acc
+                    })
+            });
+        }
+    }
 }
 
 pub(super) fn selected_udp_groups(pair: &PairSelection) -> Vec<usize> {
@@ -1858,6 +1946,30 @@ pub(super) fn unit_direction_for_spec(
     }
 }
 
+impl CompiledPlan {
+    /// 预览和启动共用同一组阻断规则，避免先允许确认、到开始时才报错。
+    /// 套件计划不允许悄悄缺项；旧矩阵仍可执行剩余的有效单元。
+    pub(super) fn blocking_errors(&self, suite_plan: bool) -> Vec<String> {
+        let mut errors = self.spec_errors.clone();
+        if suite_plan {
+            for notice in &self.notices {
+                if notice.trim_start().starts_with("跳过 ") && !errors.contains(notice) {
+                    errors.push(notice.clone());
+                }
+            }
+        }
+        if self.units.is_empty() {
+            let detail = if errors.is_empty() && !self.notices.is_empty() {
+                format!("：{}", self.notices.join("；"))
+            } else {
+                String::new()
+            };
+            errors.push(format!("所选配置最终没有生成任何测试单元{detail}"));
+        }
+        errors
+    }
+}
+
 pub(super) fn compile_request(state: &UiState, req: &RunRequest) -> Result<CompiledPlan, String> {
     validate_request(state, req)?;
     let cfg = config_from_request(state, req)?;
@@ -1867,75 +1979,52 @@ pub(super) fn compile_request(state: &UiState, req: &RunRequest) -> Result<Compi
     }
     let mut notices = Vec::new();
     let mut spec_errors = Vec::new();
-    let mut units = Vec::new();
-    let mut sources: Vec<Option<UiSource>> = Vec::new();
-    let mut source_directions: Vec<Option<String>> = Vec::new();
+    let mut specs = Vec::new();
+    let mut spec_sources = Vec::new();
     let mut port = builder::PORT_BASE;
-
-    if req.ui_plan.is_some() {
-        for test in &cfg.tests {
-            match builder::spec_from_config(test, &cfg, &state.master, &state.agent) {
-                Ok(spec) => {
-                    let (mut built, build_notices) = build_units(
-                        std::slice::from_ref(&spec),
-                        cfg.require_same_subnet_for_iperf,
-                        &mut port,
-                    );
-                    notices.extend(build_notices);
-                    let source = ui_source_from_spec(test);
-                    for unit in &built {
-                        sources.push(source.clone());
-                        source_directions.push(unit_direction_for_spec(unit, &spec));
-                    }
-                    units.append(&mut built);
-                }
-                Err(error) => {
-                    spec_errors.push(format!("{} 无法生成任务：{error}", test.name));
-                    notices.push(format!("跳过 {}: {error}", test.name));
-                }
+    for test in &cfg.tests {
+        match builder::spec_from_config(test, &cfg, &state.master, &state.agent) {
+            Ok(spec) => {
+                specs.push(spec);
+                spec_sources.push(ui_source_from_spec(test));
+            }
+            Err(error) => {
+                spec_errors.push(format!("{} 无法生成任务：{error}", test.name));
+                notices.push(format!("跳过 {}: {error}", test.name));
             }
         }
+    }
+    let (units, sources, source_directions) = if req.ui_plan.is_some() {
+        let built = builder::build_ui_units_repeated(
+            &specs,
+            cfg.require_same_subnet_for_iperf,
+            &mut port,
+            cfg.rounds,
+        );
+        let sources: Vec<_> = built
+            .spec_indices
+            .iter()
+            .map(|index| spec_sources[*index].clone())
+            .collect();
+        let directions: Vec<_> = built
+            .units
+            .iter()
+            .zip(&built.spec_indices)
+            .map(|(unit, index)| unit_direction_for_spec(unit, &specs[*index]))
+            .collect();
+        notices.extend(built.notices);
+        (built.units, sources, directions)
     } else {
-        let mut specs = Vec::new();
-        for test in &cfg.tests {
-            match builder::spec_from_config(test, &cfg, &state.master, &state.agent) {
-                Ok(spec) => specs.push(spec),
-                Err(error) => {
-                    spec_errors.push(format!("{} 无法生成任务：{error}", test.name));
-                    notices.push(format!("跳过 {}: {error}", test.name));
-                }
-            }
-        }
-        let (built, build_notices) =
-            build_units(&specs, cfg.require_same_subnet_for_iperf, &mut port);
+        let (units, build_notices) = builder::build_units_repeated(
+            &specs,
+            cfg.require_same_subnet_for_iperf,
+            &mut port,
+            cfg.rounds,
+        );
         notices.extend(build_notices);
-        units = built;
-        sources.resize(units.len(), None);
-        source_directions.resize(units.len(), None);
-    }
-
-    if req.ui_plan.is_some() {
-        let mut seen_ids = HashSet::new();
-        let mut unique_units = Vec::with_capacity(units.len());
-        let mut unique_sources = Vec::with_capacity(sources.len());
-        let mut unique_directions = Vec::with_capacity(source_directions.len());
-        for (index, unit) in units.into_iter().enumerate() {
-            if seen_ids.insert(unit.id.clone()) {
-                unique_units.push(unit);
-                unique_sources.push(sources.get(index).cloned().flatten());
-                unique_directions.push(source_directions.get(index).cloned().flatten());
-            }
-        }
-        let removed_count = sources.len().saturating_sub(unique_units.len());
-        if removed_count > 0 {
-            notices.push(format!(
-                "计划去重：移除了 {removed_count} 个最终参数完全相同的重复单元"
-            ));
-        }
-        units = unique_units;
-        sources = unique_sources;
-        source_directions = unique_directions;
-    }
+        let count = units.len();
+        (units, vec![None; count], vec![None; count])
+    };
 
     let resumed = if cfg.resume {
         let db = ResultDb::load(std::path::PathBuf::from("task_results.json"));
@@ -1950,7 +2039,7 @@ pub(super) fn compile_request(state: &UiState, req: &RunRequest) -> Result<Compi
     let execution_plan = ExecutionPlan::new(
         &cfg,
         topology_fingerprint.clone(),
-        canonical_plan_units(&cfg, state),
+        units.clone(),
         Vec::new(),
     );
     let plan_hash = execution_plan.plan_hash.clone();
@@ -2078,6 +2167,7 @@ pub(super) fn ensure_config_builds_units(cfg: &Config, state: &UiState) -> Resul
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn canonical_plan_units(cfg: &Config, state: &UiState) -> Vec<builder::Unit> {
     let mut specs = Vec::new();
     for test in &cfg.tests {
@@ -2086,5 +2176,25 @@ pub(super) fn canonical_plan_units(cfg: &Config, state: &UiState) -> Vec<builder
         }
     }
     let mut port = builder::PORT_BASE;
-    build_units(&specs, cfg.require_same_subnet_for_iperf, &mut port).0
+    if cfg
+        .tests
+        .iter()
+        .any(|test| ui_source_from_spec(test).is_some())
+    {
+        builder::build_ui_units_repeated(
+            &specs,
+            cfg.require_same_subnet_for_iperf,
+            &mut port,
+            cfg.rounds,
+        )
+        .units
+    } else {
+        builder::build_units_repeated(
+            &specs,
+            cfg.require_same_subnet_for_iperf,
+            &mut port,
+            cfg.rounds,
+        )
+        .0
+    }
 }

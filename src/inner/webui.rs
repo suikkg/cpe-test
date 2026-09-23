@@ -46,6 +46,7 @@ fn unit_json(unit: &UnitRow) -> Value {
         "index": unit.index,
         "link": unit.link,
         "host": unit.host,
+        "ip_version": unit.ip_version,
         "protocol": unit.protocol,
         "direction": unit.direction,
         "streams": unit.streams,

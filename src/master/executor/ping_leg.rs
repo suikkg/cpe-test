@@ -127,6 +127,9 @@ impl Ctx {
             count: t.count,
             payload: t.payload,
             v6: t.v6,
+            // 常规 ping 不带 DF：它测的是连通性和时延，分片与否不是结论。
+            // 路径 MTU 探测走 `run_path_mtu_leg`，那条路自己带。
+            dont_fragment: false,
         };
         let gateway_missing =
             t.purpose == PingPurpose::GatewayDiagnostic && dst_addr.trim().is_empty();
@@ -317,6 +320,26 @@ impl Ctx {
             PingPurpose::SubnetDiagnostic => "故障诊断-子网PING".into(),
             PingPurpose::GatewayDiagnostic => "故障诊断-网卡到网关PING".into(),
         };
+        // 路径 MTU 探测挂在常规 ping 之后：它自己要发十几轮小包，和上面那次
+        // ping 抢不到什么。只在开关打开、且这一腿真的跑起来了的时候做——
+        // 一条压根不通的链路上再二分一遍毫无意义。
+        let path_mtu_note: Option<String> = (self.cfg.ping.probe_path_mtu
+            && !gateway_missing
+            && exec_kind.is_none()
+            && out.received > 0)
+            .then(|| {
+                match self.probe_path_mtu(&t.src, &t.dst, t.v6, self.agent_ping_df) {
+                    Ok(found) => format!(
+                        "路径 MTU {} 字节（DF 位实测最大载荷 {}，{} 轮二分）。\
+                         **只作诊断**：要不要按它判合格由验收标准决定。",
+                        found.mtu, found.payload, found.steps
+                    ),
+                    // 探测失败也要说出来：静默跳过的话，打开了开关却看不到结果，
+                    // 分不清是「没测」还是「测了但这条链路正常」。
+                    Err(error) => format!("路径 MTU 探测未完成：{error}"),
+                }
+            });
+
         let raw_text = if out.cmd.is_empty() {
             out.raw.clone()
         } else {
@@ -341,6 +364,22 @@ impl Ctx {
             ping_max: (!gateway_missing && exec_kind.is_none())
                 .then_some(out.rtt_max)
                 .flatten(),
+            // 两条诊断都走**诊断**通道，一条都不改判定（ADR-17）：
+            //
+            // - 分辨率警告说的是「这个读数能不能当时延用」。不说的话，
+            //   报告上那个 `0.000 ms` 会被当成实测结果读。
+            // - 路径 MTU 说的是「这条链路真正能过多大的包」。要不要拿 1492
+            //   当不合格是业务判断，不是这个工具该替人下的结论。
+            diagnostics: {
+                let mut notes: Vec<String> = Vec::new();
+                if !gateway_missing && exec_kind.is_none() {
+                    if let Some(note) = crate::ping::resolution_caveat(&out) {
+                        notes.push(note.to_string());
+                    }
+                }
+                notes.extend(path_mtu_note);
+                notes
+            },
             command: out.cmd.clone(),
             raws: vec![(format!("ping{} 输出", fmt_tag(tag)), raw_text)],
             ..base_row(RowIdentity {

@@ -63,6 +63,70 @@ fn typed_tcp_names_cannot_move_the_unit_into_ping_or_udp() {
         assert!(!group_is_udp(&groups[0]));
     }
 }
+
+#[test]
+fn renamed_direction_labels_keep_both_typed_directions_and_the_rx_sum() {
+    let mut ab = traffic_detail("typed-directions", (0, 0, 0, 0));
+    ab.kind_label = "灌包 A→B".into();
+    ab.direction = RowDirection::Ab;
+    ab.rx_avg = Some(900.0);
+    let mut ba = ab.clone();
+    ba.sort_key = (0, 1, 0, 0);
+    ba.kind_label = "灌包 B→A".into();
+    ba.direction = RowDirection::Ba;
+    ba.rx_avg = Some(100.0);
+    ba.verdict = Verdict::RateFail;
+    let rows = vec![ba, ab];
+    let groups = group_rows(&rows);
+    let directions = group_direction_summaries(&groups[0]);
+    assert_eq!(directions.len(), 2);
+    assert_eq!(directions[0].tag, "AB");
+    assert_eq!(directions[1].tag, "BA");
+    assert_eq!(bidirectional_rx_average_sum(&groups[0]), Some(1000.0));
+    let html = render(rows);
+    assert!(html.contains("data-direction=\"AB\""));
+    assert!(html.contains("data-direction=\"BA\""));
+    assert!(html.contains("<td>AB</td><td><strong>灌包 A→B</strong>"));
+    assert!(html.contains("<td>BA</td><td><strong>灌包 B→A</strong>"));
+}
+
+#[test]
+fn replay_backfills_missing_tx_and_retransmits_without_overwriting_archived_values() {
+    let mut detail = traffic_detail("old-summary", (0, 0, 0, 0));
+    detail.direction = RowDirection::Ab;
+    detail.tx_avg = Some(940.0);
+    detail.tcp_retransmits = Some(7);
+    let mut summary = unit_summary("old-summary", Verdict::Pass);
+    summary.direction_summaries = vec![DirectionSummary {
+        tag: "AB".into(),
+        rx_avg: Some(901.0),
+        ..Default::default()
+    }];
+    let rows = vec![detail, summary];
+    let groups = group_rows(&rows);
+    let directions = group_direction_summaries(&groups[0]);
+    assert_eq!(directions[0].tx_avg, Some(940.0));
+    assert_eq!(directions[0].tcp_retransmits, Some(7));
+    assert_eq!(directions[0].rx_avg, Some(901.0));
+}
+
+#[test]
+fn legacy_rows_without_unit_seq_remain_separate_and_in_execution_order() {
+    let rows = vec![
+        Row {
+            sort_key: (36, 0, 0, 0),
+            ..Default::default()
+        },
+        Row {
+            sort_key: (1, 0, 0, 0),
+            ..Default::default()
+        },
+    ];
+    let groups = group_rows(&rows);
+    assert_eq!(groups.len(), 2);
+    assert_eq!(group_seq(&groups[0]), 2);
+    assert_eq!(group_seq(&groups[1]), 37);
+}
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static REPORT_INDEX: AtomicUsize = AtomicUsize::new(0);
@@ -1628,4 +1692,225 @@ fn typed_structure_wins_over_display_strings_and_legacy_rows_still_fall_back() {
     plain.is_unit_summary = false;
     plain.kind_label = "灌包".into();
     assert_eq!(direction_tag(&plain), "单向");
+}
+
+/// 「质量」列此前对 TCP 恒为 `—`：UDP 有丢包、ping 有 RTT，TCP 那一格什么都不说。
+///
+/// 重传填的就是这一格。`Some(0)` **必须照样显示**——它证明链路是干净的、
+/// 没跑满得去查窗口而不是查丢包；过滤掉 0 会让这一格重新变回一个哑格子。
+#[test]
+fn the_quality_column_reports_tcp_retransmits_where_it_used_to_say_nothing() {
+    let mut detail = traffic_detail("retr-unit", (0, 0, 0, 0));
+    detail.tcp_retransmits = Some(221);
+    let html = render(vec![detail, unit_summary("retr-unit", Verdict::Pass)]);
+    assert!(
+        html.contains("TCP 重传 221 次"),
+        "TCP 行的质量列应当报出重传次数"
+    );
+
+    let mut clean = traffic_detail("retr-clean", (1, 0, 0, 0));
+    clean.tcp_retransmits = Some(0);
+    let html = render(vec![clean, unit_summary("retr-clean", Verdict::Pass)]);
+    assert!(
+        html.contains("TCP 重传 0 次"),
+        "零重传是有信息量的结论，不能被当成「没测到」滤掉"
+    );
+}
+
+/// UDP 已经有丢包了，不能再被重传盖掉——同一格只说一件事。
+#[test]
+fn udp_loss_keeps_the_quality_column_when_a_retransmit_count_is_also_present() {
+    let mut detail = traffic_detail("retr-udp", (0, 0, 0, 0));
+    detail.udp_loss = Some(0.125);
+    detail.tcp_retransmits = Some(9);
+    let html = render(vec![detail, unit_summary("retr-udp", Verdict::Pass)]);
+    assert!(html.contains("UDP 丢包 0.125%"));
+    assert!(!html.contains("TCP 重传"));
+}
+
+/// Wi-Fi 的吞吐数离开无线上下文就不可复现：同一块网卡同一个档位，今天
+/// 1400Mbps、下周 900Mbps，只有频段的话看不出是换了信道还是信号弱了。
+///
+/// 有线口必须**一个字都不多**：一个空的 `[]` 会让人以为该有东西而没读到。
+#[test]
+fn wifi_endpoints_carry_their_radio_context_and_wired_ones_stay_clean() {
+    let mut detail = traffic_detail("wifi-unit", (0, 0, 0, 0));
+    detail.src_wifi = "CPE_TEST_5G · 信道 149 · 信号 99% · 802.11ax".into();
+    let html = render(vec![detail, unit_summary("wifi-unit", Verdict::Pass)]);
+    assert!(
+        html.contains("信道 149") && html.contains("信号 99%"),
+        "Wi-Fi 端点应当在报告里带上信道与信号"
+    );
+
+    let wired = traffic_detail("wired-unit", (0, 0, 0, 0));
+    let html = render(vec![wired, unit_summary("wired-unit", Verdict::Pass)]);
+    assert!(!html.contains("[]"), "有线端点不该出现空的无线上下文方括号");
+}
+
+/// 通过率的分母只有 PASS + RATE_FAIL。
+///
+/// MEASURED 是「没有验收目标可比」、NOT_EVALUATED 是「采样不可信不能下结论」，
+/// 把它们算进分母等于把「没测」记成「没过」——报告顶部、`meta.json` 和历史
+/// 列表三处都读这一个算式，错一次就是三处一起错。
+#[test]
+fn the_pass_rate_denominator_counts_only_the_units_that_got_a_verdict() {
+    let totals = crate::report::VerdictTotals {
+        total: 10,
+        pass: 3,
+        rate_fail: 1,
+        measured: 4,
+        not_evaluated: 2,
+        setup_error: 0,
+        skipped: 5,
+    };
+    assert!((totals.pass_rate_pct() - 75.0).abs() < 1e-9);
+
+    // 一条都没下过结论时是 0%，而不是除零。
+    let none_judged = crate::report::VerdictTotals {
+        total: 3,
+        measured: 3,
+        ..Default::default()
+    };
+    assert_eq!(none_judged.pass_rate_pct(), 0.0);
+}
+
+/// 统计按**单元**聚合，且 SKIP 不进总数——和报告顶部那八个格子同源。
+#[test]
+fn verdict_totals_aggregate_by_unit_and_keep_skips_out_of_the_total() {
+    let rows = vec![
+        traffic_detail("u1", (0, 0, 0, 0)),
+        unit_summary("u1", Verdict::Pass),
+        traffic_detail("u2", (1, 0, 0, 0)),
+        unit_summary("u2", Verdict::RateFail),
+        unit_summary("u3", Verdict::Skip),
+    ];
+    let totals = crate::report::verdict_totals(&rows);
+    assert_eq!(totals.pass, 1);
+    assert_eq!(totals.rate_fail, 1);
+    assert_eq!(totals.skipped, 1);
+    // 三个单元，SKIP 那个不进总数。两条明细行不额外计数。
+    assert_eq!(totals.total, 2);
+}
+
+/// 端到端：run 目录里有逐样本 CSV 时，报告必须把曲线画出来。
+///
+/// 在此之前报告只给一个 CSV 下载链接——要回答「这一条是不是中途掉过速」，
+/// 读报告的人得下载、开 Excel、自己画。而 ADR-17 举的那个例子（全程平均
+/// 2200、中间断了一分钟）正是这张图存在的理由。
+#[test]
+fn the_report_draws_the_rx_curve_from_the_sample_csv_next_to_it() {
+    let dir = std::env::temp_dir().join(format!(
+        "cpe_chart_report_{}_{}",
+        std::process::id(),
+        REPORT_INDEX.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(dir.join("raw")).unwrap();
+    let mut csv = String::from("elapsed_ms,rx_mbps,valid\n");
+    for i in 0..120u64 {
+        // 中间 20 秒整段掉到 0：这就是那条报告上必须一眼看得见的塌陷。
+        let mbps = if (50..70).contains(&i) { 0.0 } else { 2200.0 };
+        csv.push_str(&format!("{},{:.6},true\n", i * 1000, mbps));
+    }
+    std::fs::write(dir.join("raw/rx.csv"), &csv).unwrap();
+
+    let mut detail = traffic_detail("chart-unit", (0, 0, 0, 0));
+    detail.nic_samples_rx = "raw/rx.csv".into();
+    detail.target_mbps = Some(1800.0);
+    detail.window_start_ms = Some(5_000);
+    detail.window_end_ms = Some(115_000);
+    let mut rows = vec![detail, unit_summary("chart-unit", Verdict::Pass)];
+
+    let path = dir.join("report.html");
+    write_report(&path, &mut rows, &ReportMeta::default()).unwrap();
+    let html = std::fs::read_to_string(&path).unwrap();
+
+    assert!(
+        html.contains("<svg class=\"rate-chart"),
+        "报告里应当有速率曲线"
+    );
+    assert!(html.contains("class=\"win\""), "判定窗口要画成阴影带");
+    assert!(html.contains("门限 1800"), "门限线要标出来");
+    // 单文件离线：曲线不许引入任何外部资源。
+    assert!(!html.contains("cdn."), "报告不许连 CDN");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 没有 CSV 时**不画、不报错、不留占位**。
+///
+/// 这是正常路径而不是异常：ping 单元没有网卡采样，重放旧目录时 CSV 可能已经
+/// 被清掉，跨平台自测时采样也可能整段失败。
+#[test]
+fn a_report_without_sample_files_simply_has_no_curve() {
+    let detail = traffic_detail("nochart-unit", (0, 0, 0, 0));
+    let html = render(vec![detail, unit_summary("nochart-unit", Verdict::Pass)]);
+    assert!(!html.contains("<svg class=\"rate-chart"));
+    assert!(!html.contains("RX 曲线"), "整列画不出来时不该渲染这一列");
+}
+
+/// 负载下时延进诊断面板，且「没开探针」和「探了但全丢」必须分得开。
+///
+/// 这两件事在屏幕上长得都像「没有数」，而下一步完全相反：前者去打开开关，
+/// 后者去查设备——灌包期间 ICMP 完全不通是一个结论。
+#[test]
+fn the_diagnostics_panel_separates_an_unmeasured_probe_from_a_dead_one() {
+    let mut off = traffic_detail("probe-off", (0, 0, 0, 0));
+    off.load_latency = String::new();
+    let html = render(vec![off, unit_summary("probe-off", Verdict::Pass)]);
+    assert!(html.contains("灌包期间往返时延"));
+    assert!(
+        html.contains("未开启"),
+        "没开探针要说「未开启」，不能只留一个空格子"
+    );
+
+    let mut dead = traffic_detail("probe-dead", (0, 0, 0, 0));
+    dead.load_latency = "灌包期间 180 次探测全部超时（100% 丢失）".into();
+    let html = render(vec![dead, unit_summary("probe-dead", Verdict::Pass)]);
+    assert!(html.contains("全部超时"));
+    assert!(!html.contains("未开启"));
+}
+
+/// 负载下时延**不改写判定**（ADR-17）。
+///
+/// 一条 RX 达标、但灌包期间时延飙到 900ms 的链路，判定仍然是 PASS——
+/// 那正是这套判定一直在守的东西：验收层只吃接收端 RX 平均和门限。
+#[test]
+fn a_terrible_loaded_latency_never_turns_a_passing_unit_into_a_failure() {
+    let mut detail = traffic_detail("bloat-unit", (0, 0, 0, 0));
+    detail.rx_avg = Some(2200.0);
+    detail.target_mbps = Some(1800.0);
+    detail.load_latency = "平均 8.4 ms · 最大 912.0 ms · 丢失 2.2%（176/180）".into();
+    let html = render(vec![detail, unit_summary("bloat-unit", Verdict::Pass)]);
+    assert!(
+        html.contains("最大 912.0 ms"),
+        "难看的时延必须照样出现在报告里"
+    );
+    assert!(html.contains("PASS"), "但它不改写判定");
+}
+
+/// **重放旧 run 目录时，概览的曲线列不许整列消失。**
+///
+/// 升级前落盘的 `direction_summaries` 里没有 `nic_samples_rx`，读回来是空串；
+/// 而那些目录里逐样本 CSV 明明还在。截图路径早就有这条回填，新字段漏了同一条
+/// 就会静默地少一整列——真机重放时当场撞上的。
+#[test]
+fn a_replayed_summary_backfills_the_sample_path_from_its_detail_rows() {
+    let mut detail = traffic_detail("legacy-unit", (0, 0, 0, 0));
+    detail.nic_samples_rx = "raw/rx.csv".into();
+    let mut summary = unit_summary("legacy-unit", Verdict::Pass);
+    // 旧数据的形状：有 direction_summaries，但里面没有这个字段。
+    // tag 必须和明细行推出来的方向对得上，回填就是按它配对的。
+    summary.direction_summaries = vec![DirectionSummary {
+        tag: "AB".into(),
+        verdict: Verdict::Pass,
+        rx_avg: Some(2200.0),
+        ..Default::default()
+    }];
+    let merged = crate::report::model::group_direction_summaries(
+        &crate::report::model::group_rows(&[detail, summary])[0],
+    );
+    assert_eq!(
+        merged[0].nic_samples_rx, "raw/rx.csv",
+        "逐样本路径要从明细行回填，否则旧目录重放不出概览曲线"
+    );
 }

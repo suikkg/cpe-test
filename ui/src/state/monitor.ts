@@ -1,4 +1,4 @@
-import { reactive } from 'vue';
+import { reactive, watch } from 'vue';
 import { api, errorMessage, UnauthorizedError } from '../api/client';
 import { session } from './session';
 import type { MonitorPoint, MonitorSeriesOut } from '../api/dto';
@@ -16,6 +16,8 @@ export interface MonitorSession {
   session: string;
   side: MonitorSide;
   iface: string;
+  /** 启动时确认的主机身份；切换辅测机后旧曲线不能冒充新机器。 */
+  host: string;
   points: MonitorPoint[];
   /** 服务端游标：下一拍从这里取 */
   from: number;
@@ -29,19 +31,39 @@ export const monitor = reactive({
   sessions: [] as MonitorSession[],
   starting: false,
   error: '',
+  notice: '',
   refreshError: '',
   polling: false,
 });
 
 export function reset(): void {
+  generation += 1;
   stopPolling();
   monitor.sessions = [];
   monitor.starting = false;
   monitor.error = '';
+  monitor.notice = '';
   monitor.refreshError = '';
 }
 
 let timer: ReturnType<typeof setTimeout> | undefined;
+let generation = 0;
+let agentGeneration = 0;
+
+function agentIdentity(): string {
+  return session.connectedHost ? `${session.connectedHost}:${session.connectedPort}` : '';
+}
+
+watch(agentIdentity, () => {
+  agentGeneration += 1;
+  const previous = monitor.sessions.filter((item) => item.side === 'agent');
+  if (!previous.length) return;
+  // 本机监控可以继续；旧辅测会话要按自己的 session ID 回收，不带新机器身份。
+  monitor.sessions = monitor.sessions.filter((item) => item.side !== 'agent');
+  monitor.notice = '辅测机连接已切换，已结束旧辅测机的监控显示；请为当前辅测机重新选择网卡。';
+  if (!monitor.sessions.length) stopPolling();
+  void Promise.allSettled(previous.map((item) => api.post('/api/monitor/stop', { session: item.session })));
+}, { flush: 'sync' });
 
 /** setTimeout 链，不是 setInterval——机器忙时请求不许堆叠。 */
 function schedule(): void {
@@ -110,36 +132,52 @@ export async function startSession(
   iface: string,
   intervalMs: number,
 ): Promise<boolean> {
-  if (!iface) return false;
+  if (!iface || monitor.starting) return false;
+  if (side === 'agent' && (session.phase !== 'connected' || session.topologyStale)) {
+    monitor.error = '请先成功连接辅测机，再开始监控。';
+    return false;
+  }
   if (isMonitored(monitor.sessions, side, iface)) {
     monitor.error = `${side === 'master' ? '主控' : '辅测'} ${iface} 已经在监控了`;
     return false;
   }
   monitor.starting = true;
   monitor.error = '';
+  const epoch = generation;
+  const agentEpoch = agentGeneration;
+  const host = side === 'agent' ? agentIdentity()
+    : session.connection?.master.hostname ?? session.local?.host.hostname ?? '主控本机';
   try {
     const out = await api.post<{ session: string }>('/api/monitor/start', {
       side,
       iface,
       interval_ms: intervalMs,
     });
+    if (epoch !== generation || (side === 'agent' && agentEpoch !== agentGeneration)) {
+      // 请求途中换机或停止全部时，迟到的启动应答不能重新挂回界面。
+      await api.post('/api/monitor/stop', { session: out.session }).catch(() => undefined);
+      return false;
+    }
     monitor.sessions.push({
       session: out.session,
       side,
       iface,
+      host,
       points: [],
       from: 0,
       running: true,
       error: '',
       intervalMs,
     });
+    monitor.notice = '';
     startPolling();
     return true;
   } catch (error) {
+    if (epoch !== generation || (side === 'agent' && agentEpoch !== agentGeneration)) return false;
     monitor.error = errorMessage(error);
     return false;
   } finally {
-    monitor.starting = false;
+    if (epoch === generation) monitor.starting = false;
   }
 }
 
@@ -179,8 +217,10 @@ export async function stopSession(session: string): Promise<void> {
 
 /** 全停。切换辅测机或退出时用——旧页是串行发的，8 路就是 8 个 RTT。 */
 export async function stopAll(): Promise<void> {
+  generation += 1;
+  monitor.starting = false;
   const ids = monitor.sessions.map((s) => s.session);
-  await Promise.allSettled(ids.map((id) => api.post('/api/monitor/stop', { session: id })));
   monitor.sessions = [];
   stopPolling();
+  await Promise.allSettled(ids.map((id) => api.post('/api/monitor/stop', { session: id })));
 }

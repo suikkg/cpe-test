@@ -217,14 +217,14 @@ pub(super) fn leg_effective_window(
     let Some(out) = monitors.get(&first.dst.key()) else {
         return empty;
     };
-    let Some(first_sample) = out.samples.iter().find(|sample| sample.valid) else {
-        return empty;
-    };
-    let Some(last_sample) = out.samples.iter().rev().find(|sample| sample.valid) else {
+    let mut samples: Vec<_> = out.samples.iter().filter(|sample| sample.valid).collect();
+    samples.sort_unstable_by_key(|sample| sample.elapsed_ms);
+    samples.dedup_by_key(|sample| sample.elapsed_ms);
+    let Some(first_sample) = samples.first() else {
         return empty;
     };
     let lower = first_sample.elapsed_ms;
-    let upper = last_sample.elapsed_ms;
+    let upper = samples.last().map_or(lower, |sample| sample.elapsed_ms);
     if upper <= lower {
         return empty;
     }
@@ -240,38 +240,56 @@ pub(super) fn leg_effective_window(
         first.rx_target_mbps,
         first.offered_per_stream_mbps,
     );
+    let active_intervals: Vec<_> = results
+        .iter()
+        .filter(|flow| flow.leg_pos == leg_pos)
+        .filter_map(flow_active_interval)
+        .collect();
     let eligible = |t: u64| -> bool {
-        let active = results
+        let active = active_intervals
             .iter()
-            .filter(|flow| flow.leg_pos == leg_pos)
-            .filter_map(flow_active_interval)
             .filter(|(start, end)| *start <= t && t < *end)
             .count();
-        active >= required && nearest_valid_sample(out, t, sample_tolerance_ms).is_some()
+        active >= required && nearest_valid_sample(&samples, t, sample_tolerance_ms).is_some()
     };
 
+    // 活跃流数只在起流/停流边界变化，采样可用性只在距样本超过容差时变化。
+    // 按这些真实毫秒边界切段，不能用一秒网格把提前结束的 9.8 秒补成 10 秒，
+    // 也不能在 monitor 已停止后再凭空补一个采样周期。
+    let mut boundaries = vec![lower, upper];
+    for (start, end) in &active_intervals {
+        boundaries.push((*start).clamp(lower, upper));
+        boundaries.push((*end).clamp(lower, upper));
+    }
+    for sample in &samples {
+        boundaries.push(
+            sample
+                .elapsed_ms
+                .saturating_sub(sample_tolerance_ms)
+                .clamp(lower, upper),
+        );
+        boundaries.push(
+            sample
+                .elapsed_ms
+                .saturating_add(sample_tolerance_ms)
+                .clamp(lower, upper),
+        );
+    }
+    boundaries.sort_unstable();
+    boundaries.dedup();
     let mut best_start = 0u64;
     let mut best_end = 0u64;
     let mut current_start: Option<u64> = None;
-    let mut t = lower;
-    while t <= upper {
-        if eligible(t) {
-            if current_start.is_none() {
-                current_start = Some(t);
+    for bounds in boundaries.windows(2) {
+        let (start, end) = (bounds[0], bounds[1]);
+        if eligible(midpoint_ms(start, end)) {
+            let run_start = *current_start.get_or_insert(start);
+            if end - run_start > best_end.saturating_sub(best_start) {
+                best_start = run_start;
+                best_end = end;
             }
-        } else if let Some(start) = current_start.take() {
-            if t.saturating_sub(start) > best_end.saturating_sub(best_start) {
-                best_start = start;
-                best_end = t;
-            }
-        }
-        t = t.saturating_add(1_000);
-    }
-    if let Some(start) = current_start {
-        let end = upper.saturating_add(1_000);
-        if end.saturating_sub(start) > best_end.saturating_sub(best_start) {
-            best_start = start;
-            best_end = end;
+        } else {
+            current_start = None;
         }
     }
 
@@ -282,7 +300,9 @@ pub(super) fn leg_effective_window(
         };
     }
 
-    let scored_start = best_start.saturating_add(rate_cfg.settle_secs.saturating_mul(1_000));
+    let scored_start = best_start
+        .saturating_add(rate_cfg.settle_secs.saturating_mul(1_000))
+        .min(best_end);
     let available_ms = best_end.saturating_sub(scored_start);
     let available_secs = available_ms as f64 / 1000.0;
     // 与 iperf/CTS 同一个容差（ADR-12）。此前这里是零容差，于是 179.95 秒的
@@ -291,7 +311,9 @@ pub(super) fn leg_effective_window(
     let complete = available_ms.saturating_add(WINDOW_COMPLETE_TOLERANCE_MS)
         >= required_secs.saturating_mul(1_000);
     let scored_end = if complete {
-        scored_start.saturating_add(required_secs.saturating_mul(1_000))
+        scored_start
+            .saturating_add(required_secs.saturating_mul(1_000))
+            .min(best_end)
     } else {
         best_end
     };

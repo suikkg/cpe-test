@@ -8,4 +8,4 @@ pub mod run_status;
 pub mod ui;
 pub mod webui;
 
-pub use ui::replay_report;
+pub use ui::{compare_runs, replay_report};

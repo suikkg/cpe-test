@@ -14,6 +14,15 @@ pub struct WlanInfo {
     pub band: String,
     pub ssid: String,
     pub connected: bool,
+    /// 信号质量百分比（0..=100）；`None` = 这份输出里没有这一行。
+    ///
+    /// Wi-Fi 的吞吐结果离开信号强度就无法复现：同一块网卡同一个档位，
+    /// 今天 1400Mbps、下周 900Mbps，看不出是信号掉了还是设备退化了。
+    pub signal_pct: Option<u32>,
+    /// 当前信道号；`None` = 没读到。
+    pub channel: Option<u32>,
+    /// 无线电类型原文（`802.11ax` / `802.11be` …）。
+    pub radio: String,
 }
 
 #[cfg(windows)]
@@ -61,6 +70,14 @@ pub fn parse(text: &str) -> Vec<WlanInfo> {
             let vl = val.to_lowercase();
             w.connected = val.contains("已连接")
                 || (vl.contains("connected") && !vl.contains("disconnected"));
+        } else if key_l == "signal" || key == "信号" {
+            // 值形如 `99%`。取不到就留 None——0% 是一个真实可能的读数，
+            // 不能拿它当「没读到」的替身。
+            w.signal_pct = val.trim_end_matches('%').trim().parse().ok();
+        } else if key_l == "channel" || key == "信道" {
+            w.channel = val.parse().ok();
+        } else if key_l == "radio type" || key == "无线电类型" {
+            w.radio = val.to_string();
         }
     }
     if let Some(w) = cur.take() {
@@ -120,6 +137,9 @@ mod tests {
         assert!(v[0].connected);
         assert_eq!(v[0].band, "5GHz");
         assert_eq!(v[0].ssid, "CPE_TEST_5G");
+        assert_eq!(v[0].signal_pct, Some(99));
+        assert_eq!(v[0].channel, Some(149));
+        assert_eq!(v[0].radio, "802.11ax");
     }
 
     const SAMPLE_EN: &str = r#"
@@ -144,6 +164,10 @@ There is 1 interface on the system:
         assert_eq!(v[0].name, "Wi-Fi");
         assert!(v[0].connected);
         assert_eq!(v[0].band, "2.4GHz");
+        assert_eq!(v[0].channel, Some(6));
+        assert_eq!(v[0].radio, "802.11n");
+        // 这份英文样本没有 Signal 行——「没读到」必须是 None，不是 0%。
+        assert_eq!(v[0].signal_pct, None);
     }
 
     #[test]

@@ -4,6 +4,7 @@
 //! RX 平均为准；RX 低于目标时，发送端负载不足也按子网问题判 FAIL。
 
 use super::*;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Clone)]
 pub(super) struct UdpLegPlan {
@@ -690,134 +691,195 @@ impl Ctx {
 
         let live: Arc<Mutex<HashMap<(usize, usize), LiveFlowState>>> =
             Arc::new(Mutex::new(HashMap::new()));
-        let results: Vec<UdpFlowRun> = std::thread::scope(|scope| {
-            let handles: Vec<_> = prepared
-                .into_iter()
-                .map(|flow| {
-                    let live = Arc::clone(&live);
-                    let fallback = (
-                        flow.leg_pos,
-                        flow.stream_pos,
-                        flow.task.clone(),
-                        flow.server_req.clone(),
-                    );
-                    scope.spawn(move || {
-                        catch_unwind(AssertUnwindSafe(|| {
-                            self.run_prepared_udp_flow(flow, &epoch, &live)
-                        }))
-                        .unwrap_or_else(|payload| {
-                            if let Some(req) = &fallback.3 {
-                                let _ = self.server_stop_confirmed(
-                                    fallback.2.dst.side,
-                                    fallback.2.port,
-                                    &req.request_id,
-                                    Duration::ZERO,
-                                );
-                            }
-                            UdpFlowRun {
-                                leg_pos: fallback.0,
-                                stream_pos: fallback.1,
-                                task: fallback.2,
-                                raw_ok: false,
-                                runtime_failed: false,
-                                parsed: iperf::IperfParsed::default(),
-                                client: IperfClientOut {
-                                    output: format!(
-                                        "UDP 流线程 panic: {}",
-                                        panic_text(payload.as_ref())
-                                    ),
-                                    ..Default::default()
+        // 每条腿一个负载下时延探针（不是每条流一个：排队发生在链路上，
+        // 20 条流探 20 次只是把同一件事测 20 遍，还平白多出 20 个子进程）。
+        // `leg_pos` 就是 plans 里的下标（`prepared` 的 leg_pos 也由它来）。
+        let probe_targets: Vec<(usize, IperfTask)> = plans
+            .iter()
+            .enumerate()
+            .filter_map(|(leg_pos, plan)| plan.streams.first().map(|task| (leg_pos, task.clone())))
+            .collect();
+        // 探针的收尾信号，每条腿一个。见 `latency.rs` 模块文档：起跑要等流量
+        // 真的连上，收尾要能在灌包提前结束时立刻收手。
+        let probe_stops: Vec<AtomicBool> = probe_targets
+            .iter()
+            .map(|_| AtomicBool::new(false))
+            .collect();
+        let results: (Vec<UdpFlowRun>, HashMap<usize, String>) = std::thread::scope(|scope| {
+            let probes: Vec<(usize, _)> = probe_targets
+                .iter()
+                .zip(probe_stops.iter())
+                .map(|((leg_pos, task), stop)| {
+                    let leg_pos = *leg_pos;
+                    let live_for_probe = Arc::clone(&live);
+                    (
+                        leg_pos,
+                        scope.spawn(move || {
+                            self.probe_load_latency(
+                                &task.src,
+                                &task.dst,
+                                task.v6,
+                                task.duration,
+                                stop,
+                                || {
+                                    // 这条腿**任意一条流**连上就算流量起来了：错峰起流
+                                    // 期间后面的流还没连，等它们会把探针推到灌包中段。
+                                    lock_recover(&live_for_probe).iter().any(|((lp, _), s)| {
+                                        *lp == leg_pos && (s.connected || s.active)
+                                    })
                                 },
-                                server_output: String::new(),
-                                events: vec![],
-                                retries: 0,
-                                full_attempts: 0,
-                                single_stream_exhausted: false,
-                                error: "UDP 流线程 panic".into(),
-                            }
-                        })
-                    })
+                            )
+                        }),
+                    )
                 })
                 .collect();
+            let flows: Vec<UdpFlowRun> = {
+                let handles: Vec<_> = prepared
+                    .into_iter()
+                    .map(|flow| {
+                        let live = Arc::clone(&live);
+                        let fallback = (
+                            flow.leg_pos,
+                            flow.stream_pos,
+                            flow.task.clone(),
+                            flow.server_req.clone(),
+                        );
+                        scope.spawn(move || {
+                            catch_unwind(AssertUnwindSafe(|| {
+                                self.run_prepared_udp_flow(flow, &epoch, &live)
+                            }))
+                            .unwrap_or_else(|payload| {
+                                if let Some(req) = &fallback.3 {
+                                    let _ = self.server_stop_confirmed(
+                                        fallback.2.dst.side,
+                                        fallback.2.port,
+                                        &req.request_id,
+                                        Duration::ZERO,
+                                    );
+                                }
+                                UdpFlowRun {
+                                    leg_pos: fallback.0,
+                                    stream_pos: fallback.1,
+                                    task: fallback.2,
+                                    raw_ok: false,
+                                    runtime_failed: false,
+                                    parsed: iperf::IperfParsed::default(),
+                                    client: IperfClientOut {
+                                        output: format!(
+                                            "UDP 流线程 panic: {}",
+                                            panic_text(payload.as_ref())
+                                        ),
+                                        ..Default::default()
+                                    },
+                                    server_output: String::new(),
+                                    events: vec![],
+                                    retries: 0,
+                                    full_attempts: 0,
+                                    single_stream_exhausted: false,
+                                    error: "UDP 流线程 panic".into(),
+                                }
+                            })
+                        })
+                    })
+                    .collect();
 
-            let mut monitor_status_disabled = HashSet::new();
-            while handles.iter().any(|h| !h.is_finished()) {
-                std::thread::sleep(Duration::from_secs(1));
-                for (leg_pos, plan) in plans.iter().enumerate() {
-                    let (connected, active, ended, iperf_mbps, errors) = {
-                        let g = live.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                        let mut connected = 0usize;
-                        let mut active = 0usize;
-                        let mut ended = 0usize;
-                        let mut rate = 0.0;
-                        let mut has_rate = false;
-                        let mut errors = 0usize;
-                        for stream_pos in 0..plan.streams.len() {
-                            if let Some(state) = g.get(&(leg_pos, stream_pos)) {
-                                connected += usize::from(state.connected);
-                                active += usize::from(state.active && !state.ended);
-                                ended += usize::from(state.ended);
-                                if let Some(value) = active_iperf_rate(state) {
-                                    rate += value;
-                                    has_rate = true;
+                let mut monitor_status_disabled = HashSet::new();
+                while handles.iter().any(|h| !h.is_finished()) {
+                    std::thread::sleep(Duration::from_secs(1));
+                    for (leg_pos, plan) in plans.iter().enumerate() {
+                        let (connected, active, ended, iperf_mbps, errors) = {
+                            let g = live.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                            let mut connected = 0usize;
+                            let mut active = 0usize;
+                            let mut ended = 0usize;
+                            let mut rate = 0.0;
+                            let mut has_rate = false;
+                            let mut errors = 0usize;
+                            for stream_pos in 0..plan.streams.len() {
+                                if let Some(state) = g.get(&(leg_pos, stream_pos)) {
+                                    connected += usize::from(state.connected);
+                                    active += usize::from(state.active && !state.ended);
+                                    ended += usize::from(state.ended);
+                                    if let Some(value) = active_iperf_rate(state) {
+                                        rate += value;
+                                        has_rate = true;
+                                    }
+                                    errors += usize::from(!state.error.is_empty());
                                 }
-                                errors += usize::from(!state.error.is_empty());
                             }
-                        }
-                        (connected, active, ended, has_rate.then_some(rate), errors)
-                    };
-                    let mut monitor_error = String::new();
-                    let nic_rx_mbps = plan.streams.first().and_then(|task| {
-                        let key = task.dst.key();
-                        let (side, id, _, _) = monitor_ids.get(&key)?;
-                        if monitor_status_disabled.contains(&key) {
-                            return None;
-                        }
-                        match self.mon_status(*side, id) {
-                            Ok(status) => match status.latest_sample {
-                                Some(sample) if sample.valid => Some(sample.rx_mbps),
-                                Some(sample) => {
-                                    monitor_error = if sample.error.is_empty() {
-                                        "网卡样本无效".into()
-                                    } else {
-                                        sample.error
-                                    };
+                            (connected, active, ended, has_rate.then_some(rate), errors)
+                        };
+                        let mut monitor_error = String::new();
+                        let nic_rx_mbps = plan.streams.first().and_then(|task| {
+                            let key = task.dst.key();
+                            let (side, id, _, _) = monitor_ids.get(&key)?;
+                            if monitor_status_disabled.contains(&key) {
+                                return None;
+                            }
+                            match self.mon_status(*side, id) {
+                                Ok(status) => match status.latest_sample {
+                                    Some(sample) if sample.valid => Some(sample.rx_mbps),
+                                    Some(sample) => {
+                                        monitor_error = if sample.error.is_empty() {
+                                            "网卡样本无效".into()
+                                        } else {
+                                            sample.error
+                                        };
+                                        None
+                                    }
+                                    None => {
+                                        monitor_error = "等待首个网卡样本".into();
+                                        None
+                                    }
+                                },
+                                Err(error) => {
+                                    monitor_status_disabled.insert(key);
+                                    monitor_error = error;
                                     None
                                 }
-                                None => {
-                                    monitor_error = "等待首个网卡样本".into();
-                                    None
-                                }
-                            },
-                            Err(error) => {
-                                monitor_status_disabled.insert(key);
-                                monitor_error = error;
-                                None
                             }
-                        }
-                    });
-                    logln(&format_iperf_progress(&IperfProgressSnapshot {
-                        protocol: "UDP",
-                        tag: &plan.tag,
-                        active,
-                        connected,
-                        total: plan.streams.len(),
-                        ended,
-                        nic_rx_mbps,
-                        iperf_mbps,
-                        errors,
-                        monitor_error,
-                    }));
+                        });
+                        logln(&format_iperf_progress(&IperfProgressSnapshot {
+                            protocol: "UDP",
+                            tag: &plan.tag,
+                            active,
+                            connected,
+                            total: plan.streams.len(),
+                            ended,
+                            nic_rx_mbps,
+                            iperf_mbps,
+                            errors,
+                            monitor_error,
+                        }));
+                    }
                 }
+                handles
+                    .into_iter()
+                    .map(|h| {
+                        h.join()
+                            .unwrap_or_else(|_| unreachable!("流线程已内部隔离 panic"))
+                    })
+                    .collect()
+            };
+            // 流全跑完了，探针不必再发包。
+            for stop in &probe_stops {
+                stop.store(true, Ordering::SeqCst);
             }
-            handles
+            // 探针 panic 一律按「没探到」：它是诊断，不该弄死一组已经跑出数的流。
+            let latency: HashMap<usize, String> = probes
                 .into_iter()
-                .map(|h| {
-                    h.join()
-                        .unwrap_or_else(|_| unreachable!("流线程已内部隔离 panic"))
+                .filter_map(|(leg_pos, handle)| {
+                    handle
+                        .join()
+                        .ok()
+                        .flatten()
+                        .map(|probe| (leg_pos, probe.describe()))
                 })
-                .collect()
+                .filter(|(_, text)| !text.is_empty())
+                .collect();
+            (flows, latency)
         });
+        let (results, load_latency_by_leg) = results;
 
         let mut monitor_outputs: HashMap<String, MonitorStopOut> = HashMap::new();
         let mut monitor_sample_files: HashMap<String, String> = HashMap::new();
@@ -1154,6 +1216,12 @@ impl Ctx {
                 baseline_mbps: Some(rx_stats.baseline_mbps),
                 rolling_coverage: Some(rx_stats.rolling_coverage),
                 udp_loss,
+                // 探针是**按腿**跑的，所以挂在组合计行上而不是每条流上：
+                // 排队发生在链路上，20 条流各报一遍只是把同一件事说 20 次。
+                load_latency: load_latency_by_leg
+                    .get(&leg_pos)
+                    .cloned()
+                    .unwrap_or_default(),
                 screenshot_master,
                 screenshot_agent,
                 is_grouptotal: true,

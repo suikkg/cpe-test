@@ -84,6 +84,12 @@ pub struct Ctx {
     pub local_monitors: MonitorMgr,
     pub rows: Mutex<Vec<Row>>,
     pub db: Mutex<ResultDb>,
+    /// 对端 agent 是否声明了 [`crate::protocol::PING_DF_CAPABILITY`]。
+    ///
+    /// 路径 MTU 探测必须先看它：旧版 agent 收到 `dont_fragment` 会**静默忽略**、
+    /// 照常分片发出去并报成功，据此得到的「大包能过」是个听上去很确定的错答案。
+    /// `false` 时探测不跑，诊断里写明原因——宁可没有结果，也不要一个不能信的数。
+    pub agent_ping_df: bool,
     /// 结构化运行状态的汇报口（ADR-2）。
     ///
     /// `None` = 没人要听（命令行直跑）。回调点全部挂在**既有的** `logln` 处，
@@ -346,6 +352,84 @@ impl LegOutcome {
     }
 }
 
+/// 灌包「死流」的两层熔断计数器。**纯状态机**：不碰进程、不碰网络、不碰行。
+///
+/// 抽出来是因为分组这一层**测不到**：它与全局那一层的区别只在「有链路还活着」
+/// 时才显现，而那需要真实流量。放在这里，它就是一个可以穷举的状态机。
+///
+/// 两层共用同一个阈值 `threshold`（`Config::abort_after_dead_traffic_units`，
+/// `0` = 两层都关）：
+///
+/// - **全局**：连续 `threshold` 个灌包单元一条测量都没产生 → 中止整个剩余队列。
+/// - **按链路**：某条链路连续 `threshold` 个 → 只放弃这条链路的剩余单元。
+///
+/// 只有全局那一层的时候这个功能基本不会触发：5 条链路交替排队、1 条彻底断掉
+/// 而 4 条正常，任何一个跑出数的单元都会把全局计数清零。而「区分不了设备掉线
+/// 和某一对网口本来就不通」正是默认值取 0 的理由——分组之后这两件事分得开了。
+#[derive(Debug, Default)]
+struct DeadTrafficBreaker {
+    threshold: usize,
+    global: usize,
+    max_global: usize,
+    per_group: HashMap<String, usize>,
+    abandoned: HashSet<String>,
+}
+
+impl DeadTrafficBreaker {
+    fn new(threshold: usize) -> Self {
+        Self {
+            threshold,
+            ..Default::default()
+        }
+    }
+
+    /// 整个剩余队列是否该停。`threshold == 0` 时恒为 false（只告警不中止）。
+    fn should_abort_all(&self) -> bool {
+        self.threshold > 0 && self.global >= self.threshold
+    }
+
+    /// 这条链路是否已经被放弃。空链路键**永远不算**——键为空意味着分不出组，
+    /// 拿它当一个组会把一批互不相干的链路一起放弃。
+    fn is_abandoned(&self, group: &str) -> bool {
+        !group.is_empty() && self.abandoned.contains(group)
+    }
+
+    /// 这个灌包单元产生了可用测量：两层计数一起清零。
+    fn record_usable(&mut self, group: &str) {
+        self.global = 0;
+        if !group.is_empty() {
+            self.per_group.insert(group.to_string(), 0);
+        }
+    }
+
+    /// 这个灌包单元一条测量都没产生。
+    ///
+    /// 返回 `true` 表示**这一次**让该链路刚好越过阈值（只在第一次返回 true，
+    /// 供调用方打一条日志而不是每个单元都刷一遍）。
+    fn record_dead(&mut self, group: &str) -> bool {
+        self.global += 1;
+        self.max_global = self.max_global.max(self.global);
+        if self.threshold == 0 || group.is_empty() {
+            return false;
+        }
+        let streak = self.per_group.entry(group.to_string()).or_insert(0);
+        *streak += 1;
+        *streak >= self.threshold && self.abandoned.insert(group.to_string())
+    }
+
+    fn global_streak(&self) -> usize {
+        self.global
+    }
+
+    fn max_global_streak(&self) -> usize {
+        self.max_global
+    }
+
+    fn group_streak(&self, group: &str) -> usize {
+        self.per_group.get(group).copied().unwrap_or(0)
+    }
+}
+
 fn preflight_block_outcome(tag: &str, block: &IperfPreflightBlock) -> LegOutcome {
     LegOutcome {
         judgement: VerdictResult::new(
@@ -511,8 +595,22 @@ impl Ctx {
     ) -> RunSummary {
         let mut sum = RunSummary::default();
         let total = units.len();
-        let mut dead_streak = 0usize;
+        // 熔断的全部状态都在这个纯状态机里（两层、共用一个阈值），见
+        // [`DeadTrafficBreaker`]。执行循环只负责「问它」和「告诉它结果」。
+        let mut breaker = DeadTrafficBreaker::new(self.cfg.abort_after_dead_traffic_units);
         for (i, unit) in units.iter().enumerate() {
+            // 单元边界：先看是不是「只跳过刚才那一个」。
+            //
+            // 跳过复用整轮取消那套收尾路径（停远端作业、回收端口、收日志），
+            // 所以它也设了取消位；在这里把它清掉队列才能继续。
+            // `resume_after_skip` 里「停止和进程退出优先」那一条挡住了竞态：
+            // 跳过之后紧接着点停止，不会被这次清零抹掉。
+            // 兜底：跳过请求在单元收尾**之后**才落地（操作员点得晚了一拍）时，
+            // 上面那次取走会落空，取消位就留到了这里。在开跑下一个之前清掉它，
+            // 否则一次点晚了的「跳过」会把整个队列停掉。
+            if crate::cancel::take_skip_unit() && crate::cancel::resume_after_skip() {
+                logln("  (已按请求跳过，队列继续)");
+            }
             if crate::cancel::is_cancelled() {
                 logln("\n!! 用户中断 (Ctrl+C)，正在生成部分报告...");
                 break;
@@ -521,11 +619,14 @@ impl Ctx {
             // 路径（resume 命中、前置拦截、网卡消失），放在结尾时那些路径会
             // 整个跳过它。而「网卡消失」恰恰是本设置最该拦住的场景——被测设备
             // 掉线后每个单元的开跑前重扫都会看到网卡不见了，队列会一路空转到底。
-            let abort_at = self.cfg.abort_after_dead_traffic_units;
-            if abort_at > 0 && dead_streak >= abort_at {
+            // 日志里要报出阈值，从状态机自己身上取——执行循环再读一次
+            // `self.cfg` 就是又开了一条旁路，分组那一层当初就是这么漏掉的。
+            let abort_at = breaker.threshold;
+            if breaker.should_abort_all() {
                 logln(&format!(
-                    "\n!! 连续 {dead_streak} 个灌包单元没有产生任何测量，按 abort_after_dead_traffic_units={abort_at} 中止剩余 {} 个单元。\n\
+                    "\n!! 连续 {} 个灌包单元没有产生任何测量，按 abort_after_dead_traffic_units={abort_at} 中止剩余 {} 个单元。\n\
                      !! 请先确认被测设备是否掉线或重启，再重跑剩余项；已完成的部分会照常出报告。",
+                    breaker.global_streak(),
                     total.saturating_sub(i)
                 ));
                 // 中止点必须是全局序号：诊断补跑那一趟的 `sequence_offset` 是
@@ -538,8 +639,55 @@ impl Ctx {
             }
             let useq = sequence_offset + i;
             let is_traffic_unit = unit_has_traffic(unit);
+            // 灌包单元的计数必须在「链路已放弃」那条早退分支**之前**加。
+            // 放在后面的话，被放弃的单元只进 `traffic_setup_errors` 不进
+            // `traffic_units`，两个计数器就发散了——`ui.rs` 的收尾文案会打出
+            // 「本轮 2 个灌包单元没有产生任何有效速率测量（其中 SETUP_ERROR=50）」
+            // 这种自相矛盾的一行，`needs_traffic_failure_diagnostics()` 也跟着少数。
             if is_traffic_unit {
                 sum.traffic_units += 1;
+            }
+            let link_key = crate::master::executor::row::link_group_key(unit, None);
+            if is_traffic_unit && breaker.is_abandoned(&link_key) {
+                let detail = format!(
+                    "链路「{link_key}」已连续 {abort_at} 个灌包单元没有产生任何测量，\
+                     本轮不再对它起流；其余链路照常继续"
+                );
+                logln(&format!(
+                    "\n[{}/{}] {}\n  !! {detail}",
+                    i + 1,
+                    total,
+                    unit.title
+                ));
+                sum.bump(Verdict::SetupError);
+                sum.traffic_setup_errors += 1;
+                self.push_row(Row {
+                    verdict: Verdict::SetupError,
+                    execution_status: ExecutionStatus::Error,
+                    reason_code: ReasonCode::LinkAbandoned,
+                    reason_detail: detail.clone(),
+                    ..unit_row(unit, useq, "跳过(链路已放弃)")
+                });
+                self.persist_new_rows();
+                self.notify(|observer| {
+                    observer.unit_finished(
+                        UnitStatus {
+                            seq: useq + 1,
+                            title: unit.title.clone(),
+                            verdict: Verdict::SetupError.label().to_string(),
+                            reason_code: ReasonCode::LinkAbandoned.as_str().to_string(),
+                            reason_detail: detail.clone(),
+                            skipped: false,
+                            secs: 0,
+                            link_group: unit.link_group.clone(),
+                            // 没起过流，没有实测值可言。
+                            rx_avg: None,
+                            target_mbps: None,
+                        },
+                        Self::remaining_est_secs(units, i + 1),
+                    )
+                });
+                continue;
             }
             let blocked = preflight_blocks.and_then(|blocks| blocks.get(&unit.id));
             logln(&format!("\n[{}/{}] {}", i + 1, total, unit.title));
@@ -583,9 +731,11 @@ impl Ctx {
                             sum.bump(Verdict::SetupError);
                             if is_traffic_unit {
                                 sum.traffic_setup_errors += 1;
-                                dead_streak += 1;
-                                sum.max_dead_traffic_streak =
-                                    sum.max_dead_traffic_streak.max(dead_streak);
+                                // 网卡消失也是「这条链路过不去流量」的一种，
+                                // 两层计数都要跟着走：否则一条被拔线的链路
+                                // 会一路空转到队列结束。
+                                breaker.record_dead(&link_key);
+                                sum.max_dead_traffic_streak = breaker.max_global_streak();
                             }
                             self.push_row(Row {
                                 verdict: Verdict::SetupError,
@@ -612,6 +762,9 @@ impl Ctx {
                                         skipped: false,
                                         secs: 0,
                                         link_group: unit.link_group.clone(),
+                                        // 这条路径压根没起过流，没有实测值可言。
+                                        rx_avg: None,
+                                        target_mbps: None,
                                     },
                                     Self::remaining_est_secs(units, i + 1),
                                 )
@@ -663,6 +816,9 @@ impl Ctx {
                                 skipped: true,
                                 secs: 0,
                                 link_group: unit.link_group.clone(),
+                                // 这条路径压根没起过流，没有实测值可言。
+                                rx_avg: None,
+                                target_mbps: None,
                             },
                             Self::remaining_est_secs(units, i + 1),
                         )
@@ -786,15 +942,25 @@ impl Ctx {
                     blocked.is_none() && self.outcomes_have_usable_traffic_measurement(&outcomes);
                 if usable {
                     sum.traffic_usable_units += 1;
-                    dead_streak = 0;
+                    // 两层计数一起清零。别的链路不受影响——那正是分组的意义。
+                    breaker.record_usable(&link_key);
                 } else {
                     // 「一条测量都没产生」和「测出来不达标」是两回事，这里只数前者。
-                    dead_streak += 1;
-                    sum.max_dead_traffic_streak = sum.max_dead_traffic_streak.max(dead_streak);
-                    if dead_streak >= DEAD_TRAFFIC_STREAK_WARN {
+                    let newly_abandoned = breaker.record_dead(&link_key);
+                    sum.max_dead_traffic_streak = breaker.max_global_streak();
+                    if newly_abandoned {
                         logln(&format!(
-                            "  !! 连续 {dead_streak} 个灌包单元没有产生任何测量——被测设备可能已掉线。\
-                             后续单元大概率也是空跑；要自动中止请设 abort_after_dead_traffic_units。"
+                            "  !! 链路「{link_key}」已连续 {} 个灌包单元没有产生任何测量，\
+                             按 abort_after_dead_traffic_units={abort_at} 放弃这条链路的剩余单元；\
+                             其余链路继续。请单独确认这一对网口的连通性。",
+                            breaker.group_streak(&link_key)
+                        ));
+                    }
+                    if breaker.global_streak() >= DEAD_TRAFFIC_STREAK_WARN {
+                        logln(&format!(
+                            "  !! 连续 {} 个灌包单元没有产生任何测量——被测设备可能已掉线。\
+                             后续单元大概率也是空跑；要自动中止请设 abort_after_dead_traffic_units。",
+                            breaker.global_streak()
                         ));
                     }
                 }
@@ -843,6 +1009,21 @@ impl Ctx {
             if let Some(judgement) = &bidir_total {
                 unit_diagnostics.extend(judgement.diagnostics.clone());
             }
+            // 「人按了跳过」和「设备真的不行」在报告上必须分得开：这一行的
+            // SETUP_ERROR 全部来自被主动掐断的作业，不是被测设备的结论。
+            //
+            // 走**诊断**通道而不是改写判定：判定说的是「这次跑出了什么」，
+            // 而这一行确实什么都没跑出来。改成 PASS/SKIP 就是在判定之后再叠
+            // 一层，正是 ADR-17 一直在防的方向。
+            if crate::cancel::take_skip_unit() && crate::cancel::resume_after_skip() {
+                unit_diagnostics.insert(
+                    0,
+                    "本单元被操作员手动跳过：下面的失败来自被主动掐断的作业，\
+                     不是被测设备的结论。要复测请单独重跑这一条。"
+                        .into(),
+                );
+                logln("  (已按请求跳过本单元，队列继续)");
+            }
             // 单元级「结论的理由」只算一次，报告行和进度页共用。
             //
             // 这两处以前各算各的：报告行走合计判定，进度页走 `unit_reason` /
@@ -867,6 +1048,22 @@ impl Ctx {
                 .then(|| direction_summaries.first())
                 .flatten();
             let stream_counts = aggregate_direction_streams(&direction_summaries);
+            // 单元级的「实测 / 目标」在这里算一次，报告汇总行和进度页共用。
+            //
+            // 进度页此前只有 verdict 和原因码：盯着一轮 11.5 小时的测试，屏幕上
+            // 是一串 PASS/PASS/PASS，看不到「第 47 个单元 1850 对 1800」。而
+            // 「数值在一路往下滑」（热衰减、Wi-Fi 退避）恰恰是要当场发现、当场
+            // 停下来的那类现象——等出了报告再看出来，已经白跑了十几个小时。
+            //
+            // 两处各算一遍的话，进度页和报告会对同一个单元报两个数，
+            // 而那种不一致没人会去核对。
+            let unit_rx_avg = bidir_total
+                .is_some()
+                .then(|| bidir_total_rx_avg(&outcomes))
+                .flatten()
+                .or_else(|| single_direction.and_then(|direction| direction.rx_avg));
+            let unit_target_mbps = bidir_total_target
+                .or_else(|| single_direction.and_then(|direction| direction.target_mbps));
             logln(&format!("  ==> 单元结果: {}", unit_verdict.label()));
             self.push_row(Row {
                 // 单元汇总行永远排在本单元所有明细之后。
@@ -888,18 +1085,18 @@ impl Ctx {
                 // 双向合计单元的「RX 平均」就是判定用的那个合计值。填
                 // `single_direction`（双向恒为 None）会让报告出现「目标 1000 /
                 // RX 平均 空」这种自相矛盾的一行。
-                rx_avg: bidir_total
-                    .is_some()
-                    .then(|| bidir_total_rx_avg(&outcomes))
-                    .flatten()
-                    .or_else(|| single_direction.and_then(|direction| direction.rx_avg)),
+                rx_avg: unit_rx_avg,
                 rx_p10: single_direction.and_then(|direction| direction.rx_p10),
                 // 双向合计单元的「目标」就是那个合计门限——两条腿各自没有目标，
                 // 报告上必须能看到判定用的是哪个数。
-                target_mbps: bidir_total_target
-                    .or_else(|| single_direction.and_then(|direction| direction.target_mbps)),
+                target_mbps: unit_target_mbps,
                 sample_coverage: single_direction.and_then(|direction| direction.sample_coverage),
                 udp_loss: single_direction.and_then(|direction| direction.udp_loss),
+                // TCP 重传和 udp_loss / ping_loss 是同一类东西（「质量」列的三选一），
+                // 必须跟着一起上汇总行：`report::model::verdict_row` 优先返回汇总行，
+                // 所以只填在方向明细上等于 HTML 概览和 summary.xlsx 的「TCP 重传」
+                // 列对每一行都空着——正是 ADR-7 记下的那类静默空列。
+                tcp_retransmits: single_direction.and_then(|direction| direction.tcp_retransmits),
                 ping_loss: single_direction.and_then(|direction| direction.ping_loss),
                 ping_min: single_direction.and_then(|direction| direction.ping_min),
                 ping_avg: single_direction.and_then(|direction| direction.ping_avg),
@@ -941,6 +1138,8 @@ impl Ctx {
                         skipped: false,
                         secs: self.clock.now().duration_since(unit_started_at).as_secs(),
                         link_group: unit.link_group.clone(),
+                        rx_avg: unit_rx_avg,
+                        target_mbps: unit_target_mbps,
                     },
                     Self::remaining_est_secs(units, i + 1),
                 )
@@ -1297,8 +1496,12 @@ mod artifact;
 mod cts;
 mod db;
 mod format;
+use self::latency::LoadLatency;
+
 mod iperf_leg;
+mod latency;
 mod ping_leg;
+mod pmtu;
 mod progress;
 mod row;
 

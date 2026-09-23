@@ -443,6 +443,9 @@ fn route(method: &Method, url: &str, body: &str, st: &Arc<AgentState>) -> String
             let mut capabilities = vec![
                 RELIABLE_LIFECYCLE_CAPABILITY.into(),
                 LIVE_NIC_PROGRESS_CAPABILITY.into(),
+                // 无条件声明：DF 位在三个平台上都有对应的 ping 参数
+                // （`-f` / `-D` / `-M do`），不像 ctsTraffic 那样只在 Windows 上有。
+                crate::protocol::PING_DF_CAPABILITY.into(),
             ];
             if ctstraffic_platform_supported() {
                 capabilities.push(CTS_TRAFFIC_CAPABILITY.into());

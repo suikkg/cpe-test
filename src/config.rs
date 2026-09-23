@@ -81,13 +81,63 @@ pub struct Config {
     pub resume: bool,
     /// 测试完自动打开 HTML 报告
     pub open_report: bool,
-    /// 连续这么多个灌包单元一条测量都没产生时，中止剩余队列。0 表示只告警不中止。
+    /// 连续这么多个灌包单元一条测量都没产生时熔断。0 表示只告警不中止。
     ///
-    /// 默认 0 是刻意的保守选择：「连续零测量」区分不了「被测设备掉线」和
-    /// 「其中一对网口本来就不通」——后者在多配对批量测试里很常见，自动中止
-    /// 会把别的配对一起砍掉。告警无论如何都会打，报告顶部也会留痕；
-    /// 需要无人值守跑长队列时再把它设成 2~3。
+    /// **两层共用这一个阈值**（`master::executor::DeadTrafficBreaker`）：
+    ///
+    /// - 按链路：某条链路连续这么多个空跑 → 放弃**这条链路**的剩余单元，
+    ///   其余链路照跑；
+    /// - 全局：连续这么多个空跑（不分链路）→ 中止整个剩余队列。
+    ///
+    /// 默认 0 保持不变，但它当初那条理由已经被分组这一层解决了：「连续零测量」
+    /// 以前区分不了「被测设备掉线」和「其中一对网口本来就不通」，于是自动中止
+    /// 会把别的配对一起砍掉。现在前者由全局那一层接住、后者由链路那一层接住，
+    /// 无人值守跑长队列时设成 2~3 才真正可用。
     pub abort_after_dead_traffic_units: usize,
+    /// `runs/` 里最多保留多少轮历史；`0` = 不删（默认）。
+    ///
+    /// 一次 210 单元的全量跑带截图和逐样本 CSV 就是几百 MB、上千个文件。
+    /// 日更回归跑一年，`runs/` 会长到几十 GB，而历史列表每次都要对每个目录
+    /// 递归算一次字节数。
+    ///
+    /// **默认 0 是刻意的**：删数据必须由人显式选择。没有什么比「升级一次，
+    /// 历史记录少了一半」更符合本仓库戒律里那个「在没人注意的情况下改变行为」。
+    ///
+    /// 清理只动**本工具自己写出来的形状**（`run_<数字与下划线>`），
+    /// 且只按目录名排序取最旧的删——人手放进 `runs/` 的归档、备注、别的目录
+    /// 一个都不碰。见 `report::retention`。
+    #[serde(default)]
+    pub keep_runs: usize,
+    /// 整份计划重复跑多少遍（稳定性 / 拷机）。`1` = 跑一遍（默认，行为不变）。
+    ///
+    /// **轮次在最外层**：整套跑完再跑一遍。稳定性要回答的是「同一套用例连跑
+    /// 20 遍，有没有哪一遍开始掉」；轮次放在最内层（同一个单元连跑 N 次）
+    /// 测的是热衰减，而那个用一个更长的 `duration` 就够了。
+    ///
+    /// 每一轮有**独立的稳定身份**（`builder::round_scoped_id`），所以同一次运行里
+    /// 各轮不会互相命中 RESUME——不区分的话第 2 轮会直接命中第 1 轮刚写进去的
+    /// PASS 而整轮跳过，正好把这个功能本身取消掉。
+    ///
+    /// **第 1 轮的身份逐字节不变**：不加轮次的老计划跑出来和以前一模一样，
+    /// 历史 `task_results.json` 的 RESUME 不受影响。
+    ///
+    /// 上限 100（`builder::MAX_ROUNDS`），防手滑——一次全量跑 11.5 小时，
+    /// 输错一位就是一个月。
+    ///
+    /// # 为什么不叫 `repeats`
+    ///
+    /// 内环配置里已经有一个 `repeats`（`inner::config`），而两边的导入判别器
+    /// 靠**键集零交集**来认「你把文件导错地方了」：
+    /// `import::INNER_ONLY_KEYS` 里就有 `repeats`。子网这边再叫同一个名字，
+    /// 导出的子网 config 会被内环判别器认成内环配置，反之亦然——那不是措辞
+    /// 问题，是两个导入口互相拒收对方的文件。
+    ///
+    /// 语义上两者本来也不是一回事：内环的 `repeats` 在展开顺序的**最内层**
+    /// （同一个单元连跑 N 次），子网的 `rounds` 在**最外层**（整套跑完再跑一遍）。
+    /// 不同的东西用不同的名字是对的。守在
+    /// `the_two_import_detectors_never_share_a_key`。
+    #[serde(default = "default_rounds")]
+    pub rounds: u32,
     /// 按角色配对 / 按单块网卡给出的 RX 门限与 UDP 带宽。
     pub link_profiles: LinkProfiles,
     pub iperf: IperfCfg,
@@ -203,6 +253,10 @@ pub struct UniversalParams {
     pub rate_target_bidir_total_mbps: Option<f64>,
 }
 
+fn default_rounds() -> u32 {
+    1
+}
+
 fn default_agent_bind() -> String {
     "0.0.0.0".into()
 }
@@ -221,6 +275,8 @@ impl Default for Config {
             resume: false,
             open_report: true,
             abort_after_dead_traffic_units: 0,
+            keep_runs: 0,
+            rounds: default_rounds(),
             link_profiles: LinkProfiles::default(),
             iperf: IperfCfg::default(),
             ctstraffic: CtsTrafficCfg::default(),
@@ -602,6 +658,35 @@ impl UdpProfile {
 pub struct PingCfg {
     pub count: u32,
     pub payload_sizes: Vec<u32>,
+    /// 灌包**正在跑的时候**并发一条低速 ICMP 探针，测「负载下时延」。
+    ///
+    /// 在此之前 ping 与灌包是互斥的两种腿、单元之间顺序执行，于是 ping 测到的
+    /// 永远是**空载** RTT。空载 0.4ms 的设备满载可能是 300ms——差两个数量级，
+    /// 而用户感知到的「卡」几乎全部落在后者。
+    ///
+    /// **默认关**是刻意的：打开它会在每一轮吞吐测试期间多跑一个 ping 子进程，
+    /// 也就是改变了测量条件。本仓库对「在没人注意的情况下改动基线」有明确戒律
+    /// （见 AGENTS.md 里那条不许「修」内置预设的说明），所以这个新行为必须由人
+    /// 显式打开，而不是升级一次就悄悄生效。
+    ///
+    /// 打开后的开销可以忽略：32 字节、约 1 秒一拍，整段合计不到 3 kbps。
+    /// 结果**只进诊断**，绝不参与判定（ADR-17）。
+    #[serde(default)]
+    pub probe_during_traffic: bool,
+    /// 每个 ping 单元额外做一次**路径 MTU 探测**（带「不分片」位二分逼近）。
+    ///
+    /// 现有的包长档位（32 / 1600 / 65500）测的是**分片行为**：不带 DF 位，
+    /// 超长的包会被拆开发过去，照样通。而 1500 与 1492 的差别（PPPoE 封装）
+    /// 是 CPE 桥接场景里最常见的一类现场故障，那需要 DF 位才看得见。
+    ///
+    /// **结果只进诊断，不做判定项**——这是刻意的：判定层现在只有一个权威
+    /// （接收端 RX 平均对门限，ADR-17），给路径 MTU 开第二条判定路径就是再造
+    /// 一个「说了算的地方」。要不要拿 1492 当不合格，是业务判断，由看报告的人定。
+    ///
+    /// 默认关，理由同 `probe_during_traffic`：它给每个 ping 单元多加十几轮探测，
+    /// 改变了这一轮要跑多久。对端 agent 不支持时探测不跑，诊断里写明原因。
+    #[serde(default)]
+    pub probe_path_mtu: bool,
     /// payload <= 此值时归为 small。
     pub small_max_bytes: u32,
     /// payload <= 此值时归为 medium；再大归为 large。
@@ -626,6 +711,8 @@ impl Default for PingCfg {
         PingCfg {
             count: 180,
             payload_sizes: vec![32, 1600, 65500],
+            probe_during_traffic: false,
+            probe_path_mtu: false,
             small_max_bytes: 128,
             medium_max_bytes: 2000,
             max_rtt_ms: 30.0,

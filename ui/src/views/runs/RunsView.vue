@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue';
 import { api, downloadQuery, errorMessage } from '../../api/client';
-import type { ReplayOut, RunEntry, RunRequestOut } from '../../api/dto';
+import type { CompareOut, ReplayOut, RunEntry, RunRequestOut } from '../../api/dto';
 import { adoptRunRequest, preview } from '../../state/plan';
 import { filterByQuery, visibleCountLabel } from '../../domain/search';
 import { goto, ui } from '../../state/ui';
@@ -16,16 +16,56 @@ import { goto, ui } from '../../state/ui';
 const entries = ref<RunEntry[]>([]);
 
 /**
- * 页内搜索。字段就是 `RunEntry` **真的有**的那两样：完整目录 id 与它返回的
- * 修改时间文本（§11.1）。
+ * 页内搜索。
  *
- * 这里**没有**设备、通过率、失败数或测试状态——`RunEntry` 里根本没有这些字段，
- * 按它们筛就得先发明一个接口。也不能把 `modified` 当成"测试开始时间"：那是
- * 目录的修改时刻，恢复一次报告它就会变。
+ * `meta.json` 落地之后，这一页终于有了**开始时间**和**判定分布**：
+ * `started` 是这一轮真正开跑的时刻，和 `modified`（目录最后被写过的时刻，
+ * 恢复一次报告就会变）是两回事，两个都留着可搜。
+ *
+ * 仍然**没有**被测设备型号——那需要一个运行身份字段，这一轮没做。
  */
 const shownEntries = computed(() =>
-  filterByQuery(entries.value, ui.runs.query, (entry) => [entry.id, entry.modified]),
+  filterByQuery(entries.value, ui.runs.query, (entry) => [
+    entry.id,
+    entry.modified,
+    entry.started,
+    verdictSummary(entry),
+  ]),
 );
+
+/**
+ * 一轮的结论摘要，例如 `28/30 通过 · 2 未达标`。
+ *
+ * 读不到 `meta.json` 时返回空串——**不能把全 0 当成结论**：升级前写的旧目录
+ * 和「真的一个单元都没跑」在数字上长得一模一样。
+ *
+ * 分母只有 `PASS + RATE_FAIL`，和报告顶部、和 `passTone` 同一个算式。
+ * 一个都没判过时**不写「x/y 通过」**：拿 `total` 兜底的话，一轮全是 MEASURED
+ * （Observe 模式 / 没配门限）的运行会显示「0/10 通过」，读起来是「全挂了」，
+ * 而同一轮的报告写的是「没有单元设了验收门限」。两块屏幕，同一轮，相反的印象。
+ */
+function verdictSummary(entry: RunEntry): string {
+  if (!entry.has_meta || !entry.totals) return '';
+  const t = entry.totals;
+  const judged = t.pass + t.rate_fail;
+  if (judged === 0 && t.total === 0) return '';
+  const parts = judged > 0 ? [`${t.pass}/${judged} 通过`] : [`${t.total} 个单元`];
+  if (t.measured) parts.push(`${t.measured} 仅测量`);
+  if (t.rate_fail) parts.push(`${t.rate_fail} 未达标`);
+  if (t.not_evaluated) parts.push(`${t.not_evaluated} 未评估`);
+  if (t.setup_error) parts.push(`${t.setup_error} 准备失败`);
+  if (t.skipped) parts.push(`${t.skipped} 已跳过`);
+  return parts.join(' · ');
+}
+
+/** 通过率的着色：与报告顶部同一个算式（分母只有 PASS + RATE_FAIL）。 */
+function passTone(entry: RunEntry): 'ok' | 'bad' | '' {
+  const t = entry.totals;
+  if (!entry.has_meta || !t) return '';
+  const judged = t.pass + t.rate_fail;
+  if (judged === 0) return '';
+  return t.rate_fail === 0 ? 'ok' : 'bad';
+}
 const entryCountLabel = computed(() =>
   visibleCountLabel(shownEntries.value.length, entries.value.length),
 );
@@ -100,6 +140,51 @@ function bundleUrl(id: string): string {
  * 「已经有报告」恰恰是最需要用新数据盖掉它的情形之一。重放本身是幂等的——
  * 同一批 `rows.jsonl` 放几次都是同一份报告。服务端只挡一种情况：正在跑的那一轮。
  */
+/**
+ * 对比用的基线（旧的那一轮）。空 = 还没选。
+ *
+ * 选基线和选详情是两件事，所以用两个状态：详情跟着「我在看哪一条」走，
+ * 基线跟着「我要拿哪一条当参照」走。合成一个的话，点开详情就会把基线换掉。
+ */
+const baselineId = ref('');
+
+function toggleBaseline(id: string): void {
+  baselineId.value = baselineId.value === id ? '' : id;
+}
+
+/**
+ * 两轮对比。基线必须比本轮**旧**——目录名带时间戳，直接按字符串比就够。
+ *
+ * 反着选不拦（有时就是想看「新的比旧的好在哪」），但要在提示语里说清楚
+ * 哪一份当了基线，否则「+15%」的方向会被读反。
+ */
+async function compare(entry: RunEntry): Promise<void> {
+  const baseline = baselineId.value;
+  if (!baseline || baseline === entry.id) return;
+  busy.value = entry.id;
+  error.value = '';
+  notice.value = '';
+  try {
+    const out = await api.post<CompareOut>('/api/runs/compare', {
+      baseline,
+      current: entry.id,
+    });
+    const parts = [
+      `已对比（基线 ${out.baseline} → 本轮 ${out.current}）：${out.report}`,
+      `判定变坏 ${out.regressed} · 速率下降 ${out.slower} · 判定转好 ${out.fixed} · 新增 ${out.added} · 缺失 ${out.disappeared} · 无实质变化 ${out.unchanged}`,
+    ];
+    if (!out.same_plan) {
+      parts.push('两轮不是同一套计划，「新增/缺失」说的是计划差异，不是设备表现');
+    }
+    notice.value = parts.join('；');
+    await load();
+  } catch (e) {
+    error.value = errorMessage(e);
+  } finally {
+    busy.value = '';
+  }
+}
+
 async function replay(entry: RunEntry): Promise<void> {
   busy.value = entry.id;
   error.value = '';
@@ -185,7 +270,7 @@ onMounted(load);
         <input
           type="search"
           :value="ui.runs.query"
-          placeholder="搜运行目录 ID 或修改时间"
+          placeholder="搜运行目录 ID、开始时间或结论"
           @input="ui.runs.query = ($event.target as HTMLInputElement).value"
         />
       </label>
@@ -194,6 +279,11 @@ onMounted(load);
       </button>
       <span class="muted">{{ entryCountLabel }}</span>
     </div>
+
+    <p v-if="baselineId" class="hint" role="status">
+      对比基线：<strong class="mono">{{ baselineId }}</strong>。在另一轮上点「与基线对比」出差异报告。
+      <button type="button" class="linklike" @click="baselineId = ''">取消基线</button>
+    </p>
 
     <p v-if="selectedHidden" class="hint" role="status">
       选中的运行不在搜索结果里，下面的详情仍是它。
@@ -205,6 +295,14 @@ onMounted(load);
         <button type="button" class="ghost small" @click="ui.runs.selected = ''">收起详情</button>
       </div>
       <dl>
+        <dt>开始时间</dt>
+        <dd>{{ selectedEntry.started || '未知（升级前的旧目录）' }}</dd>
+        <dt>耗时</dt>
+        <dd class="mono">{{ selectedEntry.elapsed || '—' }}</dd>
+        <dt>结论</dt>
+        <dd :class="passTone(selectedEntry)">
+          {{ verdictSummary(selectedEntry) || '未知（升级前的旧目录，打开报告可看）' }}
+        </dd>
         <dt>修改时间</dt>
         <dd>{{ selectedEntry.modified || '时间未知' }}</dd>
         <dt>目录大小</dt>
@@ -219,8 +317,9 @@ onMounted(load);
         <dd>{{ selectedEntry.has_request ? '有（可装载重跑）' : '没有（不能重跑）' }}</dd>
       </dl>
       <p class="muted small">
-        「修改时间」是这个目录最后被写过的时刻，<strong>不是测试开始时间</strong>——恢复一次报告它就会变。
-        这一页只有运行记录里已有的字段：没有设备、通过率或失败数，那些要打开报告看。
+        「开始时间」和「结论」来自这一轮的 <code>meta.json</code>，与报告顶部那八个格子同源。
+        「修改时间」则是目录最后被写过的时刻，<strong>不是测试开始时间</strong>——恢复一次报告它就会变。
+        被测设备型号这一页还没有，要看得打开报告。
       </p>
     </div>
 
@@ -234,7 +333,7 @@ onMounted(load);
       <table :aria-busy="loading || !!busy">
         <thead>
           <tr>
-            <th scope="col">运行 / 时间</th><th scope="col">产物</th><th scope="col" class="num">大小</th><th scope="col">操作</th>
+            <th scope="col">运行 / 时间</th><th scope="col">结论</th><th scope="col">产物</th><th scope="col" class="num">大小</th><th scope="col">操作</th>
           </tr>
         </thead>
         <tbody>
@@ -252,8 +351,14 @@ onMounted(load);
               >
                 {{ entry.id }}
               </button>
-              <span class="muted">{{ entry.modified || '时间未知' }}</span>
+              <!-- 优先显示真正的开始时间；只有旧目录才退回目录修改时刻，
+                   并明说那是修改时间，免得被当成开跑时间读。 -->
+              <span class="muted">{{ entry.started || `${entry.modified || '时间未知'}（修改时间）` }}</span>
               <span v-if="busy === entry.id" class="working-label" role="status">正在处理…</span>
+            </td>
+            <td class="verdicts">
+              <span v-if="verdictSummary(entry)" :class="passTone(entry)">{{ verdictSummary(entry) }}</span>
+              <span v-else class="muted">—</span>
             </td>
             <td>
               <div class="artifacts">
@@ -287,6 +392,24 @@ onMounted(load);
                   title="载入这一轮的计划并跳到「执行」页预览，确认后再开始测试"
                   @click="rerun(entry)"
                 >重新执行</button>
+                <button
+                  v-if="entry.has_rows"
+                  type="button"
+                  class="ghost small"
+                  :class="{ 'is-baseline': baselineId === entry.id }"
+                  :aria-pressed="baselineId === entry.id"
+                  :disabled="!!busy"
+                  title="把这一轮设为对比基线，然后在另一轮上点「与基线对比」"
+                  @click="toggleBaseline(entry.id)"
+                >{{ baselineId === entry.id ? '基线 ✓' : '设为基线' }}</button>
+                <button
+                  v-if="entry.has_rows && baselineId && baselineId !== entry.id"
+                  type="button"
+                  class="ghost small"
+                  :disabled="!!busy"
+                  title="按单元对齐，列出判定变坏 / 速率下降 / 转好 / 新增 / 缺失"
+                  @click="compare(entry)"
+                >与基线对比</button>
               </div>
             </td>
           </tr>
@@ -340,6 +463,12 @@ tbody tr:hover, tbody tr.working { background: var(--panel-2); }
 .working-label { color: var(--accent); }
 .num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .artifacts { display: flex; flex-wrap: wrap; gap: 5px; min-width: 120px; }
+/* 结论那一列：全过是绿的、有未达标是红的，读不到 meta 不上色。
+   「读不到」和「零失败」在这里必须分得开。 */
+.verdicts { white-space: nowrap; font-size: 12px; }
+.is-baseline { border-color: var(--accent); color: var(--accent); font-weight: 600; }
+.ok { color: var(--ok); }
+.bad { color: var(--bad); }
 .actions { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; min-width: 180px; }
 .runs-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 0 0 12px; }
 .search { flex: 1 1 240px; max-width: 360px; }

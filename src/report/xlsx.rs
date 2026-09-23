@@ -18,8 +18,8 @@
 //! 速率、丢包、覆盖率一律写成数字单元格而不是字符串。验收的人拿到 xlsx 是要
 //! 排序、筛选、做透视表的；写成字符串的话「930.5」会排在「1000」前面。
 use super::model::{
-    bidirectional_rx_average_sum, direction_row_score, group_is_ping, group_rows, group_verdict,
-    verdict_row, UnitGroup,
+    bidirectional_rx_average_sum, direction_row_score, group_is_ping, group_rows, group_seq,
+    group_verdict, verdict_row, UnitGroup,
 };
 use super::{ReportMeta, Row, RowBackend, RowDirection, RowProtocol, RowSide};
 use crate::verdict::Verdict;
@@ -31,6 +31,7 @@ fn header_format() -> Format {
     Format::new()
         .set_bold()
         .set_align(FormatAlign::Left)
+        .set_text_wrap()
         .set_background_color(0x00EDF2F6)
 }
 
@@ -41,7 +42,23 @@ fn write_headers(
     let format = header_format();
     for (col, title) in headers.iter().enumerate() {
         sheet.write_string_with_format(0, col as u16, *title, &format)?;
+        let width = if title.contains("明细") || title.contains("诊断") || title.contains("建议")
+        {
+            56.0
+        } else if title.contains("标题") || title.contains("上下文") {
+            40.0
+        } else if title.contains("原因码") || title.contains("网口") || title.contains("参数")
+        {
+            24.0
+        } else {
+            18.0
+        };
+        sheet.set_column_width(col as u16, width)?;
+        if title.contains("覆盖率") || *title == "通过率" {
+            sheet.set_column_format(col as u16, &Format::new().set_num_format("0.0%"))?;
+        }
     }
+    sheet.set_row_height(0, 32.0)?;
     sheet.set_freeze_panes(1, 0)?;
     Ok(())
 }
@@ -122,6 +139,7 @@ fn write_overview_sheet(
             "目标(Mbps)",
             "采样覆盖率",
             "UDP 丢包(%)",
+            "TCP 重传(次)",
             "Ping 丢包(%)",
             "原因明细",
             "诊断(不参与判定)",
@@ -135,7 +153,7 @@ fn write_overview_sheet(
             continue;
         };
         let verdict = group_verdict(group);
-        sheet.write_number(line, 0, row.unit_seq.saturating_add(1) as f64)?;
+        sheet.write_number(line, 0, group_seq(group) as f64)?;
         sheet.write_string(line, 1, verdict.label())?;
         sheet.write_string(line, 2, row.reason_code.as_str())?;
         sheet.write_string(line, 3, &row.link_group)?;
@@ -153,10 +171,14 @@ fn write_overview_sheet(
         write_opt_number(sheet, line, 15, row.target_mbps)?;
         write_opt_number(sheet, line, 16, row.sample_coverage)?;
         write_opt_number(sheet, line, 17, row.udp_loss)?;
-        write_opt_number(sheet, line, 18, row.ping_loss)?;
-        sheet.write_string(line, 19, &row.reason_detail)?;
-        sheet.write_string(line, 20, row.diagnostics.join("；"))?;
+        write_opt_number(sheet, line, 18, row.tcp_retransmits.map(|v| v as f64))?;
+        write_opt_number(sheet, line, 19, row.ping_loss)?;
+        sheet.write_string(line, 20, &row.reason_detail)?;
+        sheet.write_string(line, 21, row.diagnostics.join("；"))?;
         line += 1;
+    }
+    if line > 1 {
+        sheet.autofilter(0, 0, line - 1, 21)?;
     }
 
     // 「运行健康」在 HTML 报告里是一条红色横幅，正常时**不出现**——横幅缺席
@@ -167,7 +189,7 @@ fn write_overview_sheet(
     } else {
         meta.run_health.clone()
     };
-    // 抬头信息放在数据右边，不占用可筛选的列区。
+    // 抬头信息放在数据下方，不占用可筛选的行区。
     let info = [
         ("主控", meta.master_pc.as_str()),
         ("辅测", meta.agent_pc.as_str()),
@@ -213,9 +235,7 @@ fn write_detail_sheet(
             "工具接收(Mbps)",
             "RX 平均(Mbps)",
             "RX-P10(Mbps)",
-            // 网卡 TX 侧的两个数。TX-P10 不是摆设：它决定要不要报
-            // OFFERED_LOAD_LOW，TX 滚动覆盖率不足还会把整行打成
-            // NOT_EVALUATED——判定理由里引用的数，表里就得能查到。
+            // 网卡 TX 侧的两个数只用于诊断；判定仍然只看接收端 RX。
             "TX 平均(Mbps)",
             "TX-P10(Mbps)",
             "目标(Mbps)",
@@ -224,6 +244,9 @@ fn write_detail_sheet(
             "有效秒",
             "要求秒",
             "UDP 丢包(%)",
+            "TCP 重传(次)",
+            "源端无线上下文",
+            "接收端无线上下文",
             "执行状态",
             "原因明细",
             "诊断(不参与判定)",
@@ -231,12 +254,14 @@ fn write_detail_sheet(
     )?;
 
     let mut line = 1u32;
-    for row in rows {
+    let mut ordered: Vec<_> = rows.iter().collect();
+    ordered.sort_by_key(|row| row.sort_key);
+    for row in ordered {
         if row.is_unit_summary {
             // 汇总行在「概览」表里，这里只放真正的测量行。
             continue;
         }
-        sheet.write_number(line, 0, row.unit_seq.saturating_add(1) as f64)?;
+        sheet.write_number(line, 0, row.sort_key.0.saturating_add(1) as f64)?;
         sheet.write_string(line, 1, row.verdict.label())?;
         sheet.write_string(line, 2, row.reason_code.as_str())?;
         sheet.write_string(line, 3, &row.link_group)?;
@@ -261,10 +286,16 @@ fn write_detail_sheet(
         write_opt_number(sheet, line, 22, row.effective_seconds)?;
         write_opt_number(sheet, line, 23, row.required_seconds)?;
         write_opt_number(sheet, line, 24, row.udp_loss)?;
-        sheet.write_string(line, 25, row.execution_status.label())?;
-        sheet.write_string(line, 26, &row.reason_detail)?;
-        sheet.write_string(line, 27, row.diagnostics.join("；"))?;
+        write_opt_number(sheet, line, 25, row.tcp_retransmits.map(|v| v as f64))?;
+        sheet.write_string(line, 26, &row.src_wifi)?;
+        sheet.write_string(line, 27, &row.dst_wifi)?;
+        sheet.write_string(line, 28, row.execution_status.label())?;
+        sheet.write_string(line, 29, &row.reason_detail)?;
+        sheet.write_string(line, 30, row.diagnostics.join("；"))?;
         line += 1;
+    }
+    if line > 1 {
+        sheet.autofilter(0, 0, line - 1, 30)?;
     }
     Ok(())
 }
@@ -282,6 +313,8 @@ struct LinkObservation<'a> {
     /// 接收端网口。判定口径只看接收端 RX，所以聚合键取的是**收的那一块**。
     receiver: &'a str,
     sender: &'a str,
+    receiver_side: RowSide,
+    sender_side: RowSide,
     verdict: Verdict,
     rx_avg: Option<f64>,
 }
@@ -317,6 +350,8 @@ fn link_observations<'a>(group: &UnitGroup<'a>) -> Vec<LinkObservation<'a>> {
             direction: row.direction,
             receiver: row.dst_iface.as_str(),
             sender: row.src_iface.as_str(),
+            receiver_side: row.dst_side,
+            sender_side: row.src_side,
             verdict: unit_verdict,
             rx_avg: row.rx_avg,
         }];
@@ -330,6 +365,8 @@ fn link_observations<'a>(group: &UnitGroup<'a>) -> Vec<LinkObservation<'a>> {
             direction,
             receiver: row.dst_iface.as_str(),
             sender: row.src_iface.as_str(),
+            receiver_side: row.dst_side,
+            sender_side: row.src_side,
             verdict: if single { unit_verdict } else { row.verdict },
             rx_avg: row.rx_avg,
         })
@@ -373,6 +410,8 @@ fn write_link_group_sheet(
             "通过率",
             "RX 平均最小值(Mbps)",
             "RX 平均最大值(Mbps)",
+            "发送端",
+            "接收端",
         ],
     )?;
 
@@ -383,6 +422,8 @@ fn write_link_group_sheet(
         RowDirection,
         String,
         String,
+        RowSide,
+        RowSide,
     );
     struct Stats {
         counts: [usize; 6],
@@ -411,6 +452,8 @@ fn write_link_group_sheet(
                 observation.direction,
                 observation.sender.to_string(),
                 observation.receiver.to_string(),
+                observation.sender_side,
+                observation.receiver_side,
             );
             if !stats.contains_key(&key) {
                 order.push(key.clone());
@@ -457,6 +500,11 @@ fn write_link_group_sheet(
         }
         write_opt_number(sheet, line, 14, entry.rx_min)?;
         write_opt_number(sheet, line, 15, entry.rx_max)?;
+        sheet.write_string(line, 16, side_label(key.6))?;
+        sheet.write_string(line, 17, side_label(key.7))?;
+    }
+    if !order.is_empty() {
+        sheet.autofilter(0, 0, order.len() as u32, 17)?;
     }
     Ok(())
 }
@@ -500,7 +548,7 @@ fn write_failures_sheet(
         let Some(row) = verdict_row(group) else {
             continue;
         };
-        sheet.write_number(line, 0, row.unit_seq.saturating_add(1) as f64)?;
+        sheet.write_number(line, 0, group_seq(group) as f64)?;
         sheet.write_string(line, 1, verdict.label())?;
         sheet.write_string(line, 2, row.reason_code.as_str())?;
         sheet.write_string(line, 3, &row.link_group)?;
@@ -517,6 +565,9 @@ fn write_failures_sheet(
             crate::verdict::disposition_advice(row.reason_code).unwrap_or(""),
         )?;
         line += 1;
+    }
+    if line > 1 {
+        sheet.autofilter(0, 0, line - 1, 10)?;
     }
     Ok(())
 }
@@ -538,6 +589,25 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).expect("temp dir");
         dir.join("summary.xlsx")
+    }
+
+    fn part_xml(path: &Path, name: &str) -> String {
+        use std::io::Read;
+        let file = std::fs::File::open(path).expect("打开工作簿");
+        let mut archive = zip::ZipArchive::new(file).expect("有效 xlsx 包");
+        let mut xml = String::new();
+        archive
+            .by_name(name)
+            .expect("工作簿部件存在")
+            .read_to_string(&mut xml)
+            .expect("解压 XML");
+        xml
+    }
+
+    fn cell<'a>(xml: &'a str, address: &str) -> Option<&'a str> {
+        let start = xml.find(&format!("<c r=\"{address}\""))?;
+        let end = xml[start..].find("</c>")? + start + "</c>".len();
+        Some(&xml[start..end])
     }
 
     fn detail(unit: usize, verdict: Verdict, link_group: &str) -> Row {
@@ -622,13 +692,16 @@ mod tests {
         // xlsx = zip：前两个字节是 PK。
         assert_eq!(&bytes[..2], b"PK", "不是合法的 xlsx/zip");
 
-        let text = String::from_utf8_lossy(&bytes);
-        // 表名在 workbook.xml 里是明文（这几个部件不压缩时可见；压缩时下面的
-        // 兜底断言仍然成立）。
-        let has_names = ["概览", "逐行明细", "按链路分组", "失败清单"]
-            .iter()
-            .all(|name| text.contains(name));
-        assert!(has_names || bytes.len() > 3000, "四张表没有全部生成");
+        let workbook = part_xml(&path, "xl/workbook.xml");
+        for name in ["概览", "逐行明细", "按链路分组", "失败清单"] {
+            assert!(workbook.contains(&format!("name=\"{name}\"")));
+        }
+        for (index, end) in [(1, "V3"), (2, "AE3"), (3, "R2"), (4, "K2")] {
+            let sheet = part_xml(&path, &format!("xl/worksheets/sheet{index}.xml"));
+            assert!(sheet.contains(&format!("<autoFilter ref=\"A1:{end}\"")));
+            assert!(sheet.contains("state=\"frozen\""));
+            assert!(sheet.contains("customWidth=\"1\""));
+        }
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
@@ -678,16 +751,14 @@ mod tests {
             summary(0, Verdict::Pass, "A"),
         ];
         write_xlsx(&path, &rows, &ReportMeta::default()).expect("写 xlsx");
-        let bytes = std::fs::read(&path).expect("读回");
-        let text = String::from_utf8_lossy(&bytes);
-        // 数值单元格在 sheet XML 里是 <v>930.5</v>，字符串单元格会带 t="s"
-        // 并指向共享字符串表。压缩后看不到明文时这条自动放行。
-        if text.contains("<v>") {
-            assert!(
-                text.contains("930.5"),
-                "RX 平均应当以数值形式出现在单元格里"
-            );
-        }
+        let sheet = part_xml(&path, "xl/worksheets/sheet1.xml");
+        let rx = cell(&sheet, "M2").expect("RX 平均单元格");
+        assert!(rx.contains("<v>930.5</v>"));
+        assert!(!rx.contains("t=\"s\""));
+        let coverage = cell(&sheet, "Q2").expect("采样覆盖率单元格");
+        assert!(coverage.contains("<v>0.98</v>"));
+        assert!(coverage.contains(" s=\""), "覆盖率保留数字并应用百分比格式");
+        assert!(part_xml(&path, "xl/styles.xml").contains("0.0%"));
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
@@ -781,9 +852,76 @@ mod tests {
             },
         ];
         write_xlsx(&path, &rows, &ReportMeta::default()).expect("写 xlsx");
-        // 能写出来就够：这条主要防的是「把 None 当 0 写进去」那种改法，
-        // write_opt_number 是唯一入口，改坏了上面的往返断言会先红。
-        assert!(path.exists());
+        let sheet = part_xml(&path, "xl/worksheets/sheet1.xml");
+        for address in ["M2", "P2", "Q2"] {
+            assert!(
+                cell(&sheet, address).is_none(),
+                "{address} 的未采集值必须为空"
+            );
+        }
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn all_excel_unit_numbers_and_order_match_the_html_report() {
+        let path = temp_path("sequence");
+        let mut rows = vec![
+            detail(36, Verdict::RateFail, "A"),
+            summary(36, Verdict::RateFail, "A"),
+            detail(1, Verdict::RateFail, "A"),
+            summary(1, Verdict::RateFail, "A"),
+        ];
+        // 历史记录里 unit_seq 缺省为 0，sort_key 仍保存执行顺序。
+        for row in &mut rows {
+            row.unit_seq = 0;
+        }
+        write_xlsx(&path, &rows, &ReportMeta::default()).unwrap();
+        for index in [1, 2, 4] {
+            let sheet = part_xml(&path, &format!("xl/worksheets/sheet{index}.xml"));
+            assert!(cell(&sheet, "A2").unwrap().contains("<v>2</v>"));
+            assert!(cell(&sheet, "A3").unwrap().contains("<v>37</v>"));
+        }
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn identical_windows_nic_names_on_opposite_hosts_do_not_merge_directions() {
+        let path = temp_path("same_nic_names");
+        let mut forward = detail(0, Verdict::Pass, "以太网 ↔ 以太网");
+        forward.direction = RowDirection::Single;
+        forward.src_iface = "以太网".into();
+        forward.dst_iface = "以太网".into();
+        forward.rx_avg = Some(900.0);
+        let reverse = Row {
+            sort_key: (1, 0, 0, 0),
+            parent_id: "unit-1".into(),
+            src_side: RowSide::Agent,
+            dst_side: RowSide::Master,
+            verdict: Verdict::RateFail,
+            rx_avg: Some(100.0),
+            ..forward.clone()
+        };
+        write_xlsx(&path, &[forward, reverse], &ReportMeta::default()).unwrap();
+        let sheet = part_xml(&path, "xl/worksheets/sheet3.xml");
+        for address in ["G2", "G3"] {
+            assert!(cell(&sheet, address).unwrap().contains("<v>1</v>"));
+        }
+        assert!(cell(&sheet, "O2").unwrap().contains("<v>900</v>"));
+        assert!(cell(&sheet, "O3").unwrap().contains("<v>100</v>"));
+        let value = |address| {
+            cell(&sheet, address)
+                .unwrap()
+                .split_once("<v>")
+                .unwrap()
+                .1
+                .split_once("</v>")
+                .unwrap()
+                .0
+        };
+        assert_ne!(value("Q2"), value("Q3"));
+        assert_eq!(value("Q2"), value("R3"));
+        assert_eq!(value("Q3"), value("R2"));
+        assert!(sheet.contains("<autoFilter ref=\"A1:R3\""));
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

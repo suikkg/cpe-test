@@ -26,7 +26,33 @@ export function nicSearchFields(nic: NicInfo): Array<string | number | null | un
     nic.ipv6_global,
     nic.role,
     nic.wifi_band,
+    // SSID 是找网卡最自然的关键词——现场是「跑 CPE_TEST_5G 那块」，
+    // 不是「跑 WLAN 那块」。
+    nic.wifi_ssid,
   ];
+}
+
+/**
+ * 无线上下文的一行摘要：`CPE_TEST_5G · 信道 149 · 信号 99% · 802.11ax`。
+ *
+ * 非 Wi-Fi、或一项都没读到时返回空串。**与 Rust 侧 `NicInfo::wifi_context()`
+ * 是同一个口径**——两边说法不一样的话，界面上看到的信道和报告里记下的信道
+ * 会对不上，而没人会去核对这种不一致。
+ *
+ * `0%` 是真实读数（信号断在边缘），所以只有 `null` / `undefined` 才算没读到。
+ */
+export function nicWifiContext(nic: NicInfo): string {
+  if (!nic.is_wifi) return '';
+  const parts: string[] = [];
+  if (nic.wifi_ssid) parts.push(nic.wifi_ssid);
+  if (nic.wifi_channel !== null && nic.wifi_channel !== undefined) {
+    parts.push(`信道 ${nic.wifi_channel}`);
+  }
+  if (nic.wifi_signal_pct !== null && nic.wifi_signal_pct !== undefined) {
+    parts.push(`信号 ${nic.wifi_signal_pct}%`);
+  }
+  if (nic.wifi_radio) parts.push(nic.wifi_radio);
+  return parts.join(' · ');
 }
 
 /**

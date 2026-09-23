@@ -1,8 +1,9 @@
 //! ping 命令构造 + 执行 + 输出解析（Windows 中/英文、macOS/BSD 三种格式）
 
 use crate::protocol::{PingOut, PingReq};
-use crate::util::{run_cmd, CmdOut};
+use crate::util::{run_cmd, run_streaming_controlled_timed, CmdOut};
 use regex::Regex;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 pub const MAX_PAYLOAD: u32 = 65500;
@@ -56,6 +57,9 @@ pub fn build(req: &PingReq) -> (String, Vec<String>) {
             "-l".into(),
             payload,
         ];
+        if req.dont_fragment {
+            a.push("-f".into());
+        }
         a.push(if req.v6 { "-6".into() } else { "-4".into() });
         ("ping".into(), a)
     } else if cfg!(target_os = "linux") {
@@ -69,33 +73,64 @@ pub fn build(req: &PingReq) -> (String, Vec<String>) {
             "-s".into(),
             payload,
         ];
+        if req.dont_fragment {
+            // iputils 的写法是 `-M do`（pmtudisc 策略），不是 BSD 的 `-D`。
+            a.push("-M".into());
+            a.push("do".into());
+        }
         a.push(if req.v6 { "-6".into() } else { "-4".into() });
         a.push(req.dst.clone());
         (prog.into(), a)
     } else {
         // macOS：v4 用 ping，v6 用 ping6（-c 计数，-s 负载，-S 源绑定）
         let prog = if req.v6 { "ping6" } else { "ping" };
-        let a = vec![
+        let mut a = vec![
             "-c".into(),
             count,
             "-S".into(),
             req.src.clone(),
             "-s".into(),
             payload,
-            req.dst.clone(),
         ];
+        if req.dont_fragment {
+            a.push("-D".into());
+        }
+        a.push(req.dst.clone());
         (prog.into(), a)
     }
 }
 
 /// 执行 ping 并解析
 pub fn run(req: &PingReq) -> PingOut {
+    run_cancellable(req, None).0
+}
+
+/// 可中途打断的 ping。返回 `(结果, 是不是被打断的)`。
+///
+/// # 为什么需要
+///
+/// 常规的 ping 单元跑几十秒就结束，等它无所谓。**负载下时延探针**不一样：
+/// 它的 `count` 等于灌包时长（可以是 180 秒），而灌包腿可能在第 2 秒就失败——
+/// server 起不来、连接被拒、预检拦截。不可打断的话，一条 2 秒就失败的腿要
+/// 白等 178 秒；210 条这样的腿就是十几个小时。操作员点「跳过当前单元」
+/// 更难看：灌包作业被杀了，探针还在 ping，「这条别跑了」完全没有兑现。
+///
+/// 被打断时 `ping` 来不及打印统计行，解析出来会是「全丢」。所以这里**把打断
+/// 本身报出来**，让调用方丢弃结果而不是把它当成一次 100% 丢包——那是个
+/// 听上去很确定的错答案。
+pub fn run_cancellable(req: &PingReq, cancel: Option<&AtomicBool>) -> (PingOut, bool) {
     let (prog, args) = build(req);
     let cmd_str = format!("{} {}", prog, args.join(" "));
     let timeout = Duration::from_secs(req.count.max(1) as u64 * 5 + 30);
     let args_ref: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    let out = run_cmd(&prog, &args_ref, timeout);
-    finish_run(cmd_str, req.count, timeout, out)
+    let out = match cancel {
+        None => run_cmd(&prog, &args_ref, timeout),
+        Some(flag) => {
+            run_streaming_controlled_timed(&prog, &args_ref, timeout, Some(flag), |_, _| {})
+        }
+    };
+    let cancelled = out.cancelled;
+    (finish_run(cmd_str, req.count, timeout, out), cancelled)
 }
 
 fn finish_run(cmd: String, count: u32, timeout: Duration, out: CmdOut) -> PingOut {
@@ -354,6 +389,32 @@ pub fn parse(text: &str, count: u32) -> PingOut {
         cmd: String::new(),
         raw: String::new(),
     }
+}
+
+/// 这一轮的 RTT 读数是不是被**测量工具本身的分辨率**卡住了。
+///
+/// Windows 的 `ping` 只报整数毫秒（中文「时间<1ms」、英文 `time<1ms`），
+/// `parse_ms` 把 `<1` 归成 `0.0`。有线 CPE 的实测 RTT 在 0.2~0.9ms，
+/// 于是**整档全部记成 0**，而内置门限是 10ms——这一档物理上不可能不通过。
+///
+/// 它测了跟没测一样，但报告上写着 `0.000 ms`，读的人会以为那是测出来的结果。
+/// **这比不测更糟**，所以必须当场说出来。
+///
+/// 判据只看数据不看平台：三个读数都是整毫秒、且平均值不足 1ms，就说明分辨率
+/// 顶到头了。BSD/Linux 的 `ping` 报三位小数，永远不会命中。
+///
+/// 返回 `None` = 这一轮的读数没有被分辨率卡住，照常解读。
+pub fn resolution_caveat(out: &PingOut) -> Option<&'static str> {
+    let (min, avg, max) = (out.rtt_min?, out.rtt_avg?, out.rtt_max?);
+    let integral = [min, avg, max].iter().all(|v| v.fract() == 0.0);
+    if integral && avg < 1.0 {
+        return Some(
+            "本次 RTT 读数全部落在整毫秒上且平均不足 1ms：测量工具（Windows ping）的\
+             时延分辨率就是 1ms，实际往返时延低于它时一律记为 0。**这一档只能判通断，\
+             判不了时延**——要看亚毫秒级的时延，改用负载下时延探针或专用工具。",
+        );
+    }
+    None
 }
 
 /// "<1" -> 0
@@ -740,5 +801,38 @@ Approximate round trip times in milli-seconds:
             ..Default::default()
         };
         assert_eq!(execution_error_kind(&spawn), Some(PingExecErrorKind::Spawn));
+    }
+}
+
+#[cfg(test)]
+mod resolution_tests {
+    use super::*;
+
+    fn out(min: f64, avg: f64, max: f64) -> PingOut {
+        PingOut {
+            ok: true,
+            rtt_min: Some(min),
+            rtt_avg: Some(avg),
+            rtt_max: Some(max),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_wired_link_pinned_at_zero_is_flagged_as_a_resolution_limit() {
+        // Windows ping 在有线 CPE 上的典型读数：min/avg/max 全是 0。
+        // 报告上那个 `0.000 ms` 不是「时延为零」，是「量不出来」。
+        assert!(resolution_caveat(&out(0.0, 0.0, 0.0)).is_some());
+        assert!(resolution_caveat(&out(0.0, 0.0, 1.0)).is_some());
+    }
+
+    #[test]
+    fn real_measurements_are_never_flagged() {
+        // BSD/Linux 报三位小数，永远不该命中。
+        assert!(resolution_caveat(&out(0.213, 0.418, 0.902)).is_none());
+        // 整毫秒但平均达到 1ms 以上：分辨率没有把结论吃掉。
+        assert!(resolution_caveat(&out(1.0, 4.0, 12.0)).is_none());
+        // 缺读数时不下结论。
+        assert!(resolution_caveat(&PingOut::default()).is_none());
     }
 }

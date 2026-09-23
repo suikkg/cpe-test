@@ -318,15 +318,14 @@ export function deleteRecipe(plan: UiPlan, protocol: UiProtocol, recipeId: strin
  * 承接 `the_assignment_table_can_toggle_a_whole_suite_column` 的义务。
  * 原始理由（逐字搬运）：套件多起来之后，「所有链路都跑这个套件」原本得逐格点。
  *
- * 语义是**三态归一**：只要有任何一个集合还没绑上，就全绑上；全绑上了才是全撤。
+ * 语义是**三态归一**：只要有任何一个集合只选了部分网口或没绑上，就全绑上；
+ * 每个集合的网口都选齐了才是全撤。
  * 这样连点两下的结果可预测——不会出现「点一下勾了一半」。
  */
 export function toggleSuiteColumn(plan: UiPlan, suiteId: string): UiPlan {
   const setIds = plan.link_sets.map((set) => set.id);
-  const bound = new Set(
-    plan.bindings.filter((b) => b.suite_id === suiteId).map((b) => b.link_set_id),
-  );
-  const allBound = setIds.length > 0 && setIds.every((id) => bound.has(id));
+  const allBound = setIds.length > 0
+    && setIds.every((id) => bindingSelectionState(plan, id, suiteId) === 'all');
 
   if (allBound) {
     return {
@@ -334,29 +333,41 @@ export function toggleSuiteColumn(plan: UiPlan, suiteId: string): UiPlan {
       bindings: plan.bindings.filter((b) => b.suite_id !== suiteId),
     };
   }
-  const missing = setIds.filter((id) => !bound.has(id));
-  return {
-    ...plan,
-    bindings: [
-      ...plan.bindings,
-      ...missing.map((linkSetId) => ({
-        id: `binding-${linkSetId}-${suiteId}`,
-        link_set_id: linkSetId,
-        suite_id: suiteId,
-        pair_ids: [],
-        // `append` 没有定义好的合并语义，服务端会拒绝；只用 replace。
-        mode: 'replace',
-      })),
-    ],
-  };
+  return setIds.reduce((current, setId) =>
+    bindingSelectionState(current, setId, suiteId) === 'all'
+      ? current : toggleBinding(current, setId, suiteId), plan);
+}
+
+/** 整集合绑定与显式网口子集共用同一份三态，不能用“存在绑定”代替全选。 */
+export function bindingSelectionState(
+  plan: UiPlan, linkSetId: string, suiteId: string,
+): 'none' | 'some' | 'all' {
+  const set = plan.link_sets.find((item) => item.id === linkSetId);
+  if (!set) return 'none';
+  const bindings = plan.bindings.filter(
+    (binding) => binding.link_set_id === linkSetId && binding.suite_id === suiteId,
+  );
+  if (bindings.some((binding) => binding.pair_ids.length === 0)) return 'all';
+  const ids = new Set(bindings.flatMap((binding) => binding.pair_ids));
+  const selected = set.pair_refs.filter((pair) => ids.has(pair.id)).length;
+  if (selected === 0) return 'none';
+  return selected === set.pair_refs.length ? 'all' : 'some';
 }
 
 export function toggleBinding(plan: UiPlan, linkSetId: string, suiteId: string): UiPlan {
-  const existing = plan.bindings.find(
-    (b) => b.link_set_id === linkSetId && b.suite_id === suiteId,
-  );
+  const matches = (binding: UiBinding) =>
+    binding.link_set_id === linkSetId && binding.suite_id === suiteId;
+  const existing = plan.bindings.find(matches);
   if (existing) {
-    return { ...plan, bindings: plan.bindings.filter((b) => b !== existing) };
+    const selected = bindingSelectionState(plan, linkSetId, suiteId) === 'all';
+    return {
+      ...plan,
+      bindings: plan.bindings.flatMap((binding) => {
+        if (!matches(binding)) return [binding];
+        // 部分选中补全当前集合，保留原绑定身份和位置；全选才撤销。
+        return !selected && binding === existing ? [{ ...binding, pair_ids: [] }] : [];
+      }),
+    };
   }
   return {
     ...plan,

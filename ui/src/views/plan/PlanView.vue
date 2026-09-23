@@ -1,9 +1,10 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue';
+import { computed, nextTick, onMounted, ref } from 'vue';
 import UiTabs from '../../components/UiTabs.vue';
-import { toggleBinding, toggleSuiteColumn, isBound } from '../../domain/plan-build';
+import { bindingSelectionState, toggleBinding, toggleSuiteColumn } from '../../domain/plan-build';
 import { linkSetSearchFields } from '../../domain/grouping';
 import { freshnessLabel } from '../../domain/freshness';
+import { selectedPortPairs } from '../../domain/plan-ports';
 import { filterByQuery, visibleCountLabel } from '../../domain/search';
 import type { LinkFilter } from '../../domain/pairs';
 import { topologyReady } from '../../state/inventory';
@@ -12,12 +13,14 @@ import {
   exportProject,
   importProject,
   plan,
+  preview,
   projectNotices,
   reconcile,
   restoreDefaultProject,
 } from '../../state/plan';
 import RecipeEditor from './RecipeEditor.vue';
 import SuiteEditor from './SuiteEditor.vue';
+import PortSelection from './PortSelection.vue';
 import { goto, ui } from '../../state/ui';
 
 /**
@@ -40,6 +43,22 @@ type WorkbenchSection = 'assign' | 'suites' | 'recipes';
 const section = ref<WorkbenchSection>('assign');
 const focusedRecipeId = ref('');
 const resetArmed = ref(false);
+const advancedOpen = ref(false);
+const advancedPanel = ref<HTMLDetailsElement>();
+const selectedPairs = computed(() => selectedPortPairs(plan.ui));
+
+function reviewPorts(): void {
+  goto('run');
+  void preview();
+}
+
+async function editPortSuite(id: string): Promise<void> {
+  ui.suites.selected = id;
+  section.value = 'suites';
+  advancedOpen.value = true;
+  await nextTick();
+  advancedPanel.value?.scrollIntoView({ block: 'start' });
+}
 const assignedSets = computed(
   () => new Set(plan.ui.bindings.map((binding) => binding.link_set_id)).size,
 );
@@ -138,9 +157,9 @@ const columnScopeNote = computed(() =>
  */
 function columnState(suiteId: string): 'none' | 'some' | 'all' {
   if (sets.value.length === 0) return 'none';
-  const bound = sets.value.filter((set) => isBound(plan.ui, set.id, suiteId)).length;
-  if (bound === 0) return 'none';
-  return bound === sets.value.length ? 'all' : 'some';
+  const states = sets.value.map((set) => bindingSelectionState(plan.ui, set.id, suiteId));
+  if (states.every((state) => state === 'none')) return 'none';
+  return states.every((state) => state === 'all') ? 'all' : 'some';
 }
 
 function onToggleColumn(suiteId: string): void {
@@ -197,15 +216,24 @@ onMounted(() => {
     <header class="view-head">
       <div>
         <h2>测试计划</h2>
-        <p class="muted">为链路集合分配套件，再按需调整任务与流量配置。</p>
+        <p class="muted">子网测试让两个电脑网口互相收发流量。先选择实际接入待测网络的网口，再预览并开始。</p>
       </div>
-      <button type="button" class="preview-action" @click="goto('run')">预览与执行</button>
+      <button type="button" class="preview-action" :disabled="!selectedPairs || plan.previewing" @click="reviewPorts">预览与执行</button>
     </header>
 
     <p v-if="!topologyReady" class="warn" role="alert">
-      双端网卡尚未全部就绪。导入时按已取得的扫描结果核对对应端点；未知端点暂时保留，
-      连接或重新扫描成功后继续核对。
+      尚未取得两端完整网卡信息。先到「本机」确认网口，再到「辅测机」填写地址并连接。
+      导入项目中的未知网口会保留，扫描成功后再核对。
     </p>
+
+    <div class="test-route" aria-label="子网测试准备">
+      <div><strong>接好待测网口</strong><span>将参与测试的电脑网口接入 CPE 网络；在网卡列表核对名称、IP 与角色。</span></div>
+      <div><strong>选网口与测试内容</strong><span>下表直接勾选。本机两口也可配对；A→B 表示 A 发送、B 接收。</span></div>
+      <div><strong>预览后开始</strong><span>确认最终方向、门限与耗时，运行结果在「进度」中查看。</span></div>
+    </div>
+    <p class="mode-help">要测电脑网口与 CPE 板侧之间的吞吐？<button type="button" class="linklike" @click="goto('inner')">进入内环测试</button>，由主控通过 ADB 管理板侧。</p>
+
+    <PortSelection @review="reviewPorts" @edit-suite="editPortSuite" />
 
     <div class="bar project-tools">
       <button type="button" class="ghost" @click="fileInput?.click()">导入项目</button>
@@ -236,6 +264,8 @@ onMounted(() => {
     </p>
     <p v-for="(n, i) in projectNotices.items" :key="i" class="warn">{{ n }}</p>
 
+    <details ref="advancedPanel" class="advanced-plan" :open="advancedOpen" @toggle="advancedOpen = ($event.target as HTMLDetailsElement).open">
+    <summary><strong>高级计划编辑</strong><span>按集合批量分配、编辑套件和流量参数</span></summary>
     <div class="summary" aria-label="当前计划概况">
       <div><strong>{{ sets.length }}</strong><span>链路集合</span></div>
       <div><strong>{{ pairCount }}</strong><span>网口对</span></div>
@@ -345,11 +375,13 @@ onMounted(() => {
                 <small v-if="set.auto" class="tag">自动生成</small>
               </span>
             </th>
-            <td v-for="suite in suites" :key="suite.id" class="cell" :class="{ bound: isBound(plan.ui, set.id, suite.id) }">
-              <label class="check" :title="`${set.name} / ${suite.name}`">
+            <td v-for="suite in suites" :key="suite.id" class="cell" :class="{ bound: bindingSelectionState(plan.ui, set.id, suite.id) !== 'none' }">
+              <label class="check" :title="`${set.name} / ${suite.name}${bindingSelectionState(plan.ui, set.id, suite.id) === 'some' ? '：已选部分网口，点击选择整个集合' : ''}`">
                 <input
                   type="checkbox"
-                  :checked="isBound(plan.ui, set.id, suite.id)"
+                  :checked="bindingSelectionState(plan.ui, set.id, suite.id) === 'all'"
+                  :indeterminate="bindingSelectionState(plan.ui, set.id, suite.id) === 'some'"
+                  :aria-checked="bindingSelectionState(plan.ui, set.id, suite.id) === 'some' ? 'mixed' : bindingSelectionState(plan.ui, set.id, suite.id) === 'all'"
                   @change="onToggleCell(set.id, suite.id)"
                 />
                 <span class="sr">{{ set.name }} 跑 {{ suite.name }}</span>
@@ -410,6 +442,7 @@ onMounted(() => {
       <button type="button" @click="goto('run')">预览与执行</button>
     </div>
     </div>
+    </details>
   </section>
 </template>
 
@@ -417,6 +450,14 @@ onMounted(() => {
 .hidden-file { display: none; }
 .view-head { display: flex; align-items: center; justify-content: space-between; gap: 20px; }
 .preview-action { flex: 0 0 auto; }
+.test-route { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px; padding: 16px 0; border-bottom: 1px solid var(--line); }
+.test-route strong, .test-route span { display: block; }
+.test-route strong { color: var(--accent); font-size: 14px; }
+.test-route span { margin-top: 6px; font-size: 13px; line-height: 1.65; color: var(--muted); }
+.mode-help { margin: 12px 0; font-size: 13px; color: var(--muted); }
+.advanced-plan > summary { display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap; cursor: pointer; padding: 16px 0; }
+.advanced-plan > summary span { color: var(--muted); font-size: 13px; }
+@media (max-width: 700px) { .test-route { grid-template-columns: 1fr; gap: 12px; } }
 .bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .project-tools { padding: 12px 0 16px; margin-bottom: 0; }
 .project-note { margin-left: auto; font-size: 12px; }

@@ -139,6 +139,16 @@ pub fn counters(iface: &str) -> Result<(u64, u64), String> {
         .ok_or_else(|| format!("接口不存在: {iface}"))
 }
 
+fn adapter_matches_scan(adapter: &ipconfig::IpcfgAdapter, prefixes: &[String]) -> bool {
+    !adapter.disconnected
+        && (adapter
+            .ipv4
+            .as_deref()
+            .is_some_and(|ip| ipv4_match(ip, prefixes))
+            || (prefixes.is_empty()
+                && (adapter.ipv6_ll.is_some() || adapter.ipv6_global.is_some())))
+}
+
 /// 全量扫描（带前缀过滤），返回完整 NicInfo 列表
 pub fn scan_all(prefixes: &[String]) -> Vec<NicInfo> {
     // 先拿 GetIfTable2 的别名，再交给 ipconfig 解析：那份输出的适配器标题行
@@ -161,11 +171,7 @@ pub fn scan_all(prefixes: &[String]) -> Vec<NicInfo> {
 
     let mut out = Vec::new();
     for a in adapters {
-        if a.disconnected {
-            continue;
-        }
-        let Some(ipv4) = a.ipv4.clone() else { continue };
-        if !ipv4_match(&ipv4, prefixes) {
+        if !adapter_matches_scan(&a, prefixes) {
             continue;
         }
         let row = rows_by_alias
@@ -197,7 +203,7 @@ pub fn scan_all(prefixes: &[String]) -> Vec<NicInfo> {
             name: a.name,
             description: desc,
             role,
-            ipv4,
+            ipv4: a.ipv4.unwrap_or_default(),
             gateway_v4: gateways.get(&ifindex).cloned().unwrap_or_default(),
             ipv6_ll: a.ipv6_ll.unwrap_or_default(),
             ipv6_global: a.ipv6_global.unwrap_or_default(),
@@ -205,6 +211,12 @@ pub fn scan_all(prefixes: &[String]) -> Vec<NicInfo> {
             speed_mbps: speed,
             is_wifi,
             wifi_band: band,
+            // 无线上下文只在真的是 Wi-Fi 且 netsh 认出这个接口时才有值。
+            // 有线口一律留空，不要让报告出现「信道 0」这种读数。
+            wifi_ssid: wlan.map(|w| w.ssid.clone()).unwrap_or_default(),
+            wifi_signal_pct: wlan.and_then(|w| w.signal_pct),
+            wifi_channel: wlan.and_then(|w| w.channel),
+            wifi_radio: wlan.map(|w| w.radio.clone()).unwrap_or_default(),
             ifindex,
         });
     }
@@ -214,6 +226,26 @@ pub fn scan_all(prefixes: &[String]) -> Vec<NicInfo> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_prefix_scan_includes_ipv6_only_ula_and_keeps_link_filters() {
+        let mut adapter = ipconfig::parse(
+            "Ethernet adapter Ethernet:\n\
+             \x20  IPv6 Address . . . . . . . . . . : fd12:3456::1(Preferred)\n",
+        )
+        .remove(0);
+        assert!(adapter.ipv4.is_none());
+        assert!(adapter_matches_scan(&adapter, &[]));
+        assert!(!adapter_matches_scan(&adapter, &["192.168.".into()]));
+        adapter.disconnected = true;
+        assert!(!adapter_matches_scan(&adapter, &[]));
+        adapter.disconnected = false;
+        adapter.ipv6_global = None;
+        assert!(!adapter_matches_scan(&adapter, &[]));
+        adapter.ipv4 = Some("192.168.8.2".into());
+        assert!(adapter_matches_scan(&adapter, &["192.168.".into()]));
+        assert!(!adapter_matches_scan(&adapter, &["10.".into()]));
+    }
 
     #[test]
     fn selects_lowest_metric_default_gateway_per_interface() {

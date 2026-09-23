@@ -64,6 +64,12 @@ pub enum ReasonCode {
     IperfPreflightFailed,
     IperfRuntimeErrors,
     IperfSummaryLost,
+    /// 这条链路连续多个灌包单元一条测量都没产生，剩余单元不再尝试。
+    ///
+    /// 和 `NIC_DISAPPEARED` 的区别：网卡还在、命令也发得出去，只是**过不去流量**。
+    /// 和整轮中止的区别：只放弃这一条链路，别的链路照跑——「设备掉线」和
+    /// 「其中一对网口本来就不通」在多配对批量测试里是两件常见且不同的事。
+    LinkAbandoned,
     LegThreadPanic,
     NicDisappeared,
     NicRateMissing,
@@ -164,6 +170,7 @@ impl ReasonCode {
             ReasonCode::IperfPreflightFailed => "IPERF_PREFLIGHT_FAILED",
             ReasonCode::IperfRuntimeErrors => "IPERF_RUNTIME_ERRORS",
             ReasonCode::IperfSummaryLost => "IPERF_SUMMARY_LOST",
+            ReasonCode::LinkAbandoned => "LINK_ABANDONED",
             ReasonCode::LegThreadPanic => "LEG_THREAD_PANIC",
             ReasonCode::NicDisappeared => "NIC_DISAPPEARED",
             ReasonCode::NicRateMissing => "NIC_RATE_MISSING",
@@ -301,6 +308,7 @@ impl FromStr for ReasonCode {
             "IPERF_RUNTIME_ERRORS" => ReasonCode::IperfRuntimeErrors,
             "IPERF_SUMMARY_LOST" => ReasonCode::IperfSummaryLost,
             "LEG_THREAD_PANIC" => ReasonCode::LegThreadPanic,
+            "LINK_ABANDONED" => ReasonCode::LinkAbandoned,
             "NIC_DISAPPEARED" => ReasonCode::NicDisappeared,
             "NIC_RATE_MISSING" => ReasonCode::NicRateMissing,
             "NO_STREAM_STARTED" => ReasonCode::NoStreamStarted,
@@ -347,7 +355,7 @@ impl FromStr for ReasonCode {
 
 /// 所有码，供穷举式测试使用。
 #[cfg(test)]
-pub const ALL_REASON_CODES: [ReasonCode; 83] = [
+pub const ALL_REASON_CODES: [ReasonCode; 84] = [
     ReasonCode::ActiveStreamsLow,
     ReasonCode::ConfiguredLoadTooLow,
     ReasonCode::CounterStalled,
@@ -391,6 +399,7 @@ pub const ALL_REASON_CODES: [ReasonCode; 83] = [
     ReasonCode::IperfPreflightFailed,
     ReasonCode::IperfRuntimeErrors,
     ReasonCode::IperfSummaryLost,
+    ReasonCode::LinkAbandoned,
     ReasonCode::LegThreadPanic,
     ReasonCode::NicDisappeared,
     ReasonCode::NicRateMissing,

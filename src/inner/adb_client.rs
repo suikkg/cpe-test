@@ -302,27 +302,32 @@ with tempfile.TemporaryFile() as log:
         };
         let fake = FakeAdb::new();
         let servers = iperf::IperfServerMgr::new();
-        for udp in [false, true] {
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        for (udp, bind_ip, v6) in [
+            (false, "127.0.0.1", false),
+            (true, "127.0.0.1", false),
+            (false, "::1", true),
+            (true, "::1", true),
+        ] {
+            let listener = std::net::TcpListener::bind((bind_ip, 0)).unwrap();
             let port = listener.local_addr().unwrap().port();
             drop(listener);
-            let id = format!("{}-{udp}", fake.owner);
+            let id = format!("{}-{udp}-{v6}", fake.owner);
             servers
                 .start(
                     &bin,
                     &IperfServerStartReq {
-                        bind_ip: "127.0.0.1".into(),
+                        bind_ip: bind_ip.into(),
                         port,
                         request_id: id.clone(),
                         owner_id: id.clone(),
                         lease_secs: 60,
-                        ..Default::default()
+                        v6,
                     },
                 )
                 .unwrap();
             let req = IperfClientReq {
-                dst: "127.0.0.1".into(),
-                bind_ip: "127.0.0.1".into(),
+                dst: bind_ip.into(),
+                bind_ip: bind_ip.into(),
                 duration: 1,
                 port,
                 udp,
@@ -331,7 +336,7 @@ with tempfile.TemporaryFile() as log:
                 } else {
                     Vec::new()
                 },
-                ..Default::default()
+                v6,
             };
             let result = run(
                 &fake.adb,
@@ -391,6 +396,7 @@ with tempfile.TemporaryFile() as log:
             preflight: &LinkPreflight {
                 board_iface: "br0".into(),
                 counter_source: None,
+                addresses: TrafficAddresses::ipv4(&cfg.links[0]),
             },
             bin: &bin,
             agent: None,

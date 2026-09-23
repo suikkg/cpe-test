@@ -127,6 +127,27 @@ fn real_main(args: Vec<String>) -> i32 {
             };
             master::replay_report(std::path::Path::new(&dir))
         }
+        // 两轮对比：`cpe_test compare <基线目录> <本轮目录>`。
+        //
+        // 「B12 固件比 B11 掉了多少」是版本验收唯一要回答的问题，而在此之前
+        // 它只能靠人眼比对两份 210 行的报告。**发现回归返回非 0**，
+        // 所以它可以直接接在 CI 里当一道门。
+        "compare" => {
+            let positional: Vec<String> = args[1..]
+                .iter()
+                .filter(|arg| !arg.starts_with("--"))
+                .cloned()
+                .collect();
+            let [baseline, current] = positional.as_slice() else {
+                eprintln!("用法: cpe_test compare <基线 run 目录> <本轮 run 目录>");
+                eprintln!("      两个目录都要有 rows.jsonl；对比报告写进本轮目录。");
+                return 2;
+            };
+            master::compare_runs(
+                std::path::Path::new(baseline),
+                std::path::Path::new(current),
+            )
+        }
         "scan" => {
             let f = parse_flags(&args[1..]);
             let (cfg, _) = config::load_config(flag_value(&f, "config").as_deref());
@@ -365,6 +386,12 @@ fn print_help() {
    cpe_test report <run目录>    从已有运行目录重放报告
        用途: 主控崩溃后把已完成部分的完整报告放出来（结果每个单元都已落盘），
              或改了报告模板后拿历史数据重渲染。例: cpe_test report runs/run_20260830_101112_1234
+   cpe_test compare <基线目录> <本轮目录>   两轮对比，出差异报告
+       用途: 版本回归——「这版固件比上版掉了多少」。列出判定变坏 / 速率下降 /
+             转好 / 新增 / 缺失。对齐键不含协商速率与 IP 地址——Wi-Fi 重新协商、
+             DHCP 换址都不会把同一条测试拆成「新增 + 缺失」两行。
+             **发现回归返回非 0**，可直接当 CI 的一道门。
+             例: cpe_test compare runs/run_20260901_090000_111 runs/run_20260908_090000_222
    cpe_test scan               查看本机网卡识别结果
        --prefix A.,B.
    cpe_test monitor            独立网卡速率监控 (按 Ctrl+C 停止)

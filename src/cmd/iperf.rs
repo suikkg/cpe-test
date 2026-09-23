@@ -18,7 +18,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::io::BufReader;
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6, TcpStream, ToSocketAddrs};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -222,6 +222,16 @@ pub struct IperfParsed {
     pub udp_loss_pct: Option<f64>,
     pub udp_lost_datagrams: Option<u64>,
     pub udp_total_datagrams: Option<u64>,
+    /// TCP 全程重传次数（iperf3 sender 汇总行的 `Retr` 列）。
+    ///
+    /// **只作诊断，不参与判定**（ADR-17）。它回答的是 TCP 没跑满时那个必答题：
+    /// 是链路在丢包（重传高），还是窗口没喂饱（重传接近 0、只是发不出去）。
+    /// 这两种结论对应的整改动作相反，而在此之前要拿到它只能去翻 raw log。
+    ///
+    /// `None` = 这段输出里没有 `Retr` 列。UDP 没有这一列，server 侧的
+    /// receiver 汇总行也没有——「不知道」和「一次没重传」是两件事，
+    /// 后者会让人以为链路是干净的。
+    pub tcp_retransmits: Option<u64>,
 }
 
 impl IperfParsed {
@@ -258,6 +268,13 @@ pub fn parse_output(text: &str) -> IperfParsed {
     let rate_re = Regex::new(r"(\d+(?:[.,]\d+)?)\s*([KMGT]?)(bits|Bytes)/sec").expect("regex");
     // 只取计数，百分比连捕获都不做：格式由 iperf3 决定，计数不会有歧义。
     let loss_count_re = Regex::new(r"(\d+)\s*/\s*(\d+)\s*\(").expect("regex");
+    // TCP 的 `Retr` 列**紧跟在速率单位后面**，而且必须是一个完整的整数：
+    //   [  5]  0.00-10.00  sec  1.09 GBytes   933 Mbits/sec  221   sender
+    // 锚在单位上是为了排掉 UDP。UDP 的 sender 行同一个位置是抖动
+    //   ... 1.05 Mbits/sec  0.000 ms  0/906 (0%)  sender
+    // `\d+` 能吃下 `0`，但后面跟的是 `.` 而不是空白，整条匹配就落空——
+    // 于是 UDP 永远拿不到 Retr，而不是拿到一个假的 0。
+    let retr_re = Regex::new(r"(?:bits|Bytes)/sec\s+(\d+)(?:\s|$)").expect("regex");
 
     let mut p = IperfParsed::default();
     for raw_line in text.lines() {
@@ -286,6 +303,13 @@ pub fn parse_output(text: &str) -> IperfParsed {
                 mbps *= 8.0;
             }
             last = Some(mbps);
+        }
+        // 多流时 `[SUM]` 行排在各流之后，多次 attempt 时后一次排在前一次之后，
+        // 「后出现的覆盖前面的」因此与速率、丢包两处的取值规则完全一致。
+        if line.contains("sender") {
+            if let Some(cap) = retr_re.captures(&line) {
+                p.tcp_retransmits = cap[1].parse().ok();
+            }
         }
         if let Some(v) = last {
             if line.contains("sender") {
@@ -614,15 +638,15 @@ impl IperfServerMgr {
             });
         }
 
-        // 等待就绪：普通地址用 TCP connect；IPv6 link-local 的 scope 语法在各平台
-        // 不一致，改为短暂等待后确认进程仍存活，client 侧另有连接重试兜底。
+        // 显式 scope 的 IPv6 也要经 TCP connect 确认；Windows 既有不带 zone 的
+        // link-local 绑定仍保留短暂等待 + 进程存活确认，client 侧有连接重试兜底。
         let clean_bind = req
             .bind_ip
             .split('%')
             .next()
             .unwrap_or(&req.bind_ip)
             .to_lowercase();
-        let ready = if clean_bind.starts_with("fe80:") {
+        let ready = if clean_bind.starts_with("fe80:") && !req.bind_ip.contains('%') {
             std::thread::sleep(Duration::from_millis(300));
             self.confirm_server_child_running(req.port, &req.request_id)
         } else {
@@ -963,6 +987,44 @@ fn finish_server_output(entry: &mut SrvEntry) -> String {
 
 use std::time::Duration as StdDuration;
 
+fn server_probe_addresses(bind_ip: &str, port: u16) -> Result<Vec<SocketAddr>, String> {
+    if let Some((address, zone)) = bind_ip.split_once('%') {
+        let ip = address
+            .parse::<Ipv6Addr>()
+            .map_err(|e| format!("解析 IPv6 地址失败 {bind_ip}: {e}"))?;
+        let scope_id = if !zone.is_empty() && zone.bytes().all(|b| b.is_ascii_digit()) {
+            zone.parse::<u32>()
+                .map_err(|e| format!("IPv6 scope 无效 {bind_ip}: {e}"))?
+        } else {
+            #[cfg(unix)]
+            {
+                let name = std::ffi::CString::new(zone)
+                    .map_err(|_| format!("IPv6 scope 接口名无效 {bind_ip}"))?;
+                // CString 提供以 NUL 结尾的有效接口名，返回 0 表示接口不存在。
+                unsafe { libc::if_nametoindex(name.as_ptr()) }
+            }
+            #[cfg(not(unix))]
+            {
+                return Err(format!("IPv6 scope 必须使用有效的数字接口索引：{bind_ip}"));
+            }
+        };
+        if scope_id == 0 {
+            return Err(format!("IPv6 scope 必须对应有效接口：{bind_ip}"));
+        }
+        return Ok(vec![SocketAddr::V6(SocketAddrV6::new(
+            ip, port, 0, scope_id,
+        ))]);
+    }
+    let addresses: Vec<_> = (bind_ip, port)
+        .to_socket_addrs()
+        .map_err(|e| format!("解析地址失败 {bind_ip}:{port}: {e}"))?
+        .collect();
+    if addresses.is_empty() {
+        return Err(format!("无法解析地址 {bind_ip}:{port}"));
+    }
+    Ok(addresses)
+}
+
 /// TCP connect 探测 iperf3 server 是否已就绪（兼容 IPv4 / IPv6，跨平台）
 fn wait_server_tcp_ready<F>(
     bind_ip: String,
@@ -974,34 +1036,18 @@ where
     F: FnMut() -> Result<(), String>,
 {
     let deadline = Instant::now() + timeout;
-    // probe 地址要去掉 zone（%en0 / %6），getaddrinfo 不支持带 zone 解析
-    let clean = if let Some(idx) = bind_ip.find('%') {
-        &bind_ip[..idx]
-    } else {
-        &bind_ip
-    };
-    // IPv6 需要用 [addr]:port 格式
-    let addr_str = if clean.contains(':') {
-        format!("[{clean}]:{port}")
-    } else {
-        format!("{clean}:{port}")
-    };
     while Instant::now() < deadline {
         confirm_child_running()?;
-        let addrs = addr_str
-            .to_socket_addrs()
-            .map_err(|e| format!("解析地址失败 {addr_str}: {e}"))?;
+        let addrs = server_probe_addresses(&bind_ip, port)?;
         // 取第一个可用的地址
         if let Some(sa) = addrs.last() {
-            match TcpStream::connect_timeout(&sa, StdDuration::from_secs(1)) {
+            match TcpStream::connect_timeout(sa, StdDuration::from_secs(1)) {
                 Ok(_) => return Ok(()),
                 Err(_e) => {
                     // ConnectionRefused 正常（server 还没好）
                     std::thread::sleep(StdDuration::from_millis(200));
                 }
             }
-        } else {
-            return Err(format!("无法解析地址 {addr_str}"));
         }
     }
     Err(format!(
@@ -2166,6 +2212,54 @@ iperf Done.
         assert_eq!(p.sender_mbps, Some(2379.0));
         assert_eq!(p.receiver_mbps, Some(2368.0));
         assert!(p.has_measurement());
+        // 这段输出压根没有 Retr 列（`-w` 没触发拥塞信息时 iperf3 会留空）。
+        // 「不知道」必须是 None——报成 0 等于告诉读报告的人这条链路一次没重传。
+        assert_eq!(p.tcp_retransmits, None);
+    }
+
+    /// 带 `Retr` 列的 TCP 输出：单流取本流 sender 行，多流取 `[SUM]`。
+    const TCP_RETR_SAMPLE: &str = r#"
+[ ID] Interval           Transfer     Bitrate         Retr  Cwnd
+[  5]   0.00-1.00   sec   112 MBytes   939 Mbits/sec   17    412 KBytes
+[  5]   1.00-2.00   sec   111 MBytes   933 Mbits/sec    9    398 KBytes
+- - - - - - - - - - - - - - - - - - - - - - - - -
+[ ID] Interval           Transfer     Bitrate         Retr
+[  5]   0.00-10.00  sec  1.09 GBytes   933 Mbits/sec  221             sender
+[  5]   0.00-10.04  sec  1.09 GBytes   932 Mbits/sec                  receiver
+"#;
+
+    #[test]
+    fn tcp_retransmits_come_from_the_sender_summary_line() {
+        let p = parse_output(TCP_RETR_SAMPLE);
+        assert_eq!(p.tcp_retransmits, Some(221));
+        // 逐秒 interval 行的 17 / 9 不能盖掉汇总行：那是「这一秒重传了几次」，
+        // 当全程重传数用会随最后一个采样周期上下跳。
+        assert_eq!(p.sender_mbps, Some(933.0));
+    }
+
+    const TCP_RETR_SUM_SAMPLE: &str = r#"
+- - - - - - - - - - - - - - - - - - - - - - - - -
+[ ID] Interval           Transfer     Bitrate         Retr
+[  5]   0.00-10.00  sec   372 MBytes   312 Mbits/sec   80             sender
+[  7]   0.00-10.00  sec   371 MBytes   311 Mbits/sec   64             sender
+[SUM]   0.00-10.00  sec   743 MBytes   623 Mbits/sec  144             sender
+[SUM]   0.00-10.04  sec   742 MBytes   620 Mbits/sec                  receiver
+"#;
+
+    #[test]
+    fn multi_stream_retransmits_take_the_sum_line_not_the_last_flow() {
+        let p = parse_output(TCP_RETR_SUM_SAMPLE);
+        // 144 = 80 + 64。取到 64 就是只报了最后一条流的重传。
+        assert_eq!(p.tcp_retransmits, Some(144));
+    }
+
+    #[test]
+    fn udp_never_reports_retransmits_even_though_a_number_follows_the_rate() {
+        // UDP 的 sender 行同一个位置是抖动 `0.000 ms`。这条断言守的就是
+        // 「别把抖动的整数部分当成重传数」——报出 `重传 0 次` 会让人以为
+        // 这条 UDP 链路有重传统计，而 UDP 根本没有重传。
+        assert_eq!(parse_output(UDP_SAMPLE).tcp_retransmits, None);
+        assert_eq!(parse_output(UDP_FULL_LOSS_SAMPLE).tcp_retransmits, None);
     }
 
     const UDP_SAMPLE: &str = r#"

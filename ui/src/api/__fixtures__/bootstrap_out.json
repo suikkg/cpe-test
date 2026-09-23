@@ -83,6 +83,8 @@
         1600,
         65500
       ],
+      "probe_during_traffic": false,
+      "probe_path_mtu": false,
       "small_max_bytes": 128,
       "wifi_large_avg_rtt_ms": 100.0,
       "wifi_large_max_rtt_ms": 200.0,
@@ -118,6 +120,8 @@
   "ping_wired_medium_max_rtt_ms": 50.0,
   "ping_wired_small_avg_rtt_ms": 10.0,
   "ping_wired_small_max_rtt_ms": 30.0,
+  "probe_during_traffic": false,
+  "probe_path_mtu": false,
   "screenshot": true,
   "tcp_streams": [
     10

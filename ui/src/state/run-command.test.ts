@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { PlanOut } from '../api/dto';
-import { plan, buildRunRequest } from './plan';
-import { reset, run, start, stop, stopPolling, syncStatus } from './run';
+import { plan, buildRunRequest, reset as resetPlan } from './plan';
+import { applyProgress, prepareAfterUnknownStart, reset, run, skipUnit, start, stop, stopPolling, syncStatus } from './run';
 import { session, reset as resetSession } from './session';
 
 /**
@@ -178,6 +178,101 @@ describe('开始：结果未知不等于失败', () => {
     await Promise.all([first, second]);
     const runPosts = fetchMock.mock.calls.filter((c) => String(c[0]).startsWith('/api/run'));
     expect(runPosts).toHaveLength(1);
+  });
+
+  it('开始成功后，开始前发出的旧快照不能把上一轮结果写回来', async () => {
+    let releaseOld!: (value: FakeResponse) => void;
+    fetchMock.mockReturnValueOnce(new Promise<FakeResponse>((resolve) => { releaseOld = resolve; }));
+    const previous = syncStatus();
+    fetchMock.mockResolvedValueOnce(ok(null));
+    await start();
+    expect(run.startPhase).toBe('accepted');
+    releaseOld(progress('previous-run', false));
+    await previous;
+    expect(run.running).toBe(true);
+    expect(run.status.run_id).toBe('');
+    expect(run.lines).toEqual([]);
+    expect(run.startError).toBe('');
+  });
+
+  it('重置后的旧开始应答不能启动轮询或改变新会话', async () => {
+    let release!: (value: FakeResponse) => void;
+    fetchMock.mockReturnValueOnce(new Promise<FakeResponse>((resolve) => { release = resolve; }));
+    const previous = start();
+    reset();
+    release(ok(null));
+    await previous;
+    expect(run.running).toBe(false);
+    expect(run.startPhase).toBe('idle');
+    expect(run.polling).toBe(false);
+  });
+
+  it('未知应答后空闲快照不自动解锁；显式恢复只清预览、不重发开始', async () => {
+    run.startPhase = 'unknown';
+    fetchMock.mockResolvedValue(progress('', false));
+    await syncStatus();
+    expect(run.startPhase).toBe('unknown');
+    await start();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    prepareAfterUnknownStart();
+    expect(run.startPhase).toBe('idle');
+    expect(plan.preview).toBeNull();
+    expect(plan.previewRequestFingerprint).toBe('');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    await start();
+    expect(run.startError).toContain('先点「预览」');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('开始超时后必须收到新的状态，旧空闲快照不能提前允许人工恢复', async () => {
+    fetchMock.mockResolvedValueOnce(progress('', false));
+    await syncStatus();
+    expect(run.synced).toBe(true);
+    expect(run.lastSyncAt).not.toBeNull();
+
+    let releaseOld!: (value: FakeResponse) => void;
+    fetchMock.mockReturnValueOnce(new Promise<FakeResponse>((resolve) => { releaseOld = resolve; }));
+    const oldRead = syncStatus();
+    fetchMock.mockRejectedValueOnce(new TypeError('Failed to fetch'));
+    let releaseNew!: (value: FakeResponse) => void;
+    fetchMock.mockReturnValueOnce(new Promise<FakeResponse>((resolve) => { releaseNew = resolve; }));
+    await start();
+    expect(run.startPhase).toBe('unknown');
+    expect(run.synced).toBe(false);
+    expect(run.lastSyncAt).toBeNull();
+    prepareAfterUnknownStart();
+    expect(run.startPhase).toBe('unknown');
+    expect(plan.preview).not.toBeNull();
+
+    releaseOld(progress('', false));
+    await oldRead;
+    expect(run.synced).toBe(false);
+    prepareAfterUnknownStart();
+    expect(run.startPhase).toBe('unknown');
+
+    const newRead = syncStatus();
+    releaseNew(progress('', false));
+    await newRead;
+    expect(run.synced).toBe(true);
+    expect(run.startPhase).toBe('unknown');
+    prepareAfterUnknownStart();
+    expect(run.startPhase).toBe('idle');
+    expect(plan.preview).toBeNull();
+    expect(fetchMock.mock.calls.filter((call) => String(call[0]) === '/api/run')).toHaveLength(1);
+  });
+
+  it('未同步、运行中或同步失败时不能解除未知开始', () => {
+    run.startPhase = 'unknown';
+    prepareAfterUnknownStart();
+    expect(run.startPhase).toBe('unknown');
+    run.synced = true;
+    run.running = true;
+    prepareAfterUnknownStart();
+    expect(run.startPhase).toBe('unknown');
+    run.running = false;
+    run.refreshError = '断线';
+    prepareAfterUnknownStart();
+    expect(run.startPhase).toBe('unknown');
   });
 });
 
@@ -372,5 +467,100 @@ describe('挂死的请求不会永久卡住轮询', () => {
     await syncStatus();
     expect(run.synced).toBe(true);
     expect(run.refreshError).toBe('');
+  });
+});
+
+describe('负载下时延开关', () => {
+  it('默认关，且请求体里如实带着 false', () => {
+    // 打开它会在每条腿旁边多跑一个 ping 子进程，也就是改变了测量条件。
+    // 升级一次就悄悄生效，等于在没人注意的情况下改了基线。
+    resetPlan();
+    expect(plan.probeDuringTraffic).toBe(false);
+    expect(buildRunRequest().probe_during_traffic).toBe(false);
+  });
+
+  it('勾上之后进请求体', () => {
+    resetPlan();
+    plan.probeDuringTraffic = true;
+    expect(buildRunRequest().probe_during_traffic).toBe(true);
+  });
+});
+
+describe('跳过当前单元', () => {
+  it('没有明确的运行或当前单元时不发送跳过，首个单元到达后仍只受理一次', async () => {
+    const current = { seq: 1, title: '首个单元', est_secs: 180, started_at: '', link_group: '' };
+    run.running = true;
+    await skipUnit();
+    run.status = { ...emptyRun, run_id: 'active', current: null };
+    await skipUnit();
+    run.status = { ...emptyRun, run_id: '', current };
+    await skipUnit();
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(run.skipPhase).toBe('idle');
+
+    const active = { running: true, from: 0, lines: [], report: '', units_from: 0,
+      run: { ...emptyRun, run_id: 'active', current } };
+    applyProgress(active);
+    fetchMock.mockImplementation(async (path: string) =>
+      path === '/api/skip-unit' ? ok(null) : ok(active));
+    await skipUnit();
+    await syncStatus();
+    expect(run.skipPhase).toBe('accepted');
+    await skipUnit();
+    expect(fetchMock.mock.calls.filter((call) => String(call[0]) === '/api/skip-unit')).toHaveLength(1);
+  });
+
+  it('旧单元增量不解除跳过，目标完成后未知应答才解除', async () => {
+    const current = { seq: 2, title: '当前单元', est_secs: 180, started_at: '', link_group: '' };
+    run.status = { ...emptyRun, run_id: 'active', current };
+    run.running = true;
+    fetchMock.mockRejectedValue(new TypeError('Failed to fetch'));
+    await skipUnit();
+    expect(run.skipPhase).toBe('unknown');
+    const completed = (seq: number) => ({
+      seq, title: `unit ${seq}`, verdict: 'PASS', reason_code: '', reason_detail: '',
+      skipped: false, secs: 1, link_group: '',
+    });
+    applyProgress({ running: true, from: 0, lines: [], report: '', units_from: 1,
+      run: { ...emptyRun, run_id: 'active', current, done: [completed(1)] } });
+    expect(run.skipPhase).toBe('unknown');
+    applyProgress({ running: true, from: 0, lines: [], report: '', units_from: 2,
+      run: { ...emptyRun, run_id: 'active', current: null, done: [completed(2)] } });
+    expect(run.skipPhase).toBe('idle');
+  });
+
+  it('已受理的跳过和停止不能再次发送', async () => {
+    run.running = true;
+    run.skipPhase = 'accepted';
+    run.stopPhase = 'accepted';
+    await skipUnit();
+    await stop();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('拿不到应答时不自动重发——重发会把下一个单元也跳掉', async () => {
+    // 和「开始」「停止」同一条纪律：有副作用的命令超时后一律去读状态，
+    // 不凭超时重来。这里的代价尤其具体：多跳一个单元，而且看不出来。
+    let calls = 0;
+    vi.spyOn(globalThis, 'fetch').mockImplementation(() => {
+      calls += 1;
+      return Promise.reject(new TypeError('Failed to fetch'));
+    });
+    reset();
+    run.running = true;
+    run.status = { ...emptyRun, run_id: 'active',
+      current: { seq: 1, title: '当前单元', est_secs: 180, started_at: '', link_group: '' } };
+    await skipUnit();
+    expect(run.skipPhase).toBe('unknown');
+    expect(calls).toBeLessThanOrEqual(2); // 一次 skip + 一次状态同步，没有重发
+  });
+
+  it('跳过与停止是两个状态位，互不覆盖', () => {
+    // 共用一个状态位的话，跳过一次之后界面会一直显示「已请求停止」。
+    reset();
+    expect(run.skipPhase).toBe('idle');
+    expect(run.stopPhase).toBe('idle');
+    run.skipPhase = 'accepted';
+    expect(run.stopPhase).toBe('idle');
   });
 });

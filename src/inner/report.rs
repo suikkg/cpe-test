@@ -54,10 +54,11 @@ pub(super) fn render(report: &RunReport) -> String {
         if unit.legs.is_empty() {
             let _ = write!(
                 html,
-                "<tr><td class=\"num\">{}</td><td>{}<br>{}</td><td>{}</td><td>{}</td><td class=\"num\">{}</td><td colspan=\"7\">本单元没有产生任何一条腿的结果</td><td><strong>{}</strong><br>{}</td></tr>",
+                "<tr><td class=\"num\">{}</td><td>{}<br>{}</td><td>IPv{} / {}</td><td>{}</td><td class=\"num\">{}</td><td colspan=\"7\">本单元没有产生任何一条腿的结果</td><td><strong>{}</strong><br>{}</td></tr>",
                 unit.index,
                 escape(&unit.host),
                 escape(&unit.link),
+                unit.ip_version,
                 unit.protocol.label(),
                 unit.direction.label(),
                 unit.repeat,
@@ -71,11 +72,12 @@ pub(super) fn render(report: &RunReport) -> String {
             if index == 0 {
                 let _ = write!(
                     html,
-                    "<td rowspan=\"{span}\">{}</td><td rowspan=\"{span}\">{}<br>{}</td><td rowspan=\"{span}\">{}</td><td rowspan=\"{span}\">{}</td><td rowspan=\"{span}\" class=\"num\">{}</td>",
+                    "<td rowspan=\"{span}\">{}</td><td rowspan=\"{span}\">{}<br>{}</td><td rowspan=\"{span}\">IPv{} / {}</td><td rowspan=\"{span}\">{}</td><td rowspan=\"{span}\" class=\"num\">{}</td>",
                     unit.index,
                     escape(&unit.host),
                     escape(&unit.link),
-                    unit.protocol.label(),
+                    unit.ip_version,
+                unit.protocol.label(),
                     unit.direction.label(),
                     unit.repeat
                 );
@@ -108,11 +110,12 @@ pub(super) fn render(report: &RunReport) -> String {
     for unit in &report.units {
         let _ = write!(
             html,
-            "<details><summary>#{} {} / {} · {} · {} · 第 {} 轮 · {}</summary><p>{}: {}</p>",
+            "<details><summary>#{} {} / {} · IPv{} / {} · {} · 第 {} 轮 · {}</summary><p>{}: {}</p>",
             unit.index,
             escape(&unit.host),
             escape(&unit.link),
-            unit.protocol.label(),
+            unit.ip_version,
+                unit.protocol.label(),
             unit.direction.label(),
             unit.repeat,
             escape(&unit.verdict),

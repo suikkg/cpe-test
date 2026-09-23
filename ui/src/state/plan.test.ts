@@ -2,8 +2,10 @@ import { beforeEach, describe, expect, it } from 'vitest';
 import { nextTick } from 'vue';
 import {
   buildRunRequest,
+  clampRounds,
   exportProject,
   importProject,
+  MAX_ROUNDS,
   plan,
   previewIsCurrent,
   projectNotices,
@@ -294,5 +296,47 @@ describe('exportProject 的判定基线兜底', () => {
     plan.masterConfig = { ping: { count: 99 } };
 
     expect(JSON.parse(exportProject()!).master_config).toEqual({ ping: { count: 99 } });
+  });
+});
+
+describe('稳定性轮次', () => {
+  it('默认 1 遍，行为与加这个功能之前一致', () => {
+    reset();
+    expect(plan.rounds).toBe(1);
+    expect(buildRunRequest().rounds).toBe(1);
+  });
+
+  it('上限与 Rust 侧的 MAX_ROUNDS 一致——两边不一样就会「预览说 500 轮、实际跑 100 轮」', () => {
+    expect(MAX_ROUNDS).toBe(100);
+    expect(clampRounds(500)).toBe(100);
+    expect(clampRounds(0)).toBe(1);
+    expect(clampRounds(-3)).toBe(1);
+    expect(clampRounds(2.7)).toBe(2);
+    expect(clampRounds('x')).toBe(1);
+    expect(clampRounds(undefined)).toBe(1);
+  });
+
+  it('进请求体', () => {
+    reset();
+    plan.rounds = 20;
+    expect(buildRunRequest().rounds).toBe(20);
+  });
+});
+
+describe('仅本轮强制档位', () => {
+  it('默认留空，请求体里就是空串——留空是「不覆盖」，不是「覆盖成空」', () => {
+    reset();
+    const req = buildRunRequest();
+    expect(req.force_tcp_window).toBe('');
+    expect(req.force_udp_bandwidth).toBe('');
+  });
+
+  it('填了就进请求体，从而也进 request.json——重跑跑的是同一件事', () => {
+    reset();
+    plan.forceUdpBandwidth = '500m';
+    plan.forceTcpWindow = '64k';
+    const req = buildRunRequest();
+    expect(req.force_udp_bandwidth).toBe('500m');
+    expect(req.force_tcp_window).toBe('64k');
   });
 });

@@ -440,6 +440,31 @@ pub(super) struct RunRequest {
     pub(super) resume: bool,
     #[serde(default)]
     pub(super) screenshot: bool,
+    /// 灌包期间并发一条低速 ICMP 探针，测负载下时延。
+    ///
+    /// 默认关：打开它就改变了测量条件（每条腿多一个 ping 子进程），
+    /// 这个仓库对「在没人注意的情况下改动基线」有明确戒律，所以必须显式打开。
+    #[serde(default)]
+    pub(super) probe_during_traffic: bool,
+    /// 整份计划重复跑多少遍（稳定性 / 拷机）。0 或缺省按 1 处理。
+    #[serde(default)]
+    pub(super) rounds: u32,
+    /// 每个 ping 单元额外做一次路径 MTU 探测（带 DF 位二分）。只进诊断。
+    #[serde(default)]
+    pub(super) probe_path_mtu: bool,
+    /// 「仅本轮」强制 TCP socket buffer（`-w`）；空 = 不覆盖。
+    ///
+    /// 盖在**套件任务配置之后**：配置本身就是覆盖项，排在它前面等于对配过
+    /// 参数的任务无效——而那恰恰是要覆盖的对象。它进 `request.json`，
+    /// 所以「重新执行这一轮」跑的是同一件事。
+    #[serde(default)]
+    pub(super) force_tcp_window: String,
+    /// 「仅本轮」强制 UDP 单流带宽（`-b`）；空 = 不覆盖。
+    ///
+    /// **只换 `-b`**，保留原档位的 `-l` / `-w`：压带宽试一把的时候，
+    /// 报文长度和 socket buffer 换掉的话，测的就不是同一件事了。
+    #[serde(default)]
+    pub(super) force_udp_bandwidth: String,
     /// New suite-plan request.  It is mutually exclusive with legacy `pairs`.
     #[serde(default)]
     pub(super) ui_plan: Option<UiPlan>,
@@ -518,6 +543,8 @@ pub(super) struct BootstrapOut {
     /// **不含任何连接身份**——这份数据会进项目文件，而项目文件是要传阅的。
     pub(super) master_config: serde_json::Value,
     pub(super) screenshot: bool,
+    pub(super) probe_during_traffic: bool,
+    pub(super) probe_path_mtu: bool,
     /// Feature flag for pages that can send the suite-oriented `ui_plan` DTO.
     pub(super) ui_plan_supported: bool,
 }
@@ -552,6 +579,9 @@ pub(super) struct PlanOut {
     pub(super) est_total_secs: u64,
     pub(super) est_full_secs: u64,
     pub(super) notices: Vec<String>,
+    /// 与启动入口共用的阻断原因；普通提示不阻止开始。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) blocking_errors: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(super) sections: Vec<PlanSection>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

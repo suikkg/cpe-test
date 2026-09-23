@@ -223,7 +223,18 @@ fn scan_excursion(
     }
     let mut runs: Vec<Run> = Vec::new();
     let mut current: Option<Run> = None;
+    let mut previous_end_ms: Option<u64> = None;
     for (end_ms, interval_ms, rate) in series {
+        let start_ms = end_ms.saturating_sub(*interval_ms);
+        let separated = previous_end_ms.is_some_and(|previous| {
+            start_ms > previous.saturating_add(ROLLING_COVERAGE_TOLERANCE_MS)
+        });
+        if separated || *interval_ms == 0 || !rate.is_finite() {
+            if let Some(run) = current.take() {
+                runs.push(run);
+            }
+        }
+        previous_end_ms = Some(*end_ms);
         if *interval_ms == 0 || !rate.is_finite() {
             continue;
         }
@@ -235,7 +246,7 @@ fn scan_excursion(
                 }
                 None => {
                     current = Some(Run {
-                        start_ms: end_ms.saturating_sub(*interval_ms),
+                        start_ms,
                         span_ms: *interval_ms,
                         extreme: *rate,
                     })
@@ -490,14 +501,17 @@ pub(crate) fn rate_window_coverage_sufficient(
             && tx_stats.rolling_coverage >= MIN_RATE_SAMPLE_COVERAGE)
 }
 
-pub(crate) fn nearest_valid_sample(
-    out: &MonitorStopOut,
+/// `sorted_samples` 必须只含有效样本并按 elapsed_ms 升序排列；调用方一次建立索引，
+/// 每个窗口边界仅二分定位左右邻居，避免长时间高频采样时反复全量扫描。
+pub(crate) fn nearest_valid_sample<'a>(
+    sorted_samples: &[&'a MonitorSample],
     elapsed_ms: u64,
     max_distance_ms: u64,
-) -> Option<&MonitorSample> {
-    out.samples
+) -> Option<&'a MonitorSample> {
+    let right = sorted_samples.partition_point(|sample| sample.elapsed_ms < elapsed_ms);
+    [right.checked_sub(1), Some(right)]
         .iter()
-        .filter(|sample| sample.valid)
+        .filter_map(|index| index.and_then(|index| sorted_samples.get(index).copied()))
         .min_by_key(|sample| sample.elapsed_ms.abs_diff(elapsed_ms))
         .filter(|sample| sample.elapsed_ms.abs_diff(elapsed_ms) <= max_distance_ms)
 }
@@ -775,27 +789,49 @@ pub(crate) fn monitor_rate_stats(
 /// 取「最长连续一段」而不是零样本总数，是为了区分两种形态：
 /// 起流前后各零几秒是正常的（分散的短段），而中途卡死不动是异常的（一整段）。
 fn longest_zero_delta_run_ms(out: &MonitorStopOut, window: &EffectiveWindow, rx: bool) -> u64 {
+    // 分子和平均值的分母必须使用同一段时间：边界样本先裁窗、乱序先排序，
+    // 重复或重叠的时间只计一次。无数据的间隔不能把两个短停顿拼成连续停滞。
+    let mut intervals: Vec<_> = out
+        .samples
+        .iter()
+        .filter(|sample| {
+            sample.valid
+                && sample.interval_ms > 0
+                && (if rx { sample.rx_mbps } else { sample.tx_mbps }).is_finite()
+        })
+        .filter_map(|sample| {
+            let start_ms = sample
+                .elapsed_ms
+                .saturating_sub(sample.interval_ms)
+                .max(window.start_ms);
+            let end_ms = sample.elapsed_ms.min(window.end_ms);
+            let delta = if rx {
+                sample.rx_delta_bytes
+            } else {
+                sample.tx_delta_bytes
+            };
+            (end_ms > start_ms).then_some((start_ms, end_ms, delta == 0))
+        })
+        .collect();
+    intervals.sort_by_key(|(start_ms, end_ms, _)| (*start_ms, *end_ms));
     let mut longest = 0u64;
     let mut current = 0u64;
-    for sample in &out.samples {
-        if !sample.valid
-            || sample.interval_ms == 0
-            || sample.elapsed_ms <= window.start_ms
-            || sample.elapsed_ms.saturating_sub(sample.interval_ms) >= window.end_ms
-        {
+    let mut covered_until_ms = window.start_ms;
+    for (start_ms, end_ms, zero_delta) in intervals {
+        let non_overlapping_start_ms = start_ms.max(covered_until_ms);
+        if end_ms <= non_overlapping_start_ms {
             continue;
         }
-        let delta = if rx {
-            sample.rx_delta_bytes
-        } else {
-            sample.tx_delta_bytes
-        };
-        if delta == 0 {
-            current = current.saturating_add(sample.interval_ms);
+        if start_ms > covered_until_ms.saturating_add(ROLLING_COVERAGE_TOLERANCE_MS) {
+            current = 0;
+        }
+        if zero_delta {
+            current = current.saturating_add(end_ms - non_overlapping_start_ms);
             longest = longest.max(current);
         } else {
             current = 0;
         }
+        covered_until_ms = end_ms;
     }
     longest
 }
@@ -804,6 +840,47 @@ fn longest_zero_delta_run_ms(out: &MonitorStopOut, window: &EffectiveWindow, rx:
 mod tests {
     use super::*;
     use crate::verdict::Verdict;
+
+    #[test]
+    fn indexed_sample_lookup_matches_a_linear_scan_at_tolerance_boundaries() {
+        let times = [0, 1, 499, 500, 1_500, 3_000, u64::MAX - 2, u64::MAX];
+        for valid_mask in 0..(1u16 << times.len()) {
+            let raw: Vec<_> = times
+                .iter()
+                .enumerate()
+                .rev()
+                .map(|(index, elapsed_ms)| MonitorSample {
+                    elapsed_ms: *elapsed_ms,
+                    valid: valid_mask & (1 << index) != 0,
+                    ..Default::default()
+                })
+                .collect();
+            let mut indexed: Vec<_> = raw.iter().filter(|sample| sample.valid).collect();
+            indexed.sort_unstable_by_key(|sample| sample.elapsed_ms);
+            for tolerance in [0, 1, 50, 1_500, u64::MAX] {
+                for timestamp in times {
+                    let queries = [
+                        timestamp,
+                        timestamp.saturating_sub(tolerance),
+                        timestamp.saturating_sub(tolerance).saturating_sub(1),
+                        timestamp.saturating_add(tolerance),
+                        timestamp.saturating_add(tolerance).saturating_add(1),
+                    ];
+                    for query in queries {
+                        let expected = raw
+                            .iter()
+                            .filter(|sample| sample.valid)
+                            .map(|sample| sample.elapsed_ms.abs_diff(query))
+                            .filter(|distance| *distance <= tolerance)
+                            .min();
+                        let actual = nearest_valid_sample(&indexed, query, tolerance)
+                            .map(|sample| sample.elapsed_ms.abs_diff(query));
+                        assert_eq!(actual, expected, "query={query}, tolerance={tolerance}");
+                    }
+                }
+            }
+        }
+    }
 
     /// 测试里仍按老三元组读结论，省得每条断言都改成字段访问。
     fn nic_rx(
@@ -1119,6 +1196,90 @@ mod tests {
         assert!(stats.stalled_ratio < 0.05, "{}", stats.stalled_ratio);
         let (verdict, _, _) = nic_rx(RateMode::Observe, None, &stats);
         assert_eq!(verdict, Verdict::Measured);
+    }
+
+    #[test]
+    fn stalled_counter_duration_uses_the_same_clipped_time_as_the_average() {
+        // 两端各只有 100ms 的零增长落进判定窗，完整的边界样本却各有 1 秒。
+        let mut samples = vec![sample(1_000, 0)];
+        samples.extend((2..=10).map(|i| sample(i * 1_000, 125_000_000)));
+        samples.push(sample(11_000, 0));
+        let window = EffectiveWindow {
+            start_ms: 900,
+            end_ms: 10_100,
+            ..Default::default()
+        };
+        let stats = monitor_rate_stats(
+            &MonitorStopOut {
+                samples,
+                ..Default::default()
+            },
+            &window,
+            true,
+            0,
+        );
+        assert!((stats.stalled_ratio - 100.0 / 9_200.0).abs() < 1e-9);
+        assert_eq!(
+            evaluate_rx_acceptance(RateMode::Verify, Some(900.0), &stats).verdict,
+            Verdict::Pass,
+            "窗口外空闲不能把有效 RX 达标的结果降为不可评价"
+        );
+    }
+
+    #[test]
+    fn stalled_counter_runs_ignore_duplicates_and_stop_at_missing_samples() {
+        let window = EffectiveWindow {
+            start_ms: 0,
+            end_ms: 100_000,
+            ..Default::default()
+        };
+        let samples: Vec<_> = (1..=100)
+            .map(|i| {
+                let mut point = sample(
+                    i * 1_000,
+                    if (40..=46).contains(&i) {
+                        0
+                    } else {
+                        125_000_000
+                    },
+                );
+                point.valid = i != 43;
+                point
+            })
+            .collect();
+        let stats_for = |samples| {
+            monitor_rate_stats(
+                &MonitorStopOut {
+                    samples,
+                    ..Default::default()
+                },
+                &window,
+                true,
+                0,
+            )
+        };
+        let ordered = stats_for(samples.clone());
+        assert!((ordered.stalled_ratio - 3.0 / 99.0).abs() < 1e-9);
+        assert_eq!(
+            evaluate_rx_acceptance(RateMode::Verify, Some(900.0), &ordered).verdict,
+            Verdict::Pass,
+            "缺采两侧各 3 秒不等于连续停滞 6 秒"
+        );
+        let mut repeated_and_reordered = samples.clone();
+        repeated_and_reordered.extend(
+            samples
+                .iter()
+                .filter(|point| point.rx_delta_bytes == 0)
+                .cloned(),
+        );
+        repeated_and_reordered.reverse();
+        let reordered = stats_for(repeated_and_reordered);
+        assert_eq!(reordered.stalled_ratio, ordered.stalled_ratio);
+        assert_eq!(reordered.avg_mbps, ordered.avg_mbps);
+        assert_eq!(reordered.coverage, ordered.coverage);
+
+        let missing = stats_for(samples.into_iter().filter(|point| point.valid).collect());
+        assert_eq!(missing.stalled_ratio, ordered.stalled_ratio);
     }
 
     /// 窗口没攒够要求时长时，判定确实不该给结论，但**速率必须照常算出来**。
@@ -1521,6 +1682,27 @@ mod tests {
             rate_excursion(&series, target, 0).map(|e| e.kind),
             Some(ExcursionKind::Outage)
         );
+    }
+
+    #[test]
+    fn a_sampling_gap_cannot_join_separate_short_excursions() {
+        // 掉速 3 秒、缺采 1 秒、再掉速 3 秒，不能宣称连续掉速 6 秒。
+        let series: Vec<_> = raw_series(20, |i| if (5..=11).contains(&i) { 100.0 } else { 900.0 })
+            .into_iter()
+            .filter(|(end, _, _)| *end != 8_000)
+            .collect();
+        assert!(rate_excursion(&series, 800.0, 0).is_none());
+
+        // 真实长段仍需保留，并报告自己的起点、时长与分段数。
+        let series: Vec<_> = raw_series(20, |i| if (5..=13).contains(&i) { 100.0 } else { 900.0 })
+            .into_iter()
+            .filter(|(end, _, _)| *end != 8_000)
+            .collect();
+        let excursion = rate_excursion(&series, 800.0, 0).expect("第二段实测 5 秒");
+        assert_eq!(excursion.started_at_ms, 8_000);
+        assert_eq!(excursion.longest_ms, 5_000);
+        assert_eq!(excursion.total_ms, 8_000);
+        assert_eq!(excursion.runs, 2);
     }
 
     /// 断流和掉坑各判各的：「基本为 0」比「掉到 10%」严得多。

@@ -64,7 +64,11 @@ pub(super) fn esc(s: &str) -> String {
         .replace('"', "&quot;")
 }
 
-pub fn report_endpoint(pc: &str, iface: &str, ip: &str) -> String {
+/// 端点的一行说明：`主控 / WLAN (192.168.1.2) [CPE_TEST_5G · 信道 149 · 信号 99%]`。
+///
+/// `wifi` 为空（有线口、或这台机器采不到无线上下文）时方括号整段不出现——
+/// 一个空的 `[]` 会让人以为「本来该有东西而没读到」。
+pub fn report_endpoint(pc: &str, iface: &str, ip: &str, wifi: &str) -> String {
     let mut identity = [pc, iface]
         .into_iter()
         .filter(|part| !part.is_empty())
@@ -79,10 +83,14 @@ pub fn report_endpoint(pc: &str, iface: &str, ip: &str) -> String {
         identity.push(')');
     }
     if identity.is_empty() {
-        NOT_APPLICABLE.to_string()
-    } else {
-        identity
+        return NOT_APPLICABLE.to_string();
     }
+    if !wifi.is_empty() {
+        identity.push_str(" [");
+        identity.push_str(wifi);
+        identity.push(']');
+    }
+    identity
 }
 
 pub(super) fn rx_avg_text(value: Option<f64>, is_ping: bool) -> String {
@@ -162,6 +170,7 @@ pub(super) fn streams_text(value: Option<StreamCounts>) -> String {
 
 pub(super) fn quality_text(
     udp_loss: Option<f64>,
+    tcp_retransmits: Option<u64>,
     ping_loss: Option<f64>,
     ping_min: Option<f64>,
     ping_avg: Option<f64>,
@@ -170,6 +179,12 @@ pub(super) fn quality_text(
 ) -> String {
     if let Some(loss) = udp_loss {
         return format!("UDP 丢包 {loss:.3}%");
+    }
+    // TCP 那一格此前恒为 `—`。重传是这一列对 TCP 唯一有意义的质量指标，
+    // 而 `Some(0)` 是**有信息量的**：它证明链路是干净的，没跑满得去查别处。
+    // 所以这里不做 `> 0` 过滤，只在压根没有 `Retr` 列时才留空。
+    if let Some(retr) = tcp_retransmits {
+        return format!("TCP 重传 {retr} 次");
     }
     if is_ping {
         let mut parts = Vec::new();

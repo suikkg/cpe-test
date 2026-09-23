@@ -5,6 +5,7 @@
 //! 是唯一能穷举它们的地方。
 
 use super::*;
+use crate::master::plan::ExecutionPlan;
 use crate::protocol::NicInfo;
 use serde_json::json;
 
@@ -100,6 +101,11 @@ fn request() -> RunRequest {
         limit_udp_by_link_speed: false,
         resume: false,
         screenshot: false,
+        probe_during_traffic: false,
+        probe_path_mtu: false,
+        force_tcp_window: String::new(),
+        force_udp_bandwidth: String::new(),
+        rounds: 1,
         ui_plan: None,
         plan_hash: None,
     }
@@ -189,6 +195,46 @@ fn suite_request() -> RunRequest {
     });
     req.plan_hash = None;
     req
+}
+
+/// **「仅本轮强制档位」在 `pairs` 这条路上也必须生效。**
+///
+/// `config_from_request` 有两条出口：带 `ui_plan` 的转去 `config_from_ui_plan`，
+/// 其余走 `pairs` + 自动配对（**全部 6 份出厂预设的主通路**）。覆盖只盖在前者
+/// 身上的话，后者的失败是安静的：请求里写着 `force_udp_bandwidth: "500m"`，
+/// 归档下来的 `request.json` 也如实记着 500m，实际跑的却是套件自己的档位——
+/// 于是「重新执行这一轮」和这一轮不是同一件事，而那正是那个按钮存在的理由。
+#[test]
+fn a_forced_bandwidth_reaches_the_legacy_pairs_path_too() {
+    let state = state_with_pair();
+    let mut req = request();
+    assert!(
+        req.ui_plan.is_none(),
+        "这条用例要走的正是没有 ui_plan 的那条路"
+    );
+    req.force_udp_bandwidth = "500m".into();
+    req.force_tcp_window = "8m".into();
+
+    let cfg = validated_config_from_request(&state, &req).expect("pairs 请求应能编译");
+    assert!(!cfg.tests.is_empty(), "自动配对应当展开出测试");
+    let mut checked_udp = 0usize;
+    let mut checked_tcp = 0usize;
+    for test in &cfg.tests {
+        if let Some(profiles) = test.udp_profiles.as_ref() {
+            for profile in profiles {
+                assert_eq!(profile.bandwidth, "500m", "UDP 带宽没有被强制覆盖");
+                checked_udp += 1;
+            }
+        }
+        if let Some(windows) = test.tcp_windows.as_ref() {
+            assert_eq!(windows, &vec!["8m".to_string()], "TCP 窗口没有被强制覆盖");
+            checked_tcp += 1;
+        }
+    }
+    // 没有这两句，上面的循环在字段全为 `None` 时会空转通过——一条永远绿的断言
+    // 比没有断言更糟。
+    assert!(checked_udp > 0, "没有一条 UDP 档位被检查到");
+    assert!(checked_tcp > 0, "没有一条 TCP 窗口被检查到");
 }
 
 #[test]
@@ -2009,6 +2055,82 @@ fn connect_rejects_an_invalid_agent_token_before_changing_state() {
     );
 }
 
+#[test]
+fn a_failed_connection_never_pairs_new_credentials_with_old_nics() {
+    for failed_endpoint in ["/health", "/info"] {
+        let state = state_with_pair();
+        let before = json!({
+            "cfg": state.cfg,
+            "host": state.agent_host,
+            "master": state.master,
+            "agent": state.agent,
+        });
+        let console = Arc::new(Console {
+            inner: Default::default(),
+            scenario: Default::default(),
+            state: Mutex::new(state),
+            running: AtomicBool::new(false),
+            run_gate: Mutex::new(()),
+            report: Mutex::new(String::new()),
+            ui_token: String::new(),
+            monitors: Mutex::new(HashMap::new()),
+            run_status: Arc::new(RunStatusRecorder::new()),
+        });
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let peer = std::thread::spawn(move || {
+            for endpoint in ["/health", "/info"] {
+                let mut req = server
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .expect("连接请求应到达测试辅测机");
+                assert_eq!(req.url(), endpoint);
+                assert!(req.headers().iter().any(|header| {
+                    header.field.equiv("Authorization")
+                        && header.value.as_str() == "Bearer new-token"
+                }));
+                let mut body = String::new();
+                req.as_reader().read_to_string(&mut body).unwrap();
+                if endpoint == "/info" {
+                    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+                    assert_eq!(body["ipv4_prefixes"], json!(["172.16."]));
+                }
+                let response = if endpoint == failed_endpoint {
+                    crate::protocol::err_json("模拟连接失败")
+                } else {
+                    crate::protocol::ok_json(HealthOut::default())
+                };
+                req.respond(Response::from_string(response)).unwrap();
+                if endpoint == failed_endpoint {
+                    break;
+                }
+            }
+        });
+        let error = api_connect(
+            &console,
+            &json!({
+                "host": "127.0.0.1", "port": port, "token": "new-token",
+                "ipv4_prefixes": ["172.16."]
+            })
+            .to_string(),
+        )
+        .expect_err("失败的扫描不得提交连接参数");
+        peer.join().unwrap();
+        assert!(error.contains("模拟连接失败"), "{error}");
+        let state = lock_recover(&console.state);
+        let after = json!({
+            "cfg": state.cfg,
+            "host": state.agent_host,
+            "master": state.master,
+            "agent": state.agent,
+        });
+        assert_eq!(
+            after, before,
+            "{failed_endpoint} 失败应保留完整的上次成功快照"
+        );
+    }
+}
+
 /// 界面留空不能把配置文件里的既有档位清成空列表。
 #[test]
 fn empty_lists_fall_back_to_the_configured_values() {
@@ -3692,6 +3814,17 @@ fn request_from_import(out: &serde_json::Value) -> RunRequest {
         limit_udp_by_link_speed: out["limit_udp_by_link_speed"].as_bool().unwrap_or(false),
         resume: out["resume"].as_bool().unwrap_or(false),
         screenshot: settings["screenshot"].as_bool().unwrap_or(false),
+        probe_during_traffic: settings["probe_during_traffic"].as_bool().unwrap_or(false),
+        rounds: settings["rounds"].as_u64().unwrap_or(1) as u32,
+        probe_path_mtu: settings["probe_path_mtu"].as_bool().unwrap_or(false),
+        force_tcp_window: settings["force_tcp_window"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+        force_udp_bandwidth: settings["force_udp_bandwidth"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
         ui_plan: None,
         plan_hash: None,
     }
@@ -4245,6 +4378,91 @@ fn the_plan_reports_both_ends_of_the_resume_estimate() {
     assert_eq!(total, full, "没开 resume 时两个数必须一致");
 }
 
+#[test]
+fn preview_blocking_errors_match_start_rejection_for_unavailable_ipv6() {
+    let console = console_for_monitor_tests();
+    let mut req = suite_request();
+    for task in &mut req.ui_plan.as_mut().unwrap().suites[0].tasks {
+        task.ip = vec!["v4".into(), "v6".into()];
+    }
+    let preview = api_plan(&console, &serde_json::to_string(&req).unwrap()).unwrap();
+    assert_eq!(
+        preview["units"].as_array().unwrap().len(),
+        2,
+        "IPv4 单元仍可预览"
+    );
+    let errors = preview["blocking_errors"]
+        .as_array()
+        .expect("提前暴露阻断原因");
+    assert!(errors
+        .iter()
+        .all(|error| error.as_str().unwrap().contains("IPv6")));
+    assert!(errors
+        .iter()
+        .any(|error| error.as_str().unwrap().contains("两端缺少可用的 IPv6 地址")));
+    req.plan_hash = Some(preview["plan_hash"].as_str().unwrap().to_string());
+    let error = api_run(&console, &serde_json::to_string(&req).unwrap()).unwrap_err();
+    assert_eq!(
+        Some(error.as_str()),
+        errors[0].as_str(),
+        "预览和开始必须采用同一规则"
+    );
+    assert!(
+        !console.running.load(Ordering::SeqCst),
+        "被拒绝不能遗留运行状态"
+    );
+}
+
+#[test]
+fn preview_blocking_errors_match_start_rejection_for_an_empty_legacy_plan() {
+    let console = console_for_monitor_tests();
+    let mut req = request();
+    req.pairs[0].ip = vec!["v6".into()];
+    let body = serde_json::to_string(&req).unwrap();
+    let preview = api_plan(&console, &body).unwrap();
+    assert!(preview["units"].as_array().unwrap().is_empty());
+    let errors = preview["blocking_errors"]
+        .as_array()
+        .expect("空计划同样阻断");
+    assert!(errors[0].as_str().unwrap().contains("没有生成任何测试单元"));
+    assert_eq!(
+        Some(api_run(&console, &body).unwrap_err().as_str()),
+        errors[0].as_str()
+    );
+    assert!(!console.running.load(Ordering::SeqCst));
+}
+
+#[test]
+fn preview_blocking_errors_preserve_legacy_partial_execution_and_healthy_plans() {
+    let console = console_for_monitor_tests();
+    let healthy = api_plan(&console, &serde_json::to_string(&suite_request()).unwrap()).unwrap();
+    assert!(
+        healthy.get("blocking_errors").is_none(),
+        "有效计划省略可选字段，兼容既有响应"
+    );
+    let mut legacy = request();
+    legacy.pairs[0].ip = vec!["v4".into(), "v6".into()];
+    let partial = api_plan(&console, &serde_json::to_string(&legacy).unwrap()).unwrap();
+    assert!(!partial["units"].as_array().unwrap().is_empty());
+    assert!(partial["notices"].as_array().unwrap().iter().any(|notice| {
+        notice
+            .as_str()
+            .unwrap()
+            .contains("两端缺少可用的 IPv6 地址")
+    }));
+    assert!(
+        partial.get("blocking_errors").is_none(),
+        "旧矩阵可继续执行有效部分"
+    );
+
+    let mut compiled = compile_request(&state_with_pair(), &suite_request()).unwrap();
+    compiled
+        .spec_errors
+        .push("测试规格无法生成任务：网口已消失".into());
+    assert_eq!(compiled.blocking_errors(true)[0], compiled.spec_errors[0]);
+    assert_eq!(compiled.blocking_errors(false)[0], compiled.spec_errors[0]);
+}
+
 /// resume 和裁剪开关同理：界面上的勾选是唯一来源，配置文件里的值不参与。
 ///
 /// 这一条以前是控制台唯一没暴露、却又会悄悄生效的配置项——config.json 里
@@ -4568,14 +4786,8 @@ fn a_per_nic_datagram_size_is_bounded_too() {
 
 /// **计划闸门的前提**：预览路径和执行路径必须推导出同一批单元。
 ///
-/// 预览为了把每个单元追溯回它的套件任务，是逐 spec 单独 `build_units` 的；
-/// 执行端是把所有 spec 一次性交进去。两者本该等价（端口计数器是共享的），
-/// 但这份等价从来没有人守过——一旦哪天有了跨 spec 的去重或排序，预览页
-/// 就会开始展示和实际执行不同的东西，而且完全没有痕迹。
-///
-/// 计划哈希就建立在这份等价上：算哈希用的是执行端的推导方式，展示用的是
-/// 逐 spec 的结果。这条断言若红，说明复核页在撒谎，必须先修那个分叉，
-/// 而不是把哈希改成两边各算各的。
+/// 套件预览与实际执行共用 builder 的最终展开，来源只作为旁路索引。
+/// 这条断言钉住全部单元字段，不能只检查个数或哈希。
 #[test]
 fn the_preview_and_execution_paths_build_the_same_units() {
     let state = state_with_pair();
@@ -4595,6 +4807,106 @@ fn the_preview_and_execution_paths_build_the_same_units() {
             format!("{preview:?}"),
             format!("{execution:?}"),
             "同一个位置上的单元不一致"
+        );
+    }
+}
+
+/// 多轮曾只在预览和执行里展开，预览哈希却另算了一份单轮计划，
+/// 于是用户刚确认的两轮任务在真正开始时就被自身的计划闸门拒绝。
+#[test]
+fn a_two_round_console_plan_survives_reload_and_passes_the_execution_gate() {
+    let state = state_with_pair();
+    let mut req = suite_request();
+    let once = compile_request(&state, &req).expect("single round plan");
+    req.rounds = 2;
+    let compiled = compile_request(&state, &req).expect("two round plan");
+    let reloaded: Config =
+        serde_json::from_str(&serde_json::to_string(&compiled.cfg).unwrap()).unwrap();
+    let executed = canonical_plan_units(&reloaded, &state);
+    assert_eq!(executed.len(), once.units.len() * 2);
+    assert_eq!(format!("{:?}", compiled.units), format!("{executed:?}"));
+    let execution = ExecutionPlan::new(&reloaded, "rescanned", executed, Vec::new());
+    assert!(execution.matches(Some(&compiled.plan_hash)));
+    assert_ne!(once.plan_hash, compiled.plan_hash);
+    for (index, original) in once.units.iter().enumerate() {
+        assert_eq!(compiled.units[index].id, original.id, "首轮 ID 不变");
+        let repeated = &compiled.units[index + once.units.len()];
+        assert_eq!(repeated.round, 2);
+        assert_ne!(repeated.id, original.id, "后续轮次保留独立 RESUME 身份");
+        assert_eq!(
+            compiled.trace[index].task_id,
+            compiled.trace[index + once.units.len()].task_id,
+            "整套重复后仍能追溯到同一个套件任务"
+        );
+    }
+}
+
+/// 两个 TCP 档位是两条独立 spec。本轮强制相同窗口后，只在单条 spec
+/// 内去重无法消除它们；UI 和执行必须保留同一个代表，CLI 则仍明确跑两条。
+#[test]
+fn forced_tcp_windows_deduplicate_the_same_units_in_preview_and_execution_only() {
+    let state = state_with_pair();
+    let mut req = suite_request();
+    let recipe = &mut req.ui_plan.as_mut().unwrap().recipes.tcp[0];
+    let mut extra = recipe.profiles[0].clone();
+    extra.window = Some("2m".into());
+    recipe.profiles.push(extra);
+    req.force_tcp_window = "8m".into();
+    req.rounds = 2;
+
+    let compiled = compile_request(&state, &req).expect("forced two round plan");
+    assert_eq!(compiled.cfg.tests.len(), 3, "两档 TCP 加一档 UDP");
+    assert_eq!(compiled.units.len(), 4, "每轮一个 TCP、一个 UDP");
+    assert!(compiled
+        .notices
+        .iter()
+        .any(|notice| notice.contains("移除了 2 个")));
+    let reloaded: Config =
+        serde_json::from_str(&serde_json::to_string(&compiled.cfg).unwrap()).unwrap();
+    let executed = canonical_plan_units(&reloaded, &state);
+    assert_eq!(format!("{:?}", compiled.units), format!("{executed:?}"));
+    let execution = ExecutionPlan::new(&reloaded, "rescanned", executed, Vec::new());
+    assert!(execution.matches(Some(&compiled.plan_hash)));
+    assert_eq!(
+        compiled
+            .trace
+            .iter()
+            .map(|trace| trace.protocol.as_deref())
+            .collect::<Vec<_>>(),
+        vec![Some("tcp"), Some("udp"), Some("tcp"), Some("udp")],
+        "去重和轮次复制之后，来源索引不能错位"
+    );
+    assert_eq!(
+        compiled
+            .trace
+            .iter()
+            .map(|trace| trace.seq)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3, 4]
+    );
+
+    let specs = reloaded
+        .tests
+        .iter()
+        .map(|test| {
+            builder::spec_from_config(test, &reloaded, &state.master, &state.agent).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let mut port = builder::PORT_BASE;
+    let (cli_units, _) = builder::build_units_repeated(
+        &specs,
+        reloaded.require_same_subnet_for_iperf,
+        &mut port,
+        reloaded.rounds,
+    );
+    assert_eq!(cli_units.len(), 6, "CLI 的显式重复配置仍逐条执行");
+    assert_eq!(cli_units[0].id, cli_units[1].id);
+    assert_eq!(cli_units[3].id, cli_units[4].id);
+    for (preview, original_index) in compiled.units.iter().zip([0, 2, 3, 5]) {
+        assert_eq!(
+            format!("{preview:?}"),
+            format!("{:?}", cli_units[original_index]),
+            "去重只移除后续重复项，不重新分配端口或改写轮次身份"
         );
     }
 }
@@ -5119,6 +5431,8 @@ fn the_progress_endpoint_serves_structured_status_next_to_the_log_text() {
             skipped: false,
             secs: 12,
             link_group: "SGMII ↔ WLAN".into(),
+            rx_avg: Some(2310.5),
+            target_mbps: Some(2000.0),
         },
         200,
     );
@@ -5288,6 +5602,10 @@ fn dto_fixtures_are_regenerated_for_the_frontend_contract_test() {
                 skipped: false,
                 secs: 182,
                 link_group: "SGMII ↔ WLAN".into(),
+                // 和上面那句原因里的两个数是同一对——夹具里对不上的话，
+                // 前端照着它写的显示逻辑就是在对着假数据调。
+                rx_avg: Some(2310.5),
+                target_mbps: Some(2000.0),
             },
             120,
         );
@@ -6107,6 +6425,8 @@ fn a_post_without_the_console_header_is_refused_before_it_reaches_any_route() {
         "/api/import",
         "/api/plan",
         "/api/stop",
+        // 掐断正在跑的作业，动的是被测资源——和 /api/stop 同级。
+        "/api/skip-unit",
         "/api/connect",
     ] {
         let (status, body) = post_without_header(path, "{}");
@@ -6157,6 +6477,9 @@ fn every_console_route_declares_its_concurrency_class() {
     let gated = [
         "/api/run",
         "/api/stop",
+        // 掐断正在跑的作业，动的是被测资源——和 /api/stop 同级，
+        // 同样在 run_gate 里做 admission check。
+        "/api/skip-unit",
         "/api/inner/run",
         "/api/inner/stop",
         "/api/inner/probe",
@@ -6174,6 +6497,10 @@ fn every_console_route_declares_its_concurrency_class() {
         "/api/runs/",
         "/api/runs/request",
         "/api/runs/report",
+        // 只读两轮的落盘结果、写一份新的对比 HTML 进历史目录。
+        // 不起测、不占用被测资源，所以不进 gated；它自己会拒绝把
+        // 「正在跑的那一轮」当成对比对象。
+        "/api/runs/compare",
         "/api/inner/status",
         "/api/inner/report",
         "/api/inner/runs",
@@ -6354,4 +6681,135 @@ fn accepting_a_scenario_clears_the_stale_cancel_bit_only_after_the_mutex_check()
         guard < reset,
         "cancel::reset() 跑到了互斥检查前面：一次被拒绝的启动会抹掉正在进行中的停止信号"
     );
+}
+
+/// **两个导入判别器的键集必须零交集。**
+///
+/// 子网和内环各有一个「你把文件导错地方了」的判别器，两边都靠「这些键对方
+/// 一个都没有」来认形状。哪天两边的配置出现同名字段，两个导入口就会开始
+/// 互相拒收对方的文件——而报出来的是一句听上去很确定的错话。
+///
+/// 这条是真撞上过的：子网加稳定性轮次时顺手叫了 `repeats`，而内环早就有一个
+/// `repeats`，于是导出的子网 config 被内环判别器认成内环配置。子网那个改名成
+/// `rounds`——语义上本来也不是一回事（内环在最内层重复单元，子网在最外层重复整套）。
+#[test]
+fn the_two_import_detectors_never_share_a_key() {
+    let subnet_source = include_str!("import.rs");
+    let inner_source = include_str!("../../inner/config.rs");
+    let keys_in = |source: &str, list: &str| -> Vec<String> {
+        let Some(rest) = source.split(list).nth(1) else {
+            return Vec::new();
+        };
+        let Some(body) = rest.split("];").next() else {
+            return Vec::new();
+        };
+        body.split('"')
+            .skip(1)
+            .step_by(2)
+            .map(|key| key.to_string())
+            .collect()
+    };
+    let inner_only = keys_in(subnet_source, "const INNER_ONLY_KEYS");
+    let subnet_only = keys_in(inner_source, "const SUBNET_ONLY_KEYS");
+    assert!(
+        !inner_only.is_empty() && !subnet_only.is_empty(),
+        "两张表都要读得到"
+    );
+
+    // 子网判别器声明「这些键只有内环有」——那 `Config` 就一个都不许有。
+    let subnet_cfg = serde_json::to_value(Config::default()).expect("Config 必须能序列化");
+    for key in &inner_only {
+        assert!(
+            subnet_cfg.get(key).is_none(),
+            "`{key}` 被 INNER_ONLY_KEYS 声明为内环独有，但子网 Config 也有它——\
+             导出的子网配置会被内环判别器认成内环配置。给子网那个字段换个名字。"
+        );
+    }
+    // 反向：内环判别器声明「这些键只有子网有」，两张表自身也不许重叠。
+    for key in &subnet_only {
+        assert!(
+            !inner_only.contains(key),
+            "`{key}` 同时出现在两张「对方独有」的表里，两个判别器会互相拒收"
+        );
+    }
+}
+
+/// 「仅本轮覆盖」必须**盖过套件里配好的任务参数**。
+///
+/// 排在它们前面就等于对「配过参数的任务」完全无效——而那恰恰是要覆盖的对象：
+/// 全局默认值只是没配过的任务的兜底，配过的走的是自己那份。
+#[test]
+fn a_this_run_override_beats_the_recipe_the_suite_already_pinned() {
+    use crate::config::{Config, TestSpec, UdpProfile};
+
+    let mut cfg = Config {
+        tests: vec![TestSpec {
+            name: "配过参数的任务".into(),
+            src: "master:SGMII2.5G".into(),
+            dst: "agent:SGMII2.5G".into(),
+            // 套件里钉死的档位：`-b 2500m -l 14k -w 256m`。
+            udp_profiles: Some(vec![UdpProfile {
+                bandwidth: "2500m".into(),
+                length: Some("14k".into()),
+                window: Some("256m".into()),
+            }]),
+            tcp_windows: Some(vec!["4m".into()]),
+            ..serde_json::from_value(serde_json::json!({
+                "src": "master:SGMII2.5G",
+                "dst": "agent:SGMII2.5G"
+            }))
+            .expect("最小 TestSpec")
+        }],
+        ..Config::default()
+    };
+    cfg.iperf.udp_profiles = vec![UdpProfile::bw("100m")];
+
+    let mut req = request();
+    req.force_udp_bandwidth = "500m".into();
+    req.force_tcp_window = "64k".into();
+    super::plan::apply_force_overrides_for_test(&mut cfg, &req);
+
+    let profiles = cfg.tests[0].udp_profiles.clone().expect("覆盖后仍有档位");
+    assert_eq!(profiles.len(), 1);
+    assert_eq!(
+        profiles[0].bandwidth, "500m",
+        "强制带宽要盖过套件里的 2500m"
+    );
+    // **只换 `-b`**：报文长度和 socket buffer 换掉的话，测的就不是同一件事了。
+    assert_eq!(profiles[0].length.as_deref(), Some("14k"));
+    assert_eq!(profiles[0].window.as_deref(), Some("256m"));
+    assert_eq!(
+        cfg.tests[0].tcp_windows.as_deref(),
+        Some(&["64k".to_string()][..])
+    );
+}
+
+/// 空值 = 不覆盖，而不是「覆盖成空」。留空是最常见的状态。
+#[test]
+fn an_empty_override_leaves_every_recipe_exactly_as_it_was() {
+    use crate::config::{Config, UdpProfile};
+
+    let mut cfg = Config {
+        tests: vec![serde_json::from_value(serde_json::json!({
+            "src": "master:SGMII2.5G",
+            "dst": "agent:SGMII2.5G",
+            "udp_profiles": [{ "bandwidth": "2500m", "length": "14k" }],
+            "tcp_windows": ["4m"]
+        }))
+        .expect("TestSpec")],
+        ..Config::default()
+    };
+    let before = cfg.tests.clone();
+
+    let mut req = request();
+    req.force_udp_bandwidth = "   ".into();
+    req.force_tcp_window = String::new();
+    super::plan::apply_force_overrides_for_test(&mut cfg, &req);
+
+    assert_eq!(
+        cfg.tests[0].udp_profiles, before[0].udp_profiles,
+        "留空不许把档位清掉"
+    );
+    assert_eq!(cfg.tests[0].tcp_windows, before[0].tcp_windows);
+    let _ = UdpProfile::bw("x");
 }

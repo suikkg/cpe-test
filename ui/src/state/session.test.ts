@@ -97,6 +97,38 @@ describe('两个独立请求的失败不互相覆盖', () => {
 });
 
 describe('连接身份与旧快照', () => {
+  it('连接未完成时复用同一请求，输入草稿不冒充已连接身份', async () => {
+    let release!: (value: FakeResponse) => void;
+    fetchMock.mockReturnValueOnce(new Promise<FakeResponse>((resolve) => { release = resolve; }));
+    session.host = '192.168.1.3';
+    const first = connect();
+    session.host = '192.168.1.9';
+    const second = connect();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    release(ok(connectOut));
+    await Promise.all([first, second]);
+    expect(session.connectedHost).toBe('192.168.1.3');
+    expect(session.connectedPort).toBe(28801);
+    expect(session.host).toBe('192.168.1.9');
+  });
+
+  it('重置后的旧连接应答不能覆盖新会话', async () => {
+    let release!: (value: FakeResponse) => void;
+    fetchMock.mockReturnValueOnce(new Promise<FakeResponse>((resolve) => { release = resolve; }));
+    session.host = '192.168.1.3';
+    const old = connect();
+    reset();
+    session.host = '192.168.1.9';
+    const newer = { master: host('new-master', 1), agent: host('new-agent', 1) };
+    fetchMock.mockResolvedValueOnce(ok(newer));
+    await connect();
+    release(ok(connectOut));
+    await old;
+    expect(session.connectedHost).toBe('192.168.1.9');
+    expect(session.connection?.agent.hostname).toBe('new-agent');
+    expect(session.phase).toBe('connected');
+  });
+
   it('成功之后才落地身份，失败保留上一份拓扑并标旧', async () => {
     session.host = '192.168.1.3';
     route({ '/api/connect': ok(connectOut) });
@@ -117,6 +149,19 @@ describe('连接身份与旧快照', () => {
 });
 
 describe('重新扫描', () => {
+  it('重置后的旧扫描不能覆盖新本机快照或扫描状态', async () => {
+    let release!: (value: FakeResponse) => void;
+    fetchMock.mockReturnValueOnce(new Promise<FakeResponse>((resolve) => { release = resolve; }));
+    const old = rescan();
+    reset();
+    session.scanning = true;
+    release(ok(localOut));
+    await old;
+    expect(session.local).toBeNull();
+    expect(session.scanning).toBe(true);
+    expect(session.scanMessage).toBe('');
+  });
+
   it('扫描失败保留上次成功的两张表，并说明下面是旧的', async () => {
     session.host = '192.168.1.3';
     route({ '/api/connect': ok(connectOut) });
@@ -139,5 +184,34 @@ describe('重新扫描', () => {
     expect(session.scanKind).toBe('ok');
     expect(session.scanMessage).toContain('本机 2 块 / 辅测 3 块');
     expect(session.scanMessage).toMatch(/\d{2}:\d{2}:\d{2}/);
+  });
+
+  it('连接扫描失败后的再次扫描必须刷新实际展示的双端快照', async () => {
+    session.host = '192.168.1.3';
+    route({ '/api/connect': ok(connectOut), '/api/local': ok(localOut) });
+    await connect();
+    route({ '/api/local': ok(localOut), '/api/connect': boom() });
+    await rescan();
+    expect(session.phase).toBe('failed');
+
+    const refreshed = { master: host('master', 1), agent: host('agent', 4) };
+    route({ '/api/local': ok(localOut), '/api/connect': ok(refreshed) });
+    await rescan();
+    expect(session.phase).toBe('connected');
+    expect(session.topologyStale).toBe(false);
+    expect(session.connection).toEqual(refreshed);
+    expect(session.scanMessage).toContain('本机 1 块 / 辅测 4 块');
+  });
+
+  it('再次连接仍失败时不能把只刷新的本机信息报成双端扫描成功', async () => {
+    session.host = '192.168.1.3';
+    route({ '/api/connect': ok(connectOut), '/api/local': ok(localOut) });
+    await connect();
+    route({ '/api/local': ok(localOut), '/api/connect': boom() });
+    await rescan();
+    await rescan();
+    expect(session.scanKind).toBe('bad');
+    expect(session.scanMessage).toContain('仍是上次成功的网卡');
+    expect(session.connection).toEqual(connectOut);
   });
 });

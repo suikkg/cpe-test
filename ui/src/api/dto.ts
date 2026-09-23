@@ -18,6 +18,14 @@ export interface NicInfo {
   speed_mbps: number;
   is_wifi: boolean;
   wifi_band: string;
+  /**
+   * 无线上下文。旧版 agent 不上报这几项，所以全部可缺省——
+   * 界面上一律按「没读到」处理，不拿 0 当占位。
+   */
+  wifi_ssid?: string;
+  wifi_signal_pct?: number | null;
+  wifi_channel?: number | null;
+  wifi_radio?: string;
   ifindex: number;
 }
 
@@ -68,6 +76,10 @@ export interface BootstrapOut {
    */
   master_config: Record<string, unknown>;
   screenshot: boolean;
+  /** 灌包期间并发探负载下时延；默认关。 */
+  probe_during_traffic?: boolean;
+  /** 每个 ping 单元额外做一次路径 MTU 探测；只进诊断。 */
+  probe_path_mtu?: boolean;
   ui_plan_supported: boolean;
 }
 
@@ -141,6 +153,7 @@ export interface PlanOut {
   est_total_secs: number;
   est_full_secs: number;
   notices: string[];
+  blocking_errors?: string[];
   sections?: PlanSection[];
   trace?: PlanTrace[];
   plan_hash?: string;
@@ -157,6 +170,15 @@ export interface UnitStatus {
   skipped: boolean;
   secs: number;
   link_group: string;
+  /**
+   * 本单元判定用的接收端 RX 平均（Mbps）；没起过流的单元为 null。
+   *
+   * 与报告汇总行同源。进度页要靠它回答「这一轮的数在不在往下滑」——
+   * 只看 PASS/FAIL 的话，热衰减和 Wi-Fi 退避要等报告出来才发现。
+   */
+  rx_avg?: number | null;
+  /** 本单元判定用的门限（Mbps）；null = 这一轮没有门限（Observe/Discover）。 */
+  target_mbps?: number | null;
 }
 
 export interface CurrentUnit {
@@ -215,6 +237,17 @@ export interface MonitorSeriesOut {
   error: string;
 }
 
+/** 一轮运行的单元级判定分布，取自 `meta.json`，与报告顶部那八个格子同源。 */
+export interface VerdictTotals {
+  total: number;
+  pass: number;
+  rate_fail: number;
+  measured: number;
+  not_evaluated: number;
+  setup_error: number;
+  skipped: number;
+}
+
 export interface RunEntry {
   id: string;
   modified: string;
@@ -223,6 +256,18 @@ export interface RunEntry {
   has_xlsx: boolean;
   has_request: boolean;
   bytes: number;
+  /**
+   * 本轮的开始时刻，取自 `meta.json`。
+   *
+   * **和 `modified` 不是一回事**：后者是目录的修改时刻，重放一次报告它就会变，
+   * 于是隔夜回来看到的「时间」是自己上午点重放的那一下。
+   */
+  started?: string;
+  elapsed?: string;
+  totals?: VerdictTotals;
+  total_units?: number;
+  /** 读到 `meta.json` 了吗；没有就是命令行旧目录或崩在写它之前。 */
+  has_meta?: boolean;
 }
 
 export interface ReplayOut {
@@ -232,6 +277,23 @@ export interface ReplayOut {
   rows: number;
   skipped: number;
   warnings: string[];
+}
+
+/** `/api/runs/compare` 的回包。 */
+export interface CompareOut {
+  baseline: string;
+  current: string;
+  report: string;
+  /** 两轮的 plan_hash 是否一致；不一致时「新增/缺失」说的是计划差异。 */
+  same_plan: boolean;
+  /** 有没有值得拦下来的变化（判定变坏或明显掉速）。 */
+  has_regression: boolean;
+  regressed: number;
+  slower: number;
+  fixed: number;
+  added: number;
+  disappeared: number;
+  unchanged: number;
 }
 
 export interface RunRequestOut {

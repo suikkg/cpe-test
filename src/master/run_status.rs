@@ -47,6 +47,13 @@ pub struct UnitStatus {
     pub secs: u64,
     /// 报表分组键，来自 `Unit.link_group`。失败清单按链路分组要用它。
     pub link_group: String,
+    /// 本单元判定用的接收端 RX 平均（Mbps）；跳过、准备失败等没起过流的为 `None`。
+    ///
+    /// 与报告汇总行**同一处算出来**：双向合计单元给的是合计值，单向给该方向的
+    /// RX 平均。两处各算一遍会让进度页和报告对同一个单元报两个数。
+    pub rx_avg: Option<f64>,
+    /// 本单元判定用的门限（Mbps）；`None` = 这一轮没有门限（Observe/Discover）。
+    pub target_mbps: Option<f64>,
 }
 
 /// 正在跑的那个单元。
@@ -277,6 +284,8 @@ mod tests {
             skipped: verdict == Verdict::Skip,
             secs: 7,
             link_group: "SGMII ↔ WLAN".into(),
+            rx_avg: Some(2310.5),
+            target_mbps: Some(2000.0),
         }
     }
 

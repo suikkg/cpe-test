@@ -4,6 +4,7 @@
 //! 判定在 [`super::verdict_assembly`] 和 [`crate::master::rate_window`]。
 
 use super::*;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 impl Ctx {
     pub(super) fn build_iperf_requests(
@@ -186,8 +187,22 @@ impl Ctx {
         let live_for_progress = Arc::clone(&live);
         let progress_tag = tag.to_string();
         let progress_protocol = if t.udp { "UDP" } else { "TCP" };
-        let (raw_ok, parsed, client, server_out) = std::thread::scope(|scope| {
+        // 探针的两个信号：起跑等「流量真的连上了」，收尾靠这个标志。
+        // 两个都不能省——省掉前者，平均值被起流前的空载 RTT 稀释；省掉后者，
+        // 一条 2 秒就失败的腿要白等满整个计划时长。见 `latency.rs` 模块文档。
+        let probe_stop = AtomicBool::new(false);
+        let live_for_probe = Arc::clone(&live);
+        let (raw_ok, parsed, client, server_out, load_latency) = std::thread::scope(|scope| {
             let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+            // 负载下时延探针与灌包**同起同落**。它是这一层唯一有资格并发跑的
+            // 额外流量：32 字节、约 1 秒一拍，相对 Gbps 级灌包可以忽略。
+            // 默认关着（`ping.probe_during_traffic`），开着时结果也只进诊断。
+            let latency = scope.spawn(|| {
+                self.probe_load_latency(&t.src, &t.dst, t.v6, t.duration, &probe_stop, || {
+                    let state = lock_recover(&live_for_probe);
+                    state.connected || state.active
+                })
+            });
             let progress = scope.spawn(move || {
                 let mut monitor_enabled = mon_id_for_progress.is_some();
                 loop {
@@ -267,7 +282,15 @@ impl Ctx {
             );
             let _ = done_tx.send(());
             let _ = progress.join();
-            result
+            // 灌包已经结束，探针不必再发包了。正常收尾时它多半已经自己跑完
+            // （`count` 就是计划时长，而灌包还多花了起流和收尾的时间）；
+            // 提前失败时这一下就是那条「别再等了」的指令。
+            probe_stop.store(true, Ordering::SeqCst);
+            // 探针线程 panic 一律按「没探到」处理：它是诊断，不该弄死一条
+            // 已经跑出数的腿。
+            let load_latency = latency.join().ok().flatten();
+            let (raw_ok, parsed, client, server_out) = result;
+            (raw_ok, parsed, client, server_out, load_latency)
         });
         let rx_origin_offset_ms = mon_id.as_ref().map(|(_, offset)| *offset).unwrap_or(0);
         let tx_origin_offset_ms = tx_mon_id.as_ref().map(|(_, offset)| *offset).unwrap_or(0);
@@ -424,6 +447,14 @@ impl Ctx {
             tx_mbps: parsed.best_sender(),
             rx_mbps: parsed.best_receiver(),
             udp_loss: if t.udp { parsed.udp_loss_pct } else { None },
+            // 显式按传输方向分流，和上一行的 `udp_loss` 同一个写法：解析器对
+            // UDP 本来就拿不到 `Retr`，但让「哪一列属于哪个协议」在构造点上
+            // 一眼可见，比依赖解析器的副作用可靠。
+            tcp_retransmits: if t.udp { None } else { parsed.tcp_retransmits },
+            load_latency: load_latency
+                .as_ref()
+                .map(LoadLatency::describe)
+                .unwrap_or_default(),
             screenshot_master,
             screenshot_agent,
             command: client.cmd.clone(),

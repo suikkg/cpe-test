@@ -2,11 +2,12 @@ import { reactive, watch } from 'vue';
 import { api, errorMessage, NetworkError, UnauthorizedError } from '../api/client';
 import { defaultInnerConfig, INNER_DRAFT_KEY, innerLink, mergeInnerUnits, normalizeInnerDraft, parseInnerProject, serializeInnerProject } from '../domain/inner';
 import type { InnerCapability, InnerLink, InnerPreview, InnerRunEntry, InnerStatus, InnerStatusDelta } from '../domain/inner';
+import { innerNicChoices, linksFromInnerChoices } from '../domain/inner-setup';
 import { buildRunRequest, plan as subnetPlan, preview as previewSubnet, previewIsCurrent, adoptRunRequest } from './plan';
 import { goto } from './ui';
 
 export const inner = reactive({
-  config: defaultInnerConfig(), capability: null as InnerCapability | null,
+  config: { ...defaultInnerConfig(), ip_versions: [4, 6] as (4 | 6)[] }, capability: null as InnerCapability | null,
   status: { running: false, current: '', error: null, completed: 0, total: 0, units: [], has_report: false } as InnerStatus,
   /** 计划预览由后端产出；配置一改先标记失效，避免拿旧预览去开跑。 */
   preview: null as InnerPreview | null, previewStale: true, previewError: '',
@@ -25,10 +26,26 @@ let planTimer: ReturnType<typeof setTimeout> | undefined;
 let inFlight: Promise<void> | null = null;
 let loaded = false;
 let planRequest = 0;
+let probeRequest = 0;
 let scenarioTimer: ReturnType<typeof setTimeout> | undefined;
 // 场景状态请求可能跨越一次启动命令；只允许最后发出的那一发改写本地状态。
 // 否则页面初次加载的旧 GET 在启动响应之后返回，会把 running=true 覆盖回 false。
 let scenarioRequest = 0;
+
+/** 扫描结果只描述当时的设备和电脑连接；测试参数不影响这份身份。 */
+function probeConnection() {
+  return {
+    adb_path: inner.config.adb_path,
+    serial: inner.config.serial,
+    board_iperf: inner.config.board_iperf,
+    agents: inner.config.agents.map((agent) => ({ ...agent, address: agent.address.trim() })),
+  };
+}
+watch(() => JSON.stringify(probeConnection()), () => {
+  // 同步失效也防住「改了又改回」：旧请求属于上一次连接，不能重新填回就绪状态。
+  probeRequest++;
+  inner.capability = null;
+}, { flush: 'sync' });
 
 export function loadInnerDraft(): void {
   if (loaded) return;
@@ -139,11 +156,18 @@ async function freshStatusAfterCommand(): Promise<void> {
 
 export async function probeInner(): Promise<void> {
   if (inner.busy || inner.status.running || inner.scenario.running) return;
+  const request = ++probeRequest;
   inner.busy = true; inner.error = ''; inner.capability = null;
   try {
-    // 能力扫描不依赖尚未填完的链路。
-    inner.capability = await api.post<InnerCapability>('/api/inner/probe', { ...normalizeInnerDraft(inner.config), links: [] });
-  } catch (e) { inner.error = errorMessage(e); }
+    // 扫描端点仍校验完整配置，但探测只消费设备连接信息。测试参数可能尚未
+    // 填完（例如刚勾上 UDP 还没填速率），不能让它们挡住发现网口的第一步。
+    const cfg = {
+      ...defaultInnerConfig(),
+      ...probeConnection(),
+    };
+    const capability = await api.post<InnerCapability>('/api/inner/probe', cfg);
+    if (request === probeRequest) inner.capability = capability;
+  } catch (e) { if (request === probeRequest) inner.error = errorMessage(e); }
   finally { inner.busy = false; }
 }
 
@@ -257,6 +281,7 @@ export async function loadScenario(id: string): Promise<void> {
     cfg.resume = true;
     if (!adoptRunRequest(request.subnet, true)) throw new Error('场景中的子网计划无法恢复');
     inner.config = cfg;
+    inner.capability = null;
     inner.preview = null;
     inner.previewStale = true;
     await refreshInnerPlan();
@@ -341,7 +366,7 @@ export function setInnerLinkEnabled(links: InnerLink[], enabled: boolean): void 
  * 哪台电脑的哪个网口」的身份，批量复制过去只会把别人的源 IP 写到自己头上。
  */
 export type InnerBatchPatch = Partial<Pick<InnerLink,
-  'gateway' | 'board_rx_interface' | 'measurement'
+  'gateway' | 'gateway_ipv6' | 'board_rx_interface' | 'measurement'
   | 'upload_min_mbps' | 'download_min_mbps' | 'bidir_total_min_mbps'
   | 'tool_upload_min_mbps' | 'tool_download_min_mbps' | 'tool_bidir_total_min_mbps'>>;
 
@@ -367,4 +392,12 @@ export function addInnerLink(host = 'master'): InnerLink {
   const link = innerLink(host, undefined, `网口 ${i}`);
   inner.config.links.push(link);
   return link;
+}
+
+/** 只添加操作员明确选中的扫描项，保留原有网口及其参数。 */
+export function addInnerScannedLinks(keys: string[]): InnerLink[] {
+  const selected = new Set(keys);
+  const added = linksFromInnerChoices(inner.config.links, innerNicChoices(inner.capability, true).filter((choice) => selected.has(choice.key)), inner.capability);
+  inner.config.links.push(...added);
+  return added;
 }

@@ -161,7 +161,7 @@ onMounted(() => {
         <ProgressView v-else-if="ui.region === 'progress'" />
         <MonitorView v-else-if="ui.region === 'monitor'" />
         <RunsView v-else-if="ui.region === 'runs'" />
-        <InnerView v-else-if="ui.region === 'inner'" />
+        <InnerView v-else-if="ui.region === 'inner'" :subnet-running="run.running" @show-subnet-progress="goto('progress')" />
       </main>
     </div>
   </div>

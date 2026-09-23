@@ -113,6 +113,7 @@ fn assembled_bidir(strategy: Measurement, down_start: u64, total: bool) -> UnitR
         &LinkPreflight {
             board_iface: "br0".into(),
             counter_source: Some(CounterSource::ProcNetDev),
+            addresses: TrafficAddresses::ipv4(&cfg.links[0]),
         },
         raw,
     )
@@ -1496,6 +1497,7 @@ fn report_keeps_both_calibres_side_by_side_and_names_the_one_it_used() {
         index: 1,
         link: "ETH".into(),
         host: "master".into(),
+        ip_version: 4,
         protocol: Protocol::Udp,
         direction: Direction::Bidir,
         streams: 4,
@@ -1589,6 +1591,7 @@ fn the_run_summary_counts_units_not_legs_and_keeps_the_failure_visible() {
                 index: 1,
                 link: "ETH".into(),
                 host: "master".into(),
+                ip_version: 4,
                 protocol: Protocol::Tcp,
                 direction: Direction::Bidir,
                 streams: 1,
@@ -1612,6 +1615,7 @@ fn the_run_summary_counts_units_not_legs_and_keeps_the_failure_visible() {
                 index: 2,
                 link: "Wi-Fi".into(),
                 host: "agent1".into(),
+                ip_version: 4,
                 protocol: Protocol::Tcp,
                 direction: Direction::Upload,
                 streams: 1,
@@ -1759,6 +1763,7 @@ fn unit_row(index: usize) -> UnitRow {
         index,
         link: "ETH".into(),
         host: "master".into(),
+        ip_version: 4,
         protocol: Protocol::Tcp,
         direction: Direction::Upload,
         streams: 1,
@@ -2003,4 +2008,237 @@ fn the_shared_validation_corpus_matches_the_rust_side() {
         ["adb_program", "iface_word", "safe_word", "size_token"],
         "语料必须覆盖全部四条白名单"
     );
+}
+
+// IPv4/v6 共享执行链，只在真实端点与作用域上分开；不能把两种流混成一次验收。
+fn dual_stack_example() -> InnerConfig {
+    let mut cfg = example();
+    cfg.ip_versions = vec![4, 6];
+    for (index, link) in cfg.links.iter_mut().enumerate() {
+        link.local_ipv6 = Some(format!("fe80::{}", index + 100).parse().unwrap());
+        link.gateway_ipv6 = Some("fe80::1".parse().unwrap());
+    }
+    cfg
+}
+
+#[test]
+fn ipv6_config_is_explicit_and_old_v2_projects_remain_ipv4_only() {
+    let legacy = example();
+    assert_eq!(legacy.ip_versions, vec![4]);
+    let mut value = serde_json::to_value(&legacy).unwrap();
+    value.as_object_mut().unwrap().remove("ip_versions");
+    let envelope = serde_json::json!({"kind":config::PROJECT_KIND,"version":2,"config":value});
+    assert_eq!(
+        config::parse_config(&envelope.to_string())
+            .unwrap()
+            .ip_versions,
+        vec![4]
+    );
+    assert_eq!(config::PROJECT_VERSION, 3);
+
+    let mut cfg = dual_stack_example();
+    cfg.ip_versions = vec![6];
+    let mut value = serde_json::to_value(&cfg).unwrap();
+    for link in value["links"].as_array_mut().unwrap() {
+        link.as_object_mut().unwrap().remove("local_ip");
+        link.as_object_mut().unwrap().remove("gateway");
+    }
+    let parsed = config::parse_config(&value.to_string()).unwrap();
+    assert_eq!(parsed.links[0].local_ip, std::net::Ipv4Addr::UNSPECIFIED);
+    assert_eq!(plan::build(&parsed).unwrap().unit_count(), 4);
+
+    for versions in [vec![], vec![4, 4], vec![6, 6], vec![5]] {
+        cfg.ip_versions = versions;
+        assert!(cfg.validate().is_err());
+    }
+}
+
+#[test]
+fn ipv6_config_rejects_unusable_or_mismatched_addresses_before_execution() {
+    for bad in [
+        "::",
+        "::1",
+        "ff02::1",
+        "::ffff:192.168.8.100",
+        "fe80::100%eth0",
+        "192.168.8.100",
+        "fe80:::1",
+    ] {
+        let mut value = serde_json::to_value(dual_stack_example()).unwrap();
+        value["links"][0]["local_ipv6"] = bad.into();
+        assert!(config::parse_config(&value.to_string()).is_err(), "{bad}");
+    }
+    let mut cfg = dual_stack_example();
+    cfg.links[0].local_ipv6 = None;
+    assert!(cfg.validate().unwrap_err().contains("电脑 IPv6"));
+    cfg.links[0].enabled = false;
+    cfg.validate().unwrap();
+    cfg.links[0].enabled = true;
+    cfg.links[0].local_ipv6 = cfg.links[0].gateway_ipv6;
+    assert!(cfg.validate().unwrap_err().contains("不能等于"));
+    cfg.links[0].local_ipv6 = Some("fd00::100".parse().unwrap());
+    assert!(cfg.validate().unwrap_err().contains("同为"));
+    cfg.links[0].gateway_ipv6 = Some("fd00::1".parse().unwrap());
+    cfg.validate().unwrap();
+}
+
+#[test]
+fn ipv6_plan_expands_versions_independently_and_preserves_the_ipv4_resume_identity() {
+    let mut cfg = config::parse_config(r#"{"serial":"board","links":[{"name":"ETH","local_interface":"Ethernet","local_ip":"192.168.0.100","gateway":"192.168.0.1"}]}"#).unwrap();
+    let legacy = plan::build(&cfg).unwrap();
+    // 按 schema v2 的原始字段序列计算并固定，新增字段不能让历史 PASS 失效。
+    assert_eq!(legacy.units[0].id, "664b1070b9bfc57c7d94d8fb41e51737");
+    cfg.ip_versions = vec![4, 6];
+    cfg.links[0].local_ipv6 = Some("fe80::100".parse().unwrap());
+    cfg.links[0].gateway_ipv6 = Some("fe80::1".parse().unwrap());
+    cfg.protocols = vec![Protocol::Tcp, Protocol::Udp];
+    cfg.udp_mbps = Some(100.0);
+    cfg.directions.push(Direction::Bidir);
+    cfg.repeats = 2;
+    let built = plan::build(&cfg).unwrap();
+    assert_eq!(built.unit_count(), 24);
+    assert_eq!(built.leg_count(), 32);
+    assert_eq!(built.bidir_units(), 8);
+    assert!(built.units[..12].iter().all(|unit| unit.ip_version == 4));
+    assert!(built.units[12..].iter().all(|unit| unit.ip_version == 6));
+    assert_eq!(
+        built
+            .units
+            .iter()
+            .map(|unit| &unit.id)
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        24
+    );
+    cfg.protocols = vec![Protocol::Tcp];
+    cfg.udp_mbps = None;
+    cfg.directions = vec![Direction::Upload, Direction::Download];
+    cfg.repeats = 1;
+    let dual = plan::build(&cfg).unwrap();
+    assert_eq!(dual.units[0].id, legacy.units[0].id);
+    assert_eq!(dual.units[1].id, legacy.units[1].id);
+    assert_ne!(dual.units[0].id, dual.units[2].id);
+    cfg.links[0].gateway_ipv6 = Some("fe80::2".parse().unwrap());
+    let changed = plan::build(&cfg).unwrap();
+    assert_eq!(dual.units[0].id, changed.units[0].id);
+    assert_ne!(dual.units[2].id, changed.units[2].id);
+    let resumed = std::collections::HashSet::from([legacy.units[0].id.clone()]);
+    let preview = plan::preview_with_resumed(&cfg, &resumed).unwrap();
+    assert_eq!(preview.resumed, 1);
+    assert_eq!(preview.rows[2].ip_version, 6);
+    assert!(preview.rows[2].legs[0].receiver.contains("fe80::2"));
+}
+
+#[test]
+fn ipv6_preflight_matches_canonical_addresses_and_scopes_each_sender_to_its_own_interface() {
+    let mut cfg = dual_stack_example();
+    cfg.links[1].measurement = Measurement::Tool;
+    let link = &cfg.links[1];
+    let mut cap = capability(link, "agent1");
+    cap.board_addresses
+        .push_str("\n34: br0 inet6 fe80:0:0:0:0:0:0:1/64 scope link");
+    let host = cap.agents[0].info.as_mut().unwrap();
+    host.os = "linux".into();
+    host.interfaces[0].ipv6_ll = "fe80:0:0:0:0:0:0:101".into();
+    host.interfaces[0].zone = "eth7".into();
+    let flight = preflight_version(link, &cap, 6).unwrap();
+    assert_eq!(flight.addresses.pc_bind, "fe80::101%eth7");
+    assert_eq!(flight.addresses.up_target, "fe80::1%eth7");
+    assert_eq!(flight.addresses.board_bind, "fe80::1%br0");
+    assert_eq!(flight.addresses.down_target, "fe80::101%br0");
+    for flow in [Flow::Up, Flow::Down] {
+        let request =
+            client_request_for_addresses(&cfg, &flight.addresses, Protocol::Tcp, flow, cfg.port);
+        assert!(request.v6);
+        assert!(!request.extra.iter().any(|arg| arg == "-R"));
+        assert_eq!(
+            request.bind_ip,
+            if flow == Flow::Up {
+                "fe80::101%eth7"
+            } else {
+                "fe80::1%br0"
+            }
+        );
+        assert_eq!(
+            request.dst,
+            if flow == Flow::Up {
+                "fe80::1%eth7"
+            } else {
+                "fe80::101%br0"
+            }
+        );
+    }
+    cap.agents[0].info.as_mut().unwrap().os = "windows".into();
+    let windows = preflight_version(link, &cap, 6).unwrap();
+    assert_eq!(windows.addresses.pc_bind, "fe80::101");
+    assert_eq!(windows.addresses.up_target, "fe80::1");
+    assert_eq!(windows.addresses.down_target, "fe80::101%br0");
+    cap.agents[0].info.as_mut().unwrap().interfaces[0].ipv6_ll = "fe80::999".into();
+    assert!(preflight_version(link, &cap, 6)
+        .unwrap_err()
+        .contains("未唯一匹配"));
+}
+
+#[test]
+fn ipv6_only_hosts_and_global_addresses_do_not_depend_on_ipv4_or_add_zones() {
+    let mut cfg = dual_stack_example();
+    cfg.ip_versions = vec![6];
+    cfg.links[1].measurement = Measurement::Tool;
+    cfg.links[1].local_ipv6 = Some("fd00::101".parse().unwrap());
+    cfg.links[1].gateway_ipv6 = Some("fd00::1".parse().unwrap());
+    let link = &cfg.links[1];
+    let mut cap = capability(link, "agent1");
+    cap.board_addresses = "34: br0 inet6 fd00::1/64 scope global".into();
+    let host = cap.agents[0].info.as_mut().unwrap();
+    host.os = "linux".into();
+    host.interfaces[0].ipv4.clear();
+    host.interfaces[0].ipv6_global = "fd00::101".into();
+    let flight = preflight_version(link, &cap, 6).unwrap();
+    assert_eq!(flight.addresses.pc_bind, "fd00::101");
+    assert_eq!(flight.addresses.board_bind, "fd00::1");
+    assert_eq!(flight.addresses.up_target, "fd00::1");
+    assert_eq!(flight.addresses.down_target, "fd00::101");
+    cap.board_addresses.clear();
+    assert!(
+        preflight_version(link, &cap, 6).is_err(),
+        "不能把 IPv4 地址或配置的统计接口当成板侧 IPv6 归属证据"
+    );
+}
+
+#[test]
+fn ipv6_results_keep_version_in_reports_and_resume_rows() {
+    let cfg = dual_stack_example();
+    let built = plan::build(&cfg).unwrap();
+    let row = resumed_row(&built.units[2]);
+    assert_eq!(row.ip_version, 6);
+    assert_eq!(serde_json::to_value(&row).unwrap()["ip_version"], 6);
+    let report = RunReport {
+        schema_version: 3,
+        current: String::new(),
+        created_at: String::new(),
+        config: cfg,
+        plan: None,
+        probe_only: false,
+        capability: None,
+        units: vec![row],
+        error: None,
+    };
+    assert!(report::render(&report).contains("IPv6 / TCP"));
+}
+
+#[test]
+fn an_unchecked_ipv6_only_link_does_not_require_ipv4_for_another_links_round() {
+    let mut cfg = dual_stack_example();
+    cfg.ip_versions = vec![4];
+    cfg.links[1].enabled = false;
+    cfg.links[1].local_ip = std::net::Ipv4Addr::UNSPECIFIED;
+    cfg.links[1].gateway = std::net::Ipv4Addr::UNSPECIFIED;
+    cfg.validate().unwrap();
+    assert!(plan::build(&cfg)
+        .unwrap()
+        .units
+        .iter()
+        .all(|unit| unit.link == 0));
+    cfg.links[1].enabled = true;
+    assert!(cfg.validate().unwrap_err().contains("IPv4"));
 }

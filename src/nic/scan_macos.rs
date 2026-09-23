@@ -9,7 +9,7 @@ use crate::protocol::NicInfo;
 use crate::util::run_cmd;
 use regex::Regex;
 use std::collections::HashMap;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
 #[derive(Debug, Clone, Default)]
@@ -46,12 +46,19 @@ fn parse_ifconfig(text: &str) -> Vec<Block> {
         } else if let Some(rest) = t.strip_prefix("inet6 ") {
             let addr = rest.split_whitespace().next().unwrap_or("");
             let low = addr.to_lowercase();
-            if low.starts_with("fe80") {
+            let stripped = low.split('%').next().unwrap_or(&low);
+            let Ok(ip) = stripped.parse::<Ipv6Addr>() else {
+                continue;
+            };
+            if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() {
+                continue;
+            }
+            if ip.is_unicast_link_local() {
                 if b.ipv6_ll.is_none() {
-                    b.ipv6_ll = Some(low.split('%').next().unwrap_or(&low).to_string());
+                    b.ipv6_ll = Some(stripped.to_string());
                 }
-            } else if (low.starts_with('2') || low.starts_with('3')) && b.ipv6_global.is_none() {
-                b.ipv6_global = Some(low.split('%').next().unwrap_or(&low).to_string());
+            } else if b.ipv6_global.is_none() {
+                b.ipv6_global = Some(stripped.to_string());
             }
         } else if t.starts_with("status:") {
             b.inactive = t.contains("inactive");
@@ -61,6 +68,13 @@ fn parse_ifconfig(text: &str) -> Vec<Block> {
         out.push(b);
     }
     out
+}
+
+fn block_matches_scan(b: &Block, prefixes: &[String]) -> bool {
+    b.name != "lo0"
+        && !b.inactive
+        && (b.ipv4.as_deref().is_some_and(|ip| ipv4_match(ip, prefixes))
+            || (prefixes.is_empty() && (b.ipv6_ll.is_some() || b.ipv6_global.is_some())))
 }
 
 /// networksetup -listallhardwareports：device -> 端口名（判定 Wi-Fi）
@@ -174,14 +188,7 @@ pub fn scan_all(prefixes: &[String]) -> Vec<NicInfo> {
     // 先筛出候选，避免对无关接口做慢探测
     let cands: Vec<&Block> = blocks
         .iter()
-        .filter(|b| {
-            b.name != "lo0"
-                && !b.inactive
-                && b.ipv4
-                    .as_deref()
-                    .map(|ip| ipv4_match(ip, prefixes))
-                    .unwrap_or(false)
-        })
+        .filter(|b| block_matches_scan(b, prefixes))
         .collect();
 
     let any_wifi = cands.iter().any(|b| {
@@ -223,6 +230,14 @@ pub fn scan_all(prefixes: &[String]) -> Vec<NicInfo> {
             speed_mbps: speed,
             is_wifi,
             wifi_band: band,
+            // 无线上下文只有 Windows 的 `netsh wlan show interfaces` 这一条来源。
+            // 本平台留空而不是去凑一个值：跨平台跑只用于开发自测（AGENTS.md §0），
+            // 为它另写一套 `iw` / `airport` 解析要付真实的维护成本，而报告里
+            // 一格空白已经如实说明了「这台机器上没采到」。
+            wifi_ssid: String::new(),
+            wifi_signal_pct: None,
+            wifi_channel: None,
+            wifi_radio: String::new(),
             ifindex: 0,
         });
     }
@@ -270,5 +285,36 @@ destination: default
         assert!(parse_route_gateway_v4("gateway: 0.0.0.0\n").is_empty());
         assert!(parse_route_gateway_v4("gateway: fe80::1%en0\n").is_empty());
         assert!(parse_route_gateway_v4("route: not in table\n").is_empty());
+    }
+
+    #[test]
+    fn empty_prefix_scan_includes_ipv6_only_ula_and_keeps_link_filters() {
+        let text = "en7: flags=8863<UP,BROADCAST,RUNNING> mtu 1500\n\
+                    \tinet6 fd12:3456::1 prefixlen 64\n\
+                    \tstatus: active\n";
+        let mut blocks = parse_ifconfig(text);
+        let b = &mut blocks[0];
+        assert!(b.ipv4.is_none());
+        assert_eq!(b.ipv6_global.as_deref(), Some("fd12:3456::1"));
+        assert!(block_matches_scan(b, &[]));
+        assert!(!block_matches_scan(b, &["192.168.".into()]));
+        b.inactive = true;
+        assert!(!block_matches_scan(b, &[]));
+        b.inactive = false;
+        b.name = "lo0".into();
+        assert!(!block_matches_scan(b, &[]));
+    }
+
+    #[test]
+    fn ipv6_scan_rejects_loopback_multicast_and_invalid_addresses() {
+        let text = "en7: flags=8863<UP,BROADCAST,RUNNING> mtu 1500\n\
+                    \tinet6 ::1 prefixlen 128\n\
+                    \tinet6 :: prefixlen 128\n\
+                    \tinet6 ff02::1 prefixlen 128\n\
+                    \tinet6 fe80-invalid prefixlen 64\n";
+        let b = &parse_ifconfig(text)[0];
+        assert!(b.ipv6_ll.is_none());
+        assert!(b.ipv6_global.is_none());
+        assert!(!block_matches_scan(b, &[]));
     }
 }

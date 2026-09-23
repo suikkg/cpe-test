@@ -140,6 +140,8 @@ pub(super) fn bootstrap_out(state: &UiState) -> BootstrapOut {
         ping_wifi_large_max_rtt_ms: state.cfg.ping.wifi_large_max_rtt_ms,
         master_config: super::plan::master_config_snapshot(&state.cfg),
         screenshot: state.cfg.screenshot,
+        probe_during_traffic: state.cfg.ping.probe_during_traffic,
+        probe_path_mtu: state.cfg.ping.probe_path_mtu,
         ui_plan_supported: true,
     }
 }
@@ -183,50 +185,57 @@ pub(super) fn api_connect(console: &Arc<Console>, body: &str) -> Result<serde_js
     crate::config::validate_agent_address_for_http(req.host.trim())?;
     crate::config::validate_agent_token_for_http(&req.token)?;
     let mut state = lock_recover(&console.state);
-    if !req.host.trim().is_empty() {
-        state.agent_host = req.host.trim().to_string();
-    }
+    // 连接参数和网卡清单必须来自同一次成功扫描。先改地址再联网会在
+    // health/info 失败时留下「新地址 + 旧网卡」，让后续计划指向错误的机器。
+    let mut cfg = state.cfg.clone();
+    let agent_host = if req.host.trim().is_empty() {
+        state.agent_host.clone()
+    } else {
+        req.host.trim().to_string()
+    };
     if req.port > 0 {
-        state.cfg.agent_port = req.port;
+        cfg.agent_port = req.port;
     }
     if !req.token.is_empty() {
-        state.cfg.agent_token = req.token.clone();
+        cfg.agent_token = req.token.clone();
     }
     if let Some(prefixes) = &req.ipv4_prefixes {
-        state.cfg.ipv4_prefixes = cleaned_list(prefixes);
+        cfg.ipv4_prefixes = cleaned_list(prefixes);
     }
-    if state.agent_host.is_empty() {
+    if agent_host.is_empty() {
         return Err("请先填辅测机 IP（辅测机 agent 窗口里显示的那个地址）".into());
     }
 
     let health: HealthOut = post(
-        &state.agent_host,
-        state.cfg.agent_port,
+        &agent_host,
+        cfg.agent_port,
         "/health",
         "{}",
-        &state.cfg.agent_token,
+        &cfg.agent_token,
     )
     .map_err(|e| {
         format!(
             "辅测机 {}:{} 连不上。请确认对方已双击 start_agent.bat，且 {} 端口在防火墙放行（{e}）",
-            state.agent_host, state.cfg.agent_port, state.cfg.agent_port
+            agent_host, cfg.agent_port, cfg.agent_port
         )
     })?;
     let info_body = serde_json::to_string(&InfoReq {
-        ipv4_prefixes: state.cfg.ipv4_prefixes.clone(),
+        ipv4_prefixes: cfg.ipv4_prefixes.clone(),
     })
     .unwrap_or_else(|_| "{}".into());
     let agent: HostInfo = post(
-        &state.agent_host,
-        state.cfg.agent_port,
+        &agent_host,
+        cfg.agent_port,
         "/info",
         &info_body,
-        &state.cfg.agent_token,
+        &cfg.agent_token,
     )
     .map_err(|e| format!("已连上辅测机，但获取网卡失败: {e}"))?;
 
-    let master = crate::nic::scan_host(&state.cfg.ipv4_prefixes);
-    let nic_policies = configured_nic_policies(&state.cfg, &master, &agent);
+    let master = crate::nic::scan_host(&cfg.ipv4_prefixes);
+    let nic_policies = configured_nic_policies(&cfg, &master, &agent);
+    state.agent_host = agent_host;
+    state.cfg = cfg;
     state.master = master.clone();
     state.agent = agent.clone();
     serde_json::to_value(ConnectOut {
@@ -245,6 +254,7 @@ pub(super) fn api_plan(console: &Arc<Console>, body: &str) -> Result<serde_json:
         return Err("还没连上辅测机，先点「连接」".into());
     }
     let mut compiled = compile_request(&state, &req)?;
+    let blocking_errors = compiled.blocking_errors(req.ui_plan.is_some());
     let skip_count = compiled.resumed.iter().filter(|skipped| **skipped).count();
     if compiled.cfg.resume {
         compiled.notices.push(if skip_count == 0 {
@@ -286,6 +296,7 @@ pub(super) fn api_plan(console: &Arc<Console>, body: &str) -> Result<serde_json:
         est_total_secs,
         est_full_secs,
         notices: compiled.notices,
+        blocking_errors,
         sections: compiled.sections,
         trace: compiled.trace,
         plan_hash: Some(compiled.plan_hash),
@@ -348,18 +359,13 @@ fn api_run_impl(
         }
         match compile_request(&state, &req) {
             Ok(compiled) => {
-                if let Some(error) = compiled.spec_errors.first() {
-                    console.running.store(false, Ordering::SeqCst);
-                    return Err(error.clone());
-                }
-                if req.ui_plan.is_some()
-                    && compiled
-                        .notices
-                        .iter()
-                        .any(|notice| notice.trim_start().starts_with("跳过 "))
+                if let Some(error) = compiled
+                    .blocking_errors(req.ui_plan.is_some())
+                    .into_iter()
+                    .next()
                 {
                     console.running.store(false, Ordering::SeqCst);
-                    return Err("计划包含不可执行的链路或 IP 版本，请在复核页排除后重新预览".into());
+                    return Err(error);
                 }
                 if req.ui_plan.is_some() {
                     let supplied = req.plan_hash.as_deref().or_else(|| {
@@ -375,15 +381,6 @@ fn api_run_impl(
                         console.running.store(false, Ordering::SeqCst);
                         return Err("计划已过期或网口拓扑已变化，请重新预览任务".into());
                     }
-                }
-                if compiled.units.is_empty() {
-                    console.running.store(false, Ordering::SeqCst);
-                    let detail = if compiled.notices.is_empty() {
-                        String::new()
-                    } else {
-                        format!("：{}", compiled.notices.join("；"))
-                    };
-                    return Err(format!("所选配置最终没有生成任何测试单元{detail}"));
                 }
                 confirmed_plan_hash = Some(compiled.plan_hash.clone());
                 compiled.cfg
@@ -472,6 +469,25 @@ pub(super) fn api_stop(console: &Arc<Console>) -> Result<serde_json::Value, Stri
     }
     crate::cancel::request_cancel();
     Ok(serde_json::json!({ "stopping": true }))
+}
+
+/// 跳过当前正在跑的那个单元，队列继续。
+///
+/// 设计文档 v4.3.0 把「暂停 / 跳过当前」记成「留待后续版本」。这里只做
+/// **跳过**：11.5 小时的队列里发现第 3 个单元参数配错，此前只有两个选择——
+/// 让它跑完，或者停掉重来（RESUME 救得回已 PASS 的，救不回 RATE_FAIL 的）。
+///
+/// 和 `/api/stop` 同属 gated：它掐断正在跑的作业，动的是被测资源。
+pub(super) fn api_skip_unit(console: &Arc<Console>) -> Result<serde_json::Value, String> {
+    let _run_gate = lock_recover(&console.run_gate);
+    if !console.running.load(Ordering::SeqCst) {
+        return Err("当前没有正在运行的测试".into());
+    }
+    if crate::cancel::is_stop_requested() {
+        return Err("已经请求停止整轮了，跳过没有意义".into());
+    }
+    crate::cancel::request_skip_unit();
+    Ok(serde_json::json!({ "skipping": true }))
 }
 
 pub(super) fn api_open_report(console: &Arc<Console>) -> Result<serde_json::Value, String> {

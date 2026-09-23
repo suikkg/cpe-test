@@ -1,4 +1,5 @@
 import { defineConfig } from 'vitest/config';
+import vue from '@vitejs/plugin-vue';
 
 // `environment: 'node'` 是有意的，不是省事：这里**不装** jsdom / @vue/test-utils。
 //
@@ -8,9 +9,10 @@ import { defineConfig } from 'vitest/config';
 // （由 `lint-arch.mjs` 挡着不许 import vue），普通 Vitest 就能覆盖，而且比挂载
 // 组件断言 DOM 结实得多。
 //
-// 组件测试等到出现第一个**真的只在渲染层出现**的 bug 再加。在那之前，jsdom 只是
-// 让 `npm ci` 更慢、依赖面更大。详见 .ai/PLAN-v5.0-frontend.md §7.2。
+// 页面按钮是否落实禁用门禁用 Vue 自带 SSR 渲染检查；仍无需 DOM 模拟库。
+// 其余纯逻辑继续在 domain / state 测试。详见 .ai/PLAN-v5.0-frontend.md §7.2。
 export default defineConfig({
+  plugins: [vue()],
   test: {
     environment: 'node',
     include: ['src/**/*.{test,spec}.ts'],

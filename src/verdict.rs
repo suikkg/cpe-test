@@ -449,6 +449,11 @@ pub fn disposition_advice(reason_code: ReasonCode) -> Option<&'static str> {
         ReasonCode::NoValidMeasurement | ReasonCode::CtsNoMeasurement => {
             "整轮没有产生任何可用的吞吐测量。先确认防火墙放通了测试端口段、两端工具版本可用，再重跑。"
         }
+        ReasonCode::LinkAbandoned => {
+            "这条链路连续多个灌包单元一条测量都没产生，本轮已停止对它起流（其余链路照常跑完）。\
+             网卡还在、命令也发得出去，所以先单独确认这一对网口的物理连通与被测设备该口的状态，\
+             再单独重跑这条链路——不必重跑整轮。"
+        }
         ReasonCode::NicDisappeared => {
             "测试期间接收端网卡从系统里消失了，请检查被测链路/设备的是否存在问题；恢复网卡后重跑。"
         }

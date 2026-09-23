@@ -180,3 +180,41 @@ export function filterByVerdict(units: UnitStatus[], filter: VerdictFilter): Uni
 export function unitSearchFields(unit: UnitStatus): Array<string | number | null | undefined> {
   return [unit.seq, `#${unit.seq}`, unit.title, unit.link_group, unit.verdict, unit.reason_code, unit.reason_detail];
 }
+
+/**
+ * 单元的「实测 / 门限」一句话，例如 `1850.2 / 1800 Mbps`。
+ *
+ * 三种形态各说各的，**不互相冒充**：
+ * - 有实测有门限 → `实测 / 门限`
+ * - 有实测无门限（Observe/Discover）→ 只报实测，不编一个门限出来
+ * - 没起过流（跳过、准备失败）→ 空串，让那一格干净地空着
+ *
+ * 小数位跟着量级走：几千 Mbps 上的第三位小数没有信息量，只会把一列数字撑宽。
+ */
+export function unitRateLabel(unit: UnitStatus): string {
+  const rx = unit.rx_avg;
+  if (rx === null || rx === undefined || !Number.isFinite(rx)) return '';
+  const measured = rx >= 100 ? rx.toFixed(0) : rx.toFixed(1);
+  const target = unit.target_mbps;
+  if (target === null || target === undefined || !Number.isFinite(target)) {
+    return `${measured} Mbps`;
+  }
+  const wanted = target >= 100 ? target.toFixed(0) : target.toFixed(1);
+  return `${measured} / ${wanted} Mbps`;
+}
+
+/**
+ * 实测相对门限的位置，用来给那个数上色。
+ *
+ * `null` = 没有门限或没有实测，不上色——**不上色和「刚好达标」必须分得开**，
+ * 否则一轮 Observe 模式的测试会满屏绿色，看上去像全部达标。
+ */
+export function unitRateTone(unit: UnitStatus): 'over' | 'under' | null {
+  const rx = unit.rx_avg;
+  const target = unit.target_mbps;
+  if (rx === null || rx === undefined || !Number.isFinite(rx)) return null;
+  if (target === null || target === undefined || !Number.isFinite(target) || target <= 0) {
+    return null;
+  }
+  return rx >= target ? 'over' : 'under';
+}

@@ -58,6 +58,18 @@ pub struct RunMeta {
     pub report: ReportMetaRecord,
     /// 计划摘要，供重放时在报告里说清楚「这是哪一份计划」。
     pub total_units: usize,
+    /// 本轮的单元级判定分布。
+    ///
+    /// 有了它，历史列表不用重放 `rows.jsonl` 就能说出通过率——在此之前
+    /// `/api/runs` 只能给出目录名、修改时间和字节数，于是隔夜回来找报告
+    /// 只能靠时间戳猜，`RunsView` 的注释自己承认了这一点。
+    ///
+    /// 与报告顶部那八个格子**同源**（`report::verdict_totals`）：两处各算一遍
+    /// 的话，列表和报告会各说一个数而两边都没错。
+    ///
+    /// 旧目录没有这个字段，读回来全是 0——所以消费方要靠 `total_units`
+    /// 判断「这轮真的一个单元都没有」还是「这份 meta 是旧版写的」。
+    pub verdict_totals: crate::report::VerdictTotals,
 }
 
 /// [`ReportMeta`] 的可序列化镜像。
@@ -456,6 +468,13 @@ mod tests {
                 ..Default::default()
             },
             total_units: 42,
+            verdict_totals: crate::report::VerdictTotals {
+                total: 40,
+                pass: 33,
+                rate_fail: 7,
+                skipped: 2,
+                ..Default::default()
+            },
         };
         write_meta(&dir, &meta).expect("write");
         let back = load_meta(&dir).expect("load");
@@ -463,6 +482,10 @@ mod tests {
         assert_eq!(back.plan_hash, meta.plan_hash);
         assert_eq!(back.total_units, 42);
         assert_eq!(back.report.master_pc, "MASTER");
+        // 判定计数必须完整往返：历史列表就是靠它显示通过率的，丢一个字段
+        // 那一列就会集体变成 0，而 0 和「没跑过」在屏幕上长得一样。
+        assert_eq!(back.verdict_totals, meta.verdict_totals);
+        assert!((back.verdict_totals.pass_rate_pct() - 82.5).abs() < 1e-9);
 
         // 未来版本多写了字段：旧版本必须还能读，而不是整份报废。
         std::fs::write(
@@ -472,6 +495,13 @@ mod tests {
         .expect("write future");
         let forward = load_meta(&dir).expect("未知字段不该让 meta.json 读不出来");
         assert_eq!(forward.run_id, "r");
+        // 升级前写的 meta 没有这一块，读回来是全 0。消费方要靠 `total_units`
+        // 区分「旧 meta」和「真的一个单元都没跑」，不能把 0 当成结论。
+        assert_eq!(
+            forward.verdict_totals,
+            crate::report::VerdictTotals::default()
+        );
+        assert_eq!(forward.total_units, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

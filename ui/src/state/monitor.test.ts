@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { MonitorPoint } from '../api/dto';
-import { monitor, reset, startPolling, startSession, stopPolling } from './monitor';
-import { reset as resetSession, session } from './session';
+import { monitor, reset, startPolling, startSession, stopAll, stopPolling } from './monitor';
+import { connect, reset as resetSession, session } from './session';
 
 /**
  * 监控会话表：**哪一批样本属于哪一路曲线**。
@@ -32,6 +32,9 @@ let fetchMock: ReturnType<typeof vi.fn>;
 beforeEach(() => {
   reset();
   resetSession();
+  session.phase = 'connected';
+  session.connectedHost = '192.168.1.3';
+  session.connectedPort = 28801;
   fetchMock = vi.fn();
   vi.stubGlobal('fetch', fetchMock);
 });
@@ -43,6 +46,76 @@ afterEach(() => {
 });
 
 describe('监控会话', () => {
+  it('成功切换辅测机后回收旧辅测会话，保留本机监控', async () => {
+    fetchMock.mockResolvedValue(ok({ session: 'local' }));
+    await startSession('master', 'eth0', 1000);
+    fetchMock.mockResolvedValue(ok({ session: 'old-agent' }));
+    await startSession('agent', 'eth0', 1000);
+    stopPolling();
+    expect(monitor.sessions[1].host).toBe('192.168.1.3:28801');
+
+    session.host = '192.168.1.9';
+    fetchMock.mockResolvedValue(ok({ master: { interfaces: [] }, agent: { interfaces: [] } }));
+    await connect();
+    expect(monitor.sessions.map((item) => item.session)).toEqual(['local']);
+    expect(monitor.notice).toContain('辅测机连接已切换');
+    const stops = fetchMock.mock.calls.filter(([url]) => String(url).startsWith('/api/monitor/stop'));
+    expect(stops.map(([, options]) => JSON.parse(options.body))).toEqual([{ session: 'old-agent' }]);
+
+    fetchMock.mockResolvedValue(ok({ session: 'new-agent' }));
+    expect(await startSession('agent', 'eth0', 1000)).toBe(true);
+    expect(monitor.sessions[1].host).toBe('192.168.1.9:28801');
+  });
+
+  it('同主机换端口也不能沿用旧辅测曲线', async () => {
+    fetchMock.mockResolvedValue(ok({ session: 'old-agent' }));
+    await startSession('agent', 'eth0', 1000);
+    stopPolling();
+    session.connectedPort = 28802;
+    expect(monitor.sessions).toHaveLength(0);
+    expect(monitor.polling).toBe(false);
+  });
+
+  it('连接失败或修改地址草稿不移除原有监控', async () => {
+    fetchMock.mockResolvedValue(ok({ session: 'old-agent' }));
+    await startSession('agent', 'eth0', 1000);
+    stopPolling();
+    session.host = '192.168.1.9';
+    fetchMock.mockRejectedValue(new Error('连接失败'));
+    await connect();
+    expect(monitor.sessions.map((item) => item.session)).toEqual(['old-agent']);
+    expect(monitor.sessions[0].host).toBe('192.168.1.3:28801');
+    fetchMock.mockClear();
+    expect(await startSession('agent', 'eth1', 1000)).toBe(false);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('换机期间迟到的启动应答只能回收，不能挂到新辅测机名下', async () => {
+    let release!: (value: FakeResponse) => void;
+    fetchMock.mockReturnValueOnce(new Promise<FakeResponse>((resolve) => { release = resolve; }));
+    const pending = startSession('agent', 'eth0', 1000);
+    session.connectedHost = '192.168.1.9';
+    fetchMock.mockResolvedValue(ok({}));
+    release(ok({ session: 'late-agent' }));
+    expect(await pending).toBe(false);
+    expect(monitor.sessions).toHaveLength(0);
+    expect(fetchMock).toHaveBeenLastCalledWith('/api/monitor/stop', expect.objectContaining({
+      body: JSON.stringify({ session: 'late-agent' }),
+    }));
+  });
+
+  it('全部停止期间迟到的启动应答不能重新开启会话', async () => {
+    let release!: (value: FakeResponse) => void;
+    fetchMock.mockReturnValueOnce(new Promise<FakeResponse>((resolve) => { release = resolve; }));
+    const pending = startSession('master', 'eth0', 1000);
+    await stopAll();
+    fetchMock.mockResolvedValue(ok({}));
+    release(ok({ session: 'late-local' }));
+    expect(await pending).toBe(false);
+    expect(monitor.sessions).toHaveLength(0);
+    expect(monitor.polling).toBe(false);
+  });
+
   it('同一端的同一块网卡不许开两路', async () => {
     fetchMock.mockResolvedValue(ok({ session: 's1' }));
     expect(await startSession('master', 'eth0', 1000)).toBe(true);

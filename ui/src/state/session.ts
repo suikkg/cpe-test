@@ -29,6 +29,8 @@ export type SessionPhase =
 
 /** 表单里端口那一格的出厂值；和 `reset()` 用同一个常量，别写两遍。 */
 const DEFAULT_AGENT_PORT = 28801;
+let generation = 0;
+let connecting: Promise<void> | undefined;
 
 export const session = reactive({
   phase: 'idle' as SessionPhase,
@@ -60,6 +62,7 @@ export const session = reactive({
    * 就立刻宣称已经连上了那台新机器。
    */
   connectedHost: '',
+  connectedPort: 0,
   connectedAt: null as number | null,
   /** 表单字段：辅测机地址 / 端口 / 共享令牌 / 网卡前缀过滤 */
   host: '',
@@ -103,6 +106,8 @@ export const session = reactive({
 });
 
 export function reset(): void {
+  generation += 1;
+  connecting = undefined;
   session.phase = 'idle';
   session.error = '';
   session.bootstrap = null;
@@ -113,6 +118,7 @@ export function reset(): void {
   session.connection = null;
   session.topologyStale = false;
   session.connectedHost = '';
+  session.connectedPort = 0;
   session.connectedAt = null;
   session.filled = { host: '', port: 0 };
   session.host = '';
@@ -146,6 +152,7 @@ function fail(error: unknown): void {
  * 对端，「本机」那一页也该是有内容的。两个请求并发发出，任一失败不拖垮另一个。
  */
 export async function load(): Promise<void> {
+  const epoch = generation;
   // 口令的落地**不在这里**：它以前是本函数的副作用，于是任何排在 `load()`
   // 之前的开场请求都会赶在口令之前出门（`App.vue` 的 `syncStatus()` 就这么撞过
   // 一次 401）。现在归 `api/client.ts::adoptToken()`，由 `main.ts` 和每次读
@@ -154,6 +161,7 @@ export async function load(): Promise<void> {
     api.get<BootstrapOut>('/api/bootstrap'),
     api.get<LocalOut>('/api/local'),
   ]);
+  if (epoch !== generation) return;
   if (bootstrap.status === 'fulfilled') {
     session.bootstrap = bootstrap.value;
     session.bootstrapError = '';
@@ -196,19 +204,24 @@ export async function load(): Promise<void> {
  * - 已连上：两端一起重扫（`/api/connect`），沿用当前的地址、令牌和前缀。
  */
 export async function rescan(): Promise<void> {
-  if (session.scanning) return;
+  if (session.scanning || connecting) return;
+  const epoch = generation;
   session.scanning = true;
   session.scanMessage = '正在重新扫描网卡…';
   session.scanKind = '';
   try {
-    const connected = session.phase === 'connected';
+    // 失败时保留的 connection 仍是表格来源；重试必须同时刷新它，不能只更新
+    // 被旧 connection 遮住的 local，再把未变化的表格报成「扫描成功」。
+    const connected = session.connection !== null;
     // 本机那一份总要刷：它是「还没连上」时唯一的来源，也是 iperf3 与版本号的来源。
     const local = await api.get<LocalOut>('/api/local');
+    if (epoch !== generation) return;
     session.local = local;
     session.localError = '';
     session.localAt = Date.now();
     if (connected) {
       await connect();
+      if (epoch !== generation) return;
       if (session.phase !== 'connected') {
         // 重扫失败保留上一次成功的两张表（`connect()` 不清 connection），
         // 只把它标成旧的。**不能**顺手把拓扑抹成空——那会让「分配链路」
@@ -225,6 +238,7 @@ export async function rescan(): Promise<void> {
     }
     session.scanKind = 'ok';
   } catch (error) {
+    if (epoch !== generation) return;
     if (error instanceof UnauthorizedError) {
       session.phase = 'unauthorized';
       session.scanMessage = '';
@@ -234,7 +248,7 @@ export async function rescan(): Promise<void> {
     session.scanMessage = `重新扫描失败：${errorMessage(error)}`;
     session.scanKind = 'bad';
   } finally {
-    session.scanning = false;
+    if (epoch === generation) session.scanning = false;
   }
 }
 
@@ -243,7 +257,16 @@ function stamp(): string {
   return clockStamp(Date.now());
 }
 
-export async function connect(): Promise<void> {
+export function connect(): Promise<void> {
+  if (connecting) return connecting;
+  const pending = connectOnce(generation).finally(() => {
+    if (connecting === pending) connecting = undefined;
+  });
+  connecting = pending;
+  return pending;
+}
+
+async function connectOnce(epoch: number): Promise<void> {
   session.phase = 'connecting';
   session.error = '';
   try {
@@ -253,15 +276,19 @@ export async function connect(): Promise<void> {
       host: session.host.trim(),
       port: session.port,
       token: session.token,
-      ipv4_prefixes: session.prefixes,
+      ipv4_prefixes: [...session.prefixes],
     };
-    session.connection = await api.post<ConnectOut>('/api/connect', request);
+    const connection = await api.post<ConnectOut>('/api/connect', request);
+    if (epoch !== generation) return;
+    session.connection = connection;
     // 身份只在**成功之后**落地：在这之前顶栏说的还是上一台机器，那是事实。
     session.connectedHost = request.host;
+    session.connectedPort = request.port;
     session.connectedAt = Date.now();
     session.topologyStale = false;
     session.phase = 'connected';
   } catch (error) {
+    if (epoch !== generation) return;
     // 保留上一份拓扑并标旧，不清空（理由见 `session.connection` 的注释）。
     session.topologyStale = session.connection !== null;
     fail(error);

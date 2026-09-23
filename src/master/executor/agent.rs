@@ -90,6 +90,24 @@ impl Ctx {
 
     // ---------------- 双端统一操作 ----------------
 
+    /// [`Ctx::ping_at`] 的可打断版本，返回 `(结果, 是不是被打断的)`。
+    ///
+    /// **只有本机那条路真的能被打断**：agent 的 `/ping` 是一次同步 HTTP 调用，
+    /// 请求发出去之后没有取消通道。调用方（负载下时延探针）因此把整段探测切成
+    /// 若干短段，靠「段与段之间查一次标志」给远端那条路兜上界——见
+    /// [`super::latency::PROBE_CHUNK_SECS`]。
+    pub(super) fn ping_at_cancellable(
+        &self,
+        side: Side,
+        req: &PingReq,
+        cancel: &std::sync::atomic::AtomicBool,
+    ) -> Result<(PingOut, bool), String> {
+        match side {
+            Side::Master => Ok(ping::run_cancellable(req, Some(cancel))),
+            Side::Agent => self.ping_at(side, req).map(|out| (out, false)),
+        }
+    }
+
     pub(super) fn ping_at(&self, side: Side, req: &PingReq) -> Result<PingOut, String> {
         match side {
             Side::Master => Ok(ping::run(req)),
@@ -373,7 +391,8 @@ impl Ctx {
                             .and_then(|output| output.result.clone())
                             .unwrap_or_default();
                         result.ok = false;
-                        result.cancelled = !cleanup_confirmed;
+                        // 回收成功只证明资源已释放，不能抹掉用户停止/跳过的事实。
+                        result.cancelled = true;
                         result.cleanup_confirmed =
                             Some(cleanup_confirmed && result.cleanup_confirmed == Some(true));
                         if !result.output.is_empty() && !result.output.ends_with('\n') {
@@ -665,7 +684,8 @@ impl Ctx {
                 let process_cleanup_confirmed = client.cleanup_confirmed == Some(true);
                 let cleanup_confirmed = cleanup.is_ok() && process_cleanup_confirmed;
                 client.ok = false;
-                client.cancelled = !cleanup_confirmed;
+                // 显式用户取消与超时后的主动回收不同，成功回收也仍是取消。
+                client.cancelled = true;
                 if !client.output.is_empty() && !client.output.ends_with('\n') {
                     client.output.push('\n');
                 }

@@ -53,7 +53,19 @@ describe('RunStatus 契约', () => {
     expect(run.done.length).toBeGreaterThan(0);
     expectExactKeys(
       run.done[0],
-      ['seq', 'title', 'verdict', 'reason_code', 'reason_detail', 'skipped', 'secs', 'link_group'],
+      [
+        'seq',
+        'title',
+        'verdict',
+        'reason_code',
+        'reason_detail',
+        'skipped',
+        'secs',
+        'link_group',
+        // 单元级的实测与门限。进度页靠它回答「差多少」，与报告汇总行同源。
+        'rx_avg',
+        'target_mbps',
+      ],
       'UnitStatus',
     );
     expect(run.current).not.toBeNull();
@@ -172,6 +184,9 @@ describe('BootstrapOut 契约', () => {
         'ping_wifi_large_max_rtt_ms',
         'master_config',
         'screenshot',
+        // 灌包期间并发探负载下时延；默认关，见 config::PingCfg。
+        'probe_during_traffic',
+        'probe_path_mtu',
         'ui_plan_supported',
       ],
       'BootstrapOut',

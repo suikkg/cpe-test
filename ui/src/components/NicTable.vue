@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { nicKey, nicSpeedLabel } from '../domain/nics';
+import { nicKey, nicSpeedLabel, nicWifiContext } from '../domain/nics';
 import type { NicInfo } from '../api/dto';
 
 /**
@@ -25,6 +25,7 @@ const emit = defineEmits<{ select: [nic: NicInfo] }>();
 // 速率与选中标识都走 domain：表格和详情面板必须说同一句话。
 const speed = nicSpeedLabel;
 const keyOf = nicKey;
+const wifi = nicWifiContext;
 </script>
 
 <template>
@@ -64,6 +65,9 @@ const keyOf = nicKey;
           <td>
             <span class="role mono">{{ nic.role || 'UNKNOWN' }}</span>
             <small v-if="nic.wifi_band" class="muted"> · {{ nic.wifi_band }}</small>
+            <!-- 无线上下文换行放在角色下面：它比角色长得多，挤在同一行会把
+                 整张表撑宽，而这几项恰恰是 Wi-Fi 结果可复现的前提。 -->
+            <small v-if="wifi(nic)" class="muted wifi-ctx">{{ wifi(nic) }}</small>
           </td>
           <td class="mono">{{ nic.ipv4 || '—' }}</td>
           <td class="mono">{{ nic.gateway_v4 || '—' }}</td>
@@ -78,6 +82,7 @@ const keyOf = nicKey;
 </template>
 
 <style scoped>
+.wifi-ctx { display: block; margin-top: 3px; }
 /* 宽表在自己的容器里横向滚动，页面本身永不横向滚。 */
 .scroll {
   max-width: 100%;

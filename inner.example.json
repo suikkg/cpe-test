@@ -1,6 +1,6 @@
 {
   "kind": "cpe-inner-project",
-  "version": 2,
+  "version": 3,
   "config": {
     "adb_path": "adb",
     "serial": "",
@@ -38,7 +38,9 @@
         "bidir_total_min_mbps": null,
         "tool_upload_min_mbps": null,
         "tool_download_min_mbps": null,
-        "tool_bidir_total_min_mbps": null
+        "tool_bidir_total_min_mbps": null,
+        "local_ipv6": null,
+        "gateway_ipv6": null
       },
       {
         "name": "Wi-Fi",
@@ -54,7 +56,9 @@
         "bidir_total_min_mbps": null,
         "tool_upload_min_mbps": null,
         "tool_download_min_mbps": null,
-        "tool_bidir_total_min_mbps": null
+        "tool_bidir_total_min_mbps": null,
+        "local_ipv6": null,
+        "gateway_ipv6": null
       }
     ],
     "agents": [
@@ -63,6 +67,9 @@
         "address": "192.168.8.101",
         "port": 28801
       }
+    ],
+    "ip_versions": [
+      4
     ]
   }
 }

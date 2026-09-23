@@ -588,6 +588,8 @@ pub(super) fn handle(mut request: Request, console: &Arc<Console>) {
         console.scenario.request(&body)
     } else if is_post && path == "/api/stop" {
         api_stop(console)
+    } else if is_post && path == "/api/skip-unit" {
+        api_skip_unit(console)
     } else if is_post && path == "/api/open-report" {
         api_open_report(console)
     } else if is_get && path == "/api/progress" {
@@ -596,6 +598,8 @@ pub(super) fn handle(mut request: Request, console: &Arc<Console>) {
         runs::api_runs()
     } else if is_post && path == "/api/runs/request" {
         runs::api_run_request(&body)
+    } else if is_post && path == "/api/runs/compare" {
+        crate::master::webui::runs::api_run_compare(console, &body)
     } else if is_post && path == "/api/runs/report" {
         runs::api_run_replay(console, &body)
     } else if is_post && path == "/api/monitor/start" {

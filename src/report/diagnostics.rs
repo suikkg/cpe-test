@@ -84,7 +84,13 @@ pub(super) fn diagnostic_availability(row: &Row) -> String {
     }
 }
 
-pub(super) fn push_row_diagnostics(h: &mut String, row: &Row, is_ping: bool, aria_context: &str) {
+pub(super) fn push_row_diagnostics(
+    h: &mut String,
+    row: &Row,
+    is_ping: bool,
+    aria_context: &str,
+    chart_svg: &str,
+) {
     h.push_str(&format!(
         "<details class=\"row-diagnostics\"><summary aria-label=\"{}的诊断详情\"><span>诊断</span><small class=\"diagnostic-availability\">{}</small></summary><div class=\"diagnostic-panel\"><dl class=\"diagnostic-grid\">",
         esc(aria_context),
@@ -111,12 +117,12 @@ pub(super) fn push_row_diagnostics(h: &mut String, row: &Row, is_ping: bool, ari
     diagnostic_item(
         h,
         "源端",
-        &report_endpoint(&row.src_pc, &row.src_iface, &row.src_ip),
+        &report_endpoint(&row.src_pc, &row.src_iface, &row.src_ip, &row.src_wifi),
     );
     diagnostic_item(
         h,
         "接收端",
-        &report_endpoint(&row.dst_pc, &row.dst_iface, &row.dst_ip),
+        &report_endpoint(&row.dst_pc, &row.dst_iface, &row.dst_ip, &row.dst_wifi),
     );
     diagnostic_item(h, "源网卡 TX 平均", &diagnostic_metric(row.tx_avg, is_ping));
     diagnostic_item(h, "源网卡 TX-P10", &diagnostic_metric(row.tx_p10, is_ping));
@@ -187,7 +193,30 @@ pub(super) fn push_row_diagnostics(h: &mut String, row: &Row, is_ping: bool, ari
             |value| format!("{:.1}%", value * 100.0),
         ),
     );
+    // 负载下时延。空载 RTT 和它差两个数量级，而用户感知到的「卡」几乎全部
+    // 落在后者——所以它必须和覆盖率、有效窗口摆在同一屏，而不是藏在别处。
+    diagnostic_item(
+        h,
+        "灌包期间往返时延",
+        if row.load_latency.is_empty() {
+            if is_ping {
+                NOT_APPLICABLE
+            } else {
+                "未开启（ping.probe_during_traffic）"
+            }
+        } else {
+            &row.load_latency
+        },
+    );
     h.push_str("</dl>");
+    // 曲线紧挨着那几个数：判定窗口、采样覆盖率、有效秒这三样以前对不上号——
+    // 看不出判定用的是 CSV 里的哪一段。阴影带就是那一段。
+    if !chart_svg.is_empty() {
+        h.push_str(chart_svg);
+        h.push_str(
+            "<p class=\"chart-note\">接收端网卡 RX 逐样本曲线；阴影是本行判定实际使用的窗口，虚线是门限。</p>",
+        );
+    }
     push_non_verdict_diagnostics(h, row);
 
     let artifacts = [

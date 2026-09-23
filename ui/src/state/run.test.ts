@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import type { ProgressOut, RunStatus } from '../api/dto';
-import { applyProgress, reset, run } from './run';
+import { applyProgress, reset, run, view } from './run';
 
 /**
  * 进度合并的**换轮语义**。
@@ -46,6 +46,15 @@ function tick(s: RunStatus, unitsFrom: number, report = ''): ProgressOut {
 
 describe('applyProgress', () => {
   beforeEach(() => reset());
+
+  it('进度总数读服务端汇总，增量尚未追齐时仍能看出差额', () => {
+    const incoming = status('run_a', [3], 10);
+    incoming.counts = { pass: 1, fail: 1, measured: 1, not_evaluated: 1, setup_error: 1, skip: 1 };
+    applyProgress(tick(incoming, 6));
+    expect(run.units).toHaveLength(1);
+    expect(view.value.done).toBe(6);
+    expect(view.value.ratio).toBeCloseTo(0.6);
+  });
 
   it('同一轮之内按游标累加，重复送达不产生重复行', () => {
     applyProgress(tick(status('run_a', [1, 2]), 2));

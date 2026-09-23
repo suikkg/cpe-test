@@ -25,18 +25,19 @@ impl ReceiverServer {
         log: &Path,
     ) -> Result<Self, String> {
         let request = IperfServerStartReq {
-            bind_ip: context.link.local_ip.to_string(),
+            bind_ip: context.preflight.addresses.pc_bind.clone(),
+            v6: context.preflight.addresses.ip_version == 6,
             port: leg.port,
             request_id: format!("{owner}-server"),
             owner_id: format!("{owner}-server"),
             lease_secs: context.cfg.duration_secs + 150,
-            ..Default::default()
         };
         let backend = if leg.flow.receiver_is_board() {
             Backend::Board(Server::start(
                 context.adb,
                 context.cfg,
-                context.link.gateway,
+                &context.preflight.addresses.board_bind,
+                context.preflight.addresses.ip_version,
                 leg.port,
                 owner,
                 log,

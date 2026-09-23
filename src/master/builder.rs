@@ -267,6 +267,15 @@ pub struct Unit {
     /// 不能为了显示去动它；于是预览里单向单元的参数行就没有方向，而双向单元
     /// 有，同一份清单两种样子。方向本身是用户在套件里勾的，理应逐行看得见。
     pub direction: String,
+    /// 稳定性轮次（1-based）。不分轮的计划恒为 1。
+    ///
+    /// **是类型化字段而不是从 `title` 的「· 第 N 轮」后缀里搜出来的**：那个后缀
+    /// 是展示串，而 `report::compare` 要拿轮次当对齐键的一部分。字符串推断在这个
+    /// 仓库已经付过一次代价（`infer_direction_tag`），改一次文案就全体失效，
+    /// 而失效的表现是「对比报告少了 19 轮」这种没人会去核对的安静错误。
+    ///
+    /// 不进 resume identity——那件事由 `round_scoped_id` 拌进 `id` 里完成。
+    pub round: u32,
     pub legs: Vec<Leg>,
     pub est_secs: u64,
 }
@@ -712,7 +721,191 @@ fn ep_id(e: &Endpoint) -> String {
     format!("{}|{}|{}", e.pc, e.nic.name, e.nic.ipv4)
 }
 
-/// 生成全部任务单元。返回 (units, 提示信息列表)
+/// 一份计划最多重复多少遍。
+///
+/// 上限 100 不是技术限制，是**防手滑**：一次全量跑 11.5 小时，输错一位就是
+/// 一个月。真要跑更多遍，分多次跑再用 `cpe_test compare` 逐对对比。
+pub const MAX_ROUNDS: u32 = 100;
+
+/// 给第 `round` 轮的单元派生一个独立的稳定身份。
+///
+/// **第 1 轮逐字节不变**（直接返回原 id）。这是刻意的：轮次是新功能，不该让
+/// 任何历史 `task_results.json` 的 RESUME 命中失效——不加轮次的老计划跑出来的
+/// 身份和以前一模一样。
+///
+/// 第 2 轮起才把轮次拌进哈希。**必须拌**：端口不进身份（见
+/// `push_iperf_task_identity`），所以同一份计划展开两遍拿到的是**同一个 id**，
+/// 不区分的话第 2 轮会直接命中第 1 轮刚写进去的 PASS 而整轮跳过——
+/// 那正好把「连跑 N 遍看有没有偶发」这个功能本身取消掉。
+///
+/// 派生是确定性的，所以跨运行仍然对得上：今天的第 3 轮命中昨天的第 3 轮。
+fn round_scoped_id(base: &str, round: u32) -> String {
+    if round <= 1 {
+        return base.to_string();
+    }
+    md5_hex(&format!("{base}|repeat_round_v1|{round}"))
+}
+
+/// 给一个单元里的每条腿重新分配端口。
+///
+/// 复制出来的轮次**不能共用第 1 轮的端口**：小计划连着跑时，第 2 轮可能撞上
+/// 第 1 轮刚释放、还在 TIME_WAIT 里的那个端口。端口本来就不进稳定身份
+/// （见 `push_iperf_task_identity`），所以重分不影响 RESUME。
+fn reallocate_ports(unit: &mut Unit, next_port: &mut u16) {
+    for leg in &mut unit.legs {
+        match &mut leg.kind {
+            LegKind::IperfSingle(task) => task.port = alloc_port(next_port),
+            LegKind::IperfGroup { streams, .. } => {
+                for task in streams {
+                    task.port = alloc_port(next_port);
+                }
+            }
+            LegKind::CtsTraffic(task) => task.port = alloc_port(next_port),
+            // ping 不占端口。
+            LegKind::Ping(_) => {}
+        }
+    }
+}
+
+/// 把一份**已经展开好**的计划重复 `rounds` 遍，整套跑完再跑一遍。
+///
+/// 返回的第一段就是入参本身（第 1 轮），所以调用方可以按 `units.len()` 切出
+/// 每一轮。命令行与控制台两条路共用这一个函数——各写一份的话，两边的轮次
+/// 身份会漂，而那意味着控制台跑的第 2 轮和命令行跑的第 2 轮互相命中不了 RESUME。
+/// 把整份计划重复 `rounds` 遍，**整套跑完再跑一遍**。
+///
+/// # 为什么轮次在最外层
+///
+/// 稳定性要回答的是「同一套用例连跑 20 遍，有没有哪一遍开始掉」。轮次放在最内层
+/// （同一个单元连跑 N 次）测的是另一件事——热衰减——而那个用一个更长的 `duration`
+/// 就够了。最外层才是「拷机」这个词的意思。
+///
+/// 内环（`inner::plan`）用的是最内层（网口 → 协议 → 方向 → 轮次），那是因为它的
+/// 单元少、一轮就几分钟；子网这边一轮 11.5 小时，两者要的东西不一样。
+///
+/// # 端口
+///
+/// 每一轮都重新走一遍展开，`next_port` 一路往前推，所以各轮不共用端口。
+///
+/// # 提示
+///
+/// `rounds > 1` 且开着 RESUME 时会多给一条提示：每一轮身份不同，所以**每轮至少
+/// 会跑一次**；但隔天重跑时，昨天已经 PASS 的那些轮次会被跳过。
+pub fn repeat_units(
+    units: Vec<Unit>,
+    rounds: u32,
+    next_port: &mut u16,
+) -> (Vec<Unit>, Vec<String>) {
+    let rounds = rounds.clamp(1, MAX_ROUNDS);
+    if rounds <= 1 || units.is_empty() {
+        return (units, Vec::new());
+    }
+    let per_round = units.len();
+    let mut out = units;
+    for round in 2..=rounds {
+        for index in 0..per_round {
+            let mut unit = out[index].clone();
+            unit.id = round_scoped_id(&unit.id, round);
+            unit.title = format!("{} · 第 {round} 轮", unit.title);
+            unit.round = round;
+            reallocate_ports(&mut unit, next_port);
+            out.push(unit);
+        }
+    }
+    // 第 1 轮的标题也要标出来，否则报告里前 N 个没有轮次、后面都有，
+    // 读的人会以为前面那批是「不属于任何一轮」的东西。
+    for unit in out.iter_mut().take(per_round) {
+        unit.title = format!("{} · 第 1 轮", unit.title);
+    }
+    let notice = format!(
+        "稳定性轮次：整份计划重复 {rounds} 遍（每轮 {per_round} 个单元，共 {} 个）。\
+         每一轮有独立的稳定身份，所以同一次运行里不会互相命中 RESUME；\
+         隔天重跑时，各轮各自命中自己昨天的结果。",
+        out.len()
+    );
+    (out, vec![notice])
+}
+
+pub fn build_units_repeated(
+    specs: &[SpecNorm],
+    require_same_subnet: bool,
+    next_port: &mut u16,
+    rounds: u32,
+) -> (Vec<Unit>, Vec<String>) {
+    let (units, mut notices) = build_units(specs, require_same_subnet, next_port);
+    let (units, round_notices) = repeat_units(units, rounds, next_port);
+    notices.extend(round_notices);
+    (units, notices)
+}
+
+/// 控制台套件计划的最终单元，以及每个单元来自哪条规格。
+///
+/// 预览、计划指纹和执行必须共用这一份展开规则。保留原来的端口分配顺序：
+/// 先展开全部规格并派生轮次，再移除重复项；去重不会重新给留下的单元派端口。
+/// 命令行显式列出的重复测试仍由 `build_units_repeated` 原样执行。
+pub struct UiPlanUnits {
+    pub units: Vec<Unit>,
+    pub notices: Vec<String>,
+    pub spec_indices: Vec<usize>,
+}
+
+pub fn build_ui_units_repeated(
+    specs: &[SpecNorm],
+    require_same_subnet: bool,
+    next_port: &mut u16,
+    rounds: u32,
+) -> UiPlanUnits {
+    let mut units = Vec::new();
+    let mut notices = Vec::new();
+    let mut spec_indices = Vec::new();
+    for (index, spec) in specs.iter().enumerate() {
+        let (built, build_notices) =
+            build_units(std::slice::from_ref(spec), require_same_subnet, next_port);
+        spec_indices.extend(std::iter::repeat_n(index, built.len()));
+        units.extend(built);
+        notices.extend(build_notices);
+    }
+    let (repeated, round_notices) = repeat_units(units, rounds, next_port);
+    let per_round = spec_indices.len();
+    if per_round > 0 {
+        spec_indices = spec_indices
+            .iter()
+            .copied()
+            .cycle()
+            .take(repeated.len())
+            .collect();
+    }
+    notices.extend(round_notices);
+
+    let original_count = repeated.len();
+    let mut seen_ids = HashSet::new();
+    let mut units = Vec::with_capacity(original_count);
+    let mut unique_sources = Vec::with_capacity(original_count);
+    for (unit, source) in repeated.into_iter().zip(spec_indices) {
+        if seen_ids.insert(unit.id.clone()) {
+            units.push(unit);
+            unique_sources.push(source);
+        }
+    }
+    let removed_count = original_count - units.len();
+    if removed_count > 0 {
+        notices.push(format!(
+            "计划去重：移除了 {removed_count} 个最终参数完全相同的重复单元"
+        ));
+    }
+    UiPlanUnits {
+        units,
+        notices,
+        spec_indices: unique_sources,
+    }
+}
+
+/// 生成全部任务单元。返回 `(units, 提示信息列表)`。
+///
+/// 展开顺序是 方向 → IP 版本 → iperf/ping，**这个顺序进了稳定 ID**，改它会让
+/// 历史 `task_results.json` 的 RESUME 不再命中。提示信息是那些「跳过了什么、
+/// 为什么跳过」的话（同 /24 门禁、UDP 按链路速率裁流），它们必须走返回值
+/// 而不是直接 `logln`——控制台那条路径没有终端可看。
 pub fn build_units(
     specs: &[SpecNorm],
     require_same_subnet: bool,
@@ -885,6 +1078,8 @@ pub fn build_units(
                                             .then_some(spec.rate_target_bidir_total)
                                             .flatten(),
                                         direction: dir.to_string(),
+                                        // 轮次由 `repeat_units` 在最外层派生；这里展开的永远是第 1 轮。
+                                        round: 1,
                                         legs,
                                         est_secs: spec.duration + 10,
                                     });
@@ -1201,6 +1396,8 @@ pub fn build_units(
                                             .then_some(spec.rate_target_bidir_total)
                                             .flatten(),
                                         direction: dir.to_string(),
+                                        // 轮次由 `repeat_units` 在最外层派生；这里展开的永远是第 1 轮。
+                                        round: 1,
                                         legs,
                                         est_secs: udp_estimated_secs(
                                             spec.duration,
@@ -1350,6 +1547,8 @@ pub fn build_units(
                                         .then_some(spec.rate_target_bidir_total)
                                         .flatten(),
                                     direction: dir.to_string(),
+                                    // 轮次由 `repeat_units` 在最外层派生；这里展开的永远是第 1 轮。
+                                    round: 1,
                                     legs,
                                     est_secs: if setup_error.is_some() {
                                         1
@@ -1524,6 +1723,8 @@ pub fn build_units(
                                         .then_some(spec.rate_target_bidir_total)
                                         .flatten(),
                                     direction: dir.to_string(),
+                                    // 轮次由 `repeat_units` 在最外层派生；这里展开的永远是第 1 轮。
+                                    round: 1,
                                     legs,
                                     est_secs: if setup_error.is_some() {
                                         1
@@ -1581,6 +1782,8 @@ pub fn build_units(
                             // Ping 不是吞吐测试，没有 RX 合计门限这回事。
                             bidir_total_target_mbps: None,
                             direction: dir.to_string(),
+                            // 轮次由 `repeat_units` 在最外层派生；这里展开的永远是第 1 轮。
+                            round: 1,
                             legs,
                             est_secs: ping_estimated_secs(spec.ping_count),
                         });
@@ -4987,5 +5190,78 @@ mod tests {
 
         // 同机两块网卡：门禁只对跨机成立。
         assert_eq!(kinds(&build(true, false, false).0), (true, true));
+    }
+
+    /// **第 1 轮的稳定身份必须逐字节不变。**
+    ///
+    /// 轮次是新功能，不该让任何历史 `task_results.json` 的 RESUME 命中失效。
+    /// 不加轮次（或写 `repeats: 1`）的老计划，跑出来的身份和以前一模一样。
+    #[test]
+    fn round_one_keeps_the_exact_identity_it_had_before_rounds_existed() {
+        let mut port = PORT_BASE;
+        let (plain, _) = build_units(&[base_spec()], true, &mut port);
+        let mut port = PORT_BASE;
+        let (once, _) = build_units_repeated(&[base_spec()], true, &mut port, 1);
+        assert_eq!(plain.len(), once.len());
+        for (a, b) in plain.iter().zip(once.iter()) {
+            assert_eq!(a.id, b.id, "第 1 轮的稳定 ID 不许变");
+            assert_eq!(a.title, b.title, "只跑一轮时标题也不许变");
+        }
+    }
+
+    /// 第 2 轮起必须有**独立**身份。
+    ///
+    /// 端口不进身份，所以同一份计划展开两遍拿到的是同一个 id。不区分的话，
+    /// 第 2 轮会直接命中第 1 轮刚写进去的 PASS 而整轮跳过——「连跑 N 遍看有没有
+    /// 偶发」这个功能本身就被取消掉了。
+    #[test]
+    fn later_rounds_get_their_own_identity_so_they_do_not_resume_onto_round_one() {
+        let mut port = PORT_BASE;
+        let (units, notices) = build_units_repeated(&[base_spec()], true, &mut port, 3);
+        let mut port_once = PORT_BASE;
+        let (single, _) = build_units(&[base_spec()], true, &mut port_once);
+        let per_round = single.len();
+        assert_eq!(units.len(), per_round * 3, "整份计划重复三遍");
+
+        let ids: HashSet<&str> = units.iter().map(|u| u.id.as_str()).collect();
+        assert_eq!(ids.len(), units.len(), "所有单元的身份必须两两不同");
+
+        // 轮次在**最外层**：前 N 个是第 1 轮，接着 N 个是第 2 轮。
+        assert!(units[0].title.ends_with("第 1 轮"));
+        assert!(units[per_round].title.ends_with("第 2 轮"));
+        assert!(units[per_round * 2].title.ends_with("第 3 轮"));
+        // 同一条测试在各轮之间除了身份和标题应当完全一致。
+        assert_eq!(units[0].link_group, units[per_round].link_group);
+        assert_eq!(units[0].legs.len(), units[per_round].legs.len());
+        assert!(notices.iter().any(|n| n.contains("稳定性轮次")));
+    }
+
+    /// 派生必须是**确定性**的：今天的第 3 轮要能命中昨天的第 3 轮。
+    #[test]
+    fn round_identities_are_stable_across_runs() {
+        let ids = |port_start: u16| {
+            let mut port = port_start;
+            build_units_repeated(&[base_spec()], true, &mut port, 4)
+                .0
+                .into_iter()
+                .map(|u| u.id)
+                .collect::<Vec<_>>()
+        };
+        // 端口起点不同也不该改变身份——端口本来就不进身份。
+        assert_eq!(ids(PORT_BASE), ids(PORT_BASE + 500));
+    }
+
+    /// 上限是防手滑：一次全量跑 11.5 小时，输错一位就是一个月。
+    #[test]
+    fn the_round_count_is_clamped_on_both_ends() {
+        let mut port = PORT_BASE;
+        let (zero, _) = build_units_repeated(&[base_spec()], true, &mut port, 0);
+        let mut port_one = PORT_BASE;
+        let (one, _) = build_units(&[base_spec()], true, &mut port_one);
+        assert_eq!(zero.len(), one.len(), "0 当成 1 处理，不许展开成空计划");
+
+        let mut port = PORT_BASE;
+        let (many, _) = build_units_repeated(&[base_spec()], true, &mut port, MAX_ROUNDS + 50);
+        assert_eq!(many.len(), one.len() * MAX_ROUNDS as usize);
     }
 }

@@ -3,7 +3,7 @@ use crate::nic::counter::NicCounterReader;
 use crate::util::{configure_managed_command, run_cmd};
 use serde::Serialize;
 use std::fs::File;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -182,6 +182,8 @@ pub struct BoardInterface {
     pub name: String,
     /// 该接口上的 IPv4 地址。统计接口**不必**自己持有被测 LAN 地址。
     pub addresses: Vec<String>,
+    /// 该接口上的 IPv6 地址（含前缀长度），与 IPv4 分列保持既有协议兼容。
+    pub ipv6_addresses: Vec<String>,
     /// 所属网桥；空表示它不是桥成员。
     pub master: String,
     /// 作为网桥时的成员口。
@@ -217,7 +219,7 @@ pub const INTERFACE_INVENTORY_SCRIPT: &str = r#"for d in /sys/class/net/*; do
   echo "$n|$m|$r|$t"
 done"#;
 
-/// 汇总板侧接口清单：地址来自 `ip -o -4 addr`，计数能力来自 `/proc/net/dev`
+/// 汇总板侧接口清单：地址来自 `ip -o addr show`，计数能力来自 `/proc/net/dev`
 /// 与 sysfs，桥成员关系来自 `/sys/class/net/<成员>/master`。
 ///
 /// **绝不**把 br0 和 eth1 的计数加在一起：桥和它的成员口多半在数同一批包，
@@ -236,6 +238,7 @@ pub fn board_interfaces(
         out.push(BoardInterface {
             name: fields[0].to_string(),
             addresses: Vec::new(),
+            ipv6_addresses: Vec::new(),
             master: if iface_word(fields[1]) {
                 fields[1].to_string()
             } else {
@@ -261,6 +264,7 @@ pub fn board_interfaces(
             out.push(BoardInterface {
                 name: name.into(),
                 addresses: Vec::new(),
+                ipv6_addresses: Vec::new(),
                 master: String::new(),
                 members: Vec::new(),
                 proc_counters: parse_counters(proc_net_dev, name).is_ok(),
@@ -279,17 +283,18 @@ pub fn board_interfaces(
             .filter(|(master, _)| *master == iface.name)
             .map(|(_, member)| member.clone())
             .collect();
-        iface.addresses = interface_addresses(addresses, &iface.name);
+        iface.addresses = interface_addresses(addresses, &iface.name, "inet");
+        iface.ipv6_addresses = interface_addresses(addresses, &iface.name, "inet6");
     }
     out.sort_by(|a, b| a.name.cmp(&b.name));
     out
 }
 
-fn interface_addresses(text: &str, iface: &str) -> Vec<String> {
+fn interface_addresses(text: &str, iface: &str, family: &str) -> Vec<String> {
     text.lines()
         .filter_map(|line| {
             let fields: Vec<&str> = line.split_whitespace().collect();
-            (fields.len() >= 4 && fields[2] == "inet" && fields[1].split('@').next() == Some(iface))
+            (fields.len() >= 4 && fields[2] == family && fields[1].split('@').next() == Some(iface))
                 .then(|| fields[3].to_string())
         })
         .collect()
@@ -324,15 +329,57 @@ pub fn parse_counters(text: &str, iface: &str) -> Result<(u64, u64), String> {
 /// 必须唯一：同一个地址出现在两个接口上时不猜，因为 server 到底 bind 在
 /// 哪一个、包从哪一个进出，直接决定该读谁的计数器。
 pub fn address_interface(text: &str, ip: Ipv4Addr) -> Result<String, String> {
+    address_interface_for_ip(text, IpAddr::V4(ip))
+}
+
+/// IPv6 LAN 地址同样必须唯一归属；地址表中带 `%zone` 的文本不按无 zone 地址猜测。
+pub fn address_interface_v6(text: &str, ip: Ipv6Addr) -> Result<String, String> {
+    address_interface_for_ip(text, IpAddr::V6(ip))
+}
+
+/// 桥与成员口可以因共用 MAC 拥有同一个 link-local 地址。只有扫描证明所有
+/// 匹配口归属同一座也持有该地址的桥时，才用桥作为 LAN 作用域；不跨桥猜测。
+pub fn lan_interface_v6(
+    text: &str,
+    ip: Ipv6Addr,
+    interfaces: &[BoardInterface],
+) -> Result<String, String> {
+    let unique = address_interface_v6(text, ip);
+    if unique.is_ok() || !ip.is_unicast_link_local() {
+        return unique;
+    }
+    let names = address_interfaces(text, IpAddr::V6(ip));
+    let bridges: Vec<_> = interfaces
+        .iter()
+        .filter(|bridge| {
+            names.contains(&bridge.name)
+                && names.len() > 1
+                && names.iter().all(|name| {
+                    name == &bridge.name
+                        || interfaces
+                            .iter()
+                            .any(|member| &member.name == name && member.master == bridge.name)
+                })
+        })
+        .collect();
+    if bridges.len() == 1 {
+        Ok(bridges[0].name.clone())
+    } else {
+        unique
+    }
+}
+
+fn address_interfaces(text: &str, ip: IpAddr) -> std::collections::BTreeSet<String> {
     let mut names = std::collections::BTreeSet::new();
+    let family = if ip.is_ipv6() { "inet6" } else { "inet" };
     for line in text.lines() {
         let fields: Vec<_> = line.split_whitespace().collect();
         if fields.len() >= 4
-            && fields[2] == "inet"
+            && fields[2] == family
             && fields[3]
                 .split('/')
                 .next()
-                .and_then(|v| v.parse::<Ipv4Addr>().ok())
+                .and_then(|v| v.parse::<IpAddr>().ok())
                 == Some(ip)
         {
             let name = fields[1].split('@').next().unwrap_or("");
@@ -341,6 +388,11 @@ pub fn address_interface(text: &str, ip: Ipv4Addr) -> Result<String, String> {
             }
         }
     }
+    names
+}
+
+fn address_interface_for_ip(text: &str, ip: IpAddr) -> Result<String, String> {
+    let names = address_interfaces(text, ip);
     if names.len() != 1 {
         return Err(format!(
             "板侧地址 {ip} 必须唯一归属于一个接口，实际匹配 {} 个",
@@ -419,8 +471,35 @@ pub fn rx_candidates(gateway_iface: &str, interfaces: &[BoardInterface]) -> Vec<
 
 /// 前台 shell 持有自己的 server PID。只停止本次进程；无 killall/pkill。
 /// 停止标记用于正常收尾；HUP trap 与有限租约覆盖 ADB 断开和 PC 异常退出。
+#[cfg(all(test, unix))]
 pub fn server_script(bin: &str, ip: Ipv4Addr, port: u16, dir: &str, lease: u64) -> String {
-    format!(
+    server_script_for_address(bin, &ip.to_string(), 4, port, dir, lease).unwrap()
+}
+
+fn server_script_for_address(
+    bin: &str,
+    bind_ip: &str,
+    ipver: u8,
+    port: u16,
+    dir: &str,
+    lease: u64,
+) -> Result<String, String> {
+    let valid = match ipver {
+        4 => bind_ip.parse::<Ipv4Addr>().is_ok(),
+        6 => {
+            let (ip, zone) = bind_ip
+                .split_once('%')
+                .map_or((bind_ip, None), |(ip, zone)| (ip, Some(zone)));
+            ip.parse::<Ipv6Addr>().is_ok_and(|ip| {
+                zone.is_none_or(iface_word) && (!ip.is_unicast_link_local() || zone.is_some())
+            })
+        }
+        _ => false,
+    };
+    if !valid {
+        return Err(format!("板侧 server 的 IPv{ipver} 绑定地址无效：{bind_ip}"));
+    }
+    Ok(format!(
         r#"umask 077
 mkdir '{dir}' || exit 70
 p=''
@@ -431,7 +510,7 @@ cleanup() {{
 }}
 trap cleanup EXIT
 trap 'exit 0' HUP INT TERM
-'{bin}' -s -4 -B {ip} -p {port} -i 1 -f m &
+'{bin}' -s -{ipver} -B '{bind_ip}' -p {port} -i 1 -f m &
 p=$!
 i=0
 while [ "$i" -lt {lease} ] && kill -0 "$p" 2>/dev/null && [ ! -f '{dir}/stop' ]; do
@@ -440,7 +519,7 @@ while [ "$i" -lt {lease} ] && kill -0 "$p" 2>/dev/null && [ ! -f '{dir}/stop' ];
   if kill -0 "$p" 2>/dev/null; then : > '{dir}/ready'; fi
 done
 "#
-    )
+    ))
 }
 
 pub struct Server {
@@ -455,17 +534,26 @@ impl Server {
     ///
     /// 双向单元两条腿同时在跑，共用一个端口的话两股流会撞进同一个 server
     /// 进程，日志和字节都分不出是哪条腿的。`owner` 已经把腿编进去了。
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         adb: &Adb,
         cfg: &InnerConfig,
-        ip: Ipv4Addr,
+        bind_ip: &str,
+        ipver: u8,
         port: u16,
         owner: &str,
         log: &Path,
         cancel: &AtomicBool,
     ) -> Result<Self, String> {
         let dir = format!("/tmp/cpe-inner-{owner}");
-        let script = server_script(&cfg.board_iperf, ip, port, &dir, cfg.duration_secs + 150);
+        let script = server_script_for_address(
+            &cfg.board_iperf,
+            bind_ip,
+            ipver,
+            port,
+            &dir,
+            cfg.duration_secs + 150,
+        )?;
         let file = File::create(log).map_err(|e| e.to_string())?;
         let err = file.try_clone().map_err(|e| e.to_string())?;
         let mut command = Command::new(&adb.program);
@@ -553,6 +641,104 @@ impl Drop for Server {
             if let Err(error) = self.stop() {
                 eprintln!("内环 server 清理: {error}");
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod ipv6_tests {
+    use super::*;
+
+    #[test]
+    fn shared_link_local_requires_proven_common_bridge_and_never_guesses_across_lans() {
+        let addresses = "2: br0 inet6 fe80::1/64 scope link\n3: eth0 inet6 fe80::1/64 scope link\n4: eth1 inet6 fe80::1/64 scope link";
+        let interfaces = board_interfaces("br0||1|2\neth0|br0|1|2\neth1|br0|1|2", addresses, "");
+        let ip = "fe80::1".parse().unwrap();
+        assert_eq!(lan_interface_v6(addresses, ip, &interfaces).unwrap(), "br0");
+        assert!(lan_interface_v6(addresses, ip, &[]).is_err());
+        let mut unrelated = interfaces.clone();
+        unrelated
+            .iter_mut()
+            .find(|iface| iface.name == "eth1")
+            .unwrap()
+            .master = "br1".into();
+        assert!(lan_interface_v6(addresses, ip, &unrelated).is_err());
+        let global = addresses.replace("fe80::1", "fd00::1");
+        assert!(lan_interface_v6(&global, "fd00::1".parse().unwrap(), &interfaces).is_err());
+    }
+
+    #[test]
+    fn board_inventory_keeps_ipv4_and_ipv6_addresses_in_separate_fields() {
+        let interfaces = board_interfaces(
+            "br0||100|200\neth1|br0|300|400\n",
+            "2: br0 inet 192.168.8.1/24 scope global br0\n\
+             2: br0 inet6 fd00:8::1/64 scope global\n\
+             2: br0 inet6 fe80::1/64 scope link\n\
+             3: eth1@br0 inet6 fe80::2/64 scope link\n\
+             4: eth2 inet6 2001:db8::1/64 scope global\n",
+            "",
+        );
+        assert_eq!(interfaces.len(), 3);
+        assert_eq!(interfaces[0].name, "br0");
+        assert_eq!(interfaces[0].addresses, ["192.168.8.1/24"]);
+        assert_eq!(interfaces[0].ipv6_addresses, ["fd00:8::1/64", "fe80::1/64"]);
+        assert_eq!(interfaces[0].members, ["eth1"]);
+        assert_eq!(interfaces[1].ipv6_addresses, ["fe80::2/64"]);
+        assert_eq!(interfaces[2].name, "eth2");
+        assert!(interfaces[2].addresses.is_empty());
+        assert_eq!(interfaces[2].ipv6_addresses, ["2001:db8::1/64"]);
+        assert!(!interfaces[2].sysfs_counters);
+    }
+
+    #[test]
+    fn ipv6_address_ownership_is_canonical_unique_and_does_not_guess_zones() {
+        let ip = "fe80::1".parse().unwrap();
+        let same_interface = "2: br0 inet6 fe80:0:0:0:0:0:0:1/64 scope link\n\
+                              2: br0@eth0 inet6 fe80::1/64 scope link\n";
+        assert_eq!(address_interface_v6(same_interface, ip).unwrap(), "br0");
+        assert!(address_interface_v6("2: br0 inet6 fe80::1%br0/64 scope link", ip).is_err());
+        assert!(address_interface_v6("2: br0 inet6 fe80::2/64 scope link", ip).is_err());
+        assert!(address_interface_v6(
+            &format!("{same_interface}3: eth1 inet6 fe80::1/64 scope link\n"),
+            ip
+        )
+        .unwrap_err()
+        .contains("实际匹配 2 个"));
+    }
+
+    #[test]
+    fn board_server_uses_requested_address_family_and_explicit_link_local_zone() {
+        let script = server_script_for_address(
+            "/data/local/tmp/iperf3",
+            "fe80::1%br0",
+            6,
+            56190,
+            "/tmp/cpe-inner-test",
+            151,
+        )
+        .unwrap();
+        assert!(script.contains("-s -6 -B 'fe80::1%br0' -p 56190"));
+        let v4 =
+            server_script_for_address("iperf3", "192.168.8.1", 4, 56190, "/tmp/test", 1).unwrap();
+        assert!(v4.contains("-s -4 -B '192.168.8.1' -p 56190"));
+        assert!(server_script_for_address("iperf3", "fd00::1", 6, 56190, "/tmp/test", 1).is_ok());
+    }
+
+    #[test]
+    fn board_server_rejects_family_mismatches_and_unsafe_or_missing_zones() {
+        for (ip, family) in [
+            ("192.168.8.1", 6),
+            ("fd00::1", 4),
+            ("fd00::1", 5),
+            ("fe80::1", 6),
+            ("fe80::1%", 6),
+            ("fe80::1%br0%eth1", 6),
+            ("fe80::1%br0';touch /tmp/injected", 6),
+        ] {
+            assert!(
+                server_script_for_address("iperf3", ip, family, 56190, "/tmp/test", 1).is_err(),
+                "{ip} / IPv{family}"
+            );
         }
     }
 }

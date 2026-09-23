@@ -7,13 +7,15 @@
 //! - `/sys/class/net/<iface>/wireless/`：Wi-Fi 判定；
 //! - `/sys/class/net/<iface>/wireless/link`：Wi-Fi 当前链路速率（Mb/s）。
 //!
-//! 过滤规则：loopback、非 UP、operstate=down、无 IPv4、IPv4 前缀不匹配。
+//! 过滤规则：loopback、非 UP、operstate=down、IPv4 前缀不匹配。
+//! 空前缀扫描同时保留只有 IPv6 的接口。
 
 use super::classify::classify_role;
 use super::ipv4_match;
 use crate::protocol::NicInfo;
 use crate::util::run_cmd;
 use std::collections::HashMap;
+use std::net::Ipv6Addr;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Default)]
@@ -66,13 +68,17 @@ fn parse_addr_json(text: &str, v6: bool) -> HashMap<String, IfBlock> {
                 let low = local.to_lowercase();
                 let stripped = low.split('%').next().unwrap_or(&low).to_string();
                 if v6 {
-                    if stripped.starts_with("fe80") {
+                    let Ok(ip) = stripped.parse::<Ipv6Addr>() else {
+                        continue;
+                    };
+                    if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() {
+                        continue;
+                    }
+                    if ip.is_unicast_link_local() {
                         if block.ipv6_ll.is_none() {
                             block.ipv6_ll = Some(stripped);
                         }
-                    } else if (stripped.starts_with('2') || stripped.starts_with('3'))
-                        && block.ipv6_global.is_none()
-                    {
+                    } else if block.ipv6_global.is_none() {
                         block.ipv6_global = Some(stripped);
                     }
                 } else if block.ipv4.is_none() {
@@ -82,6 +88,37 @@ fn parse_addr_json(text: &str, v6: bool) -> HashMap<String, IfBlock> {
         }
     }
     map
+}
+
+fn merge_ipv6_blocks(blocks: &mut HashMap<String, IfBlock>, v6: HashMap<String, IfBlock>) {
+    for (name, b6) in v6 {
+        let b = blocks.entry(name.clone()).or_insert_with(|| IfBlock {
+            name,
+            ..Default::default()
+        });
+        if b.ipv6_ll.is_none() {
+            b.ipv6_ll = b6.ipv6_ll;
+        }
+        if b.ipv6_global.is_none() {
+            b.ipv6_global = b6.ipv6_global;
+        }
+        if b.operstate.is_empty() {
+            b.operstate = b6.operstate;
+        }
+        for flag in b6.flags {
+            if !b.flags.contains(&flag) {
+                b.flags.push(flag);
+            }
+        }
+    }
+}
+
+fn block_matches_scan(b: &IfBlock, prefixes: &[String]) -> bool {
+    !b.name.starts_with("lo")
+        && b.flags.iter().any(|f| f == "UP")
+        && !b.operstate.eq_ignore_ascii_case("down")
+        && (b.ipv4.as_deref().is_some_and(|ip| ipv4_match(ip, prefixes))
+            || (prefixes.is_empty() && (b.ipv6_ll.is_some() || b.ipv6_global.is_some())))
 }
 
 /// 解析 `ip -j route`：返回 dev -> default gateway（IPv4）。
@@ -179,38 +216,12 @@ pub fn scan_all(prefixes: &[String]) -> Vec<NicInfo> {
     let routes = run_cmd("ip", &["-j", "route"], Duration::from_secs(10));
 
     let mut blocks = parse_addr_json(&v4.stdout, false);
-    for (name, b6) in parse_addr_json(&v6.stdout, true) {
-        let b = blocks.entry(name.clone()).or_insert_with(|| IfBlock {
-            name: name.clone(),
-            ..Default::default()
-        });
-        if b.ipv6_ll.is_none() {
-            b.ipv6_ll = b6.ipv6_ll;
-        }
-        if b.ipv6_global.is_none() {
-            b.ipv6_global = b6.ipv6_global;
-        }
-        if b.operstate.is_empty() {
-            b.operstate = b6.operstate;
-        }
-    }
+    merge_ipv6_blocks(&mut blocks, parse_addr_json(&v6.stdout, true));
     let gateways = parse_gateway_v4(&routes.stdout);
 
     let mut out = Vec::new();
     for b in blocks.values() {
-        if b.name == "lo" || b.name.starts_with("lo") {
-            continue;
-        }
-        if !b.flags.iter().any(|f| f == "UP") {
-            continue;
-        }
-        if b.operstate.eq_ignore_ascii_case("down") {
-            continue;
-        }
-        let Some(ipv4) = b.ipv4.as_deref() else {
-            continue;
-        };
-        if !ipv4_match(ipv4, prefixes) {
+        if !block_matches_scan(b, prefixes) {
             continue;
         }
         let is_wifi = is_wifi_iface(&b.name);
@@ -230,7 +241,7 @@ pub fn scan_all(prefixes: &[String]) -> Vec<NicInfo> {
             name: b.name.clone(),
             description,
             role,
-            ipv4: ipv4.to_string(),
+            ipv4: b.ipv4.clone().unwrap_or_default(),
             gateway_v4: gateways.get(&b.name).cloned().unwrap_or_default(),
             ipv6_ll: b.ipv6_ll.clone().unwrap_or_default(),
             ipv6_global: b.ipv6_global.clone().unwrap_or_default(),
@@ -238,6 +249,14 @@ pub fn scan_all(prefixes: &[String]) -> Vec<NicInfo> {
             speed_mbps: speed,
             is_wifi,
             wifi_band: band,
+            // 无线上下文只有 Windows 的 `netsh wlan show interfaces` 这一条来源。
+            // 本平台留空而不是去凑一个值：跨平台跑只用于开发自测（AGENTS.md §0），
+            // 为它另写一套 `iw` / `airport` 解析要付真实的维护成本，而报告里
+            // 一格空白已经如实说明了「这台机器上没采到」。
+            wifi_ssid: String::new(),
+            wifi_signal_pct: None,
+            wifi_channel: None,
+            wifi_radio: String::new(),
             ifindex: 0,
         });
     }
@@ -300,5 +319,35 @@ mod tests {
     fn test_parse_bad_json_is_empty() {
         assert!(parse_addr_json("not json", false).is_empty());
         assert!(parse_gateway_v4("").is_empty());
+    }
+
+    #[test]
+    fn empty_prefix_scan_includes_ipv6_only_interfaces_and_keeps_link_filters() {
+        let mut blocks = HashMap::new();
+        merge_ipv6_blocks(&mut blocks, parse_addr_json(ADDR6, true));
+        let mut b = blocks.remove("enp2s0").unwrap();
+        assert!(b.ipv4.is_none());
+        assert!(block_matches_scan(&b, &[]));
+        assert!(!block_matches_scan(&b, &["192.168.".into()]));
+        b.operstate = "down".into();
+        assert!(!block_matches_scan(&b, &[]));
+        b.operstate = "UP".into();
+        b.flags.clear();
+        assert!(!block_matches_scan(&b, &[]));
+        b.flags.push("UP".into());
+        b.name = "lo".into();
+        assert!(!block_matches_scan(&b, &[]));
+    }
+
+    #[test]
+    fn ipv6_scan_accepts_ula_but_not_loopback_multicast_or_invalid_addresses() {
+        let addresses = r#"[
+            {"ifname":"eth0","addr_info":[{"local":"fd12:3456::1"}]},
+            {"ifname":"eth1","addr_info":[{"local":"::1"},{"local":"::"},{"local":"ff02::1"},{"local":"fe80-invalid"}]}
+        ]"#;
+        let blocks = parse_addr_json(addresses, true);
+        assert_eq!(blocks["eth0"].ipv6_global.as_deref(), Some("fd12:3456::1"));
+        assert!(blocks["eth1"].ipv6_ll.is_none());
+        assert!(blocks["eth1"].ipv6_global.is_none());
     }
 }

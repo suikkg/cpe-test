@@ -37,6 +37,20 @@ export const plan = reactive({
   duration: 180,
   resume: false,
   screenshot: false,
+  /** 灌包期间并发探负载下时延。默认关：打开它就改变了测量条件。 */
+  probeDuringTraffic: false,
+  /** 每个 ping 单元额外探一次路径 MTU（带 DF 位二分）。只进诊断。 */
+  probePathMtu: false,
+  /**
+   * 「仅本轮」强制档位：空 = 不覆盖。
+   *
+   * 盖在套件任务配置**之后**，所以配过参数的任务也照样被覆盖——那正是
+   * 「就这一轮压一档试试」要覆盖的对象。值进 request.json，重跑跑的是同一件事。
+   */
+  forceTcpWindow: '',
+  forceUdpBandwidth: '',
+  /** 整份计划重复跑多少遍（稳定性 / 拷机）。1 = 跑一遍。 */
+  rounds: 1,
   limitUdpByLinkSpeed: false,
   globals: defaultGlobals() as UiGlobals,
   nicPolicies: [] as UiNicPolicy[],
@@ -123,6 +137,11 @@ function saveDraft(): void {
         duration: plan.duration,
         resume: plan.resume,
         screenshot: plan.screenshot,
+        probeDuringTraffic: plan.probeDuringTraffic,
+        probePathMtu: plan.probePathMtu,
+        forceTcpWindow: plan.forceTcpWindow,
+        forceUdpBandwidth: plan.forceUdpBandwidth,
+        rounds: plan.rounds,
         limitUdpByLinkSpeed: plan.limitUdpByLinkSpeed,
         globals: plan.globals,
         nicPolicies: plan.nicPolicies,
@@ -154,6 +173,11 @@ export function loadDraft(): boolean {
       duration?: number;
       resume?: boolean;
       screenshot?: boolean;
+      probeDuringTraffic?: boolean;
+      probePathMtu?: boolean;
+      forceTcpWindow?: string;
+      forceUdpBandwidth?: string;
+      rounds?: number;
       limitUdpByLinkSpeed?: boolean;
       globals?: UiGlobals;
       nicPolicies?: UiNicPolicy[];
@@ -185,6 +209,12 @@ export function loadDraft(): boolean {
     }
     plan.resume = parsed.resume === true;
     plan.screenshot = parsed.screenshot === true;
+    plan.probeDuringTraffic = parsed.probeDuringTraffic === true;
+    plan.probePathMtu = parsed.probePathMtu === true;
+    plan.forceTcpWindow = typeof parsed.forceTcpWindow === 'string' ? parsed.forceTcpWindow : '';
+    plan.forceUdpBandwidth =
+      typeof parsed.forceUdpBandwidth === 'string' ? parsed.forceUdpBandwidth : '';
+    plan.rounds = clampRounds(parsed.rounds);
     plan.limitUdpByLinkSpeed = parsed.limitUdpByLinkSpeed === true;
     plan.globals = parsed.globals ? normalizeGlobals(parsed.globals) : defaultGlobals();
     plan.nicPolicies = Array.isArray(parsed.nicPolicies) ? parsed.nicPolicies : [];
@@ -209,6 +239,11 @@ watch(
     plan.duration,
     plan.resume,
     plan.screenshot,
+    plan.probeDuringTraffic,
+    plan.probePathMtu,
+    plan.forceTcpWindow,
+    plan.forceUdpBandwidth,
+    plan.rounds,
     plan.limitUdpByLinkSpeed,
     plan.globals,
     plan.nicPolicies,
@@ -232,6 +267,42 @@ export function applyBootstrapDefaults(bootstrap: BootstrapOut): void {
   if (draftRestored) return;
   if (bootstrap.duration > 0) plan.duration = bootstrap.duration;
   plan.screenshot = bootstrap.screenshot;
+  plan.probeDuringTraffic = bootstrap.probe_during_traffic === true;
+  plan.probePathMtu = bootstrap.probe_path_mtu === true;
+}
+
+/**
+ * 轮次的取值收敛。**和 Rust 侧的 `builder::MAX_ROUNDS` 是同一个上限**——
+ * 界面放行 500、后端夹到 100 的话，预览说 500 轮、实际跑 100 轮。
+ *
+ * 上限存在的理由是防手滑：一次全量跑 11.5 小时，输错一位就是一个月。
+ */
+export const MAX_ROUNDS = 100;
+
+export function clampRounds(value: unknown): number {
+  const n = typeof value === 'number' && Number.isFinite(value) ? Math.floor(value) : 1;
+  return Math.min(MAX_ROUNDS, Math.max(1, n));
+}
+
+let previewRequest = 0;
+
+export function invalidatePreview(): void {
+  ++previewRequest;
+  plan.preview = null;
+  plan.previewRequestFingerprint = '';
+  plan.previewing = false;
+  plan.previewError = '';
+}
+
+/** 项目不保存的本轮选项不能跟着切换项目；历史重跑则从归档显式恢复。 */
+function resetRunOptions(): void {
+  plan.resume = false;
+  plan.screenshot = false;
+  plan.probeDuringTraffic = false;
+  plan.probePathMtu = false;
+  plan.forceTcpWindow = '';
+  plan.forceUdpBandwidth = '';
+  plan.rounds = 1;
 }
 
 export function reset(): void {
@@ -241,13 +312,9 @@ export function reset(): void {
   plan.filter = 'all';
   plan.stale = [];
   plan.pendingImportTopology = false;
-  plan.preview = null;
-  plan.previewRequestFingerprint = '';
-  plan.previewing = false;
-  plan.previewError = '';
+  invalidatePreview();
   plan.duration = 180;
-  plan.resume = false;
-  plan.screenshot = false;
+  resetRunOptions();
   plan.limitUdpByLinkSpeed = false;
   plan.globals = defaultGlobals();
   plan.nicPolicies = [];
@@ -260,9 +327,8 @@ export function restoreDefaultProject(): void {
   plan.linkSets = [];
   plan.filter = 'all';
   plan.stale = [];
-  plan.preview = null;
-  plan.previewRequestFingerprint = '';
-  plan.previewError = '';
+  invalidatePreview();
+  resetRunOptions();
   reconcile();
 }
 
@@ -272,6 +338,11 @@ export function buildRunRequest(): Record<string, unknown> {
     duration: plan.duration,
     resume: plan.resume,
     screenshot: plan.screenshot,
+    probe_during_traffic: plan.probeDuringTraffic,
+    probe_path_mtu: plan.probePathMtu,
+    force_tcp_window: plan.forceTcpWindow,
+    force_udp_bandwidth: plan.forceUdpBandwidth,
+    rounds: plan.rounds,
     limit_udp_by_link_speed: plan.limitUdpByLinkSpeed,
     tcp_windows: globals.tcp_windows,
     tcp_streams: globals.tcp_streams,
@@ -318,19 +389,25 @@ export function previewIsCurrent(): boolean {
 }
 
 export async function preview(): Promise<void> {
+  const requestId = ++previewRequest;
+  const fingerprint = JSON.stringify(buildRunRequest());
+  const current = () => requestId === previewRequest
+    && fingerprint === JSON.stringify(buildRunRequest());
   plan.previewing = true;
   plan.previewError = '';
-  const request = buildRunRequest();
-  const fingerprint = JSON.stringify(request);
   try {
-    plan.preview = await api.post<PlanOut>('/api/plan', request);
+    const result = await api.post<PlanOut>('/api/plan', JSON.parse(fingerprint));
+    if (!current()) return;
+    plan.preview = result;
     plan.previewRequestFingerprint = fingerprint;
   } catch (error) {
+    if (!current()) return;
     plan.preview = null;
     plan.previewRequestFingerprint = '';
     plan.previewError = errorMessage(error);
   } finally {
-    plan.previewing = false;
+    // 配置已改但还没发新预览时也要结束忙碌态；旧请求不能结束新请求的忙碌态。
+    if (requestId === previewRequest) plan.previewing = false;
   }
 }
 
@@ -341,6 +418,8 @@ export function importProject(text: string): boolean {
   projectNotices.items = result.notices;
   projectNotices.error = result.error ?? '';
   if (!result.ok || !result.plan) return false;
+  invalidatePreview();
+  resetRunOptions();
   plan.ui = result.plan;
   plan.linkSets = result.plan.link_sets.map((set) => ({ ...set, auto: false }));
   const settings: ProjectSettings = result.settings ?? {};
@@ -360,8 +439,14 @@ export function importProject(text: string): boolean {
 export function adoptRunRequest(raw: unknown, skipPassed: boolean): boolean {
   const snapshot = parseRunRequest(raw);
   if (!snapshot) return false;
+  invalidatePreview();
   plan.duration = snapshot.duration;
   plan.screenshot = snapshot.screenshot;
+  plan.probeDuringTraffic = snapshot.probeDuringTraffic;
+  plan.probePathMtu = snapshot.probePathMtu;
+  plan.forceTcpWindow = snapshot.forceTcpWindow;
+  plan.forceUdpBandwidth = snapshot.forceUdpBandwidth;
+  plan.rounds = snapshot.rounds;
   plan.limitUdpByLinkSpeed = snapshot.limitUdpByLinkSpeed;
   plan.globals = snapshot.globals;
   plan.nicPolicies = snapshot.nicPolicies;
@@ -374,9 +459,6 @@ export function adoptRunRequest(raw: unknown, skipPassed: boolean): boolean {
     plan.linkSets = snapshot.plan.link_sets.map((set) => ({ ...set, auto: false }));
     reconcile();
   }
-  plan.preview = null;
-  plan.previewRequestFingerprint = '';
-  plan.previewError = '';
   return true;
 }
 

@@ -54,6 +54,19 @@ pub(super) struct RunEntry {
     pub(super) has_request: bool,
     /// 整个目录的字节数——下载前让人知道要拉多大。
     pub(super) bytes: u64,
+    /// 本轮开始时刻，取自 `meta.json`；旧目录或半截运行为空。
+    ///
+    /// **不能拿 `modified` 顶替**：那是目录的修改时刻，重放一次报告它就会变，
+    /// 于是隔夜回来看到的「时间」是自己上午点重放的那一下。
+    pub(super) started: String,
+    pub(super) elapsed: String,
+    /// 参与统计的单元数（不含 SKIP）。`0` 且 `total_units` 也为 0 时，
+    /// 多半是升级前写的旧 `meta.json`，前端按「未知」显示而不是「全 0」。
+    pub(super) totals: crate::report::VerdictTotals,
+    /// 计划里一共有多少个单元。用来区分「旧 meta」和「真的没跑」。
+    pub(super) total_units: usize,
+    /// 有没有读到 `meta.json`；没有就是命令行旧目录或崩在写它之前。
+    pub(super) has_meta: bool,
 }
 
 /// 校验并解析 run id。
@@ -154,6 +167,9 @@ pub(super) fn api_runs() -> Result<serde_json::Value, String> {
         .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
         .map(|entry| {
             let dir = entry.path();
+            // `meta.json` 是小文件，读它比同一趟里那次递归 `dir_size` 便宜得多。
+            // 读不到就按「旧目录」处理：**不猜**，让前端显示「未知」。
+            let meta = crate::report::store::load_meta(&dir).ok();
             RunEntry {
                 id: entry.file_name().to_string_lossy().into_owned(),
                 modified: modified_label(&dir),
@@ -162,6 +178,17 @@ pub(super) fn api_runs() -> Result<serde_json::Value, String> {
                 has_xlsx: regular_file(&dir, "summary.xlsx"),
                 has_request: regular_file(&dir, crate::report::store::REQUEST_FILE),
                 bytes: dir_size(&dir),
+                started: meta
+                    .as_ref()
+                    .map(|m| m.report.started.clone())
+                    .unwrap_or_default(),
+                elapsed: meta
+                    .as_ref()
+                    .map(|m| m.report.elapsed.clone())
+                    .unwrap_or_default(),
+                totals: meta.as_ref().map(|m| m.verdict_totals).unwrap_or_default(),
+                total_units: meta.as_ref().map(|m| m.total_units).unwrap_or_default(),
+                has_meta: meta.is_some(),
             }
         })
         .collect();
@@ -224,6 +251,60 @@ pub(super) fn api_run_replay(
         "skipped": outcome.skipped,
         "warnings": outcome.warnings,
     }))
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct CompareReq {
+    /// 基线（旧的那一轮）目录名。
+    pub(super) baseline: String,
+    /// 本轮（新的那一轮）目录名。
+    pub(super) current: String,
+}
+
+/// 两轮对比。差异报告写进**本轮**目录，跟着它一起归档和打包。
+///
+/// 两个目录名都走 `resolve_run_dir` 的白名单（枚举 `runs/` 逐个精确比对，
+/// 请求串从头到尾不参与路径拼接），和 bundle/replay 是同一道门。
+pub(super) fn api_run_compare(
+    console: &Arc<Console>,
+    body: &str,
+) -> Result<serde_json::Value, String> {
+    let req: CompareReq = serde_json::from_str(body).map_err(|e| format!("参数解析失败: {e}"))?;
+    let (baseline_id, current_id) = (req.baseline.trim(), req.current.trim());
+    if baseline_id == current_id {
+        return Err("基线和本轮是同一个目录，没有可比的东西".into());
+    }
+    let Some(baseline_dir) = resolve_run_dir(baseline_id) else {
+        return Err("找不到基线运行目录".into());
+    };
+    let Some(current_dir) = resolve_run_dir(current_id) else {
+        return Err("找不到本轮运行目录".into());
+    };
+    // 正在跑的那一轮不许参与对比：`rows.jsonl` 还在增量追加，比出来的
+    // 「缺失」其实是「还没跑到」。
+    if console.running.load(Ordering::SeqCst) {
+        let live = console.run_status.snapshot(0, None).1.run_id;
+        if live == baseline_id || live == current_id {
+            return Err(
+                "其中一轮正在跑，等它结束再对比；现在比会把「还没跑到」当成「缺失」".into(),
+            );
+        }
+    }
+    crate::master::ui::compare_runs_into(&baseline_dir, &current_dir).map(|outcome| {
+        serde_json::json!({
+            "baseline": baseline_id,
+            "current": current_id,
+            "report": outcome.report.display().to_string(),
+            "same_plan": outcome.same_plan,
+            "has_regression": outcome.has_regression,
+            "regressed": outcome.regressed,
+            "slower": outcome.slower,
+            "fixed": outcome.fixed,
+            "added": outcome.added,
+            "disappeared": outcome.disappeared,
+            "unchanged": outcome.unchanged,
+        })
+    })
 }
 
 // ---------------------------------------------------------------------------

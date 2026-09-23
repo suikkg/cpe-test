@@ -131,6 +131,8 @@ pub fn build_traffic_failure_diagnostics(selected_units: &[Unit]) -> Vec<Unit> {
             target_lines: Vec::new(),
             // 诊断单元不是用户勾出来的方向，留空即可（展示层会跳过）。
             direction: String::new(),
+            // 诊断单元是补跑出来的，不属于任何一轮。
+            round: 1,
             legs: vec![Leg {
                 tag: "subnet-diagnostic".into(),
                 kind: LegKind::Ping(PingTask {
@@ -187,6 +189,8 @@ pub fn build_traffic_failure_diagnostics(selected_units: &[Unit]) -> Vec<Unit> {
             target_lines: Vec::new(),
             // 诊断单元不是用户勾出来的方向，留空即可（展示层会跳过）。
             direction: String::new(),
+            // 诊断单元是补跑出来的，不属于任何一轮。
+            round: 1,
             legs: vec![Leg {
                 tag: "gateway-diagnostic".into(),
                 kind: LegKind::Ping(PingTask {

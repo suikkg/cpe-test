@@ -26,6 +26,69 @@
 | `master/webui/runs.rs` | `/api/runs`、`/api/runs/{id}/bundle.zip`、`/api/runs/report`、`/api/runs/request` | 远程访问者取回报告的唯一通道；报告的相对路径子资源撞「鉴权先于路由」，不能当静态站点服务（ADR-15、§13.3）。`report` 从 `rows.jsonl` 重放（**不要求先没有报告**——崩溃留下的那份可能是半截的；只挡正在跑的那一轮），`request` 回这一轮的计划原文供「重新执行」装载回控制台 |
 | `ui/` | Vue 3 单文件产物 | 见 AGENTS.md §4 |
 
+### 本轮（功能评审）新增的模块
+
+| 新模块 | 干什么 | 为什么在这里 |
+|---|---|---|
+| `report/chart.rs` | 逐样本 CSV → 内联 SVG 速率曲线 | 报告一直只给 CSV 下载链接，「中途掉没掉速」得下载开 Excel 自己画。自绘 SVG 是**单文件离线**约束的直接推论（图表库违反它）。降采样按像素列压 min/max，**保峰值**——等距抽样会把掉速那一拍整个抽掉。不可信样本（`RateSample::valid`）是**断口**，曲线按 `Column::gap_before` 切成多条 `<polyline>`：画成一条贯通的会把采样中断的两端用直线连起来，一分钟没有数据的链路看上去是一段平直的健康曲线 |
+| `report/compare.rs` | 两轮对比：`compare` + `render_html` | 版本回归唯一要回答的问题。**对齐键刻意不用 `Unit.id`**：那个身份含 `speed_mbps`（对 RESUME 是对的），Wi-Fi 一重协商同一条测试就成了两个 ID。这条是拿真实历史数据跑出来的。键里**含稳定性轮次**（`Row.round`，`<= 1` 时一个字节都不加以保住历史键）——不含的话 N 轮在 `HashMap` 里互相覆盖只剩最后一轮，而报告不报任何错 |
+| `report/retention.rs` | `runs/` 保留策略 | `victims()` 是纯函数，删数据的逻辑不该只能靠「跑一遍看少了什么」验证。默认 `keep_runs: 0` 不删 |
+| `master/executor/latency.rs` | 负载下时延探针 `LoadLatency` | 灌包腿旁并发一条 ICMP，复用 `ping::run_cancellable`。**只进诊断**——`evaluate_rx_acceptance` 在类型上就收不到它。起跑等 `wait_for_traffic`、收尾靠 `probe_stop` + 分段，见下面的不变量 |
+| `master/executor.rs::DeadTrafficBreaker` | 两层熔断的纯状态机 | 分组那一层**行为上测不到**（要真实流量才显现），做成状态机才能穷举 |
+| `master/executor/pmtu.rs` | 路径 MTU 探测（DF 位二分） | 现有包长档位测的是分片行为，看不出 1500 与 1492。`binary_search` 是纯函数——边界条件（全过 / 全不过 / 差一个字节）靠真链路验证不了 |
+| `builder::repeat_units` / `round_scoped_id` | 稳定性轮次（最外层） | 命令行与控制台**共用这一个**：各写一份的话两边的轮次身份会漂，跨路径互相命中不了 RESUME |
+| `webui::plan::apply_force_overrides` | 仅本轮强制档位 | 必须排在套件任务配置**之后**——配置本身就是覆盖项，排前面等于对配过参数的任务无效 |
+
+**本轮新增/改动的不变量**：
+
+- `report::verdict_totals` 是报告顶部八格与 `meta.json` 判定计数的**唯一**来源。
+  它刻意**不写成 `match verdict => field += 1`**——那个形状是 `RunSummary::bump` /
+  `RunCounts::bump` 的专利，`the_verdict_to_counter_mapping_has_no_third_copy` 禁止第三份。
+- `cancel` 里「停止」与「跳过当前单元」是**两个独立标志**。跳过复用整轮取消那套收尾路径
+  （所以也设 `RUN_CANCELLED`），单元边界靠 `resume_after_skip()` 清掉它继续；
+  而 `STOP_REQUESTED` / `PROCESS_SHUTDOWN_REQUESTED` 优先，不许被那次清零抹掉。
+  只有一个标志的话，「跳过之后紧接着点停止」必然被吃掉。
+- `NicInfo` 的无线上下文（`wifi_ssid` / `wifi_signal_pct` / `wifi_channel` / `wifi_radio`）
+  是**对外 JSON 兼容面**，全部 `#[serde(default)]`。它**刻意不并进 `NicInfo::brief()`**：
+  `brief()` 参与 `Unit.title`，而标题进了
+  `the_full_unit_expansion_is_byte_stable` 的全量快照，也进每一份历史报告的抬头。
+- **两个导入判别器的键集必须零交集**。子网 `import::INNER_ONLY_KEYS` 与内环
+  `config::SUBNET_ONLY_KEYS` 都靠「这些键对方一个都没有」来认形状；出现同名字段，
+  两个导入口就开始互相拒收对方的文件，而报出来的是一句听上去很确定的错话。
+  真撞上过：子网的稳定性轮次一度叫 `repeats`，而内环早就有一个。子网那个改名成
+  `rounds`——语义上本来也不是一回事（内环在**最内层**重复单元，子网在**最外层**
+  重复整套）。守在 `the_two_import_detectors_never_share_a_key`。
+- **轮次的第 1 轮身份逐字节不变**（`round_scoped_id` 对 `round <= 1` 直接返回原值）。
+  第 2 轮起才把轮次拌进哈希——端口不进身份，不拌的话同一份计划展开两遍拿到的是
+  同一个 id，第 2 轮会直接命中第 1 轮刚写进去的 PASS 而整轮跳过。
+- **路径 MTU 与负载下时延都只进诊断**。判定层只有一个权威（接收端 RX 对门限，
+  ADR-17）；给它们开判定路径就是再造「说了算的地方」。PMTU 另有一枚
+  `PING_DF_CAPABILITY`：旧 agent 会忽略 DF 位并报成功，据此得到的「大包能过」
+  是个**听上去很确定的错答案**——宁可没有结果。
+- **路径 MTU 探测只做 IPv4**（`pmtu::probe_path_mtu` 对 `v6` 直接返回 `Err`）。
+  IPv6 协议层面没有 DF 位可设，分片只由源主机做：Windows 的 `ping -f` 文档标注
+  IPv4-only、配 `-6` 时被忽略，macOS 的 `ping6` 不认 `-D`，只有 Linux 的 `-M do`
+  真的生效。三条里两条会给出「大包能过」——**和旧 agent 静默忽略 DF 位是同一个
+  错答案**，而 `PING_DF_CAPABILITY` 只认版本、认不出这一类，主战场又恰恰是
+  Windows。按平台分叉的话，同一份报告在 Linux 主控上有 v6 结果、在 Windows 主控上
+  没有，而两者都不报错。守在
+  `path_mtu_probing_refuses_ipv6_instead_of_returning_a_number_it_cannot_trust`。
+- **负载下时延探针必须和灌包同起同落，这是写代码保证的**。探针线程在
+  `std::thread::scope` 一进去就 spawn，所以起跑要等 `latency::wait_for_traffic`
+  （不等的话，server 启动 + 就绪探测 + 每流 200ms 错峰那几秒的**空载** RTT 会混进
+  平均值，把探针要暴露的排队时延稀释掉）；收尾靠每条腿一个的 `probe_stop` 标志，
+  整段探测按 `PROBE_CHUNK_SECS` 切段——`ping::run` 不可打断时，一条 2 秒就失败的
+  腿要白等满整个计划时长，而点了「跳过当前单元」之后灌包作业被杀、探针还在 ping，
+  那个按钮等于没按。agent 的 `/ping` 是同步 HTTP、没有取消通道，段边界就是它的上界。
+- **「跳过当前单元」清取消位时要检查两遍**（`cancel::resume_after_skip`）。
+  「先看有没有人要停，再清取消位」是 check-then-store：`request_cancel` 恰好落在
+  这两步之间时，它设的 `RUN_CANCELLED` 会被那次 `store(false)` 抹掉，而
+  `STOP_REQUESTED` 在执行循环里**没有第二个读者**（循环只看 `is_cancelled`）。
+  拆成两个标志还不够，清完必须再看一眼。守在
+  `a_stop_that_lands_inside_the_clear_window_still_stops_the_run`。
+- `keep_runs` / `rounds` 归在 `MASTER_CONFIG_LOCAL_KEYS`：「这台机器上留几份历史」是磁盘管理，
+  不是判定参数。跟着项目走的话，别人导入这份项目会连带删掉自己的历史。
+
 **v6.0 新增的结构断言**（都在 CI 的 `cargo test` 里）：
 
 | 断言 | 守什么 |
@@ -36,6 +99,12 @@
 | `the_embedded_page_was_built_from_the_current_ui_sources` | 溯源戳：产物是不是从当前 `ui/` 源码构建的 |
 | `every_verdict_label_round_trips` | `Verdict::label()` 与 `from_label()` 一一对应 |
 | `the_summary_grid_has_one_cell_for_every_verdict` | 报告概览的统计格覆盖全部六个 verdict |
+| `the_unit_summary_row_carries_every_quality_metric_not_just_two_of_them` | 「质量」列的 `udp_loss` / `tcp_retransmits` / `ping_loss` 一起上单元汇总行——`verdict_row` 优先返回汇总行，漏一个就是 HTML 概览和 Excel 上的一整列空白 |
+| `traffic_units_are_counted_before_the_abandoned_link_shortcut` | 灌包单元计数排在「链路已放弃」早退分支之前，否则 `traffic_setup_errors` 会超过 `traffic_units`，收尾文案自相矛盾、诊断补跑也跟着少数 |
+| `every_round_gets_its_own_row_instead_of_overwriting_the_previous_one` | 对比报告里每一轮各占一行 |
+| `a_single_round_plan_keys_exactly_like_it_did_before_rounds_existed` | 不分轮的计划与历史数据算出的对齐键逐字不变 |
+| `the_comparison_stylesheet_colours_every_verdict` | 对比报告的判定徽章六色齐全（只有基类时全渲染成同一个墨色，而那两列并排的意义就是看出翻转） |
+| `a_sampling_outage_actually_breaks_the_line_instead_of_being_bridged` | 采样中断在曲线上是断口，不是一段被直线连过去的健康曲线 |
 
 **判定层的单源**（ADR-12 / ADR-17，改之前读变更说明）：
 `rate::effective_rate_target`（Observe/Discover 不比目标）、
@@ -338,6 +407,7 @@ Windows 文本适配器：`src/cmd/ipconfig.rs` 解析中英文 `ipconfig /all`�
 - 方向腿 `dir_pairs`：ab 一腿、ba 一腿、bidir 按 `[ab,ba]` 两腿。
 - 共享 materializer `map_legs` 和 `unit` 消除了 TCP/ping 重复初始化。
 - Unit 生成主循环：先方向，再 IP 版本，再 iperf/ping；跨机 IPv4 iperf 可受同 /24 门禁，ping 不受门禁。
+- 套件控制台共用 `builder::build_ui_units_repeated`：逐规格展开、整套派生轮次、按稳定 ID 保序去重，`UiPlanUnits::spec_indices` 保留最终单元的原始规格索引。`webui::plan::compile_request` 用这些索引生成来源信息，并直接对最终单元计算计划哈希；`ui::run_master` 仅在 `console_request` 含 `ui_plan` 时使用同一展开函数。普通 CLI 继续使用 `build_units_repeated`，显式重复任务保留。去重不重分配已留下单元的端口，不改首轮 ID 或轮次身份。
 
 ### 6.3 端口、流和稳定 ID
 
@@ -447,7 +517,29 @@ Windows 文本适配器：`src/cmd/ipconfig.rs` 解析中英文 `ipconfig /all`�
 
 ### 11.1 必须保持
 
-- ADB 内环入口 `inner::run_cli` 与 `inner::webui::Controller` 共用 `inner::perform`，独立严格配置 `inner::config::InnerConfig`、项目标识 `cpe-inner-project` 与 schema `version: 2`，不混入子网 Config/Unit；内环单元有独立稳定身份和 24 小时 PASS RESUME，绝不命中子网历史。分层固定：`config` 定义 schema 与 v1→v2 迁移（`protocol`→`protocols`、`board_interface`→`board_rx_interface`，补 `enabled`/`measurement`/`repeats`/`resume`；顺序单向**绝不**迁成 `bidir`，策略保持 `nic_strict`）；`plan` 是**全仓唯一**的笛卡尔积，页面预览、执行器、进度和报告都消费它，展开顺序为 网口 → 协议 → 方向 → 轮次；`adb` 适配板侧设备（接口清单、桥成员、`/proc/net/dev` 与 sysfs 两条读取路径、按端口起 server）；`measure` 是纯策略层，来源选择与门限配对只在这里；`mod` 只负责按计划起流采样；`report`/`history` 输出与历史。`inner::remote` 根据链路 host 使用现有 agent client/monitor/owner cleanup 协议，令牌不序列化。`inner::adb` 仅经 ADB 确认自有 server 就绪，不要求主控能路由到被测 LAN；前台 shell 使用本次 PID、停止标记和有限租约回收，未确认回收时停止后续起流。发送端始终运行普通 client：上行 PC client → 板侧 server，下行板侧 client → PC server，不使用 `-R`；`inner::adb_client` 经公共 ProcessExecutor 复用 iperf 参数/重试/事件解析，`inner::receiver_server` 按方向管理本机/agent/板侧 server，server owner 与 client/monitor owner 隔离以便停止后先收日志；接收端按数据走向定（上行采板侧 RX，下行采网口所在电脑 RX），不按谁跑 client 推断。`enabled: false` 的网口保留配置但不执行、不预检，其引用的辅测机也不进连接门禁——无 agent 或 agent 离线都不阻断本机测试。`bidir` 是一个含两条腿的单元：两腿各占 `port` / `port+1`、独立 job 与日志、在作用域线程里同时起流，按两腿有效窗口的**交集**计算，一腿失败置位单元取消位停止对向并定向回收。`-P`/`-w`/`-b`/`-l` 按协议分开配置，`tcp_window` / `udp_length` 走 `config::size_token` 白名单、`board_rx_interface` 走 `config::iface_word` 白名单后才拼进命令行或 sysfs 路径。测量策略 `nic_strict` / `nic_preferred` / `tool` 决定来源：网卡口径始终单独留存并仍由 `rate_window::evaluate_rx_acceptance` 产出，字段语义不变；兜底整条腿只选一次来源并记录原因，**可信低速不触发兜底**，工具口径**不继承**网卡门限（无工具门限只出 MEASURED）；工具速率只认真正的 receiver 汇总（多流须有 `[SUM]`），不取 sender / interval 末行；双向合计只相加同来源层次的两端接收速率，配了合计门限才按合计判一次。`max_udp_loss_pct` 超限仅追加 `UDP_LOSS_HIGH`，不推翻速率判定。板侧 server 原文按首尾裁剪后随腿进报告。`inner` 与子网共用纯 `cmd::iperf_window` 和 `rate_window`，不调用子网执行器。`master::webui::http` 在既有鉴权后转发 `/api/inner/*`（含 `plan` 预览与 `runs*` 历史，历史目录名按白名单精确比对、不做路径拼接）；两类启动共用 run_gate 防止并发占线，但配置、运行状态和取消标志分开；组合入口 `/api/scenario/*` 按子网后内环顺序执行，并在 `scenarios/` 保存两份原始配置，历史恢复默认打开两段各自的 RESUME。内环输出 `inner_runs`（`report.html`/`result.json`/`summary.json`/`config.json`/`units.jsonl`），子网历史仍只读 `runs`；历史「装载配置」只回配置不直接开跑。前端 `state/inner`、`domain/inner`、`views/inner/*` 不读写子网计划/连接/运行状态；独立草稿键与导入导出，误导入不得改写另一模式的配置；计划预览来自后端，前端不自算笛卡尔积。
+- 内环 `ip_versions` 只允许 4/6，每个版本独立单元、预检、结果及 RESUME；旧配置缺字段默认 IPv4，新建页面默认双栈。`Link::local_ipv6` / `gateway_ipv6` 是不带 zone 的 IPv6 单播，参与链路两端须同为链路本地或同为非链路本地；`TrafficAddresses` 按执行端真实网口构造绑定地址和目标，板侧地址经 ADB 验证唯一 LAN 归属，不能由 IPv4 推算；`adb::lan_interface_v6` 仅在扫描证明共享 link-local 地址的全部匹配口属于同一座也持有该地址的桥时选桥作用域，跨桥或缺少归属证据仍拒绝。取消参与的 IPv6-only 链路不要求补 IPv4，反之亦然。`plan::legacy_link_identity` 固定旧字段的 Debug 格式以保留原 IPv4 身份。`BoardInterface::ipv6_addresses` 与既有 IPv4 `addresses` 分列，空前缀电脑扫描保留 IPv6-only 接口，显式 IPv4 前缀的旧过滤语义保持不变。
+
+- 内环扫描绑定 ADB 与辅测机连接身份；身份编辑立即清能力快照，请求代次拒绝迟到成功或失败。子网本机页重扫在任一种测试运行期间禁用，失败保留旧快照并明确标注，再次重扫刷新双端。监控会话绑定已连接辅测机的 host/port，换机回收旧辅测会话并拒绝迟到启动应答；本机监控继续。
+
+- `webui::api::api_connect` 先在候选配置中应用地址、端口、令牌和前缀，待 `/health`、`/info` 与本机扫描成功后，一次性提交连接身份和双端网卡清单。失败不得留下新地址配旧网卡，也不得部分覆盖上次成功连接的配置。
+
+- `state/run` 的进度响应受请求代次约束，开始受理后不接收开始前的快照。开始超时保持 `unknown`，一次空闲快照不证明请求未执行；操作员确认后的 `prepareAfterUnknownStart` 只清准备态和预览，不发起运行。跳过受理绑定发出时的运行和单元，旧单元的迟到增量不得解除当前跳过状态。`state/session` 合并重复连接，重置后旧连接响应不得覆盖新会话。
+
+- `rate_window::longest_zero_delta_run_ms` 与 RX 平均采用同一有效窗口：边界区间裁剪、重复/重叠时间只计一次、缺采断开连续段；`scan_excursion` 同样不把缺采前后两段短掉速拼成一次连续掉速。窗口外空闲不参与停滞比例。
+
+- `executor::window::leg_effective_window` 按流量事件和采样边界计算 UDP 的毫秒区间，不按一秒网格补长尾部。完整性可使用既有时间容差，窗口终点仍不得超过实际证据。`executor::agent` 的显式用户取消在回收成功后仍保留 `cancelled`；取消事实和回收确认彼此独立，超时重试语义不因此改变。
+
+- 报告的方向统一由 `report::model::direction_tag` 优先读取类型化字段；历史缺失才从文案兜底。`group_rows` 按 `sort_key` 还原顺序，HTML 与 Excel 单元序号共用 `group_seq`；历史缺失 `unit_seq` 时不得把不同单元并为一组。Excel 链路键包括源端/接收端 `RowSide`，同名网口的正反向单向单元分别统计。
+
+- 子网预览和开始的阻断规则只有 `webui::plan::CompiledPlan::blocking_errors` 一份实现：规格编译失败、套件中有被跳过的项目、没有可执行单元。`api_plan` 返回可选 `PlanOut::blocking_errors`，`api_run_impl` 使用同一结果拒绝启动；前端只读该字段，不另解析提示文本。旧矩阵仍允许执行有效部分，空计划仍拒绝。`RunView` 只有确认 `startPhase === 'accepted'` 后才切到进度页，未知应答不当作启动成功。
+
+- 子网默认逐网口入口 `views/plan/PortSelection` 通过纯函数 `domain/plan-ports::assignedPairIds` / `setPairAssigned` 编辑既有分配，保留集合 ID、端点方向、其他套件和绑定顺序。`pair_ids: []` 在协议里表示整集合，取消最后一对必须删除绑定，不能写回空数组；逐网口新增绑定使用显式 ID，后来扫描发现的网口不能自动参与。默认入口的批量操作仅影响显示行的当前套件，搜索不能改动隐藏行；高级集合整列分配仍保留原有全集合语义。
+
+- 子网 `state/plan::invalidatePreview` 增加请求代次并清空预览状态；`preview` 响应仅在请求代次和当前配置快照同时匹配时落地。成功导入项目或恢复默认时调用 `resetRunOptions`，清空项目不保存的 RESUME、截图、探测、强制窗口/带宽并将轮次恢复为 1；历史 `adoptRunRequest` 则从归档恢复这些选项。导入前发出的旧响应不得覆盖新项目，也不得结束新请求的忙碌态。
+
+- 内环扫描选择由纯函数 `domain/inner-setup::innerNicChoices` / `linksFromInnerChoices` 生成，默认展示 192.168 网段或仅 IPv6 的有效电脑网口并隐藏常见隧道/虚拟口，其他候选须显式展开；完整扫描不被裁剪，板侧全部系统接口与测试网口数分开；用户明确选择后由 `state/inner::addInnerScannedLinks` 添加，按电脑、接口名和 IPv4 去重，不把扫描结果全量加入。`innerSetupIssues` 同源生成缺项与修复定位；`InnerView` 的接线说明区分 ADB 控制与被测网口数据路径。`InnerLinkTable` 批量设置只处理当前显示且 enabled 的行，扫描发现网卡不等于链路预检通过。
+
+- ADB 内环入口 `inner::run_cli` 与 `inner::webui::Controller` 共用 `inner::perform`，独立严格配置 `inner::config::InnerConfig`、项目标识 `cpe-inner-project` 与 schema `version: 3`（兼容 v1/v2），不混入子网 Config/Unit；内环单元有独立稳定身份和 24 小时 PASS RESUME，绝不命中子网历史。分层固定：`config` 定义 schema 与 v1→v2 迁移（`protocol`→`protocols`、`board_interface`→`board_rx_interface`，补 `enabled`/`measurement`/`repeats`/`resume`；顺序单向**绝不**迁成 `bidir`，策略保持 `nic_strict`）；`plan` 是**全仓唯一**的笛卡尔积，页面预览、执行器、进度和报告都消费它，展开顺序为 网口 → IP 版本 → 协议 → 方向 → 轮次；`adb` 适配板侧设备（接口清单、桥成员、`/proc/net/dev` 与 sysfs 两条读取路径、按端口起 server）；`measure` 是纯策略层，来源选择与门限配对只在这里；`mod` 只负责按计划起流采样；`report`/`history` 输出与历史。`inner::remote` 根据链路 host 使用现有 agent client/monitor/owner cleanup 协议，令牌不序列化。`inner::adb` 仅经 ADB 确认自有 server 就绪，不要求主控能路由到被测 LAN；前台 shell 使用本次 PID、停止标记和有限租约回收，未确认回收时停止后续起流。发送端始终运行普通 client：上行 PC client → 板侧 server，下行板侧 client → PC server，不使用 `-R`；`inner::adb_client` 经公共 ProcessExecutor 复用 iperf 参数/重试/事件解析，`inner::receiver_server` 按方向管理本机/agent/板侧 server，server owner 与 client/monitor owner 隔离以便停止后先收日志；接收端按数据走向定（上行采板侧 RX，下行采网口所在电脑 RX），不按谁跑 client 推断。`enabled: false` 的网口保留配置但不执行、不预检，其引用的辅测机也不进连接门禁——无 agent 或 agent 离线都不阻断本机测试。`bidir` 是一个含两条腿的单元：两腿各占 `port` / `port+1`、独立 job 与日志、在作用域线程里同时起流，按两腿有效窗口的**交集**计算，一腿失败置位单元取消位停止对向并定向回收。`-P`/`-w`/`-b`/`-l` 按协议分开配置，`tcp_window` / `udp_length` 走 `config::size_token` 白名单、`board_rx_interface` 走 `config::iface_word` 白名单后才拼进命令行或 sysfs 路径。测量策略 `nic_strict` / `nic_preferred` / `tool` 决定来源：网卡口径始终单独留存并仍由 `rate_window::evaluate_rx_acceptance` 产出，字段语义不变；兜底整条腿只选一次来源并记录原因，**可信低速不触发兜底**，工具口径**不继承**网卡门限（无工具门限只出 MEASURED）；工具速率只认真正的 receiver 汇总（多流须有 `[SUM]`），不取 sender / interval 末行；双向合计只相加同来源层次的两端接收速率，配了合计门限才按合计判一次。`max_udp_loss_pct` 超限仅追加 `UDP_LOSS_HIGH`，不推翻速率判定。板侧 server 原文按首尾裁剪后随腿进报告。`inner` 与子网共用纯 `cmd::iperf_window` 和 `rate_window`，不调用子网执行器。`master::webui::http` 在既有鉴权后转发 `/api/inner/*`（含 `plan` 预览与 `runs*` 历史，历史目录名按白名单精确比对、不做路径拼接）；两类启动共用 run_gate 防止并发占线，但配置、运行状态和取消标志分开；组合入口 `/api/scenario/*` 按子网后内环顺序执行，并在 `scenarios/` 保存两份原始配置，历史恢复默认打开两段各自的 RESUME。内环输出 `inner_runs`（`report.html`/`result.json`/`summary.json`/`config.json`/`units.jsonl`），子网历史仍只读 `runs`；历史「装载配置」只回配置不直接开跑。前端 `state/inner`、`domain/inner`、`views/inner/*` 不读写子网计划/连接/运行状态；独立草稿键与导入导出，误导入不得改写另一模式的配置；计划预览来自后端，前端不自算笛卡尔积。
 
 - 项目导入通过 `domain/import-topology::reconcileImportedTopology` 区分未知快照与成功扫描的空网卡表；只清理确认缺失的端点，并提示被删除的集合/绑定。绑定的显式 `pair_ids` 清空时必须删除该绑定，不能变成整集合分配。手工集合协调保留 pair ID 和端点方向。待校验状态随草稿保存，并在取得可信拓扑后自动校验。
 

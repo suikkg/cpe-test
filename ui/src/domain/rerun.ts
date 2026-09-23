@@ -6,6 +6,11 @@ export interface RerunSnapshot {
   duration: number;
   resume: boolean;
   screenshot: boolean;
+  probeDuringTraffic: boolean;
+  probePathMtu: boolean;
+  forceTcpWindow: string;
+  forceUdpBandwidth: string;
+  rounds: number;
   limitUdpByLinkSpeed: boolean;
   globals: UiGlobals;
   nicPolicies: UiNicPolicy[];
@@ -62,6 +67,12 @@ export function parseRunRequest(raw: unknown): RerunSnapshot | null {
     duration: count(request.duration, 180) || 180,
     resume: request.resume === true,
     screenshot: request.screenshot === true,
+    probeDuringTraffic: request.probe_during_traffic === true,
+    probePathMtu: request.probe_path_mtu === true,
+    forceTcpWindow: typeof request.force_tcp_window === 'string' ? request.force_tcp_window : '',
+    forceUdpBandwidth:
+      typeof request.force_udp_bandwidth === 'string' ? request.force_udp_bandwidth : '',
+    rounds: count(request.rounds, 1) || 1,
     limitUdpByLinkSpeed: request.limit_udp_by_link_speed === true,
     globals,
     nicPolicies: nicPolicies(request.nic_policies),

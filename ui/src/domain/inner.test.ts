@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
-  innerIpv4, innerHistoryStatus,
+  canonicalInnerIpv6, innerIpv4, innerIpv6, innerIpv6LinkLocal, innerHistoryStatus,
   mergeInnerUnits,
   INNER_VERSION, defaultInnerConfig, innerDuration, innerIfaceWord, innerLink, innerSizeToken,
   normalizeInnerDraft, parseInnerProject, serializeInnerProject,
@@ -313,6 +313,66 @@ describe('导入格式与后端一致', () => {
       bad.config.links[0][field] += ' ';
       expect(() => parseInnerProject(JSON.stringify(bad))).toThrow('IPv4');
     }
+  });
+});
+
+describe('内环 IPv6 配置与兼容', () => {
+  it('旧 v2 省略 IP 版本时保持 IPv4，不自动增加测试单元', () => {
+    const cfg = defaultInnerConfig(); cfg.links = [link()];
+    const saved = JSON.parse(serializeInnerProject(cfg)); saved.version = 2;
+    delete saved.config.ip_versions;
+    delete saved.config.links[0].local_ipv6; delete saved.config.links[0].gateway_ipv6;
+    expect(parseInnerProject(JSON.stringify(saved)).ip_versions).toEqual([4]);
+    expect(parseInnerProject(JSON.stringify(saved)).links[0].local_ipv6).toBeNull();
+  });
+  it('明确标成 v2 的旧字段错误不能被 v1 迁移悄悄吞掉', () => {
+    const saved = JSON.parse(V1_PROJECT); saved.version = 2;
+    expect(() => parseInnerProject(JSON.stringify(saved))).toThrow('未知字段');
+  });
+  it('双栈导出导入保留真实两端地址，缺 IPv6 必须明确报错', () => {
+    const cfg = defaultInnerConfig(); cfg.ip_versions = [4, 6];
+    cfg.links = [link({ local_ipv6: 'fe80::100', gateway_ipv6: 'fe80::1' })];
+    expect(parseInnerProject(serializeInnerProject(cfg))).toEqual(cfg);
+    cfg.links[0].gateway_ipv6 = null;
+    expect(() => parseInnerProject(serializeInnerProject(cfg))).toThrow('IPv6');
+    cfg.links[0].enabled = false;
+    expect(parseInnerProject(serializeInnerProject(cfg)).links[0].enabled).toBe(false);
+  });
+  it('仅 IPv6 可不填 IPv4，清空 v6 不会被猜成板侧地址', () => {
+    const cfg = defaultInnerConfig(); cfg.ip_versions = [6];
+    cfg.links = [link({ local_ip: '', gateway: '', local_ipv6: 'fd12::100', gateway_ipv6: 'fd12::1' })];
+    const normalized = normalizeInnerDraft(cfg);
+    expect(normalized.links[0]).toMatchObject({ local_ip: '0.0.0.0', gateway: '0.0.0.0' });
+    expect(parseInnerProject(serializeInnerProject(normalized)).ip_versions).toEqual([6]);
+    cfg.links[0].gateway_ipv6 = '';
+    expect(normalizeInnerDraft(cfg).links[0].gateway_ipv6).toBeNull();
+    expect(() => parseInnerProject(serializeInnerProject(normalizeInnerDraft(cfg)))).toThrow('IPv6');
+  });
+  it.each(['::', '::1', 'ff02::1', '::ffff:192.168.0.1', 'fe80::1%en0', 'fe80::1/64', '[fe80::1]', 'fe80:::1', 'fe80::1 '])('拒绝不可测试或带执行端作用域的地址 %s', (ip) => {
+    expect(innerIpv6(ip)).toBe(false);
+  });
+  it.each(['fe80::1', 'febf::2', 'fd12:3456::1', '2001:db8::1'])('接受 IPv6 单播 %s', (ip) => {
+    expect(innerIpv6(ip)).toBe(true);
+  });
+  it('等价地址与 /10 链路本地作用域校验一致', () => {
+    expect(canonicalInnerIpv6('FE80:0:0:0:0:0:0:1')).toBe('fe80::1');
+    expect(innerIpv6LinkLocal('febf::1')).toBe(true);
+    expect(innerIpv6LinkLocal('fec0::1')).toBe(false);
+    const cfg = defaultInnerConfig(); cfg.ip_versions = [6];
+    cfg.links = [link({ local_ipv6: 'fe80::1', gateway_ipv6: 'FE80:0:0:0:0:0:0:1' })];
+    expect(() => parseInnerProject(serializeInnerProject(cfg))).toThrow('不能等于');
+    cfg.links[0].gateway_ipv6 = 'fd12::1';
+    expect(() => parseInnerProject(serializeInnerProject(cfg))).toThrow('同为');
+    cfg.links[0].gateway_ipv6 = 'febf::2';
+    expect(parseInnerProject(serializeInnerProject(cfg)).ip_versions).toEqual([6]);
+  });
+  it('同接口等价 IPv6 不能作为两条参与链路重复加入', () => {
+    const cfg = defaultInnerConfig(); cfg.ip_versions = [6];
+    cfg.links = [link({ name: 'a', local_ipv6: 'fe80::100', gateway_ipv6: 'fe80::1' }), link({ name: 'b', local_ipv6: 'FE80:0:0:0:0:0:0:100', gateway_ipv6: 'fe80::2' })];
+    expect(() => parseInnerProject(serializeInnerProject(cfg))).toThrow('同一网口');
+  });
+  it.each([{ versions: [] }, { versions: [4, 4] }, { versions: [5] }, { versions: ['6'] }])('拒绝无效 IP 版本选择 $versions', ({ versions }) => {
+    expect(() => parseInnerProject(JSON.stringify({ ...defaultInnerConfig(), ip_versions: versions }))).toThrow('IP 版本');
   });
 });
 

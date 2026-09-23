@@ -37,6 +37,9 @@ pub struct DirectionSummary {
     pub target_mbps: Option<f64>,
     pub sample_coverage: Option<f64>,
     pub udp_loss: Option<f64>,
+    /// TCP 全程重传次数。与 `udp_loss` 平级：都是**只作诊断**的质量指标，
+    /// 都不参与判定（ADR-17）。
+    pub tcp_retransmits: Option<u64>,
     pub ping_loss: Option<f64>,
     pub ping_min: Option<f64>,
     pub ping_avg: Option<f64>,
@@ -44,6 +47,10 @@ pub struct DirectionSummary {
     /// 该方向主行的截图路径；概览把接收速率和截图并排展示。
     pub screenshot_master: String,
     pub screenshot_agent: String,
+    /// 该方向主行的接收端逐样本 CSV 路径。概览的缩略曲线从它读。
+    ///
+    /// 和截图同一个道理：概览要展示的东西，得先在这一层能拿到。
+    pub nic_samples_rx: String,
 }
 
 /// 这一行测的是**哪个方向**。
@@ -141,7 +148,7 @@ impl RowBackend {
 /// 与 `builder::Side` 同构，但**不复用它**：`report` 是纯消费端，让它反过来依赖
 /// `master::builder` 会把「报告只读结果」这条边弄脏。转换发生在 executor 侧
 /// （那里两个类型都在手边）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RowSide {
     #[default]
@@ -190,6 +197,13 @@ pub struct Row {
     pub dst_pc: String,
     pub dst_iface: String,
     pub dst_ip: String,
+    /// 本行跑的时候，源端网口的无线上下文（SSID / 信道 / 信号 / 无线电类型）。
+    ///
+    /// 非 Wi-Fi 口是空串。取的是**这一单元开跑前那次重扫**看到的值，所以
+    /// Wi-Fi 重新协商之后前后两个单元可以不一样——那正是要记下来的东西。
+    pub src_wifi: String,
+    /// 同 [`Row::src_wifi`]，目标端网口。
+    pub dst_wifi: String,
     pub verdict: Verdict,
     pub execution_status: ExecutionStatus,
     pub reason_code: ReasonCode,
@@ -201,11 +215,36 @@ pub struct Row {
     /// 这条通道：报告里照样看得见，但 `verdict` 只由接收端 RX 平均与门限决定。
     pub diagnostics: Vec<String>,
     pub kind_label: String,
+    /// 稳定性轮次（1-based）。`0` = 历史数据，那时还没有这个字段；不分轮的计划是 `1`。
+    ///
+    /// 存在的理由只有一个：`report::compare` 的对齐键要能把第 3 轮和第 4 轮分开。
+    /// 那个键刻意不用 `Unit.id`（里面拌了 `speed_mbps`，Wi-Fi 一重协商同一条测试
+    /// 就成了两个 id），于是轮次必须单独有一条通路——否则 20 轮的计划在
+    /// `HashMap` 里互相覆盖，只剩最后一轮，而对比报告不会有任何异常提示。
+    pub round: u32,
     pub rx_avg: Option<f64>,
     pub peer_rx: String,
     pub tx_mbps: Option<f64>,
     pub rx_mbps: Option<f64>,
     pub udp_loss: Option<f64>,
+    /// 灌包**期间**并发探到的往返时延，已经格式化成一句人话；空串 = 这一轮
+    /// 没开探针（`ping.probe_during_traffic`）或压根没探到。
+    ///
+    /// 空载 RTT 和负载下 RTT 差两个数量级，而用户感知到的「卡」几乎全部落在
+    /// 后者。**只作诊断**：负载下时延再难看也不改写判定（ADR-17）。
+    ///
+    /// 存成展示串而不是三个数：它进的是诊断面板的一格，没有第二个消费者要拿它
+    /// 做算术。真出现了再类型化——那正是 ADR-7 说的「赶在第二个消费者之前」。
+    pub load_latency: String,
+    /// TCP 全程重传次数（iperf3 sender 汇总行的 `Retr`）。
+    ///
+    /// 报告的「质量」列此前对 TCP 恒为 `—`：UDP 有丢包、ping 有 RTT，
+    /// 唯独 TCP 那一格什么都不说。重传正是这一格该有的东西——TCP 没跑满时，
+    /// 它区分「链路在丢包」和「窗口没喂饱」，而这两种结论的整改动作相反。
+    ///
+    /// **只作诊断，不参与判定**：达标与否仍然只看接收端 RX 平均。
+    /// `None` = 这一行不是 TCP，或这段输出没有 `Retr` 列。
+    pub tcp_retransmits: Option<u64>,
     pub ping_loss: Option<f64>,
     pub ping_min: Option<f64>,
     pub ping_avg: Option<f64>,
@@ -306,7 +345,7 @@ pub struct ReportMeta {
     pub run_health: String,
 }
 
-pub(super) struct UnitGroup<'a> {
+pub struct UnitGroup<'a> {
     pub(super) key: String,
     pub(super) summary: Option<&'a Row>,
     pub(super) details: Vec<&'a Row>,
@@ -318,14 +357,18 @@ pub(super) fn row_unit_key(row: &Row) -> String {
     } else if row.is_unit_summary && !row.task_id.is_empty() {
         row.task_id.clone()
     } else {
-        // 单元序号有 `sort_key.0` 和 `unit_seq` 两处表示，取类型化的那个。
-        format!("unit-{}", row.unit_seq)
+        // 与报告的展示序号同源；旧 rows.jsonl 的 unit_seq 可能尚未落盘。
+        format!("unit-{}", row.sort_key.0)
     }
 }
 
 pub(super) fn group_rows(rows: &[Row]) -> Vec<UnitGroup<'_>> {
     let mut groups: Vec<UnitGroup<'_>> = Vec::new();
-    for row in rows {
+    // HTML、Excel、两轮对比都接受落盘顺序，统一按实际执行序还原。
+    // 只排序引用，避免复制每行携带的原始输出。
+    let mut ordered: Vec<_> = rows.iter().collect();
+    ordered.sort_by_key(|row| row.sort_key);
+    for row in ordered {
         let key = row_unit_key(row);
         let index = groups
             .iter()
@@ -503,8 +546,8 @@ impl Row {
     pub fn direction_summary(&self) -> DirectionSummary {
         DirectionSummary {
             tag: direction_tag(self),
-            src: report_endpoint(&self.src_pc, &self.src_iface, &self.src_ip),
-            dst: report_endpoint(&self.dst_pc, &self.dst_iface, &self.dst_ip),
+            src: report_endpoint(&self.src_pc, &self.src_iface, &self.src_ip, &self.src_wifi),
+            dst: report_endpoint(&self.dst_pc, &self.dst_iface, &self.dst_ip, &self.dst_wifi),
             verdict: self.verdict,
             reason_code: self.reason_code,
             reason_detail: self.reason_detail.clone(),
@@ -520,12 +563,14 @@ impl Row {
             target_mbps: self.target_mbps,
             sample_coverage: self.sample_coverage,
             udp_loss: self.udp_loss,
+            tcp_retransmits: self.tcp_retransmits,
             ping_loss: self.ping_loss,
             ping_min: self.ping_min,
             ping_avg: self.ping_avg,
             ping_max: self.ping_max,
             screenshot_master: self.screenshot_master.clone(),
             screenshot_agent: self.screenshot_agent.clone(),
+            nic_samples_rx: self.nic_samples_rx.clone(),
         }
     }
 }
@@ -550,7 +595,7 @@ pub(super) fn direction_row_score(row: &Row) -> u8 {
 pub(super) fn fallback_direction_summaries(group: &UnitGroup<'_>) -> Vec<DirectionSummary> {
     let mut selected: Vec<(String, &Row)> = Vec::new();
     for row in &group.details {
-        let tag = infer_direction_tag(row);
+        let tag = direction_tag(row);
         if let Some((_, current)) = selected.iter_mut().find(|(current, _)| *current == tag) {
             if direction_row_score(row) > direction_row_score(current) {
                 *current = row;
@@ -594,6 +639,9 @@ pub(super) fn merge_missing_direction_fields(
     if target.rx_p10.is_none() {
         target.rx_p10 = fallback.rx_p10;
     }
+    if target.tx_avg.is_none() {
+        target.tx_avg = fallback.tx_avg;
+    }
     if target.target_mbps.is_none() {
         target.target_mbps = fallback.target_mbps;
     }
@@ -602,6 +650,9 @@ pub(super) fn merge_missing_direction_fields(
     }
     if target.udp_loss.is_none() {
         target.udp_loss = fallback.udp_loss;
+    }
+    if target.tcp_retransmits.is_none() {
+        target.tcp_retransmits = fallback.tcp_retransmits;
     }
     if target.ping_loss.is_none() {
         target.ping_loss = fallback.ping_loss;
@@ -624,6 +675,12 @@ pub(super) fn merge_missing_direction_fields(
         target
             .screenshot_agent
             .clone_from(&fallback.screenshot_agent);
+    }
+    // 逐样本 CSV 路径和截图路径同一个道理：升级前落盘的 `direction_summaries`
+    // 里没有这个字段，读回来是空串。不从明细行回填的话，**重放旧 run 目录时
+    // 概览的曲线列会整列消失**——而那些目录里 CSV 明明还在。
+    if target.nic_samples_rx.is_empty() {
+        target.nic_samples_rx.clone_from(&fallback.nic_samples_rx);
     }
 }
 

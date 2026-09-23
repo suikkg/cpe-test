@@ -6,12 +6,22 @@ import { nicKey, nicLinkLocal, nicSearchFields, nicSpeedLabel } from '../../doma
 import { filterByQuery, visibleCountLabel } from '../../domain/search';
 import { agentHostname, agentNics, masterHostname, masterNics } from '../../state/inventory';
 import { load, rescan, session } from '../../state/session';
+import { inner } from '../../state/inner';
+import { run } from '../../state/run';
+import { freshnessLabel } from '../../domain/freshness';
 import { goto, ui } from '../../state/ui';
 
 /** 本机信息独立于辅测机连接；尚未返回时不能把未知工具状态当成缺失。 */
 const iperf = computed(() => session.local?.iperf3 ?? null);
 const loaded = computed(() => session.local !== null);
 const connected = computed(() => session.phase === 'connected');
+const testInFlight = computed(() => run.running || inner.status.running || inner.scenario.running);
+const scanLocked = computed(() => session.scanning || session.phase === 'connecting' || testInFlight.value);
+const scanLockHint = computed(() => testInFlight.value
+  ? '测试进行中，请等待结束后再重新扫描网卡。' : undefined);
+async function onRescan(): Promise<void> {
+  if (!scanLocked.value) await rescan();
+}
 // 连接回包也包含主控网卡，工具信息未取到不应挡住这份有效拓扑。
 const inventoryReady = computed(() => loaded.value || session.connection !== null);
 
@@ -66,6 +76,19 @@ const detailRows = computed(() => {
       </button>
     </header>
 
+    <section class="test-modes" aria-label="选择测试方式">
+      <div>
+        <h3>两个电脑网口互测</h3>
+        <p>选择主控、辅测机或同一电脑上的两个网口，测试它们经过 CPE 网络的连通性与吞吐。</p>
+        <button type="button" @click="goto(connected ? 'plan' : 'agent')">{{ connected ? '选择子网测试网口' : '连接辅测机，准备子网测试' }}</button>
+      </div>
+      <div>
+        <h3>电脑网口与 CPE 板侧互测</h3>
+        <p>通过 ADB 控制 CPE，逐个选择 LAN、Wi-Fi 或 RNDIS 网口测上行、下行；本机即可独立测试。</p>
+        <button type="button" class="ghost" @click="goto('inner')">进入内环测试，扫描网口</button>
+      </div>
+    </section>
+
     <div class="connection-overview" aria-label="双端连接状态">
       <div class="endpoint">
         <span class="endpoint-label">主控机 <small>本机</small></span>
@@ -78,7 +101,7 @@ const detailRows = computed(() => {
       </div>
       <div class="endpoint">
         <span class="endpoint-label">辅测机 <small>对端</small></span>
-        <strong>{{ connected ? agentHostname || session.host : '尚未连接' }}</strong>
+        <strong>{{ connected ? agentHostname || session.connectedHost : '尚未连接' }}</strong>
         <span class="hint">{{ connected ? `${agentNics.length} 块网卡` : '连接后获取对端网卡' }}</span>
       </div>
     </div>
@@ -110,11 +133,16 @@ const detailRows = computed(() => {
         </h3>
         <p class="hint">插拔网线、开关 Wi-Fi 或修改 IP 后，重新扫描更新列表。</p>
       </div>
-      <button type="button" class="ghost" :disabled="session.scanning" @click="rescan">
+      <button type="button" class="ghost" :disabled="scanLocked" :title="scanLockHint" @click="onRescan">
         {{ session.scanning ? '扫描中…' : '重新扫描' }}
       </button>
     </div>
     <p v-if="session.scanMessage" class="scan" :class="session.scanKind" role="status">{{ session.scanMessage }}</p>
+    <p v-if="testInFlight" class="hint filter-note" role="status">测试进行中，网卡列表保持开跑时的连接信息；结束后可重新扫描。</p>
+    <p v-if="session.topologyStale" class="warn" role="status">
+      当前网卡列表仍是上次成功连接 {{ session.connectedHost }} 时的快照（{{ freshnessLabel(session.connectedAt) }}）。
+      重新扫描成功后才会更新，当前不能据此确认网口状态。
+    </p>
     <p v-if="connected" class="hint filter-note">当前显示连接时按 IPv4 前缀过滤的网卡；重新扫描会同时更新两端。</p>
     <p v-if="!inventoryReady && !session.localError" class="loading" role="status">正在读取本机网卡…</p>
 
@@ -172,6 +200,11 @@ const detailRows = computed(() => {
 </template>
 
 <style scoped>
+.test-modes { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 24px; margin-bottom: 24px; padding: 20px; border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: 6px; }
+.test-modes h3 { margin: 0 0 8px; font-size: 15px; }
+.test-modes p { margin: 0 0 14px; font-size: 13px; line-height: 1.7; color: var(--muted); }
+.test-modes button { max-width: 100%; }
+@media (max-width: 700px) { .test-modes { grid-template-columns: 1fr; gap: 20px; padding: 16px; } }
 .local-head { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
 .local-head button { flex-shrink: 0; }
 .connection-overview { display: grid; grid-template-columns: minmax(0, 1fr) minmax(130px, .7fr) minmax(0, 1fr); gap: 24px; padding: 26px; background: var(--panel-2); border: 1px solid var(--line); border-radius: 9px; }

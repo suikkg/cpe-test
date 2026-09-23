@@ -155,7 +155,7 @@ pub(super) fn ping_pass_reason(
     ping_avg: Option<f64>,
     ping_max: Option<f64>,
 ) -> String {
-    let quality = quality_text(None, ping_loss, ping_min, ping_avg, ping_max, true);
+    let quality = quality_text(None, None, ping_loss, ping_min, ping_avg, ping_max, true);
     if quality == NOT_COLLECTED {
         "PING_OK: Ping 执行完成".into()
     } else {

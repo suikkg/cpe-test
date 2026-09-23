@@ -72,7 +72,7 @@ function loss(unit: InnerUnit, leg: InnerLeg): string {
             <tr v-if="!unit.legs.length" :key="`${unit.index}-empty`">
               <td class="num">{{ unit.index }}</td>
               <td>{{ unit.host }}<br><strong>{{ unit.link }}</strong></td>
-              <td>{{ PROTOCOL_LABEL[unit.protocol] }}</td>
+              <td>{{ PROTOCOL_LABEL[unit.protocol] }} / IPv{{ unit.ip_version ?? 4 }}</td>
               <td>{{ DIRECTION_LABEL[unit.direction] }}</td>
               <td class="num">{{ unit.repeat }}</td>
               <td colspan="7" class="muted">本单元没有产生任何一条腿的结果</td>
@@ -81,7 +81,7 @@ function loss(unit: InnerUnit, leg: InnerLeg): string {
             <tr v-for="(leg, i) in unit.legs" :key="`${unit.index}-${leg.flow}`">
               <td v-if="i === 0" :rowspan="unit.legs.length" class="num">{{ unit.index }}</td>
               <td v-if="i === 0" :rowspan="unit.legs.length">{{ unit.host }}<br><strong>{{ unit.link }}</strong></td>
-              <td v-if="i === 0" :rowspan="unit.legs.length">{{ PROTOCOL_LABEL[unit.protocol] }}</td>
+              <td v-if="i === 0" :rowspan="unit.legs.length">{{ PROTOCOL_LABEL[unit.protocol] }} / IPv{{ unit.ip_version ?? 4 }}</td>
               <td v-if="i === 0" :rowspan="unit.legs.length">{{ DIRECTION_LABEL[unit.direction] }}</td>
               <td v-if="i === 0" :rowspan="unit.legs.length" class="num">{{ unit.repeat }}</td>
               <td>{{ FLOW_LABEL[leg.flow] }}<br><span class="muted">{{ leg.receiver_host }} {{ leg.receiver }}</span></td>

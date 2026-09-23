@@ -3,6 +3,7 @@
 #[cfg(windows)]
 use crate::util::run_cmd;
 use regex::Regex;
+use std::net::Ipv6Addr;
 #[cfg(windows)]
 use std::time::Duration;
 
@@ -10,10 +11,11 @@ use std::time::Duration;
 pub struct IpcfgAdapter {
     pub name: String,
     pub ipv4: Option<String>,
-    /// fe80::（不带 %zone）
+    /// 链路本地 IPv6（不带 %zone）
     pub ipv6_ll: Option<String>,
     /// fe80 的 zone（%后面的接口索引数字）
     pub zone: String,
+    /// 非链路本地单播 IPv6，含 ULA。
     pub ipv6_global: Option<String>,
     pub disconnected: bool,
 }
@@ -92,7 +94,14 @@ pub fn parse_with_aliases(text: &str, known_aliases: &[String]) -> Vec<IpcfgAdap
         } else if key.contains("IPv6") {
             let v = strip_paren(val);
             let vl = v.to_lowercase();
-            if vl.starts_with("fe80") {
+            let addr = vl.split('%').next().unwrap_or(&vl);
+            let Ok(ip) = addr.parse::<Ipv6Addr>() else {
+                continue;
+            };
+            if ip.is_unspecified() || ip.is_loopback() || ip.is_multicast() {
+                continue;
+            }
+            if ip.is_unicast_link_local() {
                 if a.ipv6_ll.is_none() {
                     if let Some((addr, zone)) = vl.split_once('%') {
                         a.ipv6_ll = Some(addr.to_string());
@@ -104,11 +113,8 @@ pub fn parse_with_aliases(text: &str, known_aliases: &[String]) -> Vec<IpcfgAdap
                         a.ipv6_ll = Some(vl.clone());
                     }
                 }
-            } else if (vl.starts_with('2') || vl.starts_with('3'))
-                && vl.contains(':')
-                && a.ipv6_global.is_none()
-            {
-                a.ipv6_global = Some(vl.split('%').next().unwrap_or(&vl).to_string());
+            } else if a.ipv6_global.is_none() {
+                a.ipv6_global = Some(addr.to_string());
             }
         } else if (key.contains("媒体状态") || key_l.contains("media state"))
             && (val.contains("已断开") || val.to_lowercase().contains("disconnected"))
@@ -163,6 +169,26 @@ fn looks_ipv4(v: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ipv6_only_adapter_keeps_ula_and_rejects_unusable_addresses() {
+        let text = "Ethernet adapter Ethernet:\n\
+                    \x20  IPv6 Address . . . . . . . . . . : fd12:3456::1(Preferred)\n\
+                    \x20  Link-local IPv6 Address . . . . : fe80::2%7(Preferred)\n\
+                    Ethernet adapter Empty:\n\
+                    \x20  IPv6 Address . . . . . . . . . . : ::1(Preferred)\n\
+                    \x20  IPv6 Address . . . . . . . . . . : ::(Preferred)\n\
+                    \x20  IPv6 Address . . . . . . . . . . : ff02::1(Preferred)\n\
+                    \x20  IPv6 Address . . . . . . . . . . : fe80-invalid(Preferred)\n";
+        let adapters = super::parse(text);
+        assert_eq!(adapters.len(), 2);
+        assert!(adapters[0].ipv4.is_none());
+        assert_eq!(adapters[0].ipv6_global.as_deref(), Some("fd12:3456::1"));
+        assert_eq!(adapters[0].ipv6_ll.as_deref(), Some("fe80::2"));
+        assert_eq!(adapters[0].zone, "7");
+        assert!(adapters[1].ipv6_global.is_none());
+        assert!(adapters[1].ipv6_ll.is_none());
+    }
+
     /// 非中英文 Windows 上，适配器标题行的措辞一个都对不上。
     ///
     /// `scan_all()` 的主循环挂在这份解析结果上，所以「一条都认不出来」
