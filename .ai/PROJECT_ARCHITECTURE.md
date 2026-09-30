@@ -1,7 +1,7 @@
 # CPE Test 项目架构索引（AI 专用）
 
 > 生成基准：2026-08-11。本文服务于 AI/代码代理的源码定位，不是面向终端用户的操作手册。
-> 所有 `file:line` 均以本文生成时工作树中的 `nl -ba` 为准。源码是唯一权威；当本文、README 或旧说明冲突时，先读源码并更新本文。
+> 源码是唯一权威；当本文、README 或旧说明冲突时，先读源码并更新本文。
 
 > **引用约定**：本文只引用**模块路径与符号名**，不写行号。
 >
@@ -517,11 +517,19 @@ Windows 文本适配器：`src/cmd/ipconfig.rs` 解析中英文 `ipconfig /all`�
 
 ### 11.1 必须保持
 
+- 两轮对比使用 `Row.comparison_identity`（`ComparisonIdentity` / `ComparisonLeg`），由 `executor::row::unit_row` 从计划保存单元方向、轮次、各腿端点及参数/时长；不改变 `Leg.tag`、行级方向或 RESUME 身份。历史缺字段时只从完整类型化明细还原，重复或不完整的键全部保留并标记 `DeltaKind::Ambiguous`，禁止覆盖或任意配对；CLI 对比不完整返回 2，API 附加 `ambiguous` 计数。
+- 子网扫描统一调用 `InfoReq::for_scan`：空前缀显式全扫，有前缀照常过滤。预览和执行启动都验证完整扫描能力，`LiveTopology` 复用相同请求构造，不添加额外轮询。旧 `/info` 缺省请求仍回落到 agent 默认前缀。
+- 组合场景的启动结果未知由 `state/inner::scenarioStartPhase` 持续保存，`scenarioBlocksActions` 统一拦截冲突操作；断线只续接状态查询，不重发启动。单次空闲不解除未知，明确重新准备只清本地状态和预览；401 进入统一会话失效流程。监控每条轮询链绑定 `pollEpoch`，停止即作废，旧请求成功/失败都不得改状态或续接。
+- `/api/skip-unit` 必须提供 `run_id` / `unit_seq`；`RunStatusRecorder::request_skip` 与 `unit_started` / `unit_finished` 共用状态锁，目标核验和取消信号写入不可分离，同一目标只写一次。执行器在发布下一单元之前消耗前一单元的 skip，停止/退出始终优先。
+
+
 - 内环 `ip_versions` 只允许 4/6，每个版本独立单元、预检、结果及 RESUME；旧配置缺字段默认 IPv4，新建页面默认双栈。`Link::local_ipv6` / `gateway_ipv6` 是不带 zone 的 IPv6 单播，参与链路两端须同为链路本地或同为非链路本地；`TrafficAddresses` 按执行端真实网口构造绑定地址和目标，板侧地址经 ADB 验证唯一 LAN 归属，不能由 IPv4 推算；`adb::lan_interface_v6` 仅在扫描证明共享 link-local 地址的全部匹配口属于同一座也持有该地址的桥时选桥作用域，跨桥或缺少归属证据仍拒绝。取消参与的 IPv6-only 链路不要求补 IPv4，反之亦然。`plan::legacy_link_identity` 固定旧字段的 Debug 格式以保留原 IPv4 身份。`BoardInterface::ipv6_addresses` 与既有 IPv4 `addresses` 分列，空前缀电脑扫描保留 IPv6-only 接口，显式 IPv4 前缀的旧过滤语义保持不变。
 
-- 内环扫描绑定 ADB 与辅测机连接身份；身份编辑立即清能力快照，请求代次拒绝迟到成功或失败。子网本机页重扫在任一种测试运行期间禁用，失败保留旧快照并明确标注，再次重扫刷新双端。监控会话绑定已连接辅测机的 host/port，换机回收旧辅测会话并拒绝迟到启动应答；本机监控继续。
+- 内环主控扫描不设前缀，辅测机以 `InfoReq::all_interfaces` 显式请求全接口扫描（含 IPv6-only），先核实 `UNFILTERED_INFO_CAPABILITY`；旧 `/info` 请求缺少该字段时仍保留空列表回落到 agent 默认前缀的语义，不支持显式全扫的旧 agent 明确报错。
 
-- `webui::api::api_connect` 先在候选配置中应用地址、端口、令牌和前缀，待 `/health`、`/info` 与本机扫描成功后，一次性提交连接身份和双端网卡清单。失败不得留下新地址配旧网卡，也不得部分覆盖上次成功连接的配置。
+- 内环扫描绑定 ADB 与辅测机连接身份；身份编辑立即清能力快照和待添加勾选；两者共用 `state/inner::innerProbeIdentity`。同一连接重扫按电脑、接口与地址键恢复待添加选择，不按扫描顺序恢复；请求代次拒绝迟到成功或失败。子网本机页重扫在任一种测试运行期间禁用，失败保留旧快照并明确标注，再次重扫刷新双端。监控会话绑定已连接辅测机的 host/port，换机回收旧辅测会话并拒绝迟到启动应答；本机监控继续。
+
+- `webui::api::api_connect` 的空前缀显式请求 `InfoReq::all_interfaces`，与本机无前缀扫描一致；旧 agent 无完整扫描能力时拒绝全扫并保留旧连接，显式前缀仍兼容。它先在候选配置中应用地址、端口、令牌和前缀，待 `/health`、`/info` 与本机扫描成功后，一次性提交连接身份和双端网卡清单。失败不得留下新地址配旧网卡，也不得部分覆盖上次成功连接的配置。
 
 - `state/run` 的进度响应受请求代次约束，开始受理后不接收开始前的快照。开始超时保持 `unknown`，一次空闲快照不证明请求未执行；操作员确认后的 `prepareAfterUnknownStart` 只清准备态和预览，不发起运行。跳过受理绑定发出时的运行和单元，旧单元的迟到增量不得解除当前跳过状态。`state/session` 合并重复连接，重置后旧连接响应不得覆盖新会话。
 
@@ -534,6 +542,8 @@ Windows 文本适配器：`src/cmd/ipconfig.rs` 解析中英文 `ipconfig /all`�
 - 子网预览和开始的阻断规则只有 `webui::plan::CompiledPlan::blocking_errors` 一份实现：规格编译失败、套件中有被跳过的项目、没有可执行单元。`api_plan` 返回可选 `PlanOut::blocking_errors`，`api_run_impl` 使用同一结果拒绝启动；前端只读该字段，不另解析提示文本。旧矩阵仍允许执行有效部分，空计划仍拒绝。`RunView` 只有确认 `startPhase === 'accepted'` 后才切到进度页，未知应答不当作启动成功。
 
 - 子网默认逐网口入口 `views/plan/PortSelection` 通过纯函数 `domain/plan-ports::assignedPairIds` / `setPairAssigned` 编辑既有分配，保留集合 ID、端点方向、其他套件和绑定顺序。`pair_ids: []` 在协议里表示整集合，取消最后一对必须删除绑定，不能写回空数组；逐网口新增绑定使用显式 ID，后来扫描发现的网口不能自动参与。默认入口的批量操作仅影响显示行的当前套件，搜索不能改动隐藏行；高级集合整列分配仍保留原有全集合语义。
+
+- 控制台浏览器回归在 `ui/e2e/console.spec.ts`，使用 `webui::tests::browser_regression_server` 交付真实鉴权、CSP 和内联页面；扫描与运行响应可控，cookie-only API 请求直接验证 Rust 服务。`state/session::rescan` 的本机阶段失败也保留并标旧双端快照；`LocalView` 打开网卡详情后聚焦返回按钮，关闭后恢复原网卡按钮（已移除则回搜索框），避免窄屏隐藏列表丢失键盘焦点。
 
 - 子网 `state/plan::invalidatePreview` 增加请求代次并清空预览状态；`preview` 响应仅在请求代次和当前配置快照同时匹配时落地。成功导入项目或恢复默认时调用 `resetRunOptions`，清空项目不保存的 RESUME、截图、探测、强制窗口/带宽并将轮次恢复为 1；历史 `adoptRunRequest` 则从归档恢复这些选项。导入前发出的旧响应不得覆盖新项目，也不得结束新请求的忙碌态。
 
@@ -590,7 +600,8 @@ Windows 文本适配器：`src/cmd/ipconfig.rs` 解析中英文 `ipconfig /all`�
     快照下来）；哪天执行线程开始回读，它们就必须搬进 `gated`。
     界面侧另有一道 **UX 门**：`AgentView` 的「连接」「重新扫描」（两者都发
     `/api/connect`）在 `run.running || inner.status.running || inner.scenario.running`
-    任一为真时禁用，理由是页面显示的辅测机会和实际被测的那台对不上。
+    任一为真时禁用，表单提交处理也检查同一道门，理由是页面显示的辅测机会和实际被测的那台对不上。
+    `App` 首次挂载同时同步组合场景状态，刷新后无需先进入内环页才能锁定。
     它不替代后端门禁，后端也有意不拦这三个端点。
   - 编译期读的文件必须在版本控制里。`include_str!` / `include_bytes!` 的实参
     不许命中 `.gitignore` 里 `*.后缀` 那类「本机配置」规则。守在
@@ -627,11 +638,8 @@ Windows 文本适配器：`src/cmd/ipconfig.rs` 解析中英文 `ipconfig /all`�
 
 ## 12. 变更与验证记录
 
-- 本次重构前 Rust 物理行数：；生产区（每文件首个 `#[cfg(test)]` 前）。
-- 最终 Rust 物理行数：；生产物理行数：；生产区净减少 行，全部 Rust 净减少 行。
-- 测试从基线 增加到，没有通过删除测试获得减量。
-- 已验证：`cargo fmt --all -- --check`、`cargo test --all-targets --locked`（当前 773 项）、本机与 `x86_64-pc-windows-msvc` 严格 Clippy、Linux target check、`git diff --check`。
-- 旧说明 `使用说明.md:276-277` 关于 iperf server `-1`/netstat LISTEN 探测已过时；当前实现是无 `-1`、主动 stop、TCP connect ready 探测（`cmd/iperf.rs`）。维护 AI 文档时以当前实现为准。
+历史回归记录在 `docs/testing/` 与 `.ai/REGRESSION-REVIEW-20260910.md`。
+当前检查结果见 `docs/testing/project-review-2026-09-29.md`；测试数量随代码变化，不在架构索引重复维护。
 
 ### 内环进度与产物一致性补充
 

@@ -89,7 +89,7 @@ async function addAll(): Promise<void> {
     <header class="view-head">
       <h2>监控</h2>
       <p class="muted">
-        独立的网卡速率观测，和一轮测试正交——开跑前确认量级，跑起来盯着看也行。
+        查看网卡实时收发速率，可在测试前或测试期间使用。
       </p>
     </header>
 
@@ -147,7 +147,7 @@ async function addAll(): Promise<void> {
 
     <p class="muted hint">
       同时最多 {{ MONITOR_MAX_SESSIONS }} 路（当前 {{ monitor.sessions.length }} 路）。
-      同一端的同一块网卡不重复开——两条曲线读的是同一个内核计数器，必然一模一样。
+      每块网卡同时只能开启一路监控。
       <template v-if="full"><strong>已达上限，先停掉一路再开。</strong></template>
       <template v-else-if="selectable === 0 && nics.length">这一端的网卡都已经在监控了。</template>
     </p>

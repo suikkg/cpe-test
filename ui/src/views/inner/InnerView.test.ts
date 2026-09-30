@@ -71,6 +71,7 @@ beforeEach(() => {
   inner.busy = false;
   inner.error = '';
   inner.draftSaved = true;
+  inner.scenarioStartPhase = 'idle'; inner.scenarioLastReadIdle = false;
   inner.scenario = { running: false, id: '', phase: '', error: null, runs: [] };
 });
 
@@ -196,4 +197,17 @@ describe('内环双栈的表单、预览和结果', () => {
     inner.status.units = [result(1, undefined, [])];
     expect(await render()).toContain('TCP / IPv4');
   });
+});
+
+
+it('未知启动显示查询状态，禁用开始，并仅在已读到空闲后提供人工恢复', async () => {
+  inner.scenarioStartPhase = 'unknown';
+  let html = await render();
+  expect(html).toContain('启动结果未确认');
+  expect(html).not.toContain('空闲 / 已结束');
+  expect(html.match(/<button[^>]*disabled[^>]*>开始内环测试<\/button>/)).not.toBeNull();
+  expect(html).not.toContain('已核实测试未运行，重新准备');
+  inner.scenarioLastReadIdle = true;
+  html = await render();
+  expect(html).toContain('已核实测试未运行，重新准备');
 });

@@ -48,6 +48,7 @@ export function reset(): void {
 
 let timer: ReturnType<typeof setTimeout> | undefined;
 let generation = 0;
+let pollEpoch = 0;
 let agentGeneration = 0;
 
 function agentIdentity(): string {
@@ -66,12 +67,13 @@ watch(agentIdentity, () => {
 }, { flush: 'sync' });
 
 /** setTimeout 链，不是 setInterval——机器忙时请求不许堆叠。 */
-function schedule(): void {
-  timer = setTimeout(() => void tick(), 1000);
+function schedule(epoch: number): void {
+  if (timer !== undefined) clearTimeout(timer);
+  timer = setTimeout(() => { timer = undefined; void tick(epoch); }, 1000);
 }
 
-async function tick(): Promise<void> {
-  if (!monitor.polling) return;
+async function tick(epoch: number): Promise<void> {
+  if (!monitor.polling || epoch !== pollEpoch) return;
   if (monitor.sessions.length > 0) {
     try {
       // **一次问完全部在跑的监控。** 每路各发一次也能 work，但浏览器对同一个源
@@ -80,6 +82,7 @@ async function tick(): Promise<void> {
       const out = await api.post<{ series: MonitorSeriesOut[] }>('/api/monitor/samples', {
         cursors: monitor.sessions.map((s) => ({ session: s.session, from: s.from })),
       });
+      if (epoch !== pollEpoch) return;
       monitor.refreshError = '';
       for (const series of out.series ?? []) {
         const target = monitor.sessions.find((s) => s.session === series.session);
@@ -90,6 +93,7 @@ async function tick(): Promise<void> {
         target.error = series.error;
       }
     } catch (error) {
+      if (epoch !== pollEpoch) return;
       if (error instanceof UnauthorizedError) {
         // 口令失效不是断线，**自愈不了**：继续按秒重试只会刷出一串 401，而屏幕
         // 上什么都不会变——曲线就那么静止着，没有一处说它已经不再更新了。而这台
@@ -103,16 +107,17 @@ async function tick(): Promise<void> {
       monitor.refreshError = errorMessage(error);
     }
   }
-  if (monitor.polling) schedule();
+  if (monitor.polling && epoch === pollEpoch) schedule(epoch);
 }
 
 export function startPolling(): void {
   if (monitor.polling) return;
   monitor.polling = true;
-  void tick();
+  void tick(++pollEpoch);
 }
 
 export function stopPolling(): void {
+  pollEpoch += 1;
   monitor.polling = false;
   if (timer !== undefined) {
     clearTimeout(timer);

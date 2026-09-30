@@ -13,7 +13,7 @@ import RunView from './views/run/RunView.vue';
 import ProgressView from './views/progress/ProgressView.vue';
 import MonitorView from './views/monitor/MonitorView.vue';
 import InnerView from './views/inner/InnerView.vue';
-import { inner, loadInnerDraft, syncInnerStatus } from './state/inner';
+import { inner, loadInnerDraft, syncInnerStatus, syncScenarioStatus } from './state/inner';
 import RunsView from './views/runs/RunsView.vue';
 
 // 各区域的实时角标。旧页用「第几步」的编号来暗示进度，但那个编号是假的：
@@ -42,6 +42,9 @@ const connectionLabel = computed(() => {
 // 「还没读到」和「读到了，是空闲」必须分开：屏幕上长得一样，下一步却相反——
 // 真空闲可以开跑，没读到时开跑就是往一轮已经在跑的测试上再叠一轮。
 const runLabel = computed(() => {
+  if (inner.scenarioStartPhase === 'unknown') return '启动结果未确认';
+  if (inner.scenarioStartPhase === 'sending') return '正在启动组合场景';
+  if (inner.scenario.running) return '组合场景运行中';
   if (!run.synced) return '运行状态待同步';
   if (run.running) return `运行中 ${runView.value.done}/${runView.value.total}`;
   if (runView.value.finished) return '本轮已结束';
@@ -85,6 +88,7 @@ onMounted(() => {
   loadDraft();
   loadInnerDraft();
   void syncInnerStatus();
+  void syncScenarioStatus();
   // 先认一次「服务器上是不是已经有一轮在跑」。走的是轮询那同一个出口，
   // 不新开第二条链、不提高频率；读到在跑才把轮询接上。
   void syncStatus();
@@ -110,8 +114,8 @@ onMounted(() => {
         <span v-if="ui.region !== 'inner'" class="status-readout" :class="{ connected: session.phase === 'connected' }">
           <i aria-hidden="true"></i>{{ connectionLabel }}
         </span>
-        <span v-if="ui.region === 'inner'" class="status-readout">{{ inner.status.running ? '内环运行中' : inner.synced ? '内环空闲' : '内环状态待同步' }}</span>
-        <button v-else type="button" class="run-status" :class="{ live: run.running }" @click="goto('progress')">
+        <span v-if="ui.region === 'inner'" class="status-readout">{{ inner.scenarioStartPhase === 'unknown' ? '启动结果未确认' : inner.scenario.running ? '组合场景运行中' : inner.status.running ? '内环运行中' : inner.synced ? '内环空闲' : '内环状态待同步' }}</span>
+        <button v-else type="button" class="run-status" :class="{ live: run.running }" @click="goto(inner.scenarioStartPhase === 'unknown' || inner.scenario.running ? 'inner' : 'progress')">
           <i aria-hidden="true"></i>{{ runLabel }}
         </button>
         <button type="button" class="ghost theme-toggle" :aria-label="`切换主题，当前${themeLabel}`" @click="cycleTheme">

@@ -215,3 +215,32 @@ describe('重新扫描', () => {
     expect(session.connection).toEqual(connectOut);
   });
 });
+
+describe('重扫在本机请求阶段失败', () => {
+  it('双端快照保留并标旧，不继续宣称连接有效', async () => {
+    session.host = '192.168.1.3';
+    route({ '/api/connect': ok(connectOut) });
+    await connect();
+    const connectedAt = session.connectedAt;
+    route({ '/api/local': () => { throw new TypeError('offline'); } });
+    await rescan();
+    expect(session.phase).toBe('failed');
+    expect(session.topologyStale).toBe(true);
+    expect(session.connection).toEqual(connectOut);
+    expect(session.connectedAt).toBe(connectedAt);
+    expect(session.scanMessage).toContain('仍是上次成功的网卡');
+    expect(session.scanning).toBe(false);
+  });
+
+  it('本机扫描 401 保留快照但进入鉴权终态', async () => {
+    route({ '/api/connect': ok(connectOut) });
+    await connect();
+    route({ '/api/local': unauthorized() });
+    await rescan();
+    expect(session.phase).toBe('unauthorized');
+    expect(session.topologyStale).toBe(true);
+    expect(session.connection).toEqual(connectOut);
+    expect(session.scanKind).toBe('');
+    expect(session.scanning).toBe(false);
+  });
+});

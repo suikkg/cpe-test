@@ -126,13 +126,11 @@ shasum -a 256 dist/cpe_test-v<版本号>-windows-config-docs.zip   # 必须等�
 
 ## 4. 前端构建链
 
-> 状态：`feat/webui-vue` 分支上正在把 `src/master/webui.html`（手写 3519 行）
-> 换成 Vue 3 + Vite 构建产物。选型与分层见 `.ai/DESIGN-v5.0-webui.md` +
-> `.ai/PLAN-v5.0-frontend.md`，全系统的目标架构与分期见
-> `.ai/DESIGN-v6.0-architecture.md`（前端选型被它确认，进度/结果的消费方式被它修订）。
-> **在该分支合入 main 之前，本节描述的是目标形态；main 上仍是手写单文件。**
+控制台已使用 Vue 3 + Vite，源码在 `ui/`，构建产物为 `src/master/webui.html`。
+设计与分层说明见 `.ai/DESIGN-v5.0-webui.md`、`.ai/PLAN-v5.0-frontend.md` 和
+`.ai/DESIGN-v6.0-architecture.md`；当前实现以源码为准。
 
-### 目标形态
+### 当前结构
 
 ```
 ui/                      # Vite 项目，只有开发期需要 Node
@@ -150,6 +148,19 @@ src/master/webui.html    # 构建产物，**提交进仓库**
 ```bash
 npm ci && npm run test && npm run build && npm run verify
 ```
+
+控制台操作路径还须运行真实 Chromium 回归（CI 的 UI job 同样执行）：
+
+```bash
+npx playwright install chromium  # 首次安装；Linux CI 加 --with-deps
+npm run test:e2e                 # 必须先 build；需要 Rust 工具链
+```
+
+`ui/e2e/` 经 Playwright 启动 `browser_regression_server`（默认忽略的 Rust 测试），
+加载真实 HTTP 层交付的内联页面，验证 cookie/API 鉴权、扫描、运行锁定和键盘操作。
+网卡与运行状态由浏览器请求桩控制，不起真实流量；服务不读本机配置、不打开系统浏览器，
+由测试运行器回收。默认端口 29876，可用 `CPE_BROWSER_TEST_PORT` 改；不复用已有服务。
+失败 trace 在 `ui/test-results/`，CI 上传为 `console-browser-traces`。
 
 然后**把产物 `src/master/webui.html` 和源码一起提交**，再跑一遍 §1 的四件事。
 
@@ -191,6 +202,11 @@ esbuild 版本和构建机差异影响，也不要求 CI 装 Node，`cargo test`
 
 轮询一律用「响应落地后再排下一次」的 `setTimeout` 链，不用 `setInterval`：
 机器一忙请求就会叠着发。这是重写要**修掉**的，不是要照搬的。
+
+### 用户可见文案
+
+正文、标题、按钮、占位文字和悬浮提示只写操作信息、输入规则、状态及必要的测量口径。
+AI 提示词、任务要求、修复经过和内部实现说明放在开发文档或代码注释中，不写进 UI。
 
 ### CSP
 

@@ -2242,3 +2242,83 @@ fn an_unchecked_ipv6_only_link_does_not_require_ipv4_for_another_links_round() {
     cfg.links[1].enabled = true;
     assert!(cfg.validate().unwrap_err().contains("IPv4"));
 }
+
+#[test]
+fn inner_multinic_binding_keeps_host_interface_addresses_and_report_identity_together() {
+    for host_id in ["master", "agent1"] {
+        let mut cfg = dual_stack_example();
+        cfg.links = vec![cfg.links[1].clone()];
+        cfg.links[0].host = host_id.into();
+        cfg.links[0].local_interface = "LAN-B".into();
+        cfg.links[0].measurement = Measurement::Tool;
+        let link = &cfg.links[0];
+        let mut cap = capability(link, host_id);
+        cap.board_addresses
+            .push_str("\n34: br0 inet6 fe80::1/64 scope link");
+        if host_id == "master" {
+            cap.agents.clear(); // 未配置辅测机不影响本机身份和预检。
+        }
+        let info = if host_id == "master" {
+            &mut cap.local
+        } else {
+            cap.agents[0].info.as_mut().unwrap()
+        };
+        info.os = "linux".into();
+        info.interfaces[0].ipv6_ll = link.local_ipv6.unwrap().to_string();
+        info.interfaces[0].zone = "port-b".into();
+        let mut other = info.interfaces[0].clone();
+        other.name = "LAN-A".into();
+        other.ipv4 = "192.168.8.199".into();
+        // 不同网卡可持有相同 link-local；不能只凭地址选第一项的 zone。
+        other.zone = "port-a".into();
+        info.interfaces.insert(0, other);
+        let built = plan::build(&cfg).unwrap();
+        for unit in &built.units {
+            let flight = preflight_version(link, &cap, unit.ip_version).unwrap();
+            let bind = if unit.ip_version == 6 {
+                format!("{}%port-b", link.local_ipv6.unwrap())
+            } else {
+                link.local_ip.to_string()
+            };
+            assert_eq!(flight.addresses.pc_bind, bind);
+            for flow in [Flow::Up, Flow::Down] {
+                let request = client_request_for_addresses(
+                    &cfg,
+                    &flight.addresses,
+                    unit.protocol,
+                    flow,
+                    unit.legs[0].port,
+                );
+                assert_eq!(request.v6, unit.ip_version == 6);
+                if flow == Flow::Up {
+                    assert_eq!(request.bind_ip, bind);
+                } else {
+                    assert_eq!(
+                        request.dst,
+                        if unit.ip_version == 6 {
+                            format!("{}%br0", link.local_ipv6.unwrap())
+                        } else {
+                            link.local_ip.to_string()
+                        }
+                    );
+                }
+            }
+            let row = assemble_unit(&cfg, link, unit, &flight, vec![]);
+            assert_eq!(row.host, host_id);
+            assert_eq!(row.link, link.name);
+            assert_eq!(row.ip_version, unit.ip_version);
+            assert_eq!(row.id, unit.id);
+        }
+        let info = if host_id == "master" {
+            &mut cap.local
+        } else {
+            cap.agents[0].info.as_mut().unwrap()
+        };
+        info.interfaces.retain(|nic| nic.name != "LAN-B");
+        for version in [4, 6] {
+            assert!(preflight_version(link, &cap, version)
+                .unwrap_err()
+                .contains("未唯一匹配"));
+        }
+    }
+}

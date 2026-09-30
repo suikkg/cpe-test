@@ -149,8 +149,7 @@ function fmt(v: number): string {
       </span>
     </div>
     <p class="dim window">
-      读数与曲线取同一段样本（当前缓冲全部）。横轴是「会话开始后」的相对时间——
-      两端的系统时钟不保证同步。
+      读数统计当前保留的样本；横轴为监控开始后的时间。
     </p>
   </div>
 </template>

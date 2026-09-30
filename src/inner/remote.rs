@@ -95,10 +95,22 @@ impl Remote {
                 self.config.id
             ));
         }
+        // 老 agent 会忽略未知字段并悄悄套用默认前缀，必须先核实能力。
+        if !health
+            .capabilities
+            .iter()
+            .any(|v| v == UNFILTERED_INFO_CAPABILITY)
+        {
+            return Err(format!(
+                "辅测机 {} 不支持完整网卡扫描，请使用同版本 agent",
+                self.config.id
+            ));
+        }
         self.post(
             "/info",
             &InfoReq {
                 ipv4_prefixes: Vec::new(),
+                all_interfaces: true,
             },
         )
     }
@@ -217,6 +229,70 @@ mod tests {
     use crate::http_client::{HttpRequest, HttpResponse, Transport};
     use serde_json::json;
     use std::sync::Mutex;
+
+    struct ScanAgent {
+        supports_all: bool,
+    }
+    impl Transport for ScanAgent {
+        fn send(&self, req: &HttpRequest, _: Duration) -> Result<HttpResponse, String> {
+            let data = match req.path.as_str() {
+                "/health" => {
+                    let mut capabilities = vec![RELIABLE_LIFECYCLE_CAPABILITY];
+                    if self.supports_all {
+                        capabilities.push(UNFILTERED_INFO_CAPABILITY);
+                    }
+                    json!({"hostname":"remote", "os":"windows", "version":"test", "iperf3":"iperf3", "capabilities":capabilities})
+                }
+                "/info" => {
+                    assert!(self.supports_all, "旧 agent 必须在扫描前被明确拒绝");
+                    let request: InfoReq = serde_json::from_str(&req.body).unwrap();
+                    let defaults = vec!["192.168.".to_string()];
+                    // 真实线协议和 agent 使用的前缀解析不得漏掉私网和 v6-only。
+                    let prefixes = request.effective_prefixes(&defaults);
+                    assert!(prefixes.is_empty(), "内环全扫不能回落到 agent 默认前缀");
+                    for ip in ["192.168.8.2", "10.0.0.2", "172.16.0.2"] {
+                        assert!(crate::nic::ipv4_match(ip, prefixes));
+                    }
+                    serde_json::to_value(HostInfo {
+                        interfaces: vec![NicInfo {
+                            name: "ETH6".into(),
+                            ipv6_ll: "fe80::2".into(),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    })
+                    .unwrap()
+                }
+                path => panic!("unexpected request {path}"),
+            };
+            Ok(HttpResponse::new(
+                200,
+                json!({"ok":true,"data":data}).to_string(),
+            ))
+        }
+    }
+
+    #[test]
+    fn inner_remote_scan_is_unfiltered_and_rejects_agents_that_would_ignore_the_request() {
+        for supports_all in [true, false] {
+            let remote = Remote::with_transport(
+                AgentConfig {
+                    id: "agent1".into(),
+                    address: "agent.example".into(),
+                    port: 28801,
+                    token: String::new(),
+                },
+                Arc::new(ScanAgent { supports_all }),
+            );
+            if supports_all {
+                let info = remote.info().unwrap();
+                assert_eq!(info.interfaces[0].ipv6_ll, "fe80::2");
+                assert!(info.interfaces[0].ipv4.is_empty());
+            } else {
+                assert!(remote.info().unwrap_err().contains("不支持完整网卡扫描"));
+            }
+        }
+    }
 
     struct FakeAgent {
         paths: Mutex<Vec<String>>,

@@ -227,3 +227,38 @@ describe('监控会话', () => {
     expect(fetchMock.mock.calls.length).toBe(calls);
   });
 });
+
+describe('轮询跨会话的迟到响应', () => {
+  it.each(['success', 'failure', 'unauthorized'])('旧请求 %s 不覆盖新状态或增加轮询', async (result) => {
+    vi.useFakeTimers();
+    try {
+      let resolveOld!: (value: FakeResponse) => void;
+      let rejectOld!: (error: Error) => void;
+      let reads = 0;
+      let starts = 0;
+      fetchMock.mockImplementation(async (url: string) => {
+        if (url.includes('/monitor/start')) return ok({ session: `s${++starts}` });
+        if (url.includes('/monitor/samples')) {
+          reads++;
+          if (reads === 1) return new Promise<FakeResponse>((resolve, reject) => { resolveOld = resolve; rejectOld = reject; });
+          return ok({ series: [] });
+        }
+        return ok({});
+      });
+      await startSession('master', 'eth0', 1000);
+      await stopAll();
+      await startSession('master', 'eth0', 1000);
+      await vi.advanceTimersByTimeAsync(0);
+      monitor.refreshError = 'new session error';
+      if (result === 'failure') rejectOld(new Error('old failure'));
+      else resolveOld(result === 'unauthorized' ? unauthorized() : ok({ series: [] }));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(monitor.refreshError).toBe('new session error');
+      expect(session.phase).toBe('connected');
+      const initial = reads;
+      await vi.advanceTimersByTimeAsync(3000);
+      expect(reads - initial).toBe(3);
+      expect(monitor.polling).toBe(true);
+    } finally { vi.clearAllTimers(); vi.useRealTimers(); }
+  });
+});

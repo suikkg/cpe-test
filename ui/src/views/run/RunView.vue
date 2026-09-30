@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { scenarioBlocksActions } from '../../state/inner';
 import { computed, ref, watch } from 'vue';
 import type { PlannedUnit } from '../../api/dto';
 import { humanDuration } from '../../domain/progress';
@@ -23,7 +24,7 @@ import NicPolicyTable from './NicPolicyTable.vue';
 const out = computed(() => plan.preview);
 const units = computed<PlannedUnit[]>(() => out.value?.units ?? []);
 const selectedPairs = computed(() => selectedPortPairs(plan.ui));
-const otherRunning = computed(() => inner.status.running || inner.scenario.running);
+const otherRunning = computed(() => inner.status.running || scenarioBlocksActions());
 const blockingErrors = computed(() => out.value?.blocking_errors ?? []);
 const reviewOrder = ref<'execution' | 'source'>('execution');
 const visibleLimit = ref(50);
@@ -243,7 +244,7 @@ const blockedReason = computed(() => {
             v-model="plan.forceTcpWindow"
             type="text"
             placeholder="留空 = 不覆盖"
-            title="盖过套件里每条任务已经配好的 -w，只对这一轮生效，不写回套件。值会存进 request.json，所以「重新执行这一轮」跑的是同一件事。"
+            title="覆盖本轮所有 TCP 任务的窗口大小，保留套件原参数；历史重跑会沿用此值。"
           />
         </label>
         <label class="field">
@@ -252,7 +253,7 @@ const blockedReason = computed(() => {
             v-model="plan.forceUdpBandwidth"
             type="text"
             placeholder="留空 = 不覆盖"
-            title="只换 -b，保留原档位的 -l 与 -w——压带宽试一把的时候，报文长度和 socket buffer 换掉的话，测的就不是同一件事了。"
+            title="覆盖本轮 UDP 发送带宽，保留原报文长度和缓冲区设置。"
           />
         </label>
       </div>
@@ -263,13 +264,13 @@ const blockedReason = computed(() => {
       <div class="run-options">
         <label class="switch">
           <input v-model="plan.probeDuringTraffic" type="checkbox" />
-          <span title="灌包期间并发一条 32 字节、约 1 秒一拍的 ICMP 探针，测「负载下时延」。结果只进诊断，绝不改写判定。">
+          <span title="打流期间每秒测量一次 32 字节 Ping 时延，结果仅供诊断。">
             <strong>测负载下时延</strong><small>打流时额外测量网络响应时间</small>
           </span>
         </label>
         <label class="switch">
           <input v-model="plan.probePathMtu" type="checkbox" />
-          <span title="每个 Ping 单元额外做一次路径 MTU 探测（带「不分片」位二分逼近）。现有包长档位测的是分片行为，看不出 1500 与 1492 的差别（PPPoE 封装）。结果只进诊断，不做判定项。">
+          <span title="在 IPv4 Ping 测试中探测不分片的最大包长，结果仅供诊断。">
             <strong>探路径 MTU</strong><small>检查不分片时可传输的最大包长</small>
           </span>
         </label>
@@ -328,7 +329,7 @@ const blockedReason = computed(() => {
     <div v-if="run.startPhase === 'unknown'" class="warn" role="alert">
       <p>
         「开始」这条请求<strong>没有拿到应答</strong>，无法确认这一轮有没有起跑。
-        正在同步运行状态；空闲快照不能证明这次请求未执行，超时请求可能仍被受理。
+        正在同步运行状态，请勿重复开始。
         请先在主控确认没有运行，再重新准备并预览。
       </p>
       <button type="button" class="ghost" @click="syncStatus">再同步一次运行状态</button>

@@ -288,7 +288,7 @@ function has(list: string[] | undefined, value: string): boolean {
         <button
           type="button"
           class="ghost small"
-          title="复制一份（含全部任务，不含分配）。给某条链路单独的双向门限就靠它。"
+          title="复制套件及全部任务，链路分配需另行设置。"
           @click="onDuplicateSuite(current.id)"
         >
           复制
@@ -498,9 +498,7 @@ function has(list: string[] | undefined, value: string): boolean {
                 />
               </label>
               <p class="muted small-hint">
-                填了这里就<strong>不再看「按网口门限」那张表</strong>：那张表一块网卡只能填一个数，
-                而同一块网卡对不同对端能收到的完全不是一个量级——1G 口做发送端时，
-                收口上挂的 1800/2000 在这条路径上物理上就跑不到。只能填绝对 Mbps。
+                此处填写绝对 Mbps，优先于按网口设置的门限。
               </p>
               <p class="muted small-hint">门限挂在任务上，作用于所有分配了本套件的链路集合。</p>
             </fieldset>
@@ -525,7 +523,7 @@ function has(list: string[] | undefined, value: string): boolean {
                   <span>A→B 接收端</span>
                   <input
                     type="text"
-                    placeholder="留空 = 走兜底判定"
+                    placeholder="留空 = 沿用默认门限"
                     :value="task.rx_target_bidir_ab ?? ''"
                     @input="onRxTarget(current.id, task.id, 'rx_target_bidir_ab', $event)"
                   />
@@ -534,7 +532,7 @@ function has(list: string[] | undefined, value: string): boolean {
                   <span>B→A 接收端</span>
                   <input
                     type="text"
-                    placeholder="留空 = 走兜底判定"
+                    placeholder="留空 = 沿用默认门限"
                     :value="task.rx_target_bidir_ba ?? ''"
                     @input="onRxTarget(current.id, task.id, 'rx_target_bidir_ba', $event)"
                   />

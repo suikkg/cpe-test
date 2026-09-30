@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { scenarioBlocksActions } from '../../state/inner';
 import { computed, ref } from 'vue';
 import NicTable from '../../components/NicTable.vue';
 import { agentHostname, agentNics, masterNics } from '../../state/inventory';
@@ -37,7 +38,7 @@ const busy = computed(() => session.phase === 'connecting');
  * 互相拒绝），任一在跑都意味着有一轮测试正在用当前这份连接身份。
  */
 const testInFlight = computed(
-  () => run.running || inner.status.running || inner.scenario.running,
+  () => run.running || inner.status.running || scenarioBlocksActions(),
 );
 const lockHint = computed(() =>
   testInFlight.value ? '测试进行中，改连接会让页面显示的辅测机与实际被测的那台对不上' : undefined,
@@ -75,11 +76,13 @@ function syncPrefixes(): void {
 }
 
 async function onConnect(): Promise<void> {
+  if (busy.value || session.scanning || testInFlight.value) return;
   syncPrefixes();
   await connect();
 }
 
 async function onRescan(): Promise<void> {
+  if (busy.value || session.scanning || testInFlight.value) return;
   syncPrefixes();
   await rescan();
 }
@@ -132,8 +135,7 @@ async function onRescan(): Promise<void> {
       <div class="form-actions">
       <p id="prefix-help" class="hint">多个前缀用英文逗号分隔，对两端同时生效。留空显示全部网卡。</p>
       <p v-if="testInFlight" class="hint" role="status">
-        测试进行中，暂时不能改连接：正在跑的那一轮用的是开跑时的配置快照，
-        这里改了只会让页面显示的辅测机与实际被测的那台对不上。停止后再改。
+        测试进行中，连接设置暂不可修改。测试结束后可重新连接或扫描。
       </p>
       <button type="submit" class="primary" :disabled="busy || session.scanning || testInFlight" :title="lockHint">
         {{ busy ? '连接中…' : '连接' }}

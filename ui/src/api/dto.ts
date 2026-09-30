@@ -294,6 +294,7 @@ export interface CompareOut {
   added: number;
   disappeared: number;
   unchanged: number;
+  ambiguous?: number;
 }
 
 export interface RunRequestOut {

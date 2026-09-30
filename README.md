@@ -30,6 +30,13 @@
 
 结果保存在 `inner_runs/inner_*/` 下的 `report.html`、`result.json`、`summary.json`、`config.json` 与 `units.jsonl`，不进入子网 `runs`。页面下方的“内环历史”可以列出历次运行、下载报告，或把当时的配置装载回控制台重新生成计划——装载配置后默认打开内环 RESUME，仍需重新预览并点击开始；隔夜的网口拓扑可能已经变了，该看到的是预览里的差异。组合场景记录保存在 `scenarios/`，可载入子网计划与内环配置后再次执行。退出码 0 表示完成且 PASS/MEASURED（探测模式为能力探测成功），1 表示 RATE_FAIL/NOT_EVALUATED，2 表示配置、环境、取消或回收失败。内环使用自己的 HTML/JSON 报告，目前没有 Excel 出口；内环 RESUME 与子网 RESUME 分开计算。每单元追加 JSONL 并更新摘要；HTML/完整 JSON 在单元结束时按 30 秒间隔节流更新，收尾必写，因此运行中的下载可能落后于界面已完成数量。历史记录显示明确的收尾状态，旧记录未提供状态时显示未知。
 
+## v6.5.1
+
+修复报告对比、全量网卡扫描、组合场景断线恢复、监控轮询和跳过当前任务的边界问题。
+对比身份现在区分单向/双向和轮次；信息不足或重复的历史记录会明确标记为无法唯一匹配，CLI 以退出码 2 提示对比不完整。跳过请求绑定运行与单元，扫描预览和执行使用同一过滤规则；后台任务状态未知时持续查询，停止后迟到的监控响应不会启动第二条轮询链。
+
+验证：Rust 888 项、前端 508 项、Chromium 19 项测试通过；格式检查、本机与 Windows MSVC Clippy、前端构建和产物校验通过。尚未进行 Windows 双机 CPE 实机流量验收。
+
 ## v6.5.0
 
 按「测试开发 / CPE 测试」两个角度做的一轮功能评审，产出 11 项改动。**没有一项动判定层**——
@@ -754,7 +761,7 @@ CPE（Customer Premises Equipment）子网测试工具用于在**两台电脑之
 ```
 cpe_test.exe          ← 本工具（单文件）
 iperf3.exe            ← 从 iperf.fr 下载（只测 Ping/ctsTraffic 可不放）
-ctsTraffic.exe        ← v6.5.0 Windows Release 已捆绑（仅 Windows 10+）
+ctsTraffic.exe        ← v6.5.1 Windows Release 已捆绑（仅 Windows 10+）
 start_agent.bat       ← 辅测机双击
 start_ui.bat          ← 主控机双击（图形控制台，推荐）
 start_master.bat      ← 主控机双击（命令行问答式）
@@ -856,6 +863,8 @@ cpe_test compare <基线目录> <本轮目录>   两轮对比，出差异报告
           **发现回归（判定变坏或速率下降超过 5%）返回非 0**，可直接当 CI 的一道门。
           对齐键不含协商速率与 IP 地址——Wi-Fi 重新协商、DHCP 换址都不会
           把同一条测试拆成「新增 + 缺失」两行。
+          单向、双向和各轮次分别匹配；身份不足或重复的记录全部保留并标为
+          「无法唯一匹配」，不计入「无实质变化」，此时退出码为 2（对比不完整）。
     例：cpe_test compare runs/run_20260901_090000_111 runs/run_20260908_090000_222
 
 cpe_test scan               查看本机网卡识别结果
@@ -1576,7 +1585,7 @@ cargo build --release --locked
 
 自行编译后，把 `cpe_test.exe`、启动脚本和所需吞吐工具放到两台 Windows 电脑同一目录：
 iperf3 测试需要完整的 iperf3 Windows 发行包；ctsTraffic 测试需要 `ctsTraffic.exe`。
-官方 v6.5.0 Windows Release ZIP 已捆绑固定且校验过的 ctsTraffic 2.0.4.0，但由于发行包差异不内置 iperf3。
+官方 v6.5.1 Windows Release ZIP 已捆绑固定且校验过的 ctsTraffic 2.0.4.0，但由于发行包差异不内置 iperf3。
 
 ### GitHub Actions CI
 
@@ -1599,7 +1608,7 @@ Windows ZIP 包含启动脚本、四份配置、固定 CTS 二进制和第三方
 `tar.gz` 保留 `cpe_test` 可执行位。发布作业会再次核对资产名称、数量、内部结构和哈希。
 
 仓库同时跟踪一份不含可执行程序的
-[`cpe_test-v6.5.0-windows-config-docs.zip`](dist/cpe_test-v6.5.0-windows-config-docs.zip)，
+[`cpe_test-v6.5.1-windows-config-docs.zip`](dist/cpe_test-v6.5.1-windows-config-docs.zip)，
 便于直接从 Git 下载 Windows 配置、文档和启动脚本。其 SHA-256 位于同目录的
 `.zip.sha256` 文件；CI 会逐文件确认压缩包内容与仓库源文件一致。需要开箱即用的程序、
 固定版 ctsTraffic 和许可证全集时，仍应下载上面的正式 Windows Release ZIP。

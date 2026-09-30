@@ -1,9 +1,10 @@
 <script setup lang="ts">
+import { scenarioBlocksActions } from '../../state/inner';
 import { computed, nextTick, onMounted, ref } from 'vue';
 import {
   inner, importInner, innerReport, innerRunReport, listInnerRuns, loadInnerDraft, loadInnerRunConfig,
   probeInner, refreshInnerPlan, startInner, startSubnetThenInner, stopInner, stopScenario, syncInnerStatus,
-  listScenarioRuns, loadScenario, syncScenarioStatus,
+  listScenarioRuns, loadScenario, syncScenarioStatus, prepareAfterUnknownScenario,
 } from '../../state/inner';
 import {
   DIRECTION_LABEL, FLOW_LABEL, INNER_DIRECTIONS, INNER_IP_VERSIONS, INNER_PROTOCOLS, MEASUREMENT_LABEL, PROTOCOL_LABEL,
@@ -20,7 +21,7 @@ const props = defineProps<{ subnetRunning?: boolean }>();
 const emit = defineEmits<{ (e: 'show-subnet-progress'): void }>();
 const fileInput = ref<HTMLInputElement>();
 const editing = ref<InnerLink | null>(null);
-const locked = computed(() => props.subnetRunning || inner.busy || inner.status.running || inner.scenario.running || !inner.synced);
+const locked = computed(() => props.subnetRunning || inner.busy || inner.status.running || scenarioBlocksActions() || !inner.synced);
 const hosts = computed(() => [{ id: 'master', label: '主控本机' }, ...inner.config.agents.map((a) => ({ id: a.id, label: `${a.id} · ${a.address}` }))]);
 const tcp = computed(() => inner.config.protocols.includes('tcp'));
 const udp = computed(() => inner.config.protocols.includes('udp'));
@@ -35,6 +36,7 @@ const deviceSettings = ref<HTMLDetailsElement>();
 const advancedParams = ref<HTMLDetailsElement>();
 const startBlocked = computed(() => {
   if (props.subnetRunning) return '子网测试正在运行，请先等待它结束或在进度页请求停止。';
+  if (inner.scenarioStartPhase === 'unknown') return '启动结果未确认，正在查询，请勿重复启动。';
   if (inner.status.running || inner.scenario.running) return '测试正在运行，请等待结束或停止当前测试。';
   if (!inner.synced) return '先同步运行状态，确认没有其他测试正在执行。';
   if (inner.busy) return '正在处理当前操作，请稍候。';
@@ -147,7 +149,7 @@ onMounted(() => { loadInnerDraft(); void syncInnerStatus(); void syncScenarioSta
     <fieldset ref="devicePanel" :disabled="locked" class="inner-card" tabindex="-1">
       <legend>1 · 检查设备，扫描网卡</legend>
       <p>确认 CPE 已通过 ADB 接到主控，点击扫描。单台设备可自动识别，程序路径与辅测机在下方按需设置。</p>
-      <div class="bar inner-actions"><button class="primary" @click="probeInner">{{ inner.busy ? '检查与扫描中…' : '检查 ADB / 扫描各电脑网卡' }}</button><span class="muted">扫描不启动测试，也不修改电脑网络设置。</span></div>
+      <div class="bar inner-actions"><button class="primary" @click="probeInner">{{ inner.busy ? '检查与扫描中…' : '检查 ADB / 扫描各电脑网卡' }}</button><span class="muted">扫描完成后选择本轮网口。</span></div>
       <details ref="deviceSettings" class="advanced-settings">
         <summary>ADB 与辅测机设置{{ inner.capability ? `（已识别 ${inner.capability.serial}）` : '' }}</summary>
         <p>ADB 设备接在主控电脑；其他电脑运行同版本 <code>cpe_test agent</code>，并填写可从主控访问的地址。没有辅测机时本机也能独立测试。</p>
@@ -175,7 +177,7 @@ onMounted(() => { loadInnerDraft(); void syncInnerStatus(); void syncScenarioSta
         </span>
       </div>
       <p v-if="inner.capability?.agents.some(a => a.status === 'failed')" class="muted">
-        连接失败的辅测机不会删除配置。只要没有网口勾选它，本轮照样可以只跑本机。
+        辅测机连接失败时，可取消其网口的参与勾选，仅测试本机。
       </p>
       <template v-if="inner.capability">
         <p v-if="inner.capability.board_inventory_error" class="warn" role="status">板侧接口信息不完整：{{ inner.capability.board_inventory_error }}。请核对统计接口后重新扫描。</p>
@@ -195,7 +197,7 @@ onMounted(() => { loadInnerDraft(); void syncInnerStatus(); void syncScenarioSta
     <fieldset ref="linksPanel" :disabled="locked" class="inner-card" tabindex="-1">
       <legend>2 · 选择本轮网口，核对地址</legend>
       <p class="muted">
-        板侧 LAN 地址填这条链路访问的板侧地址，不是板侧 WAN 默认网关。取消勾选只是这一轮不跑它，参数一个字节都不会丢。
+        填写被测 CPE 的 LAN 地址。取消参与会保留该网口配置。
       </p>
       <InnerLinkTable :hosts="hosts" :editing="editing" :disabled="locked" @edit="editLink" />
       <div v-if="editing" ref="detailPanel" class="detail-panel" tabindex="-1"><InnerLinkDetail :link="editing" :hosts="hosts" :disabled="locked" @close="editing = null" /></div>
@@ -253,8 +255,7 @@ onMounted(() => { loadInnerDraft(); void syncInnerStatus(); void syncScenarioSta
       </div>
       </details>
       <p class="muted">
-        「上行 + 下行」是两个独立的单向单元；「双向并发」是一个同时跑上下行两条腿的单元。两次顺序单向不等于双向并发，
-        三项可以同时勾选，各自出结果。重复轮次只是多跑几遍并各留一条记录，不会因为没达标就自动重跑。
+        上行和下行分别测试；双向并发同时测试上下行。可同时选择多个方向，每轮分别记录结果。
       </p>
     </fieldset>
 
@@ -268,7 +269,7 @@ onMounted(() => { loadInnerDraft(); void syncInnerStatus(); void syncScenarioSta
         <strong>还需完成 {{ setupIssues.length }} 项</strong>
         <ul><li v-for="(issue, index) in setupIssues" :key="index"><span>{{ issue.message }}</span><button :disabled="locked" @click="fixIssue(issue)">{{ issue.action }}</button></li></ul>
       </div>
-      <p v-else class="muted">配置已填写完整。启动时会检查设备和链路；扫描结果与计划预览不代表测试已通过。</p>
+      <p v-else class="muted">配置已填写完整，请复核下方计划。</p>
       <p v-if="inner.previewError && !setupIssues.length" class="bad" role="alert">{{ inner.previewError }}</p>
       <template v-if="inner.preview">
         <p>
@@ -308,17 +309,19 @@ onMounted(() => { loadInnerDraft(); void syncInnerStatus(); void syncScenarioSta
         <button :disabled="inner.busy || (!inner.status.running && !inner.scenario.running && inner.synced)" @click="inner.scenario.running ? stopScenario() : stopInner">停止测试</button>
         <button :disabled="!inner.status.has_report" @click="report">下载内环报告</button>
         <span aria-live="polite">
-          {{ inner.status.running ? '运行中' : inner.synced ? '空闲 / 已结束' : '待同步' }} ·
+          {{ inner.scenarioStartPhase === 'unknown' ? '启动结果未确认' : inner.scenario.running ? '组合场景运行中' : inner.status.running ? '运行中' : inner.synced ? '空闲 / 已结束' : '待同步' }} ·
           {{ inner.status.completed }} / {{ inner.status.total }} 个单元
         </span>
       </div>
       <p v-if="inner.status.current" aria-live="polite">{{ inner.status.current }}</p>
+      <div v-if="inner.scenarioStartPhase === 'unknown'" class="notice" role="status">
+        <p>启动结果未确认，正在查询。请勿重复启动测试。</p>
+        <button v-if="inner.scenarioLastReadIdle" @click="prepareAfterUnknownScenario">已核实测试未运行，重新准备</button>
+      </div>
       <p v-if="inner.scenario.running" class="notice" aria-live="polite">组合场景进行中：{{ inner.scenario.phase === 'subnet' ? '先执行子网测试' : inner.scenario.phase === 'inner' ? '子网完成，正在执行内环' : inner.scenario.phase }}</p>
       <p v-if="inner.status.error" class="bad" role="alert">{{ inner.status.error }}</p>
       <p class="muted">
-        上行的接收端在板侧，下行的接收端是网口所在电脑；接收端按数据走向定，不按谁跑 client。
-        速率优先取可信的接收接口字节计数；只有该链路选了兜底策略、且计数不可用或已判不可信时才改用工具 receiver 汇总，
-        并在「来源」列标出来。工具口径的门限单独配置，工具数字不会套用网卡门限，可信的低速也不会被兜底救成达标。
+        上行统计 CPE 接收速率，下行统计电脑网卡接收速率。测量来源及判定门限见结果表。
       </p>
       <InnerResults />
     </section>
@@ -338,7 +341,6 @@ onMounted(() => { loadInnerDraft(); void syncInnerStatus(); void syncScenarioSta
       <div class="bar">
         <h3>内环历史</h3>
         <button @click="listInnerRuns">刷新列表</button>
-        <span class="muted">保存在 inner_runs/，与子网历史各走各的。</span>
       </div>
       <p v-if="!inner.runs.length" class="muted">还没有历史记录。跑完一轮后这里会列出报告，可下载或把当时的配置装载回来。</p>
       <div v-else class="history">
@@ -371,8 +373,7 @@ onMounted(() => { loadInnerDraft(); void syncInnerStatus(); void syncScenarioSta
         </table>
       </div>
       <p class="muted">
-        「装载配置」只把当时的配置放回控制台并重新生成预览，不会直接开跑：隔了一夜的网口拓扑可能已经变了，
-        该看到的是预览里的差异。辅测机令牌不写进历史文件，装载后需要重填。重跑会生成新的一条记录。
+        恢复重跑会载入配置并生成预览。核对网口、补填辅测机令牌后，再开始测试；新结果另存为一轮记录。
       </p>
     </section>
   </section>

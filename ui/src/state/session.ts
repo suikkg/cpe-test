@@ -239,13 +239,14 @@ export async function rescan(): Promise<void> {
     session.scanKind = 'ok';
   } catch (error) {
     if (epoch !== generation) return;
+    session.topologyStale = session.connection !== null;
+    fail(error);
     if (error instanceof UnauthorizedError) {
-      session.phase = 'unauthorized';
       session.scanMessage = '';
       session.scanKind = '';
       return;
     }
-    session.scanMessage = `重新扫描失败：${errorMessage(error)}`;
+    session.scanMessage = `重新扫描失败：${errorMessage(error)}${session.local || session.connection ? '；下面仍是上次成功的网卡' : ''}`;
     session.scanKind = 'bad';
   } finally {
     if (epoch === generation) session.scanning = false;

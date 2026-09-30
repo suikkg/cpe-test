@@ -38,6 +38,7 @@ use super::{group_rows, group_verdict, Row, Verdict};
 pub struct UnitDelta {
     /// 两轮对齐用的键，见 [`comparison_key`]。**不是** `Unit.id`。
     pub unit_id: String,
+    pub ambiguous: bool,
     /// 展示标题，优先取新的那一轮。
     pub title: String,
     pub link_group: String,
@@ -60,6 +61,7 @@ pub struct UnitSnapshot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DeltaKind {
     /// 上一轮 PASS，这一轮不是了。**回归测试要找的就是这一类。**
+    Ambiguous,
     Regressed,
     /// 判定没变，但接收速率明显下降。
     SlowerButStillSameVerdict,
@@ -76,6 +78,7 @@ pub enum DeltaKind {
 impl DeltaKind {
     pub fn label(self) -> &'static str {
         match self {
+            DeltaKind::Ambiguous => "无法唯一匹配",
             DeltaKind::Regressed => "判定变坏",
             DeltaKind::SlowerButStillSameVerdict => "速率下降",
             DeltaKind::Disappeared => "本轮缺失",
@@ -105,6 +108,9 @@ impl UnitDelta {
     }
 
     pub fn kind(&self) -> DeltaKind {
+        if self.ambiguous {
+            return DeltaKind::Ambiguous;
+        }
         let (Some(before), Some(after)) = (self.before, self.after) else {
             return if self.after.is_some() {
                 DeltaKind::Added
@@ -159,64 +165,74 @@ impl RunComparison {
     }
 }
 
-/// 一个单元的**跨轮对齐键**。
-///
-/// 只由「不会随这一轮的现场条件变化」的东西拼成：IP 版本、协议、后端、方向、
-/// 两端的机器与网口名、下发参数、要求时长。
-///
-/// 参数与 IP 版本取自本单元**排序最靠前的那条明细行**——单元汇总行的 `param`
-/// 恒为空串（协议写在标题里），而标题里带着网卡协商速率这种每轮都会变的数。
-///
-/// **含稳定性轮次**：`rounds > 1` 时整份计划会重复 N 遍，上面那些字段在各轮之间
-/// 逐字相同。不把轮次拌进来的话，`snapshots()` 的 `HashMap` 会让同一条测试的
-/// N 轮互相覆盖、只留最后一轮，而对比报告不会报任何错——「第 13 轮开始掉速」
-/// 恰恰是轮次这个功能存在的理由。
-///
-/// 轮次 `<= 1` 时**一个字节都不加**：历史 run 目录里的行没有 `round` 字段
-/// （serde 默认 0），不分轮的新计划是 1，两者都必须和加这个字段之前算出同一把键，
-/// 否则昨天的报告和今天的报告全体对不上。
-///
-/// 刻意**不含**：IP 地址（DHCP 会变）、协商速率（Wi-Fi 每轮都在变）、
-/// 序号、时间、`Unit.id`。理由见模块文档。
+/// 新报告直接读计划身份；旧报告只能从完整的类型化明细还原，绝不解析标题。
 fn comparison_key(group: &super::model::UnitGroup<'_>) -> Option<String> {
-    let summary = group.summary.or_else(|| group.details.first().copied())?;
-    // 明细行按 sort_key 排过，第一条就是确定的那条。
-    let detail = group.details.first().copied().unwrap_or(summary);
-    let endpoint = |side: super::RowSide, iface: &str| {
-        format!(
-            "{}:{}",
-            match side {
-                super::RowSide::Master => "master",
-                super::RowSide::Agent => "agent",
-                super::RowSide::Unknown => "?",
-            },
-            iface.trim()
-        )
-    };
-    let round = summary.round.max(detail.round);
-    let round_part = if round > 1 {
-        format!("|r{round}")
-    } else {
-        String::new()
-    };
-    Some(format!(
-        "{}|{}|{}|{}|{}|{}|{}|{}{round_part}",
-        if detail.ip.is_empty() {
-            summary.ip.trim()
-        } else {
-            detail.ip.trim()
-        },
-        summary.protocol.label(),
-        summary.backend.label(),
-        summary.direction.label(),
-        endpoint(summary.src_side, &summary.src_iface),
-        endpoint(summary.dst_side, &summary.dst_iface),
-        detail.param.trim(),
-        detail
-            .required_seconds
-            .map(|secs| format!("{secs:.0}s"))
-            .unwrap_or_default(),
-    ))
+    use super::{ComparisonIdentity, ComparisonLeg, RowDirection, RowProtocol, RowSide};
+    if let Some(identity) = group
+        .summary
+        .and_then(|row| row.comparison_identity.as_ref())
+    {
+        return (!identity.legs.is_empty()).then(|| serde_json::to_string(identity).unwrap());
+    }
+    let mut legs: std::collections::BTreeMap<usize, ComparisonLeg> =
+        std::collections::BTreeMap::new();
+    let mut ab = false;
+    let mut ba = false;
+    let mut round = 1;
+    for row in &group.details {
+        if row.is_grouptotal || row.sort_key.3 != 0 {
+            continue;
+        }
+        // 旧 PING 明细没有次数，不能断言两个计划相同。
+        if row.ip.is_empty()
+            || row.protocol == RowProtocol::None
+            || row.protocol == RowProtocol::Icmp
+            || row.src_side == RowSide::Unknown
+            || row.dst_side == RowSide::Unknown
+        {
+            return None;
+        }
+        ab |= row.direction == RowDirection::Ab;
+        ba |= row.direction == RowDirection::Ba;
+        round = round.max(row.round);
+        let parameter = row
+            .param
+            .split_once(" (#")
+            .map_or(row.param.as_str(), |(profile, _)| profile)
+            .trim();
+        if parameter.is_empty() {
+            return None;
+        }
+        let entry = legs.entry(row.sort_key.1).or_insert_with(|| ComparisonLeg {
+            ip: row.ip.clone(),
+            protocol: row.protocol,
+            backend: row.backend,
+            src_side: row.src_side,
+            src_iface: row.src_iface.clone(),
+            dst_side: row.dst_side,
+            dst_iface: row.dst_iface.clone(),
+            parameters: Vec::new(),
+            seconds: group
+                .details
+                .iter()
+                .filter(|detail| detail.sort_key.1 == row.sort_key.1)
+                .filter_map(|detail| detail.required_seconds)
+                .find(|seconds| seconds.is_finite() && *seconds > 0.0)
+                .map(|seconds| seconds as u64),
+        });
+        entry.parameters.push(parameter.to_string());
+    }
+    if legs.is_empty() || ab != ba || legs.values().any(|leg| leg.seconds.is_none()) {
+        return None;
+    }
+    Some(
+        serde_json::to_string(&ComparisonIdentity {
+            bidir: ab && ba,
+            round,
+            legs: legs.into_values().collect(),
+        })
+        .unwrap(),
+    )
 }
 
 /// 一个单元在对比报告里要展示的身份：标题和链路组名。
@@ -231,18 +247,17 @@ struct UnitLabel {
 }
 
 /// 从一轮的行里抽出「每个单元的结论」，按 [`comparison_key`] 索引。
-fn snapshots(rows: &[Row]) -> std::collections::HashMap<String, (UnitSnapshot, UnitLabel)> {
-    let mut out = std::collections::HashMap::new();
+fn snapshots(
+    rows: &[Row],
+) -> std::collections::BTreeMap<Option<String>, Vec<(UnitSnapshot, UnitLabel)>> {
+    let mut out = std::collections::BTreeMap::new();
     for group in group_rows(rows) {
         let Some(row) = group.summary.or_else(|| group.details.first().copied()) else {
             continue;
         };
-        let Some(key) = comparison_key(&group) else {
-            continue;
-        };
-        out.insert(
-            key,
-            (
+        out.entry(comparison_key(&group))
+            .or_insert_with(Vec::new)
+            .push((
                 UnitSnapshot {
                     verdict: group_verdict(&group),
                     rx_avg: row.rx_avg,
@@ -252,37 +267,46 @@ fn snapshots(rows: &[Row]) -> std::collections::HashMap<String, (UnitSnapshot, U
                     title: row.task.clone(),
                     link_group: row.link_group.clone(),
                 },
-            ),
-        );
+            ));
     }
     out
 }
 
-/// 对比两轮。`before` 是基线（旧的那一轮），`after` 是这一轮。
+/// 重复或不完整的身份全部保留为无法匹配，不能任意配对或覆盖。
 pub fn compare(before: &[Row], after: &[Row], same_plan: bool) -> RunComparison {
     let mut old = snapshots(before);
-    let new = snapshots(after);
-
-    let mut deltas: Vec<UnitDelta> = Vec::new();
-    for (unit_id, (after_snap, after_label)) in &new {
-        let removed = old.remove(unit_id);
-        deltas.push(UnitDelta {
-            unit_id: unit_id.clone(),
-            title: after_label.title.clone(),
-            link_group: after_label.link_group.clone(),
-            before: removed.map(|(snap, _)| snap),
-            after: Some(*after_snap),
-        });
-    }
-    // `old` 里剩下的就是这一轮没有的。
-    for (unit_id, (before_snap, before_label)) in old {
-        deltas.push(UnitDelta {
-            unit_id,
-            title: before_label.title,
-            link_group: before_label.link_group,
-            before: Some(before_snap),
-            after: None,
-        });
+    let mut new = snapshots(after);
+    let keys: std::collections::BTreeSet<_> = old.keys().chain(new.keys()).cloned().collect();
+    let mut deltas = Vec::new();
+    for key in keys {
+        let mut before = old.remove(&key).unwrap_or_default();
+        let mut after = new.remove(&key).unwrap_or_default();
+        let ambiguous = key.is_none() || before.len() > 1 || after.len() > 1;
+        let unit_id = key.unwrap_or_else(|| "历史记录缺少完整对比身份".into());
+        if !ambiguous && before.len() == 1 && after.len() == 1 {
+            let (after, label) = after.pop().unwrap();
+            deltas.push(UnitDelta {
+                unit_id,
+                ambiguous: false,
+                title: label.title,
+                link_group: label.link_group,
+                before: Some(before.pop().unwrap().0),
+                after: Some(after),
+            });
+        } else {
+            for (items, is_after) in [(before, false), (after, true)] {
+                for (snapshot, label) in items {
+                    deltas.push(UnitDelta {
+                        unit_id: unit_id.clone(),
+                        ambiguous,
+                        title: label.title,
+                        link_group: label.link_group,
+                        before: (!is_after).then_some(snapshot),
+                        after: is_after.then_some(snapshot),
+                    });
+                }
+            }
+        }
     }
     deltas.sort_by_key(|delta| delta.sort_key());
     RunComparison { deltas, same_plan }
@@ -406,6 +430,7 @@ td.absent { color: var(--muted); }
     }
 
     let tally = [
+        (DeltaKind::Ambiguous, "无法唯一匹配", "bad"),
         (DeltaKind::Regressed, "判定变坏", "bad"),
         (DeltaKind::SlowerButStillSameVerdict, "速率下降", "bad"),
         (DeltaKind::Fixed, "判定转好", "good"),
@@ -432,6 +457,7 @@ td.absent { color: var(--muted); }
     for delta in &diff.deltas {
         let kind = delta.kind();
         let kind_class = match kind {
+            DeltaKind::Ambiguous => "kind-regressed",
             DeltaKind::Regressed => "kind-regressed",
             DeltaKind::SlowerButStillSameVerdict => "kind-slower",
             DeltaKind::Fixed => "kind-fixed",
@@ -542,6 +568,82 @@ mod tests {
             out.extend(unit);
         }
         out
+    }
+
+    #[test]
+    fn single_and_bidir_do_not_hide_each_others_regression() {
+        fn mixed(failed: bool) -> Vec<Row> {
+            let mut single = rows(&[(
+                "4m",
+                if failed {
+                    Verdict::RateFail
+                } else {
+                    Verdict::Pass
+                },
+                Some(100.0),
+            )]);
+            let mut bidir = rows(&[("4m", Verdict::Pass, Some(1900.0))]);
+            for row in &mut bidir {
+                row.parent_id = "bidir".into();
+                row.task_id.push_str("-bidir");
+                row.sort_key.0 = 2;
+                row.unit_seq = 2;
+            }
+            bidir[0].direction = RowDirection::Ab;
+            let mut reverse = bidir[0].clone();
+            reverse.direction = RowDirection::Ba;
+            reverse.sort_key.1 = 1;
+            std::mem::swap(&mut reverse.src_side, &mut reverse.dst_side);
+            std::mem::swap(&mut reverse.src_iface, &mut reverse.dst_iface);
+            bidir.push(reverse);
+            single.extend(bidir);
+            single
+        }
+        let before = mixed(false);
+        let after = mixed(true);
+        let diff = compare(&before, &after, true);
+        assert_eq!(diff.deltas.len(), 2);
+        assert_eq!(diff.count(DeltaKind::Regressed), 1);
+        assert_eq!(diff.count(DeltaKind::Unchanged), 1);
+        // 新汇总即使没有明细（RESUME），也能和完整历史对齐。
+        let mut summaries = Vec::new();
+        for group in group_rows(&after) {
+            let mut row = group.summary.unwrap().clone();
+            row.comparison_identity =
+                Some(serde_json::from_str(&comparison_key(&group).unwrap()).unwrap());
+            summaries.push(row);
+        }
+        assert_eq!(
+            compare(&before, &summaries, true).count(DeltaKind::Regressed),
+            1
+        );
+    }
+
+    #[test]
+    fn duplicate_and_incomplete_identities_are_retained_and_marked() {
+        let original = rows(&[("4m", Verdict::Pass, Some(1900.0))]);
+        let mut duplicate = original.clone();
+        for row in &mut duplicate {
+            row.parent_id = "duplicate".into();
+            row.task_id.push_str("-duplicate");
+            row.sort_key.0 = 2;
+            row.unit_seq = 2;
+        }
+        let mut all = original.clone();
+        all.extend(duplicate);
+        let diff = compare(&original, &all, true);
+        assert_eq!(diff.deltas.len(), 3);
+        assert_eq!(diff.count(DeltaKind::Ambiguous), 3);
+        assert_eq!(diff.count(DeltaKind::Unchanged), 0);
+        let missing = vec![original[1].clone()];
+        assert_eq!(
+            compare(&missing, &missing, true).count(DeltaKind::Ambiguous),
+            2
+        );
+        assert!(
+            render_html(&diff, &ReportMeta::default(), &ReportMeta::default())
+                .contains("无法唯一匹配")
+        );
     }
 
     #[test]

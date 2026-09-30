@@ -147,6 +147,7 @@ pub struct CompareOutcome {
     pub added: usize,
     pub disappeared: usize,
     pub unchanged: usize,
+    pub ambiguous: usize,
 }
 
 /// 对比两个 run 目录，把差异报告写进**新的那一轮**的目录里。
@@ -203,6 +204,7 @@ pub fn compare_runs_into(baseline: &Path, current: &Path) -> Result<CompareOutco
         added: diff.count(DeltaKind::Added),
         disappeared: diff.count(DeltaKind::Disappeared),
         unchanged: diff.count(DeltaKind::Unchanged),
+        ambiguous: diff.count(DeltaKind::Ambiguous),
     })
 }
 
@@ -227,7 +229,15 @@ pub fn compare_runs(baseline: &Path, current: &Path) -> i32 {
                     "提示: 两轮的 plan_hash 不同，「新增/缺失」说的是计划差异，不是设备表现。"
                 );
             }
-            i32::from(outcome.has_regression)
+            if outcome.ambiguous > 0 {
+                println!(
+                    "无法唯一匹配 {} 条记录，请查看对比报告；本次对比不完整。",
+                    outcome.ambiguous
+                );
+                2
+            } else {
+                i32::from(outcome.has_regression)
+            }
         }
         Err(error) => {
             eprintln!("{error}");
@@ -459,6 +469,12 @@ pub fn run_master(opts: MasterOpts) -> i32 {
         }
     ));
 
+    if let Err(error) =
+        InfoReq::for_scan(&cfg.ipv4_prefixes).check_capabilities(&health.capabilities)
+    {
+        logln(&format!("!! {error}"));
+        return 2;
+    }
     // ---- 双端扫描 ----
     logln("正在扫描本机网卡...");
     let master_info = scan_host(&cfg.ipv4_prefixes);
@@ -994,9 +1010,7 @@ fn agent_health(host: &str, port: u16, token: &str) -> Result<HealthOut, String>
 }
 
 fn agent_info(host: &str, port: u16, prefixes: &[String], token: &str) -> Result<HostInfo, String> {
-    let req = InfoReq {
-        ipv4_prefixes: prefixes.to_vec(),
-    };
+    let req = InfoReq::for_scan(prefixes);
     let body = serde_json::to_string(&req).unwrap_or_default();
     let (st, text) =
         http_client::post_json_auth(host, port, "/info", &body, token, Duration::from_secs(60))?;
@@ -1654,6 +1668,42 @@ mod tests {
 
     /// 空文件、只有空白、以及带换行的正常记录都要给出正确答案——
     /// 控制台拿它预填输入框，返回一个空串会让「已记住」看起来像「没记住」。
+    #[test]
+    fn execution_and_live_rescan_send_explicit_all_interface_requests() {
+        let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let worker = std::thread::spawn(move || {
+            for expected in [true, false, true] {
+                let mut request = server
+                    .recv_timeout(Duration::from_secs(10))
+                    .unwrap()
+                    .unwrap();
+                let mut body = String::new();
+                request.as_reader().read_to_string(&mut body).unwrap();
+                let info: InfoReq = serde_json::from_str(&body).unwrap();
+                assert_eq!(info.all_interfaces, expected);
+                let defaults = vec!["192.168.".to_string()];
+                assert_eq!(info.effective_prefixes(&defaults).is_empty(), expected);
+                request
+                    .respond(tiny_http::Response::from_string(crate::protocol::ok_json(
+                        HostInfo::default(),
+                    )))
+                    .unwrap();
+            }
+        });
+        agent_info("127.0.0.1", port, &[], "").unwrap();
+        agent_info("127.0.0.1", port, &["10.".into()], "").unwrap();
+        let topology = LiveTopology {
+            agent_host: "127.0.0.1".into(),
+            agent_port: port,
+            prefixes: vec![],
+            token: String::new(),
+        };
+        use crate::master::executor::TopologySource;
+        topology.snapshot().unwrap();
+        worker.join().unwrap();
+    }
+
     #[test]
     fn the_remembered_agent_host_ignores_missing_and_blank_records() {
         // 固定目录名会在并发 cargo test 之间撞车（两个 checkout、CI 矩阵、

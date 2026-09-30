@@ -56,11 +56,11 @@ function changeHost(): void {
       <label v-if="v6">CPE LAN IPv6<input v-model="props.link.gateway_ipv6" list="inner-board-ipv6" placeholder="从板侧扫描选择或按实际地址填写"><datalist id="inner-board-ipv6"><option v-for="choice in boardIpv6" :key="`${choice.name}:${choice.address}`" :value="choice.address">{{ choice.name }}</option></datalist></label>
     </div>
     <p class="identity">电脑网卡：<strong>{{ props.link.local_interface || '未选择' }}</strong><template v-if="v4">　IPv4：<strong>{{ props.link.local_ip || '未填写' }}</strong></template><template v-if="v6">　IPv6：<strong>{{ props.link.local_ipv6 || '未填写' }}</strong></template></p>
-    <p v-if="v6" class="muted">优先使用两端链路本地地址（fe80::/10），也可填写两端全局 / ULA 地址。不要填 %接口或 /前缀；程序按实际执行端绑定网口。板侧 IPv6 来自真实扫描，不按 IPv4 推算。</p>
+    <p v-if="v6" class="muted">两端需同为链路本地地址（fe80::/10），或同为全局 / ULA 地址。填写实际 IPv6，不含 %接口或 /前缀。</p>
     <label class="other-toggle"><input v-model="showOther" type="checkbox">显示此电脑的其他网段 / 隧道接口</label>
     <details :open="!nics.length" class="advanced">
       <summary>手动填写网卡{{ v4 ? '与 IPv4' : '' }}</summary>
-      <p class="muted">只用于扫描未覆盖的接口。网卡名称与 IP 必须真实存在于所选电脑；这里不会修改电脑的网络设置。</p>
+      <p class="muted">扫描未找到网卡时，可填写所选电脑上实际的网卡名称与 IP。</p>
       <div class="grid">
         <label>网卡名称<input v-model="props.link.local_interface" placeholder="以太网"></label>
         <label v-if="v4">该电脑网卡 IPv4<input v-model="props.link.local_ip" placeholder="192.168.0.100"></label>
@@ -70,7 +70,7 @@ function changeHost(): void {
     <h4>这一口测什么</h4>
     <p class="muted">
       上行（PC → CPE）看板侧桥接口 RX，默认 br0；下行（CPE → PC）看上方所选电脑网卡的 RX。
-      双向分别记录这两处接收速率。RNDIS、网线、Wi-Fi 都沿用这个口径，无需配置板侧成员口。
+      双向并发分别记录两端接收速率。
     </p>
     <details class="advanced">
       <summary>高级：统计接口、测量策略与验收门限</summary>
@@ -93,7 +93,7 @@ function changeHost(): void {
       <label v-if="usesTool">下行 · 工具口径 Mbps<input v-model.number="props.link.tool_download_min_mbps" type="number" min="0.01" step="any" placeholder="留空只标 MEASURED"></label>
       <label v-if="usesTool && bidir">双向合计 · 工具口径 Mbps<input v-model.number="props.link.tool_bidir_total_min_mbps" type="number" min="0.01" step="any" placeholder="留空只标 MEASURED"></label>
     </div>
-    <p v-if="bidir" class="muted">双向合计门限留空时，两条腿各自按方向门限判定；系统不会拿单向门限除以二当合计门限。</p>
+    <p v-if="bidir" class="muted">双向合计门限留空时，按各方向门限分别判定。</p>
     </details>
     <div class="bar"><button @click="emit('close')">完成，返回网口清单</button></div>
   </fieldset>

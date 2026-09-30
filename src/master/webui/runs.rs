@@ -303,6 +303,7 @@ pub(super) fn api_run_compare(
             "added": outcome.added,
             "disappeared": outcome.disappeared,
             "unchanged": outcome.unchanged,
+            "ambiguous": outcome.ambiguous,
         })
     })
 }

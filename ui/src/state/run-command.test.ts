@@ -507,7 +507,9 @@ describe('跳过当前单元', () => {
     await syncStatus();
     expect(run.skipPhase).toBe('accepted');
     await skipUnit();
-    expect(fetchMock.mock.calls.filter((call) => String(call[0]) === '/api/skip-unit')).toHaveLength(1);
+    const requests = fetchMock.mock.calls.filter((call) => String(call[0]) === '/api/skip-unit');
+    expect(requests).toHaveLength(1);
+    expect(JSON.parse(requests[0][1].body)).toEqual({ run_id: 'active', unit_seq: 1 });
   });
 
   it('旧单元增量不解除跳过，目标完成后未知应答才解除', async () => {

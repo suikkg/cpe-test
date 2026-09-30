@@ -219,10 +219,9 @@ pub(super) fn api_connect(console: &Arc<Console>, body: &str) -> Result<serde_js
             agent_host, cfg.agent_port, cfg.agent_port
         )
     })?;
-    let info_body = serde_json::to_string(&InfoReq {
-        ipv4_prefixes: cfg.ipv4_prefixes.clone(),
-    })
-    .unwrap_or_else(|_| "{}".into());
+    let info_request = InfoReq::for_scan(&cfg.ipv4_prefixes);
+    info_request.check_capabilities(&health.capabilities)?;
+    let info_body = serde_json::to_string(&info_request).unwrap_or_else(|_| "{}".into());
     let agent: HostInfo = post(
         &agent_host,
         cfg.agent_port,
@@ -478,7 +477,18 @@ pub(super) fn api_stop(console: &Arc<Console>) -> Result<serde_json::Value, Stri
 /// 让它跑完，或者停掉重来（RESUME 救得回已 PASS 的，救不回 RATE_FAIL 的）。
 ///
 /// 和 `/api/stop` 同属 gated：它掐断正在跑的作业，动的是被测资源。
-pub(super) fn api_skip_unit(console: &Arc<Console>) -> Result<serde_json::Value, String> {
+#[derive(Deserialize)]
+struct SkipUnitReq {
+    run_id: String,
+    unit_seq: usize,
+}
+
+pub(super) fn api_skip_unit(
+    console: &Arc<Console>,
+    body: &str,
+) -> Result<serde_json::Value, String> {
+    let request: SkipUnitReq = serde_json::from_str(body)
+        .map_err(|_| "跳过请求必须包含 run_id 和 unit_seq，请刷新页面后重试".to_string())?;
     let _run_gate = lock_recover(&console.run_gate);
     if !console.running.load(Ordering::SeqCst) {
         return Err("当前没有正在运行的测试".into());
@@ -486,8 +496,12 @@ pub(super) fn api_skip_unit(console: &Arc<Console>) -> Result<serde_json::Value,
     if crate::cancel::is_stop_requested() {
         return Err("已经请求停止整轮了，跳过没有意义".into());
     }
-    crate::cancel::request_skip_unit();
-    Ok(serde_json::json!({ "skipping": true }))
+    console
+        .run_status
+        .request_skip(&request.run_id, request.unit_seq)?;
+    Ok(
+        serde_json::json!({ "skipping": true, "run_id": request.run_id, "unit_seq": request.unit_seq }),
+    )
 }
 
 pub(super) fn api_open_report(console: &Arc<Console>) -> Result<serde_json::Value, String> {

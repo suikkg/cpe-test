@@ -443,6 +443,7 @@ fn route(method: &Method, url: &str, body: &str, st: &Arc<AgentState>) -> String
             let mut capabilities = vec![
                 RELIABLE_LIFECYCLE_CAPABILITY.into(),
                 LIVE_NIC_PROGRESS_CAPABILITY.into(),
+                UNFILTERED_INFO_CAPABILITY.into(),
                 // 无条件声明：DF 位在三个平台上都有对应的 ping 参数
                 // （`-f` / `-D` / `-M do`），不像 ctsTraffic 那样只在 Windows 上有。
                 crate::protocol::PING_DF_CAPABILITY.into(),
@@ -464,12 +465,7 @@ fn route(method: &Method, url: &str, body: &str, st: &Arc<AgentState>) -> String
                 Ok(r) => r,
                 Err(e) => return e,
             };
-            let prefixes = if req.ipv4_prefixes.is_empty() {
-                st.default_prefixes.clone()
-            } else {
-                req.ipv4_prefixes
-            };
-            ok_json(scan_host(&prefixes))
+            ok_json(scan_host(req.effective_prefixes(&st.default_prefixes)))
         }
         (Method::Post, "/ping") => {
             let req: PingReq = match parse(body) {
@@ -876,6 +872,9 @@ mod tests {
         assert!(capabilities
             .iter()
             .any(|capability| capability == LIVE_NIC_PROGRESS_CAPABILITY));
+        assert!(capabilities
+            .iter()
+            .any(|capability| capability == UNFILTERED_INFO_CAPABILITY));
         assert_eq!(
             capabilities
                 .iter()

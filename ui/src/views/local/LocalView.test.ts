@@ -11,6 +11,7 @@ beforeEach(() => {
   resetSession();
   inner.status.running = false;
   inner.scenario.running = false;
+  inner.scenarioStartPhase = 'idle';
 });
 
 async function rescanButton(): Promise<string> {
@@ -28,6 +29,11 @@ describe('本机扫描入口', () => {
     if (kind === 'subnet') run.running = true;
     if (kind === 'inner') inner.status.running = true;
     if (kind === 'scenario') inner.scenario.running = true;
+    expect(await rescanButton()).toContain('disabled');
+  });
+
+  it.each(['sending', 'unknown'] as const)('组合场景 %s 时不能重扫', async (phase) => {
+    inner.scenarioStartPhase = phase;
     expect(await rescanButton()).toContain('disabled');
   });
 

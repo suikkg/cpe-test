@@ -6813,3 +6813,125 @@ fn an_empty_override_leaves_every_recipe_exactly_as_it_was() {
     assert_eq!(cfg.tests[0].tcp_windows, before[0].tcp_windows);
     let _ = UdpProfile::bw("x");
 }
+
+/// Playwright 专用宿主：真实 HTTP 鉴权、CSP 与 include_str! 页面，
+/// 不打开系统浏览器，不读取开发机配置。普通 cargo test 不启动长驻服务。
+#[test]
+#[ignore = "由 ui/npm run test:e2e 启动并回收"]
+fn browser_regression_server() {
+    let port: u16 = std::env::var("CPE_BROWSER_TEST_PORT")
+        .expect("只由 Playwright 显式启动")
+        .parse()
+        .expect("测试端口");
+    let console = Arc::new(Console {
+        inner: Default::default(),
+        scenario: Default::default(),
+        state: Mutex::new(state_with_pair()),
+        running: AtomicBool::new(false),
+        run_gate: Mutex::new(()),
+        report: Mutex::new(String::new()),
+        ui_token: "browser-regression-secret".into(),
+        monitors: Mutex::new(HashMap::new()),
+        run_status: Arc::new(RunStatusRecorder::new()),
+    });
+    let server = Server::http(("127.0.0.1", port)).expect("独立测试端口必须可用");
+    for request in server.incoming_requests() {
+        handle(request, &console);
+    }
+}
+
+#[test]
+fn console_scan_prefixes_match_the_ui_and_unsupported_full_scan_preserves_state() {
+    for (supports_all, prefixes) in [(true, vec![]), (false, vec![]), (false, vec!["172.16."])] {
+        let state = state_with_pair();
+        let before = json!({"cfg": state.cfg, "host": state.agent_host, "master": state.master, "agent": state.agent});
+        let console = Arc::new(Console {
+            inner: Default::default(),
+            scenario: Default::default(),
+            state: Mutex::new(state),
+            running: AtomicBool::new(false),
+            run_gate: Mutex::new(()),
+            report: Mutex::new(String::new()),
+            ui_token: String::new(),
+            monitors: Mutex::new(HashMap::new()),
+            run_status: Arc::new(RunStatusRecorder::new()),
+        });
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let port = server.server_addr().to_ip().unwrap().port();
+        let all = prefixes.is_empty();
+        let expected_prefixes = prefixes.clone();
+        let peer = std::thread::spawn(move || {
+            let req = server
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+            assert_eq!(req.url(), "/health");
+            req.respond(Response::from_string(crate::protocol::ok_json(HealthOut {
+                capabilities: if supports_all {
+                    vec![crate::protocol::UNFILTERED_INFO_CAPABILITY.into()]
+                } else {
+                    vec![]
+                },
+                ..Default::default()
+            })))
+            .unwrap();
+            if all && !supports_all {
+                return;
+            }
+            let mut req = server
+                .recv_timeout(Duration::from_secs(5))
+                .unwrap()
+                .unwrap();
+            assert_eq!(req.url(), "/info");
+            let mut body = String::new();
+            req.as_reader().read_to_string(&mut body).unwrap();
+            let request: crate::protocol::InfoReq = serde_json::from_str(&body).unwrap();
+            assert_eq!(
+                request.all_interfaces, all,
+                "清空过滤必须显式全扫，不能套用辅测机默认前缀"
+            );
+            assert_eq!(request.ipv4_prefixes, expected_prefixes);
+            let defaults = vec!["192.168.".to_string()];
+            assert_eq!(request.effective_prefixes(&defaults), expected_prefixes);
+            req.respond(Response::from_string(crate::protocol::ok_json(
+                HostInfo::default(),
+            )))
+            .unwrap();
+        });
+        let result = api_connect(
+            &console,
+            &json!({"host":"127.0.0.1", "port":port, "ipv4_prefixes":prefixes}).to_string(),
+        );
+        peer.join().unwrap();
+        if all && !supports_all {
+            assert!(result.unwrap_err().contains("显示全部网卡"));
+            let state = lock_recover(&console.state);
+            assert_eq!(
+                json!({"cfg":state.cfg, "host":state.agent_host, "master":state.master, "agent":state.agent}),
+                before
+            );
+        } else {
+            assert!(result.is_ok(), "{result:?}");
+        }
+    }
+}
+
+#[test]
+fn skip_endpoint_rejects_missing_and_stale_targets_without_cancelling() {
+    use crate::master::run_status::{CurrentUnit, RunObserver};
+    let console = console_with(state_with_pair());
+    console.running.store(true, Ordering::SeqCst);
+    console.run_status.run_started("new-run", "hash", 2, 20);
+    console.run_status.unit_started(CurrentUnit {
+        seq: 2,
+        title: "second".into(),
+        est_secs: 10,
+        started_at: String::new(),
+        link_group: String::new(),
+    });
+    assert!(api_skip_unit(&console, "{}")
+        .unwrap_err()
+        .contains("run_id"));
+    assert!(api_skip_unit(&console, r#"{"run_id":"new-run","unit_seq":1}"#).is_err());
+    assert!(api_skip_unit(&console, r#"{"run_id":"old-run","unit_seq":2}"#).is_err());
+}

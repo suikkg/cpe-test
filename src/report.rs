@@ -1113,7 +1113,8 @@ pub mod xlsx;
 // 对外只露报告的数据模型和两个组装文本的入口；其余是渲染内部的事。
 pub use format::report_endpoint;
 pub use model::{
-    DirectionSummary, ReportMeta, Row, RowBackend, RowDirection, RowProtocol, RowSide, StreamCounts,
+    ComparisonIdentity, ComparisonLeg, DirectionSummary, ReportMeta, Row, RowBackend, RowDirection,
+    RowProtocol, RowSide, StreamCounts,
 };
 pub use reason::report_reason;
 

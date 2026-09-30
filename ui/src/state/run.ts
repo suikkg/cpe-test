@@ -379,7 +379,7 @@ export async function skipUnit(): Promise<void> {
   run.skipPhase = 'sending';
   run.skipError = '';
   try {
-    await api.post('/api/skip-unit', {});
+    await api.post('/api/skip-unit', { run_id: skipTarget.runId, unit_seq: skipTarget.seq });
     if (epoch !== generation) return;
     run.skipPhase = 'accepted';
     // 收尾要等当前单元的工具退出，进度页靠轮询把结果带回来。
@@ -393,6 +393,7 @@ export async function skipUnit(): Promise<void> {
       run.skipPhase = 'idle';
       skipTarget = null;
       run.skipError = errorMessage(error);
+      void syncAfterCommand();
     }
   }
 }

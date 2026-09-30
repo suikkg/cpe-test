@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue';
-import { inner, addInnerLink, addInnerScannedLinks, applyInnerBatch, moveInnerLinkTo, setInnerLinkEnabled } from '../../state/inner';
+import { computed, ref, watch } from 'vue';
+import { inner, innerProbeIdentity, addInnerLink, addInnerScannedLinks, applyInnerBatch, moveInnerLinkTo, setInnerLinkEnabled } from '../../state/inner';
 import type { InnerBatchPatch } from '../../state/inner';
 import { INNER_MEASUREMENTS, MEASUREMENT_LABEL, canonicalInnerIpv6, innerNicIpv6 } from '../../domain/inner';
 import type { NicInfo } from '../../api/dto';
@@ -14,6 +14,9 @@ const search = ref('');
 const hostFilter = ref('');
 const batchOpen = ref(false);
 const selectedNics = ref<string[]>([]);
+// 相同逻辑 ID 的新辅测机可能也有同名同 IP 网卡，旧勾选不能跟着连接身份迁移。
+// 同一连接上的重扫则保留稳定网口键，不依赖扫描顺序或可见筛选。
+watch(innerProbeIdentity, () => { selectedNics.value = []; }, { flush: 'sync' });
 const showOther = ref(false);
 const choices = computed(() => innerNicChoices(inner.capability, showOther.value));
 const otherCount = computed(() => innerNicChoices(inner.capability, true).length - innerNicChoices(inner.capability).length);
@@ -147,7 +150,7 @@ function remove(index: number, link: InnerLink): void {
         <label>上行网卡门限 Mbps<input v-model="batch.upload_min_mbps" type="number" min="0.01" step="any"></label>
         <label>下行网卡门限 Mbps<input v-model="batch.download_min_mbps" type="number" min="0.01" step="any"></label>
       </div>
-      <p class="muted">电脑、网卡名和源 IP 不参与批量：那是「哪台机器的哪个口」的身份，复制过去会把别人的源 IP 写到自己头上。</p>
+      <p class="muted">批量设置只修改当前显示且参与测试的网口。电脑、网卡和源地址请逐口编辑。</p>
       <div class="bar"><button class="primary" @click="applyBatch">应用到已勾选</button><button @click="batchOpen = false">取消</button></div>
     </fieldset>
 

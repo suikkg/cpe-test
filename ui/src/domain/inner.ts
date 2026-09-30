@@ -30,9 +30,9 @@ export const MEASUREMENT_LABEL: Record<InnerMeasurement, string> = {
   tool: '工具接收速率',
 };
 export const MEASUREMENT_HINT: Record<InnerMeasurement, string> = {
-  nic_strict: '只认可信的接收接口字节计数，不可信就 NOT_EVALUATED；与子网正式验收完全一致。',
-  nic_preferred: '计数不可用或已判不可信时才改用工具 receiver 汇总；可信的低速不会触发兜底。',
-  tool: '明确使用工具 receiver 汇总，字节计数只并列作诊断；需要单独配置工具口径门限。',
+  nic_strict: '使用接收网卡速率判定；无法取得可信采样时标记为 NOT_EVALUATED。',
+  nic_preferred: '优先使用接收网卡速率；无法取得可信采样时改用工具接收速率，并应用工具门限。',
+  tool: '使用工具接收速率判定，需单独填写工具门限；网卡速率作为参考。',
 };
 export const SOURCE_LABEL: Record<string, string> = {
   nic: '网卡字节计数',

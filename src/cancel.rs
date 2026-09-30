@@ -174,12 +174,20 @@ pub fn setup_cancel_handler() {
     });
 }
 
+/// 修改进程级取消位的测试必须互斥，不能互相 reset 对方的信号。
+#[cfg(test)]
+pub(crate) fn test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    crate::util::lock_recover(&LOCK)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn run_cancel_and_process_shutdown_are_independent_until_shutdown_is_requested() {
+        let _guard = test_guard();
         RUN_CANCELLED.store(false, Ordering::SeqCst);
         PROCESS_SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
 
@@ -209,6 +217,7 @@ mod skip_tests {
     /// 屏幕上写着已请求停止，测试却继续跑完剩下的十个小时。
     #[test]
     fn a_stop_that_lands_during_a_skip_is_never_cleared() {
+        let _guard = test_guard();
         reset();
         request_skip_unit();
         assert!(is_cancelled(), "跳过要复用整轮取消那套收尾路径");
@@ -229,6 +238,7 @@ mod skip_tests {
     /// `is_cancelled`），于是「已请求停止」只停在屏幕上，队列照跑。
     #[test]
     fn a_stop_that_lands_inside_the_clear_window_still_stops_the_run() {
+        let _guard = test_guard();
         reset();
         request_skip_unit();
         assert!(take_skip_unit());
@@ -244,6 +254,7 @@ mod skip_tests {
 
     #[test]
     fn a_plain_skip_lets_the_queue_carry_on() {
+        let _guard = test_guard();
         reset();
         request_skip_unit();
         assert!(take_skip_unit());
@@ -256,6 +267,7 @@ mod skip_tests {
 
     #[test]
     fn ctrl_c_also_outranks_a_pending_skip() {
+        let _guard = test_guard();
         reset();
         request_skip_unit();
         request_shutdown();

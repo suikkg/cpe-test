@@ -155,8 +155,7 @@ onMounted(startPolling);
     <div v-if="!run.synced" class="empty" role="status">
       <strong>运行状态待同步</strong>
       <p>
-        还没读到主控上的运行状态。在读到之前这里不显示「空闲」——那两件事在屏幕上长得一样，
-        而它们的下一步相反。
+        尚未获取主控运行状态，请同步后查看。
       </p>
       <button type="button" class="ghost" @click="syncStatus">同步运行状态</button>
     </div>
@@ -183,7 +182,7 @@ onMounted(startPolling);
               type="button"
               class="ghost"
               :disabled="!run.status.run_id || !run.status.current || run.skipPhase !== 'idle'"
-              title="掐断当前这一个单元，队列继续跑下一个。已请求停止整轮时这个按钮不出现。"
+              title="停止当前单元并继续下一个单元。"
               @click="skipUnit"
             >{{ skipLabel }}</button>
             <button
@@ -221,27 +220,22 @@ onMounted(startPolling);
       </section>
 
       <p v-if="run.refreshError" class="warn" role="status">
-        连接暂时中断，正在按原节奏重试。下面显示的是 <strong>{{ freshness }}</strong> 的数据，
-        不是刚刚的；已完成的单元和日志都没有丢。（{{ run.refreshError }}）
+        连接暂时中断，正在重试。当前显示上次更新的数据：<strong>{{ freshness }}</strong>。（{{ run.refreshError }}）
       </p>
       <p v-if="run.stopPhase === 'accepted'" class="warn" role="status">
-        已请求停止，等待当前单元收尾。<strong>收到请求不等于已经停下</strong>——以运行状态为准，
-        已完成的部分照常出报告。
+        已请求停止，正在等待测试结束。已完成结果将保存在报告中。
       </p>
       <div v-if="run.stopPhase === 'unknown'" class="warn" role="alert">
         <p>
-          停止请求没有拿到应答，<strong>无法确认它有没有到达主控</strong>。不会自动重发——
-          重发有可能停掉下一轮。请先同步一次运行状态再决定。
+          停止结果未确认。请同步运行状态，确认本轮是否仍在运行。
         </p>
         <button type="button" class="ghost" @click="syncStatus">同步运行状态</button>
       </div>
       <p v-if="run.skipPhase === 'accepted'" class="warn" role="status">
-        已请求跳过当前单元，等待收尾。诊断会标记「被操作员手动跳过」，
-        是否取得有效测量、能否判定，以最终结果为准。
+        已请求跳过当前单元，正在收尾。已有测量及跳过记录会保留。
       </p>
       <p v-if="run.skipPhase === 'unknown'" class="warn" role="alert">
-        跳过请求没有拿到应答，无法确认它有没有到达主控。<strong>不会自动重发</strong>——
-        重发有可能把下一个单元也跳掉。请先同步一次运行状态再决定。
+        跳过结果未确认。请先同步运行状态，再决定是否继续操作。
       </p>
       <p v-if="run.skipError" class="bad" role="alert">跳过失败：{{ run.skipError }}</p>
       <p v-if="run.stopError" class="bad" role="alert">停止失败：{{ run.stopError }}</p>
@@ -336,8 +330,7 @@ onMounted(startPolling);
         <p class="muted small">
           <!-- 单元级的 RX 平均与门限现在在运行状态里（与报告汇总行同源）。
                P10、采样覆盖率、逐样本 CSV 仍然只在报告里——缺的照旧说缺。 -->
-          这里的实测值就是判定用的那个数。要看 P10、采样覆盖率和逐样本曲线，
-          等本轮结束后打开报告。
+          P10、采样覆盖率和完整曲线请在测试结束后查看报告。
         </p>
       </div>
 

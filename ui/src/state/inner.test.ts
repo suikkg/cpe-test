@@ -6,11 +6,12 @@ import { innerNicChoices } from '../domain/inner-setup';
 import {
   addInnerLink, addInnerScannedLinks, applyInnerBatch, importInner, inner, moveInnerLinkTo, probeInner, refreshInnerPlan,
   setInnerLinkEnabled, startInner, startSubnetThenInner, stopInner, syncInnerStatus, syncScenarioStatus,
-  loadInnerRunConfig,
+  loadInnerRunConfig, scenarioBlocksActions, prepareAfterUnknownScenario,
 } from './inner';
 import { buildRunRequest, plan as subnetPlan } from './plan';
 import { api } from '../api/client';
-import { NetworkError } from '../api/client';
+import { NetworkError, UnauthorizedError } from '../api/client';
+import { session } from './session';
 import type * as ApiModule from '../api/client';
 vi.mock('../api/client', async (original) => ({ ...await original<typeof ApiModule>(), api: { get: vi.fn(), post: vi.fn() } }));
 
@@ -23,6 +24,7 @@ describe('内环独立状态与 API', () => {
     vi.clearAllMocks(); inner.config = defaultInnerConfig(); inner.busy = false; inner.synced = true; inner.error = '';
     inner.preview = null; inner.previewStale = true; inner.previewError = '';
     inner.status = { running: false, current: '', error: null, completed: 0, total: 0, units: [], has_report: false };
+    inner.scenarioStartPhase = 'idle'; inner.scenarioLastReadIdle = false;
     inner.scenario = { running: false, id: '', phase: '', error: null, runs: [] };
     subnetPlan.preview = null; subnetPlan.previewRequestFingerprint = '';
     vi.mocked(api.get).mockResolvedValue(inner.status);
@@ -257,7 +259,7 @@ describe('内环独立状态与 API', () => {
     expect(api.post).toHaveBeenCalledWith('/api/scenario/run', expect.anything());
     expect(api.get).toHaveBeenCalledWith('/api/scenario/status');
   });
-  it('启动响应和第一次状态回读都丢失时仍继续回读，不重复启动', async () => {
+  it('启动响应和连续三次状态回读丢失后仍恢复，不重复启动', async () => {
     inner.config.links = [link()];
     inner.preview = { units: 2 } as never;
     inner.previewStale = false;
@@ -270,7 +272,7 @@ describe('内环独立状态与 API', () => {
       vi.mocked(api.get).mockImplementation(async (path) => {
         if (path === '/api/scenario/status') {
           statusCalls += 1;
-          if (statusCalls === 1) throw new NetworkError(new Error('status connection lost'));
+          if (statusCalls <= 3) throw new NetworkError(new Error('status connection lost'));
           return { running: true, id: 'scenario-2', phase: 'subnet', error: null };
         }
         return inner.status;
@@ -278,14 +280,49 @@ describe('内环独立状态与 API', () => {
 
       await startSubnetThenInner();
       expect(inner.scenario.running).toBe(false);
-      await vi.advanceTimersByTimeAsync(1000);
+      expect(inner.scenarioStartPhase).toBe('unknown');
+      await vi.advanceTimersByTimeAsync(3000);
       expect(inner.scenario).toMatchObject({ running: true, id: 'scenario-2', phase: 'subnet' });
       expect(api.post).toHaveBeenCalledTimes(1);
-      expect(statusCalls).toBe(2);
+      expect(statusCalls).toBe(4);
     } finally {
       vi.useRealTimers();
     }
   });
+  it('未知启动收到空闲快照仍锁定，明确重新准备才解除且不重发', async () => {
+    vi.useFakeTimers();
+    try {
+      inner.scenarioStartPhase = 'unknown';
+      vi.mocked(api.get).mockImplementation(async (path) => path === '/api/scenario/status'
+        ? { running: false, id: '', phase: '', error: null } : inner.status);
+      await syncScenarioStatus();
+      expect(inner.scenarioStartPhase).toBe('unknown');
+      expect(scenarioBlocksActions()).toBe(true);
+      await startSubnetThenInner();
+      expect(api.post).not.toHaveBeenCalled();
+      prepareAfterUnknownScenario();
+      expect(scenarioBlocksActions()).toBe(false);
+      expect(inner.previewStale).toBe(true);
+      const reads = vi.mocked(api.get).mock.calls.length;
+      await vi.advanceTimersByTimeAsync(3000);
+      expect(api.get).toHaveBeenCalledTimes(reads);
+    } finally { vi.clearAllTimers(); vi.useRealTimers(); }
+  });
+
+  it('未知场景查询遇到 401 停止轮询并进入全局会话失效', async () => {
+    vi.useFakeTimers();
+    try {
+      inner.scenarioStartPhase = 'unknown';
+      vi.mocked(api.get).mockRejectedValue(new UnauthorizedError());
+      await syncScenarioStatus();
+      expect(session.phase).toBe('unauthorized');
+      expect(inner.scenarioLastReadIdle).toBe(false);
+      const reads = vi.mocked(api.get).mock.calls.length;
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(api.get).toHaveBeenCalledTimes(reads);
+    } finally { vi.clearAllTimers(); vi.useRealTimers(); }
+  });
+
   it('乱序场景状态响应不能覆盖较新的启动状态', async () => {
     vi.useFakeTimers();
     try {

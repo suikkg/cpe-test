@@ -13,6 +13,20 @@ function capability(): InnerCapability {
 }
 
 describe('内环扫描选口', () => {
+  it('主控和辅测机共享展示过滤，展开 10/172 与虚拟口不混淆同网段多网卡', () => {
+    const cap = capability();
+    const interfaces = [nic('LAN-A', '192.168.0.2'), nic('LAN-B', '192.168.0.3'),
+      nic('LAN-10', '10.0.0.2'), nic('LAN-172', '172.16.0.2'), nic('WireGuard', '192.168.9.2')];
+    cap.local = host(interfaces);
+    cap.agents = [{ id: 'pc2', status: 'ready', error: null, info: host([...interfaces].reverse()) }];
+    expect(innerNicChoices(cap)).toHaveLength(4);
+    const all = innerNicChoices(cap, true);
+    expect(all).toHaveLength(10);
+    expect(new Set(all.map((choice) => choice.key)).size).toBe(10);
+    const selected = all.filter((choice) => choice.host === 'pc2' && choice.nic.name === 'LAN-172');
+    expect(linksFromInnerChoices([], selected)[0]).toMatchObject({ host: 'pc2', local_interface: 'LAN-172', local_ip: '172.16.0.2' });
+    expect(innerNicChoices(cap)).toHaveLength(4);
+  });
   it('IPv6-only 物理网口可见，v6 隧道仍默认隐藏；双栈只添加一个网口', () => {
     const cap = capability();
     cap.agents = [];

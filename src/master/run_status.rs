@@ -200,6 +200,7 @@ pub trait RunObserver: Send + Sync + std::fmt::Debug {
 #[derive(Debug, Default)]
 pub struct RunStatusRecorder {
     status: std::sync::Mutex<RunStatus>,
+    skip_target: std::sync::Mutex<Option<(String, usize)>>,
 }
 
 impl RunStatusRecorder {
@@ -213,6 +214,35 @@ impl RunStatusRecorder {
         crate::util::lock_recover(&self.status).since(units_from, client_run_id)
     }
 
+    /// 校验和发取消信号必须持有单元转移所用的同一把锁。
+    /// executor 在下一单元 unit_started 之前消耗上一单元的 skip 信号。
+    pub fn request_skip(&self, run_id: &str, unit_seq: usize) -> Result<(), String> {
+        self.request_skip_with(run_id, unit_seq, crate::cancel::request_skip_unit)
+    }
+
+    fn request_skip_with(
+        &self,
+        run_id: &str,
+        unit_seq: usize,
+        cancel: impl FnOnce(),
+    ) -> Result<(), String> {
+        let status = crate::util::lock_recover(&self.status);
+        if run_id.is_empty()
+            || status.run_id != run_id
+            || status.finished
+            || status.current.as_ref().map(|unit| unit.seq) != Some(unit_seq)
+        {
+            return Err("目标单元已结束或当前运行已变化，请刷新进度后重试".into());
+        }
+        let target = (run_id.to_string(), unit_seq);
+        let mut previous = crate::util::lock_recover(&self.skip_target);
+        if previous.as_ref() != Some(&target) {
+            cancel();
+            *previous = Some(target);
+        }
+        Ok(())
+    }
+
     /// 丢弃上一轮的状态。
     ///
     /// `/api/run` 接受请求时就要调，**不能等到 worker 线程里的 `run_started`**：
@@ -220,13 +250,16 @@ impl RunStatusRecorder {
     /// 上一轮**已完成**的全套单元。前端把它们攒进列表、把游标推到上一轮的
     /// 长度，之后新一轮的单元就再也进不来了。
     pub fn reset(&self) {
-        *crate::util::lock_recover(&self.status) = RunStatus::default();
+        let mut status = crate::util::lock_recover(&self.status);
+        *status = RunStatus::default();
+        *crate::util::lock_recover(&self.skip_target) = None;
     }
 }
 
 impl RunObserver for RunStatusRecorder {
     fn run_started(&self, run_id: &str, plan_hash: &str, total_units: usize, eta_secs: u64) {
         let mut status = crate::util::lock_recover(&self.status);
+        *crate::util::lock_recover(&self.skip_target) = None;
         *status = RunStatus {
             run_id: run_id.to_string(),
             plan_hash: plan_hash.to_string(),
@@ -287,6 +320,44 @@ mod tests {
             rx_avg: Some(2310.5),
             target_mbps: Some(2000.0),
         }
+    }
+
+    #[test]
+    fn targeted_skip_is_atomic_idempotent_and_rejects_stale_units() {
+        let recorder = RunStatusRecorder::new();
+        let current = |seq| CurrentUnit {
+            seq,
+            title: String::new(),
+            est_secs: 1,
+            started_at: String::new(),
+            link_group: String::new(),
+        };
+        recorder.run_started("run-a", "hash", 2, 2);
+        recorder.unit_started(current(1));
+        let calls = std::cell::Cell::new(0);
+        let cancel = || {
+            // 取消落地前单元转移不能抢先通过同一把锁。
+            assert!(recorder.status.try_lock().is_err());
+            calls.set(calls.get() + 1);
+        };
+        recorder.request_skip_with("run-a", 1, cancel).unwrap();
+        recorder.request_skip_with("run-a", 1, cancel).unwrap();
+        assert_eq!(calls.get(), 1);
+        recorder.unit_finished(unit(1, Verdict::Measured), 1);
+        assert!(recorder.request_skip_with("run-a", 1, cancel).is_err());
+        recorder.unit_started(current(2));
+        assert!(recorder.request_skip_with("run-a", 1, cancel).is_err());
+        assert!(recorder.request_skip_with("run-old", 2, cancel).is_err());
+        recorder.request_skip_with("run-a", 2, cancel).unwrap();
+        assert_eq!(calls.get(), 2);
+        recorder.run_finished();
+        assert!(recorder.request_skip_with("run-a", 2, cancel).is_err());
+        recorder.reset();
+        recorder.run_started("run-b", "hash", 1, 1);
+        recorder.unit_started(current(1));
+        assert!(recorder.request_skip_with("run-a", 1, cancel).is_err());
+        recorder.request_skip_with("run-b", 1, cancel).unwrap();
+        assert_eq!(calls.get(), 3);
     }
 
     /// 计数按 `Verdict` 的六个取值走，一个都不许漏。

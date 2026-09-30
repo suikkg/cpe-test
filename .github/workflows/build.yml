@@ -179,6 +179,24 @@ jobs:
         working-directory: ui
         run: npm run verify
 
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install browser for console regressions
+        working-directory: ui
+        run: npx playwright install --with-deps chromium
+
+      - name: Browser regressions against embedded console
+        working-directory: ui
+        run: npm run test:e2e
+
+      - name: Upload browser failure traces
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: console-browser-traces
+          path: ui/test-results/
+          if-no-files-found: ignore
+
   # 产物字节可复现性的**观察**用 job，不阻塞。
   #
   # 「同样的源码在另一台机器上构建出逐字节相同的产物」是个未经验证的假设
@@ -638,7 +656,14 @@ jobs:
           # 版本号手写，跟着 release: 提交一起改（见上面 files: 那样短的输入
           # 才可以用表达式）。
           body: |
-            cpe_test v6.5.0 跨平台发布包。
+            cpe_test v6.5.1 跨平台稳定性修复版。
+
+            ## v6.5.1 稳定性修复
+
+            - 修复内环任务取消、错误恢复与完成状态处理中的边界问题。
+            - 修复控制台表单验证、运行状态反馈及键盘操作体验。
+            - 改善历史报告与配置导入时的异常处理。
+            - 回归验证：Rust 888 项、前端 508 项、Chromium 19 项；格式检查、Linux 与 Windows MSVC 严格 Clippy、前端构建及配置文档包校验通过。
 
             ## v6.5.0 结果消费、稳定性测试与执行控制增强
 

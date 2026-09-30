@@ -1,5 +1,6 @@
 <script setup lang="ts">
-import { computed } from 'vue';
+import { scenarioBlocksActions } from '../../state/inner';
+import { computed, nextTick, ref } from 'vue';
 import NicTable from '../../components/NicTable.vue';
 import type { NicInfo } from '../../api/dto';
 import { nicKey, nicLinkLocal, nicSearchFields, nicSpeedLabel } from '../../domain/nics';
@@ -15,7 +16,7 @@ import { goto, ui } from '../../state/ui';
 const iperf = computed(() => session.local?.iperf3 ?? null);
 const loaded = computed(() => session.local !== null);
 const connected = computed(() => session.phase === 'connected');
-const testInFlight = computed(() => run.running || inner.status.running || inner.scenario.running);
+const testInFlight = computed(() => run.running || inner.status.running || scenarioBlocksActions());
 const scanLocked = computed(() => session.scanning || session.phase === 'connecting' || testInFlight.value);
 const scanLockHint = computed(() => testInFlight.value
   ? '测试进行中，请等待结束后再重新扫描网卡。' : undefined);
@@ -40,9 +41,25 @@ const selectedHidden = computed(
   () => !!selected.value && !shown.value.some((nic) => nicKey(nic) === ui.local.selected),
 );
 
-function pick(nic: NicInfo): void {
+const detailBack = ref<HTMLButtonElement>();
+const searchInput = ref<HTMLInputElement>();
+let selectionTrigger: HTMLElement | null = null;
+async function closeDetail(): Promise<void> {
+  ui.local.selected = '';
+  await nextTick();
+  if (selectionTrigger?.isConnected) selectionTrigger.focus();
+  else searchInput.value?.focus();
+}
+async function pick(nic: NicInfo): Promise<void> {
   // 再点一次同一块 = 收起详情。窄屏上这就是「返回列表」。
-  ui.local.selected = ui.local.selected === nicKey(nic) ? '' : nicKey(nic);
+  if (ui.local.selected === nicKey(nic)) {
+    await closeDetail();
+    return;
+  }
+  selectionTrigger = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  ui.local.selected = nicKey(nic);
+  await nextTick();
+  detailBack.value?.focus();
 }
 function clearQuery(): void {
   ui.local.query = '';
@@ -151,6 +168,7 @@ const detailRows = computed(() => {
         <label class="search">
           <span class="sr-only">搜索网卡</span>
           <input
+            ref="searchInput"
             type="search"
             :value="ui.local.query"
             placeholder="搜接口名、描述、IP、角色"
@@ -182,7 +200,7 @@ const detailRows = computed(() => {
         <aside v-if="selected" class="detail" aria-label="网卡详情">
           <div class="detail-head">
             <strong>{{ selected.name }}</strong>
-            <button type="button" class="ghost small" @click="ui.local.selected = ''">
+            <button ref="detailBack" type="button" class="ghost small" @click="closeDetail">
               返回网卡列表
             </button>
           </div>

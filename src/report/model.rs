@@ -53,6 +53,27 @@ pub struct DirectionSummary {
     pub nic_samples_rx: String,
 }
 
+/// 跨轮对比身份：不含 IP 地址、协商速率、运行序号或测量结果。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComparisonIdentity {
+    pub bidir: bool,
+    pub round: u32,
+    pub legs: Vec<ComparisonLeg>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComparisonLeg {
+    pub ip: String,
+    pub protocol: RowProtocol,
+    pub backend: RowBackend,
+    pub src_side: RowSide,
+    pub src_iface: String,
+    pub dst_side: RowSide,
+    pub dst_iface: String,
+    pub parameters: Vec<String>,
+    pub seconds: Option<u64>,
+}
+
 /// 这一行测的是**哪个方向**。
 ///
 /// 报告过去是从 `kind_label` 里搜 `-ab`/`-ba` 反推的（`infer_direction_tag`）。
@@ -182,6 +203,8 @@ impl RowSide {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Row {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comparison_identity: Option<ComparisonIdentity>,
     /// (unit序, leg序, 流序, 组合计标记) 用于稳定排序
     pub sort_key: (usize, usize, usize, u8),
     pub time: String,

@@ -180,6 +180,63 @@ pub(super) fn unit_protocol_and_backend(unit: &Unit) -> (RowProtocol, RowBackend
     seen.unwrap_or((RowProtocol::None, RowBackend::None))
 }
 
+fn comparison_identity(unit: &Unit) -> crate::report::ComparisonIdentity {
+    use crate::report::{ComparisonIdentity, ComparisonLeg};
+    let (protocol, backend) = unit_protocol_and_backend(unit);
+    let mut legs = Vec::new();
+    for leg in &unit.legs {
+        let (src, dst, v6, parameters, seconds) = match &leg.kind {
+            LegKind::IperfSingle(t) => (
+                &t.src,
+                &t.dst,
+                t.v6,
+                vec![t.profile_label.clone()],
+                Some(t.duration),
+            ),
+            LegKind::IperfGroup { streams, .. } => {
+                let Some(t) = streams.first() else { continue };
+                (
+                    &t.src,
+                    &t.dst,
+                    t.v6,
+                    streams.iter().map(|t| t.profile_label.clone()).collect(),
+                    Some(t.duration),
+                )
+            }
+            LegKind::CtsTraffic(t) => (
+                &t.src,
+                &t.dst,
+                t.v6,
+                vec![t.profile_label.clone()],
+                Some(t.duration),
+            ),
+            LegKind::Ping(t) => (
+                &t.src,
+                &t.dst,
+                t.v6,
+                vec![format!("-l {} -n {}", t.payload, t.count)],
+                None,
+            ),
+        };
+        legs.push(ComparisonLeg {
+            ip: if v6 { "V6" } else { "V4" }.into(),
+            protocol,
+            backend,
+            src_side: row_side(src.side),
+            src_iface: src.nic.name.clone(),
+            dst_side: row_side(dst.side),
+            dst_iface: dst.nic.name.clone(),
+            parameters,
+            seconds,
+        });
+    }
+    ComparisonIdentity {
+        bidir: unit.bidir,
+        round: unit.round.max(1),
+        legs,
+    }
+}
+
 /// 单元级行（汇总 / resume 跳过 / 网卡消失）的身份。
 ///
 /// 与 [`base_row`] 的区别有两处：端点从单元的第一条腿上取，取不到就留空；
@@ -196,6 +253,7 @@ pub(super) fn unit_row(unit: &Unit, unit_seq: usize, kind_label: impl Into<Strin
             // 单元级行的 transport 列一直是空的（协议写在标题里），保持原样。
             transport: String::new(),
             is_unit_summary: true,
+            comparison_identity: Some(comparison_identity(unit)),
             ..base_row(RowIdentity {
                 unit_seq,
                 leg_index: 0,
@@ -234,6 +292,7 @@ pub(super) fn unit_row(unit: &Unit, unit_seq: usize, kind_label: impl Into<Strin
             Row {
                 transport: String::new(),
                 is_unit_summary: true,
+                comparison_identity: Some(comparison_identity(unit)),
                 src_side: RowSide::Unknown,
                 dst_side: RowSide::Unknown,
                 ..base_row(RowIdentity {

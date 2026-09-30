@@ -2,6 +2,9 @@
 
 use serde::{Deserialize, Serialize};
 
+/// agent 支持显式全接口扫描，不套用本地 IPv4 默认前缀。
+pub const UNFILTERED_INFO_CAPABILITY: &str = "unfiltered_info_v1";
+
 /// 表示 agent 支持 request-id 幂等、同步 stop、owner 批量清理和动态租约。
 pub const RELIABLE_LIFECYCLE_CAPABILITY: &str = "reliable_lifecycle_v1";
 pub const LIVE_NIC_PROGRESS_CAPABILITY: &str = "live_nic_progress_v1";
@@ -156,6 +159,42 @@ pub struct InfoReq {
     /// 主控下发的 IPv4 前缀过滤（空则用 agent 本地默认）
     #[serde(default)]
     pub ipv4_prefixes: Vec<String>,
+    /// 显式扫描全部接口（含 IPv6-only）；缺省保留旧客户端的空列表回落语义。
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub all_interfaces: bool,
+}
+
+impl InfoReq {
+    /// 主控侧的扫描语义：空前缀明确请求全部接口，不能与旧客户端的缺省请求混用。
+    pub fn for_scan(prefixes: &[String]) -> Self {
+        Self {
+            ipv4_prefixes: prefixes.to_vec(),
+            all_interfaces: prefixes.is_empty(),
+        }
+    }
+
+    pub fn check_capabilities(&self, capabilities: &[String]) -> Result<(), String> {
+        if self.all_interfaces
+            && !capabilities
+                .iter()
+                .any(|value| value == UNFILTERED_INFO_CAPABILITY)
+        {
+            return Err(
+                "辅测机暂不支持显示全部网卡，请更新辅测机程序，或填写 IPv4 前缀后重试".into(),
+            );
+        }
+        Ok(())
+    }
+
+    pub fn effective_prefixes<'a>(&'a self, defaults: &'a [String]) -> &'a [String] {
+        if self.all_interfaces {
+            &[]
+        } else if self.ipv4_prefixes.is_empty() {
+            defaults
+        } else {
+            &self.ipv4_prefixes
+        }
+    }
 }
 
 // ---------- /ping ----------
@@ -575,6 +614,45 @@ pub struct HealthOut {
 mod tests {
     use super::*;
 
+    #[test]
+    fn info_scan_distinguishes_explicit_all_from_legacy_default_and_prefixes() {
+        let defaults = vec!["192.168.".to_string()];
+        for json in ["{}", r#"{"ipv4_prefixes":[]}"#] {
+            let request: super::InfoReq = serde_json::from_str(json).unwrap();
+            assert_eq!(request.effective_prefixes(&defaults), defaults);
+        }
+        let request: super::InfoReq =
+            serde_json::from_str(r#"{"ipv4_prefixes":["10.","172.16."]}"#).unwrap();
+        assert_eq!(request.effective_prefixes(&defaults), ["10.", "172.16."]);
+        assert_eq!(
+            serde_json::to_value(super::InfoReq::default()).unwrap(),
+            serde_json::json!({"ipv4_prefixes":[]})
+        );
+        let all = super::InfoReq {
+            all_interfaces: true,
+            ..request
+        };
+        assert!(all.effective_prefixes(&defaults).is_empty());
+    }
+
+    #[test]
+    fn explicit_scan_is_shared_and_preserves_legacy_defaults() {
+        let defaults = vec!["192.168.".to_string()];
+        let request = super::InfoReq::for_scan(&[]);
+        assert!(request.effective_prefixes(&defaults).is_empty());
+        assert!(request.check_capabilities(&[]).is_err());
+        assert!(request
+            .check_capabilities(&[super::UNFILTERED_INFO_CAPABILITY.into()])
+            .is_ok());
+        let request = super::InfoReq::for_scan(&["10.".into()]);
+        assert_eq!(request.effective_prefixes(&defaults), ["10."]);
+        assert!(request.check_capabilities(&[]).is_ok());
+        assert_eq!(
+            super::InfoReq::default().effective_prefixes(&defaults),
+            defaults
+        );
+    }
+
     #[derive(Debug, Deserialize)]
     struct LegacyServerStartReq {
         bind_ip: String,
@@ -771,6 +849,7 @@ mod tests {
             serde_json::to_string(&InfoReq {
                 // 前缀是用户配置，给 64 条超长的
                 ipv4_prefixes: (0..64).map(|_| "192.168.100.".repeat(8)).collect(),
+                ..Default::default()
             })
             .unwrap(),
         );

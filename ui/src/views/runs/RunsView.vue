@@ -171,7 +171,7 @@ async function compare(entry: RunEntry): Promise<void> {
     });
     const parts = [
       `已对比（基线 ${out.baseline} → 本轮 ${out.current}）：${out.report}`,
-      `判定变坏 ${out.regressed} · 速率下降 ${out.slower} · 判定转好 ${out.fixed} · 新增 ${out.added} · 缺失 ${out.disappeared} · 无实质变化 ${out.unchanged}`,
+      `判定变坏 ${out.regressed} · 速率下降 ${out.slower} · 判定转好 ${out.fixed} · 新增 ${out.added} · 缺失 ${out.disappeared} · 无实质变化 ${out.unchanged} · 无法唯一匹配 ${out.ambiguous ?? 0}`,
     ];
     if (!out.same_plan) {
       parts.push('两轮不是同一套计划，「新增/缺失」说的是计划差异，不是设备表现');
@@ -317,9 +317,7 @@ onMounted(load);
         <dd>{{ selectedEntry.has_request ? '有（可装载重跑）' : '没有（不能重跑）' }}</dd>
       </dl>
       <p class="muted small">
-        「开始时间」和「结论」来自这一轮的 <code>meta.json</code>，与报告顶部那八个格子同源。
-        「修改时间」则是目录最后被写过的时刻，<strong>不是测试开始时间</strong>——恢复一次报告它就会变。
-        被测设备型号这一页还没有，要看得打开报告。
+        修改时间为记录最近更新的时间，重新生成报告后会更新。
       </p>
     </div>
 

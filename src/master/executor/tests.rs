@@ -181,6 +181,10 @@ fn a_unit_summary_row_carries_the_protocol_and_backend_of_its_legs() {
     );
     assert_eq!(row.protocol, RowProtocol::Udp);
     assert_eq!(row.backend, RowBackend::CtsTraffic);
+    let identity = row.comparison_identity.unwrap();
+    assert!(!identity.legs.is_empty());
+    assert_eq!(identity.legs[0].backend, RowBackend::CtsTraffic);
+    assert_eq!(identity.round, 1);
 }
 
 fn ctstraffic_attempt(attempt: usize, traffic_established: bool) -> CtsAttemptRun {
@@ -504,6 +508,7 @@ fn acc_start_req(request_id: &str, port: u16) -> IperfClientStartReq {
 
 #[test]
 fn explicit_user_cancellation_survives_successful_remote_cleanup() {
+    let _guard = crate::cancel::test_guard();
     // 取消位是进程级共享状态；在独立测试进程驱动真实 RPC 分支，避免影响
     // 同时运行的吞吐测试，也不靠静态源码匹配代替行为验证。
     const CHILD_ENV: &str = "CPE_TEST_EXECUTOR_CANCEL_CHILD";
@@ -6508,4 +6513,31 @@ fn traffic_units_are_counted_before_the_abandoned_link_shortcut() {
         counted_at < shortcut_at,
         "灌包单元计数排在早退分支之后，被放弃的单元不会进 traffic_units"
     );
+}
+
+#[test]
+fn comparison_identity_keeps_both_legs_without_changing_resume_or_leg_tags() {
+    let single = ctstraffic_unit("original-id", false);
+    let mut bidir = single.clone();
+    bidir.bidir = true;
+    let mut reverse = ctstraffic_task(false);
+    std::mem::swap(&mut reverse.src, &mut reverse.dst);
+    reverse.profile_label = "other parameters".into();
+    bidir.legs.push(Leg {
+        tag: "ba".into(),
+        kind: LegKind::CtsTraffic(reverse),
+    });
+    let make = |unit: &Unit| {
+        crate::master::executor::row::unit_row(unit, 0, "汇总")
+            .comparison_identity
+            .unwrap()
+    };
+    let identity = make(&bidir);
+    assert!(identity.bidir);
+    assert_eq!(identity.legs.len(), 2);
+    assert_ne!(identity, make(&single));
+    assert_eq!(identity.legs[1].src_side, crate::report::RowSide::Agent);
+    assert_eq!(identity.legs[1].parameters, ["other parameters"]);
+    assert_eq!(bidir.id, "original-id");
+    assert_eq!(bidir.legs[0].tag, single.legs[0].tag);
 }

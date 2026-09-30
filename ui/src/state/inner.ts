@@ -5,6 +5,7 @@ import type { InnerCapability, InnerLink, InnerPreview, InnerRunEntry, InnerStat
 import { innerNicChoices, linksFromInnerChoices } from '../domain/inner-setup';
 import { buildRunRequest, plan as subnetPlan, preview as previewSubnet, previewIsCurrent, adoptRunRequest } from './plan';
 import { goto } from './ui';
+import { session } from './session';
 
 export const inner = reactive({
   config: { ...defaultInnerConfig(), ip_versions: [4, 6] as (4 | 6)[] }, capability: null as InnerCapability | null,
@@ -14,6 +15,8 @@ export const inner = reactive({
   /** 内环历史，独立于子网的 runs/。 */
   runs: [] as InnerRunEntry[],
   synced: false, busy: false, error: '',
+  scenarioStartPhase: 'idle' as 'idle' | 'sending' | 'accepted' | 'unknown',
+  scenarioLastReadIdle: false,
   /** 当前配置是否已存进草稿。填到一半（还缺网卡/IP）时存不下，界面要说出来。 */
   draftSaved: true,
   scenario: {
@@ -32,6 +35,24 @@ let scenarioTimer: ReturnType<typeof setTimeout> | undefined;
 // 否则页面初次加载的旧 GET 在启动响应之后返回，会把 running=true 覆盖回 false。
 let scenarioRequest = 0;
 
+let scenarioBeforeStartId = '';
+
+export function scenarioBlocksActions(): boolean {
+  return inner.scenario.running || inner.scenarioStartPhase === 'sending' || inner.scenarioStartPhase === 'unknown';
+}
+
+/** 操作员确认重新准备；只清本地准备态，绝不重发启动。 */
+export function prepareAfterUnknownScenario(): void {
+  if (inner.scenarioStartPhase !== 'unknown' || !inner.scenarioLastReadIdle) return;
+  scenarioRequest++;
+  if (scenarioTimer !== undefined) clearTimeout(scenarioTimer);
+  scenarioTimer = undefined;
+  inner.scenarioStartPhase = 'idle';
+  inner.scenarioLastReadIdle = false;
+  inner.previewStale = true;
+  inner.error = '';
+}
+
 /** 扫描结果只描述当时的设备和电脑连接；测试参数不影响这份身份。 */
 function probeConnection() {
   return {
@@ -41,7 +62,11 @@ function probeConnection() {
     agents: inner.config.agents.map((agent) => ({ ...agent, address: agent.address.trim() })),
   };
 }
-watch(() => JSON.stringify(probeConnection()), () => {
+/** 能力快照与待添加选择共用连接身份；普通重扫不改变身份。 */
+export function innerProbeIdentity(): string {
+  return JSON.stringify(probeConnection());
+}
+watch(innerProbeIdentity, () => {
   // 同步失效也防住「改了又改回」：旧请求属于上一次连接，不能重新填回就绪状态。
   probeRequest++;
   inner.capability = null;
@@ -84,7 +109,7 @@ export function loadInnerDraft(): void {
 }
 
 export function importInner(text: string): void {
-  if (inner.busy || inner.status.running || inner.scenario.running || !inner.synced) throw new Error('请等待状态同步或当前内环操作完成');
+  if (inner.busy || inner.status.running || scenarioBlocksActions() || !inner.synced) throw new Error('请等待状态同步或当前内环操作完成');
   inner.config = parseInnerProject(text);
   inner.capability = null;
   inner.preview = null;
@@ -99,10 +124,10 @@ export function importInner(text: string): void {
  * 笛卡尔积——否则「预览说 8 个单元、实际跑了 12 个」这种事迟早发生。
  */
 export async function refreshInnerPlan(): Promise<void> {
-  if (inner.status.running || inner.scenario.running) return;
+  if (inner.status.running || scenarioBlocksActions()) return;
   const request = ++planRequest;
   const snapshot = JSON.stringify(normalizeInnerDraft(inner.config));
-  const current = () => request === planRequest && !inner.status.running && !inner.scenario.running
+  const current = () => request === planRequest && !inner.status.running && !scenarioBlocksActions()
     && snapshot === JSON.stringify(normalizeInnerDraft(inner.config));
   inner.previewStale = true;
   try {
@@ -155,7 +180,7 @@ async function freshStatusAfterCommand(): Promise<void> {
 }
 
 export async function probeInner(): Promise<void> {
-  if (inner.busy || inner.status.running || inner.scenario.running) return;
+  if (inner.busy || inner.status.running || scenarioBlocksActions()) return;
   const request = ++probeRequest;
   inner.busy = true; inner.error = ''; inner.capability = null;
   try {
@@ -172,7 +197,7 @@ export async function probeInner(): Promise<void> {
 }
 
 export async function startInner(): Promise<void> {
-  if (inner.busy || inner.status.running || inner.scenario.running || !inner.synced) return;
+  if (inner.busy || inner.status.running || scenarioBlocksActions() || !inner.synced) return;
   inner.busy = true; inner.error = '';
   try {
     const cfg = normalizeInnerDraft(inner.config);
@@ -187,7 +212,7 @@ export async function startInner(): Promise<void> {
 }
 
 export async function stopInner(): Promise<void> {
-  if (inner.busy || inner.scenario.running) return;
+  if (inner.busy || scenarioBlocksActions()) return;
   inner.busy = true; inner.error = '';
   try { await api.post('/api/inner/stop'); }
   catch (e) { inner.error = errorMessage(e); }
@@ -196,7 +221,7 @@ export async function stopInner(): Promise<void> {
 
 /** 按「子网→内环」顺序运行两段测试；两段各自使用自己的 RESUME 历史。 */
 export async function startSubnetThenInner(): Promise<void> {
-  if (inner.busy || inner.status.running || inner.scenario.running || !inner.synced) return;
+  if (inner.busy || inner.status.running || scenarioBlocksActions() || !inner.synced) return;
   const hash = subnetPlan.preview?.plan_hash;
   if (!hash || !previewIsCurrent()) throw new Error('请先在子网「执行」页预览当前计划，再启动子网→内环场景');
   if (!inner.preview || inner.previewStale) throw new Error('请先刷新内环预览，再启动子网→内环场景');
@@ -205,10 +230,15 @@ export async function startSubnetThenInner(): Promise<void> {
   parseInnerProject(JSON.stringify(innerCfg));
   if (!innerCfg.links.some((link) => link.enabled)) throw new Error('内环场景没有勾选任何网口');
   inner.busy = true; inner.error = '';
+  scenarioBeforeStartId = inner.scenario.id;
+  inner.scenarioStartPhase = 'sending';
+  inner.scenarioLastReadIdle = false;
+  scenarioRequest++;
   try {
     const out = await api.post<{ started: boolean; id: string }>('/api/scenario/run', {
       subnet, inner: innerCfg, resume_subnet: true, resume_inner: true,
     });
+    inner.scenarioStartPhase = 'accepted';
     inner.scenario.running = true;
     inner.scenario.id = out.id;
     inner.scenario.phase = 'subnet';
@@ -219,6 +249,7 @@ export async function startSubnetThenInner(): Promise<void> {
     // 不重发启动请求，避免网络抖动下跑出两条场景或把后端的互斥错误误当成新失败。
     // 如果这次回读也断在半路，本地仍是 running=false，普通状态链不会自行续
     // 轮询；保留一条延迟回读，避免后台场景继续跑而页面永远失去跟踪。
+    inner.scenarioStartPhase = e instanceof NetworkError ? 'unknown' : 'idle';
     await syncScenarioStatus(e instanceof NetworkError);
   } finally { inner.busy = false; }
 }
@@ -230,6 +261,9 @@ export async function stopScenario(): Promise<void> {
 }
 
 export async function syncScenarioStatus(retryWhenUnknown = false): Promise<void> {
+  if (retryWhenUnknown && !inner.scenario.running && inner.scenarioStartPhase !== 'accepted') {
+    inner.scenarioStartPhase = 'unknown';
+  }
   const request = ++scenarioRequest;
   if (scenarioTimer !== undefined) {
     clearTimeout(scenarioTimer);
@@ -238,6 +272,10 @@ export async function syncScenarioStatus(retryWhenUnknown = false): Promise<void
   try {
     const status = await api.get<{ running: boolean; id: string; phase: string; error: string | null }>('/api/scenario/status');
     if (request !== scenarioRequest) return;
+    inner.scenarioLastReadIdle = !status.running;
+    if (status.running || (status.id && status.id !== scenarioBeforeStartId)) {
+      inner.scenarioStartPhase = 'accepted';
+    }
     inner.scenario.running = status.running;
     inner.scenario.id = status.id;
     inner.scenario.phase = status.phase;
@@ -246,7 +284,7 @@ export async function syncScenarioStatus(retryWhenUnknown = false): Promise<void
     // 场景第二阶段仍由独立的内环控制器产出进度；场景轮询不能把内环轮询
     // 链掐掉，否则页面只会显示「组合场景进行中」，单元和当前腿永远不更新。
     void syncInnerStatus();
-    if (status.running) {
+    if (status.running || inner.scenarioStartPhase === 'unknown') {
       scheduleScenarioStatus();
     }
   } catch (e) {
@@ -255,7 +293,9 @@ export async function syncScenarioStatus(retryWhenUnknown = false): Promise<void
     // 场景状态也是响应落地后再排下一拍；一次临时网络错误不能让一个仍在
     // 后台执行的五小时场景永久失去 UI 进度。401 则交给统一的会话失效流程，
     // 不继续用错误口令轮询。
-    if (!(e instanceof UnauthorizedError) && (inner.scenario.running || retryWhenUnknown)) scheduleScenarioStatus();
+    inner.scenarioLastReadIdle = false;
+    if (e instanceof UnauthorizedError) session.phase = 'unauthorized';
+    else if (scenarioBlocksActions()) scheduleScenarioStatus();
   }
 }
 
@@ -271,7 +311,7 @@ export async function listScenarioRuns(): Promise<void> {
 
 /** 载入组合场景的两份配置，仍需在子网页重新预览后点击开始。 */
 export async function loadScenario(id: string): Promise<void> {
-  if (inner.busy || inner.status.running || inner.scenario.running || !inner.synced) throw new Error('请等待状态同步或当前测试完成');
+  if (inner.busy || inner.status.running || scenarioBlocksActions() || !inner.synced) throw new Error('请等待状态同步或当前测试完成');
   inner.busy = true;
   try {
     const request = await api.post<{ subnet: unknown; inner: Record<string, unknown> }>('/api/scenario/runs/request', { id });
@@ -313,7 +353,7 @@ export async function innerRunReport(id: string): Promise<{ name: string; html: 
  * 令牌不在历史文件里，装载后仍要手工重填。
  */
 export async function loadInnerRunConfig(id: string): Promise<void> {
-  if (inner.busy || inner.status.running || inner.scenario.running || !inner.synced) throw new Error('请等待状态同步或当前内环操作完成');
+  if (inner.busy || inner.status.running || scenarioBlocksActions() || !inner.synced) throw new Error('请等待状态同步或当前内环操作完成');
   inner.busy = true;
   try {
     const cfg = await api.post<Record<string, unknown>>('/api/inner/runs/config', { id });

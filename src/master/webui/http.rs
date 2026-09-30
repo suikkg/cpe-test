@@ -589,7 +589,7 @@ pub(super) fn handle(mut request: Request, console: &Arc<Console>) {
     } else if is_post && path == "/api/stop" {
         api_stop(console)
     } else if is_post && path == "/api/skip-unit" {
-        api_skip_unit(console)
+        api_skip_unit(console, &body)
     } else if is_post && path == "/api/open-report" {
         api_open_report(console)
     } else if is_get && path == "/api/progress" {
