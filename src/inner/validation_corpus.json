@@ -6,7 +6,7 @@
     "每次都表现为『界面保存成功、后端才拒绝』，配置一长就没法定位。",
     "这份语料是两侧共同的验收表：Rust 侧由 inner::tests 断言，前端侧由 inner-corpus.test.ts 断言。",
     "改任何一侧的规则都必须先改这里，然后两边一起变红——这就是防止第六次漂移的机制。",
-    "repeat: [片段, 次数] 是 value 的等价写法，避免在 JSON 里写 513 个 a。"
+    "repeat: [片段, 次数] 是 value 的等价写法，避免在 JSON 里写 513 个 a；tail 接在最后，用于「很长的目录 + 固定文件名」这类长度边界。"
   ],
   "limits": {
     "_why": "这两个上限没有独立谓词（在 validate() 里内联），所以按常量比对：两侧源码里的数字必须一致。",
@@ -62,11 +62,23 @@
     { "field": "adb_program", "value": "", "valid": false, "why": "空值" },
     { "field": "adb_program", "value": "-adb", "valid": false, "why": "前导减号" },
     { "field": "adb_program", "value": "/bin/sh", "valid": false, "why": "这是整份配置里唯一会被当程序执行的字段" },
-    { "field": "adb_program", "value": "/usr/bin/xadb", "valid": false, "why": "文件名必须以 adb 开头，不是包含" },
+    { "field": "adb_program", "value": "/usr/bin/xadb", "valid": false, "why": "文件名必须是 adb（可带 .exe 与版本号）" },
+    { "field": "adb_program", "value": "/usr/bin/adb-wrapper", "valid": false, "why": "前缀相同也不行：adb- 后面只能是版本号" },
+    { "field": "adb_program", "value": "C:\\tools\\adbx.exe", "valid": false, "why": "前缀相同也不行" },
+    { "field": "adb_program", "value": "adb.exe", "valid": true, "why": "Windows 的裸文件名同样走 PATH" },
+    { "field": "adb_program", "value": "platform-tools/adb-1.0.41", "valid": true, "why": "带版本号的文件名，多版本并存时常见" },
+    { "field": "adb_program", "value": "C:\\tools\\ADB-35.0.2.exe", "valid": true, "why": "带版本号的 .exe，大小写不敏感" },
+    { "field": "adb_program", "value": "/usr/bin/adb-", "valid": false, "why": "adb- 后面必须是版本号" },
+    { "field": "adb_program", "value": "/usr/bin/adb-1.0x", "valid": false, "why": "版本号只能是数字和点" },
+    { "field": "adb_program", "value": "./platform-tools/adb", "valid": true, "why": "本机相对路径" },
+    { "field": "adb_program", "value": "\\\\server\\share\\adb.exe", "valid": false, "why": "网络路径：这个字段会被主控当程序执行，只接受本机路径" },
+    { "field": "adb_program", "value": "//server/share/adb", "valid": false, "why": "另一种写法的网络路径" },
+    { "field": "adb_program", "value": "/\\server\\share\\adb.exe", "valid": false, "why": "混用分隔符的网络路径，Windows 会把它归一成同一个网络地址" },
+    { "field": "adb_program", "value": "\\\\?\\C:\\platform-tools\\adb.exe", "valid": false, "why": "设备命名空间前缀一律不收" },
     { "field": "adb_program", "value": "adb\u0000", "valid": false, "why": "NUL" },
     { "field": "adb_program", "value": "adb\u009f", "valid": false, "why": "C1 控制字符——前端曾经只覆盖到 U+007F" },
-    { "field": "adb_program", "repeat": ["a", 509], "valid": false, "why": "509 个 a 不以 adb 开头" },
-    { "field": "adb_program", "value": "adb", "repeat_suffix": ["a", 509], "valid": true, "why": "512 字节是上限" },
-    { "field": "adb_program", "value": "adb", "repeat_suffix": ["a", 510], "valid": false, "why": "513 字节超上限" }
+    { "field": "adb_program", "repeat": ["a", 509], "valid": false, "why": "文件名不是 adb" },
+    { "field": "adb_program", "value": "/", "repeat": ["a", 507], "tail": "/adb", "valid": true, "why": "512 字节是上限" },
+    { "field": "adb_program", "value": "/", "repeat": ["a", 508], "tail": "/adb", "valid": false, "why": "513 字节超上限" }
   ]
 }

@@ -16,6 +16,7 @@ type Case = {
   value?: string;
   repeat?: [string, number];
   repeat_suffix?: [string, number];
+  tail?: string;
   valid: boolean;
   why: string;
 };
@@ -32,7 +33,7 @@ function build(one: Case): string {
   for (const spec of [one.repeat, one.repeat_suffix]) {
     if (spec) value += spec[0].repeat(spec[1]);
   }
-  return value;
+  return value + (one.tail ?? '');
 }
 
 // 这几条白名单在 Rust 和 TypeScript 里各有一份手写实现，历史上漂移过五次，每次都

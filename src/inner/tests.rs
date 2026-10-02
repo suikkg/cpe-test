@@ -330,7 +330,7 @@ fn adb_path_must_point_at_adb_so_a_config_cannot_pick_the_program_to_run() {
         cfg.adb_path = path.into();
         cfg.validate()
     };
-    // 位置随便放，Windows 的空格和反斜杠都要能用。
+    // 本机任意位置都行，Windows 的空格和反斜杠都要能用；带版本号的文件名也算 adb。
     for good in [
         "adb",
         "./adb",
@@ -363,6 +363,9 @@ fn adb_path_must_point_at_adb_so_a_config_cannot_pick_the_program_to_run() {
         "   ",
         "-adb",
         "adb\nrm -rf /",
+        "/usr/bin/adb-wrapper",
+        "\\\\server\\share\\adb.exe",
+        "//server/share/adb",
     ] {
         assert!(with_path(bad).is_err(), "应拒绝: {bad:?}");
     }
@@ -1987,6 +1990,7 @@ fn the_shared_validation_corpus_matches_the_rust_side() {
                 value.push_str(&unit.repeat(times));
             }
         }
+        value.push_str(case["tail"].as_str().unwrap_or(""));
 
         let actual = match field {
             "size_token" => config::size_token(&value),

@@ -281,7 +281,11 @@ export function isAdbProgram(value: string): boolean {
   if (!path || new TextEncoder().encode(path).length > 512 || path.startsWith('-')) return false;
   // eslint-disable-next-line no-control-regex
   if (/[\u0000-\u001f\u007f-\u009f]/.test(path)) return false;
-  return (path.split(/[/\\]/).pop() ?? path).toLowerCase().startsWith('adb');
+  // 开头两个字符都是分隔符：网络共享或设备命名空间，只接受本机路径。
+  if (/^[/\\]{2}/.test(path)) return false;
+  const name = (path.split(/[/\\]/).pop() ?? path).toLowerCase();
+  const stem = name.endsWith('.exe') ? name.slice(0, -4) : name;
+  return stem === 'adb' || /^adb-\d[\d.]*$/.test(stem);
 }
 
 function looksLikeV1(raw: Record<string, unknown>): boolean {
@@ -321,10 +325,10 @@ export function parseInnerProject(text: string): InnerConfig {
   const cfg = { ...defaultInnerConfig(), ...raw } as InnerConfig;
   if (typeof cfg.adb_path !== 'string' || !cfg.adb_path.trim() || typeof cfg.serial !== 'string' || typeof cfg.board_iperf !== 'string' || !cfg.board_iperf.trim()) throw new Error('ADB 路径、序列号和板侧工具必须是文本');
   // 与后端 `adb_program` 同一条规矩：这是唯一会被主控当程序执行的字段，
-  // 管的是「指向什么」而不是「长什么样」——位置随意（Windows 的空格和反斜杠
-  // 都要能用），但文件名必须以 adb 开头。前端不挡的话，界面存得下、后端一跑
-  // 就报错，人得在两处之间来回猜。
-  if (!isAdbProgram(cfg.adb_path)) throw new Error('ADB 路径的文件名必须以 adb 开头（位置随意，可含空格/反斜杠）');
+  // 管的是「指向什么」而不是「长什么样」——Windows 的空格和反斜杠都要能用，
+  // 但文件名必须是 adb / adb.exe（可带版本号），且只能是本机路径。前端不挡的话，界面
+  // 存得下、后端一跑就报错，人得在两处之间来回猜。
+  if (!isAdbProgram(cfg.adb_path)) throw new Error('ADB 路径必须是本机上名为 adb 或 adb.exe 的文件（可带版本号如 adb-1.0.41，可含空格/反斜杠，不接受网络路径）');
   if (!innerSafeWord(cfg.board_iperf) || (cfg.serial !== '' && !innerSafeWord(cfg.serial))) throw new Error('序列号和板侧工具只能含字母、数字及 _./:-，且不能以 - 开头');
   // 双向单元的两条腿各占一个端口，所以端口上限留一格给 port + 1。
   if (!number(cfg.duration_secs, 6, 3600, true) || !number(cfg.parallel, 1, 16, true) || !number(cfg.port, 1024, 65534, true) || !number(cfg.repeats, 1, 10, true)) throw new Error('时长应为 6–3600 秒，并行流 1–16，端口 1024–65534（双向占用 port 与 port+1），重复轮次 1–10');

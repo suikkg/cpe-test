@@ -109,12 +109,12 @@ describe('内环项目隔离', () => {
       return JSON.stringify(cfg);
     };
     for (const good of ['adb', './adb', '/usr/local/bin/adb', 'adb.exe', 'C:\\Program Files\\platform-tools\\adb.exe']) {
-      expect(() => parseInnerProject(withAdb(good)), good).not.toThrow('adb 开头');
+      expect(() => parseInnerProject(withAdb(good)), good).not.toThrow('ADB 路径');
     }
-    for (const bad of ['/usr/bin/curl', '/bin/sh', '-adb']) {
-      expect(() => parseInnerProject(withAdb(bad)), bad).toThrow('adb 开头');
+    for (const bad of ['/usr/bin/curl', '/bin/sh', '-adb', '/usr/bin/adb-wrapper', '\\\\server\\share\\adb.exe']) {
+      expect(() => parseInnerProject(withAdb(bad)), bad).toThrow('ADB 路径');
     }
-    expect(() => parseInnerProject(withAdb(`adb${'界'.repeat(255)}`))).toThrow('adb 开头');
+    expect(() => parseInnerProject(withAdb(`/${'界'.repeat(255)}/adb`))).toThrow('ADB 路径');
     for (const bad of ['board serial', '-board', 'board;serial']) {
       const cfg = defaultInnerConfig(); cfg.serial = bad;
       expect(() => parseInnerProject(JSON.stringify(cfg)), bad).toThrow('序列号');

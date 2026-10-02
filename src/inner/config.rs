@@ -472,8 +472,16 @@ pub fn safe_word(value: &str) -> bool {
 ///
 /// 不能直接套 `safe_word`：Windows 路径要用反斜杠和空格
 /// （`C:\Program Files\platform-tools\adb.exe`），那个白名单一个都不放行。
-/// 所以这里管的是**指向什么**而不是长什么样——文件名必须以 `adb` 开头。位置
-/// 随便放，但不能借这个字段改成运行别的程序。
+/// 所以这里管的是**指向什么**而不是长什么样：
+///
+/// - 文件名（去掉可选的 `.exe`、大小写不敏感）必须是 `adb`，或 `adb-` 加版本号
+///   （`adb-1.0.41`，多版本并存时常见）。以前只要求「以 adb 开头」，任何名字以
+///   adb 开头的程序都能借这个字段执行，等于没挡住上面那件事；
+/// - 只接受本机路径：开头两个字符都是分隔符的一律拒绝——网络共享（`\\server\share`、
+///   `//server/share`、混用分隔符的写法）和设备命名空间（`\\?\`、`\\.\`）都长这样。
+///   这个字段会被当程序执行，指到别的机器上就是让主控运行一份不在本机的程序。
+///
+/// 只写 `adb` / `adb.exe` 时走 PATH，本机任意目录下的 adb 照常可用。
 pub fn adb_program(value: &str) -> bool {
     let value = value.trim();
     if value.is_empty() || value.len() > 512 || value.starts_with('-') {
@@ -483,12 +491,24 @@ pub fn adb_program(value: &str) -> bool {
     if value.chars().any(char::is_control) {
         return false;
     }
+    let mut leading = value.chars();
+    if matches!(
+        (leading.next(), leading.next()),
+        (Some('/' | '\\'), Some('/' | '\\'))
+    ) {
+        return false;
+    }
     let name = value
         .rsplit(['/', '\\'])
         .next()
         .unwrap_or(value)
         .to_ascii_lowercase();
-    name.starts_with("adb")
+    let stem = name.strip_suffix(".exe").unwrap_or(&name);
+    stem == "adb"
+        || stem.strip_prefix("adb-").is_some_and(|version| {
+            version.starts_with(|c: char| c.is_ascii_digit())
+                && version.chars().all(|c| c.is_ascii_digit() || c == '.')
+        })
 }
 
 /// 板侧接口名。比 [`safe_word`] 更窄：它要拼进 `/sys/class/net/<iface>/...`，
@@ -542,7 +562,7 @@ impl InnerConfig {
             || (!self.serial.is_empty() && !safe_word(&self.serial))
         {
             return Err(
-                "ADB 路径的文件名必须以 adb 开头（位置随意，可含空格/反斜杠）；serial/board_iperf 只能含字母、数字及 _./:-"
+                "ADB 路径必须是本机上名为 adb 或 adb.exe 的文件（可带版本号如 adb-1.0.41，可含空格/反斜杠，不接受网络路径）；serial/board_iperf 只能含字母、数字及 _./:-"
                     .into(),
             );
         }
