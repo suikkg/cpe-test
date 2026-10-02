@@ -232,12 +232,17 @@ pub(super) fn parse_iperf_size(value: &str) -> Option<u64> {
 ///
 /// 掐头去尾而不是只留开头：iperf3 和 ctsTraffic 的**汇总行在最后**，
 /// 而那正是最常要看的一段；只留开头等于把结论截掉。
-pub(super) fn embedded_raw(text: &str) -> String {
+///
+/// 省略说明本身也算进上限，结果永远不超过 `EMBEDDED_RAW_MAX_CHARS`，所以对裁过的
+/// 文本再裁一次原样返回：执行器在原始记录落盘后先在行里裁一次（见
+/// `executor::row_raws`），渲染报告时还会再过一遍。不幂等的话第二遍会把省略说明
+/// 当成正文再省略，报出一个错的省略字数。
+pub(crate) fn embedded_raw(text: &str) -> String {
     let total = text.chars().count();
     if total <= EMBEDDED_RAW_MAX_CHARS {
         return text.to_string();
     }
-    let keep = EMBEDDED_RAW_MAX_CHARS / 2;
+    let keep = (EMBEDDED_RAW_MAX_CHARS - EMBEDDED_RAW_NOTE_BUDGET) / 2;
     let head: String = text.chars().take(keep).collect();
     let tail: String = text.chars().skip(total - keep).collect();
     format!(

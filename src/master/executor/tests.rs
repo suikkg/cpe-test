@@ -6589,3 +6589,28 @@ fn the_comparison_identity_does_not_depend_on_how_many_udp_streams_survived_clam
     assert_eq!(make(&four), make(&one));
     assert_eq!(make(&four).legs[0].parameters, ["UDP -b 500m"]);
 }
+
+/// 原始记录落盘后，行里只留报告会嵌入的首尾版本；没落盘时行里那份是唯一的全文。
+///
+/// 每行挂着 client / server / 流事件三份原文，整轮留在内存、整份写进 rows.jsonl，
+/// 一轮几十个长时长单元就是几百 MB——而报告本来就只嵌入首尾，全文在原始记录里。
+#[test]
+fn row_raws_keep_only_the_embedded_copy_once_the_raw_record_is_on_disk() {
+    let long = format!(
+        "开头\n{}\n结尾汇总 receiver",
+        "[  5] 1.00-2.00 sec 112 MBytes 940 Mbits/sec\n".repeat(5_000)
+    );
+    let raws = vec![("iperf3 client 输出".to_string(), long.clone())];
+
+    let saved = row_raws(true, raws.clone());
+    assert_eq!(saved[0].0, "iperf3 client 输出");
+    assert_eq!(saved[0].1, crate::report::embedded_raw(&long));
+    assert!(saved[0].1.starts_with("开头") && saved[0].1.ends_with("结尾汇总 receiver"));
+    assert!(saved[0].1.len() < long.len() / 5);
+
+    assert_eq!(
+        row_raws(false, raws.clone()),
+        raws,
+        "没落盘时不许丢任何内容"
+    );
+}

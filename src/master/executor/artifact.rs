@@ -161,6 +161,25 @@ elapsed_ms,interval_ms,rx_bytes,tx_bytes,rx_delta_bytes,tx_delta_bytes,rx_mbps,t
     csv
 }
 
+/// 行里留的原始输出。
+///
+/// 每一行都挂着 client / server / 流事件的原文，整轮都留在内存里、整份写进
+/// `rows.jsonl`；而报告嵌入时本来就只取首尾（`report::embedded_raw`），全文另在
+/// 原始记录文件里。一轮几十个长时长单元时，这几份全文加起来就是几百 MB。所以原始
+/// 记录已经落盘时，行里只留报告会嵌入的那一份；没写成（`raw_log` 为空）时，行里
+/// 这份就是唯一的全文，原样保留。
+pub(super) fn row_raws(
+    raw_record_saved: bool,
+    raws: Vec<(String, String)>,
+) -> Vec<(String, String)> {
+    if !raw_record_saved {
+        return raws;
+    }
+    raws.into_iter()
+        .map(|(title, text)| (title, crate::report::embedded_raw(&text)))
+        .collect()
+}
+
 impl Ctx {
     pub(super) fn write_output_artifact(
         &self,

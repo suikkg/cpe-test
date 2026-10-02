@@ -403,6 +403,7 @@ impl Ctx {
             events: &events,
             error: &raw_error,
         });
+        let raw_record_saved = !raw_log.is_empty();
 
         logln(&format!(
             "    结果: {} 发送={} 接收={} 网卡实测={}",
@@ -483,17 +484,20 @@ impl Ctx {
             window_end_ms: Some(effective_window.end_ms),
             baseline_mbps: Some(rx_stats.baseline_mbps),
             rolling_coverage: Some(rx_stats.rolling_coverage),
-            raws: vec![
-                (
-                    format!("iperf3 client{} 输出", fmt_tag(tag)),
-                    format!("$ {}\n{}", client.cmd, client.output),
-                ),
-                (format!("iperf3 server{} 输出", fmt_tag(tag)), server_out),
-                (
-                    format!("流事件{}", fmt_tag(tag)),
-                    format_flow_events(&events, &raw_error),
-                ),
-            ],
+            raws: row_raws(
+                raw_record_saved,
+                vec![
+                    (
+                        format!("iperf3 client{} 输出", fmt_tag(tag)),
+                        format!("$ {}\n{}", client.cmd, client.output),
+                    ),
+                    (format!("iperf3 server{} 输出", fmt_tag(tag)), server_out),
+                    (
+                        format!("流事件{}", fmt_tag(tag)),
+                        format_flow_events(&events, &raw_error),
+                    ),
+                ],
+            ),
             ..base_row(RowIdentity {
                 unit_seq: useq,
                 leg_index: lidx,

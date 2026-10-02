@@ -501,6 +501,7 @@ Windows 文本适配器：`src/cmd/ipconfig.rs` 解析中英文 `ipconfig /all`�
 - HTML 辅助函数：截图链接、HTML 转义、数值格式、 PASS/FAIL/SKIP 映射。
 - `write_report`：按 sort_key 排序；组合计不进入总数；输出元数据、统计、25 列表格和原始输出 details；字段均转义。
 - Task/Parent ID 在表格显示前用 `short8` 截 8 个 Unicode 字符：。
+- `Row.raws`：原始记录文件落盘成功后，行里只留 `report::embedded_raw` 的首尾版本（`executor::row_raws`），全文只在原始记录里；落盘失败时行里保留全文。`embedded_raw` 把省略说明算进上限、是幂等的——执行器裁一次、渲染再过一遍，第二遍原样返回。
 
 ### 9.2 截图实现
 

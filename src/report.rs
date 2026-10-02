@@ -335,6 +335,9 @@ const EXPAND_COLLAPSE_SCRIPT: &str = r#"<script>
 /// 内嵌这一份是给「点开就看」用的，不是存档。
 const EMBEDDED_RAW_MAX_CHARS: usize = 20_000;
 
+/// `embedded_raw` 给省略说明预留的字符数。说明算进上限，结果才永远不超过上限。
+const EMBEDDED_RAW_NOTE_BUDGET: usize = 200;
+
 /// 报告是否同时包含两种吞吐后端；只有同时出现时才值得提示口径差异。
 fn report_mixes_traffic_backends(groups: &[UnitGroup<'_>]) -> bool {
     let mut iperf = false;
@@ -1111,6 +1114,7 @@ pub mod store;
 pub mod xlsx;
 
 // 对外只露报告的数据模型和两个组装文本的入口；其余是渲染内部的事。
+pub(crate) use format::embedded_raw;
 pub use format::report_endpoint;
 pub use model::{
     ComparisonIdentity, ComparisonLeg, DirectionSummary, ReportMeta, Row, RowBackend, RowDirection,

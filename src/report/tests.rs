@@ -25,6 +25,19 @@ fn an_oversized_raw_segment_keeps_both_ends() {
     );
     assert!(trimmed.contains("中间省略"), "省略要说出来");
     assert!(trimmed.contains("独立原始记录"), "要指向完整那份");
+    assert!(
+        trimmed.chars().count() <= super::EMBEDDED_RAW_MAX_CHARS,
+        "省略说明也算进上限"
+    );
+    assert_eq!(
+        super::embedded_raw(&trimmed),
+        trimmed,
+        "执行器在行里裁过一次、渲染时再过一遍，第二遍必须原样返回"
+    );
+
+    // 再长的输入，省略说明也装得进预留的字符数。
+    let huge = "x".repeat(super::EMBEDDED_RAW_MAX_CHARS * 500);
+    assert!(super::embedded_raw(&huge).chars().count() <= super::EMBEDDED_RAW_MAX_CHARS);
 }
 
 use super::*;

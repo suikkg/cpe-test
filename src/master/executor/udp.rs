@@ -1085,6 +1085,7 @@ impl Ctx {
                     events: &flow.events,
                     error: &flow.error,
                 });
+                let raw_record_saved = !raw_log.is_empty();
                 let nic_samples_rx = monitor_sample_files
                     .get(&flow.task.dst.key())
                     .cloned()
@@ -1117,28 +1118,31 @@ impl Ctx {
                     raw_log,
                     nic_samples_rx,
                     nic_samples_tx,
-                    raws: vec![
-                        (
-                            format!(
-                                "iperf3 client{} 流#{} 输出",
-                                fmt_tag(&plan.tag),
-                                flow.stream_pos + 1
+                    raws: row_raws(
+                        raw_record_saved,
+                        vec![
+                            (
+                                format!(
+                                    "iperf3 client{} 流#{} 输出",
+                                    fmt_tag(&plan.tag),
+                                    flow.stream_pos + 1
+                                ),
+                                format!("$ {}\n{}", flow.client.cmd, flow.client.output),
                             ),
-                            format!("$ {}\n{}", flow.client.cmd, flow.client.output),
-                        ),
-                        (
-                            format!(
-                                "iperf3 server{} 流#{} 输出",
-                                fmt_tag(&plan.tag),
-                                flow.stream_pos + 1
+                            (
+                                format!(
+                                    "iperf3 server{} 流#{} 输出",
+                                    fmt_tag(&plan.tag),
+                                    flow.stream_pos + 1
+                                ),
+                                flow.server_output.clone(),
                             ),
-                            flow.server_output.clone(),
-                        ),
-                        (
-                            format!("流事件{} #{}", fmt_tag(&plan.tag), flow.stream_pos + 1),
-                            format_flow_events(&flow.events, &flow.error),
-                        ),
-                    ],
+                            (
+                                format!("流事件{} #{}", fmt_tag(&plan.tag), flow.stream_pos + 1),
+                                format_flow_events(&flow.events, &flow.error),
+                            ),
+                        ],
+                    ),
                     ..base_row(RowIdentity {
                         unit_seq: useq,
                         leg_index: plan.lidx,

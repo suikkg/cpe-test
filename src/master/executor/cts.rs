@@ -1316,6 +1316,7 @@ impl Ctx {
                 format!("[{}] {}", issue.code, issue.detail),
             ));
         }
+        let raws = row_raws(!raw_log.is_empty(), raws);
         let idx = self.push_row(Row {
             time,
             // CTS 的 transport 列一直写成 `CTS/TCP` / `CTS/UDP`（后端信息混在里面）。
