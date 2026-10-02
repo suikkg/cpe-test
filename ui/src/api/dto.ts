@@ -153,6 +153,8 @@ export interface PlanOut {
   est_total_secs: number;
   est_full_secs: number;
   notices: string[];
+  /** 底层排查信息（如 socket 缓冲排空时间），不影响判定；预览区不展开。 */
+  diagnostic_notices?: string[];
   blocking_errors?: string[];
   sections?: PlanSection[];
   trace?: PlanTrace[];

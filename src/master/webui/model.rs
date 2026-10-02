@@ -579,6 +579,9 @@ pub(super) struct PlanOut {
     pub(super) est_total_secs: u64,
     pub(super) est_full_secs: u64,
     pub(super) notices: Vec<String>,
+    /// 底层排查信息（例如 `-w` 过大时 socket 缓冲的排空时间）：不影响判定，预览不展开。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) diagnostic_notices: Vec<String>,
     /// 与启动入口共用的阻断原因；普通提示不阻止开始。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(super) blocking_errors: Vec<String>,
@@ -634,7 +637,12 @@ pub(super) struct UiSource {
 pub(super) struct CompiledPlan {
     pub(super) cfg: Config,
     pub(super) units: Vec<builder::Unit>,
+    /// 预览里展示的提示（不含底层诊断）。
     pub(super) notices: Vec<String>,
+    /// 套件计划里因此没有生成单元的那几项，`blocking_errors` 的来源之一。
+    pub(super) skipped_notices: Vec<String>,
+    /// 底层排查信息（`builder::NoticeKind::Diagnostic`），预览不展开。
+    pub(super) diagnostic_notices: Vec<String>,
     pub(super) resumed: Vec<bool>,
     pub(super) trace: Vec<PlanTrace>,
     pub(super) sections: Vec<PlanSection>,

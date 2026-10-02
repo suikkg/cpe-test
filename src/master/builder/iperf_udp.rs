@@ -26,7 +26,7 @@ pub(super) fn expand_iperf_udp(x: &mut Expansion<'_>, route: &Route<'_>) {
         let parsed_bandwidth = match prof.parsed_bandwidth() {
             Ok(value) => value,
             Err(error) => {
-                x.notices.push(format!(
+                x.notices.push_skipped(format!(
                     "跳过 {} 的 iperf {}：{error}；带宽格式非法，未生成任务",
                     spec.name,
                     prof.label()

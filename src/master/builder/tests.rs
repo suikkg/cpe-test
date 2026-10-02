@@ -4067,7 +4067,13 @@ fn a_notice_is_said_once_however_many_units_repeat_it() {
     let mut port = PORT_BASE;
     let plan = build_ui_units_repeated(&[spec, other], true, &mut port, 1);
     assert_eq!(plan.units.len(), 12);
-    assert_eq!(plan.notices, vec![expected.to_string()]);
+    assert_eq!(
+        plan.notices,
+        vec![PlanNotice {
+            kind: NoticeKind::Info,
+            text: expected.to_string(),
+        }]
+    );
 }
 
 /// ctsTraffic 与 iperf 两条 UDP 路径按同一份规则决定每条腿的负载与报文长度。
@@ -4174,5 +4180,54 @@ fn cts_udp_legs_follow_the_same_load_policy_as_iperf() {
             .iter()
             .any(|line| line.contains("配置非法，将记录 SETUP_ERROR") && line.contains("65507")),
         "{notices:#?}"
+    );
+}
+
+/// 计划提示带着类别出去，控制台按类别处理，不从文字里猜。
+///
+/// 以前控制台靠「文字以『跳过 』开头」认跳过、靠「含『socket 缓冲』」藏诊断：
+/// 改一次措辞就静默失效，任务名恰好以「跳过」开头又会被误判成阻断项。
+#[test]
+fn every_plan_notice_carries_the_kind_the_console_acts_on() {
+    let kind_of = |spec: SpecNorm, needle: &str| {
+        let mut port = PORT_BASE;
+        let plan = build_ui_units_repeated(&[spec], true, &mut port, 1);
+        plan.notices
+            .iter()
+            .find(|notice| notice.text.contains(needle))
+            .unwrap_or_else(|| panic!("没找到含 {needle:?} 的提示：{:#?}", plan.notices))
+            .kind
+    };
+
+    let mut oversized = base_spec();
+    oversized.tcp_windows = vec!["256m".into()];
+    oversized.tcp_streams = 10;
+    assert_eq!(kind_of(oversized, "socket 缓冲"), NoticeKind::Diagnostic);
+
+    let mut no_v6 = base_spec();
+    no_v6.ipvers = vec!["v6".into()];
+    no_v6.dst.nic.ipv6_ll = String::new();
+    assert_eq!(
+        kind_of(no_v6, "两端缺少可用的 IPv6 地址"),
+        NoticeKind::Skipped
+    );
+
+    // 任务名以「跳过 」开头，普通的裁剪提示也不会因此变成跳过。
+    let mut clipped = base_spec();
+    clipped.name = "跳过 网关回归".into();
+    clipped.transports = vec!["udp".into()];
+    clipped.udp_profiles = vec![UdpProfile::bw("2500m")];
+    clipped.dst = ep(Side::Agent, "eth1", "SGMII1G", "192.168.1.3", 1000);
+    assert_eq!(kind_of(clipped, "路径上限不足"), NoticeKind::Info);
+
+    // 命令行拿到的仍是按原顺序的全部文字。
+    let mut spec = base_spec();
+    spec.tcp_windows = vec!["256m".into()];
+    spec.tcp_streams = 10;
+    let mut port = PORT_BASE;
+    let (_, texts) = build_units(&[spec], true, &mut port);
+    assert!(
+        texts.iter().any(|text| text.contains("socket 缓冲")),
+        "{texts:#?}"
     );
 }

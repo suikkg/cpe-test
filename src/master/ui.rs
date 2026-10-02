@@ -605,7 +605,13 @@ pub fn run_master(opts: MasterOpts) -> i32 {
             &mut next_port,
             cfg.rounds,
         );
-        (built.units, built.notices)
+        // 运行日志与命令行一样打印全部提示，类别只在控制台的预览里用。
+        let notices = built
+            .notices
+            .into_iter()
+            .map(|notice| notice.text)
+            .collect();
+        (built.units, notices)
     } else {
         build_units_repeated(
             &specs,

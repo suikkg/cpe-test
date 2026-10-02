@@ -36,7 +36,7 @@ impl TopologyGate {
             return false;
         }
         if !self.notice_emitted {
-            x.notices.push(format!(
+            x.notices.push_skipped(format!(
                 "跳过 {} 的 ctsTraffic：两端 IPv4 不同 /24 ({} vs {})，无法直连灌包",
                 spec.name, spec.src.nic.ipv4, spec.dst.nic.ipv4
             ));

@@ -1952,8 +1952,9 @@ impl CompiledPlan {
     pub(super) fn blocking_errors(&self, suite_plan: bool) -> Vec<String> {
         let mut errors = self.spec_errors.clone();
         if suite_plan {
-            for notice in &self.notices {
-                if notice.trim_start().starts_with("跳过 ") && !errors.contains(notice) {
+            // 按 builder 给的类别认，不按文字前缀：措辞一改，前缀判断就静默失效。
+            for notice in &self.skipped_notices {
+                if !errors.contains(notice) {
                     errors.push(notice.clone());
                 }
             }
@@ -1978,6 +1979,9 @@ pub(super) fn compile_request(state: &UiState, req: &RunRequest) -> Result<Compi
         return Err(format!("配置项异常：{}", problems.join("；")));
     }
     let mut notices = Vec::new();
+    // 只有套件计划（ui_plan）这条路按类别分流；旧矩阵沿用一份全量提示，也不按跳过阻断。
+    let mut skipped_notices = Vec::new();
+    let mut diagnostic_notices = Vec::new();
     let mut spec_errors = Vec::new();
     let mut specs = Vec::new();
     let mut spec_sources = Vec::new();
@@ -2012,7 +2016,16 @@ pub(super) fn compile_request(state: &UiState, req: &RunRequest) -> Result<Compi
             .zip(&built.spec_indices)
             .map(|(unit, index)| unit_direction_for_spec(unit, &specs[*index]))
             .collect();
-        notices.extend(built.notices);
+        for notice in built.notices {
+            match notice.kind {
+                builder::NoticeKind::Info => notices.push(notice.text),
+                builder::NoticeKind::Skipped => {
+                    skipped_notices.push(notice.text.clone());
+                    notices.push(notice.text);
+                }
+                builder::NoticeKind::Diagnostic => diagnostic_notices.push(notice.text),
+            }
+        }
         (built.units, sources, directions)
     } else {
         let (units, build_notices) = builder::build_units_repeated(
@@ -2136,6 +2149,8 @@ pub(super) fn compile_request(state: &UiState, req: &RunRequest) -> Result<Compi
         cfg,
         units,
         notices,
+        skipped_notices,
+        diagnostic_notices,
         resumed,
         trace,
         sections,

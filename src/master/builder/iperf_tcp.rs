@@ -53,7 +53,7 @@ pub(super) fn expand_iperf_tcp(x: &mut Expansion<'_>, route: &Route<'_>) {
                     d,
                     &spec.rate_check,
                 ) {
-                    x.notices.push(msg);
+                    x.notices.push_diagnostic(msg);
                 }
             }
         }

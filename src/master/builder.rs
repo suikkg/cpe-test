@@ -743,8 +743,29 @@ pub fn build_units_repeated(
 /// 命令行显式列出的重复测试仍由 `build_units_repeated` 原样执行。
 pub struct UiPlanUnits {
     pub units: Vec<Unit>,
-    pub notices: Vec<String>,
+    pub notices: Vec<PlanNotice>,
     pub spec_indices: Vec<usize>,
+}
+
+/// 一条计划提示的类别。控制台按类别处理，不再从文字里猜：
+/// 「是不是跳过」以前靠文字以「跳过 」开头来认，改一次措辞就静默失效，
+/// 任务名恰好以「跳过」开头又会被误判。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoticeKind {
+    /// 普通计划提示。
+    Info,
+    /// 计划里的某一项因此没有生成单元。控制台的套件计划把它当阻断项
+    /// （`webui::plan::CompiledPlan::blocking_errors`）。
+    Skipped,
+    /// 底层排查信息：不影响判定，也不必改配置才能跑。控制台不在预览里展开，
+    /// 命令行与运行日志照常打印。
+    Diagnostic,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlanNotice {
+    pub kind: NoticeKind,
+    pub text: String,
 }
 
 pub fn build_ui_units_repeated(
@@ -759,10 +780,10 @@ pub fn build_ui_units_repeated(
     let mut spec_indices = Vec::new();
     for (index, spec) in specs.iter().enumerate() {
         let (built, build_notices) =
-            build_units(std::slice::from_ref(spec), require_same_subnet, next_port);
+            expand_specs(std::slice::from_ref(spec), require_same_subnet, next_port);
         spec_indices.extend(std::iter::repeat_n(index, built.len()));
         units.extend(built);
-        notices.extend(build_notices);
+        notices.absorb(build_notices);
     }
     let (repeated, round_notices) = repeat_units(units, rounds, next_port);
     let per_round = spec_indices.len();
@@ -794,7 +815,7 @@ pub fn build_ui_units_repeated(
     }
     UiPlanUnits {
         units,
-        notices: notices.into_vec(),
+        notices: notices.list,
         spec_indices: unique_sources,
     }
 }
@@ -814,6 +835,16 @@ pub fn build_units(
     require_same_subnet: bool,
     next_port: &mut u16,
 ) -> (Vec<Unit>, Vec<String>) {
+    let (units, notices) = expand_specs(specs, require_same_subnet, next_port);
+    (units, notices.into_texts())
+}
+
+/// `build_units` 的本体，提示保留类别（控制台要按类别处理，命令行只要文字）。
+fn expand_specs(
+    specs: &[SpecNorm],
+    require_same_subnet: bool,
+    next_port: &mut u16,
+) -> (Vec<Unit>, Notices) {
     let mut x = Expansion {
         units: Vec::new(),
         notices: Notices::default(),
@@ -837,7 +868,7 @@ pub fn build_units(
             for ipver in &spec.ipvers {
                 let v6 = ipver == "v6";
                 if v6 && v6_addrs(&spec.src.nic, &spec.dst.nic).is_none() {
-                    x.notices.push(format!(
+                    x.notices.push_skipped(format!(
                         "跳过 {} {} IPv6：两端缺少可用的 IPv6 地址",
                         spec.name, route_str
                     ));
@@ -857,7 +888,7 @@ pub fn build_units(
                 // ---------- iperf ----------
                 if spec.kinds.iter().any(|k| k == "iperf") {
                     if !v6 && !same_subnet_ok {
-                        x.notices.push(format!(
+                        x.notices.push_skipped(format!(
                             "跳过 {} 的 iperf：两端 IPv4 不同网段 ({} vs {})，无法直连灌包（ping 不受限）",
                             spec.name, spec.src.nic.ipv4, spec.dst.nic.ipv4
                         ));
@@ -884,7 +915,7 @@ pub fn build_units(
             }
         }
     }
-    (x.units, x.notices.into_vec())
+    (x.units, x.notices)
 }
 
 /// `ip` 的规范值（`v4` / `v6`）。控制台（`webui::validate`）与配置文件共用这一张
@@ -970,7 +1001,7 @@ fn canonical_values(
                     out.push(value.to_string());
                 }
             }
-            None => x.notices.push(format!(
+            None => x.notices.push_skipped(format!(
                 "{spec_name}：{field} 取值 {value:?} 无法识别，已忽略（可选 {accepted}）"
             )),
         }
@@ -983,28 +1014,46 @@ fn canonical_values(
 /// 同一句话会在每个档位 × 每条腿 × 方向 × IP 版本上各算出来一遍（流数非法、`-w`
 /// 排空、路径裁剪……），以前原样重复：一条「流数配置非法」按方向 × IP 版本印六遍，
 /// `-w` 过大印十遍，命令行逐条打印、控制台逐条列出，真正要看的那几句被淹没。
-/// 去重收在 `push` 里，调用方没有绕过它的写法。
+/// 去重收在这里的几个 push 里，调用方没有绕过它的写法；类别见 `NoticeKind`。
 #[derive(Default)]
 struct Notices {
-    list: Vec<String>,
+    list: Vec<PlanNotice>,
     seen: HashSet<String>,
 }
 
 impl Notices {
-    fn push(&mut self, message: String) {
-        if self.seen.insert(message.clone()) {
-            self.list.push(message);
+    fn push(&mut self, text: String) {
+        self.push_kind(NoticeKind::Info, text);
+    }
+
+    fn push_skipped(&mut self, text: String) {
+        self.push_kind(NoticeKind::Skipped, text);
+    }
+
+    fn push_diagnostic(&mut self, text: String) {
+        self.push_kind(NoticeKind::Diagnostic, text);
+    }
+
+    fn push_kind(&mut self, kind: NoticeKind, text: String) {
+        if self.seen.insert(text.clone()) {
+            self.list.push(PlanNotice { kind, text });
         }
     }
 
-    fn extend(&mut self, messages: impl IntoIterator<Item = String>) {
-        for message in messages {
-            self.push(message);
+    fn extend(&mut self, texts: impl IntoIterator<Item = String>) {
+        for text in texts {
+            self.push(text);
         }
     }
 
-    fn into_vec(self) -> Vec<String> {
-        self.list
+    fn absorb(&mut self, other: Notices) {
+        for notice in other.list {
+            self.push_kind(notice.kind, notice.text);
+        }
+    }
+
+    fn into_texts(self) -> Vec<String> {
+        self.list.into_iter().map(|notice| notice.text).collect()
     }
 }
 

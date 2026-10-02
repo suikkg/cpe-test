@@ -6943,3 +6943,54 @@ fn skip_endpoint_rejects_missing_and_stale_targets_without_cancelling() {
     assert!(api_skip_unit(&console, r#"{"run_id":"new-run","unit_seq":1}"#).is_err());
     assert!(api_skip_unit(&console, r#"{"run_id":"old-run","unit_seq":2}"#).is_err());
 }
+
+/// 控制台预览只把底层诊断从 `notices` 挪到 `diagnostic_notices`，阻断只认 builder
+/// 标成「跳过」的提示——不再按文字里有没有「socket 缓冲」、是不是以「跳过 」开头来猜。
+#[test]
+fn the_console_preview_routes_notices_by_kind_not_by_wording() {
+    let console = console_for_monitor_tests();
+    let mut req = suite_request();
+    req.ui_plan.as_mut().unwrap().recipes.tcp[0].profiles[0].window = Some("256m".into());
+    let preview = api_plan(&console, &serde_json::to_string(&req).unwrap()).unwrap();
+    let texts = |key: &str| -> Vec<String> {
+        preview
+            .get(key)
+            .and_then(|value| value.as_array())
+            .map(|values| {
+                values
+                    .iter()
+                    .map(|value| value.as_str().unwrap().to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    assert!(
+        texts("diagnostic_notices")
+            .iter()
+            .any(|text| text.contains("socket 缓冲")),
+        "{preview:#}"
+    );
+    assert!(
+        !texts("notices")
+            .iter()
+            .any(|text| text.contains("socket 缓冲")),
+        "底层诊断不在预览区展开"
+    );
+    assert!(preview.get("blocking_errors").is_none(), "诊断不阻断");
+
+    // 阻断只认类别：以「跳过 」开头的普通提示不阻断，标成跳过的才阻断。
+    let mut compiled = compile_request(&state_with_pair(), &suite_request()).unwrap();
+    compiled
+        .notices
+        .push("跳过 网关回归 TCP：只是任务名以「跳过」开头".into());
+    assert!(compiled.blocking_errors(true).is_empty());
+    compiled.skipped_notices.push("某一项没有生成单元".into());
+    assert_eq!(
+        compiled.blocking_errors(true),
+        vec!["某一项没有生成单元".to_string()]
+    );
+    assert!(
+        compiled.blocking_errors(false).is_empty(),
+        "旧矩阵不按跳过阻断"
+    );
+}

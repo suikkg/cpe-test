@@ -295,6 +295,7 @@ pub(super) fn api_plan(console: &Arc<Console>, body: &str) -> Result<serde_json:
         est_total_secs,
         est_full_secs,
         notices: compiled.notices,
+        diagnostic_notices: compiled.diagnostic_notices,
         blocking_errors,
         sections: compiled.sections,
         trace: compiled.trace,

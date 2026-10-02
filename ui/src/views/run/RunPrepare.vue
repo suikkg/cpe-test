@@ -33,10 +33,8 @@ async function startAndView(): Promise<void> {
   if (run.startPhase === 'accepted') ui.preparing = false;
 }
 
-// socket 缓冲诊断属于底层排查信息，不在预览区展开；其余提示照常显示。
-const visiblePreviewNotices = computed(
-  () => out.value?.notices.filter((notice) => !notice.includes('socket 缓冲')) ?? [],
-);
+// 底层排查信息由后端单独放在 diagnostic_notices，不在预览区展开；notices 照常显示。
+const visiblePreviewNotices = computed(() => out.value?.notices ?? []);
 
 /**
  * 预览单元的页内搜索：序号、标题、最终参数与门限文字。
