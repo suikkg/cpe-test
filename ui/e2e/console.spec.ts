@@ -50,25 +50,24 @@ async function consoleApi(page: Page, running: 'subnet' | 'inner' | 'scenario' |
     return route.continue();
   });
   await page.goto(entry);
-  await expect(page.getByRole('heading', { name: '本机', exact: true })).toBeVisible();
-  await expect(page.getByRole('button', { name: 'master-LAN', exact: true })).toBeVisible();
+  await expect(page.getByRole('heading', { name: '连接', exact: true })).toBeVisible();
+  await expect(page.getByText('master-LAN', { exact: true })).toBeVisible();
   return state;
 }
 
 async function connectAgent(page: Page) {
-  await nav(page, '辅测机').click();
+  await nav(page, '连接').click();
   await page.getByRole('textbox', { name: /^辅测机地址/ }).fill('192.168.1.3');
   await page.getByRole('button', { name: '连接', exact: true }).click();
   await expect(page.getByText('已连上', { exact: false }).first()).toBeVisible();
 }
 
-test('本机未连接重扫、连接多前缀、两页重扫刷新同一份双端表', async ({ page }) => {
+test('未连接只扫本机；连接多前缀；一个重扫入口刷新同一份双端表', async ({ page }) => {
   const state = await consoleApi(page);
   state.localSuffix = '-local';
   await page.getByRole('button', { name: '重新扫描', exact: true }).click();
-  await expect(page.getByRole('button', { name: 'master-LAN-local', exact: true })).toBeVisible();
+  await expect(page.getByText('master-LAN-local', { exact: true })).toBeVisible();
   expect(state.connections).toHaveLength(0);
-  await nav(page, '辅测机').click();
   await page.getByRole('textbox', { name: /^辅测机地址/ }).fill('192.168.1.3');
   await page.getByLabel('IPv4 前缀过滤').fill('192.168., 10., ,172.16.');
   await page.getByLabel('IPv4 前缀过滤').press('Enter');
@@ -80,12 +79,10 @@ test('本机未连接重扫、连接多前缀、两页重扫刷新同一份双�
   await page.getByRole('button', { name: '重新扫描', exact: true }).click();
   await expect(page.getByText('agent-LAN-agent-scan', { exact: true })).toBeVisible();
   expect(state.connections[1].ipv4_prefixes).toEqual([]);
-  await nav(page, '本机').click();
-  await expect(page.getByRole('button', { name: 'master-LAN-agent-scan', exact: true })).toBeVisible();
+  await expect(page.getByText('master-LAN-agent-scan', { exact: true })).toBeVisible();
   state.connectSuffix = '-local-scan';
   await page.getByRole('button', { name: '重新扫描', exact: true }).click();
-  await expect(page.getByRole('button', { name: 'master-LAN-local-scan', exact: true })).toBeVisible();
-  await nav(page, '辅测机').click();
+  await expect(page.getByText('master-LAN-local-scan', { exact: true })).toBeVisible();
   await expect(page.getByText('agent-LAN-local-scan', { exact: true })).toBeVisible();
   expect(state.connections).toHaveLength(3);
   expect(state.localCalls).toBe(4);
@@ -102,30 +99,26 @@ for (const failure of ['local', 'connect'] as const) {
     await expect(page.getByText('与 192.168.1.3 的连接已断开', { exact: true })).toBeVisible();
     await expect(page.getByRole('alert')).toContainText('上次成功');
     await expect(page.getByRole('alert')).toContainText('192.168.1.3');
+    await expect(page.getByRole('alert')).toContainText(/192\.168\.1\.3.*\d{2}:\d{2}:\d{2}/);
     await expect(page.getByText('agent-LAN', { exact: true })).toBeVisible();
-    await nav(page, '本机').click();
-    await expect(page.getByText(/当前网卡列表仍是上次成功连接/)).toContainText(/192\.168\.1\.3.*\d{2}:\d{2}:\d{2}/);
-    await expect(page.getByRole('button', { name: 'master-LAN', exact: true })).toBeVisible();
+    await expect(page.getByText('master-LAN', { exact: true })).toBeVisible();
     state[`${failure}Fail`] = false;
     state.connectSuffix = '-recovered';
     await page.getByRole('button', { name: '重新扫描', exact: true }).click();
-    await expect(page.getByRole('button', { name: 'master-LAN-recovered', exact: true })).toBeVisible();
-    await expect(page.getByText(/当前网卡列表仍是上次成功连接/)).toHaveCount(0);
+    await expect(page.getByText('master-LAN-recovered', { exact: true })).toBeVisible();
+    await expect(page.getByText(/上次成功连接/)).toHaveCount(0);
     await expect(page.getByText('已连 192.168.9.9', { exact: true })).toBeVisible();
   });
 }
 
 for (const running of ['subnet', 'inner', 'scenario'] as const) {
-  test(`${running} 首页同步后锁定两页按钮及表单提交`, async ({ page }) => {
+  test(`${running} 首页同步后锁定扫描、连接及表单提交`, async ({ page }) => {
     const state = await consoleApi(page, running);
     await expect(page.getByRole('button', { name: '重新扫描', exact: true })).toBeDisabled();
-    await nav(page, '辅测机').click();
     await expect(page.getByRole('button', { name: '连接', exact: true })).toBeDisabled();
-    await expect(page.getByRole('button', { name: '重新扫描', exact: true })).toBeDisabled();
     await page.getByRole('textbox', { name: /^辅测机地址/ }).press('Enter');
     // 同时守住处理函数：requestSubmit 不受 disabled submit 按钮保护。
     await page.locator('form').evaluate((form: HTMLFormElement) => form.requestSubmit());
-    await nav(page, '本机').click();
     expect(state.connections).toHaveLength(0);
     expect(state.localCalls).toBe(1);
   });
@@ -138,7 +131,7 @@ test('真实页面 cookie 支持刷新和新标签；API 只带 cookie 仍为 40
   expect(cookie).toMatchObject({ value: token, sameSite: 'Strict', httpOnly: false, expires: -1 });
   const refreshed = await page.reload();
   expect(refreshed?.status()).toBe(200);
-  await expect(page.getByRole('button', { name: 'master-LAN', exact: true })).toBeVisible();
+  await expect(page.getByText('master-LAN', { exact: true })).toBeVisible();
   expect(state.headers.every((header) => header['x-cpe-token'] === token)).toBe(true);
   // 新标签的 sessionStorage 是空的：只靠服务端 cookie 打开，再由前端补请求头。
   const fresh = await context.newPage();
@@ -159,13 +152,13 @@ test('API 401 进入全局口令失效提示，普通网络失败不冒充 401',
   await page.getByRole('button', { name: '重新扫描', exact: true }).click();
   await expect(page.getByRole('alert')).toContainText('控制台口令无效或已失效');
   await expect(page.getByRole('alert')).toContainText('?token=');
-  await nav(page, '本机').click();
-  await expect(page.getByRole('heading', { name: '本机', exact: true })).toHaveCount(0);
+  await nav(page, '连接').click();
+  await expect(page.getByRole('heading', { name: '连接', exact: true })).toHaveCount(0);
   expect(state.connections).toHaveLength(2);
 });
 
 for (const width of [1280, 600]) {
-  test(`键盘导航、搜索与网卡详情往返保留焦点（${width}px）`, async ({ page }) => {
+  test(`键盘导航与网卡搜索（${width}px）`, async ({ page }) => {
     await page.setViewportSize({ width, height: 900 });
     await consoleApi(page);
     await page.keyboard.press('Tab');
@@ -174,27 +167,22 @@ for (const width of [1280, 600]) {
     await expect(page.locator('#main-content')).toBeFocused();
     const search = page.getByRole('searchbox', { name: '搜索网卡' });
     await search.fill('USB');
-    await expect(page.getByRole('button', { name: 'master-LAN', exact: true })).toHaveCount(0);
-    const pick = page.getByRole('button', { name: 'master-USB', exact: true });
-    await pick.focus();
+    await expect(page.getByText('master-LAN', { exact: true })).toHaveCount(0);
+    await expect(page.getByText('master-USB', { exact: true })).toBeVisible();
+    await nav(page, '计划').focus();
+    await page.keyboard.press('Space');
+    await expect(page.getByRole('heading', { name: '计划', exact: true })).toBeVisible();
+    await nav(page, '连接').focus();
     await page.keyboard.press('Enter');
-    const back = page.getByRole('button', { name: '返回网卡列表' });
-    await expect(back).toBeFocused();
-    await expect(page.getByRole('complementary', { name: '网卡详情' })).toContainText('10.1.1.2');
-    await page.keyboard.press('Space');
-    await expect(pick).toBeFocused();
-    await expect(search).toHaveValue('USB');
-    await nav(page, '辅测机').focus();
-    await page.keyboard.press('Space');
-    await expect(page.getByRole('heading', { name: '辅测机', exact: true })).toBeVisible();
+    // 搜索属于界面上下文：切走再回来仍在。
+    await expect(page.getByRole('searchbox', { name: '搜索网卡' })).toHaveValue('USB');
   });
 }
 
 test('计划 Tabs 的方向键环绕、Home/End 与 Enter/空格手动激活', async ({ page }) => {
   await consoleApi(page);
   await connectAgent(page);
-  await nav(page, '测试计划').click();
-  await page.locator('summary').filter({ hasText: '高级计划编辑' }).press('Enter');
+  await nav(page, '计划').click();
   const tabs = page.getByRole('tablist', { name: '计划编辑区域' }).getByRole('tab');
   await tabs.nth(0).focus();
   await page.keyboard.press('ArrowLeft');
@@ -217,7 +205,7 @@ test('计划 Tabs 的方向键环绕、Home/End 与 Enter/空格手动激活', a
 });
 
 for (const endpoint of ['local', 'connect'] as const) {
-  test(`${endpoint} 重扫请求未返回时，两页都不能重复发请求`, async ({ page }) => {
+  test(`${endpoint} 重扫请求未返回时，不能重复发请求`, async ({ page }) => {
     const state = await consoleApi(page);
     await connectAgent(page);
     let release!: () => void;
@@ -232,7 +220,6 @@ for (const endpoint of ['local', 'connect'] as const) {
     await expect(page.getByRole('button', { name: '扫描中…', exact: true })).toBeDisabled();
     await expect(page.locator('button[type="submit"]')).toBeDisabled();
     await page.locator('form').evaluate((form: HTMLFormElement) => form.requestSubmit());
-    await nav(page, '本机').click();
     await expect(page.getByRole('button', { name: '扫描中…', exact: true })).toBeDisabled();
     release();
     await expect(page.getByText(/已重新扫描 · 本机 2 块/)).toBeVisible();
@@ -323,9 +310,18 @@ test('跳过请求绑定显示的单元；目标变化被拒绝后刷新进度',
     run: { ...progress.run, current: { ...progress.run.current, seq: advanced ? 3 : 2,
       title: advanced ? '下一个单元' : progress.run.current.title } },
   }));
-  await nav(page, '进度').click();
+  await nav(page, '执行').click();
   await page.getByRole('button', { name: '跳过当前单元', exact: true }).click();
   expect(target).toEqual({ run_id: progress.run.run_id, unit_seq: 2 });
   await expect(page.getByText('下一个单元', { exact: true })).toBeVisible();
   await expect(page.getByRole('alert')).toContainText('目标单元已结束');
+});
+
+test('单独运行的内环测试点「停止测试」真的发出停止请求', async ({ page }) => {
+  await consoleApi(page, 'inner');
+  let stops = 0;
+  await page.route('**/api/inner/stop', (route) => { stops++; return success(route, {}); });
+  await nav(page, '内环测试').click();
+  await page.getByRole('button', { name: '停止测试', exact: true }).click();
+  await expect.poll(() => stops).toBe(1);
 });

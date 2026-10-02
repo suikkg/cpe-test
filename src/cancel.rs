@@ -174,11 +174,38 @@ pub fn setup_cancel_handler() {
     });
 }
 
-/// 修改进程级取消位的测试必须互斥，不能互相 reset 对方的信号。
+/// 读或写进程级取消位的测试互斥：调用后**一直持有到这个测试线程结束**。
+///
+/// 取消位是全局静态，同一个测试二进制里的用例并发跑。只让「改标志的」测试
+/// 互斥不够——读它们的测试同样会被别人的写入带偏：
+/// - 一条测试 `request_skip_unit()` 还没 `take_skip_unit()`，另一条测试经
+///   `api_run` 走到 `reset()`，跳过请求凭空消失；
+/// - 一条测试在验证 Ctrl+C 时把 `PROCESS_SHUTDOWN_REQUESTED` 临时置位，并发的
+///   `api_run` 测试拿到的就是「控制台正在退出」而不是它要断言的那句错误；
+/// - 执行器测试的单元循环读 `is_cancelled()`，别人留下的取消位会让它第一格就
+///   break，`take_skip_unit()` 还会把别人的跳过请求吞掉。
+///
+/// 所以执行器测试的公共夹具（`isolated_ctx`）自动调用它，走 `api_run` /
+/// `api_skip_unit` / 组合场景启停的测试显式调用它；漏调由
+/// `every_test_touching_cancel_flags_takes_the_guard` 拦下。
+///
+/// 持有到线程结束而不是交回一个 guard 值，是为了**可重入**：测试先调了它、
+/// 再经夹具调一次不会自锁；libtest 每个用例一个线程，线程退出时 TLS 析构
+/// 释放锁（用例 panic 也一样，`lock_recover` 兜住中毒）。
 #[cfg(test)]
-pub(crate) fn test_guard() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    crate::util::lock_recover(&LOCK)
+pub(crate) fn test_guard() {
+    use std::cell::RefCell;
+    use std::sync::{Mutex, MutexGuard};
+    static LOCK: Mutex<()> = Mutex::new(());
+    thread_local! {
+        static HELD: RefCell<Option<MutexGuard<'static, ()>>> = const { RefCell::new(None) };
+    }
+    HELD.with(|held| {
+        let mut held = held.borrow_mut();
+        if held.is_none() {
+            *held = Some(crate::util::lock_recover(&LOCK));
+        }
+    });
 }
 
 #[cfg(test)]
@@ -187,7 +214,7 @@ mod tests {
 
     #[test]
     fn run_cancel_and_process_shutdown_are_independent_until_shutdown_is_requested() {
-        let _guard = test_guard();
+        test_guard();
         RUN_CANCELLED.store(false, Ordering::SeqCst);
         PROCESS_SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
 
@@ -217,7 +244,7 @@ mod skip_tests {
     /// 屏幕上写着已请求停止，测试却继续跑完剩下的十个小时。
     #[test]
     fn a_stop_that_lands_during_a_skip_is_never_cleared() {
-        let _guard = test_guard();
+        test_guard();
         reset();
         request_skip_unit();
         assert!(is_cancelled(), "跳过要复用整轮取消那套收尾路径");
@@ -238,7 +265,7 @@ mod skip_tests {
     /// `is_cancelled`），于是「已请求停止」只停在屏幕上，队列照跑。
     #[test]
     fn a_stop_that_lands_inside_the_clear_window_still_stops_the_run() {
-        let _guard = test_guard();
+        test_guard();
         reset();
         request_skip_unit();
         assert!(take_skip_unit());
@@ -254,7 +281,7 @@ mod skip_tests {
 
     #[test]
     fn a_plain_skip_lets_the_queue_carry_on() {
-        let _guard = test_guard();
+        test_guard();
         reset();
         request_skip_unit();
         assert!(take_skip_unit());
@@ -267,7 +294,7 @@ mod skip_tests {
 
     #[test]
     fn ctrl_c_also_outranks_a_pending_skip() {
-        let _guard = test_guard();
+        test_guard();
         reset();
         request_skip_unit();
         request_shutdown();
@@ -275,5 +302,204 @@ mod skip_tests {
         assert!(!resume_after_skip(), "进程退出请求优先于跳过");
         PROCESS_SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
         reset();
+    }
+}
+
+#[cfg(test)]
+mod guard_coverage {
+    use std::path::Path;
+
+    /// 读写进程级取消位的入口。测试体里出现任何一个，就必须持有 `test_guard`。
+    ///
+    /// 除了直接读写，还有经由下面这些入口间接读写的：
+    /// - `api_run*` 过了互斥检查会 `reset()`，开头还读进程退出位；
+    /// - `api_stop` / 组合场景的 `stop` 会 `request_cancel()`；
+    /// - `api_skip_unit` / `RunStatusRecorder::request_skip` 会 `request_skip_unit()`；
+    /// - 造了执行器 `Ctx` 的用例跑单元时会读取消位、吞跳过请求。
+    const TOUCHES_FLAGS: &[&str] = &[
+        "cancel::reset(",
+        "cancel::request_cancel(",
+        "cancel::request_skip_unit(",
+        "cancel::request_shutdown(",
+        "cancel::take_skip_unit(",
+        "cancel::resume_after_skip(",
+        "cancel::is_cancelled(",
+        "cancel::is_stop_requested(",
+        "cancel::is_shutdown_requested(",
+        "api_run(",
+        "api_run_impl(",
+        "api_run_for_scenario(",
+        "api_stop(",
+        "api_skip_unit(",
+        ".scenario.start(",
+        ".scenario.stop(",
+        ".request_skip(",
+        "Ctx {",
+    ];
+    /// 本模块里只读源码、不碰标志的用例。
+    const SCANNER_TESTS: &[&str] = &[
+        "every_test_touching_cancel_flags_takes_the_guard",
+        "the_source_scanner_ignores_literals_and_comments",
+    ];
+    /// 自带 `test_guard()` 的夹具。
+    const GUARDED_FIXTURES: &[&str] = &["test_guard()", "isolated_ctx("];
+
+    /// 去掉注释和字符串/字符字面量，只留代码本身，免得大括号计数和关键字匹配
+    /// 被字面量里的 `{` 或文档注释里的函数名带偏。
+    fn strip(source: &str) -> String {
+        let bytes = source.as_bytes();
+        let mut out = String::with_capacity(source.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            let rest = &source[i..];
+            if rest.starts_with("//") {
+                let end = rest.find('\n').unwrap_or(rest.len());
+                i += end;
+            } else if rest.starts_with("/*") {
+                let end = rest.find("*/").map_or(rest.len(), |at| at + 2);
+                i += end;
+            } else if let Some(hashes) = raw_string_hashes(rest) {
+                let open = 2 + hashes;
+                let close = format!("\"{}", "#".repeat(hashes));
+                let end = rest[open..]
+                    .find(&close)
+                    .map_or(rest.len(), |at| open + at + close.len());
+                out.push_str("\"\"");
+                i += end;
+            } else if rest.starts_with('"') {
+                let mut j = 1;
+                while j < rest.len() {
+                    match rest.as_bytes()[j] {
+                        b'\\' => j += 2,
+                        b'"' => break,
+                        _ => j += 1,
+                    }
+                }
+                out.push_str("\"\"");
+                i += (j + 1).min(rest.len());
+            } else if rest.starts_with("'") && char_literal_len(rest).is_some() {
+                out.push_str("' '");
+                i += char_literal_len(rest).unwrap();
+            } else {
+                let ch = rest.chars().next().unwrap();
+                out.push(ch);
+                i += ch.len_utf8();
+            }
+        }
+        out
+    }
+
+    fn raw_string_hashes(rest: &str) -> Option<usize> {
+        let tail = rest.strip_prefix('r')?;
+        let hashes = tail.chars().take_while(|c| *c == '#').count();
+        tail[hashes..].starts_with('"').then_some(hashes)
+    }
+
+    /// `'a'`、`'\n'`、`'{'` 这类字符字面量的长度；生命周期 `'a` 返回 `None`。
+    fn char_literal_len(rest: &str) -> Option<usize> {
+        let mut chars = rest.char_indices().skip(1);
+        let (_, first) = chars.next()?;
+        if first == '\\' {
+            let close = rest[2..].find('\'')?;
+            return Some(2 + close + 1);
+        }
+        let (at, next) = chars.next()?;
+        (next == '\'').then_some(at + 1)
+    }
+
+    /// 每个 `#[test]` 函数的 (名字, 函数体)。
+    fn test_bodies(code: &str) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let mut from = 0;
+        while let Some(at) = code[from..].find("#[test]") {
+            let start = from + at;
+            let Some(fn_at) = code[start..].find("fn ") else {
+                break;
+            };
+            let name_start = start + fn_at + 3;
+            let name: String = code[name_start..]
+                .chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_')
+                .collect();
+            let Some(open) = code[name_start..].find('{') else {
+                break;
+            };
+            let open = name_start + open;
+            let mut depth = 0usize;
+            let mut end = code.len();
+            for (offset, ch) in code[open..].char_indices() {
+                match ch {
+                    '{' => depth += 1,
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = open + offset + 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            out.push((name, code[open..end].to_string()));
+            from = end;
+        }
+        out
+    }
+
+    fn rust_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                rust_files(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// 漏了 guard 的后果不是这条用例红，而是**别的**用例偶发红：一条
+    /// `request_skip_unit()` 的测试被并发的 `reset()` 抹掉请求，或者执行器测试
+    /// 撞上别人临时置位的取消位提前 break。这种失败复现不了、也指不到真凶，
+    /// 所以在源码层面拦。
+    #[test]
+    fn every_test_touching_cancel_flags_takes_the_guard() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        rust_files(&root, &mut files);
+        let mut missing = Vec::new();
+        for file in files {
+            let code = strip(&std::fs::read_to_string(&file).unwrap());
+            let in_cancel_module = file.ends_with("cancel.rs");
+            for (name, body) in test_bodies(&code) {
+                let touches = TOUCHES_FLAGS.iter().any(|needle| body.contains(needle))
+                    // 本模块的用例直接调 `reset()` / `request_cancel()`，不带路径前缀。
+                    || (in_cancel_module && !SCANNER_TESTS.contains(&name.as_str()));
+                let guarded = GUARDED_FIXTURES.iter().any(|needle| body.contains(needle));
+                if touches && !guarded {
+                    let shown = file
+                        .strip_prefix(&root)
+                        .unwrap_or(&file)
+                        .display()
+                        .to_string();
+                    missing.push(format!("{shown}::{name}"));
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "这些测试读写了进程级取消位却没有调用 crate::cancel::test_guard()：\n{}",
+            missing.join("\n")
+        );
+    }
+
+    #[test]
+    fn the_source_scanner_ignores_literals_and_comments() {
+        let code = strip("#[test]\nfn a() { let s = \"api_run(\"; // api_stop(\n let c = '{'; }\n#[test]\nfn b() { api_stop(&x); }");
+        let bodies = test_bodies(&code);
+        assert_eq!(bodies.len(), 2);
+        assert!(!TOUCHES_FLAGS
+            .iter()
+            .any(|needle| bodies[0].1.contains(needle)));
+        assert!(bodies[1].1.contains("api_stop("));
     }
 }

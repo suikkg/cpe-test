@@ -203,7 +203,10 @@ export function loadDraft(): boolean {
     plan.ui = ensureDefaults(parsed.ui);
     plan.pendingImportTopology = parsed.pendingImportTopology === true;
     plan.linkSets = Array.isArray(parsed.linkSets) ? parsed.linkSets : [];
-    plan.filter = parsed.filter ?? 'all';
+    // 「全部/跨机/同机」已改成网口表上只影响显示的筛选；集合始终按全部候选生成。
+    // 旧草稿里存的 cross/same 不再生效：roleKey 区分跨机与同机，两类网口从不进
+    // 同一个集合，所以 'all' 只会多出没有分配的集合，实际执行的单元不变。
+    plan.filter = 'all';
     if (typeof parsed.duration === 'number' && parsed.duration > 0) {
       plan.duration = parsed.duration;
     }

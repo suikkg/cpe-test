@@ -3,7 +3,7 @@ import { api, errorMessage, NetworkError, UnauthorizedError } from '../api/clien
 import { defaultInnerConfig, INNER_DRAFT_KEY, innerLink, mergeInnerUnits, normalizeInnerDraft, parseInnerProject, serializeInnerProject } from '../domain/inner';
 import type { InnerCapability, InnerLink, InnerPreview, InnerRunEntry, InnerStatus, InnerStatusDelta } from '../domain/inner';
 import { innerNicChoices, linksFromInnerChoices } from '../domain/inner-setup';
-import { buildRunRequest, plan as subnetPlan, preview as previewSubnet, previewIsCurrent, adoptRunRequest } from './plan';
+import { buildRunRequest, invalidatePreview, plan as subnetPlan, preview as previewSubnet, previewIsCurrent, adoptRunRequest } from './plan';
 import { goto } from './ui';
 import { session } from './session';
 
@@ -35,21 +35,49 @@ let scenarioTimer: ReturnType<typeof setTimeout> | undefined;
 // 否则页面初次加载的旧 GET 在启动响应之后返回，会把 running=true 覆盖回 false。
 let scenarioRequest = 0;
 
-let scenarioBeforeStartId = '';
+/**
+ * 尚未确认的那次组合场景启动所带的令牌；空串 = 没有待确认的启动。
+ *
+ * 启动请求没拿到应答时，只能靠回读状态判断它有没有起跑。以前拿「状态里的
+ * 场景 ID ≠ 开始前记下的 ID」判断：页面初次读状态失败时记下的是空串，任何
+ * 一个旧场景的 ID 都会被当成「这次起来了」，锁随之解开，而那条请求可能还在
+ * 排队。现在只认状态里带回的、自己发出的这枚令牌。
+ */
+let pendingStartToken = '';
+
+/**
+ * 一次性的随机令牌，32 位十六进制。
+ *
+ * 不用 `crypto.randomUUID()`：用 `--ui-bind` 远程打开的明文 HTTP 页面不是安全
+ * 上下文，没有这个函数；`getRandomValues` 两种上下文都有。
+ */
+function newStartToken(): string {
+  const bytes = new Uint8Array(16);
+  globalThis.crypto.getRandomValues(bytes);
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
+}
 
 export function scenarioBlocksActions(): boolean {
   return inner.scenario.running || inner.scenarioStartPhase === 'sending' || inner.scenarioStartPhase === 'unknown';
 }
 
-/** 操作员确认重新准备；只清本地准备态，绝不重发启动。 */
+/**
+ * 操作员确认重新准备；只清本地准备态，绝不重发启动。
+ *
+ * 子网预览和内环预览**一起**作废：组合场景同时用两份计划，只作废内环那份的话，
+ * 下一次启动会拿事故前的子网 `plan_hash` 直接重开——子网自己的
+ * `prepareAfterUnknownStart` 早就要求重新预览了。
+ */
 export function prepareAfterUnknownScenario(): void {
   if (inner.scenarioStartPhase !== 'unknown' || !inner.scenarioLastReadIdle) return;
   scenarioRequest++;
   if (scenarioTimer !== undefined) clearTimeout(scenarioTimer);
   scenarioTimer = undefined;
+  pendingStartToken = '';
   inner.scenarioStartPhase = 'idle';
   inner.scenarioLastReadIdle = false;
   inner.previewStale = true;
+  invalidatePreview();
   inner.error = '';
 }
 
@@ -230,14 +258,16 @@ export async function startSubnetThenInner(): Promise<void> {
   parseInnerProject(JSON.stringify(innerCfg));
   if (!innerCfg.links.some((link) => link.enabled)) throw new Error('内环场景没有勾选任何网口');
   inner.busy = true; inner.error = '';
-  scenarioBeforeStartId = inner.scenario.id;
+  const startToken = newStartToken();
+  pendingStartToken = startToken;
   inner.scenarioStartPhase = 'sending';
   inner.scenarioLastReadIdle = false;
   scenarioRequest++;
   try {
     const out = await api.post<{ started: boolean; id: string }>('/api/scenario/run', {
-      subnet, inner: innerCfg, resume_subnet: true, resume_inner: true,
+      subnet, inner: innerCfg, resume_subnet: true, resume_inner: true, start_token: startToken,
     });
+    pendingStartToken = '';
     inner.scenarioStartPhase = 'accepted';
     inner.scenario.running = true;
     inner.scenario.id = out.id;
@@ -250,6 +280,8 @@ export async function startSubnetThenInner(): Promise<void> {
     // 如果这次回读也断在半路，本地仍是 running=false，普通状态链不会自行续
     // 轮询；保留一条延迟回读，避免后台场景继续跑而页面永远失去跟踪。
     inner.scenarioStartPhase = e instanceof NetworkError ? 'unknown' : 'idle';
+    // 服务端明确拒绝时这次启动确定没发生，令牌作废；断线时留着等状态里带回来。
+    if (!(e instanceof NetworkError)) pendingStartToken = '';
     await syncScenarioStatus(e instanceof NetworkError);
   } finally { inner.busy = false; }
 }
@@ -270,10 +302,16 @@ export async function syncScenarioStatus(retryWhenUnknown = false): Promise<void
     scenarioTimer = undefined;
   }
   try {
-    const status = await api.get<{ running: boolean; id: string; phase: string; error: string | null }>('/api/scenario/status');
+    const status = await api.get<{
+      running: boolean; id: string; phase: string; error: string | null; start_token?: string;
+    }>('/api/scenario/status');
     if (request !== scenarioRequest) return;
     inner.scenarioLastReadIdle = !status.running;
-    if (status.running || (status.id && status.id !== scenarioBeforeStartId)) {
+    // 只有状态里带回的是**这一次**启动的令牌，才算确认起跑（不论此刻是否已跑完）。
+    // 别的标签页起的场景在跑时保持未确认：`scenarioBlocksActions()` 照样锁着操作，
+    // 它结束、读到空闲之后，仍由操作员核实后点「重新准备」。
+    if (pendingStartToken && status.start_token === pendingStartToken) {
+      pendingStartToken = '';
       inner.scenarioStartPhase = 'accepted';
     }
     inner.scenario.running = status.running;

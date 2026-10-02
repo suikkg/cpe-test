@@ -53,9 +53,22 @@ pub struct DirectionSummary {
     pub nic_samples_rx: String,
 }
 
+/// 当前写出的对齐身份版本。
+///
+/// - 0：6.5.1 写下的身份（没有这个字段）。参数是实际下发的标签，可能带着路径裁剪、
+///   链路策略说明和 CTS 的「×N流」，多流 UDP 还按流重复。
+/// - 2：参数是计划里请求的档位（`comparison_label`），每条腿一项。
+///
+/// 旧报告从明细行还原出来的身份同样按 0 处理。版本只决定读取时要不要做历史兜底，
+/// 对齐键里一律写成当前版本，新旧两类身份才能落在同一把键上。
+pub const COMPARISON_IDENTITY_VERSION: u32 = 2;
+
 /// 跨轮对比身份：不含 IP 地址、协商速率、运行序号或测量结果。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ComparisonIdentity {
+    /// 见 [`COMPARISON_IDENTITY_VERSION`]；6.5.1 的记录没有这个字段，读进来是 0。
+    #[serde(default)]
+    pub version: u32,
     pub bidir: bool,
     pub round: u32,
     pub legs: Vec<ComparisonLeg>,
@@ -70,6 +83,8 @@ pub struct ComparisonLeg {
     pub src_iface: String,
     pub dst_side: RowSide,
     pub dst_iface: String,
+    /// 请求的参数。新记录每条腿一项（不按流展开、不含路径裁剪与按网口策略的改写）；
+    /// 6.5.1 写下的记录由 `report::compare` 归一后再对齐，见 [`COMPARISON_IDENTITY_VERSION`]。
     pub parameters: Vec<String>,
     pub seconds: Option<u64>,
 }

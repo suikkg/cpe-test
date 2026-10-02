@@ -1114,7 +1114,7 @@ pub mod xlsx;
 pub use format::report_endpoint;
 pub use model::{
     ComparisonIdentity, ComparisonLeg, DirectionSummary, ReportMeta, Row, RowBackend, RowDirection,
-    RowProtocol, RowSide, StreamCounts,
+    RowProtocol, RowSide, StreamCounts, COMPARISON_IDENTITY_VERSION,
 };
 pub use reason::report_reason;
 

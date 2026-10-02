@@ -173,12 +173,22 @@ impl InfoReq {
         }
     }
 
-    pub fn check_capabilities(&self, capabilities: &[String]) -> Result<(), String> {
-        if self.all_interfaces
+    /// 这份请求需要、而对方没有声明的能力；`None` = 可以发。
+    ///
+    /// 旧 agent 会忽略不认识的 `all_interfaces` 并悄悄套用默认前缀，所以全接口扫描
+    /// 必须先核实能力。子网与内环两个入口共用这一条规则，提示文案各自说：子网可以
+    /// 改填前缀绕过，内环没有这个选项。
+    pub fn missing_capability(&self, capabilities: &[String]) -> Option<&'static str> {
+        (self.all_interfaces
             && !capabilities
                 .iter()
-                .any(|value| value == UNFILTERED_INFO_CAPABILITY)
-        {
+                .any(|value| value == UNFILTERED_INFO_CAPABILITY))
+        .then_some(UNFILTERED_INFO_CAPABILITY)
+    }
+
+    /// 子网入口（控制台连接、命令行主控）的能力检查与提示。
+    pub fn check_capabilities(&self, capabilities: &[String]) -> Result<(), String> {
+        if self.missing_capability(capabilities).is_some() {
             return Err(
                 "辅测机暂不支持显示全部网卡，请更新辅测机程序，或填写 IPv4 前缀后重试".into(),
             );
@@ -641,12 +651,26 @@ mod tests {
         let request = super::InfoReq::for_scan(&[]);
         assert!(request.effective_prefixes(&defaults).is_empty());
         assert!(request.check_capabilities(&[]).is_err());
+        assert_eq!(
+            request.missing_capability(&[]),
+            Some(super::UNFILTERED_INFO_CAPABILITY),
+            "子网与内环共用的能力规则"
+        );
         assert!(request
             .check_capabilities(&[super::UNFILTERED_INFO_CAPABILITY.into()])
             .is_ok());
+        assert_eq!(
+            request.missing_capability(&[super::UNFILTERED_INFO_CAPABILITY.into()]),
+            None
+        );
         let request = super::InfoReq::for_scan(&["10.".into()]);
         assert_eq!(request.effective_prefixes(&defaults), ["10."]);
         assert!(request.check_capabilities(&[]).is_ok());
+        assert_eq!(
+            request.missing_capability(&[]),
+            None,
+            "带前缀的扫描不需要这项能力"
+        );
         assert_eq!(
             super::InfoReq::default().effective_prefixes(&defaults),
             defaults

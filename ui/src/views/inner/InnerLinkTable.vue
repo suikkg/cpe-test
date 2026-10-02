@@ -109,8 +109,7 @@ function remove(index: number, link: InnerLink): void {
   <div class="link-table">
     <section v-if="inner.capability" class="scan-picker" aria-label="从扫描结果添加网口">
       <strong>选择实际接到 CPE 的电脑网卡</strong>
-      <p class="muted">勾选后自动填入电脑、网卡和 IPv4 / IPv6；添加后核对每个网口的 CPE LAN 地址。已发现网卡不代表 CPE 已可达，启动时还会检查链路。</p>
-      <p class="muted">默认显示 192.168.* 和仅有 IPv6 的电脑网卡，隐藏常见隧道和虚拟接口。其他网段可按需展开，已添加的配置不受影响。</p>
+      <p class="muted">默认只列 192.168.* 和仅 IPv6 的网卡；添加后核对每个网口的 CPE LAN 地址，启动时还会检查链路。</p>
       <label v-if="otherCount" class="other-toggle"><input v-model="showOther" type="checkbox">显示其他网段 / 隧道接口（{{ otherCount }} 项）</label>
       <div v-if="choices.length" class="scan-options">
         <label v-for="choice in choices" :key="choice.key" class="scan-option">
@@ -128,12 +127,12 @@ function remove(index: number, link: InnerLink): void {
         <option value="">全部电脑</option>
         <option v-for="host in props.hosts" :key="host.id" :value="host.id">{{ host.label }}</option>
       </select>
-      <button :disabled="props.disabled" @click="setInnerLinkEnabled(rows.map((r) => r.link), true)">勾选当前筛选</button>
-      <button :disabled="props.disabled" @click="setInnerLinkEnabled(rows.map((r) => r.link), false)">取消勾选</button>
-      <button :disabled="props.disabled || !visibleEnabled.length" :aria-expanded="batchOpen" @click="batchOpen = !batchOpen">
+      <button class="ghost small" :disabled="props.disabled" @click="setInnerLinkEnabled(rows.map((r) => r.link), true)">勾选当前筛选</button>
+      <button class="ghost small" :disabled="props.disabled" @click="setInnerLinkEnabled(rows.map((r) => r.link), false)">取消勾选</button>
+      <button class="ghost small" :disabled="props.disabled || !visibleEnabled.length" :aria-expanded="batchOpen" @click="batchOpen = !batchOpen">
         批量设置（{{ visibleEnabled.length }} 条）
       </button>
-      <button :disabled="props.disabled || inner.config.links.length >= 32" @click="addManual">手动添加网口</button>
+      <button class="ghost small" :disabled="props.disabled || inner.config.links.length >= 32" @click="addManual">手动添加网口</button>
       <span class="muted">共 {{ inner.config.links.length }} 条，本轮参与 {{ enabledCount }} 条</span>
     </div>
 
@@ -150,11 +149,10 @@ function remove(index: number, link: InnerLink): void {
         <label>上行网卡门限 Mbps<input v-model="batch.upload_min_mbps" type="number" min="0.01" step="any"></label>
         <label>下行网卡门限 Mbps<input v-model="batch.download_min_mbps" type="number" min="0.01" step="any"></label>
       </div>
-      <p class="muted">批量设置只修改当前显示且参与测试的网口。电脑、网卡和源地址请逐口编辑。</p>
-      <div class="bar"><button class="primary" @click="applyBatch">应用到已勾选</button><button @click="batchOpen = false">取消</button></div>
+      <div class="bar"><button class="primary" @click="applyBatch">应用到已勾选</button><button class="ghost" @click="batchOpen = false">取消</button></div>
     </fieldset>
 
-    <p v-if="!inner.config.links.length" class="muted">还没有网口。先点上方「检查 ADB / 扫描各电脑网卡」，再从扫描结果勾选实际接到 CPE 的网卡。</p>
+    <p v-if="!inner.config.links.length" class="muted">还没有网口：先扫描，再从扫描结果勾选，或手动添加。</p>
     <div v-else class="scroll">
       <table>
         <thead><tr>
@@ -167,8 +165,8 @@ function remove(index: number, link: InnerLink): void {
             <td><input v-model="link.enabled" type="checkbox" :disabled="props.disabled" :aria-label="`${link.name} 参与本轮`"></td>
             <td class="order">
               <span class="num">{{ index + 1 }}</span>
-              <button :disabled="props.disabled || prev === undefined" :aria-label="`${link.name} 上移`" @click="moveInnerLinkTo(index, prev!)">↑</button>
-              <button :disabled="props.disabled || next === undefined" :aria-label="`${link.name} 下移`" @click="moveInnerLinkTo(index, next!)">↓</button>
+              <button class="ghost small" :disabled="props.disabled || prev === undefined" :aria-label="`${link.name} 上移`" @click="moveInnerLinkTo(index, prev!)">↑</button>
+              <button class="ghost small" :disabled="props.disabled || next === undefined" :aria-label="`${link.name} 下移`" @click="moveInnerLinkTo(index, next!)">↓</button>
             </td>
             <td>{{ link.host === 'master' ? '本机' : link.host }}</td>
             <td><strong>{{ link.name }}</strong><br><span class="muted">{{ link.local_interface || '未选网卡' }}</span></td>
@@ -177,14 +175,14 @@ function remove(index: number, link: InnerLink): void {
             <td>{{ link.board_rx_interface || '自动' }}<br><span class="muted">{{ MEASUREMENT_LABEL[link.measurement] }}</span></td>
             <td :class="status(link).tone">{{ status(link).text }}</td>
             <td class="bar">
-              <button @click="emit('edit', props.editing === link ? null : link)">{{ props.editing === link ? '收起' : status(link).tone === 'warn' || status(link).tone === 'bad' ? '检查 / 修改' : '编辑' }}</button>
-              <button :disabled="props.disabled" @click="remove(index, link)">删除</button>
+              <button class="ghost small" @click="emit('edit', props.editing === link ? null : link)">{{ props.editing === link ? '收起' : status(link).tone === 'warn' || status(link).tone === 'bad' ? '检查 / 修改' : '编辑' }}</button>
+              <button class="ghost small danger" :disabled="props.disabled" @click="remove(index, link)">删除</button>
             </td>
           </tr>
         </tbody>
       </table>
     </div>
-    <p v-if="inner.config.links.length && !rows.length" class="muted">没有网口匹配当前筛选。<button @click="search = ''; hostFilter = ''">清空筛选</button></p>
+    <p v-if="inner.config.links.length && !rows.length" class="muted">没有网口匹配当前筛选。<button class="linklike" @click="search = ''; hostFilter = ''">清空筛选</button></p>
   </div>
 </template>
 
@@ -196,7 +194,8 @@ function remove(index: number, link: InnerLink): void {
 .scan-option input { margin-top: 3px; flex-shrink: 0; }
 .scan-option span { overflow-wrap: anywhere; }
 .scan-option small { display: block; margin-top: 3px; color: var(--muted); }
-.table-tools { flex-wrap: wrap; gap: 8px; align-items: center; }
+.bar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.table-tools { margin-bottom: 10px; }
 .table-tools input[type="search"] { min-width: 200px; }
 /* 表格限高 + 固定表头：几十条链路也不会把页面撑成一条长卷。 */
 .scroll { max-height: 24rem; overflow: auto; border: 1px solid var(--line); border-radius: 6px; }

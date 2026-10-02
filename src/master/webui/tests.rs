@@ -2369,6 +2369,8 @@ fn console_for_monitor_tests() -> Arc<Console> {
 
 #[test]
 fn inner_import_and_stop_leave_the_subnet_configuration_and_run_untouched() {
+    // api_run 读进程退出位并在过了互斥检查后 reset()；api_skip_unit 读停止位。
+    crate::cancel::test_guard();
     let console = console_for_monitor_tests();
     let before = serde_json::to_string(&lock_recover(&console.state).cfg).unwrap();
     let error = api_import(&console, include_str!("../../../inner.example.json")).unwrap_err();
@@ -4380,6 +4382,8 @@ fn the_plan_reports_both_ends_of_the_resume_estimate() {
 
 #[test]
 fn preview_blocking_errors_match_start_rejection_for_unavailable_ipv6() {
+    // api_run 读进程退出位并在过了互斥检查后 reset()；api_skip_unit 读停止位。
+    crate::cancel::test_guard();
     let console = console_for_monitor_tests();
     let mut req = suite_request();
     for task in &mut req.ui_plan.as_mut().unwrap().suites[0].tasks {
@@ -4415,6 +4419,8 @@ fn preview_blocking_errors_match_start_rejection_for_unavailable_ipv6() {
 
 #[test]
 fn preview_blocking_errors_match_start_rejection_for_an_empty_legacy_plan() {
+    // api_run 读进程退出位并在过了互斥检查后 reset()；api_skip_unit 读停止位。
+    crate::cancel::test_guard();
     let console = console_for_monitor_tests();
     let mut req = request();
     req.pairs[0].ip = vec!["v6".into()];
@@ -6918,6 +6924,8 @@ fn console_scan_prefixes_match_the_ui_and_unsupported_full_scan_preserves_state(
 
 #[test]
 fn skip_endpoint_rejects_missing_and_stale_targets_without_cancelling() {
+    // api_run 读进程退出位并在过了互斥检查后 reset()；api_skip_unit 读停止位。
+    crate::cancel::test_guard();
     use crate::master::run_status::{CurrentUnit, RunObserver};
     let console = console_with(state_with_pair());
     console.running.store(true, Ordering::SeqCst);

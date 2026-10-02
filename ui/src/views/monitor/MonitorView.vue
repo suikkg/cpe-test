@@ -86,11 +86,8 @@ async function addAll(): Promise<void> {
 
 <template>
   <section class="view">
-    <header class="view-head">
+    <header class="page-head">
       <h2>监控</h2>
-      <p class="muted">
-        查看网卡实时收发速率，可在测试前或测试期间使用。
-      </p>
     </header>
 
     <div class="bar">
@@ -145,12 +142,8 @@ async function addAll(): Promise<void> {
       </button>
     </div>
 
-    <p class="muted hint">
-      同时最多 {{ MONITOR_MAX_SESSIONS }} 路（当前 {{ monitor.sessions.length }} 路）。
-      每块网卡同时只能开启一路监控。
-      <template v-if="full"><strong>已达上限，先停掉一路再开。</strong></template>
-      <template v-else-if="selectable === 0 && nics.length">这一端的网卡都已经在监控了。</template>
-    </p>
+    <p v-if="full" class="hint" role="status">已达 {{ MONITOR_MAX_SESSIONS }} 路上限，先停掉一路再开。</p>
+    <p v-else-if="selectable === 0 && nics.length" class="hint" role="status">这一端的网卡都已在监控。</p>
 
     <p v-if="monitor.error" class="bad" role="alert">{{ monitor.error }}</p>
     <p v-if="monitor.notice" class="hint" role="status">{{ monitor.notice }}</p>
@@ -158,9 +151,7 @@ async function addAll(): Promise<void> {
       监控更新失败，当前曲线为上次成功数据：{{ monitor.refreshError }}。正在等待重新同步。
     </p>
 
-    <div v-if="monitor.sessions.length === 0" class="empty">
-      还没有在跑的监控。选一块网卡开始。
-    </div>
+    <p v-if="monitor.sessions.length === 0" class="empty-state">选一块网卡开始监控（最多 {{ MONITOR_MAX_SESSIONS }} 路）。</p>
 
     <!-- 左边选，右边看：全部曲线一路向下堆叠时，第三路以后就得靠滚动去找，
          而每一张图都在按采样间隔重画。切换选中**只换展示**，不启停任何会话。 -->

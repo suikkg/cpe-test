@@ -148,6 +148,8 @@ pub struct CompareOutcome {
     pub disappeared: usize,
     pub unchanged: usize,
     pub ambiguous: usize,
+    /// 其中一轮按 RESUME 复用 PASS、没有实际执行的单元数。
+    pub resumed: usize,
 }
 
 /// 对比两个 run 目录，把差异报告写进**新的那一轮**的目录里。
@@ -205,23 +207,28 @@ pub fn compare_runs_into(baseline: &Path, current: &Path) -> Result<CompareOutco
         disappeared: diff.count(DeltaKind::Disappeared),
         unchanged: diff.count(DeltaKind::Unchanged),
         ambiguous: diff.count(DeltaKind::Ambiguous),
+        resumed: diff.count(DeltaKind::Resumed),
     })
 }
 
 /// 命令行入口。**发现回归就返回非 0**，这样它可以直接接在 CI 里当一道门。
 ///
-/// 判定变坏或明显掉速都算回归；「本轮新增/缺失」不算——那多半是计划变了。
+/// 判定变坏或明显掉速都算回归；「本轮新增/缺失」「RESUME 跳过」不算——那多半是
+/// 计划变了，或者这一轮根本没执行。
+///
+/// 退出码见 [`compare_exit_code`]。
 pub fn compare_runs(baseline: &Path, current: &Path) -> i32 {
     match compare_runs_into(baseline, current) {
         Ok(outcome) => {
             println!("对比报告已生成: {}", outcome.report.display());
             println!(
-                "判定变坏 {} · 速率下降 {} · 判定转好 {} · 本轮新增 {} · 本轮缺失 {} · 无实质变化 {}",
+                "判定变坏 {} · 速率下降 {} · 判定转好 {} · 本轮新增 {} · 本轮缺失 {} · RESUME 跳过 {} · 无实质变化 {}",
                 outcome.regressed,
                 outcome.slower,
                 outcome.fixed,
                 outcome.added,
                 outcome.disappeared,
+                outcome.resumed,
                 outcome.unchanged,
             );
             if !outcome.same_plan {
@@ -234,15 +241,28 @@ pub fn compare_runs(baseline: &Path, current: &Path) -> i32 {
                     "无法唯一匹配 {} 条记录，请查看对比报告；本次对比不完整。",
                     outcome.ambiguous
                 );
-                2
-            } else {
-                i32::from(outcome.has_regression)
             }
+            compare_exit_code(outcome.has_regression, outcome.ambiguous)
         }
         Err(error) => {
             eprintln!("{error}");
             2
         }
+    }
+}
+
+/// 对比的退出码：0 = 无回归且对比完整；1 = 有回归；2 = 无回归但对比不完整（或出错）。
+///
+/// **确定的回归优先于「不完整」。** 先判不完整的话，只要基线里有一条旧 PING
+/// （6.5.0 之前的明细不带次数，必然无法唯一匹配），一次真正的判定变坏也只能
+/// 拿到 2，接在 CI 上分不出「设备退化了」和「历史数据不全」。
+pub(crate) fn compare_exit_code(has_regression: bool, ambiguous: usize) -> i32 {
+    if has_regression {
+        1
+    } else if ambiguous > 0 {
+        2
+    } else {
+        0
     }
 }
 
@@ -1666,8 +1686,20 @@ mod tests {
     use crate::master::builder::{CtsTrafficTask, IperfTask, Leg, PingPurpose, PingTask};
     use crate::protocol::NicInfo;
 
-    /// 空文件、只有空白、以及带换行的正常记录都要给出正确答案——
-    /// 控制台拿它预填输入框，返回一个空串会让「已记住」看起来像「没记住」。
+    /// 确定的回归优先于「对比不完整」：只要基线里有一条无法唯一匹配的旧 PING，
+    /// 真正的判定变坏也不能只拿到 2——CI 上那就分不出「设备退化」和「历史不全」。
+    #[test]
+    fn a_regression_outranks_an_incomplete_comparison_in_the_exit_code() {
+        assert_eq!(compare_exit_code(false, 0), 0);
+        assert_eq!(compare_exit_code(true, 0), 1);
+        assert_eq!(compare_exit_code(true, 3), 1);
+        assert_eq!(compare_exit_code(false, 3), 2);
+    }
+
+    /// 命令行主控的开跑扫描与执行期的实时重扫，都要**显式**说明要不要全接口。
+    ///
+    /// 前缀留空时发 `all_interfaces: true`；旧语义里空前缀会被 agent 换成它自己的
+    /// 默认前缀，两端网卡清单就对不上了。填了前缀时照旧按前缀过滤。
     #[test]
     fn execution_and_live_rescan_send_explicit_all_interface_requests() {
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
@@ -1704,6 +1736,8 @@ mod tests {
         worker.join().unwrap();
     }
 
+    /// 空文件、只有空白、以及带换行的正常记录都要给出正确答案——
+    /// 控制台拿它预填输入框，返回一个空串会让「已记住」看起来像「没记住」。
     #[test]
     fn the_remembered_agent_host_ignores_missing_and_blank_records() {
         // 固定目录名会在并发 cargo test 之间撞车（两个 checkout、CI 矩阵、
@@ -1909,6 +1943,7 @@ mod tests {
                     udp: true,
                     profile_name: "udp".into(),
                     profile_label: "UDP".into(),
+                    comparison_label: "UDP".into(),
                     src: master,
                     dst: agent,
                     port: 56_000,
@@ -1943,6 +1978,7 @@ mod tests {
                     udp: true,
                     profile_name: "cts_udp_b500m_c3".into(),
                     profile_label: "CTS UDP -b 500m ×3流 (每流)".into(),
+                    comparison_label: "CTS UDP -b 500m (每流)".into(),
                     src: master,
                     dst: agent,
                     port: 56_001,

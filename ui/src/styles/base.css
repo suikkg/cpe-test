@@ -23,10 +23,15 @@
   scrollbar-gutter: stable;
 }
 .view { max-width: 1200px; margin-inline: auto; }
-.view-head { margin: 0 0 24px; }
-.view-head h2 { margin: 0 0 6px; font-size: 24px; line-height: 1.35; letter-spacing: -.02em; }
-.view-head p { margin: 0; font-size: 13px; line-height: 1.7; max-width: 76ch; }
 .view h3 { margin: 24px 0 10px; font-size: 15px; }
+
+/* 页头：只有标题和这一页的主操作，不写副标题。 */
+.page-head {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px 16px; flex-wrap: wrap; margin: 0 0 20px;
+}
+.page-head h2 { margin: 0; font-size: 22px; line-height: 1.35; letter-spacing: -.02em; }
+.page-head .actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 
 button {
   font: inherit;
@@ -68,6 +73,78 @@ summary::marker { color: var(--muted); }
 }
 .skip-link:focus { transform: translateY(0); }
 
+/* 提示条：一句话说清发生了什么、下一步做什么。 */
+.msg {
+  margin: 12px 0; padding: 10px 14px;
+  border: 1px solid var(--line); border-left: 3px solid var(--muted); border-radius: 6px;
+  background: var(--panel-2); font-size: 13px; line-height: 1.6; overflow-wrap: anywhere;
+}
+.msg p { margin: 0; }
+.msg p + p { margin-top: 6px; }
+.msg button { margin: 8px 8px 0 0; }
+.msg ul { margin: 6px 0 0; padding-left: 20px; }
+.msg.ok { border-left-color: var(--ok); background: var(--ok-bg); }
+.msg.warn { border-left-color: var(--warn); background: var(--info-bg); }
+.msg.bad { border-left-color: var(--bad); background: var(--bad-bg); }
+
+.empty-state {
+  padding: 28px 20px; text-align: center; color: var(--muted);
+  border: 1px dashed var(--line); border-radius: 8px;
+}
+.empty-state p { margin: 0; }
+.empty-state button { margin: 12px 4px 0; }
+
+.toolbar { display: flex; align-items: center; gap: 8px 10px; flex-wrap: wrap; margin: 12px 0; }
+.toolbar .grow { flex: 1 1 220px; }
+.toolbar input[type='search'] { width: 100%; }
+.toolbar .count { color: var(--muted); font-size: 12.5px; }
+.toolbar .push { margin-left: auto; }
+
+.panel { margin: 16px 0; padding: 16px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); }
+.panel > h3:first-child { margin-top: 0; }
+
+/* 分段按钮：互斥的几个显示选项。 */
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+.seg button {
+  min-height: 32px; padding: 5px 12px; border: 0; border-radius: 0;
+  background: var(--surface); color: var(--muted); font-weight: 500;
+}
+.seg button + button { border-left: 1px solid var(--line); }
+.seg button[aria-pressed='true'] { background: var(--accent); color: var(--on-accent); }
+.seg button:hover:not(:disabled):not([aria-pressed='true']) { background: var(--head); }
+
+.check { display: inline-flex; align-items: center; gap: 6px; cursor: pointer; }
+.field { display: grid; gap: 5px; font-size: 12.5px; color: var(--muted); }
+.field > input, .field > select, .field > span > input { color: var(--ink); }
+.unit-input { display: inline-flex; align-items: center; gap: 6px; }
+.unit-input input { width: 90px; }
+
+.table-wrap { max-width: 100%; overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; }
+table.data { width: 100%; border-collapse: collapse; font-size: 13px; }
+table.data th, table.data td {
+  padding: 9px 12px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--line);
+}
+table.data thead th {
+  background: var(--head); color: var(--muted); font-size: 12px; font-weight: 600; white-space: nowrap;
+}
+table.data tbody tr:last-child > * { border-bottom: 0; }
+table.data .num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+table.data small { display: block; color: var(--muted); }
+
+.verdict { display: inline-block; font: 600 11.5px/1.6 var(--fm); white-space: nowrap; }
+.verdict.pass { color: var(--ok); }
+.verdict.fail { color: var(--bad); }
+.verdict.inconclusive { color: var(--warn); }
+.verdict.measured, .verdict.skip { color: var(--muted); }
+
+button.small { min-height: 30px; padding: 4px 10px; font-size: 12.5px; }
+button.linklike {
+  min-height: 0; padding: 0; border: 0; background: none; color: var(--accent);
+  font-weight: 500; text-decoration: underline; text-underline-offset: 3px;
+}
+button.linklike:hover:not(:disabled) { background: none; color: var(--accent-hover); }
+button.danger { color: var(--bad); }
+
 /* 暗色数据屏是仪器的读数区，不随主题切换。 */
 .screen {
   position: relative;
@@ -97,6 +174,5 @@ summary::marker { color: var(--muted); }
   .app { border-inline: 0; }
   .app-body { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
   .app-main { padding: 22px 16px 32px; }
-  .view-head { margin-bottom: 20px; }
-  .view-head h2 { font-size: 22px; }
+  .page-head h2 { font-size: 20px; }
 }

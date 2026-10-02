@@ -87,6 +87,11 @@ fn ctstraffic_task(udp: bool) -> CtsTrafficTask {
         } else {
             "CTS TCP socket-buffer 64k ×3连接".into()
         },
+        comparison_label: if udp {
+            "CTS UDP -b 500m (每流)".into()
+        } else {
+            "CTS TCP socket-buffer 64k ×3连接".into()
+        },
         src: endpoint(Side::Master, "master0", "192.168.1.2"),
         dst: endpoint(Side::Agent, "agent0", "192.168.1.3"),
         port: 56_000,
@@ -221,6 +226,9 @@ fn ctstraffic_attempt(attempt: usize, traffic_established: bool) -> CtsAttemptRu
 }
 
 fn isolated_ctx(agent_port: u16) -> (Ctx, PathBuf) {
+    // 执行器会读进程级取消位（单元循环、腿内轮询、探针）并在单元边界吞掉跳过
+    // 请求：凡是造了 Ctx 的用例都要和改这些标志的用例互斥，见 `cancel::test_guard`。
+    crate::cancel::test_guard();
     let seq = RESOURCE_OWNER_SEQ.fetch_add(1, Ordering::SeqCst);
     let db_path = std::env::temp_dir().join(format!(
         "cpe_test_executor_{}_{}.json",
@@ -508,7 +516,7 @@ fn acc_start_req(request_id: &str, port: u16) -> IperfClientStartReq {
 
 #[test]
 fn explicit_user_cancellation_survives_successful_remote_cleanup() {
-    let _guard = crate::cancel::test_guard();
+    crate::cancel::test_guard();
     // 取消位是进程级共享状态；在独立测试进程驱动真实 RPC 分支，避免影响
     // 同时运行的吞吐测试，也不靠静态源码匹配代替行为验证。
     const CHILD_ENV: &str = "CPE_TEST_EXECUTOR_CANCEL_CHILD";
@@ -969,6 +977,7 @@ fn udp_plan(
             udp: true,
             profile_name: "udp_b500m".into(),
             profile_label: "UDP -b 500m".into(),
+            comparison_label: "UDP -b 500m".into(),
             src: src.clone(),
             dst: dst.clone(),
             port: 56_000 + (lidx * 100 + stream_idx) as u16,
@@ -994,6 +1003,7 @@ fn tcp_task(src: &Endpoint, dst: &Endpoint, port: u16) -> IperfTask {
         udp: false,
         profile_name: "tcp_w64k_P2".into(),
         profile_label: "TCP -w 64k -P 2".into(),
+        comparison_label: "TCP -w 64k -P 2".into(),
         src: src.clone(),
         dst: dst.clone(),
         port,
@@ -1983,6 +1993,7 @@ fn bidir_udp_unit(ab_port: u16, ba_port: u16, streams: usize) -> (Unit, Vec<UdpL
                 udp: true,
                 profile_name: "udp_b500m".into(),
                 profile_label: "UDP -b 500m".into(),
+                comparison_label: "UDP -b 500m".into(),
                 src: src.clone(),
                 dst: dst.clone(),
                 port: base + stream_idx as u16,
@@ -4536,6 +4547,7 @@ fn preflight_block_marks_iperf_without_touching_ping_legs() {
         udp: false,
         profile_name: "tcp_w64k".into(),
         profile_label: "TCP -w 64k".into(),
+        comparison_label: "TCP -w 64k".into(),
         src: master,
         dst: agent,
         port: 56_000,
@@ -5070,6 +5082,7 @@ fn preflight_block_takes_priority_over_resume_pass() {
                 udp: false,
                 profile_name: "tcp_w64k".into(),
                 profile_label: "TCP -w 64k".into(),
+                comparison_label: "TCP -w 64k".into(),
                 src: master,
                 dst: agent,
                 port: 56_000,
@@ -5095,6 +5108,7 @@ fn preflight_block_takes_priority_over_resume_pass() {
         resume: true,
         ..Default::default()
     };
+    crate::cancel::test_guard();
     let ctx = Ctx {
         agent_ping_df: true,
         topology: None,
@@ -5322,6 +5336,7 @@ fn mixed_preflight_failure_still_runs_independent_ping_unit() {
                 udp: false,
                 profile_name: "tcp".into(),
                 profile_label: "TCP".into(),
+                comparison_label: "TCP".into(),
                 src: endpoint(Side::Master, "master0", "192.168.1.2"),
                 dst: endpoint(Side::Agent, "agent0", "192.168.1.3"),
                 port: 56_000,
@@ -5573,6 +5588,7 @@ fn raw_iperf_record_contains_both_sides_events_and_error() {
         udp: false,
         profile_name: "tcp_w1m_P5".into(),
         profile_label: "TCP -w 1m -P 5".into(),
+        comparison_label: "TCP -w 1m -P 5".into(),
         src: master,
         dst: agent,
         port: 56_000,
@@ -6522,7 +6538,7 @@ fn comparison_identity_keeps_both_legs_without_changing_resume_or_leg_tags() {
     bidir.bidir = true;
     let mut reverse = ctstraffic_task(false);
     std::mem::swap(&mut reverse.src, &mut reverse.dst);
-    reverse.profile_label = "other parameters".into();
+    reverse.comparison_label = "other parameters".into();
     bidir.legs.push(Leg {
         tag: "ba".into(),
         kind: LegKind::CtsTraffic(reverse),
@@ -6540,4 +6556,36 @@ fn comparison_identity_keeps_both_legs_without_changing_resume_or_leg_tags() {
     assert_eq!(identity.legs[1].parameters, ["other parameters"]);
     assert_eq!(bidir.id, "original-id");
     assert_eq!(bidir.legs[0].tag, single.legs[0].tag);
+}
+
+/// **流数不进对比身份。**
+///
+/// 开着「按链路上限裁剪」时，UDP 的流数是 `floor(路径上限 / -b)`，路径上限跟着
+/// 协商速率走：同一条链路从 2.5G 降到 1G，4 条流可能变成 1 条，腿也从
+/// `IperfGroup` 变成 `IperfSingle`。按流展开参数的话，这条测试在两轮里就是两把键，
+/// 对比报告把一次掉速报成「本轮缺失 + 本轮新增」。
+#[test]
+fn the_comparison_identity_does_not_depend_on_how_many_udp_streams_survived_clamping() {
+    let src = endpoint(Side::Master, "en0", "192.168.1.2");
+    let dst = endpoint(Side::Agent, "en1", "192.168.1.3");
+    let mut four = ctstraffic_unit("udp-unit", true);
+    four.legs = vec![Leg {
+        tag: String::new(),
+        kind: LegKind::IperfGroup {
+            name: "udp_b500m".into(),
+            streams: udp_plan(0, "", 4, &src, &dst, 10).streams,
+        },
+    }];
+    let mut one = four.clone();
+    one.legs = vec![Leg {
+        tag: String::new(),
+        kind: LegKind::IperfSingle(udp_plan(0, "", 1, &src, &dst, 10).streams.remove(0)),
+    }];
+    let make = |unit: &Unit| {
+        crate::master::executor::row::unit_row(unit, 0, "汇总")
+            .comparison_identity
+            .unwrap()
+    };
+    assert_eq!(make(&four), make(&one));
+    assert_eq!(make(&four).legs[0].parameters, ["UDP -b 500m"]);
 }

@@ -94,36 +94,6 @@ export function progressView(
 }
 
 /**
- * 失败清单：只留需要处置的单元。
- *
- * 一轮 210 单元的测试，验收现场要的是「哪几条不行、该找谁」。把 210 行全列
- * 出来等于没有这张清单。
- */
-export function failureList(units: UnitStatus[]): UnitStatus[] {
-  return units.filter((unit) => {
-    const tone = verdictTone(unit.verdict);
-    return tone === 'fail' || tone === 'inconclusive';
-  });
-}
-
-/** 按链路组归拢失败——同一条链路上连着失败，指向的是链路而不是某个单元。 */
-export function failuresByLinkGroup(
-  units: UnitStatus[],
-): Array<{ group: string; units: UnitStatus[] }> {
-  const order: string[] = [];
-  const buckets = new Map<string, UnitStatus[]>();
-  for (const unit of failureList(units)) {
-    const key = unit.link_group || '(未分组)';
-    if (!buckets.has(key)) {
-      buckets.set(key, []);
-      order.push(key);
-    }
-    buckets.get(key)!.push(unit);
-  }
-  return order.map((group) => ({ group, units: buckets.get(group)! }));
-}
-
-/**
  * 合并增量：`units_from` 游标只回新完成的单元，前端自己攒完整列表。
  *
  * 幂等——同一批增量重复送达（比如请求重发）不会产生重复行。
@@ -141,8 +111,18 @@ export function mergeUnits(existing: UnitStatus[], incoming: UnitStatus[]): Unit
   return merged;
 }
 
-/** 进度页那一行可点筛选的取值。`all` = 不筛。 */
-export type VerdictFilter = 'all' | 'pass' | 'fail' | 'measured' | 'not_evaluated' | 'setup_error' | 'skip';
+/**
+ * 进度面板那一行可点筛选的取值。`all` = 不筛；`attention` = 需处置
+ * （未达标、未评估、准备失败三桶之和）。
+ *
+ * 一轮 210 单元的测试，验收现场要的是「哪几条不行」。`attention` 取代了旧页
+ * 单独的「需要处置」区块——那块和筛选后的结果表是同一份数据画了两遍。
+ */
+export type VerdictFilter =
+  | 'all' | 'attention' | 'pass' | 'fail' | 'measured' | 'not_evaluated' | 'setup_error' | 'skip';
+
+/** 归入「需处置」的桶。数字与服务端 counts 三个字段之和同源。 */
+export const ATTENTION_BUCKETS: ReadonlySet<VerdictFilter> = new Set(['fail', 'not_evaluated', 'setup_error']);
 
 /**
  * 判定字符串 → 筛选桶。
@@ -151,7 +131,7 @@ export type VerdictFilter = 'all' | 'pass' | 'fail' | 'measured' | 'not_evaluate
  * 出自同一套口径。**未知判定归到 `not_evaluated`**，不归 `pass`——§3.1 那条
  * 「未知值显示『未知状态』和原值，不能自动归入成功」在这里的落点。
  */
-export function verdictBucket(verdict: string): Exclude<VerdictFilter, 'all'> {
+export function verdictBucket(verdict: string): Exclude<VerdictFilter, 'all' | 'attention'> {
   switch (verdict.trim().toUpperCase()) {
     case 'PASS':
       return 'pass';
@@ -173,6 +153,7 @@ export function verdictBucket(verdict: string): Exclude<VerdictFilter, 'all'> {
 /** 按筛选桶过滤已完成单元，**保持 seq 顺序**（过滤不重排）。 */
 export function filterByVerdict(units: UnitStatus[], filter: VerdictFilter): UnitStatus[] {
   if (filter === 'all') return [...units];
+  if (filter === 'attention') return units.filter((unit) => ATTENTION_BUCKETS.has(verdictBucket(unit.verdict)));
   return units.filter((unit) => verdictBucket(unit.verdict) === filter);
 }
 

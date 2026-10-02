@@ -9,7 +9,7 @@ describe('导航区域表', () => {
     // 这两处是分开写的：类型是给编译器看的，表是给渲染用的。少一条的后果不是
     // 报错，而是**导航栏里那个区域根本画不出来**——用户会以为功能没做。
     // 下面这个字面量数组是 RegionId 的穷举，加了新区域忘了进表，这里就红。
-    const all: RegionId[] = ['local', 'agent', 'plan', 'run', 'progress', 'monitor', 'runs', 'inner'];
+    const all: RegionId[] = ['connect', 'plan', 'run', 'inner', 'monitor', 'history'];
     expect(REGIONS.map((r) => r.id).sort()).toEqual([...all].sort());
   });
 
@@ -29,11 +29,9 @@ describe('导航区域表', () => {
     // 监控和「一轮测试」正交：它在测试跑着的时候也能开，不该被排进流程序列。
     expect(REGIONS.find((r) => r.id === 'monitor')?.group).toBe('tool');
     expect(REGIONS.filter((r) => r.group === 'flow').map((r) => r.id)).toEqual([
-      'local',
-      'agent',
+      'connect',
       'plan',
       'run',
-      'progress',
     ]);
   });
 
@@ -41,8 +39,10 @@ describe('导航区域表', () => {
     // 模块级 reactive 是单例，用例之间会串味——每个 state 模块都得导出 reset()。
     goto('monitor');
     expect(ui.region).toBe('monitor');
+    ui.preparing = true;
     reset();
-    expect(ui.region).toBe('local');
+    expect(ui.region).toBe('connect');
+    expect(ui.preparing).toBe(false);
   });
 });
 

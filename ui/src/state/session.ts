@@ -189,16 +189,15 @@ export async function load(): Promise<void> {
 }
 
 /**
- * 重新扫描网卡。**「本机」和「辅测机」两页共用同一个实现**。
+ * 重新扫描网卡。「连接」页唯一的扫描入口。
  *
  * 网卡是会变的：插拔网线、开关 Wi-Fi、装驱动、改 IP——控制台却没有重扫入口，
  * 只能整页刷新（而刷新还要重新走一遍连接）。agent 的状态页一直有「重新扫描」，
  * 主控这边反而没有。
  *
- * 两页共用一个实现，是因为两张表本来就来自**同一次扫描**：连上之后
- * `masterNics` 读的是 `/api/connect` 回包里的 `master`（按 IPv4 前缀过滤过的
- * 那一份），不是 `/api/local`。所以「本机页只重扫本机」做不到——那样按下去
- * 表格不会变，看起来又是按钮没反应。
+ * 两张表本来就来自**同一次扫描**：连上之后 `masterNics` 读的是
+ * `/api/connect` 回包里的 `master`（按 IPv4 前缀过滤过的那一份），不是
+ * `/api/local`。所以「只重扫本机」做不到——那样按下去表格不会变。
  *
  * - 还没连上：只能扫本机（`/api/local`，有意不按前缀过滤）。
  * - 已连上：两端一起重扫（`/api/connect`），沿用当前的地址、令牌和前缀。
@@ -240,7 +239,10 @@ export async function rescan(): Promise<void> {
   } catch (error) {
     if (epoch !== generation) return;
     session.topologyStale = session.connection !== null;
-    fail(error);
+    // 没连过辅测机时，本机扫描失败与辅测机无关：不能把会话标成「连接失败」，
+    // 否则顶栏和连接区会把一次本机扫描错误说成辅测机连不上。
+    if (session.connection !== null || error instanceof UnauthorizedError) fail(error);
+    else session.localError = errorMessage(error);
     if (error instanceof UnauthorizedError) {
       session.scanMessage = '';
       session.scanKind = '';

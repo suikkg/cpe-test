@@ -1,8 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { RunStatus, UnitStatus } from '../api/dto';
 import {
-  failureList,
-  failuresByLinkGroup,
+  filterByVerdict,
   finishTimeHint,
   humanDuration,
   mergeUnits,
@@ -63,7 +62,7 @@ describe('判定分组', () => {
   });
 });
 
-describe('失败清单', () => {
+describe('需处置筛选', () => {
   const units = [
     unit(1, 'PASS'),
     unit(2, 'RATE_FAIL'),
@@ -73,26 +72,12 @@ describe('失败清单', () => {
     unit(6, 'SETUP_ERROR'),
   ];
 
-  it('只留需要处置的：一轮 210 单元全列出来等于没有这张清单', () => {
-    expect(failureList(units).map((u) => u.seq)).toEqual([2, 4, 6]);
+  it('只留需要处置的：未达标、未评估、准备失败', () => {
+    expect(filterByVerdict(units, 'attention').map((u) => u.seq)).toEqual([2, 4, 6]);
   });
 
-  it('按链路组归拢——同一条链路连着失败指向的是链路，不是某个单元', () => {
-    const mixed = [
-      unit(1, 'RATE_FAIL', 'A ↔ B'),
-      unit(2, 'RATE_FAIL', 'C ↔ D'),
-      unit(3, 'NOT_EVALUATED', 'A ↔ B'),
-      unit(4, 'PASS', 'A ↔ B'),
-    ];
-    const grouped = failuresByLinkGroup(mixed);
-    expect(grouped).toHaveLength(2);
-    expect(grouped[0].group).toBe('A ↔ B');
-    expect(grouped[0].units.map((u) => u.seq)).toEqual([1, 3]);
-    expect(grouped[1].units.map((u) => u.seq)).toEqual([2]);
-  });
-
-  it('没有链路组时落进「未分组」而不是空字符串', () => {
-    expect(failuresByLinkGroup([unit(1, 'RATE_FAIL', '')])[0].group).toBe('(未分组)');
+  it('未知判定也算需处置，绝不当成通过', () => {
+    expect(filterByVerdict([unit(1, 'SOMETHING_NEW')], 'attention').map((u) => u.seq)).toEqual([1]);
   });
 });
 

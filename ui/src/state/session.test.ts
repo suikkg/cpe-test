@@ -232,6 +232,16 @@ describe('重扫在本机请求阶段失败', () => {
     expect(session.scanning).toBe(false);
   });
 
+  it('没连过辅测机时，本机扫描失败不冒充辅测机连接失败', async () => {
+    route({ '/api/local': () => { throw new TypeError('offline'); } });
+    await rescan();
+    expect(session.phase).toBe('idle');
+    expect(session.error).toBe('');
+    expect(session.localError).not.toBe('');
+    expect(session.scanKind).toBe('bad');
+    expect(session.topologyStale).toBe(false);
+  });
+
   it('本机扫描 401 保留快照但进入鉴权终态', async () => {
     route({ '/api/connect': ok(connectOut) });
     await connect();

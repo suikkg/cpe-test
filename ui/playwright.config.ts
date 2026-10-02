@@ -18,6 +18,8 @@ export default defineConfig({
     env: { CPE_BROWSER_TEST_PORT: port },
     url: `${baseURL}/?token=browser-regression-secret`,
     reuseExistingServer: false,
-    timeout: 180_000,
+    // CI 在这之前已单独编好测试二进制（build.yml 的 UI job），这里通常几秒就起来；
+    // 本地第一次跑仍可能要冷编译整个测试二进制，所以留足时间。
+    timeout: 600_000,
   },
 });

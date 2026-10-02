@@ -15,6 +15,20 @@ import { session } from './session';
 import type * as ApiModule from '../api/client';
 vi.mock('../api/client', async (original) => ({ ...await original<typeof ApiModule>(), api: { get: vi.fn(), post: vi.fn() } }));
 
+/** 最近一次组合场景启动请求里带的令牌——模拟服务端在状态里原样带回。 */
+function sentStartToken(): string {
+  const calls = vi.mocked(api.post).mock.calls.filter(([path]) => path === '/api/scenario/run');
+  return (calls[calls.length - 1]?.[1] as { start_token?: string } | undefined)?.start_token ?? '';
+}
+
+function readyForScenario(): void {
+  inner.config.links = [link()];
+  inner.preview = { units: 2 } as never;
+  inner.previewStale = false;
+  subnetPlan.preview = { plan_hash: 'plan-hash' } as never;
+  subnetPlan.previewRequestFingerprint = JSON.stringify(buildRunRequest());
+}
+
 function link(patch: Partial<InnerLink> = {}): InnerLink {
   return { ...innerLink(), local_interface: 'WLAN', local_ip: '192.168.8.101', gateway: '192.168.8.1', ...patch };
 }
@@ -248,12 +262,16 @@ describe('内环独立状态与 API', () => {
     subnetPlan.previewRequestFingerprint = JSON.stringify(buildRunRequest());
     vi.mocked(api.post).mockRejectedValueOnce(new NetworkError(new Error('connection lost')));
     vi.mocked(api.get).mockImplementation(async (path) => {
-      if (path === '/api/scenario/status') return { running: true, id: 'scenario-1', phase: 'subnet', error: null };
+      if (path === '/api/scenario/status') {
+        return { running: true, id: 'scenario-1', phase: 'subnet', error: null, start_token: sentStartToken() };
+      }
       return inner.status;
     });
 
     await startSubnetThenInner();
 
+    expect(sentStartToken()).toMatch(/^[0-9a-f]{32}$/);
+    expect(inner.scenarioStartPhase).toBe('accepted');
     expect(inner.scenario).toMatchObject({ running: true, id: 'scenario-1', phase: 'subnet' });
     expect(api.post).toHaveBeenCalledTimes(1);
     expect(api.post).toHaveBeenCalledWith('/api/scenario/run', expect.anything());
@@ -273,7 +291,7 @@ describe('内环独立状态与 API', () => {
         if (path === '/api/scenario/status') {
           statusCalls += 1;
           if (statusCalls <= 3) throw new NetworkError(new Error('status connection lost'));
-          return { running: true, id: 'scenario-2', phase: 'subnet', error: null };
+          return { running: true, id: 'scenario-2', phase: 'subnet', error: null, start_token: sentStartToken() };
         }
         return inner.status;
       });
@@ -283,6 +301,7 @@ describe('内环独立状态与 API', () => {
       expect(inner.scenarioStartPhase).toBe('unknown');
       await vi.advanceTimersByTimeAsync(3000);
       expect(inner.scenario).toMatchObject({ running: true, id: 'scenario-2', phase: 'subnet' });
+      expect(inner.scenarioStartPhase).toBe('accepted');
       expect(api.post).toHaveBeenCalledTimes(1);
       expect(statusCalls).toBe(4);
     } finally {
@@ -300,12 +319,58 @@ describe('内环独立状态与 API', () => {
       expect(scenarioBlocksActions()).toBe(true);
       await startSubnetThenInner();
       expect(api.post).not.toHaveBeenCalled();
+      readyForScenario();
       prepareAfterUnknownScenario();
       expect(scenarioBlocksActions()).toBe(false);
       expect(inner.previewStale).toBe(true);
+      // 子网预览一起作废：不能拿事故前的子网 plan_hash 直接重开组合场景。
+      expect(subnetPlan.preview).toBeNull();
+      await expect(startSubnetThenInner()).rejects.toThrow('预览');
+      expect(api.post).not.toHaveBeenCalled();
       const reads = vi.mocked(api.get).mock.calls.length;
       await vi.advanceTimersByTimeAsync(3000);
       expect(api.get).toHaveBeenCalledTimes(reads);
+    } finally { vi.clearAllTimers(); vi.useRealTimers(); }
+  });
+
+  it('页面初次没读到场景状态时，旧场景的 ID 不能把未知启动当成已受理', async () => {
+    vi.useFakeTimers();
+    try {
+      readyForScenario();
+      // 初次状态读取失败：本地 scenario.id 仍是空串，而服务器上留着一条已结束的旧场景。
+      vi.mocked(api.post).mockRejectedValueOnce(new NetworkError(new Error('connection lost')));
+      vi.mocked(api.get).mockImplementation(async (path) => path === '/api/scenario/status'
+        ? { running: false, id: 'scenario_old', phase: 'finished', error: null, start_token: 'someone-else' }
+        : inner.status);
+      await startSubnetThenInner();
+      expect(inner.scenarioStartPhase).toBe('unknown');
+      expect(scenarioBlocksActions()).toBe(true);
+      await vi.advanceTimersByTimeAsync(3000);
+      expect(inner.scenarioStartPhase).toBe('unknown');
+      expect(api.post).toHaveBeenCalledTimes(1);
+    } finally { vi.clearAllTimers(); vi.useRealTimers(); }
+  });
+
+  it('别的页面起的场景在跑时保持未确认并继续查询，读到自己的令牌才确认', async () => {
+    vi.useFakeTimers();
+    try {
+      readyForScenario();
+      let mine = false;
+      vi.mocked(api.post).mockRejectedValueOnce(new NetworkError(new Error('connection lost')));
+      vi.mocked(api.get).mockImplementation(async (path) => path === '/api/scenario/status'
+        ? { running: true, id: mine ? 'scenario_mine' : 'scenario_other', phase: 'subnet', error: null,
+          start_token: mine ? sentStartToken() : 'another-tab' }
+        : inner.status);
+      await startSubnetThenInner();
+      expect(inner.scenarioStartPhase).toBe('unknown');
+      const reads = vi.mocked(api.get).mock.calls.length;
+      await vi.advanceTimersByTimeAsync(1500);
+      expect(vi.mocked(api.get).mock.calls.length).toBeGreaterThan(reads);
+      expect(inner.scenarioStartPhase).toBe('unknown');
+      mine = true;
+      await vi.advanceTimersByTimeAsync(1500);
+      expect(inner.scenarioStartPhase).toBe('accepted');
+      expect(inner.scenario.id).toBe('scenario_mine');
     } finally { vi.clearAllTimers(); vi.useRealTimers(); }
   });
 

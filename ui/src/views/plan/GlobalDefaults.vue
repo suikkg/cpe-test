@@ -199,11 +199,9 @@ const pingSizes = numbers('ping_payload_sizes');
 </script>
 
 <template>
-  <section class="block">
-    <div class="head">
-      <strong>全局默认档位</strong>
-    </div>
-
+  <section class="panel">
+    <h3>默认档位</h3>
+    <p class="hint">任务未选流量配置、或未填 Ping 参数时使用。多个档位用逗号分隔。</p>
     <div class="grid">
       <label class="wide">
         <span>UDP 单流带宽 <code>-b</code></span>
@@ -281,8 +279,11 @@ const pingSizes = numbers('ping_payload_sizes');
       </label>
     </div>
 
-    <details class="policy">
-      <summary><strong>Ping 高级阈值</strong> <span class="muted">自动按链路类型 × payload 档位选择；需要时可临时收紧/放宽</span></summary>
+  </section>
+
+  <section class="panel">
+    <h3>Ping 阈值</h3>
+    <p class="hint">按链路类型 × 包长档位自动选择；灰字为默认值，填数值覆盖。所有档位都要求 0% 丢包。</p>
       <div class="policy-grid">
         <label class="bucket-rule">
           <span>small 最大字节</span>
@@ -319,11 +320,11 @@ const pingSizes = numbers('ping_payload_sizes');
           </tbody>
         </table>
       </div>
-      <p class="muted hint">灰字“默认 xx”是控制台默认值，输入数值后覆盖；所有档位仍要求 0% 丢包。</p>
-    </details>
+  </section>
 
-    <details class="policy">
-      <summary><strong>Wi-Fi 互测门限</strong> <span class="muted">按当前识别到的频段组合显示</span></summary>
+  <section class="panel">
+    <h3>Wi-Fi 互测门限</h3>
+    <p class="hint">按两端当前频段组合显示，单位 Mbps。双向并发按两端 RX 合计判定；留空只记录实测。</p>
       <div v-if="wifiBandRows.length === 0" class="empty-inline">两端识别到 Wi-Fi 网口后显示门限表。</div>
       <div v-else class="table-scroll">
         <table class="ping-policy-table wifi-table wifi-matrix">
@@ -342,25 +343,16 @@ const pingSizes = numbers('ping_payload_sizes');
           </tbody>
         </table>
       </div>
-      <p class="muted hint">双向并发按两端 RX 合计判定，不要求各方向达到一半；留空则只显示实测值。</p>
       <div v-if="hasLegacyWifiOverrides" class="legacy-warning">
         <span>当前项目含旧版具体网口覆盖，仍按兼容规则执行。</span>
         <button type="button" class="ghost small" @click="clearLegacyWifiOverrides">清除旧覆盖</button>
       </div>
-    </details>
-
   </section>
 </template>
 
 <style scoped>
-.block {
-  margin: 0 0 14px;
-  padding: 11px 12px;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  background: var(--surface);
-}
-.head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.panel h3 { margin: 0 0 4px; }
+.panel > .hint { margin: 0; }
 .grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
@@ -383,9 +375,6 @@ input {
 }
 input::placeholder { color: var(--muted); opacity: 1; }
 input:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
-.hint { margin: 9px 0 0; font-size: 12px; }
-.policy { margin-top: 10px; border-top: 1px dashed var(--line); padding-top: 9px; }
-.policy summary { cursor: pointer; font-size: 12px; }
 .policy-grid { display: grid; grid-template-columns: repeat(2, minmax(190px, 1fr)); gap: 10px; margin-top: 9px; max-width: 520px; }
 .table-scroll { max-width: 100%; overflow-x: auto; margin-top: 11px; border: 1px solid var(--line); border-radius: 5px; }
 .ping-policy-table { width: 100%; min-width: 660px; table-layout: fixed; border-collapse: separate; border-spacing: 0; font-size: 12px; }
@@ -401,7 +390,8 @@ input:focus-visible { outline: 2px solid var(--focus); outline-offset: 1px; }
 .wifi-table { min-width: 720px; }
 .wifi-table input { min-width: 100px; }
 .empty-inline { margin-top: 9px; padding: 10px; border: 1px dashed var(--line); color: var(--muted); font-size: 12px; }
-.wifi-matrix th:nth-child(-n + 2), .wifi-matrix td:nth-child(-n + 2) { width: 13%; }
+/* 只收窄「主控 / 辅测」两列；表头第一行的 colspan 单元格不能被套上这个宽度。 */
+.wifi-matrix .subhead th:nth-child(-n + 2), .wifi-matrix tbody tr > :nth-child(-n + 2) { width: 13%; }
 .wifi-matrix .band-cell { font-weight: 600; }
 .legacy-warning { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 9px; padding: 8px 10px; border: 1px solid var(--warn); border-radius: 5px; color: var(--muted); font-size: 12px; }
 @media (max-width: 560px) { .policy-grid { grid-template-columns: 1fr; max-width: none; } }

@@ -37,7 +37,12 @@ use super::{group_rows, group_verdict, Row, Verdict};
 #[derive(Debug, Clone, PartialEq)]
 pub struct UnitDelta {
     /// 两轮对齐用的键，见 [`comparison_key`]。**不是** `Unit.id`。
+    ///
+    /// 它是序列化后的对齐身份，只作分组和排序的末位依据，不给人看；
+    /// 报告里显示的是 [`UnitDelta::identity_label`]。
     pub unit_id: String,
+    /// 对齐身份的可读写法，例如「V4 · TCP · iperf3 · 主控 en0 → 辅测 en1 · TCP -w 4m · 180s」。
+    pub identity_label: String,
     pub ambiguous: bool,
     /// 展示标题，优先取新的那一轮。
     pub title: String,
@@ -56,19 +61,30 @@ pub struct UnitSnapshot {
 
 /// 这一条在两轮之间**发生了什么**。
 ///
-/// 顺序就是严重程度：判定翻坏 → 掉速 → 消失 → 新增 → 提升 → 没变。
-/// 报告按它排序，读的人从上往下看就是「先处理最要紧的」。
+/// 顺序就是严重程度：判定翻坏 → 掉速 → 无法匹配 → 消失 → 新增 → RESUME 跳过 →
+/// 提升 → 没变。报告按它排序，读的人从上往下看就是「先处理最要紧的」。
+///
+/// 「无法唯一匹配」排在确定的回归**之后**：它说的是「这次对比不完整」，不是设备
+/// 结论。和 6.5.0 之前的历史比时，旧 PING 明细缺次数，每一条都落在这一类；排在
+/// 最前面的话，真正的「判定变坏」会被一屏旧 PING 压到下面去。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DeltaKind {
     /// 上一轮 PASS，这一轮不是了。**回归测试要找的就是这一类。**
-    Ambiguous,
     Regressed,
     /// 判定没变，但接收速率明显下降。
     SlowerButStillSameVerdict,
+    /// 对齐身份重复或不完整，无法和另一轮一一对应（见 [`compare`]）。
+    Ambiguous,
     /// 这一轮没有这个单元（计划改了，或者跑到一半停了）。
     Disappeared,
     /// 上一轮没有这个单元。
     Added,
+    /// 其中一轮按 RESUME 复用了更早的 PASS，这一轮**没有实际执行**，无从比较。
+    ///
+    /// 不能算「判定变坏」：PASS → SKIP 不是设备退化，而是没测。也不能算「判定
+    /// 转好」或「无实质变化」：被复用的那个 PASS 可能正是基线那一轮自己跑出来的，
+    /// 它对本轮固件什么都没说明。
+    Resumed,
     /// 上一轮不是 PASS，这一轮是了。
     Fixed,
     /// 判定和速率都没有实质变化。
@@ -83,6 +99,7 @@ impl DeltaKind {
             DeltaKind::SlowerButStillSameVerdict => "速率下降",
             DeltaKind::Disappeared => "本轮缺失",
             DeltaKind::Added => "本轮新增",
+            DeltaKind::Resumed => "RESUME 跳过",
             DeltaKind::Fixed => "判定转好",
             DeltaKind::Unchanged => "无实质变化",
         }
@@ -118,6 +135,10 @@ impl UnitDelta {
                 DeltaKind::Disappeared
             };
         };
+        // SKIP 只来自 RESUME 复用：那一轮没有执行，任何翻转都无从谈起。
+        if before.verdict == Verdict::Skip || after.verdict == Verdict::Skip {
+            return DeltaKind::Resumed;
+        }
         // 判定翻转优先于数字：跨过门限和没跨过，是两件不同性质的事。
         if before.verdict == Verdict::Pass && after.verdict != Verdict::Pass {
             return DeltaKind::Regressed;
@@ -165,6 +186,56 @@ impl RunComparison {
     }
 }
 
+/// 历史身份里的一项参数，去掉由运行条件生成的说明，还原成计划里请求的档位。
+///
+/// **只用于版本 0 的身份**（6.5.1 写下的、或从更早的明细行还原的），属于
+/// AGENTS.md 允许的历史数据兜底；新记录直接写 `comparison_label`，不走这里。
+/// 去掉的三种说明都随协商速率、角色或 IP 变化：
+/// - iperf UDP 的「（按路径上限从 2500M 裁剪至 1000M）」；
+/// - iperf UDP 的「（按链路策略至 2600M）」；
+/// - CTS UDP 的「×N流」（流数按路径上限裁剪）。
+///
+/// 标签文案由 builder 生成；`legacy_parameter(profile_label) == comparison_label`
+/// 由 builder 的测试钉住，改文案时那条会先红。
+///
+/// 还原不了的只有一种：6.5.1 及更早的记录里按网口改过 `-l` 的 UDP 单元——标签里
+/// 只剩改写后的值，档位原来的 `-l` 没有被记下。
+pub(crate) fn legacy_parameter(parameter: &str) -> String {
+    use regex::Regex;
+    use std::sync::OnceLock;
+    static NOTE: OnceLock<Regex> = OnceLock::new();
+    static CTS_STREAMS: OnceLock<Regex> = OnceLock::new();
+    let note = NOTE.get_or_init(|| {
+        Regex::new(r"（按(?:路径上限从 [0-9]+M 裁剪至 [0-9]+M|链路策略至 [0-9]+M)）").unwrap()
+    });
+    let cts = CTS_STREAMS.get_or_init(|| Regex::new(r"^(CTS UDP .*) ×[0-9]+流 \(每流\)$").unwrap());
+    let stripped = note.replace_all(parameter, "");
+    cts.replace(&stripped, "$1 (每流)").into_owned()
+}
+
+/// 把一份对齐身份归一成可比的形状，再序列化成对齐键。
+///
+/// - 版本 0 的身份先逐项过 [`legacy_parameter`]；
+/// - 每条腿的参数里相邻重复的只留一项：6.5.1 写下的多流 UDP 身份按流展开
+///   （4 条流就是同一个参数写 4 遍），旧报告从明细行还原的身份同理；
+/// - 版本统一写成当前版本，新旧身份落在同一把键上。
+fn canonical_key(mut identity: super::ComparisonIdentity) -> Option<String> {
+    if identity.legs.is_empty() {
+        return None;
+    }
+    let legacy = identity.version < super::COMPARISON_IDENTITY_VERSION;
+    for leg in &mut identity.legs {
+        if legacy {
+            for parameter in &mut leg.parameters {
+                *parameter = legacy_parameter(parameter);
+            }
+        }
+        leg.parameters.dedup();
+    }
+    identity.version = super::COMPARISON_IDENTITY_VERSION;
+    Some(serde_json::to_string(&identity).unwrap())
+}
+
 /// 新报告直接读计划身份；旧报告只能从完整的类型化明细还原，绝不解析标题。
 fn comparison_key(group: &super::model::UnitGroup<'_>) -> Option<String> {
     use super::{ComparisonIdentity, ComparisonLeg, RowDirection, RowProtocol, RowSide};
@@ -172,7 +243,7 @@ fn comparison_key(group: &super::model::UnitGroup<'_>) -> Option<String> {
         .summary
         .and_then(|row| row.comparison_identity.as_ref())
     {
-        return (!identity.legs.is_empty()).then(|| serde_json::to_string(identity).unwrap());
+        return canonical_key(identity.clone());
     }
     let mut legs: std::collections::BTreeMap<usize, ComparisonLeg> =
         std::collections::BTreeMap::new();
@@ -225,14 +296,13 @@ fn comparison_key(group: &super::model::UnitGroup<'_>) -> Option<String> {
     if legs.is_empty() || ab != ba || legs.values().any(|leg| leg.seconds.is_none()) {
         return None;
     }
-    Some(
-        serde_json::to_string(&ComparisonIdentity {
-            bidir: ab && ba,
-            round,
-            legs: legs.into_values().collect(),
-        })
-        .unwrap(),
-    )
+    canonical_key(ComparisonIdentity {
+        // 从旧明细行还原：参数是实际下发的标签，按历史身份归一。
+        version: 0,
+        bidir: ab && ba,
+        round,
+        legs: legs.into_values().collect(),
+    })
 }
 
 /// 一个单元在对比报告里要展示的身份：标题和链路组名。
@@ -272,6 +342,56 @@ fn snapshots(
     out
 }
 
+/// 对齐身份的可读写法，给对比报告每一行的标题下面用。
+///
+/// 报告以前直接印对齐键本身——一整串 JSON，双向和多参数的单元有好几行长。
+fn identity_label(identity: &super::ComparisonIdentity) -> String {
+    let legs: Vec<String> = identity
+        .legs
+        .iter()
+        .map(|leg| {
+            let mut parts = vec![
+                leg.ip.clone(),
+                leg.protocol.label().to_string(),
+                leg.backend.label().to_string(),
+                format!(
+                    "{} {} → {} {}",
+                    leg.src_side.label(),
+                    leg.src_iface,
+                    leg.dst_side.label(),
+                    leg.dst_iface
+                )
+                .trim()
+                .to_string(),
+            ];
+            parts.extend(leg.parameters.iter().cloned());
+            if let Some(seconds) = leg.seconds {
+                parts.push(format!("{seconds}s"));
+            }
+            parts.retain(|part| !part.trim().is_empty());
+            parts.join(" · ")
+        })
+        .collect();
+    let mut label = legs.join("；");
+    if identity.bidir {
+        label = format!("双向并发 · {label}");
+    }
+    if identity.round > 1 {
+        label.push_str(&format!(" · 第 {} 轮", identity.round));
+    }
+    label
+}
+
+/// 对齐键 → 可读写法。键是 [`canonical_key`] 写出的 JSON，读不回来时退回原文。
+fn key_label(key: Option<&str>) -> String {
+    match key {
+        None => "历史记录缺少完整对比身份".into(),
+        Some(key) => serde_json::from_str::<super::ComparisonIdentity>(key)
+            .map(|identity| identity_label(&identity))
+            .unwrap_or_else(|_| key.to_string()),
+    }
+}
+
 /// 重复或不完整的身份全部保留为无法匹配，不能任意配对或覆盖。
 pub fn compare(before: &[Row], after: &[Row], same_plan: bool) -> RunComparison {
     let mut old = snapshots(before);
@@ -282,11 +402,13 @@ pub fn compare(before: &[Row], after: &[Row], same_plan: bool) -> RunComparison 
         let mut before = old.remove(&key).unwrap_or_default();
         let mut after = new.remove(&key).unwrap_or_default();
         let ambiguous = key.is_none() || before.len() > 1 || after.len() > 1;
+        let identity_label = key_label(key.as_deref());
         let unit_id = key.unwrap_or_else(|| "历史记录缺少完整对比身份".into());
         if !ambiguous && before.len() == 1 && after.len() == 1 {
             let (after, label) = after.pop().unwrap();
             deltas.push(UnitDelta {
                 unit_id,
+                identity_label,
                 ambiguous: false,
                 title: label.title,
                 link_group: label.link_group,
@@ -298,6 +420,7 @@ pub fn compare(before: &[Row], after: &[Row], same_plan: bool) -> RunComparison 
                 for (snapshot, label) in items {
                     deltas.push(UnitDelta {
                         unit_id: unit_id.clone(),
+                        identity_label: identity_label.clone(),
                         ambiguous,
                         title: label.title,
                         link_group: label.link_group,
@@ -390,7 +513,8 @@ td.absent { color: var(--muted); }
 .kind-regressed { color: #b3261e; }
 .kind-slower { color: #8a5a00; }
 .kind-fixed { color: #1b5e20; }
-.kind-added, .kind-disappeared, .kind-unchanged { color: var(--muted); }
+.kind-ambiguous { color: #8a5a00; }
+.kind-added, .kind-disappeared, .kind-resumed, .kind-unchanged { color: var(--muted); }
 .status { display: inline-block; padding: 1px 6px; border-radius: 3px; font-weight: 700; font-size: 12px; white-space: nowrap; }
 /* 六个判定各自的颜色，取值与主报告逐字相同（`report.rs` 的 `.status.*`）。
    这里以前只有上面那条基类规则，于是 `Verdict::css()` 发出的 pass/fail/…
@@ -430,12 +554,13 @@ td.absent { color: var(--muted); }
     }
 
     let tally = [
-        (DeltaKind::Ambiguous, "无法唯一匹配", "bad"),
         (DeltaKind::Regressed, "判定变坏", "bad"),
         (DeltaKind::SlowerButStillSameVerdict, "速率下降", "bad"),
+        (DeltaKind::Ambiguous, "无法唯一匹配", ""),
         (DeltaKind::Fixed, "判定转好", "good"),
         (DeltaKind::Added, "本轮新增", ""),
         (DeltaKind::Disappeared, "本轮缺失", ""),
+        (DeltaKind::Resumed, "RESUME 跳过", ""),
         (DeltaKind::Unchanged, "无实质变化", ""),
     ];
     h.push_str("<div class=\"tally\">");
@@ -457,12 +582,13 @@ td.absent { color: var(--muted); }
     for delta in &diff.deltas {
         let kind = delta.kind();
         let kind_class = match kind {
-            DeltaKind::Ambiguous => "kind-regressed",
+            DeltaKind::Ambiguous => "kind-ambiguous",
             DeltaKind::Regressed => "kind-regressed",
             DeltaKind::SlowerButStillSameVerdict => "kind-slower",
             DeltaKind::Fixed => "kind-fixed",
             DeltaKind::Added => "kind-added",
             DeltaKind::Disappeared => "kind-disappeared",
+            DeltaKind::Resumed => "kind-resumed",
             DeltaKind::Unchanged => "kind-unchanged",
         };
         let target = delta
@@ -475,7 +601,7 @@ td.absent { color: var(--muted); }
              <td class=\"num\">{}</td><td class=\"num\">{}</td>{}<td class=\"num\">{}</td></tr>\n",
             kind.label(),
             esc(&delta.title),
-            esc(&delta.unit_id),
+            esc(&delta.identity_label),
             esc(&delta.link_group),
             verdict_cell(delta.before),
             verdict_cell(delta.after),
@@ -666,6 +792,150 @@ mod tests {
         assert_eq!(diff.deltas[0].kind(), DeltaKind::Regressed);
         assert_eq!(diff.count(DeltaKind::Regressed), 1);
         assert!(diff.has_regression());
+    }
+
+    /// 只留单元汇总行，并带上和明细还原出来一样的对齐身份——RESUME 跳过的单元
+    /// 在真实报告里就是这个形状（没有起流，只有一条汇总）。
+    fn summary_only(rows: &[Row]) -> Vec<Row> {
+        group_rows(rows)
+            .into_iter()
+            .map(|group| {
+                let mut row = group.summary.unwrap().clone();
+                row.comparison_identity =
+                    Some(serde_json::from_str(&comparison_key(&group).unwrap()).unwrap());
+                row
+            })
+            .collect()
+    }
+
+    /// **RESUME 跳过不是退化，也不是转好。**
+    ///
+    /// 那一轮没有执行这个单元，复用的 PASS 可能正是基线那一轮自己跑出来的。
+    /// 报成「判定变坏」会让每一次带 RESUME 的复测都拦住 CI；报成「判定转好」
+    /// 或「无实质变化」又是在替一次没测过的固件下结论。
+    #[test]
+    fn a_resume_skipped_unit_is_neither_a_regression_nor_a_fix() {
+        let ran = rows(&[("4m", Verdict::Pass, Some(1900.0))]);
+        let skipped = summary_only(&rows(&[("4m", Verdict::Skip, None)]));
+
+        let diff = compare(&ran, &skipped, true);
+        assert_eq!(diff.deltas.len(), 1, "两轮仍然对得上，不拆成缺失 + 新增");
+        assert_eq!(diff.deltas[0].kind(), DeltaKind::Resumed);
+        assert!(!diff.has_regression());
+
+        let diff = compare(&skipped, &ran, true);
+        assert_eq!(diff.deltas[0].kind(), DeltaKind::Resumed);
+        assert_eq!(diff.count(DeltaKind::Fixed), 0);
+        assert!(
+            render_html(&diff, &ReportMeta::default(), &ReportMeta::default())
+                .contains("RESUME 跳过")
+        );
+    }
+
+    /// 确定的回归排在「无法唯一匹配」前面。
+    ///
+    /// 和 6.5.0 之前的历史比时，旧 PING 明细缺次数，每一条都无法唯一匹配；
+    /// 它们排在最前面的话，真正的「判定变坏」会被压到一屏之外。
+    #[test]
+    fn a_real_regression_sorts_above_rows_that_could_not_be_matched() {
+        fn with_duplicate(rows: Vec<Row>) -> Vec<Row> {
+            let mut duplicate: Vec<Row> = rows
+                .iter()
+                .filter(|row| row.parent_id == "run-local-b")
+                .cloned()
+                .collect();
+            for row in &mut duplicate {
+                row.parent_id.push_str("-again");
+                row.task_id.push_str("-again");
+                row.sort_key.0 = 9;
+                row.unit_seq = 9;
+            }
+            let mut all = rows;
+            all.extend(duplicate);
+            all
+        }
+        let before = with_duplicate(rows(&[
+            ("a", Verdict::Pass, Some(1900.0)),
+            ("b", Verdict::Pass, Some(1900.0)),
+        ]));
+        let after = with_duplicate(rows(&[
+            ("a", Verdict::RateFail, Some(1500.0)),
+            ("b", Verdict::Pass, Some(1900.0)),
+        ]));
+        let diff = compare(&before, &after, true);
+        assert!(diff.count(DeltaKind::Ambiguous) > 0);
+        assert_eq!(diff.deltas[0].kind(), DeltaKind::Regressed);
+        assert!(diff.has_regression());
+    }
+
+    /// 6.5.1 写下的多流身份按流重复参数；新记录每条腿一项。两者必须对得上。
+    #[test]
+    fn a_6_5_1_identity_with_one_parameter_per_stream_still_lines_up() {
+        let base = summary_only(&rows(&[("x", Verdict::Pass, Some(1900.0))]));
+        let mut old = base.clone();
+        let identity = old[0].comparison_identity.as_mut().unwrap();
+        let parameter = identity.legs[0].parameters[0].clone();
+        identity.legs[0].parameters = vec![parameter; 4];
+        let mut new = base;
+        new[0].rx_avg = Some(1500.0);
+        new[0].verdict = Verdict::RateFail;
+
+        let diff = compare(&old, &new, true);
+        assert_eq!(diff.deltas.len(), 1, "不能拆成缺失 + 新增");
+        assert_eq!(diff.deltas[0].kind(), DeltaKind::Regressed);
+    }
+
+    /// 6.5.1 写下的身份带着实际下发的标签（路径裁剪说明）；新身份写的是请求的档位。
+    /// 历史兜底只作用于版本 0：新身份里哪怕出现同样的字样也原样保留。
+    #[test]
+    fn a_6_5_1_identity_with_a_clipping_note_lines_up_with_the_requested_profile() {
+        let base = summary_only(&rows(&[("x", Verdict::Pass, Some(1900.0))]));
+        let mut old = base.clone();
+        let mut new = base;
+        {
+            let identity = old[0].comparison_identity.as_mut().unwrap();
+            identity.version = 0;
+            identity.legs[0].parameters =
+                vec!["UDP -b 2500m（按路径上限从 2500M 裁剪至 1000M）".into()];
+        }
+        new[0].comparison_identity.as_mut().unwrap().legs[0].parameters =
+            vec!["UDP -b 2500m".into()];
+        new[0].rx_avg = Some(900.0);
+        new[0].verdict = Verdict::RateFail;
+        let diff = compare(&old, &new, true);
+        assert_eq!(
+            diff.deltas.len(),
+            1,
+            "不能拆成缺失 + 新增：{:?}",
+            diff.deltas
+        );
+        assert_eq!(diff.deltas[0].kind(), DeltaKind::Regressed);
+
+        let mut current = old.clone();
+        current[0].comparison_identity.as_mut().unwrap().version =
+            crate::report::COMPARISON_IDENTITY_VERSION;
+        assert_eq!(
+            compare(&current, &new, true).deltas.len(),
+            2,
+            "新版身份不做历史兜底"
+        );
+    }
+
+    /// 报告每一行标题下面是可读的身份，不是序列化后的对齐键。
+    #[test]
+    fn the_report_shows_a_readable_identity_instead_of_the_json_key() {
+        let before = rows(&[("4m", Verdict::Pass, Some(1900.0))]);
+        let diff = compare(&before, &before, true);
+        assert_eq!(
+            diff.deltas[0].identity_label,
+            "V4 · TCP · iperf3 · 主控 en0 → 辅测 en1 · -w 4m · 180s"
+        );
+        let html = render_html(&diff, &ReportMeta::default(), &ReportMeta::default());
+        assert!(html.contains("主控 en0 → 辅测 en1"));
+        assert!(
+            !html.contains("&quot;legs&quot;") && !html.contains("\"legs\""),
+            "不许把 JSON 印给人看"
+        );
     }
 
     #[test]

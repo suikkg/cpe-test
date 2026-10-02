@@ -235,7 +235,7 @@ export function applyProgress(out: ProgressOut): void {
     run.startPhase = 'idle';
     run.startError =
       '主控受理了「开始」，但这一轮在产生任何测试单元之前就结束了。' +
-      '到「进度」页展开运行日志看最后几行——那里写着执行端为什么退出。';
+      '展开下方「运行日志」看最后几行——那里写着执行端为什么退出。';
   }
   // 停下来这件事由**运行状态**说了算，不由那次 HTTP 200 说了算：一旦真的
   // 不在跑了，「已请求停止 / 停止结果未确认」这两句话就没有意义了，留着只会
@@ -382,7 +382,7 @@ export async function skipUnit(): Promise<void> {
     await api.post('/api/skip-unit', { run_id: skipTarget.runId, unit_seq: skipTarget.seq });
     if (epoch !== generation) return;
     run.skipPhase = 'accepted';
-    // 收尾要等当前单元的工具退出，进度页靠轮询把结果带回来。
+    // 收尾要等当前单元的工具退出，进度面板靠轮询把结果带回来。
     void syncAfterCommand();
   } catch (error) {
     if (epoch !== generation) return;

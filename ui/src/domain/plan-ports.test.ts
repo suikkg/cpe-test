@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { emptyPlan, ensureDefaults, type UiPlan } from './plan-build';
-import { assignedPairIds, selectedPortPairs, setPairAssigned } from './plan-ports';
+import { bindingSelectionState, emptyPlan, ensureDefaults, toggleBinding, type UiPlan } from './plan-build';
+import { assignedPairIds, selectedPortPairs, setPairAssigned, setPairsAssigned } from './plan-ports';
 
 function fixture(): UiPlan {
   return {
@@ -48,5 +48,36 @@ describe('逐网口分配', () => {
     expect(setPairAssigned(plan, 'ports', 'p1', 'missing', true)).toBe(plan);
     const once = setPairAssigned(plan, 'ports', 'p1', 'suite-baseline', false);
     expect(setPairAssigned(once, 'ports', 'p1', 'suite-baseline', false)).toEqual(once);
+  });
+});
+
+describe('分组网口表：整组与逐网口', () => {
+  const rows = [{ setId: 'ports', pairId: 'p1' }, { setId: 'ports', pairId: 'p2' }];
+
+  it('批量全选不会把整组分配改写成显式清单', () => {
+    const plan = fixture();
+    expect(setPairsAssigned(plan, rows, 'suite-baseline', true)).toBe(plan);
+    expect(plan.bindings[0].pair_ids).toEqual([]);
+  });
+
+  it('组复选框：无 → 整组；取消一对 → 部分；再点组复选框 → 补回整组且保留绑定身份', () => {
+    let plan = fixture();
+    plan.bindings = [];
+    plan = toggleBinding(plan, 'ports', 'suite-baseline');
+    expect(plan.bindings).toHaveLength(1);
+    expect(plan.bindings[0].pair_ids).toEqual([]);
+    const id = plan.bindings[0].id;
+
+    plan = setPairAssigned(plan, 'ports', 'p1', 'suite-baseline', false);
+    expect(bindingSelectionState(plan, 'ports', 'suite-baseline')).toBe('some');
+
+    plan = toggleBinding(plan, 'ports', 'suite-baseline');
+    expect(plan.bindings).toEqual([expect.objectContaining({ id, pair_ids: [] })]);
+    expect(bindingSelectionState(plan, 'ports', 'suite-baseline')).toBe('all');
+  });
+
+  it('批量取消只动显示的行，其余网口保持分配', () => {
+    const plan = setPairsAssigned(fixture(), [rows[0]], 'suite-baseline', false);
+    expect([...assignedPairIds(plan, 'ports', 'suite-baseline')]).toEqual(['p2']);
   });
 });

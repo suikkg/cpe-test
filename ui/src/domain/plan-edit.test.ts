@@ -10,6 +10,7 @@ import {
   moveTask,
   profilesToAxes,
   recipeIsAxisEditable,
+  recipeReferences,
   removeSuite,
   removeTask,
   setTaskProtocol,
@@ -20,6 +21,7 @@ import {
   toggleTaskIp,
   toggleTaskRecipe,
   uniqueId,
+  unusedRecipes,
   updateRecipe,
   updateSuite,
   updateTask,
@@ -275,5 +277,23 @@ describe('配置的档位编辑', () => {
     expect(added.profiles).toEqual([]);
     expect(added.mode).toBeUndefined();
     expect(recipeIsAxisEditable(added)).toBe(true);
+  });
+});
+
+describe('配置的引用面', () => {
+  it('点名引用它的每一个任务，且不把没引用的配置算进去', () => {
+    let plan = ensureDefaults(emptyPlan());
+    plan = addRecipe(plan, 'tcp');
+    const added = plan.recipes.tcp[plan.recipes.tcp.length - 1];
+    expect(recipeReferences(plan, added.id)).toEqual([]);
+    expect(unusedRecipes(plan).map((item) => item.recipe.id)).toContain(added.id);
+
+    const suite = plan.suites[0];
+    const task = suite.tasks.find((item) => item.protocol === 'tcp')!;
+    plan = toggleTaskRecipe(plan, suite.id, task.id, added.id);
+    expect(recipeReferences(plan, added.id)).toEqual([
+      { suiteId: suite.id, suite: suite.name, taskId: task.id, task: task.name || 'TCP' },
+    ]);
+    expect(unusedRecipes(plan).map((item) => item.recipe.id)).not.toContain(added.id);
   });
 });

@@ -13,7 +13,7 @@ import { ref } from 'vue';
  *
  * # 为什么方向键**不**顺手切换面板（手动激活）
  *
- * 这三块面板一块比一块重（分配矩阵、套件编辑器、流量配置）。自动激活时，用户
+ * 面板都不轻（网口表、测试内容编辑器、门限表）。自动激活时，用户
  * 从第一个按方向键找到第三个，中间那块会被完整挂载再卸载一次——在一台正在灌
  * 线速的机器上这不是"顺手"。所以焦点与选中分离：方向键只移动焦点，Enter / 空格
  * 才切。这也是 WAI-ARIA 对"面板昂贵"场景给的建议。
@@ -93,3 +93,15 @@ function onKeydown(event: KeyboardEvent, index: number): void {
     </button>
   </div>
 </template>
+
+<style scoped>
+.tabs { display: flex; gap: 0; margin: 0 0 18px; border-bottom: 1px solid var(--line); overflow-x: auto; }
+.tabs button {
+  display: inline-flex; align-items: baseline; gap: 8px; flex: 0 0 auto;
+  padding: 10px 16px; border: 0; border-bottom: 3px solid transparent; border-radius: 0;
+  background: transparent; color: var(--muted); font-weight: 600;
+}
+.tabs button:hover:not(:disabled) { background: var(--head); color: var(--ink); }
+.tabs button.on { border-bottom-color: var(--accent); color: var(--accent); }
+.tabs small { font-size: 11px; font-weight: 400; color: var(--muted); }
+</style>

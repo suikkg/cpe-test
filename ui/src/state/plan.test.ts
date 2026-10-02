@@ -1,10 +1,11 @@
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { nextTick } from 'vue';
 import {
   buildRunRequest,
   clampRounds,
   exportProject,
   importProject,
+  loadDraft,
   MAX_ROUNDS,
   plan,
   previewIsCurrent,
@@ -56,6 +57,25 @@ describe('离线导入的延后校验', () => {
  * 请求体形状同时是 `plan_hash` 那道闸的前提：`/api/plan` 和 `/api/run` 必须发
  * 同一份东西，复核过的计划才等于实际跑的计划。
  */
+describe('旧草稿里的链路范围', () => {
+  beforeEach(() => { reset(); resetSession(); });
+  it('cross/same 不再生效，集合始终按全部候选生成', () => {
+    const ui = ensureDefaults(emptyPlan());
+    const stored = new Map([['cpe_ui_plan_draft', JSON.stringify({ ui, linkSets: [], filter: 'same' })]]);
+    vi.stubGlobal('localStorage', {
+      getItem: (key: string) => stored.get(key) ?? null,
+      setItem: (key: string, value: string) => { stored.set(key, value); },
+      removeItem: (key: string) => { stored.delete(key); },
+    });
+    try {
+      expect(loadDraft()).toBe(true);
+      expect(plan.filter).toBe('all');
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+});
+
 describe('buildRunRequest', () => {
   beforeEach(reset);
 

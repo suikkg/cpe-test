@@ -160,6 +160,16 @@ pub struct IperfTask {
     pub udp: bool,
     pub profile_name: String,
     pub profile_label: String,
+    /// 两轮对比的对齐键用的参数：**计划里请求的档位**（套件 / 全局档位的原始标签），
+    /// 不含任何随运行条件变化的改写。
+    ///
+    /// `profile_label` 必须写实际下发的值（报表和命令行要对得上），所以它会带上：
+    /// 路径上限的裁剪（「（按路径上限从 2500M 裁剪至 1000M）」，上限跟着协商速率走）、
+    /// 按网口策略改写的 `-b` / `-l`（`by_role` 跟着由协商速率推出的角色走，`by_nic`
+    /// 按 IPv4 匹配，DHCP 换址就变）。这些都进对齐键的话，一次降速或换址就把同一条
+    /// 测试拆成「本轮缺失 + 本轮新增」，恰好藏住了对比要抓的那次掉速。
+    /// TCP 不受链路策略和裁剪影响，两者相同。
+    pub comparison_label: String,
     pub src: Endpoint,
     pub dst: Endpoint,
     pub port: u16,
@@ -182,6 +192,12 @@ pub struct CtsTrafficTask {
     pub udp: bool,
     pub profile_name: String,
     pub profile_label: String,
+    /// 两轮对比的对齐键用的参数，见 [`IperfTask::comparison_label`]。
+    ///
+    /// UDP 的 `profile_label` 里写着「×N流」，而 N 由 `allowed_udp_streams_for_mbps`
+    /// 按路径上限裁剪、随协商速率变化，所以这里不写流数。TCP 的连接数来自配置，
+    /// 两者相同。
+    pub comparison_label: String,
     /// 数据方向始终是 src -> dst；UDP 的进程角色会在执行器中反转。
     pub src: Endpoint,
     pub dst: Endpoint,
@@ -1034,6 +1050,7 @@ pub fn build_units(
                                             udp: false,
                                             profile_name: pname.clone(),
                                             profile_label: plabel.clone(),
+                                            comparison_label: plabel.clone(),
                                             src: (*s).clone(),
                                             dst: (*d).clone(),
                                             port: alloc_port(next_port),
@@ -1236,11 +1253,15 @@ pub fn build_units(
                                         // offered 必须跟着实际下发的 -b 走，否则
                                         // 报表里的「请求负载」和命令行对不上。
                                         let offered_per_stream_mbps = Some(load.mbps);
+                                        // 对齐键只认档位本身：裁剪、按网口策略改写的 -b / -l
+                                        // 都随协商速率或 IP 变化，见 `IperfTask::comparison_label`。
+                                        let comparison_label = prof.label();
                                         let mk = |idx: usize, port: u16| IperfTask {
                                             v6,
                                             udp: true,
                                             profile_name: prof.name(),
                                             profile_label: leg_label.clone(),
+                                            comparison_label: comparison_label.clone(),
                                             src: (*s).clone(),
                                             dst: (*d).clone(),
                                             port,
@@ -1510,6 +1531,7 @@ pub fn build_units(
                                             udp: false,
                                             profile_name: profile_name.clone(),
                                             profile_label: profile_label.clone(),
+                                            comparison_label: profile_label.clone(),
                                             src: (*src).clone(),
                                             dst: (*dst).clone(),
                                             port: alloc_port(next_port),
@@ -1681,6 +1703,10 @@ pub fn build_units(
                                                 streams
                                             ),
                                             profile_label,
+                                            comparison_label: format!(
+                                                "CTS UDP {} (每流)",
+                                                profile.label().trim_start_matches("UDP ")
+                                            ),
                                             src: (*src).clone(),
                                             dst: (*dst).clone(),
                                             port: alloc_port(next_port),
@@ -1960,6 +1986,161 @@ mod tests {
                 hits.is_empty(),
                 "单元 {unit_id} 的 extra 里出现了受控参数 {hits:?}（extra={extra:?}）"
             );
+        }
+    }
+
+    /// **对比用的参数标签不随协商速率变。**
+    ///
+    /// 同一份 UDP 计划，链路从 2.5G 降到 1G 时：`-b 500m × 4 流` 被裁成 2 条流，
+    /// `-b 2500m` 单流被压到 1000M 并在 `profile_label` 里写明裁剪。报表必须写实际
+    /// 下发的值，所以 `profile_label` 变了是对的；但对比报告要靠 `comparison_label`
+    /// 认出「这还是同一条测试」，才能把这次掉速报成退化，而不是「缺失 + 新增」。
+    #[test]
+    fn the_comparison_label_survives_a_renegotiation_that_clamps_streams_and_bandwidth() {
+        fn udp_legs(units: &[Unit]) -> Vec<(usize, String, String)> {
+            let mut out = Vec::new();
+            for unit in units {
+                for leg in &unit.legs {
+                    match &leg.kind {
+                        LegKind::IperfSingle(t) => {
+                            out.push((1, t.profile_label.clone(), t.comparison_label.clone()))
+                        }
+                        LegKind::IperfGroup { streams, .. } => out.push((
+                            streams.len(),
+                            streams[0].profile_label.clone(),
+                            streams[0].comparison_label.clone(),
+                        )),
+                        _ => {}
+                    }
+                }
+            }
+            out
+        }
+        let plan = |src_role: &str, speed: u64| {
+            let mut spec = base_spec();
+            spec.src = ep(Side::Master, "eth0", src_role, "192.168.1.2", speed);
+            spec.transports = vec!["udp".into()];
+            spec.udp_profiles = vec![UdpProfile::bw("500m"), UdpProfile::bw("2500m")];
+            spec.udp_streams = 4;
+            spec.streams = 4;
+            spec.udp_limit = true;
+            let mut port = 45000u16;
+            udp_legs(&build_units(&[spec], true, &mut port).0)
+        };
+        let fast = plan("SGMII2.5G", 2500);
+        let slow = plan("SGMII1G", 1000);
+        assert_eq!(fast.len(), 2);
+        assert_eq!(slow.len(), 2);
+        assert_ne!(
+            fast[0].0, slow[0].0,
+            "降速后 -b 500m 的流数被裁剪：{fast:?} / {slow:?}"
+        );
+        assert_ne!(
+            fast[1].1, slow[1].1,
+            "降速后 -b 2500m 被压到路径上限，标签写明裁剪"
+        );
+        for (fast, slow) in fast.iter().zip(&slow) {
+            assert_eq!(fast.2, slow.2, "对比标签不能跟着协商速率变");
+            assert!(
+                !fast.2.contains("裁剪"),
+                "对比标签里不能出现裁剪说明：{}",
+                fast.2
+            );
+        }
+    }
+
+    /// **历史标签归一的规则和 builder 的标签文案是同一件事的两半。**
+    ///
+    /// 6.5.1 及更早的对比身份里存的是 `profile_label`（实际下发的值），读取时由
+    /// `report::compare::legacy_parameter` 去掉随运行条件生成的说明，还原成
+    /// `comparison_label`。这里拿 builder 真实产出的三类标签逐个过一遍：
+    /// 路径裁剪、按角色策略改写的 `-b`、CTS 被裁剪的流数。以后改标签文案而忘了
+    /// 改归一规则，这条先红，而不是让历史对比悄悄对不上。
+    #[test]
+    fn legacy_labels_normalize_to_the_comparison_label_the_builder_now_writes() {
+        use crate::report::compare::legacy_parameter;
+        fn labels(units: &[Unit]) -> Vec<(String, String)> {
+            let mut out = Vec::new();
+            for unit in units {
+                for leg in &unit.legs {
+                    match &leg.kind {
+                        LegKind::IperfSingle(t) => {
+                            out.push((t.profile_label.clone(), t.comparison_label.clone()))
+                        }
+                        LegKind::IperfGroup { streams, .. } => out.push((
+                            streams[0].profile_label.clone(),
+                            streams[0].comparison_label.clone(),
+                        )),
+                        LegKind::CtsTraffic(t) => {
+                            out.push((t.profile_label.clone(), t.comparison_label.clone()))
+                        }
+                        LegKind::Ping(_) => {}
+                    }
+                }
+            }
+            out
+        }
+        let build = |spec: SpecNorm| {
+            let mut port = 45000u16;
+            labels(&build_units(&[spec], true, &mut port).0)
+        };
+        let fast_src = ep(Side::Master, "eth0", "SGMII2.5G", "192.168.1.2", 2500);
+        let slow_src = ep(Side::Master, "eth0", "SGMII1G", "192.168.1.2", 1000);
+
+        // ① 路径裁剪：1G 上的 -b 2500m 被压到 1000M。
+        let clipped = |src: &Endpoint| {
+            let mut spec = base_spec();
+            spec.src = src.clone();
+            spec.transports = vec!["udp".into()];
+            spec.udp_profiles = vec![UdpProfile::bw("2500m")];
+            spec.udp_limit = true;
+            spec
+        };
+        // ② 按角色策略：降速后角色变成 SGMII1G，命中策略，-b 被改写成 800M。
+        let policed = |src: &Endpoint| {
+            let mut spec = base_spec();
+            spec.src = src.clone();
+            spec.transports = vec!["udp".into()];
+            spec.udp_profiles = vec![UdpProfile::bw("500m")];
+            spec.link_profiles = LinkProfiles {
+                by_role: vec![RoleProfile {
+                    pair: "SGMII1G<->SGMII2.5G".into(),
+                    rx_target_mbps: RateTargets::default(),
+                    udp_bandwidth: DirectionalBandwidth {
+                        ab: Some("800m".into()),
+                        ..Default::default()
+                    },
+                }],
+                by_nic: Vec::new(),
+            };
+            spec
+        };
+        // ③ CTS UDP：3 条流在 1G 上被裁成 2 条。
+        let cts = |src: &Endpoint| {
+            let mut spec = cts_spec("udp");
+            spec.src = src.clone();
+            spec.udp_limit = true;
+            spec
+        };
+
+        for (case, make) in [
+            ("路径裁剪", &clipped as &dyn Fn(&Endpoint) -> SpecNorm),
+            ("按角色策略", &policed),
+            ("CTS 流数", &cts),
+        ] {
+            let fast = build(make(&fast_src));
+            let slow = build(make(&slow_src));
+            assert_eq!(fast.len(), 1, "{case}: {fast:?}");
+            assert_eq!(slow.len(), 1, "{case}: {slow:?}");
+            assert_ne!(fast[0].0, slow[0].0, "{case}: 降速后实际下发的标签应当变了");
+            assert_eq!(fast[0].1, slow[0].1, "{case}: 对比标签不能跟着降速变");
+            for (profile_label, comparison_label) in fast.iter().chain(&slow) {
+                assert_eq!(
+                    &legacy_parameter(profile_label),
+                    comparison_label,
+                    "{case}: 历史标签 {profile_label:?} 归一后应当等于对比标签"
+                );
+            }
         }
     }
 

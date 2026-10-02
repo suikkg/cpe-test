@@ -2,8 +2,10 @@
 import { computed, ref } from 'vue';
 import { formatNumberList, parseNumberList } from '../../domain/globals';
 import {
+  addRecipe,
   addSuite,
   addTask,
+  deleteRecipe,
   directionLabel,
   duplicateSuite,
   moveTask,
@@ -16,6 +18,7 @@ import {
   toggleTaskDirection,
   toggleTaskIp,
   toggleTaskRecipe,
+  unusedRecipes,
   updateSuite,
   updateTask,
   type UiProtocol,
@@ -25,12 +28,14 @@ import {
 import { filterByQuery, visibleCountLabel } from '../../domain/search';
 import { plan } from '../../state/plan';
 import { ui } from '../../state/ui';
-
-// 带上**来源**：光有 recipeId，「返回任务」只能回到这个工作区，回不到那一条任务。
-const emit = defineEmits<{ editRecipe: [payload: { recipeId: string; suiteId: string; taskId: string }] }>();
+import RecipeFields from './RecipeFields.vue';
 
 /**
- * 「套件」：左边一列套件名，右边只编辑选中的那一个。
+ * 「测试内容」：左边一列套件名，右边只编辑选中的那一个。
+ *
+ * TCP/UDP 流量配置在任务里**就地**展开编辑（`RecipeFields`）。旧版把配置放在
+ * 单独的标签里，改参数要先跳过去、改完再「返回任务」，而套件和配置本来就是
+ * 同一件事的两层。
  *
  * # 为什么是左右分栏而不是平铺
  *
@@ -92,6 +97,28 @@ function toggleTask(taskId: string): void {
 
 function recipesFor(protocol: UiProtocol) {
   return protocol === 'ping' ? [] : plan.ui.recipes[protocol];
+}
+
+/** 正在就地编辑的配置（一次只展开一条）。放 `state/ui`，切走再回来还在。 */
+const editingRecipe = computed({
+  get: () => ui.recipes.selected,
+  set: (value: string) => { ui.recipes.selected = value; },
+});
+function toggleRecipeEdit(recipeId: string): void {
+  editingRecipe.value = editingRecipe.value === recipeId ? '' : recipeId;
+}
+/** 在任务里新建一条配置：直接勾上并展开，新建它就是为了给这个任务用。 */
+function onNewRecipe(suiteId: string, task: UiTask): void {
+  if (task.protocol === 'ping') return;
+  const protocol = task.protocol;
+  plan.ui = addRecipe(plan.ui, protocol);
+  const added = plan.ui.recipes[protocol][plan.ui.recipes[protocol].length - 1];
+  plan.ui = toggleTaskRecipe(plan.ui, suiteId, task.id, added.id);
+  editingRecipe.value = added.id;
+}
+const unused = computed(() => unusedRecipes(plan.ui));
+function cleanUnused(): void {
+  for (const item of unused.value) plan.ui = deleteRecipe(plan.ui, item.protocol, item.recipe.id);
 }
 
 function boundSets(suiteId: string): number {
@@ -311,7 +338,6 @@ function has(list: string[] | undefined, value: string): boolean {
       <div class="outline">
         <strong>{{ current.tasks.length }} 个任务</strong>
         <span class="muted">按顺序执行：{{ suiteOutline(current) }}</span>
-        <span class="muted">展开任务可调整方向、IP 与参数</span>
       </div>
 
       <ol class="tasks">
@@ -403,38 +429,40 @@ function has(list: string[] | undefined, value: string): boolean {
             </fieldset>
 
             <fieldset v-if="task.protocol !== 'ping'" class="wide recipe-fieldset">
-              <legend>配置（多选 = 各跑一遍）</legend>
-              <span v-if="recipesFor(task.protocol).length === 0" class="muted small-hint">
-                还没有 {{ task.protocol.toUpperCase() }} 配置，请在「编辑流量配置」中添加。
-              </span>
-              <div
-                v-for="recipe in recipesFor(task.protocol)"
-                :key="recipe.id"
-                class="recipe-choice"
-              >
-                <label class="check">
-                  <input
-                    type="checkbox"
-                    :checked="has(task.recipe_ids, recipe.id)"
-                    @change="plan.ui = toggleTaskRecipe(plan.ui, current.id, task.id, recipe.id)"
-                  />
-                  <span>
-                    {{ recipe.name }}
-                    <small class="muted mono">{{ recipeSummary(recipe, task.protocol) }}</small>
-                  </span>
-                </label>
-                <button
-                  type="button"
-                  class="recipe-edit"
-                  :aria-label="`编辑 ${recipe.name} 的参数`"
-                  @click="emit('editRecipe', { recipeId: recipe.id, suiteId: current.id, taskId: task.id })"
-                >
-                  编辑参数
-                </button>
-              </div>
-              <span v-if="task.recipe_ids.length === 0" class="muted small-hint">
-                一个都不选 = 走「执行」页的全局默认档位
-              </span>
+              <legend>流量配置（多选 = 各跑一遍；不选 = 默认档位）</legend>
+              <template v-for="recipe in recipesFor(task.protocol)" :key="recipe.id">
+                <div class="recipe-choice">
+                  <label class="check">
+                    <input
+                      type="checkbox"
+                      :checked="has(task.recipe_ids, recipe.id)"
+                      @change="plan.ui = toggleTaskRecipe(plan.ui, current.id, task.id, recipe.id)"
+                    />
+                    <span>
+                      {{ recipe.name }}
+                      <small class="muted mono">{{ recipeSummary(recipe, task.protocol) }}</small>
+                    </span>
+                  </label>
+                  <button
+                    type="button"
+                    class="recipe-edit"
+                    :aria-expanded="editingRecipe === recipe.id"
+                    :aria-label="`${editingRecipe === recipe.id ? '收起' : '编辑'} ${recipe.name} 的参数`"
+                    @click="toggleRecipeEdit(recipe.id)"
+                  >
+                    {{ editingRecipe === recipe.id ? '收起' : '编辑' }}
+                  </button>
+                </div>
+                <RecipeFields
+                  v-if="editingRecipe === recipe.id"
+                  :protocol="task.protocol"
+                  :recipe-id="recipe.id"
+                  @close="editingRecipe = ''"
+                />
+              </template>
+              <button type="button" class="ghost small add-recipe" @click="onNewRecipe(current.id, task)">
+                + 新建 {{ task.protocol.toUpperCase() }} 配置
+              </button>
             </fieldset>
 
             <fieldset v-else class="wide ping-fieldset">
@@ -483,7 +511,7 @@ function has(list: string[] | undefined, value: string): boolean {
                 <span>A→B 接收端</span>
                 <input
                   type="text"
-                  placeholder="留空 = 走按网口门限"
+                  placeholder="留空 = 按网口门限"
                   :value="task.rx_target_ab ?? ''"
                   @input="onRxTarget(current.id, task.id, 'rx_target_ab', $event)"
                 />
@@ -492,15 +520,11 @@ function has(list: string[] | undefined, value: string): boolean {
                 <span>B→A 接收端</span>
                 <input
                   type="text"
-                  placeholder="留空 = 走按网口门限"
+                  placeholder="留空 = 按网口门限"
                   :value="task.rx_target_ba ?? ''"
                   @input="onRxTarget(current.id, task.id, 'rx_target_ba', $event)"
                 />
               </label>
-              <p class="muted small-hint">
-                此处填写绝对 Mbps，优先于按网口设置的门限。
-              </p>
-              <p class="muted small-hint">门限挂在任务上，作用于所有分配了本套件的链路集合。</p>
             </fieldset>
 
             <fieldset v-if="taskUsesBidir(task)" class="wide">
@@ -514,9 +538,7 @@ function has(list: string[] | undefined, value: string): boolean {
                   @input="onRxTarget(current.id, task.id, 'rx_target_bidir_total', $event)"
                 />
               </label>
-              <p class="muted small-hint">
-                判一次：<strong>A→B 接收端 RX + B→A 接收端 RX ≥ 合计</strong>，单位 Mbps。
-              </p>
+              <p class="muted small-hint">判定：A→B 接收 RX + B→A 接收 RX ≥ 合计。</p>
               <details class="per-direction-bidir">
                 <summary>按方向分别设门限（逐方向把关）</summary>
                 <label class="inline">
@@ -537,13 +559,17 @@ function has(list: string[] | undefined, value: string): boolean {
                     @input="onRxTarget(current.id, task.id, 'rx_target_bidir_ba', $event)"
                   />
                 </label>
-                <p class="muted small-hint">两个方向各判一次；填了合计门限时这两格不参与判定。</p>
+                <p class="muted small-hint">填了合计门限时这两格不参与判定。</p>
               </details>
-              <p class="muted small-hint">门限挂在任务上，作用于所有分配了本套件的链路集合。</p>
             </fieldset>
           </div>
         </li>
       </ol>
+
+      <p v-if="unused.length" class="unused muted">
+        {{ unused.length }} 条流量配置未被任何任务使用
+        <button type="button" class="linklike" @click="cleanUnused">清理</button>
+      </p>
 
       <div class="task-add">
         <span class="muted">添加任务</span>
@@ -609,6 +635,8 @@ legend { padding: 0 5px; font-size: 12px; font-weight: 600; color: var(--muted);
 .recipe-choice .check { flex: 1 1 auto; min-width: 0; }
 .recipe-edit { margin-left: auto; min-height: 32px; padding: 5px 8px; border: 0; background: transparent; color: var(--accent); font-size: 11px; white-space: nowrap; }
 .recipe-edit:hover { background: var(--head); }
+.add-recipe { margin-top: 8px; }
+.unused { margin: 14px 0 0; font-size: 12px; }
 .inline { display: grid; grid-template-columns: minmax(120px, .75fr) minmax(0, 1fr); align-items: center; gap: 12px; margin: 7px 0; font-size: 12px; }
 .inline span { color: var(--muted); font-size: 12px; }
 .inline input { width: 100%; min-width: 0; }

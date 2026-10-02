@@ -31,7 +31,7 @@
 | 新模块 | 干什么 | 为什么在这里 |
 |---|---|---|
 | `report/chart.rs` | 逐样本 CSV → 内联 SVG 速率曲线 | 报告一直只给 CSV 下载链接，「中途掉没掉速」得下载开 Excel 自己画。自绘 SVG 是**单文件离线**约束的直接推论（图表库违反它）。降采样按像素列压 min/max，**保峰值**——等距抽样会把掉速那一拍整个抽掉。不可信样本（`RateSample::valid`）是**断口**，曲线按 `Column::gap_before` 切成多条 `<polyline>`：画成一条贯通的会把采样中断的两端用直线连起来，一分钟没有数据的链路看上去是一段平直的健康曲线 |
-| `report/compare.rs` | 两轮对比：`compare` + `render_html` | 版本回归唯一要回答的问题。**对齐键刻意不用 `Unit.id`**：那个身份含 `speed_mbps`（对 RESUME 是对的），Wi-Fi 一重协商同一条测试就成了两个 ID。这条是拿真实历史数据跑出来的。键里**含稳定性轮次**（`Row.round`，`<= 1` 时一个字节都不加以保住历史键）——不含的话 N 轮在 `HashMap` 里互相覆盖只剩最后一轮，而报告不报任何错 |
+| `report/compare.rs` | 两轮对比：`compare` + `render_html` | 版本回归唯一要回答的问题。**对齐键刻意不用 `Unit.id`**：那个身份含 `speed_mbps`（对 RESUME 是对的），Wi-Fi 一重协商同一条测试就成了两个 ID。这条是拿真实历史数据跑出来的。键里**含稳定性轮次**（`Row.round`；轮次 0 与 1 都归一成 1，不分轮的计划与分轮之前的历史对得上）——不含的话 N 轮在 `HashMap` 里互相覆盖只剩最后一轮，而报告不报任何错。**协商速率与 IP 也不进键**：iperf / CTS 腿取 `comparison_label`（计划里请求的档位），每条腿一项、不按流展开，不含路径裁剪、按网口策略改写的 `-b` / `-l`（`by_role` 跟着由协商速率推出的角色走，`by_nic` 按 IPv4 匹配）和 CTS 被裁剪的流数。身份带 `version`（`COMPARISON_IDENTITY_VERSION`）：版本 0（6.5.1 写下的、或从旧明细行还原的）由 `legacy_parameter` 去掉三种运行条件说明并相邻去重后再对齐，文案与归一规则由 `legacy_labels_normalize_to_the_comparison_label_the_builder_now_writes` 绑住；唯一还原不了的是 ≤6.5.1 里按网口改过 `-l` 的 UDP 单元（原档位没被记下）。报告每行显示 `identity_label`，不印序列化后的键 |
 | `report/retention.rs` | `runs/` 保留策略 | `victims()` 是纯函数，删数据的逻辑不该只能靠「跑一遍看少了什么」验证。默认 `keep_runs: 0` 不删 |
 | `master/executor/latency.rs` | 负载下时延探针 `LoadLatency` | 灌包腿旁并发一条 ICMP，复用 `ping::run_cancellable`。**只进诊断**——`evaluate_rx_acceptance` 在类型上就收不到它。起跑等 `wait_for_traffic`、收尾靠 `probe_stop` + 分段，见下面的不变量 |
 | `master/executor.rs::DeadTrafficBreaker` | 两层熔断的纯状态机 | 分组那一层**行为上测不到**（要真实流量才显现），做成状态机才能穷举 |
@@ -86,6 +86,15 @@
   `STOP_REQUESTED` 在执行循环里**没有第二个读者**（循环只看 `is_cancelled`）。
   拆成两个标志还不够，清完必须再看一眼。守在
   `a_stop_that_lands_inside_the_clear_window_still_stops_the_run`。
+- **「要不要停」只认 `is_stop_requested`，不认 `is_cancelled`**（执行循环之外的读者）。
+  跳过也会设取消位；组合场景的 `scenario_cancelled` 以前读取消位，子网阶段点一次
+  「跳过」就调 `api_stop` 把整个场景停了。子网阶段结束后由 `discard_late_subnet_skip`
+  丢掉落在最后一个单元收尾之后、没被消费的跳过请求。守在
+  `skipping_a_subnet_unit_does_not_cancel_the_scenario_but_stopping_does`。
+- **读写进程级取消位的测试必须持有 `cancel::test_guard()`**：它持有到测试线程结束、
+  可重入；执行器夹具 `isolated_ctx` 自动调用。只让写标志的测试互斥不够——别人临时
+  置位的取消位/退出位会让并发的执行器测试提前 break、让 `api_run` 测试拿到另一句错误。
+  漏调由 `every_test_touching_cancel_flags_takes_the_guard` 按源码拦下。
 - `keep_runs` / `rounds` 归在 `MASTER_CONFIG_LOCAL_KEYS`：「这台机器上留几份历史」是磁盘管理，
   不是判定参数。跟着项目走的话，别人导入这份项目会连带删掉自己的历史。
 
@@ -517,15 +526,15 @@ Windows 文本适配器：`src/cmd/ipconfig.rs` 解析中英文 `ipconfig /all`�
 
 ### 11.1 必须保持
 
-- 两轮对比使用 `Row.comparison_identity`（`ComparisonIdentity` / `ComparisonLeg`），由 `executor::row::unit_row` 从计划保存单元方向、轮次、各腿端点及参数/时长；不改变 `Leg.tag`、行级方向或 RESUME 身份。历史缺字段时只从完整类型化明细还原，重复或不完整的键全部保留并标记 `DeltaKind::Ambiguous`，禁止覆盖或任意配对；CLI 对比不完整返回 2，API 附加 `ambiguous` 计数。
+- 两轮对比使用 `Row.comparison_identity`（`ComparisonIdentity` / `ComparisonLeg`），由 `executor::row::unit_row` 从计划保存单元方向、轮次、各腿端点及参数/时长；不改变 `Leg.tag`、行级方向或 RESUME 身份。历史缺字段时只从完整类型化明细还原，重复或不完整的键全部保留并标记 `DeltaKind::Ambiguous`，禁止覆盖或任意配对；`Ambiguous` 排在 `Regressed` / `SlowerButStillSameVerdict` 之后。任一轮判定为 SKIP（只来自 RESUME 复用）的对齐项归为 `DeltaKind::Resumed`，不算回归也不算转好。CLI 退出码由 `master::ui::compare_exit_code` 决定：有回归 1，无回归但不完整 2，否则 0（回归优先）；API 附加 `ambiguous` 与 `resumed` 计数。
 - 子网扫描统一调用 `InfoReq::for_scan`：空前缀显式全扫，有前缀照常过滤。预览和执行启动都验证完整扫描能力，`LiveTopology` 复用相同请求构造，不添加额外轮询。旧 `/info` 缺省请求仍回落到 agent 默认前缀。
-- 组合场景的启动结果未知由 `state/inner::scenarioStartPhase` 持续保存，`scenarioBlocksActions` 统一拦截冲突操作；断线只续接状态查询，不重发启动。单次空闲不解除未知，明确重新准备只清本地状态和预览；401 进入统一会话失效流程。监控每条轮询链绑定 `pollEpoch`，停止即作废，旧请求成功/失败都不得改状态或续接。
+- 组合场景的启动结果未知由 `state/inner::scenarioStartPhase` 持续保存，`scenarioBlocksActions` 统一拦截冲突操作；断线只续接状态查询，不重发启动。**确认起跑只认状态里带回的本次启动令牌**（`scenario::Request::start_token`，`valid_start_token` 校验，`/api/scenario/status` 原样带回）：不再拿「场景 ID 与开始前不同」判断——初次状态读取失败时基准是空串，任何旧场景都会被误认。别的页面起的场景在跑时保持未确认。单次空闲不解除未知，明确重新准备（`prepareAfterUnknownScenario`）只清本地状态，并**同时作废内环与子网预览**；401 进入统一会话失效流程。监控每条轮询链绑定 `pollEpoch`，停止即作废，旧请求成功/失败都不得改状态或续接。
 - `/api/skip-unit` 必须提供 `run_id` / `unit_seq`；`RunStatusRecorder::request_skip` 与 `unit_started` / `unit_finished` 共用状态锁，目标核验和取消信号写入不可分离，同一目标只写一次。执行器在发布下一单元之前消耗前一单元的 skip，停止/退出始终优先。
 
 
 - 内环 `ip_versions` 只允许 4/6，每个版本独立单元、预检、结果及 RESUME；旧配置缺字段默认 IPv4，新建页面默认双栈。`Link::local_ipv6` / `gateway_ipv6` 是不带 zone 的 IPv6 单播，参与链路两端须同为链路本地或同为非链路本地；`TrafficAddresses` 按执行端真实网口构造绑定地址和目标，板侧地址经 ADB 验证唯一 LAN 归属，不能由 IPv4 推算；`adb::lan_interface_v6` 仅在扫描证明共享 link-local 地址的全部匹配口属于同一座也持有该地址的桥时选桥作用域，跨桥或缺少归属证据仍拒绝。取消参与的 IPv6-only 链路不要求补 IPv4，反之亦然。`plan::legacy_link_identity` 固定旧字段的 Debug 格式以保留原 IPv4 身份。`BoardInterface::ipv6_addresses` 与既有 IPv4 `addresses` 分列，空前缀电脑扫描保留 IPv6-only 接口，显式 IPv4 前缀的旧过滤语义保持不变。
 
-- 内环主控扫描不设前缀，辅测机以 `InfoReq::all_interfaces` 显式请求全接口扫描（含 IPv6-only），先核实 `UNFILTERED_INFO_CAPABILITY`；旧 `/info` 请求缺少该字段时仍保留空列表回落到 agent 默认前缀的语义，不支持显式全扫的旧 agent 明确报错。
+- 内环主控扫描不设前缀，辅测机以 `InfoReq::all_interfaces` 显式请求全接口扫描（含 IPv6-only），先核实 `UNFILTERED_INFO_CAPABILITY`（`inner::remote::Remote::info` 复用 `InfoReq::for_scan(&[])` 与 `missing_capability`，与子网入口同一条规则，提示文案为内环自有）；旧 `/info` 请求缺少该字段时仍保留空列表回落到 agent 默认前缀的语义，不支持显式全扫的旧 agent 明确报错。
 
 - 内环扫描绑定 ADB 与辅测机连接身份；身份编辑立即清能力快照和待添加勾选；两者共用 `state/inner::innerProbeIdentity`。同一连接重扫按电脑、接口与地址键恢复待添加选择，不按扫描顺序恢复；请求代次拒绝迟到成功或失败。子网本机页重扫在任一种测试运行期间禁用，失败保留旧快照并明确标注，再次重扫刷新双端。监控会话绑定已连接辅测机的 host/port，换机回收旧辅测会话并拒绝迟到启动应答；本机监控继续。
 
@@ -539,15 +548,16 @@ Windows 文本适配器：`src/cmd/ipconfig.rs` 解析中英文 `ipconfig /all`�
 
 - 报告的方向统一由 `report::model::direction_tag` 优先读取类型化字段；历史缺失才从文案兜底。`group_rows` 按 `sort_key` 还原顺序，HTML 与 Excel 单元序号共用 `group_seq`；历史缺失 `unit_seq` 时不得把不同单元并为一组。Excel 链路键包括源端/接收端 `RowSide`，同名网口的正反向单向单元分别统计。
 
-- 子网预览和开始的阻断规则只有 `webui::plan::CompiledPlan::blocking_errors` 一份实现：规格编译失败、套件中有被跳过的项目、没有可执行单元。`api_plan` 返回可选 `PlanOut::blocking_errors`，`api_run_impl` 使用同一结果拒绝启动；前端只读该字段，不另解析提示文本。旧矩阵仍允许执行有效部分，空计划仍拒绝。`RunView` 只有确认 `startPhase === 'accepted'` 后才切到进度页，未知应答不当作启动成功。
+- 子网预览和开始的阻断规则只有 `webui::plan::CompiledPlan::blocking_errors` 一份实现：规格编译失败、套件中有被跳过的项目、没有可执行单元。`api_plan` 返回可选 `PlanOut::blocking_errors`，`api_run_impl` 使用同一结果拒绝启动；前端只读该字段，不另解析提示文本。旧矩阵仍允许执行有效部分，空计划仍拒绝。「执行」页 `views/run/RunView` 按运行状态在准备面板（`RunPrepare`）与进度面板（`RunProgress`）之间切换，切换条件由状态推出、不另存：运行中、开始应答 `sending`/`unknown`、运行状态未同步一律显示进度；本轮已结束（有 `run_id` 或留有日志）时先看结果，`ui.preparing`（「准备下一轮」、从计划或历史进入时置位）才回到准备面板。只有确认 `startPhase === 'accepted'` 才清 `ui.preparing`，未知应答不当作启动成功；进入准备面板且预览过期时自动预览一次。
 
-- 子网默认逐网口入口 `views/plan/PortSelection` 通过纯函数 `domain/plan-ports::assignedPairIds` / `setPairAssigned` 编辑既有分配，保留集合 ID、端点方向、其他套件和绑定顺序。`pair_ids: []` 在协议里表示整集合，取消最后一对必须删除绑定，不能写回空数组；逐网口新增绑定使用显式 ID，后来扫描发现的网口不能自动参与。默认入口的批量操作仅影响显示行的当前套件，搜索不能改动隐藏行；高级集合整列分配仍保留原有全集合语义。
+- 「计划 › 网口」`views/plan/PortSelection` 是唯一的分配编辑器（旧的集合×套件矩阵已并入），按链路集合分组：组复选框走 `domain/plan-build::toggleBinding` / `bindingSelectionState`（整集合 `pair_ids: []`，后来扫描到的同类网口自动参与，组标题标「整组」）；行复选框走 `domain/plan-ports::setPairAssigned`，批量「全选显示 / 取消显示」走 `setPairsAssigned`——已处于目标状态的行不重写，整组分配不会被改写成显式清单。保留集合 ID、端点方向、其他套件和绑定顺序；取消最后一对必须删除绑定，不能写回空数组；逐网口新增绑定使用显式 ID。批量操作仅影响显示行的当前套件，搜索与「全部/跨机/同机」只控制显示，不改集合与分配。`plan.filter` 固定为 `'all'`，旧草稿里的 `cross`/`same` 读入时改写：`pairs::roleKey` 区分跨机与同机，两类网口从不进同一个集合，所以 `'all'` 只多出未分配的集合，执行单元不变；它不在项目文件里。
+- 「计划 › 测试内容」`views/plan/SuiteEditor` 在任务里就地展开共享流量配置（`RecipeFields`），影响面由纯函数 `domain/plan-build::recipeReferences` 点名，未被引用的配置由 `unusedRecipes` 列出并可清理。「门限与默认值」标签承载 `NicPolicyTable` 与 `GlobalDefaults`，标注的优先级（任务门限 › 按网口 › Wi-Fi 频段 › 默认）与 `webui::plan::apply_wifi_pair_targets` 的 `fill_direction_target` / `nic_rx_override_resolves` 顺序一致。
 
-- 控制台浏览器回归在 `ui/e2e/console.spec.ts`，使用 `webui::tests::browser_regression_server` 交付真实鉴权、CSP 和内联页面；扫描与运行响应可控，cookie-only API 请求直接验证 Rust 服务。`state/session::rescan` 的本机阶段失败也保留并标旧双端快照；`LocalView` 打开网卡详情后聚焦返回按钮，关闭后恢复原网卡按钮（已移除则回搜索框），避免窄屏隐藏列表丢失键盘焦点。
+- 控制台浏览器回归在 `ui/e2e/console.spec.ts`，使用 `webui::tests::browser_regression_server` 交付真实鉴权、CSP 和内联页面；扫描与运行响应可控，cookie-only API 请求直接验证 Rust 服务。`state/session::rescan` 的本机阶段失败也保留并标旧双端快照；从未连接过辅测机时，本机阶段失败只记 `localError`，不把会话标成连接失败。控制台导航为「连接 / 计划 / 执行 / 内环测试 / 监控 / 历史」六区：「连接」`views/connect/ConnectView` 合并旧本机与辅测机两页、只留一个重扫入口，`NicTable` 列出全部扫描字段（不再有网卡详情面板）；「历史」`views/runs/HistoryView` 以标签承载子网（`SubnetRuns`）、内环（`InnerRuns`）与组合场景（`ScenarioRuns`）记录。子网重新执行固定以 RESUME 装载，准备面板上可取消。内环「停止测试」在组合场景时停场景、否则停内环，两个分支都必须**调用**（`InnerView::stopCurrent`），守在 e2e「单独运行的内环测试点「停止测试」真的发出停止请求」。
 
 - 子网 `state/plan::invalidatePreview` 增加请求代次并清空预览状态；`preview` 响应仅在请求代次和当前配置快照同时匹配时落地。成功导入项目或恢复默认时调用 `resetRunOptions`，清空项目不保存的 RESUME、截图、探测、强制窗口/带宽并将轮次恢复为 1；历史 `adoptRunRequest` 则从归档恢复这些选项。导入前发出的旧响应不得覆盖新项目，也不得结束新请求的忙碌态。
 
-- 内环扫描选择由纯函数 `domain/inner-setup::innerNicChoices` / `linksFromInnerChoices` 生成，默认展示 192.168 网段或仅 IPv6 的有效电脑网口并隐藏常见隧道/虚拟口，其他候选须显式展开；完整扫描不被裁剪，板侧全部系统接口与测试网口数分开；用户明确选择后由 `state/inner::addInnerScannedLinks` 添加，按电脑、接口名和 IPv4 去重，不把扫描结果全量加入。`innerSetupIssues` 同源生成缺项与修复定位；`InnerView` 的接线说明区分 ADB 控制与被测网口数据路径。`InnerLinkTable` 批量设置只处理当前显示且 enabled 的行，扫描发现网卡不等于链路预检通过。
+- 内环扫描选择由纯函数 `domain/inner-setup::innerNicChoices` / `linksFromInnerChoices` 生成，默认展示 192.168 网段或仅 IPv6 的有效电脑网口并隐藏常见隧道/虚拟口，其他候选须显式展开；完整扫描不被裁剪，板侧全部系统接口与测试网口数分开；用户明确选择后由 `state/inner::addInnerScannedLinks` 添加，按电脑、接口名和 IPv4 去重，不把扫描结果全量加入。`innerSetupIssues` 同源生成缺项与修复定位；`InnerView` 参数区用一句话说明上下行的统计口径。`InnerLinkTable` 批量设置只处理当前显示且 enabled 的行，扫描发现网卡不等于链路预检通过。
 
 - ADB 内环入口 `inner::run_cli` 与 `inner::webui::Controller` 共用 `inner::perform`，独立严格配置 `inner::config::InnerConfig`、项目标识 `cpe-inner-project` 与 schema `version: 3`（兼容 v1/v2），不混入子网 Config/Unit；内环单元有独立稳定身份和 24 小时 PASS RESUME，绝不命中子网历史。分层固定：`config` 定义 schema 与 v1→v2 迁移（`protocol`→`protocols`、`board_interface`→`board_rx_interface`，补 `enabled`/`measurement`/`repeats`/`resume`；顺序单向**绝不**迁成 `bidir`，策略保持 `nic_strict`）；`plan` 是**全仓唯一**的笛卡尔积，页面预览、执行器、进度和报告都消费它，展开顺序为 网口 → IP 版本 → 协议 → 方向 → 轮次；`adb` 适配板侧设备（接口清单、桥成员、`/proc/net/dev` 与 sysfs 两条读取路径、按端口起 server）；`measure` 是纯策略层，来源选择与门限配对只在这里；`mod` 只负责按计划起流采样；`report`/`history` 输出与历史。`inner::remote` 根据链路 host 使用现有 agent client/monitor/owner cleanup 协议，令牌不序列化。`inner::adb` 仅经 ADB 确认自有 server 就绪，不要求主控能路由到被测 LAN；前台 shell 使用本次 PID、停止标记和有限租约回收，未确认回收时停止后续起流。发送端始终运行普通 client：上行 PC client → 板侧 server，下行板侧 client → PC server，不使用 `-R`；`inner::adb_client` 经公共 ProcessExecutor 复用 iperf 参数/重试/事件解析，`inner::receiver_server` 按方向管理本机/agent/板侧 server，server owner 与 client/monitor owner 隔离以便停止后先收日志；接收端按数据走向定（上行采板侧 RX，下行采网口所在电脑 RX），不按谁跑 client 推断。`enabled: false` 的网口保留配置但不执行、不预检，其引用的辅测机也不进连接门禁——无 agent 或 agent 离线都不阻断本机测试。`bidir` 是一个含两条腿的单元：两腿各占 `port` / `port+1`、独立 job 与日志、在作用域线程里同时起流，按两腿有效窗口的**交集**计算，一腿失败置位单元取消位停止对向并定向回收。`-P`/`-w`/`-b`/`-l` 按协议分开配置，`tcp_window` / `udp_length` 走 `config::size_token` 白名单、`board_rx_interface` 走 `config::iface_word` 白名单后才拼进命令行或 sysfs 路径。测量策略 `nic_strict` / `nic_preferred` / `tool` 决定来源：网卡口径始终单独留存并仍由 `rate_window::evaluate_rx_acceptance` 产出，字段语义不变；兜底整条腿只选一次来源并记录原因，**可信低速不触发兜底**，工具口径**不继承**网卡门限（无工具门限只出 MEASURED）；工具速率只认真正的 receiver 汇总（多流须有 `[SUM]`），不取 sender / interval 末行；双向合计只相加同来源层次的两端接收速率，配了合计门限才按合计判一次。`max_udp_loss_pct` 超限仅追加 `UDP_LOSS_HIGH`，不推翻速率判定。板侧 server 原文按首尾裁剪后随腿进报告。`inner` 与子网共用纯 `cmd::iperf_window` 和 `rate_window`，不调用子网执行器。`master::webui::http` 在既有鉴权后转发 `/api/inner/*`（含 `plan` 预览与 `runs*` 历史，历史目录名按白名单精确比对、不做路径拼接）；两类启动共用 run_gate 防止并发占线，但配置、运行状态和取消标志分开；组合入口 `/api/scenario/*` 按子网后内环顺序执行，并在 `scenarios/` 保存两份原始配置，历史恢复默认打开两段各自的 RESUME。内环输出 `inner_runs`（`report.html`/`result.json`/`summary.json`/`config.json`/`units.jsonl`），子网历史仍只读 `runs`；历史「装载配置」只回配置不直接开跑。前端 `state/inner`、`domain/inner`、`views/inner/*` 不读写子网计划/连接/运行状态；独立草稿键与导入导出，误导入不得改写另一模式的配置；计划预览来自后端，前端不自算笛卡尔积。
 
@@ -598,7 +608,7 @@ Windows 文本适配器：`src/cmd/ipconfig.rs` 解析中英文 `ipconfig /all`�
     作者必须回答「它会不会起测/停测/占用被测资源」。`stateful` 那几条不加门的
     **前提**是执行线程不回读 `console.state`（`api_run_impl` 起线程前已把 `cfg`
     快照下来）；哪天执行线程开始回读，它们就必须搬进 `gated`。
-    界面侧另有一道 **UX 门**：`AgentView` 的「连接」「重新扫描」（两者都发
+    界面侧另有一道 **UX 门**：`ConnectView` 的「连接」「重新扫描」（两者都发
     `/api/connect`）在 `run.running || inner.status.running || inner.scenario.running`
     任一为真时禁用，表单提交处理也检查同一道门，理由是页面显示的辅测机会和实际被测的那台对不上。
     `App` 首次挂载同时同步组合场景状态，刷新后无需先进入内环页才能锁定。

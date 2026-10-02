@@ -295,6 +295,8 @@ export interface CompareOut {
   disappeared: number;
   unchanged: number;
   ambiguous?: number;
+  /** 其中一轮按 RESUME 复用 PASS、没有实际执行的单元数（旧版主控不返回）。 */
+  resumed?: number;
 }
 
 export interface RunRequestOut {

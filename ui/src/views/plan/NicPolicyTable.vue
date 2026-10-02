@@ -73,22 +73,14 @@ function clearAll(): void {
 </script>
 
 <template>
-  <details class="block">
-    <summary>
-      <strong>按网口门限与负载</strong>
-      <small class="muted">
-        {{ activeCount ? `${activeCount} 个网口已设` : '' }}
-      </small>
-    </summary>
-
-    <p class="muted hint">
-      「RX 通过门限」是这块网口<strong>作为接收端</strong>时判 PASS 的线：填
-      <code>1800</code> 是绝对 1800Mbps，填 <code>90%</code> 是协商速率的 90%。
+  <section class="panel">
+    <h3>按网口门限与负载 <small v-if="activeCount" class="muted">{{ activeCount }} 个网口已设</small></h3>
+    <p class="hint">
+      RX 通过门限是网口作为接收端时判 PASS 的线：<code>1800</code> = 1800 Mbps，<code>90%</code> = 协商速率的 90%。
+      UDP 参数只作用于该网口作为发送端的测试，填了就不再逐档扫描。
     </p>
 
-    <div v-if="rows.length === 0" class="empty">
-      还没有网口可设。先到「辅测机」页连上对端。
-    </div>
+    <p v-if="rows.length === 0" class="empty">连接辅测机后显示网口。</p>
     <template v-else>
       <div class="scroll">
         <table>
@@ -151,22 +143,15 @@ function clearAll(): void {
         <button type="button" class="ghost" :disabled="activeCount === 0" @click="clearAll">
           清空全部网口策略
         </button>
-        <span class="muted">钉死发送端的 UDP 带宽或报文长度后，该轴不再逐档扫描，单元数会随之减少。</span>
       </div>
     </template>
-  </details>
+  </section>
 </template>
 
 <style scoped>
-.block {
-  margin: 0 0 14px;
-  padding: 10px 12px;
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  background: var(--surface);
-}
-.block > summary { cursor: pointer; display: flex; align-items: baseline; gap: 10px; }
-.hint { margin: 8px 0 10px; font-size: 12px; }
+.panel h3 { margin: 0 0 4px; }
+.panel h3 small { margin-left: 6px; font-size: 12px; font-weight: 400; }
+.hint { margin: 0 0 10px; font-size: 12px; }
 .scroll { max-width: 100%; overflow-x: auto; border: 1px solid var(--line); border-radius: 6px; }
 table { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 13px; }
 th, td { padding: 7px 9px; text-align: left; border-bottom: 1px solid var(--line); vertical-align: top; }

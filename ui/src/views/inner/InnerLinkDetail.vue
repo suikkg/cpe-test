@@ -60,18 +60,12 @@ function changeHost(): void {
     <label class="other-toggle"><input v-model="showOther" type="checkbox">显示此电脑的其他网段 / 隧道接口</label>
     <details :open="!nics.length" class="advanced">
       <summary>手动填写网卡{{ v4 ? '与 IPv4' : '' }}</summary>
-      <p class="muted">扫描未找到网卡时，可填写所选电脑上实际的网卡名称与 IP。</p>
       <div class="grid">
         <label>网卡名称<input v-model="props.link.local_interface" placeholder="以太网"></label>
         <label v-if="v4">该电脑网卡 IPv4<input v-model="props.link.local_ip" placeholder="192.168.0.100"></label>
       </div>
     </details>
 
-    <h4>这一口测什么</h4>
-    <p class="muted">
-      上行（PC → CPE）看板侧桥接口 RX，默认 br0；下行（CPE → PC）看上方所选电脑网卡的 RX。
-      双向并发分别记录两端接收速率。
-    </p>
     <details class="advanced">
       <summary>高级：统计接口、测量策略与验收门限</summary>
     <div class="grid">
@@ -80,11 +74,11 @@ function changeHost(): void {
         <option v-for="item in INNER_MEASUREMENTS" :key="item" :value="item">{{ MEASUREMENT_LABEL[item] }}</option>
       </select></label>
     </div>
-    <p class="muted">桥接口名称变化时可手动修改，例如 br-lan；留空按板侧 LAN 地址归属自动识别。修改随草稿和导出配置保存。</p>
+    <p class="muted">上行统计这里的板侧桥接口（如 br0、br-lan）接收，留空按板侧 LAN 地址自动识别；下行统计上面所选电脑网卡接收。</p>
     <p class="muted">{{ MEASUREMENT_HINT[props.link.measurement] }}</p>
 
     <h4>验收门限</h4>
-    <p class="muted">留空只测量。网卡口径和工具口径的门限互相独立，工具速率不会套用网卡门限。</p>
+    <p class="muted">留空只测量。网卡口径与工具口径各设各的，工具速率不套用网卡门限。</p>
     <div class="grid">
       <label>上行 · 网卡口径 Mbps<input v-model.number="props.link.upload_min_mbps" type="number" min="0.01" step="any" placeholder="留空仅测量"></label>
       <label>下行 · 网卡口径 Mbps<input v-model.number="props.link.download_min_mbps" type="number" min="0.01" step="any" placeholder="留空仅测量"></label>

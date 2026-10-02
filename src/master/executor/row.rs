@@ -180,6 +180,14 @@ pub(super) fn unit_protocol_and_backend(unit: &Unit) -> (RowProtocol, RowBackend
     seen.unwrap_or((RowProtocol::None, RowBackend::None))
 }
 
+/// 两轮对比的对齐身份。
+///
+/// **协商速率不能进这把键**（`report::compare` 模块头）。iperf 腿因此取请求的
+/// 档位（`IperfTask::comparison_label`），并且**每条腿只取一项**，不按流展开：
+/// UDP 开着「按链路上限裁剪」时，流数是 `floor(路径上限 / -b)`，而路径上限跟着
+/// 协商速率走——同一条 2.5G 链路降到 1G，4 条流变 1 条，按流展开的键就对不上了，
+/// 对比报告把这次掉速拆成「本轮缺失 + 本轮新增」。单流和多流都取第一条流的那一项，
+/// 所以流数被裁成 1（腿从 `IperfGroup` 变成 `IperfSingle`）也照样对得上。
 fn comparison_identity(unit: &Unit) -> crate::report::ComparisonIdentity {
     use crate::report::{ComparisonIdentity, ComparisonLeg};
     let (protocol, backend) = unit_protocol_and_backend(unit);
@@ -190,7 +198,7 @@ fn comparison_identity(unit: &Unit) -> crate::report::ComparisonIdentity {
                 &t.src,
                 &t.dst,
                 t.v6,
-                vec![t.profile_label.clone()],
+                vec![t.comparison_label.clone()],
                 Some(t.duration),
             ),
             LegKind::IperfGroup { streams, .. } => {
@@ -199,7 +207,7 @@ fn comparison_identity(unit: &Unit) -> crate::report::ComparisonIdentity {
                     &t.src,
                     &t.dst,
                     t.v6,
-                    streams.iter().map(|t| t.profile_label.clone()).collect(),
+                    vec![t.comparison_label.clone()],
                     Some(t.duration),
                 )
             }
@@ -207,7 +215,7 @@ fn comparison_identity(unit: &Unit) -> crate::report::ComparisonIdentity {
                 &t.src,
                 &t.dst,
                 t.v6,
-                vec![t.profile_label.clone()],
+                vec![t.comparison_label.clone()],
                 Some(t.duration),
             ),
             LegKind::Ping(t) => (
@@ -231,6 +239,7 @@ fn comparison_identity(unit: &Unit) -> crate::report::ComparisonIdentity {
         });
     }
     ComparisonIdentity {
+        version: crate::report::COMPARISON_IDENTITY_VERSION,
         bidir: unit.bidir,
         round: unit.round.max(1),
         legs,

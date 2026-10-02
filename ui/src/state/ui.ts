@@ -2,8 +2,11 @@ import { reactive } from 'vue';
 import type { VerdictFilter } from '../domain/progress';
 
 /** 左侧导航的区域标识。旧页用 1–5 的向导编号，但流程本来就不是严格线性的
- *  （「本机」不编号却常驻，第 3 步内部又自带 1·2·3·4），所以这里改用具名区域。 */
-export type RegionId = 'local' | 'agent' | 'plan' | 'run' | 'progress' | 'monitor' | 'runs' | 'inner';
+ *  （「本机」不编号却常驻，第 3 步内部又自带 1·2·3·4），所以这里改用具名区域。
+ *
+ *  「连接」合并了旧的本机/辅测机两页（两页的重扫是同一个请求）；「执行」合并了
+ *  旧的执行/进度两页（开始之后本来就自动跳过去）。 */
+export type RegionId = 'connect' | 'plan' | 'run' | 'inner' | 'monitor' | 'history';
 
 export interface RegionDef {
   id: RegionId;
@@ -13,15 +16,18 @@ export interface RegionDef {
 }
 
 export const REGIONS: readonly RegionDef[] = [
-  { id: 'local', label: '本机', group: 'flow' },
-  { id: 'agent', label: '辅测机', group: 'flow' },
-  { id: 'plan', label: '测试计划', group: 'flow' },
+  { id: 'connect', label: '连接', group: 'flow' },
+  { id: 'plan', label: '计划', group: 'flow' },
   { id: 'run', label: '执行', group: 'flow' },
-  { id: 'progress', label: '进度', group: 'flow' },
   { id: 'inner', label: '内环测试', group: 'inner' },
   { id: 'monitor', label: '监控', group: 'tool' },
-  { id: 'runs', label: '历史运行', group: 'tool' },
+  { id: 'history', label: '历史', group: 'tool' },
 ];
+
+/** 「计划」页的三个标签。 */
+export type PlanTab = 'ports' | 'content' | 'limits';
+/** 「历史」页的三个标签。 */
+export type HistoryTab = 'subnet' | 'inner' | 'scenario';
 
 /** 主题：跟随系统 / 强制亮 / 强制暗。旧页把这个写在 documentElement 的
  *  data-theme 上，CSS 变量按 :root[data-theme] 覆盖，这里保持同一套契约。 */
@@ -61,24 +67,33 @@ function emptyContext(): RegionContext {
 }
 
 export const ui = reactive({
-  region: 'local' as RegionId,
+  region: 'connect' as RegionId,
   theme: storedTheme(),
-  /** 「本机」页的网卡列表上下文。 */
-  local: emptyContext(),
-  /** 「测试计划」页分配表的上下文（这一版只用到 query）。 */
+  /** 「连接」页的网卡列表上下文（只用到 query）。 */
+  connect: emptyContext(),
+  /** 「计划」页网口表的上下文（只用到 query）。 */
   plan: emptyContext(),
   /** 套件工作区：query = 列表搜索，selected = 当前套件 id。 */
   suites: emptyContext(),
-  /** 配置工作区：query = 列表搜索，selected = 当前配置 id。 */
+  /** 「测试内容」里就地展开编辑的配置：selected = 配置 id（query 未用）。 */
   recipes: emptyContext(),
-  /** 「执行」页计划复核清单的上下文（这一版只用到 query）。 */
+  /** 「执行」页准备面板的预览清单上下文（只用到 query）。 */
   run: emptyContext(),
-  /** 「进度」页已完成单元的上下文：query = 搜索，selected = 选中单元的 seq。 */
+  /** 「执行」页进度面板的已完成单元：query = 搜索，selected = 展开详情的单元 seq。 */
   progress: emptyContext(),
   /** 「监控」页：selected = 当前展示哪一路会话的曲线（**只换展示，不启停**）。 */
   monitor: emptyContext(),
-  /** 「历史运行」页：query = 搜索，selected = 选中的运行目录 id。 */
-  runs: emptyContext(),
+  /** 「历史」页子网标签：query = 搜索。 */
+  history: emptyContext(),
+  planTab: 'ports' as PlanTab,
+  historyTab: 'subnet' as HistoryTab,
+  /**
+   * 「执行」页上一轮已结束、用户点了「准备下一轮」。
+   *
+   * 只在「本轮已结束」时起作用：运行中、开始结果未确认时一律显示进度，不看它。
+   * 开始被受理时清掉，这样新一轮结束后仍先看到结果。
+   */
+  preparing: false,
   /** 进度页那一行可点筛选当前选的是哪一桶。 */
   progressFilter: 'all' as VerdictFilter,
   /**
@@ -89,14 +104,6 @@ export const ui = reactive({
    * 上一轮留下的。
    */
   progressRunId: '',
-  /**
-   * 从某个任务点「编辑参数」跳进配置编辑器时记下的**来源**（方案 §11.2）。
-   *
-   * 不记的话，「返回套件」只能回到那个工作区，而选中的套件是组件本地 `ref`——
-   * 重新挂载后回落到第一个。用户改完参数回来，看到的是别的套件，而他以为
-   * 自己只是点了「返回」。
-   */
-  recipeReturn: null as { suiteId: string; taskId: string } | null,
 });
 
 export function goto(region: RegionId): void {
@@ -135,16 +142,18 @@ export function applyTheme(): void {
 /** 全部状态复位。每个 state 模块都要导出一个，供「断开连接 / 换辅测机」这类
  *  操作把整块资源清干净——旧页靠逐个变量手动赋值，漏一个就是幽灵状态。 */
 export function reset(): void {
-  ui.region = 'local';
-  ui.local = emptyContext();
+  ui.region = 'connect';
+  ui.connect = emptyContext();
   ui.plan = emptyContext();
   ui.suites = emptyContext();
   ui.recipes = emptyContext();
   ui.run = emptyContext();
   ui.progress = emptyContext();
   ui.monitor = emptyContext();
-  ui.runs = emptyContext();
+  ui.history = emptyContext();
+  ui.planTab = 'ports';
+  ui.historyTab = 'subnet';
+  ui.preparing = false;
   ui.progressFilter = 'all';
   ui.progressRunId = '';
-  ui.recipeReturn = null;
 }

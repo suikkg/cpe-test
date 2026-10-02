@@ -81,6 +81,24 @@ pub(super) struct Request {
     pub(super) resume_subnet: bool,
     #[serde(default)]
     pub(super) resume_inner: bool,
+    /// 页面为**这一次**启动请求生成的随机令牌，原样记进状态、由 `/api/scenario/status` 带回。
+    ///
+    /// 启动请求没拿到应答时，页面只能靠回读状态判断它有没有起跑。以前拿「状态里的
+    /// 场景 ID ≠ 开始前记下的 ID」判断；页面初次读状态失败时记下的是空串，任何一个
+    /// 旧场景的 ID 都会被当成「这次起来了」，锁随之解开，而那条请求可能还在排队。
+    /// 有了令牌，页面只认自己发出的那一个。旧页面不带令牌时为空串，照常启动。
+    #[serde(default)]
+    pub(super) start_token: String,
+}
+
+/// 启动令牌只许 ASCII 字母、数字和连字符，最长 64 字节；空串表示没带。
+///
+/// 它会原样进状态回包，限制形状是为了不让请求体把任意字符串塞进每一次状态轮询。
+fn valid_start_token(token: &str) -> bool {
+    token.len() <= 64
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -91,6 +109,8 @@ struct State {
     error: Option<String>,
     subnet_run_id: String,
     inner_run_id: String,
+    /// 创建这一场景的启动请求带来的令牌，见 [`Request::start_token`]。
+    start_token: String,
 }
 
 #[derive(Default)]
@@ -129,6 +149,9 @@ impl Controller {
     pub(super) fn start(&self, console: &Arc<Console>, body: &str) -> Result<Value, String> {
         let request: Request =
             serde_json::from_str(body).map_err(|e| format!("场景参数解析失败: {e}"))?;
+        if !valid_start_token(&request.start_token) {
+            return Err("场景启动令牌格式不正确，请刷新页面后重试".into());
+        }
         let inner_text = serde_json::to_string(&request.inner).map_err(|e| e.to_string())?;
         let mut inner_cfg = config::parse_config(&inner_text)?;
         inner_cfg.resume |= request.resume_inner;
@@ -181,6 +204,7 @@ impl Controller {
             running: true,
             id: id.clone(),
             phase: "subnet".into(),
+            start_token: request.start_token.clone(),
             ..Default::default()
         };
         self.cancel.store(false, Ordering::SeqCst);
@@ -204,6 +228,7 @@ impl Controller {
                         }
                         std::thread::sleep(Duration::from_millis(200));
                     }
+                    discard_late_subnet_skip();
                     if scenario_cancelled(&cancel) {
                         return Err("组合场景已取消".into());
                     }
@@ -369,10 +394,29 @@ fn inner_stage_error_status(status: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
+/// 这一场景是不是被要求停下来。
+///
+/// 看的是**整轮停止**（`is_stop_requested`），不是取消位（`is_cancelled`）。
+/// 「跳过当前单元」复用整轮取消那套收尾路径，也会设取消位；读取消位的话，
+/// 子网阶段里点一次「跳过」就被当成「停止」，场景线程随即调 `api_stop`
+/// 把剩下的子网队列和整个内环阶段一起取消。执行页的「停止」、组合场景的
+/// 「停止」和 Ctrl+C 都经 `request_cancel` 设了 `STOP_REQUESTED`，照样能停。
 fn scenario_cancelled(cancel: &AtomicBool) -> bool {
     cancel.load(Ordering::SeqCst)
-        || crate::cancel::is_cancelled()
+        || crate::cancel::is_stop_requested()
         || crate::cancel::is_shutdown_requested()
+}
+
+/// 子网阶段结束后，丢掉没被消费的「跳过当前单元」请求。
+///
+/// 执行器在单元边界取走跳过请求；请求落在最后一个单元收尾**之后**时，后面
+/// 没有下一个单元边界了，跳过位和取消位就留了下来。内环阶段用自己的取消
+/// 标志不受它影响，但留着它等于让一次点晚了的「跳过」挂在进程状态里。
+/// `resume_after_skip` 里停止与退出优先，有人真要停时不会被这里清掉。
+fn discard_late_subnet_skip() {
+    if crate::cancel::take_skip_unit() {
+        crate::cancel::resume_after_skip();
+    }
 }
 
 fn runtime_inner_body(raw: &Value, resume: bool) -> Result<String, String> {
@@ -395,11 +439,13 @@ fn runtime_inner_body(raw: &Value, resume: bool) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        inner_stage_error_status, runtime_inner_body, subnet_stage_finished,
-        update_manifest_phase_at,
+        discard_late_subnet_skip, inner_stage_error_status, runtime_inner_body, scenario_cancelled,
+        subnet_stage_finished, update_manifest_phase_at, valid_start_token, Controller, Request,
+        State,
     };
     use crate::master::run_status::RunStatus;
     use serde_json::json;
+    use std::sync::atomic::AtomicBool;
 
     #[test]
     fn runtime_body_keeps_agent_tokens_but_updates_nested_resume() {
@@ -414,6 +460,77 @@ mod tests {
             serde_json::from_str(&runtime_inner_body(&raw, true).unwrap()).unwrap();
         assert_eq!(body["config"]["agents"][0]["token"], "private-token");
         assert_eq!(body["config"]["resume"], true);
+    }
+
+    #[test]
+    fn start_tokens_are_short_plain_identifiers_or_absent() {
+        assert!(valid_start_token(""), "旧页面不带令牌");
+        assert!(valid_start_token("0123456789abcdef0123456789ABCDEF"));
+        assert!(valid_start_token("a-b"));
+        assert!(valid_start_token(&"a".repeat(64)));
+        assert!(!valid_start_token(&"a".repeat(65)));
+        assert!(!valid_start_token("a b"));
+        assert!(!valid_start_token("<script>"));
+        assert!(!valid_start_token("令牌"));
+    }
+
+    /// 页面靠状态里带回的令牌认出「这是我发起的那一场」。
+    #[test]
+    fn the_status_echoes_the_start_token_and_old_requests_still_parse() {
+        let controller = Controller::default();
+        *crate::util::lock_recover(&controller.state) = State {
+            running: true,
+            id: "scenario_1".into(),
+            start_token: "abc-123".into(),
+            ..Default::default()
+        };
+        assert_eq!(controller.status()["start_token"], "abc-123");
+
+        let old: Request = serde_json::from_value(json!({
+            "subnet": {},
+            "inner": {},
+        }))
+        .unwrap();
+        assert_eq!(old.start_token, "", "旧页面的请求照常解析");
+    }
+
+    /// 子网阶段里点「跳过当前单元」只跳过那一个单元，不能变成停止整个场景。
+    #[test]
+    fn skipping_a_subnet_unit_does_not_cancel_the_scenario_but_stopping_does() {
+        crate::cancel::test_guard();
+        crate::cancel::reset();
+        let own = AtomicBool::new(false);
+        crate::cancel::request_skip_unit();
+        assert!(
+            crate::cancel::is_cancelled(),
+            "跳过复用取消位去掐断当前单元"
+        );
+        assert!(!scenario_cancelled(&own), "跳过不是停止，场景要继续");
+        crate::cancel::request_cancel();
+        assert!(scenario_cancelled(&own), "执行页的「停止」仍然停下整个场景");
+        crate::cancel::reset();
+        assert!(
+            scenario_cancelled(&AtomicBool::new(true)),
+            "组合场景自己的停止"
+        );
+    }
+
+    /// 跳过请求落在最后一个子网单元收尾之后：没有下一个单元边界来消费它。
+    #[test]
+    fn a_late_skip_after_the_last_subnet_unit_is_discarded_but_a_stop_is_kept() {
+        crate::cancel::test_guard();
+        crate::cancel::reset();
+        crate::cancel::request_skip_unit();
+        discard_late_subnet_skip();
+        assert!(!crate::cancel::is_cancelled());
+        assert!(!crate::cancel::take_skip_unit());
+
+        crate::cancel::request_skip_unit();
+        crate::cancel::request_cancel();
+        discard_late_subnet_skip();
+        assert!(crate::cancel::is_cancelled(), "有人真要停时取消位必须留着");
+        assert!(crate::cancel::is_stop_requested());
+        crate::cancel::reset();
     }
 
     #[test]

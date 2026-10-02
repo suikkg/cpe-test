@@ -771,6 +771,45 @@ export function profilesToAxes(recipe: UiRecipe, protocol: 'tcp' | 'udp'): UiRec
   };
 }
 
+/**
+ * 引用这条配置的任务，带上所在套件。
+ *
+ * 配置是**共享**的：改它会同时改变所有引用它的任务。就地编辑时必须把影响面
+ * 逐条点名，而不是改完预览时才发现别的套件单元数也变了。
+ */
+export function recipeReferences(
+  plan: UiPlan,
+  recipeId: string,
+): Array<{ suiteId: string; suite: string; taskId: string; task: string }> {
+  const out: Array<{ suiteId: string; suite: string; taskId: string; task: string }> = [];
+  for (const suite of plan.suites) {
+    for (const task of suite.tasks) {
+      if (task.recipe_ids.includes(recipeId)) {
+        out.push({
+          suiteId: suite.id,
+          suite: suite.name || '(未命名套件)',
+          taskId: task.id,
+          task: task.name || task.protocol.toUpperCase(),
+        });
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * 没有任何任务引用的配置。
+ *
+ * 配置只能从任务里打开编辑，没人引用的那几条在界面上看不见，却仍在项目文件里。
+ * 列出来给一个「清理」入口，免得它们变成看不见的数据。
+ */
+export function unusedRecipes(plan: UiPlan): Array<{ protocol: 'tcp' | 'udp'; recipe: UiRecipe }> {
+  const used = new Set(plan.suites.flatMap((suite) => suite.tasks.flatMap((task) => task.recipe_ids)));
+  return (['tcp', 'udp'] as const).flatMap((protocol) =>
+    plan.recipes[protocol].filter((recipe) => !used.has(recipe.id)).map((recipe) => ({ protocol, recipe })),
+  );
+}
+
 /** 一条配置在界面上的一句话摘要（收起时也要看得出它是什么）。 */
 export function recipeSummary(recipe: UiRecipe, protocol: UiProtocol): string {
   const parts: string[] = [];

@@ -95,24 +95,16 @@ impl Remote {
                 self.config.id
             ));
         }
-        // 老 agent 会忽略未知字段并悄悄套用默认前缀，必须先核实能力。
-        if !health
-            .capabilities
-            .iter()
-            .any(|v| v == UNFILTERED_INFO_CAPABILITY)
-        {
+        // 内环总是扫全部接口：请求构造与能力规则都走 `InfoReq`，和子网入口同一份。
+        // 提示文案是内环自己的——这里没有「改填 IPv4 前缀」这条退路。
+        let request = InfoReq::for_scan(&[]);
+        if request.missing_capability(&health.capabilities).is_some() {
             return Err(format!(
                 "辅测机 {} 不支持完整网卡扫描，请使用同版本 agent",
                 self.config.id
             ));
         }
-        self.post(
-            "/info",
-            &InfoReq {
-                ipv4_prefixes: Vec::new(),
-                all_interfaces: true,
-            },
-        )
+        self.post("/info", &request)
     }
     pub fn cleanup(&self, owner: &str) -> Result<(), String> {
         let result: ResourceCleanupOut = self.post(

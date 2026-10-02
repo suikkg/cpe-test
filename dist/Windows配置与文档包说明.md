@@ -1,13 +1,13 @@
-# cpe_test v6.5.1 Windows 配置与文档包
+# cpe_test v6.5.2 Windows 配置与文档包
 
-仓库中的 `cpe_test-v6.5.1-windows-config-docs.zip` 是便于从 Git 直接下载的
+仓库中的 `cpe_test-v6.5.2-windows-config-docs.zip` 是便于从 Git 直接下载的
 Windows 配置、说明文档和启动脚本资料包。包内文件由仓库当前版本生成，并由 CI
 逐文件与源码副本比对，避免配置或文档过期。
 
 这个资料包**不包含可执行程序或吞吐工具**：
 
 - 不包含 `cpe_test.exe`；请从 GitHub Release 下载正式
-  `cpe_test-v6.5.1-windows-x86_64.zip`，或自行编译。
+  `cpe_test-v6.5.2-windows-x86_64.zip`，或自行编译。
 - 不包含 `ctsTraffic.exe`；正式 Windows Release ZIP 会捆绑固定并校验过的
   Microsoft ctsTraffic 2.0.4.0 x64。
 - 不包含 `iperf3.exe` 及其 DLL；需要 iperf3 测试时，请放入完整的 Windows
@@ -28,9 +28,9 @@ Windows 配置、说明文档和启动脚本资料包。包内文件由仓库当
 - `start_ui.bat`（图形控制台）、`start_agent.bat`、`start_master.bat`、`start_master_select_config.bat`。
 - iperf3/ctsTraffic 放置说明、MIT 许可证和第三方声明。
 
-## v6.5.1 修复
+## v6.5.2 更新
 
-修复报告对比错合并单向与双向任务、空前缀扫描预览和执行不一致、组合场景断线后丢失状态、监控重启重复轮询及跳过请求可能作用到下一单元的问题。历史资料不足或对比身份重复时会明确标记无法唯一匹配。
+改进两轮报告对比：区分单向与双向任务及稳定性轮次，兼容归一旧版身份，并将不完整或重复的历史匹配明确标为无法唯一匹配。组合场景以本次启动令牌确认启动结果；扫描预览与执行使用一致的全接口请求，跳过请求绑定运行和单元，停止后的迟到轮询响应不会重启轮询链。控制台整理连接、计划、运行准备、进度和历史页面，支持更完整的键盘操作。
 
 ## v6.5.0 行为要点
 

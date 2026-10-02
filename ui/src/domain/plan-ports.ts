@@ -41,6 +41,22 @@ export function setPairAssigned(
   return { ...plan, bindings };
 }
 
+/**
+ * 批量勾选或取消一批网口（网口表的「全选显示 / 取消显示」）。
+ *
+ * 已处于目标状态的行**不重写**：对整组分配（`pair_ids: []`）里的网口再调一次
+ * `setPairAssigned(…, true)` 会把它改写成一份显式清单，之后扫到的同类网口就
+ * 不再自动加入——而用户只是点了一下「全选」。
+ */
+export function setPairsAssigned(
+  plan: UiPlan, rows: ReadonlyArray<{ setId: string; pairId: string }>, suiteId: string, selected: boolean,
+): UiPlan {
+  return rows.reduce((current, row) =>
+    assignedPairIds(current, row.setId, suiteId).has(row.pairId) === selected
+      ? current
+      : setPairAssigned(current, row.setId, row.pairId, suiteId, selected), plan);
+}
+
 export function selectedPortPairs(plan: UiPlan): number {
   return plan.link_sets.reduce((total, set) => {
     const selected = new Set(plan.suites.flatMap((suite) =>
