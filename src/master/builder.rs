@@ -14,14 +14,22 @@ use crate::rate;
 use crate::util::md5_hex;
 use std::collections::{BTreeMap, HashSet};
 
+mod cts;
 mod diagnostics;
 mod identity;
+mod iperf_tcp;
+mod iperf_udp;
+mod ping;
 mod policy;
 
+use cts::*;
 #[cfg(test)]
 pub use diagnostics::build_iperf_failure_diagnostics;
 pub use diagnostics::build_traffic_failure_diagnostics;
 use identity::*;
+use iperf_tcp::*;
+use iperf_udp::*;
+use ping::*;
 use policy::*;
 
 pub const PORT_BASE: u16 = 56000;
@@ -580,132 +588,6 @@ pub fn spec_from_config(
     })
 }
 
-/// UDP 按整条路径的可信负载上限裁剪流数。
-/// RNDIS 3.7G 协商按约 2.5G，10GUSB 的 4.2G 已知显示 bug 不按 4.2G 裁剪。
-fn allowed_udp_streams_for_mbps(
-    sender: &Endpoint,
-    receiver: &Endpoint,
-    bandwidth_mbps: f64,
-    want: u32,
-    limit: bool,
-    rate_cfg: &RateCheckCfg,
-) -> u32 {
-    if !limit {
-        return want;
-    }
-    let Some(speed) = rate::path_payload_ceiling_mbps(&sender.nic, &receiver.nic, rate_cfg) else {
-        return want;
-    };
-    let bw = bandwidth_mbps;
-    if bw <= 0.0 {
-        return want;
-    }
-    let max_n = (speed / bw).floor() as u32;
-    max_n.min(want)
-}
-
-/// 一条方向腿实际下发的 UDP 负载：单流 `-b` 与流数。
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct UdpLoad {
-    pub bits_per_second: u64,
-    pub mbps: f64,
-    pub streams: u32,
-    /// 单流带宽被路径上限压低时，记下原始请求值，供任务标签与报表说明。
-    pub clipped_from_mbps: Option<f64>,
-}
-
-impl UdpLoad {
-    /// iperf3 的无后缀带宽值按 bit/s 解释。传精确整数可避免依赖它对
-    /// `Gbps` 等长后缀的非文档兼容行为。
-    pub(crate) fn iperf_arg(self) -> String {
-        self.bits_per_second.to_string()
-    }
-}
-
-/// 按整条路径的可信负载上限决定这条腿的 `-b` 和流数。
-///
-/// 优先降流数（保持单流带宽不变），流数已经降到 1 仍然超限时才压 `-b`。
-///
-/// 旧行为在「单流带宽就已经超过路径上限」时返回 0 流，调用方据此把任务整个
-/// 跳过。run_20260825_215915_7684 里 80 条 UDP 命令全部带着同一个
-/// `-b 2600000000`，其中相当一部分打向 1Gbps 收端，制造出 60~99% 的丢包——
-/// 那是配置出来的丢包，不是测出来的。给 1Gbps 收端灌 1Gbps 拿到一个真实
-/// 结论，永远好过跳过或者灌 2.6G 拿到一个必然失败的结论。
-/// 详见 .ai/DESIGN-v4.3.0.md D4。
-pub(crate) fn udp_load_for_leg(
-    sender: &Endpoint,
-    receiver: &Endpoint,
-    requested: ParsedBandwidth,
-    want_streams: u32,
-    limit: bool,
-    explicit: bool,
-    rate_cfg: &RateCheckCfg,
-) -> UdpLoad {
-    let want = want_streams.max(1);
-    let as_requested = |streams: u32| UdpLoad {
-        bits_per_second: requested.bits_per_second,
-        mbps: requested.mbps,
-        streams,
-        clipped_from_mbps: None,
-    };
-    // `explicit` = 这条链路在 link_profiles 里被专门指定过带宽。
-    // 那是操作者对这条链路的明确判断，自动裁剪不该覆盖它——裁剪是给
-    // 没配过的链路兜底用的安全网，不是用来推翻人的决定的。
-    if explicit || !limit || requested.mbps <= 0.0 {
-        return as_requested(want);
-    }
-    let Some(ceiling) = rate::path_payload_ceiling_mbps(&sender.nic, &receiver.nic, rate_cfg)
-    else {
-        return as_requested(want);
-    };
-    let fit = (ceiling / requested.mbps).floor();
-    if fit >= 1.0 {
-        return as_requested((fit as u32).clamp(1, want));
-    }
-    // 单流就已经超过整条路径的可信上限：压 -b，而不是放弃这条腿。
-    let bits_per_second = (ceiling * 1_000_000.0).round().max(1.0) as u64;
-    UdpLoad {
-        bits_per_second,
-        mbps: bits_per_second as f64 / 1_000_000.0,
-        streams: 1,
-        clipped_from_mbps: Some(requested.mbps),
-    }
-}
-
-/// iperf UDP 单元的“预计总耗时”（秒），按典型成功路径估算：
-/// 第一次完整尝试的时长 + 启动/收尾/错峰开销。
-///
-/// 单流 UDP 的重试只在“当次尝试没有产生任何有效测量”时发生，属于异常路径；
-/// 若按最坏情况（最多 3 次完整尝试 × 每次再附加 130s 宽限）累加，
-/// 180s 的单流 UDP 项会被估成 14+ 分钟，开始前的总耗时规划会严重偏大。
-/// 因此这里统一按一次尝试估算，与多流 UDP / TCP 口径一致。
-///
-/// 错峰只按单腿最大流数计算：双向 AB/BA 腿是并行执行的，
-/// 不能把两条腿的流数相加，否则双向会凭空多出毫秒级错峰取整。
-fn udp_estimated_secs(
-    duration: u64,
-    max_leg_streams: u64,
-    mode: RateMode,
-    rate_cfg: &RateCheckCfg,
-) -> u64 {
-    let stagger_ms = max_leg_streams
-        .saturating_sub(1)
-        .saturating_mul(rate_cfg.launch_interval_ms.clamp(0, 1_000));
-    let discovery_ms = if mode == RateMode::Discover {
-        3_u64
-            .saturating_mul(rate_cfg.discovery_step_secs)
-            .saturating_mul(1_000)
-    } else {
-        0
-    };
-    duration
-        .saturating_add(rate_cfg.background_secs.min(30))
-        .saturating_add(rate_cfg.startup_timeout_secs)
-        .saturating_add(rate_cfg.settle_secs)
-        .saturating_add(5)
-        .saturating_add(stagger_ms.saturating_add(discovery_ms).div_ceil(1_000))
-}
-
 /// 计划页要显示的一行「这条腿最终按什么门限判」。
 ///
 /// 预览必须直接给出**最终生效值**，而不是把请求体里的字段原样铺出来：
@@ -922,17 +804,26 @@ pub fn build_ui_units_repeated(
 /// 历史 `task_results.json` 的 RESUME 不再命中。提示信息是那些「跳过了什么、
 /// 为什么跳过」的话（同 /24 门禁、UDP 按链路速率裁流），它们必须走返回值
 /// 而不是直接 `logln`——控制台那条路径没有终端可看。
+///
+/// 这里只管外层循环、两道公共门禁（缺 IPv6、跨机同 /24）和后端的先后顺序；
+/// 每种后端怎么展开在各自的文件里（`iperf_tcp` / `iperf_udp` / `cts` / `ping`）。
+/// 端口按展开顺序全局递增分配，所以后端的先后顺序同样不能改。
 pub fn build_units(
     specs: &[SpecNorm],
     require_same_subnet: bool,
     next_port: &mut u16,
 ) -> (Vec<Unit>, Vec<String>) {
-    let mut units: Vec<Unit> = Vec::new();
-    let mut notices: Vec<String> = Vec::new();
-    // 同一条门限算式会在每个档位 × 每条腿上重复解析出来，去重后只提示一次。
-    let mut rx_target_notes: HashSet<String> = HashSet::new();
+    let mut x = Expansion {
+        units: Vec::new(),
+        notices: Vec::new(),
+        rx_target_notes: HashSet::new(),
+        next_port,
+    };
 
     for spec in specs {
+        let cross = spec.src.side != spec.dst.side;
+        let same_subnet_ok =
+            !cross || !require_same_subnet || same_slash24(&spec.src.nic.ipv4, &spec.dst.nic.ipv4);
         for dir in &spec.directions {
             let bidir = dir == "bidir";
             let pairs = dir_pairs(spec, dir);
@@ -944,490 +835,37 @@ pub fn build_units(
 
             for ipver in &spec.ipvers {
                 let v6 = ipver == "v6";
-                let ip_tag = if v6 { "V6" } else { "V4" };
                 if v6 && v6_addrs(&spec.src.nic, &spec.dst.nic).is_none() {
-                    notices.push(format!(
+                    x.notices.push(format!(
                         "跳过 {} {} IPv6：两端缺少可用的 IPv6 地址",
                         spec.name, route_str
                     ));
                     continue;
                 }
+                let route = Route {
+                    spec,
+                    dir,
+                    bidir,
+                    pairs: &pairs,
+                    route_str: &route_str,
+                    v6,
+                    ip_tag: if v6 { "V6" } else { "V4" },
+                    same_subnet_ok,
+                };
 
                 // ---------- iperf ----------
                 if spec.kinds.iter().any(|k| k == "iperf") {
-                    let cross = spec.src.side != spec.dst.side;
-                    let same24_ok = !cross
-                        || !require_same_subnet
-                        || same_slash24(&spec.src.nic.ipv4, &spec.dst.nic.ipv4);
-                    if !v6 && !same24_ok {
-                        notices.push(format!(
+                    if !v6 && !same_subnet_ok {
+                        x.notices.push(format!(
                             "跳过 {} 的 iperf：两端 IPv4 不同网段 ({} vs {})，无法直连灌包（ping 不受限）",
                             spec.name, spec.src.nic.ipv4, spec.dst.nic.ipv4
                         ));
                     } else {
-                        for tr in &spec.transports {
-                            if tr == "tcp" {
-                                if let Some(error) = spec.stream_config_error(false) {
-                                    notices.push(format!(
-                                        "{} 的 iperf TCP 流数配置非法，将按兼容范围使用 {} 流: {error}",
-                                        spec.name,
-                                        spec.effective_tcp_streams()
-                                    ));
-                                }
-                                let tcp_streams = spec.effective_tcp_streams();
-                                // 空的 -w 档位列表 = 跑一条不带 -w 的 TCP（附加 TCP
-                                // 参数组把 -w 留空时会这样）。默认组经过 non_empty
-                                // 兜底、老配置也总有窗口，都不会走到 None 这一支，
-                                // 行为与从前逐字一致。
-                                let windows: Vec<Option<&String>> = if spec.tcp_windows.is_empty() {
-                                    vec![None]
-                                } else {
-                                    spec.tcp_windows.iter().map(Some).collect()
-                                };
-                                for w in windows {
-                                    let (pname, plabel) = match w {
-                                        Some(w) => (
-                                            format!("tcp_w{}_P{}", w, tcp_streams),
-                                            format!("TCP -w {} -P {}", w, tcp_streams),
-                                        ),
-                                        None => (
-                                            format!("tcp_noW_P{}", tcp_streams),
-                                            format!("TCP -P {}", tcp_streams),
-                                        ),
-                                    };
-                                    if let Some(w) = w {
-                                        for (s, d, _tag) in &pairs {
-                                            if let Some(msg) = oversized_socket_buffer_notice(
-                                                &spec.name,
-                                                &plabel,
-                                                w,
-                                                tcp_streams,
-                                                spec.duration,
-                                                s,
-                                                d,
-                                                &spec.rate_check,
-                                            ) {
-                                                notices.push(msg);
-                                            }
-                                        }
-                                    }
-                                    let mut legs = Vec::new();
-                                    // Ping 单元没有速率门限：RTT 与丢包的判定在别处。
-                                    let mut target_lines: Vec<String> = Vec::new();
-                                    for (s, d, tag) in &pairs {
-                                        let flow_direction =
-                                            if bidir { tag.to_string() } else { dir.clone() };
-                                        let leg_policy = link_policy(spec, s, d);
-                                        note_rx_target(
-                                            &mut notices,
-                                            &mut rx_target_notes,
-                                            &spec.name,
-                                            &leg_policy,
-                                        );
-                                        let rate_plan = leg_rate_plan(
-                                            spec,
-                                            &leg_policy,
-                                            &flow_direction,
-                                            bidir,
-                                            &s.nic,
-                                            &d.nic,
-                                        );
-                                        note_target_cap(
-                                            &mut notices,
-                                            &mut rx_target_notes,
-                                            &spec.name,
-                                            &rate_plan,
-                                        );
-                                        let (effective_mode, target) =
-                                            (rate_plan.mode, rate_plan.target_mbps);
-                                        target_lines.push(target_line(
-                                            &flow_direction,
-                                            target,
-                                            rate_plan.source,
-                                        ));
-                                        let t = IperfTask {
-                                            v6,
-                                            udp: false,
-                                            profile_name: pname.clone(),
-                                            profile_label: plabel.clone(),
-                                            comparison_label: plabel.clone(),
-                                            src: (*s).clone(),
-                                            dst: (*d).clone(),
-                                            port: alloc_port(next_port),
-                                            duration: spec.duration,
-                                            extra: match w {
-                                                Some(w) => vec![
-                                                    "-w".into(),
-                                                    w.clone(),
-                                                    "-P".into(),
-                                                    tcp_streams.to_string(),
-                                                ],
-                                                None => {
-                                                    vec!["-P".into(), tcp_streams.to_string()]
-                                                }
-                                            },
-                                            stream_idx: 0,
-                                            rate_mode: effective_mode,
-                                            rx_target_mbps: target,
-                                            offered_per_stream_mbps: None,
-                                        };
-                                        legs.push(Leg {
-                                            tag: tag.to_string(),
-                                            kind: LegKind::IperfSingle(t),
-                                        });
-                                    }
-                                    let title = format!(
-                                        "{}IPERF {} {} | {}",
-                                        if bidir { "★★双向 " } else { "" },
-                                        ip_tag,
-                                        plabel,
-                                        route_str
-                                    );
-                                    let id =
-                                        tcp_resume_unit_id_v2(spec, ip_tag, dir, &pname, &legs);
-                                    units.push(Unit {
-                                        id,
-                                        title,
-                                        link_group: spec.link_group.clone(),
-                                        bidir,
-                                        target_lines,
-                                        bidir_total_target_mbps: bidir
-                                            .then_some(spec.rate_target_bidir_total)
-                                            .flatten(),
-                                        direction: dir.to_string(),
-                                        // 轮次由 `repeat_units` 在最外层派生；这里展开的永远是第 1 轮。
-                                        round: 1,
-                                        legs,
-                                        est_secs: spec.duration + 10,
-                                    });
-                                }
-                            } else if tr == "udp" {
-                                if let Some(error) = spec.stream_config_error(true) {
-                                    notices.push(format!(
-                                        "{} 的 iperf UDP 流数配置非法，将按兼容范围使用 {} 流: {error}",
-                                        spec.name,
-                                        spec.effective_udp_streams()
-                                    ));
-                                }
-                                let udp_streams = spec.effective_udp_streams();
-                                for prof in &spec.udp_profiles {
-                                    let parsed_bandwidth = match prof.parsed_bandwidth() {
-                                        Ok(value) => value,
-                                        Err(error) => {
-                                            notices.push(format!(
-                                                "跳过 {} 的 iperf UDP profile {}：{error}；带宽格式非法，未生成任务",
-                                                spec.name,
-                                                prof.label()
-                                            ));
-                                            continue;
-                                        }
-                                    };
-                                    // 每个方向腿按 min(发送口, 接收口) 的路径上限
-                                    // 各自决定 -b 与流数：同一条链路的两个方向
-                                    // 能力可以差很多，共用一个 -b 没有物理依据。
-                                    let leg_loads: Vec<UdpLoad> = pairs
-                                        .iter()
-                                        .map(|(s, d, _tag)| {
-                                            // 单口覆盖 / 角色配对可以改写这条腿的
-                                            // 单流带宽；解析不了就退回全局档位，
-                                            // 绝不因为一个笔误让任务凭空消失。
-                                            let configured = link_policy(spec, s, d)
-                                                .udp_bandwidth
-                                                .and_then(|value| {
-                                                    UdpProfile::bw(&value).parsed_bandwidth().ok()
-                                                });
-                                            udp_load_for_leg(
-                                                s,
-                                                d,
-                                                configured.unwrap_or(parsed_bandwidth),
-                                                udp_streams,
-                                                spec.udp_limit,
-                                                configured.is_some(),
-                                                &spec.rate_check,
-                                            )
-                                        })
-                                        .collect();
-                                    // 发送口可以单独覆盖 `-l`：同一条用例在不同网口上
-                                    // 要用不同报文长度是常见需求。按腿算一次，标签和
-                                    // 命令都从这里取，免得两边各算一遍再对不上。
-                                    let leg_profiles: Vec<UdpProfile> = pairs
-                                        .iter()
-                                        .map(|(s, d, _tag)| UdpProfile {
-                                            bandwidth: prof.bandwidth.clone(),
-                                            length: link_policy(spec, s, d)
-                                                .udp_length
-                                                .or_else(|| prof.length.clone()),
-                                            window: prof.window.clone(),
-                                        })
-                                        .collect();
-                                    for ((s, d, _tag), load) in pairs.iter().zip(leg_loads.iter()) {
-                                        if let Some(from) = load.clipped_from_mbps {
-                                            notices.push(format!(
-                                                "{} {}：{} -> {} 路径上限不足，-b 由 {:.0}Mbps 裁剪到 {:.0}Mbps",
-                                                spec.name,
-                                                prof.label(),
-                                                s.nic.name,
-                                                d.nic.name,
-                                                from,
-                                                load.mbps
-                                            ));
-                                        }
-                                    }
-                                    let mut legs = Vec::new();
-                                    // Ping 单元没有速率门限：RTT 与丢包的判定在别处。
-                                    let mut target_lines: Vec<String> = Vec::new();
-                                    let mut max_n = 1;
-                                    for (leg_idx, ((s, d, tag), load)) in
-                                        pairs.iter().zip(leg_loads.iter()).enumerate()
-                                    {
-                                        let n = load.streams;
-                                        max_n = max_n.max(n);
-                                        // 标签必须反映**实际下发**的 -b。链路策略
-                                        // 覆盖和路径裁剪都会改它，而报表里的
-                                        // 「类型 / 参数」列是很多人唯一会看的地方——
-                                        // 那里印着 2.6G、命令行却是 1G，比不印更糟。
-                                        // 裁剪与否只能问 clipped_from_mbps：链路策略
-                                        // 先把 2.5G 改成 2.6G、路径上限再裁回 2500，
-                                        // 拿全局档位去比会得出「没变」，把两次改写
-                                        // 一起抹掉。
-                                        // 标签必须反映**实际下发**的 -l，不是档位里那个。
-                                        let leg_policy = link_policy(spec, s, d);
-                                        let effective = &leg_profiles[leg_idx];
-                                        let leg_label = if let Some(from) = load.clipped_from_mbps {
-                                            format!(
-                                                "{}（按路径上限从 {:.0}M 裁剪至 {:.0}M）",
-                                                effective.label(),
-                                                from,
-                                                load.mbps
-                                            )
-                                        } else if (load.mbps - parsed_bandwidth.mbps).abs()
-                                            >= f64::EPSILON
-                                        {
-                                            format!(
-                                                "{}（按链路策略至 {:.0}M）",
-                                                effective.label(),
-                                                load.mbps
-                                            )
-                                        } else {
-                                            effective.label()
-                                        };
-                                        let mut extra: Vec<String> =
-                                            vec!["-b".into(), load.iperf_arg()];
-                                        if let Some(l) = &effective.length {
-                                            extra.push("-l".into());
-                                            extra.push(l.clone());
-                                        }
-                                        if let Some(w) = &effective.window {
-                                            extra.push("-w".into());
-                                            extra.push(w.clone());
-                                        }
-                                        let flow_direction =
-                                            if bidir { tag.to_string() } else { dir.clone() };
-                                        note_rx_target(
-                                            &mut notices,
-                                            &mut rx_target_notes,
-                                            &spec.name,
-                                            &leg_policy,
-                                        );
-                                        let rate_plan = leg_rate_plan(
-                                            spec,
-                                            &leg_policy,
-                                            &flow_direction,
-                                            bidir,
-                                            &s.nic,
-                                            &d.nic,
-                                        );
-                                        note_target_cap(
-                                            &mut notices,
-                                            &mut rx_target_notes,
-                                            &spec.name,
-                                            &rate_plan,
-                                        );
-                                        let (effective_mode, target) =
-                                            (rate_plan.mode, rate_plan.target_mbps);
-                                        target_lines.push(target_line(
-                                            &flow_direction,
-                                            target,
-                                            rate_plan.source,
-                                        ));
-                                        // offered 必须跟着实际下发的 -b 走，否则
-                                        // 报表里的「请求负载」和命令行对不上。
-                                        let offered_per_stream_mbps = Some(load.mbps);
-                                        // 对齐键只认档位本身：裁剪、按网口策略改写的 -b / -l
-                                        // 都随协商速率或 IP 变化，见 `IperfTask::comparison_label`。
-                                        let comparison_label = prof.label();
-                                        let mk = |idx: usize, port: u16| IperfTask {
-                                            v6,
-                                            udp: true,
-                                            profile_name: prof.name(),
-                                            profile_label: leg_label.clone(),
-                                            comparison_label: comparison_label.clone(),
-                                            src: (*s).clone(),
-                                            dst: (*d).clone(),
-                                            port,
-                                            duration: spec.duration,
-                                            extra: extra.clone(),
-                                            stream_idx: idx,
-                                            rate_mode: effective_mode,
-                                            rx_target_mbps: target,
-                                            offered_per_stream_mbps,
-                                        };
-                                        // **计划期就要说清「这几条流灌不到这个门限」。**
-                                        //
-                                        // 执行端要求「所有必需流并发活跃」才算有效判定窗口，
-                                        // 而必需流数按 `target×(1+余量)/每流负载` 上取整。配少了
-                                        // 就不是「勉强够呛」，而是那个窗口**永远形不成**：整条腿
-                                        // 稳定判 NOT_EVALUATED/EFFECTIVE_WINDOW_SHORT。
-                                        //
-                                        // 现场代价是这条链路完全确定、却只能事后才知道：真机上
-                                        // 一轮 180s 预设的 UDP 单元会**全部**这样跑完再报「无法
-                                        // 评价」，而拿到的原因码指向采样窗口，不指向真因。
-                                        // 公式复用执行端那一份，不在这里重写。
-                                        if n > 1 {
-                                            let required =
-                                                crate::master::executor::required_udp_streams(
-                                                    n as usize,
-                                                    &spec.rate_check,
-                                                    target,
-                                                    offered_per_stream_mbps,
-                                                );
-                                            if required > n as usize {
-                                                if let (Some(target), Some(per_stream)) =
-                                                    (target, offered_per_stream_mbps)
-                                                {
-                                                    let msg = format!(
-                                                        "{} UDP {n} 条流 × {per_stream:.0}Mbps 灌不到 {target:.0}Mbps 门限\
-                                                         （含 {:.0}% 余量至少要 {required} 条并发流）。\
-                                                         按当前配置这一腿的有效判定窗口永远形不成，结果会稳定落在\
-                                                         「无法评价 / EFFECTIVE_WINDOW_SHORT」。把流数提到 {required}、\
-                                                         调大每流 -b，或把门限降到 {:.0}Mbps 以下。",
-                                                        leg_label,
-                                                        spec.rate_check.offered_headroom_pct.max(0.0),
-                                                        per_stream * n as f64
-                                                            / (1.0 + spec.rate_check.offered_headroom_pct.max(0.0) / 100.0),
-                                                    );
-                                                    if rx_target_notes.insert(msg.clone()) {
-                                                        notices.push(msg);
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        let kind = if n <= 1 {
-                                            LegKind::IperfSingle(mk(0, alloc_port(next_port)))
-                                        } else {
-                                            let streams: Vec<IperfTask> = (0..n as usize)
-                                                .map(|i| mk(i, alloc_port(next_port)))
-                                                .collect();
-                                            LegKind::IperfGroup {
-                                                name: prof.name(),
-                                                streams,
-                                            }
-                                        };
-                                        legs.push(Leg {
-                                            tag: tag.to_string(),
-                                            kind,
-                                        });
-                                    }
-                                    let stream_note = if max_n > 1 {
-                                        format!(" ×{max_n}流")
-                                    } else {
-                                        String::new()
-                                    };
-                                    // 标题里的 -b 必须是**实际下发**的值。链路策略和
-                                    // 路径裁剪都会改它，而任务清单（控制台的「预览
-                                    // 任务」、日志开头的编号列表）是很多人唯一会看
-                                    // 的地方——那里印着全局档位、命令行却是别的数，
-                                    // 会让人以为自己填的值没生效。
-                                    //
-                                    // 两条腿取值不同时退回档位标签：一个标题写不下
-                                    // 两个方向，逐行的 profile_label 里各自写着准确值。
-                                    let uniform = leg_loads.first().is_some_and(|first| {
-                                        leg_loads.iter().all(|load| {
-                                            (load.mbps - first.mbps).abs() < f64::EPSILON
-                                        })
-                                    });
-                                    let effective = leg_loads
-                                        .first()
-                                        .map(|first| first.mbps)
-                                        .unwrap_or(parsed_bandwidth.mbps);
-                                    // `-l` 被发送口改写时，标题同样不能再印档位里的原值。
-                                    let leg_lengths: Vec<Option<String>> =
-                                        leg_profiles.iter().map(|p| p.length.clone()).collect();
-                                    let length_changed =
-                                        leg_lengths.iter().any(|length| *length != prof.length);
-                                    let changed = length_changed
-                                        || leg_loads.iter().any(|load| {
-                                            (load.mbps - parsed_bandwidth.mbps).abs()
-                                                >= f64::EPSILON
-                                        });
-                                    let profile_label = if !changed {
-                                        prof.label()
-                                    } else {
-                                        // 两条腿取值不同就两个都印（顺序即腿序 ab/ba）：
-                                        // 退回全局档位会显示一个谁都没在用的数。
-                                        let bw = if uniform {
-                                            format!("{effective:.0}m")
-                                        } else {
-                                            leg_loads
-                                                .iter()
-                                                .map(|load| format!("{:.0}m", load.mbps))
-                                                .collect::<Vec<_>>()
-                                                .join("/")
-                                        };
-                                        let mut label = format!("UDP -b {bw}");
-                                        let uniform_length =
-                                            leg_lengths.first().is_some_and(|first| {
-                                                leg_lengths.iter().all(|length| length == first)
-                                            });
-                                        if uniform_length {
-                                            if let Some(Some(l)) = leg_lengths.first() {
-                                                label.push_str(&format!(" -l {l}"));
-                                            }
-                                        } else {
-                                            let shown = leg_lengths
-                                                .iter()
-                                                .map(|length| length.as_deref().unwrap_or("默认"))
-                                                .collect::<Vec<_>>()
-                                                .join("/");
-                                            label.push_str(&format!(" -l {shown}"));
-                                        }
-                                        if let Some(w) = &prof.window {
-                                            label.push_str(&format!(" -w {w}"));
-                                        }
-                                        label
-                                    };
-                                    let title = format!(
-                                        "{}IPERF {} {}{} | {}",
-                                        if bidir { "★★双向 " } else { "" },
-                                        ip_tag,
-                                        profile_label,
-                                        stream_note,
-                                        route_str
-                                    );
-                                    let id = udp_resume_unit_id_v4(spec, ip_tag, dir, prof, &legs);
-                                    // 错峰按单腿最大流数估算：双向双腿并行，不能把
-                                    // 两条腿的流数相加。
-                                    units.push(Unit {
-                                        id,
-                                        title,
-                                        link_group: spec.link_group.clone(),
-                                        bidir,
-                                        target_lines,
-                                        bidir_total_target_mbps: bidir
-                                            .then_some(spec.rate_target_bidir_total)
-                                            .flatten(),
-                                        direction: dir.to_string(),
-                                        // 轮次由 `repeat_units` 在最外层派生；这里展开的永远是第 1 轮。
-                                        round: 1,
-                                        legs,
-                                        est_secs: udp_estimated_secs(
-                                            spec.duration,
-                                            max_n as u64,
-                                            spec.rate_mode,
-                                            &spec.rate_check,
-                                        ),
-                                    });
-                                }
+                        for transport in &spec.transports {
+                            if transport == "tcp" {
+                                expand_iperf_tcp(&mut x, &route);
+                            } else if transport == "udp" {
+                                expand_iperf_udp(&mut x, &route);
                             }
                         }
                     }
@@ -1439,410 +877,138 @@ pub fn build_units(
                     .iter()
                     .any(|kind| kind == "ctstraffic" || kind == "cts")
                 {
-                    let cross = spec.src.side != spec.dst.side;
-                    let same24_ok = !cross
-                        || !require_same_subnet
-                        || same_slash24(&spec.src.nic.ipv4, &spec.dst.nic.ipv4);
-                    let topology_blocked = !v6 && !same24_ok;
-                    let mut topology_notice_emitted = false;
-                    for transport in &spec.transports {
-                        if transport == "tcp" {
-                            let tcp_streams = spec.effective_tcp_streams();
-                            for window in &spec.tcp_windows {
-                                let mut setup_errors = cts_task_config_errors(spec, false);
-                                let mut window_invalid = false;
-                                let window_bytes = match cts_window_bytes(window) {
-                                    Ok(value) => value,
-                                    Err(error) => {
-                                        window_invalid = true;
-                                        setup_errors.push(format!(
-                                            "CTS TCP socket buffer {window:?} 非法: {error}"
-                                        ));
-                                        None
-                                    }
-                                };
-                                let setup_error =
-                                    (!setup_errors.is_empty()).then(|| setup_errors.join("；"));
-                                if topology_blocked && setup_error.is_none() {
-                                    if !topology_notice_emitted {
-                                        notices.push(format!(
-                                                "跳过 {} 的 ctsTraffic：两端 IPv4 不同 /24 ({} vs {})，无法直连灌包",
-                                                spec.name, spec.src.nic.ipv4, spec.dst.nic.ipv4
-                                            ));
-                                        topology_notice_emitted = true;
-                                    }
-                                    continue;
-                                }
-                                if let Some(error) = &setup_error {
-                                    notices.push(format!(
-                                        "{} CTS TCP 配置非法，将记录 SETUP_ERROR: {error}",
-                                        spec.name
-                                    ));
-                                }
-                                let window_label = if window_invalid {
-                                    format!("socket-buffer {window}（非法）")
-                                } else {
-                                    window_bytes
-                                        .map(|bytes| format!("socket-buffer {window} ({bytes}B)"))
-                                        .unwrap_or_else(|| "socket-buffer 自动".into())
-                                };
-                                let profile_name = format!(
-                                    "cts_tcp_w{}_c{}",
-                                    if window.trim().is_empty() {
-                                        "auto"
-                                    } else {
-                                        window
-                                    },
-                                    tcp_streams
-                                );
-                                let profile_label =
-                                    format!("CTS TCP {window_label} ×{}连接", tcp_streams);
-                                let mut legs = Vec::new();
-                                // Ping 单元没有速率门限：RTT 与丢包的判定在别处。
-                                let mut target_lines: Vec<String> = Vec::new();
-                                for (src, dst, tag) in &pairs {
-                                    let flow_direction =
-                                        if bidir { tag.to_string() } else { dir.clone() };
-                                    let rate_plan = leg_rate_plan(
-                                        spec,
-                                        &link_policy(spec, src, dst),
-                                        &flow_direction,
-                                        bidir,
-                                        &src.nic,
-                                        &dst.nic,
-                                    );
-                                    note_target_cap(
-                                        &mut notices,
-                                        &mut rx_target_notes,
-                                        &spec.name,
-                                        &rate_plan,
-                                    );
-                                    let (effective_mode, target) =
-                                        (rate_plan.mode, rate_plan.target_mbps);
-                                    target_lines.push(target_line(
-                                        &flow_direction,
-                                        target,
-                                        rate_plan.source,
-                                    ));
-                                    legs.push(Leg {
-                                        tag: tag.to_string(),
-                                        kind: LegKind::CtsTraffic(CtsTrafficTask {
-                                            v6,
-                                            udp: false,
-                                            profile_name: profile_name.clone(),
-                                            profile_label: profile_label.clone(),
-                                            comparison_label: profile_label.clone(),
-                                            src: (*src).clone(),
-                                            dst: (*dst).clone(),
-                                            port: alloc_port(next_port),
-                                            duration: spec.duration,
-                                            streams: tcp_streams,
-                                            window_bytes,
-                                            bits_per_second: None,
-                                            datagram_bytes: None,
-                                            frame_rate: spec.ctstraffic.udp_frame_rate,
-                                            buffer_depth_secs: spec
-                                                .ctstraffic
-                                                .udp_buffer_depth_secs,
-                                            status_update_ms: spec.ctstraffic.status_update_ms,
-                                            rate_mode: effective_mode,
-                                            rx_target_mbps: target,
-                                            offered_total_mbps: None,
-                                            setup_error: setup_error.clone(),
-                                        }),
-                                    });
-                                }
-                                let title = format!(
-                                    "{}CTS TRAFFIC {} {} | {}",
-                                    if bidir { "★★双向 " } else { "" },
-                                    ip_tag,
-                                    profile_label,
-                                    route_str
-                                );
-                                units.push(Unit {
-                                    id: cts_resume_unit_id(spec, ip_tag, dir, &legs),
-                                    title,
-                                    link_group: spec.link_group.clone(),
-                                    bidir,
-                                    target_lines,
-                                    bidir_total_target_mbps: bidir
-                                        .then_some(spec.rate_target_bidir_total)
-                                        .flatten(),
-                                    direction: dir.to_string(),
-                                    // 轮次由 `repeat_units` 在最外层派生；这里展开的永远是第 1 轮。
-                                    round: 1,
-                                    legs,
-                                    est_secs: if setup_error.is_some() {
-                                        1
-                                    } else {
-                                        spec.duration.saturating_add(15)
-                                    },
-                                });
-                            }
-                        } else if transport == "udp" {
-                            let udp_streams = spec.effective_udp_streams();
-                            for profile in &spec.udp_profiles {
-                                let mut setup_errors = cts_task_config_errors(spec, true);
-                                let window_bytes = match profile
-                                    .window
-                                    .as_deref()
-                                    .map(cts_window_bytes)
-                                    .transpose()
-                                {
-                                    Ok(value) => value.flatten(),
-                                    Err(error) => {
-                                        setup_errors.push(format!(
-                                            "CTS UDP socket buffer {:?} 非法: {error}",
-                                            profile.window.as_deref().unwrap_or_default()
-                                        ));
-                                        None
-                                    }
-                                };
-                                let bandwidth = match cts_udp_bandwidth(profile) {
-                                    Ok(value) => Some(value),
-                                    Err(error) => {
-                                        setup_errors.push(error);
-                                        None
-                                    }
-                                };
-                                let datagram_bytes = match cts_datagram_bytes(profile) {
-                                    Ok(value) => value,
-                                    Err(error) => {
-                                        setup_errors.push(error);
-                                        None
-                                    }
-                                };
-                                let setup_error =
-                                    (!setup_errors.is_empty()).then(|| setup_errors.join("；"));
-                                if topology_blocked && setup_error.is_none() {
-                                    if !topology_notice_emitted {
-                                        notices.push(format!(
-                                                "跳过 {} 的 ctsTraffic：两端 IPv4 不同 /24 ({} vs {})，无法直连灌包",
-                                                spec.name, spec.src.nic.ipv4, spec.dst.nic.ipv4
-                                            ));
-                                        topology_notice_emitted = true;
-                                    }
-                                    continue;
-                                }
-                                if let Some(error) = &setup_error {
-                                    notices.push(format!(
-                                        "{} CTS UDP {} 配置非法，将记录 SETUP_ERROR: {error}",
-                                        spec.name,
-                                        profile.label()
-                                    ));
-                                }
-                                let mut legs = Vec::new();
-                                // Ping 单元没有速率门限：RTT 与丢包的判定在别处。
-                                let mut target_lines: Vec<String> = Vec::new();
-                                let mut max_streams = 1u32;
-                                for (src, dst, tag) in &pairs {
-                                    let streams = if setup_error.is_some() {
-                                        udp_streams
-                                    } else {
-                                        allowed_udp_streams_for_mbps(
-                                            src,
-                                            dst,
-                                            bandwidth
-                                                .expect("合法 CTS UDP 配置必须有严格带宽值")
-                                                .mbps,
-                                            udp_streams,
-                                            spec.udp_limit,
-                                            &spec.rate_check,
-                                        )
-                                    };
-                                    if streams == 0 {
-                                        notices.push(format!(
-                                            "跳过 {} CTS UDP {}：路径上限不足以承载单流",
-                                            spec.name,
-                                            profile.label()
-                                        ));
-                                        legs.clear();
-                                        break;
-                                    }
-                                    max_streams = max_streams.max(streams);
-                                    let flow_direction =
-                                        if bidir { tag.to_string() } else { dir.clone() };
-                                    let rate_plan = leg_rate_plan(
-                                        spec,
-                                        &link_policy(spec, src, dst),
-                                        &flow_direction,
-                                        bidir,
-                                        &src.nic,
-                                        &dst.nic,
-                                    );
-                                    note_target_cap(
-                                        &mut notices,
-                                        &mut rx_target_notes,
-                                        &spec.name,
-                                        &rate_plan,
-                                    );
-                                    let (effective_mode, target) =
-                                        (rate_plan.mode, rate_plan.target_mbps);
-                                    target_lines.push(target_line(
-                                        &flow_direction,
-                                        target,
-                                        rate_plan.source,
-                                    ));
-                                    // 每流带宽 × 流数 = 整条腿的总量。CTS 侧的
-                                    // 字段是**总量**口径，与 iperf 的每流口径相反。
-                                    let offered_total_mbps =
-                                        bandwidth.map(|value| value.mbps * streams as f64);
-                                    let profile_label = format!(
-                                        "CTS UDP {} ×{}流 (每流)",
-                                        profile.label().trim_start_matches("UDP "),
-                                        streams
-                                    );
-                                    legs.push(Leg {
-                                        tag: tag.to_string(),
-                                        kind: LegKind::CtsTraffic(CtsTrafficTask {
-                                            v6,
-                                            udp: true,
-                                            profile_name: format!(
-                                                "cts_{}_c{}",
-                                                profile.name(),
-                                                streams
-                                            ),
-                                            profile_label,
-                                            comparison_label: format!(
-                                                "CTS UDP {} (每流)",
-                                                profile.label().trim_start_matches("UDP ")
-                                            ),
-                                            src: (*src).clone(),
-                                            dst: (*dst).clone(),
-                                            port: alloc_port(next_port),
-                                            duration: spec.duration,
-                                            streams,
-                                            window_bytes,
-                                            bits_per_second: bandwidth
-                                                .map(|value| value.bits_per_second),
-                                            datagram_bytes,
-                                            frame_rate: spec.ctstraffic.udp_frame_rate,
-                                            buffer_depth_secs: spec
-                                                .ctstraffic
-                                                .udp_buffer_depth_secs,
-                                            status_update_ms: spec.ctstraffic.status_update_ms,
-                                            rate_mode: effective_mode,
-                                            rx_target_mbps: target,
-                                            offered_total_mbps,
-                                            setup_error: setup_error.clone(),
-                                        }),
-                                    });
-                                }
-                                if legs.is_empty() {
-                                    continue;
-                                }
-                                let title = format!(
-                                    "{}CTS TRAFFIC {} UDP {} ×{}流 | {}",
-                                    if bidir { "★★双向 " } else { "" },
-                                    ip_tag,
-                                    profile.label().trim_start_matches("UDP "),
-                                    max_streams,
-                                    route_str
-                                );
-                                units.push(Unit {
-                                    id: cts_resume_unit_id(spec, ip_tag, dir, &legs),
-                                    title,
-                                    link_group: spec.link_group.clone(),
-                                    bidir,
-                                    target_lines,
-                                    bidir_total_target_mbps: bidir
-                                        .then_some(spec.rate_target_bidir_total)
-                                        .flatten(),
-                                    direction: dir.to_string(),
-                                    // 轮次由 `repeat_units` 在最外层派生；这里展开的永远是第 1 轮。
-                                    round: 1,
-                                    legs,
-                                    est_secs: if setup_error.is_some() {
-                                        1
-                                    } else {
-                                        spec.duration.saturating_add(15)
-                                    },
-                                });
-                            }
-                        }
-                    }
+                    expand_cts(&mut x, &route);
                 }
 
                 // ---------- ping ----------
                 if spec.kinds.iter().any(|k| k == "ping") {
-                    for payload in &spec.payload_sizes {
-                        let mut legs = Vec::new();
-                        // Ping 单元没有速率门限：RTT 与丢包的判定在别处。
-                        let target_lines: Vec<String> = Vec::new();
-                        for (s, d, tag) in &pairs {
-                            legs.push(Leg {
-                                tag: tag.to_string(),
-                                kind: LegKind::Ping(PingTask {
-                                    v6,
-                                    src: (*s).clone(),
-                                    dst: (*d).clone(),
-                                    count: spec.ping_count,
-                                    payload: *payload,
-                                    purpose: PingPurpose::SubnetTest,
-                                }),
-                            });
-                        }
-                        let title = format!(
-                            "{}PING {} -l {} n={} | {}",
-                            if bidir { "★双向 " } else { "" },
-                            ip_tag,
-                            payload,
-                            spec.ping_count,
-                            route_str
-                        );
-                        let id = md5_hex(&format!(
-                            "ping_v1|{}|{}|{}|{}|{}|{}",
-                            spec.ping_count,
-                            payload,
-                            ip_tag,
-                            ep_id(&spec.src),
-                            ep_id(&spec.dst),
-                            dir
-                        ));
-                        units.push(Unit {
-                            id,
-                            title,
-                            link_group: spec.link_group.clone(),
-                            bidir,
-                            target_lines,
-                            // Ping 不是吞吐测试，没有 RX 合计门限这回事。
-                            bidir_total_target_mbps: None,
-                            direction: dir.to_string(),
-                            // 轮次由 `repeat_units` 在最外层派生；这里展开的永远是第 1 轮。
-                            round: 1,
-                            legs,
-                            est_secs: ping_estimated_secs(spec.ping_count),
-                        });
-                    }
+                    expand_ping(&mut x, &route);
                 }
             }
         }
     }
-    (units, notices)
+    (x.units, x.notices)
 }
 
-/// 一个 PING 单元的预计墙钟秒数。
-///
-/// `ping` 每秒发一个包，主体就是 `count - 1` 个间隔。原来的 `count + 5` 漏的是
-/// **收尾等待**：最后一个包没回来时，BSD ping 还要再等约 10 秒才收摊。实测
-/// （macOS，65500 字节打网关，全程无回包）：
-///
-/// | count | 实测 | 旧公式 `count+5` |
-/// |-------|------|------------------|
-/// | 5     | 15.0s| 10s              |
-/// | 20    | 30.1s| 25s              |
-/// | 40    | 50.2s| 45s              |
-///
-/// 三档都正好是 `count + 10`，即旧公式稳定少算 5 秒。这里取 `+12`，多出的 2 秒
-/// 留给进程启动和一次 RPC 往返。包能正常回来时实际约 `count - 1` 秒，估算偏
-/// 保守——预计耗时宁可报多不报少。
-///
-/// 这条估算只覆盖「包基本能回来」和「最后一个包丢了」两种形态。Windows 的
-/// `ping` 对**每一个**没回来的包都要等满 `-w` 的 4 秒，一个 100% 丢包的单元实际
-/// 会跑到 `count × 4` 秒。那是故障路径、事前无法预测，估算里不假装知道；执行侧
-/// 的超时预算（`count * 5 + 60`）本来就按这个上限留的，不会被误杀。
-fn ping_estimated_secs(count: u32) -> u64 {
-    count as u64 + 12
+/// `build_units` 一路累加的结果，四种后端的展开函数共用。
+struct Expansion<'p> {
+    units: Vec<Unit>,
+    /// 给人看的计划提示：跳过了什么、为什么跳过、门限从哪来。
+    notices: Vec<String>,
+    /// 同一条门限算式会在每个档位 × 每条腿上重复解析出来，去重后只提示一次。
+    rx_target_notes: HashSet<String>,
+    next_port: &'p mut u16,
+}
+
+impl Expansion<'_> {
+    fn port(&mut self) -> u16 {
+        alloc_port(self.next_port)
+    }
+
+    /// 同一句话可能在每个档位 × 每条腿上各算出来一遍，只说第一遍。
+    fn notice_once(&mut self, message: String) {
+        if self.rx_target_notes.insert(message.clone()) {
+            self.notices.push(message);
+        }
+    }
+
+    /// 门限来自协商速率百分比时，把算式说出来（见 `policy::note_rx_target`）。
+    /// 两条 iperf 路径调用它；ctsTraffic 的两条路径不调用。
+    fn note_rx_target(&mut self, spec_name: &str, policy: &rate::LinkPolicy) {
+        note_rx_target(
+            &mut self.notices,
+            &mut self.rx_target_notes,
+            spec_name,
+            policy,
+        );
+    }
+
+    /// 一条腿的判定模式与门限。
+    ///
+    /// 四种吞吐后端共用这一段：按 `leg_rate_plan` 定门限，把「最终门限为什么不是
+    /// 配置里那个」作为提示说出来，再给预览补一行最终生效的门限。它以前在
+    /// `build_units` 里逐字抄了四份，改一份漏三份，四种后端就各说各的门限。
+    fn leg_rate(
+        &mut self,
+        route: &Route<'_>,
+        policy: &rate::LinkPolicy,
+        flow_direction: &str,
+        src: &Endpoint,
+        dst: &Endpoint,
+        target_lines: &mut Vec<String>,
+    ) -> (RateMode, Option<f64>) {
+        let plan = leg_rate_plan(
+            route.spec,
+            policy,
+            flow_direction,
+            route.bidir,
+            &src.nic,
+            &dst.nic,
+        );
+        note_target_cap(
+            &mut self.notices,
+            &mut self.rx_target_notes,
+            &route.spec.name,
+            &plan,
+        );
+        target_lines.push(target_line(flow_direction, plan.target_mbps, plan.source));
+        (plan.mode, plan.target_mbps)
+    }
+}
+
+/// 一个「规格 × 方向 × IP 版本」组合：四种后端展开时读的同一组参数。
+#[derive(Clone, Copy)]
+struct Route<'a> {
+    spec: &'a SpecNorm,
+    /// `ab` / `ba` / `bidir`
+    dir: &'a str,
+    bidir: bool,
+    /// 方向腿，见 `dir_pairs`：单向一条（tag 为空），双向 `[ab, ba]` 两条。
+    pairs: &'a [(&'a Endpoint, &'a Endpoint, &'static str)],
+    /// 标题里的「源 -> 目标」。
+    route_str: &'a str,
+    v6: bool,
+    ip_tag: &'static str,
+    /// 同机、没开门禁、或两端同 /24。只约束 IPv4 灌包，ping 不受限。
+    same_subnet_ok: bool,
+}
+
+impl Route<'_> {
+    /// 这条腿的流向：双向取腿标签（ab / ba），单向就是单元方向。
+    fn flow_direction(&self, tag: &str) -> String {
+        if self.bidir {
+            tag.to_string()
+        } else {
+            self.dir.to_string()
+        }
+    }
+
+    /// 本组合下一个单元的公共字段。
+    fn unit(
+        &self,
+        id: String,
+        title: String,
+        target_lines: Vec<String>,
+        legs: Vec<Leg>,
+        est_secs: u64,
+    ) -> Unit {
+        Unit {
+            id,
+            title,
+            link_group: self.spec.link_group.clone(),
+            bidir: self.bidir,
+            target_lines,
+            bidir_total_target_mbps: self
+                .bidir
+                .then_some(self.spec.rate_target_bidir_total)
+                .flatten(),
+            direction: self.dir.to_string(),
+            // 轮次由 `repeat_units` 在最外层派生；这里展开的永远是第 1 轮。
+            round: 1,
+            legs,
+            est_secs,
+        }
+    }
 }
 
 fn alloc_port(next: &mut u16) -> u16 {

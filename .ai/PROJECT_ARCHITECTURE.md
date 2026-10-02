@@ -20,7 +20,8 @@
 |---|---|---|
 | `master/run_status.rs` | `RunStatus` / `UnitStatus` / `RunObserver` | 进度从「日志文本」变成结构化数据。executor 依赖 trait 不依赖 webui；CLI 传 `None` 行为零变化（ADR-2） |
 | `master/executor/row.rs` | `RowIdentity` / `base_row` / `unit_row` | 报告行的**唯一**构造入口。加身份字段会让 10 个构造点全部编译失败——从「运行期空列」变成编译期错误（ADR-7） |
-| `master/builder/{identity,policy,diagnostics}.rs` | resume identity、速率目标/链路策略、诊断单元 | 从 4359 行的 `builder.rs` 里按**改动的理由**分出来。`identity` 那份是 RESUME 承重面，不许「顺手清理」（R4） |
+| `master/builder/{identity,policy,diagnostics}.rs` | resume identity、速率目标/链路策略（含 UDP 每腿负载 `udp_load_for_leg`）、诊断单元 | 从 4359 行的 `builder.rs` 里按**改动的理由**分出来。`identity` 那份是 RESUME 承重面，不许「顺手清理」（R4） |
+| `master/builder/{iperf_tcp,iperf_udp,cts,ping}.rs` | 四种后端各自的单元展开（`expand_*`） | R4 的后半：`build_units` 只留外层循环、缺 IPv6 与同 /24 两道公共门禁和后端顺序。共享状态在 `builder::Expansion`（单元、提示、提示去重、端口游标），每个「规格 × 方向 × IP 版本」组合是一个 `builder::Route`；四种后端共用的门限段只有 `Expansion::leg_rate` 一份 |
 | `report/store.rs` | `rows.jsonl` + `meta.json` + `request.json` 读写 | 每单元增量落盘，报告可重放。崩溃损失从「整轮」变成「未完成的单元」（ADR-3）。`request.json` 是控制台发起这一轮时的 `RunRequest` 原文，「重新执行这一轮」唯一的输入（`meta.json` 里只有 `plan_hash`，那是摘要、反推不出计划）；命令行路径不写它 |
 | `report/xlsx.rs` | `summary.xlsx` 四张表 | 第二个结果出口。**只吃类型化字段**，不许解析展示串（有结构断言）（ADR-7） |
 | `master/webui/runs.rs` | `/api/runs`、`/api/runs/{id}/bundle.zip`、`/api/runs/report`、`/api/runs/request` | 远程访问者取回报告的唯一通道；报告的相对路径子资源撞「鉴权先于路由」，不能当静态站点服务（ADR-15、§13.3）。`report` 从 `rows.jsonl` 重放（**不要求先没有报告**——崩溃留下的那份可能是半截的；只挡正在跑的那一轮），`request` 回这一轮的计划原文供「重新执行」装载回控制台 |
@@ -105,6 +106,7 @@
 | `every_production_row_is_built_through_the_shared_constructor` | 生产代码造 `Row` 只能走 `base_row`/`unit_row`，不许 `..Default::default()` |
 | `the_leg_assembly_contracts_have_exactly_one_definition_in_the_tree` | 腿级判定装配的四个契约只能定义在 `rate.rs` / `rate_window.rs`（ADR-12） |
 | `the_full_unit_expansion_is_byte_stable` | 稳定 ID / 端口顺序 / 单元展开的全量快照——**它红了先问「我是不是改了不该改的」** |
+| `the_full_plan_expansion_including_commands_and_targets_is_stable` | 展开结果的全量快照：每条腿的 `-w/-P/-b/-l` 与 CTS 参数、判定模式与门限、`target_lines`、计划提示的内容与顺序。和上一条分开，因为红了的含义不同——这一条在有意改文案或参数时就该红 |
 | `the_embedded_page_was_built_from_the_current_ui_sources` | 溯源戳：产物是不是从当前 `ui/` 源码构建的 |
 | `every_verdict_label_round_trips` | `Verdict::label()` 与 `from_label()` 一一对应 |
 | `the_summary_grid_has_one_cell_for_every_verdict` | 报告概览的统计格覆盖全部六个 verdict |
@@ -415,7 +417,7 @@ Windows 文本适配器：`src/cmd/ipconfig.rs` 解析中英文 `ipconfig /all`�
 - UDP 发送口限流：WiFi、WIFI 角色、未知速率或非法带宽不裁剪；否则 `floor(speed/bandwidth)` 与请求流数取最小。
 - 方向腿 `dir_pairs`：ab 一腿、ba 一腿、bidir 按 `[ab,ba]` 两腿。
 - 共享 materializer `map_legs` 和 `unit` 消除了 TCP/ping 重复初始化。
-- Unit 生成主循环：先方向，再 IP 版本，再 iperf/ping；跨机 IPv4 iperf 可受同 /24 门禁，ping 不受门禁。
+- Unit 生成主循环 `build_units`：先方向，再 IP 版本，再按 iperf（TCP、UDP）→ ctsTraffic → ping 的顺序交给 `builder/{iperf_tcp,iperf_udp,cts,ping}.rs` 展开；跨机 IPv4 iperf 与 ctsTraffic 可受同 /24 门禁，ping 不受门禁。端口按这个顺序全局递增分配。
 - 套件控制台共用 `builder::build_ui_units_repeated`：逐规格展开、整套派生轮次、按稳定 ID 保序去重，`UiPlanUnits::spec_indices` 保留最终单元的原始规格索引。`webui::plan::compile_request` 用这些索引生成来源信息，并直接对最终单元计算计划哈希；`ui::run_master` 仅在 `console_request` 含 `ui_plan` 时使用同一展开函数。普通 CLI 继续使用 `build_units_repeated`，显式重复任务保留。去重不重分配已留下单元的端口，不改首轮 ID 或轮次身份。
 
 ### 6.3 端口、流和稳定 ID
@@ -641,7 +643,7 @@ Windows 文本适配器：`src/cmd/ipconfig.rs` 解析中英文 `ipconfig /all`�
 | CLI/新参数 | `main.rs`；master 参数另看 `master/ui.rs` | `main.rs` 的帮助 的解析测试、README |
 | 配置字段/默认 | `config.rs` | `config.rs`、`config.example.json`、README，以及 `main.rs`、`master/ui.rs`、`master/builder.rs`、`master/executor.rs`、`agent/server.rs` 中对应消费者 |
 | HTTP DTO/端点 | `protocol.rs` 或 `agent/server.rs` | `http_client.rs`、`master/ui.rs`、`master/executor.rs`、对应实现及 `agent/server.rs` 的解析/错误包装测试 |
-| 任务数量/顺序/ID/端口 | `builder.rs` | `builder.rs`、`master/ui.rs`、`executor.rs`、executor 的 `sort_key` 构造与 `report.rs` |
+| 任务数量/顺序/ID/端口 | `builder.rs`（外层循环）与 `builder/` 下对应后端的 `expand_*` | `builder/tests.rs` 的两份全量快照、`master/ui.rs`、`executor.rs`、executor 的 `sort_key` 构造与 `report.rs` |
 | PASS/并发/监控/截图/RESUME | `executor.rs` | `executor.rs`、builder Unit/legs、`cmd/iperf/`、`ping.rs`、`nic/monitor.rs`、`screenshot.rs`、agent 对应端点及 `report.rs` |
 | iperf 命令/解析/进程 | `cmd/iperf/` 下对应职责的文件（args / parse / server / client / jobs） | `cmd/iperf/tests.rs`、`protocol.rs`、`agent/server.rs`、`master/executor.rs`、`inner/adb_client.rs`（复用 client 执行与重试）、`cmd/ctstraffic.rs`（复用作业管理）、`util::run_streaming` |
 | ping 命令/解析 | `ping.rs` | `ping.rs`、`protocol.rs`、`agent/server.rs`、`executor.rs` |

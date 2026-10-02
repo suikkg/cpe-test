@@ -342,3 +342,95 @@ pub(super) fn cts_datagram_bytes(profile: &UdpProfile) -> Result<Option<u32>, St
             }
         })
 }
+
+/// UDP 按整条路径的可信负载上限裁剪流数。
+/// RNDIS 3.7G 协商按约 2.5G，10GUSB 的 4.2G 已知显示 bug 不按 4.2G 裁剪。
+pub(super) fn allowed_udp_streams_for_mbps(
+    sender: &Endpoint,
+    receiver: &Endpoint,
+    bandwidth_mbps: f64,
+    want: u32,
+    limit: bool,
+    rate_cfg: &RateCheckCfg,
+) -> u32 {
+    if !limit {
+        return want;
+    }
+    let Some(speed) = rate::path_payload_ceiling_mbps(&sender.nic, &receiver.nic, rate_cfg) else {
+        return want;
+    };
+    let bw = bandwidth_mbps;
+    if bw <= 0.0 {
+        return want;
+    }
+    let max_n = (speed / bw).floor() as u32;
+    max_n.min(want)
+}
+
+/// 一条方向腿实际下发的 UDP 负载：单流 `-b` 与流数。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct UdpLoad {
+    pub bits_per_second: u64,
+    pub mbps: f64,
+    pub streams: u32,
+    /// 单流带宽被路径上限压低时，记下原始请求值，供任务标签与报表说明。
+    pub clipped_from_mbps: Option<f64>,
+}
+
+impl UdpLoad {
+    /// iperf3 的无后缀带宽值按 bit/s 解释。传精确整数可避免依赖它对
+    /// `Gbps` 等长后缀的非文档兼容行为。
+    pub(crate) fn iperf_arg(self) -> String {
+        self.bits_per_second.to_string()
+    }
+}
+
+/// 按整条路径的可信负载上限决定这条腿的 `-b` 和流数。
+///
+/// 优先降流数（保持单流带宽不变），流数已经降到 1 仍然超限时才压 `-b`。
+///
+/// 旧行为在「单流带宽就已经超过路径上限」时返回 0 流，调用方据此把任务整个
+/// 跳过。run_20260825_215915_7684 里 80 条 UDP 命令全部带着同一个
+/// `-b 2600000000`，其中相当一部分打向 1Gbps 收端，制造出 60~99% 的丢包——
+/// 那是配置出来的丢包，不是测出来的。给 1Gbps 收端灌 1Gbps 拿到一个真实
+/// 结论，永远好过跳过或者灌 2.6G 拿到一个必然失败的结论。
+/// 详见 .ai/DESIGN-v4.3.0.md D4。
+pub(crate) fn udp_load_for_leg(
+    sender: &Endpoint,
+    receiver: &Endpoint,
+    requested: ParsedBandwidth,
+    want_streams: u32,
+    limit: bool,
+    explicit: bool,
+    rate_cfg: &RateCheckCfg,
+) -> UdpLoad {
+    let want = want_streams.max(1);
+    let as_requested = |streams: u32| UdpLoad {
+        bits_per_second: requested.bits_per_second,
+        mbps: requested.mbps,
+        streams,
+        clipped_from_mbps: None,
+    };
+    // `explicit` = 这条链路在 link_profiles 里被专门指定过带宽。
+    // 那是操作者对这条链路的明确判断，自动裁剪不该覆盖它——裁剪是给
+    // 没配过的链路兜底用的安全网，不是用来推翻人的决定的。
+    if explicit || !limit || requested.mbps <= 0.0 {
+        return as_requested(want);
+    }
+    let Some(ceiling) = rate::path_payload_ceiling_mbps(&sender.nic, &receiver.nic, rate_cfg)
+    else {
+        return as_requested(want);
+    };
+    let fit = (ceiling / requested.mbps).floor();
+    if fit >= 1.0 {
+        return as_requested((fit as u32).clamp(1, want));
+    }
+    // 单流就已经超过整条路径的可信上限：压 -b，而不是放弃这条腿。
+    let bits_per_second = (ceiling * 1_000_000.0).round().max(1.0) as u64;
+    UdpLoad {
+        bits_per_second,
+        mbps: bits_per_second as f64 / 1_000_000.0,
+        streams: 1,
+        clipped_from_mbps: Some(requested.mbps),
+    }
+}

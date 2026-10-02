@@ -107,7 +107,7 @@ shasum -a 256 dist/cpe_test-v<版本号>-windows-config-docs.zip   # 必须等�
 |---|---|---|
 | 配置字段 / 默认值 | `config.rs` | `config.example.json`、`config.minimal.json`、`dist/configs/*.json`（4+1 份）、README、`使用说明.md`，以及钉住默认值的那几个测试 |
 | HTTP DTO / 端点 | `protocol.rs` 或 `agent/server.rs` | `http_client.rs`、`master/executor.rs`、agent 侧解析与错误包装测试 |
-| 任务数量 / 顺序 / ID / 端口 | `master/builder.rs` | executor 的 `sort_key` 构造、`report.rs` 的排序与组合计、**历史 RESUME 会不再命中** |
+| 任务数量 / 顺序 / ID / 端口 | `master/builder.rs`（外层循环）与 `master/builder/{iperf_tcp,iperf_udp,cts,ping}.rs` | executor 的 `sort_key` 构造、`report.rs` 的排序与组合计、**历史 RESUME 会不再命中** |
 | 报告列 / HTML | `report.rs` | 身份类字段走 `executor/row.rs` 的 `RowIdentity`/`base_row`（加字段会让 10 个构造点全部编译失败，这是有意的）；测量类字段仍要逐个构造点看 |
 
 补两条本仓库特有的：
