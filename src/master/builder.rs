@@ -2151,9 +2151,10 @@ mod tests {
     /// 跳过的单元会全部重跑，一次 11.5 小时的验收变成两次，而且**没有任何报错**，
     /// 只是「怎么又从头跑了」。端口顺序同理：它进 identity，也决定并发资源分配。
     ///
-    /// 快照是**内联的字面量**而不是外部文件：拆分 `builder.rs`（R4）时，任何
+    /// 快照在 `builder_snapshot.txt`，逐字比对：拆分 `builder.rs`（R4）时，任何
     /// 一处顺序、拼接、命名的手滑都会让这里逐字段报出差异，而不是等到用户
-    /// 现场发现 resume 不命中。
+    /// 现场发现 resume 不命中。它只钉身份与端口；命令参数、门限和提示由
+    /// `the_full_plan_expansion_including_commands_and_targets_is_stable` 钉。
     ///
     /// 如果这条测试红了，先问「我是不是改了不该改的东西」，而不是更新快照。
     /// 真要改 identity 模板，那是一次**需要说明的兼容性事件**（会清空所有人的
@@ -2248,6 +2249,334 @@ mod tests {
              如果是有意改 identity 模板，那会清空所有用户的 resume 缓存，\
              属于需要单独说明的兼容性事件。\n"
         );
+    }
+
+    /// 计划快照里一条 iperf 流的全部字段。解构是穷举的：给 `IperfTask` 加字段会在
+    /// 这里编译失败，逼人决定新字段算不算「builder 展开出来的东西」。
+    fn iperf_task_fingerprint(task: &IperfTask) -> String {
+        let IperfTask {
+            v6,
+            udp,
+            profile_name,
+            profile_label,
+            comparison_label,
+            src,
+            dst,
+            port,
+            duration,
+            extra,
+            stream_idx,
+            rate_mode,
+            rx_target_mbps,
+            offered_per_stream_mbps,
+        } = task;
+        format!(
+            "v6={v6} udp={udp} name={profile_name} label={profile_label} cmp={comparison_label} \
+             {}->{} port={port} dur={duration} extra=[{}] idx={stream_idx} mode={rate_mode:?} \
+             target={rx_target_mbps:?} offered={offered_per_stream_mbps:?}",
+            src.key(),
+            dst.key(),
+            extra.join(" ")
+        )
+    }
+
+    /// 计划快照里的一条腿。端点只记 `Endpoint::key()`，不展开 `NicInfo`：网卡字段的
+    /// 增减与展开逻辑无关，不该让这份快照红。
+    fn leg_fingerprint(leg: &Leg) -> String {
+        let body = match &leg.kind {
+            LegKind::IperfSingle(task) => format!("single {}", iperf_task_fingerprint(task)),
+            LegKind::IperfGroup { name, streams } => format!(
+                "group {name}\n{}",
+                streams
+                    .iter()
+                    .map(|task| format!("      {}", iperf_task_fingerprint(task)))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+            LegKind::CtsTraffic(task) => {
+                let CtsTrafficTask {
+                    v6,
+                    udp,
+                    profile_name,
+                    profile_label,
+                    comparison_label,
+                    src,
+                    dst,
+                    port,
+                    duration,
+                    streams,
+                    window_bytes,
+                    bits_per_second,
+                    datagram_bytes,
+                    frame_rate,
+                    buffer_depth_secs,
+                    status_update_ms,
+                    rate_mode,
+                    rx_target_mbps,
+                    offered_total_mbps,
+                    setup_error,
+                } = task;
+                format!(
+                    "cts v6={v6} udp={udp} name={profile_name} label={profile_label} \
+                     cmp={comparison_label} {}->{} port={port} dur={duration} streams={streams} \
+                     window={window_bytes:?} bps={bits_per_second:?} datagram={datagram_bytes:?} \
+                     fps={frame_rate} depth={buffer_depth_secs} status={status_update_ms} \
+                     mode={rate_mode:?} target={rx_target_mbps:?} offered={offered_total_mbps:?} \
+                     setup_error={setup_error:?}",
+                    src.key(),
+                    dst.key()
+                )
+            }
+            LegKind::Ping(task) => {
+                let PingTask {
+                    v6,
+                    src,
+                    dst,
+                    count,
+                    payload,
+                    purpose,
+                } = task;
+                format!(
+                    "ping v6={v6} {}->{} count={count} payload={payload} purpose={purpose:?}",
+                    src.key(),
+                    dst.key()
+                )
+            }
+        };
+        format!("    leg tag={:?} {body}", leg.tag)
+    }
+
+    /// **展开结果的全量快照：命令参数、速率模式、门限、预览行与计划提示。**
+    ///
+    /// `the_full_unit_expansion_is_byte_stable` 只钉 RESUME 身份与端口——它红了意味着
+    /// 用户的历史 PASS 全部失效。这一条钉的是「builder 到底展开出了什么」：每条腿
+    /// 下发的 `-w/-P/-b/-l`、CTS 的全部参数、判定模式与门限、`target_lines`、
+    /// 以及提示信息的内容与顺序。两条分开，是因为它们红了的含义不同：这一条在
+    /// 有意改文案或改参数时就该红，而那一条不该。
+    ///
+    /// 输入刻意覆盖各个分支：四种后端、三种方向、双栈、空 `-w` 档位、超大 `-w`、
+    /// 非法流数、非法带宽、路径裁剪、按角色/按网口改写、多流组灌不到门限、合计门限
+    /// 盖掉逐方向门限、CTS 的非法参数与拓扑门禁、缺 IPv6 与跨 /24 的跳过。
+    ///
+    /// 重构（R4 拆 `build_units`）时它红了：**不要更新快照**，去找搬错的那一处。
+    /// 有意改了展开结果：核对差异确实是想要的，再更新 `builder_plan_snapshot.txt`。
+    #[test]
+    fn the_full_plan_expansion_including_commands_and_targets_is_stable() {
+        let mut tcp = base_spec();
+        tcp.name = "plan-tcp".into();
+        tcp.directions = vec!["ab".into(), "ba".into(), "bidir".into()];
+        tcp.ipvers = vec!["v4".into(), "v6".into()];
+        tcp.tcp_windows = vec!["64k".into(), "256m".into()];
+        tcp.tcp_streams = 40;
+        tcp.duration = 30;
+        tcp.rate_targets_single = RateTargets {
+            ab: Some(2000.0),
+            ..Default::default()
+        };
+        tcp.rate_targets_bidir = RateTargets {
+            ab: Some(900.0),
+            ba: Some(900.0),
+            ..Default::default()
+        };
+        tcp.rate_target_bidir_total = Some(1800.0);
+
+        let mut tcp_no_window = base_spec();
+        tcp_no_window.name = "plan-tcp-no-window".into();
+        tcp_no_window.directions = vec!["bidir".into()];
+        tcp_no_window.tcp_windows = Vec::new();
+        tcp_no_window.rate_targets_bidir = RateTargets {
+            forward: Some(1000.0),
+            ..Default::default()
+        };
+
+        let mut udp = base_spec();
+        udp.name = "plan-udp".into();
+        udp.dst = ep(Side::Agent, "eth1", "SGMII1G", "192.168.1.3", 1000);
+        udp.directions = vec!["ab".into(), "bidir".into()];
+        udp.transports = vec!["udp".into()];
+        udp.udp_streams = 4;
+        udp.udp_profiles = vec![
+            UdpProfile {
+                bandwidth: "2500m".into(),
+                length: Some("1400".into()),
+                window: None,
+            },
+            UdpProfile::bw("100m"),
+            UdpProfile::bw("abc"),
+            UdpProfile {
+                bandwidth: "300m".into(),
+                length: None,
+                window: Some("4m".into()),
+            },
+        ];
+        udp.rate_targets = RateTargets {
+            forward: Some(900.0),
+            ..Default::default()
+        };
+        udp.link_profiles = LinkProfiles {
+            by_role: vec![RoleProfile {
+                pair: "SGMII2.5G<->SGMII1G".into(),
+                rx_target_mbps: RateTargets {
+                    ba: Some(800.0),
+                    ..Default::default()
+                },
+                udp_bandwidth: DirectionalBandwidth {
+                    ba: Some("600m".into()),
+                    ..Default::default()
+                },
+            }],
+            by_nic: vec![NicProfile {
+                host: "master".into(),
+                name: "eth0".into(),
+                ipv4: "192.168.1.2".into(),
+                rx_target_percent: Some(90.0),
+                udp_length: Some("1200".into()),
+                ..Default::default()
+            }],
+        };
+
+        let mut cts = base_spec();
+        cts.name = "plan-cts".into();
+        cts.kinds = vec!["ctstraffic".into()];
+        cts.transports = vec!["tcp".into(), "udp".into()];
+        cts.directions = vec!["ab".into(), "bidir".into()];
+        cts.tcp_streams = 2;
+        cts.udp_streams = 3;
+        cts.tcp_windows = vec!["auto".into(), "1m".into(), "bogus".into()];
+        cts.udp_profiles = vec![
+            UdpProfile {
+                bandwidth: "500m".into(),
+                length: Some("1372".into()),
+                window: Some("2m".into()),
+            },
+            UdpProfile::bw("3000m"),
+        ];
+
+        let mut cts_blocked = cts.clone();
+        cts_blocked.name = "plan-cts-cross-subnet".into();
+        cts_blocked.kinds = vec!["cts".into()];
+        cts_blocked.directions = vec!["ab".into()];
+        cts_blocked.dst = ep(Side::Agent, "eth0", "SGMII2.5G", "192.168.9.3", 2500);
+
+        let mut cts_bad = base_spec();
+        cts_bad.name = "plan-cts-invalid".into();
+        cts_bad.kinds = vec!["ctstraffic".into()];
+        cts_bad.transports = vec!["udp".into()];
+        cts_bad.ctstraffic_config_error = Some("duration 超出 ctsTraffic 允许范围".into());
+        cts_bad.ctstraffic.udp_frame_rate = 0;
+
+        let mut ping = base_spec();
+        ping.name = "plan-ping".into();
+        ping.kinds = vec!["ping".into()];
+        ping.transports = Vec::new();
+        ping.directions = vec!["ab".into(), "bidir".into()];
+        ping.ipvers = vec!["v4".into(), "v6".into()];
+        ping.payload_sizes = vec![32, 1472];
+
+        let mut no_v6 = base_spec();
+        no_v6.name = "plan-no-v6".into();
+        no_v6.ipvers = vec!["v6".into()];
+        no_v6.dst.nic.ipv6_ll = String::new();
+
+        let mut cross = base_spec();
+        cross.name = "plan-cross-subnet".into();
+        cross.kinds = vec!["iperf".into(), "ping".into()];
+        cross.dst = ep(Side::Agent, "eth0", "SGMII2.5G", "192.168.9.3", 2500);
+
+        let specs = [
+            tcp,
+            tcp_no_window,
+            udp,
+            cts,
+            cts_blocked,
+            cts_bad,
+            ping,
+            no_v6,
+            cross,
+        ];
+        let mut port = PORT_BASE;
+        let (units, notices) = build_units(&specs, true, &mut port);
+
+        let mut lines = Vec::new();
+        for unit in &units {
+            let Unit {
+                id,
+                title,
+                link_group,
+                bidir,
+                target_lines,
+                bidir_total_target_mbps,
+                direction,
+                round,
+                legs,
+                est_secs,
+            } = unit;
+            lines.push(format!(
+                "{id}|{title}|group={link_group:?}|bidir={bidir}|dir={direction}|round={round}\
+                 |est={est_secs}|total={bidir_total_target_mbps:?}|targets={target_lines:?}"
+            ));
+            lines.extend(legs.iter().map(leg_fingerprint));
+        }
+        lines.push("--- notices".into());
+        lines.extend(notices.iter().cloned());
+        lines.push(format!("--- next_port={port}"));
+        let snapshot = lines.join("\n");
+
+        let expected = include_str!("builder_plan_snapshot.txt").replace("\r\n", "\n");
+        assert!(
+            snapshot.trim_end() == expected.trim_end(),
+            "\n计划展开发生了变化（命令参数 / 门限 / 预览行 / 提示之一）。\n\
+             重构过程中出现：说明搬运没有保持等价，**不要更新快照**，去找搬错的那一处。\n\
+             有意改了展开结果：逐行核对下面的差异，确认后再更新 builder_plan_snapshot.txt。\n\
+             {}",
+            first_difference(&expected, &snapshot)
+        );
+    }
+
+    /// 两份多行文本的第一处差异，前后各带两行上下文。快照有上百行，
+    /// `assert_eq!` 把两整份字符串转义后并排打出来，人眼找不到差在哪。
+    fn first_difference(expected: &str, actual: &str) -> String {
+        let expected: Vec<&str> = expected.trim_end().lines().collect();
+        let actual: Vec<&str> = actual.trim_end().lines().collect();
+        let at = expected
+            .iter()
+            .zip(&actual)
+            .position(|(left, right)| left != right)
+            .unwrap_or(expected.len().min(actual.len()));
+        let from = at.saturating_sub(2);
+        let show = |lines: &[&str]| {
+            lines
+                .iter()
+                .enumerate()
+                .skip(from)
+                .take(5)
+                .map(|(index, line)| format!("  {:>4} {line}", index + 1))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        // 快照一行能有几百个字符，再指出这一行里从哪个字符开始不同。
+        let left: Vec<char> = expected.get(at).copied().unwrap_or("").chars().collect();
+        let right: Vec<char> = actual.get(at).copied().unwrap_or("").chars().collect();
+        let column = left.iter().zip(&right).take_while(|(a, b)| a == b).count();
+        let around = |chars: &[char]| -> String {
+            chars
+                .iter()
+                .skip(column.saturating_sub(20))
+                .take(60)
+                .collect()
+        };
+        format!(
+            "第 {} 行第 {} 个字符起不同（期望 {} 行，实际 {} 行）\n\
+             期望 …{}\n实际 …{}\n期望:\n{}\n实际:\n{}",
+            at + 1,
+            column + 1,
+            expected.len(),
+            actual.len(),
+            around(&left),
+            around(&right),
+            show(&expected),
+            show(&actual)
+        )
     }
 
     fn cts_spec(transport: &str) -> SpecNorm {
