@@ -933,7 +933,7 @@ pub(super) fn normalized_ui_directions(raw: &[String]) -> Vec<String> {
 pub(super) fn normalized_ui_ips(raw: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     for value in raw {
-        if let Some(ip) = canonical_ui_ip(value) {
+        if let Some(ip) = builder::canonical_ip_version(value) {
             if !out.iter().any(|v| v == ip) {
                 out.push(ip.to_string());
             }

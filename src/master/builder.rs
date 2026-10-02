@@ -821,6 +821,7 @@ pub fn build_units(
     };
 
     for spec in specs {
+        let spec = &canonical_axes(spec, &mut x);
         let cross = spec.src.side != spec.dst.side;
         let same_subnet_ok =
             !cross || !require_same_subnet || same_slash24(&spec.src.nic.ipv4, &spec.dst.nic.ipv4);
@@ -872,11 +873,7 @@ pub fn build_units(
                 }
 
                 // ---------- Microsoft ctsTraffic（Windows 10+ 专用） ----------
-                if spec
-                    .kinds
-                    .iter()
-                    .any(|kind| kind == "ctstraffic" || kind == "cts")
-                {
+                if spec.kinds.iter().any(|kind| kind == "ctstraffic") {
                     expand_cts(&mut x, &route);
                 }
 
@@ -888,6 +885,97 @@ pub fn build_units(
         }
     }
     (x.units, x.notices)
+}
+
+/// `ip` 的规范值（`v4` / `v6`）。控制台（`webui::validate`）与配置文件共用这一张
+/// 写法表：两边各认一套的话，同一个 `"ipv6"` 在控制台跑成 IPv6、在命令行跑成
+/// 第二遍 IPv4。
+pub(crate) fn canonical_ip_version(raw: &str) -> Option<&'static str> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "v4" | "ipv4" | "4" => Some("v4"),
+        "v6" | "ipv6" | "6" => Some("v6"),
+        _ => None,
+    }
+}
+
+fn canonical_kind(raw: &str) -> Option<&'static str> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "iperf" => Some("iperf"),
+        "ctstraffic" | "cts" => Some("ctstraffic"),
+        "ping" => Some("ping"),
+        _ => None,
+    }
+}
+
+fn canonical_transport(raw: &str) -> Option<&'static str> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "tcp" => Some("tcp"),
+        "udp" => Some("udp"),
+        _ => None,
+    }
+}
+
+/// 把规格里的 `ip` / `kinds` / `transports` 换成规范值（去重保序），认不出的值
+/// 作为计划提示说出来。
+///
+/// 展开只认规范值：IP 版本只问「是不是 `v6`」，别的一律按 IPv4 展开，所以
+/// `"ipv6"` 以前会被展开成第二份 IPv4——ID 相同、两份都跑、没有一句提示；后端与
+/// 传输认不出的值则整类不生成，同样不说。配置文件 `tests[]` 只做了小写、`pairs`
+/// 连小写都没做，所以收在展开入口：不管规格从哪条路来，都过这一道。
+fn canonical_axes(spec: &SpecNorm, x: &mut Expansion<'_>) -> SpecNorm {
+    let mut spec = spec.clone();
+    spec.ipvers = canonical_values(
+        x,
+        &spec.name,
+        "ip",
+        &spec.ipvers,
+        canonical_ip_version,
+        "v4 / v6",
+    );
+    spec.kinds = canonical_values(
+        x,
+        &spec.name,
+        "kinds",
+        &spec.kinds,
+        canonical_kind,
+        "iperf / ctstraffic / ping",
+    );
+    // 只跑 ping 时传输协议用不上，写了什么都不必提示。
+    if spec.kinds.iter().any(|kind| kind != "ping") {
+        spec.transports = canonical_values(
+            x,
+            &spec.name,
+            "transports",
+            &spec.transports,
+            canonical_transport,
+            "tcp / udp",
+        );
+    }
+    spec
+}
+
+fn canonical_values(
+    x: &mut Expansion<'_>,
+    spec_name: &str,
+    field: &str,
+    raw: &[String],
+    canonical: fn(&str) -> Option<&'static str>,
+    accepted: &str,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for value in raw {
+        match canonical(value) {
+            Some(value) => {
+                if !out.iter().any(|seen| seen == value) {
+                    out.push(value.to_string());
+                }
+            }
+            None => x.notices.push(format!(
+                "{spec_name}：{field} 取值 {value:?} 无法识别，已忽略（可选 {accepted}）"
+            )),
+        }
+    }
+    out
 }
 
 /// `build_units` 一路累加的结果，四种后端的展开函数共用。

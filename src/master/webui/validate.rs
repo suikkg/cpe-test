@@ -368,14 +368,6 @@ pub(super) fn canonical_ui_direction(raw: &str) -> Option<&'static str> {
     }
 }
 
-pub(super) fn canonical_ui_ip(raw: &str) -> Option<&'static str> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "v4" | "ipv4" | "4" => Some("v4"),
-        "v6" | "ipv6" | "6" => Some("v6"),
-        _ => None,
-    }
-}
-
 pub(super) fn ui_task_protocol(task: &UiTask) -> Option<String> {
     let raw = if !task.protocol.trim().is_empty() {
         task.protocol.trim().to_ascii_lowercase()
@@ -788,7 +780,12 @@ pub(super) fn validate_ui_plan(state: &UiState, plan: &UiPlan) -> Result<(), Str
             {
                 return Err(format!("suite {} 的 task {} 方向无效", suite.id, task.id));
             }
-            if task.ip.is_empty() || task.ip.iter().any(|ip| canonical_ui_ip(ip).is_none()) {
+            if task.ip.is_empty()
+                || task
+                    .ip
+                    .iter()
+                    .any(|ip| builder::canonical_ip_version(ip).is_none())
+            {
                 return Err(format!(
                     "suite {} 的 task {} IP 版本无效",
                     suite.id, task.id

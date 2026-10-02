@@ -1075,7 +1075,7 @@ iperf3 和 ctsTraffic 的 IPv4 直连任务。发布包预置配置默认仍使�
 | `direction` | string/array | `"A->B" / "B->A" / "bidir" / "both"` | A->B |
 | `kinds` | array | `iperf`、`ctstraffic`、`ping` 可任选或组合；`cts` 是 ctsTraffic 别名 | ["iperf"] |
 | `transports` | array | `["tcp"] / ["udp"] / ["tcp","udp"]` | ["tcp"] |
-| `ip` | array | `["v4"] / ["v6"]` | ["v4"] |
+| `ip` | array | `["v4"] / ["v6"] / ["v4","v6"]`；也认 `ipv4`/`ipv6`/`4`/`6` | ["v4"] |
 | `streams` | int | 兼容旧配置的通用并发流数；协议专用值缺省或为 0 时回退到此值 | 1 |
 | `tcp_streams` | int | TCP 并发数；iperf3=`-P`，ctsTraffic=`Connections`，有效范围 `1..=32` | `streams` |
 | `udp_streams` | int | UDP 并发数；iperf3=独立进程，ctsTraffic=`Connections`，有效范围 `1..=32` | `streams` |
@@ -1086,6 +1086,8 @@ iperf3 和 ctsTraffic 的 IPv4 直连任务。发布包预置配置默认仍使�
 | `ping_payload_sizes` | array | 覆盖全局负载字节；默认覆盖 32、1600、65500 | — |
 | `tcp_windows` | array | TCP socket buffer 档位；ctsTraffic 映射为方向正确的 Send/Recv buffer | — |
 | `udp_profiles` | array | UDP profile；支持严格带宽、可选 `length` 和可选 `window`，格式见下文 | — |
+
+`kinds`、`transports`、`ip` 里写错的值（例如 `"iperf3"`、`"sctp"`）会在计划提示里列出并忽略，不会悄悄少生成一类测试；`tests[]` 与 `universal_params` 规则相同。
 
 ### pairs 自动配对（比 tests[] 更省事的写法）
 

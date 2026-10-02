@@ -3904,3 +3904,72 @@ fn the_round_count_is_clamped_on_both_ends() {
     let (many, _) = build_units_repeated(&[base_spec()], true, &mut port, MAX_ROUNDS + 50);
     assert_eq!(many.len(), one.len() * MAX_ROUNDS as usize);
 }
+
+/// `ip` 的别名展开成它说的那个版本，而不是第二份 IPv4。
+///
+/// 展开只问「是不是 `v6`」，以前 `"ipv6"` / `"6"` / 大写 `"V6"`（`pairs` 路径连小写
+/// 都不做）都会被当成 IPv4：ID 相同的单元出现两份、两份都跑，报告里只有 V4，
+/// 而计划里一句提示都没有。写法表与控制台共用 `canonical_ip_version`。
+#[test]
+fn ip_aliases_expand_to_the_version_they_name_instead_of_a_second_ipv4() {
+    for aliases in [vec!["v4", "ipv6"], vec!["IPv4", "6"], vec!["4", "V6", "v6"]] {
+        let mut spec = base_spec();
+        spec.ipvers = aliases.iter().map(|value| value.to_string()).collect();
+        let mut port = PORT_BASE;
+        let (units, notices) = build_units(&[spec], true, &mut port);
+        let titles: Vec<&str> = units.iter().map(|unit| unit.title.as_str()).collect();
+        assert_eq!(units.len(), 2, "{aliases:?}: {titles:?}");
+        assert!(titles[0].contains(" V4 "), "{aliases:?}: {titles:?}");
+        assert!(titles[1].contains(" V6 "), "{aliases:?}: {titles:?}");
+        assert_ne!(units[0].id, units[1].id, "{aliases:?}");
+        assert!(notices.is_empty(), "{aliases:?}: {notices:?}");
+    }
+}
+
+/// 认不出的 `ip` / `kinds` / `transports` 取值要说出来，而不是整类静默不生成。
+///
+/// 配置文件 `tests[]` 与 `pairs` 两条路都不校验这三个字段，`"kinds": ["iperf3"]`
+/// 以前得到的是一个空计划和零条提示。
+#[test]
+fn unrecognised_axis_values_are_reported_instead_of_silently_dropped() {
+    let mut spec = base_spec();
+    spec.name = "typo".into();
+    spec.kinds = vec!["iperf3".into(), "ping".into()];
+    spec.transports = vec!["tcp".into(), "sctp".into()];
+    spec.ipvers = vec!["v4".into(), "v5".into()];
+    let mut port = PORT_BASE;
+    let (units, notices) = build_units(&[spec.clone()], true, &mut port);
+    // iperf3 不是别名：只剩 ping。
+    assert!(
+        units.iter().all(|unit| unit.title.starts_with("PING")),
+        "{:?}",
+        units.iter().map(|unit| &unit.title).collect::<Vec<_>>()
+    );
+    for expected in [
+        "typo：kinds 取值 \"iperf3\" 无法识别，已忽略（可选 iperf / ctstraffic / ping）",
+        "typo：ip 取值 \"v5\" 无法识别，已忽略（可选 v4 / v6）",
+    ] {
+        assert!(
+            notices.iter().any(|notice| notice == expected),
+            "{notices:?}"
+        );
+    }
+    // 只剩 ping 时传输协议用不上，不为它提示。
+    assert!(
+        !notices.iter().any(|notice| notice.contains("transports")),
+        "{notices:?}"
+    );
+
+    // 有灌包后端时，认不出的传输协议同样要说，认得出的照常展开。
+    spec.kinds = vec!["iperf".into()];
+    let mut port = PORT_BASE;
+    let (units, notices) = build_units(&[spec], true, &mut port);
+    assert!(!units.is_empty() && units.iter().all(|unit| unit.title.contains(" TCP ")));
+    assert!(
+        notices
+            .iter()
+            .any(|notice| notice
+                == "typo：transports 取值 \"sctp\" 无法识别，已忽略（可选 tcp / udp）"),
+        "{notices:?}"
+    );
+}

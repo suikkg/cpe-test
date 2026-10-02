@@ -417,7 +417,7 @@ Windows 文本适配器：`src/cmd/ipconfig.rs` 解析中英文 `ipconfig /all`�
 - UDP 发送口限流：WiFi、WIFI 角色、未知速率或非法带宽不裁剪；否则 `floor(speed/bandwidth)` 与请求流数取最小。
 - 方向腿 `dir_pairs`：ab 一腿、ba 一腿、bidir 按 `[ab,ba]` 两腿。
 - 共享 materializer `map_legs` 和 `unit` 消除了 TCP/ping 重复初始化。
-- Unit 生成主循环 `build_units`：先方向，再 IP 版本，再按 iperf（TCP、UDP）→ ctsTraffic → ping 的顺序交给 `builder/{iperf_tcp,iperf_udp,cts,ping}.rs` 展开；跨机 IPv4 iperf 与 ctsTraffic 可受同 /24 门禁，ping 不受门禁。端口按这个顺序全局递增分配。
+- Unit 生成主循环 `build_units`：先方向，再 IP 版本，再按 iperf（TCP、UDP）→ ctsTraffic → ping 的顺序交给 `builder/{iperf_tcp,iperf_udp,cts,ping}.rs` 展开；跨机 IPv4 iperf 与 ctsTraffic 可受同 /24 门禁，ping 不受门禁。端口按这个顺序全局递增分配。入口先经 `canonical_axes` 把 `ip` / `kinds` / `transports` 换成规范值（`ip` 的写法表 `canonical_ip_version` 与控制台共用），认不出的值进计划提示——展开只问「是不是 `v6`」，不归一的话 `"ipv6"` 会变成第二份 IPv4。
 - 套件控制台共用 `builder::build_ui_units_repeated`：逐规格展开、整套派生轮次、按稳定 ID 保序去重，`UiPlanUnits::spec_indices` 保留最终单元的原始规格索引。`webui::plan::compile_request` 用这些索引生成来源信息，并直接对最终单元计算计划哈希；`ui::run_master` 仅在 `console_request` 含 `ui_plan` 时使用同一展开函数。普通 CLI 继续使用 `build_units_repeated`，显式重复任务保留。去重不重分配已留下单元的端口，不改首轮 ID 或轮次身份。
 
 ### 6.3 端口、流和稳定 ID
