@@ -179,13 +179,24 @@ fn expand_cts_udp(x: &mut Expansion<'_>, route: &Route<'_>, gate: &mut TopologyG
                 None
             }
         };
-        let datagram_bytes = match cts_datagram_bytes(profile) {
-            Ok(value) => value,
-            Err(error) => {
-                setup_errors.push(error);
-                None
+        // 发送口可以单独覆盖报文长度，与 iperf 的 `-l` 同一套规则（`udp_leg_profile`）。
+        // 按腿解析；两条腿报同一个错只记一次。
+        let leg_profiles: Vec<UdpProfile> = pairs
+            .iter()
+            .map(|(src, dst, _tag)| udp_leg_profile(spec, profile, src, dst))
+            .collect();
+        let mut leg_datagrams = Vec::with_capacity(leg_profiles.len());
+        for leg_profile in &leg_profiles {
+            match cts_datagram_bytes(leg_profile) {
+                Ok(value) => leg_datagrams.push(value),
+                Err(error) => {
+                    if !setup_errors.contains(&error) {
+                        setup_errors.push(error);
+                    }
+                    leg_datagrams.push(None);
+                }
             }
-        };
+        }
         let setup_error = (!setup_errors.is_empty()).then(|| setup_errors.join("；"));
         if gate.skips(x, spec, &setup_error) {
             continue;
@@ -197,38 +208,32 @@ fn expand_cts_udp(x: &mut Expansion<'_>, route: &Route<'_>, gate: &mut TopologyG
                 profile.label()
             ));
         }
+        // 每腿负载与 iperf UDP 同一份规则（`udp_leg_load`）：先降流数，单流仍超过
+        // 路径上限才压每流带宽，链路策略明确给了带宽的不裁。配置非法的单元不起
+        // 进程，参数按配置原样记下，不参与裁剪。
+        let leg_loads: Option<Vec<UdpLoad>> = match (&setup_error, bandwidth) {
+            (None, Some(requested)) => Some(
+                pairs
+                    .iter()
+                    .map(|(src, dst, _tag)| udp_leg_load(spec, src, dst, requested, udp_streams))
+                    .collect(),
+            ),
+            _ => None,
+        };
+        if let Some(loads) = &leg_loads {
+            let label = format!("CTS {}", profile.label());
+            for ((src, dst, _tag), load) in pairs.iter().zip(loads) {
+                if let Some(notice) = udp_clip_notice(&spec.name, &label, src, dst, load) {
+                    x.notices.push(notice);
+                }
+            }
+        }
         let mut legs = Vec::new();
         let mut target_lines: Vec<String> = Vec::new();
         let mut max_streams = 1u32;
-        for (src, dst, tag) in pairs {
-            let streams = if setup_error.is_some() {
-                udp_streams
-            } else {
-                allowed_udp_streams_for_mbps(
-                    src,
-                    dst,
-                    bandwidth.expect("合法 CTS UDP 配置必须有严格带宽值").mbps,
-                    udp_streams,
-                    spec.udp_limit,
-                    &spec.rate_check,
-                )
-            };
-            if streams == 0 {
-                // 只有配置合法、路径上限有值且容不下单流时才会落到 0 流，
-                // 所以两个数在这里都有；说出来人才知道该调档位还是换链路。
-                let ceiling = rate::path_payload_ceiling_mbps(&src.nic, &dst.nic, &spec.rate_check)
-                    .unwrap_or_default();
-                let per_stream = bandwidth.map(|value| value.mbps).unwrap_or_default();
-                x.notices.push(format!(
-                    "跳过 {} CTS {}：{} -> {} 路径上限约 {ceiling:.0}Mbps，容不下单流 {per_stream:.0}Mbps",
-                    spec.name,
-                    profile.label(),
-                    src.nic.name,
-                    dst.nic.name
-                ));
-                legs.clear();
-                break;
-            }
+        for (leg_idx, (src, dst, tag)) in pairs.iter().enumerate() {
+            let load = leg_loads.as_ref().map(|loads| loads[leg_idx]);
+            let streams = load.map_or(udp_streams, |load| load.streams);
             max_streams = max_streams.max(streams);
             let flow_direction = route.flow_direction(tag);
             let (effective_mode, target) = x.leg_rate(
@@ -241,10 +246,23 @@ fn expand_cts_udp(x: &mut Expansion<'_>, route: &Route<'_>, gate: &mut TopologyG
             );
             // 每流带宽 × 流数 = 整条腿的总量。CTS 侧的
             // 字段是**总量**口径，与 iperf 的每流口径相反。
-            let offered_total_mbps = bandwidth.map(|value| value.mbps * streams as f64);
+            let (bits_per_second, per_stream_mbps) = match load {
+                Some(load) => (Some(load.bits_per_second), Some(load.mbps)),
+                None => (
+                    bandwidth.map(|value| value.bits_per_second),
+                    bandwidth.map(|value| value.mbps),
+                ),
+            };
+            let offered_total_mbps = per_stream_mbps.map(|mbps| mbps * streams as f64);
+            let leg_label = match (load, bandwidth) {
+                (Some(load), Some(requested)) => {
+                    udp_leg_label(&leg_profiles[leg_idx], &load, requested)
+                }
+                _ => profile.label(),
+            };
             let profile_label = format!(
                 "CTS UDP {} ×{}流 (每流)",
-                profile.label().trim_start_matches("UDP "),
+                leg_label.trim_start_matches("UDP "),
                 streams
             );
             legs.push(Leg {
@@ -254,6 +272,7 @@ fn expand_cts_udp(x: &mut Expansion<'_>, route: &Route<'_>, gate: &mut TopologyG
                     udp: true,
                     profile_name: format!("cts_{}_c{}", profile.name(), streams),
                     profile_label,
+                    // 对齐键只认档位本身：裁剪与按网口改写都随协商速率或 IP 变化。
                     comparison_label: format!(
                         "CTS UDP {} (每流)",
                         profile.label().trim_start_matches("UDP ")
@@ -264,8 +283,8 @@ fn expand_cts_udp(x: &mut Expansion<'_>, route: &Route<'_>, gate: &mut TopologyG
                     duration: spec.duration,
                     streams,
                     window_bytes,
-                    bits_per_second: bandwidth.map(|value| value.bits_per_second),
-                    datagram_bytes,
+                    bits_per_second,
+                    datagram_bytes: leg_datagrams[leg_idx],
                     frame_rate: spec.ctstraffic.udp_frame_rate,
                     buffer_depth_secs: spec.ctstraffic.udp_buffer_depth_secs,
                     status_update_ms: spec.ctstraffic.status_update_ms,
@@ -276,14 +295,17 @@ fn expand_cts_udp(x: &mut Expansion<'_>, route: &Route<'_>, gate: &mut TopologyG
                 }),
             });
         }
-        if legs.is_empty() {
-            continue;
-        }
+        let unit_label = match (&leg_loads, bandwidth) {
+            (Some(loads), Some(requested)) => {
+                udp_unit_label(profile, requested, loads, &leg_profiles)
+            }
+            _ => profile.label(),
+        };
         let title = format!(
             "{}CTS TRAFFIC {} UDP {} ×{}流 | {}",
             if bidir { "★★双向 " } else { "" },
             ip_tag,
-            profile.label().trim_start_matches("UDP "),
+            unit_label.trim_start_matches("UDP "),
             max_streams,
             route_str
         );

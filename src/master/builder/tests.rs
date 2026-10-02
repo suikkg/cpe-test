@@ -3594,7 +3594,7 @@ fn traffic_arguments_are_separate_argv_entries_never_a_shell_string() {
     }
 }
 
-/// **裁流的两个边界：速率未知时不裁，一条腿灌不动时整个单元不排**
+/// **裁流的两个边界：速率未知时不裁，单流灌不动时压带宽而不是丢单元**
 /// （回归方案 PLAN-05）。
 ///
 /// 逐腿裁剪、Wi-Fi 固定档、RNDIS/NCM/10GUSB 的特例各自已有测试，这里补的是
@@ -3607,13 +3607,14 @@ fn traffic_arguments_are_separate_argv_entries_never_a_shell_string() {
 /// 猜测替换掉操作者的配置，失败方向还是「灌得比要求的少、却按原门限判」，
 /// 直接制造假 FAIL。
 ///
-/// **② 单流就灌不动时，整个单元不许排。** CTS 那条路上流数会算到 0
-/// （iperf 那条路 v4.3.0 起改成压 `-b` 而不是跳过，见
-/// `test_udp_over_path_ceiling_clips_bandwidth_instead_of_skipping`）。
-/// 0 流必须让**整个单元消失**，而不是留下一个没有腿的空单元——空单元会
-/// 进计数、进报告、占一行，却什么都没跑。
+/// **② 单流就灌不动时，CTS 与 iperf 一样压每流带宽。** iperf 那条路 v4.3.0 起
+/// 就改成了压 `-b` 而不是跳过（见
+/// `test_udp_over_path_ceiling_clips_bandwidth_instead_of_skipping`），CTS 那条路
+/// 以前仍按旧规则把流数算到 0、整个单元跳过：同一条 1G 链路上 iperf 的 2.6G 档位
+/// 照测，CTS 的这一档整个消失。两条路现在共用 `udp_leg_load`；也不许留下没有腿的
+/// 空单元——空单元会进计数、进报告、占一行，却什么都没跑。
 #[test]
-fn an_unknown_link_speed_is_never_clipped_and_a_leg_that_cannot_run_drops_the_unit() {
+fn an_unknown_link_speed_is_never_clipped_and_cts_clips_instead_of_dropping_the_unit() {
     let cfg = RateCheckCfg::default();
 
     // ---- ① 未知速率 ----
@@ -3654,8 +3655,7 @@ fn an_unknown_link_speed_is_never_clipped_and_a_leg_that_cannot_run_drops_the_un
         "1G 路径上灌 2.6G 却原样放行：{clipped:?}"
     );
 
-    // ---- ② 一条腿排不出来，整个单元不许留 ----
-    // CTS UDP 那条路上单流超过路径上限时流数算到 0。
+    // ---- ② 单流超过路径上限：CTS 压每流带宽，单元照排 ----
     let mut spec = base_spec();
     spec.src = ep(Side::Master, "eth0", "SGMII1G", "192.168.1.2", 1000);
     spec.dst = ep(Side::Agent, "eth0", "SGMII1G", "192.168.1.3", 1000);
@@ -3670,22 +3670,41 @@ fn an_unknown_link_speed_is_never_clipped_and_a_leg_that_cannot_run_drops_the_un
     }];
     let mut port = PORT_BASE;
     let (units, notices) = build_units(&[spec], true, &mut port);
-    // 注：`legs.clear()` 那一步在当前结构下够不到——路径上限是
-    // `min(两端)`，对称，所以一个单元的两条腿永远同进同退，第一条排不出来时
-    // `legs` 本来就是空的。它是防御性的，不是本条测试证到的东西。
-    // 真正证到的是下面两条：0 流检查在，且跳过会说一声。
+    assert_eq!(
+        units.len(),
+        1,
+        "1G 链路上的 2.6G 档位必须照测：{notices:#?}"
+    );
     assert!(
         units.iter().all(|unit| !unit.legs.is_empty()),
         "留下了一个没有腿的空单元：它会进计数、进报告、占一行，却什么都没跑"
     );
+    let LegKind::CtsTraffic(task) = &units[0].legs[0].kind else {
+        panic!("应当是 CTS 腿：{:?}", units[0].legs[0].kind);
+    };
+    assert_eq!(task.streams, 1, "先降流数，降到 1 仍放不下才压带宽");
+    assert_eq!(
+        task.bits_per_second,
+        Some(1_000_000_000),
+        "每流带宽压到路径上限"
+    );
+    assert_eq!(task.offered_total_mbps, Some(1000.0));
+    assert_eq!(task.datagram_bytes, Some(1200), "报文长度不跟着裁剪变");
     assert!(
-        units.is_empty(),
-        "单流就超过路径上限时整个单元都该消失，实际排出了 {} 个",
-        units.len()
+        task.profile_label
+            .contains("按路径上限从 2600M 裁剪至 1000M"),
+        "标签必须写实际下发的值：{}",
+        task.profile_label
+    );
+    assert_eq!(
+        task.comparison_label, "CTS UDP -b 2.6G -l 1200 (每流)",
+        "对齐键只认档位本身"
     );
     assert!(
-        notices.iter().any(|line| line.contains("跳过")),
-        "跳过必须说一声，否则用户只会发现「少跑了几个」：{notices:#?}"
+        notices
+            .iter()
+            .any(|line| line.contains("路径上限不足，-b 由 2600Mbps 裁剪到 1000Mbps")),
+        "裁剪必须说一声：{notices:#?}"
     );
 }
 
@@ -4049,4 +4068,111 @@ fn a_notice_is_said_once_however_many_units_repeat_it() {
     let plan = build_ui_units_repeated(&[spec, other], true, &mut port, 1);
     assert_eq!(plan.units.len(), 12);
     assert_eq!(plan.notices, vec![expected.to_string()]);
+}
+
+/// ctsTraffic 与 iperf 两条 UDP 路径按同一份规则决定每条腿的负载与报文长度。
+///
+/// 链路策略（`link_profiles`）给的单流带宽与报文长度、路径上限的裁剪，以前只作用
+/// 在 iperf 上：同一份配置，iperf 腿按网口改了 `-b` / `-l`、在 1G 收端上压到 1000M，
+/// CTS 腿照档位原值发、单流放不下就整个单元跳过。
+#[test]
+fn cts_udp_legs_follow_the_same_load_policy_as_iperf() {
+    let mut spec = base_spec();
+    spec.src = ep(Side::Master, "eth0", "SGMII2.5G", "192.168.1.2", 2500);
+    spec.dst = ep(Side::Agent, "eth1", "SGMII1G", "192.168.1.3", 1000);
+    spec.directions = vec!["bidir".into()];
+    spec.transports = vec!["udp".into()];
+    spec.udp_streams = 2;
+    spec.udp_profiles = vec![UdpProfile {
+        bandwidth: "1500m".into(),
+        length: Some("1400".into()),
+        window: None,
+    }];
+    // 辅测口作为发送端（ba）时：单流带宽与报文长度都按网口改写。
+    spec.link_profiles = LinkProfiles {
+        by_role: Vec::new(),
+        by_nic: vec![NicProfile {
+            host: "agent".into(),
+            name: "eth1".into(),
+            ipv4: "192.168.1.3".into(),
+            udp_bandwidth: Some("300m".into()),
+            udp_length: Some("1200".into()),
+            ..Default::default()
+        }],
+    };
+    let legs_of = |kind: &str| {
+        let mut spec = spec.clone();
+        spec.kinds = vec![kind.into()];
+        let mut port = PORT_BASE;
+        let (units, notices) = build_units(&[spec], true, &mut port);
+        assert_eq!(units.len(), 1, "{kind}: {notices:#?}");
+        units[0]
+            .legs
+            .iter()
+            .map(|leg| match &leg.kind {
+                LegKind::IperfSingle(task) => {
+                    let flag = |name: &str| {
+                        task.extra
+                            .iter()
+                            .position(|arg| arg == name)
+                            .map(|at| task.extra[at + 1].clone())
+                    };
+                    (
+                        1,
+                        flag("-b").and_then(|value| value.parse::<u64>().ok()),
+                        flag("-l"),
+                    )
+                }
+                LegKind::IperfGroup { streams, .. } => {
+                    let extra = &streams[0].extra;
+                    let flag = |name: &str| {
+                        extra
+                            .iter()
+                            .position(|arg| arg == name)
+                            .map(|at| extra[at + 1].clone())
+                    };
+                    (
+                        streams.len() as u32,
+                        flag("-b").and_then(|value| value.parse::<u64>().ok()),
+                        flag("-l"),
+                    )
+                }
+                LegKind::CtsTraffic(task) => (
+                    task.streams,
+                    task.bits_per_second,
+                    task.datagram_bytes.map(|bytes| bytes.to_string()),
+                ),
+                LegKind::Ping(_) => panic!("不该有 ping 腿"),
+            })
+            .collect::<Vec<_>>()
+    };
+    let iperf = legs_of("iperf");
+    let cts = legs_of("ctstraffic");
+    assert_eq!(
+        iperf,
+        vec![
+            // ab：2.5G -> 1G，1500m 单流就超过 1000M 的路径上限，降到 1 流再压带宽。
+            (1, Some(1_000_000_000), Some("1400".to_string())),
+            // ba：按网口改写成 300m / 1200，明确配过的不裁。
+            (2, Some(300_000_000), Some("1200".to_string())),
+        ]
+    );
+    assert_eq!(cts, iperf, "CTS 与 iperf 的每腿负载必须一致");
+
+    // 按网口改写的报文长度非法时，CTS 记 SETUP_ERROR，而不是悄悄用档位原值。
+    let mut bad = spec.clone();
+    bad.kinds = vec!["ctstraffic".into()];
+    bad.link_profiles.by_nic[0].udp_length = Some("70000".into());
+    let mut port = PORT_BASE;
+    let (units, notices) = build_units(&[bad], true, &mut port);
+    let LegKind::CtsTraffic(task) = &units[0].legs[0].kind else {
+        panic!("应当是 CTS 腿");
+    };
+    assert!(task.setup_error.is_some(), "{task:?}");
+    assert!(
+        notices
+            .iter()
+            .any(|line| line.contains("配置非法，将记录 SETUP_ERROR") && line.contains("65507")),
+        "{notices:#?}"
+    );
 }

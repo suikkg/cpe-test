@@ -39,48 +39,15 @@ pub(super) fn expand_iperf_udp(x: &mut Expansion<'_>, route: &Route<'_>) {
         // 能力可以差很多，共用一个 -b 没有物理依据。
         let leg_loads: Vec<UdpLoad> = pairs
             .iter()
-            .map(|(s, d, _tag)| {
-                // 单口覆盖 / 角色配对可以改写这条腿的
-                // 单流带宽；解析不了就退回全局档位，
-                // 绝不因为一个笔误让任务凭空消失。
-                let configured = link_policy(spec, s, d)
-                    .udp_bandwidth
-                    .and_then(|value| UdpProfile::bw(&value).parsed_bandwidth().ok());
-                udp_load_for_leg(
-                    s,
-                    d,
-                    configured.unwrap_or(parsed_bandwidth),
-                    udp_streams,
-                    spec.udp_limit,
-                    configured.is_some(),
-                    &spec.rate_check,
-                )
-            })
+            .map(|(s, d, _tag)| udp_leg_load(spec, s, d, parsed_bandwidth, udp_streams))
             .collect();
-        // 发送口可以单独覆盖 `-l`：同一条用例在不同网口上
-        // 要用不同报文长度是常见需求。按腿算一次，标签和
-        // 命令都从这里取，免得两边各算一遍再对不上。
         let leg_profiles: Vec<UdpProfile> = pairs
             .iter()
-            .map(|(s, d, _tag)| UdpProfile {
-                bandwidth: prof.bandwidth.clone(),
-                length: link_policy(spec, s, d)
-                    .udp_length
-                    .or_else(|| prof.length.clone()),
-                window: prof.window.clone(),
-            })
+            .map(|(s, d, _tag)| udp_leg_profile(spec, prof, s, d))
             .collect();
         for ((s, d, _tag), load) in pairs.iter().zip(leg_loads.iter()) {
-            if let Some(from) = load.clipped_from_mbps {
-                x.notices.push(format!(
-                    "{} {}：{} -> {} 路径上限不足，-b 由 {:.0}Mbps 裁剪到 {:.0}Mbps",
-                    spec.name,
-                    prof.label(),
-                    s.nic.name,
-                    d.nic.name,
-                    from,
-                    load.mbps
-                ));
+            if let Some(notice) = udp_clip_notice(&spec.name, &prof.label(), s, d, load) {
+                x.notices.push(notice);
             }
         }
         let mut legs = Vec::new();
@@ -89,29 +56,9 @@ pub(super) fn expand_iperf_udp(x: &mut Expansion<'_>, route: &Route<'_>) {
         for (leg_idx, ((s, d, tag), load)) in pairs.iter().zip(leg_loads.iter()).enumerate() {
             let n = load.streams;
             max_n = max_n.max(n);
-            // 标签必须反映**实际下发**的 -b。链路策略
-            // 覆盖和路径裁剪都会改它，而报表里的
-            // 「类型 / 参数」列是很多人唯一会看的地方——
-            // 那里印着 2.6G、命令行却是 1G，比不印更糟。
-            // 裁剪与否只能问 clipped_from_mbps：链路策略
-            // 先把 2.5G 改成 2.6G、路径上限再裁回 2500，
-            // 拿全局档位去比会得出「没变」，把两次改写
-            // 一起抹掉。
-            // 标签必须反映**实际下发**的 -l，不是档位里那个。
             let leg_policy = link_policy(spec, s, d);
             let effective = &leg_profiles[leg_idx];
-            let leg_label = if let Some(from) = load.clipped_from_mbps {
-                format!(
-                    "{}（按路径上限从 {:.0}M 裁剪至 {:.0}M）",
-                    effective.label(),
-                    from,
-                    load.mbps
-                )
-            } else if (load.mbps - parsed_bandwidth.mbps).abs() >= f64::EPSILON {
-                format!("{}（按链路策略至 {:.0}M）", effective.label(), load.mbps)
-            } else {
-                effective.label()
-            };
+            let leg_label = udp_leg_label(effective, load, parsed_bandwidth);
             let mut extra: Vec<String> = vec!["-b".into(), load.iperf_arg()];
             if let Some(l) = &effective.length {
                 extra.push("-l".into());
@@ -248,74 +195,6 @@ fn unreachable_target_notice(
         rate_check.offered_headroom_pct.max(0.0),
         per_stream * n as f64 / (1.0 + rate_check.offered_headroom_pct.max(0.0) / 100.0),
     ))
-}
-
-/// 单元标题里的档位标签。
-///
-/// 标题里的 -b 必须是**实际下发**的值。链路策略和
-/// 路径裁剪都会改它，而任务清单（控制台的「预览
-/// 任务」、日志开头的编号列表）是很多人唯一会看
-/// 的地方——那里印着全局档位、命令行却是别的数，
-/// 会让人以为自己填的值没生效。
-///
-/// 两条腿取值不同时退回档位标签：一个标题写不下
-/// 两个方向，逐行的 profile_label 里各自写着准确值。
-fn udp_unit_label(
-    prof: &UdpProfile,
-    parsed_bandwidth: ParsedBandwidth,
-    leg_loads: &[UdpLoad],
-    leg_profiles: &[UdpProfile],
-) -> String {
-    let uniform = leg_loads.first().is_some_and(|first| {
-        leg_loads
-            .iter()
-            .all(|load| (load.mbps - first.mbps).abs() < f64::EPSILON)
-    });
-    let effective = leg_loads
-        .first()
-        .map(|first| first.mbps)
-        .unwrap_or(parsed_bandwidth.mbps);
-    // `-l` 被发送口改写时，标题同样不能再印档位里的原值。
-    let leg_lengths: Vec<Option<String>> = leg_profiles.iter().map(|p| p.length.clone()).collect();
-    let length_changed = leg_lengths.iter().any(|length| *length != prof.length);
-    let changed = length_changed
-        || leg_loads
-            .iter()
-            .any(|load| (load.mbps - parsed_bandwidth.mbps).abs() >= f64::EPSILON);
-    if !changed {
-        return prof.label();
-    }
-    // 两条腿取值不同就两个都印（顺序即腿序 ab/ba）：
-    // 退回全局档位会显示一个谁都没在用的数。
-    let bw = if uniform {
-        format!("{effective:.0}m")
-    } else {
-        leg_loads
-            .iter()
-            .map(|load| format!("{:.0}m", load.mbps))
-            .collect::<Vec<_>>()
-            .join("/")
-    };
-    let mut label = format!("UDP -b {bw}");
-    let uniform_length = leg_lengths
-        .first()
-        .is_some_and(|first| leg_lengths.iter().all(|length| length == first));
-    if uniform_length {
-        if let Some(Some(l)) = leg_lengths.first() {
-            label.push_str(&format!(" -l {l}"));
-        }
-    } else {
-        let shown = leg_lengths
-            .iter()
-            .map(|length| length.as_deref().unwrap_or("默认"))
-            .collect::<Vec<_>>()
-            .join("/");
-        label.push_str(&format!(" -l {shown}"));
-    }
-    if let Some(w) = &prof.window {
-        label.push_str(&format!(" -w {w}"));
-    }
-    label
 }
 
 /// iperf UDP 单元的“预计总耗时”（秒），按典型成功路径估算：

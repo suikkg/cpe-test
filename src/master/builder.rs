@@ -202,7 +202,7 @@ pub struct CtsTrafficTask {
     pub profile_label: String,
     /// 两轮对比的对齐键用的参数，见 [`IperfTask::comparison_label`]。
     ///
-    /// UDP 的 `profile_label` 里写着「×N流」，而 N 由 `allowed_udp_streams_for_mbps`
+    /// UDP 的 `profile_label` 里写着「×N流」，而 N 由 `policy::udp_leg_load`
     /// 按路径上限裁剪、随协商速率变化，所以这里不写流数。TCP 的连接数来自配置，
     /// 两者相同。
     pub comparison_label: String,
