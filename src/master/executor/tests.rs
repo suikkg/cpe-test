@@ -3902,7 +3902,12 @@ fn the_abort_gate_runs_before_any_early_continue() {
     let gate = loop_body
         .find("breaker.should_abort_all()")
         .expect("熔断检查必须在单元循环内");
-    let first_continue = loop_body.find("continue;").unwrap_or(usize::MAX);
+    // 找不到 `continue;` 时不能取 usize::MAX：那样下面的断言恒真，循环结构一改，
+    // 这条守卫就什么都不检查地通过了。提前退出的路径（resume 命中、前置拦截、
+    // 网卡消失）一定在；不在了说明结构变了，这条断言要跟着改写。
+    let first_continue = loop_body
+        .find("continue;")
+        .expect("单元循环里应当有提前 continue 的路径；循环结构变了就改写这条断言");
     assert!(
         gate < first_continue,
         "熔断检查必须排在任何 continue 之前，否则提前退出的路径会绕过它"
