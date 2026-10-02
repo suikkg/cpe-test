@@ -35,17 +35,9 @@ pub(super) fn link_policy(spec: &SpecNorm, src: &Endpoint, dst: &Endpoint) -> ra
 /// 门限来自协商速率百分比时，把算式作为计划提示说出来（每条算式只说一次）。
 ///
 /// 不说的话，同一份配置在 Wi-Fi 重新协商后跑出不同门限，报告上看不出为什么。
-pub(super) fn note_rx_target(
-    notices: &mut Vec<String>,
-    seen: &mut HashSet<String>,
-    spec_name: &str,
-    policy: &rate::LinkPolicy,
-) {
+pub(super) fn note_rx_target(notices: &mut Notices, spec_name: &str, policy: &rate::LinkPolicy) {
     if let Some(note) = &policy.rx_target_note {
-        let line = format!("{spec_name}：{note}");
-        if seen.insert(line.clone()) {
-            notices.push(line);
-        }
+        notices.push(format!("{spec_name}：{note}"));
     }
 }
 
@@ -235,17 +227,9 @@ pub(super) fn leg_rate_plan(
 }
 
 /// 把「最终门限为什么不是配置里那个」作为计划提示说出来（每条只说一次）。
-pub(super) fn note_target_cap(
-    notices: &mut Vec<String>,
-    seen: &mut HashSet<String>,
-    spec_name: &str,
-    plan: &LegRatePlan,
-) {
+pub(super) fn note_target_cap(notices: &mut Notices, spec_name: &str, plan: &LegRatePlan) {
     for note in &plan.notes {
-        let line = format!("{spec_name}：{note}");
-        if seen.insert(line.clone()) {
-            notices.push(line);
-        }
+        notices.push(format!("{spec_name}：{note}"));
     }
 }
 

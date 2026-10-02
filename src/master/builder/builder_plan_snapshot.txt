@@ -119,30 +119,14 @@ de5d29055b6c651854f9270d2fe3131f|PING V4 -l 32 n=4 | 主控 eth0(192.168.1.2, 25
 --- notices
 plan-tcp 的 iperf TCP 流数配置非法，将按兼容范围使用 32 流: TCP streams 必须在 1..=32，当前为 40（来源 tcp_streams）
 plan-tcp TCP -w 256m -P 32：-w 256m × 32 流 = 8.59GB socket 缓冲，相当于这条链路 26.4 秒的流量。这些字节会被算进「工具自报发送」但未必上线，使 30s 的测试里「发送−接收」出现约 2291Mbps 的恒定虚高；判定用的接收端网卡口径不受影响。
-plan-tcp 的 iperf TCP 流数配置非法，将按兼容范围使用 32 流: TCP streams 必须在 1..=32，当前为 40（来源 tcp_streams）
-plan-tcp TCP -w 256m -P 32：-w 256m × 32 流 = 8.59GB socket 缓冲，相当于这条链路 26.4 秒的流量。这些字节会被算进「工具自报发送」但未必上线，使 30s 的测试里「发送−接收」出现约 2291Mbps 的恒定虚高；判定用的接收端网卡口径不受影响。
-plan-tcp 的 iperf TCP 流数配置非法，将按兼容范围使用 32 流: TCP streams 必须在 1..=32，当前为 40（来源 tcp_streams）
-plan-tcp TCP -w 256m -P 32：-w 256m × 32 流 = 8.59GB socket 缓冲，相当于这条链路 26.4 秒的流量。这些字节会被算进「工具自报发送」但未必上线，使 30s 的测试里「发送−接收」出现约 2291Mbps 的恒定虚高；判定用的接收端网卡口径不受影响。
-plan-tcp 的 iperf TCP 流数配置非法，将按兼容范围使用 32 流: TCP streams 必须在 1..=32，当前为 40（来源 tcp_streams）
-plan-tcp TCP -w 256m -P 32：-w 256m × 32 流 = 8.59GB socket 缓冲，相当于这条链路 26.4 秒的流量。这些字节会被算进「工具自报发送」但未必上线，使 30s 的测试里「发送−接收」出现约 2291Mbps 的恒定虚高；判定用的接收端网卡口径不受影响。
-plan-tcp 的 iperf TCP 流数配置非法，将按兼容范围使用 32 流: TCP streams 必须在 1..=32，当前为 40（来源 tcp_streams）
 plan-tcp：双向 RX 合计门限 1800Mbps 已盖掉逐方向门限 ab 900Mbps：本单元只比一次合计，两条腿各自不再判定。要逐方向把关，请清掉合计门限。
 plan-tcp：双向 RX 合计门限 1800Mbps 已盖掉逐方向门限 ba 900Mbps：本单元只比一次合计，两条腿各自不再判定。要逐方向把关，请清掉合计门限。
-plan-tcp TCP -w 256m -P 32：-w 256m × 32 流 = 8.59GB socket 缓冲，相当于这条链路 26.4 秒的流量。这些字节会被算进「工具自报发送」但未必上线，使 30s 的测试里「发送−接收」出现约 2291Mbps 的恒定虚高；判定用的接收端网卡口径不受影响。
-plan-tcp TCP -w 256m -P 32：-w 256m × 32 流 = 8.59GB socket 缓冲，相当于这条链路 26.4 秒的流量。这些字节会被算进「工具自报发送」但未必上线，使 30s 的测试里「发送−接收」出现约 2291Mbps 的恒定虚高；判定用的接收端网卡口径不受影响。
-plan-tcp 的 iperf TCP 流数配置非法，将按兼容范围使用 32 流: TCP streams 必须在 1..=32，当前为 40（来源 tcp_streams）
-plan-tcp TCP -w 256m -P 32：-w 256m × 32 流 = 8.59GB socket 缓冲，相当于这条链路 26.4 秒的流量。这些字节会被算进「工具自报发送」但未必上线，使 30s 的测试里「发送−接收」出现约 2291Mbps 的恒定虚高；判定用的接收端网卡口径不受影响。
-plan-tcp TCP -w 256m -P 32：-w 256m × 32 流 = 8.59GB socket 缓冲，相当于这条链路 26.4 秒的流量。这些字节会被算进「工具自报发送」但未必上线，使 30s 的测试里「发送−接收」出现约 2291Mbps 的恒定虚高；判定用的接收端网卡口径不受影响。
 plan-udp UDP -b 2500m -l 1400：eth0 -> eth1 路径上限不足，-b 由 2500Mbps 裁剪到 1000Mbps
 UDP -b 100m -l 1200 UDP 4 条流 × 100Mbps 灌不到 900Mbps 门限（含 5% 余量至少要 10 条并发流）。按当前配置这一腿的有效判定窗口永远形不成，结果会稳定落在「无法评价 / EFFECTIVE_WINDOW_SHORT」。把流数提到 10、调大每流 -b，或把门限降到 381Mbps 以下。
 跳过 plan-udp 的 iperf UDP profile UDP -b abc：无法解析 UDP 带宽 abc；带宽格式非法，未生成任务
 UDP -b 300m -l 1200 -w 4m UDP 3 条流 × 300Mbps 灌不到 900Mbps 门限（含 5% 余量至少要 4 条并发流）。按当前配置这一腿的有效判定窗口永远形不成，结果会稳定落在「无法评价 / EFFECTIVE_WINDOW_SHORT」。把流数提到 4、调大每流 -b，或把门限降到 857Mbps 以下。
-plan-udp UDP -b 2500m -l 1400：eth0 -> eth1 路径上限不足，-b 由 2500Mbps 裁剪到 1000Mbps
 plan-udp：接收口 eth0 门限按协商速率换算：2500Mbps × 90% = 2250Mbps
 plan-udp：门限 2250Mbps 超过这条链路的物理上限（eth1 上限 1000Mbps）；本条按 95% 折算到 950Mbps 判定
-跳过 plan-udp 的 iperf UDP profile UDP -b abc：无法解析 UDP 带宽 abc；带宽格式非法，未生成任务
-plan-cts CTS TCP 配置非法，将记录 SETUP_ERROR: CTS TCP socket buffer "bogus" 非法: 无法解析 socket buffer: bogus
-跳过 plan-cts CTS UDP UDP -b 3000m：路径上限不足以承载单流
 plan-cts CTS TCP 配置非法，将记录 SETUP_ERROR: CTS TCP socket buffer "bogus" 非法: 无法解析 socket buffer: bogus
 跳过 plan-cts CTS UDP UDP -b 3000m：路径上限不足以承载单流
 跳过 plan-cts-cross-subnet 的 ctsTraffic：两端 IPv4 不同 /24 (192.168.1.2 vs 192.168.9.3)，无法直连灌包

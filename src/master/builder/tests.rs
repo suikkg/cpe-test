@@ -4017,3 +4017,30 @@ fn a_percentage_derived_target_is_explained_for_every_traffic_backend() {
         );
     }
 }
+
+/// 同一句计划提示只说一遍，不管有多少个单元会把它再算出来。
+///
+/// 流数非法、`-w` 排空、路径裁剪这类提示按 方向 × IP 版本 × 档位 各算一遍，
+/// 以前原样重复：命令行逐条打印，控制台逐条列出，一份普通计划里同一句话能出现
+/// 十次。命令行（一次展开）和控制台（逐条规格展开再汇总）两条路都要去重。
+#[test]
+fn a_notice_is_said_once_however_many_units_repeat_it() {
+    let mut spec = base_spec();
+    spec.directions = vec!["ab".into(), "ba".into(), "bidir".into()];
+    spec.ipvers = vec!["v4".into(), "v6".into()];
+    spec.tcp_streams = 40;
+    let expected =
+        "t 的 iperf TCP 流数配置非法，将按兼容范围使用 32 流: TCP streams 必须在 1..=32，当前为 40（来源 tcp_streams）";
+
+    let mut port = PORT_BASE;
+    let (units, notices) = build_units(&[spec.clone()], true, &mut port);
+    assert_eq!(units.len(), 6);
+    assert_eq!(notices, vec![expected.to_string()]);
+
+    let mut other = spec.clone();
+    other.dst = ep(Side::Agent, "eth1", "SGMII2.5G", "192.168.1.4", 2500);
+    let mut port = PORT_BASE;
+    let plan = build_ui_units_repeated(&[spec, other], true, &mut port, 1);
+    assert_eq!(plan.units.len(), 12);
+    assert_eq!(plan.notices, vec![expected.to_string()]);
+}

@@ -754,7 +754,8 @@ pub fn build_ui_units_repeated(
     rounds: u32,
 ) -> UiPlanUnits {
     let mut units = Vec::new();
-    let mut notices = Vec::new();
+    // 逐条规格分别展开，跨规格同样只说一遍。
+    let mut notices = Notices::default();
     let mut spec_indices = Vec::new();
     for (index, spec) in specs.iter().enumerate() {
         let (built, build_notices) =
@@ -793,7 +794,7 @@ pub fn build_ui_units_repeated(
     }
     UiPlanUnits {
         units,
-        notices,
+        notices: notices.into_vec(),
         spec_indices: unique_sources,
     }
 }
@@ -815,8 +816,7 @@ pub fn build_units(
 ) -> (Vec<Unit>, Vec<String>) {
     let mut x = Expansion {
         units: Vec::new(),
-        notices: Vec::new(),
-        rx_target_notes: HashSet::new(),
+        notices: Notices::default(),
         next_port,
     };
 
@@ -884,7 +884,7 @@ pub fn build_units(
             }
         }
     }
-    (x.units, x.notices)
+    (x.units, x.notices.into_vec())
 }
 
 /// `ip` 的规范值（`v4` / `v6`）。控制台（`webui::validate`）与配置文件共用这一张
@@ -978,26 +978,47 @@ fn canonical_values(
     out
 }
 
+/// 计划提示，按第一次出现的顺序每句只记一遍。
+///
+/// 同一句话会在每个档位 × 每条腿 × 方向 × IP 版本上各算出来一遍（流数非法、`-w`
+/// 排空、路径裁剪……），以前原样重复：一条「流数配置非法」按方向 × IP 版本印六遍，
+/// `-w` 过大印十遍，命令行逐条打印、控制台逐条列出，真正要看的那几句被淹没。
+/// 去重收在 `push` 里，调用方没有绕过它的写法。
+#[derive(Default)]
+struct Notices {
+    list: Vec<String>,
+    seen: HashSet<String>,
+}
+
+impl Notices {
+    fn push(&mut self, message: String) {
+        if self.seen.insert(message.clone()) {
+            self.list.push(message);
+        }
+    }
+
+    fn extend(&mut self, messages: impl IntoIterator<Item = String>) {
+        for message in messages {
+            self.push(message);
+        }
+    }
+
+    fn into_vec(self) -> Vec<String> {
+        self.list
+    }
+}
+
 /// `build_units` 一路累加的结果，四种后端的展开函数共用。
 struct Expansion<'p> {
     units: Vec<Unit>,
     /// 给人看的计划提示：跳过了什么、为什么跳过、门限从哪来。
-    notices: Vec<String>,
-    /// 同一条门限算式会在每个档位 × 每条腿上重复解析出来，去重后只提示一次。
-    rx_target_notes: HashSet<String>,
+    notices: Notices,
     next_port: &'p mut u16,
 }
 
 impl Expansion<'_> {
     fn port(&mut self) -> u16 {
         alloc_port(self.next_port)
-    }
-
-    /// 同一句话可能在每个档位 × 每条腿上各算出来一遍，只说第一遍。
-    fn notice_once(&mut self, message: String) {
-        if self.rx_target_notes.insert(message.clone()) {
-            self.notices.push(message);
-        }
     }
 
     /// 一条腿的判定模式与门限。
@@ -1016,12 +1037,7 @@ impl Expansion<'_> {
         dst: &Endpoint,
         target_lines: &mut Vec<String>,
     ) -> (RateMode, Option<f64>) {
-        note_rx_target(
-            &mut self.notices,
-            &mut self.rx_target_notes,
-            &route.spec.name,
-            policy,
-        );
+        note_rx_target(&mut self.notices, &route.spec.name, policy);
         let plan = leg_rate_plan(
             route.spec,
             policy,
@@ -1030,12 +1046,7 @@ impl Expansion<'_> {
             &src.nic,
             &dst.nic,
         );
-        note_target_cap(
-            &mut self.notices,
-            &mut self.rx_target_notes,
-            &route.spec.name,
-            &plan,
-        );
+        note_target_cap(&mut self.notices, &route.spec.name, &plan);
         target_lines.push(target_line(flow_direction, plan.target_mbps, plan.source));
         (plan.mode, plan.target_mbps)
     }

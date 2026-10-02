@@ -153,7 +153,7 @@ pub(super) fn expand_iperf_udp(x: &mut Expansion<'_>, route: &Route<'_>) {
                 offered_per_stream_mbps,
                 &spec.rate_check,
             ) {
-                x.notice_once(msg);
+                x.notices.push(msg);
             }
             let kind = if n <= 1 {
                 LegKind::IperfSingle(mk(0, x.port()))
