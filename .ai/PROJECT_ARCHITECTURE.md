@@ -469,13 +469,16 @@ Windows 文本适配器：`src/cmd/ipconfig.rs` 解析中英文 `ipconfig /all`�
 
 ### 8.1 iperf 适配
 
-`src/cmd/iperf.rs`：
+`src/cmd/iperf.rs` 只放 server 与作业两套注册表共用的生命周期工具（ID 校验、租约截止、分段锁），
+并 `pub use` 外部用到的符号；实现按职责分在 `src/cmd/iperf/`，外部路径仍是 `crate::cmd::iperf::*`：
 
-- 常量和 server/client 参数构造；TCP 用 `-P`，UDP 用 `-u` 加额外 `-b/-l`。
-- `IperfParsed` 和最佳 sender/receiver/measurement 判定；文本速率、Bytes/bits、单位换算和 UDP 丢包解析。
-- `IperfServerMgr`：同端口先停旧 server，后台收集 stdout，TCP connect 探测 ready，主动 stop/kill，sweep/stop_all。
-- 就绪探测：去掉 IPv6 zone，解析地址一次，200ms 轮询，超时 15 秒。
-- client 瞬态错误和重试：最多 3 次，单次总超时为 duration+120 秒，保留实时输出和 stderr。
+- `args`：server/client 参数构造；TCP 用 `-P`，UDP 用 `-u` 加额外 `-b/-l`；`extra` 不许覆盖的受控参数（`RESERVED_CLIENT_FLAGS`）。
+- `parse`：`IperfParsed` 和最佳 sender/receiver/measurement 判定；文本速率、Bytes/bits、单位换算和 UDP 丢包解析；运行中逐行的实时事件（`classify_live_line`）。
+- `server`：`IperfServerMgr`。不带 request_id 的旧协议同端口先停旧 server，带 request_id 的按 request/owner 幂等；后台收集 stdout/stderr，TCP connect 探测 ready，主动 stop/kill，sweep/stop_all。
+- 就绪探测（`server`）：IPv6 zone 解析成 scope id（数字索引，或 unix 上按接口名查），每轮重新解析地址，connect 超时 1 秒、失败后 200ms 再试，总超时 15 秒；Windows 不带 zone 的 link-local 只等 300ms 并确认进程存活。
+- `client`：瞬态错误和重试，最多 3 次，单次总超时为 duration+120 秒，保留实时输出和 stderr；事件时间轴对齐（`align_event_to_epoch`）。
+- `jobs`：`IperfClientJobMgr`，异步 client 作业（`/iperf/client/start` 立即返回 job id）、租约、tombstone、owner 清理；CTS 经 `start_external_request` 复用同一套。
+- 测试在 `src/cmd/iperf/tests.rs`，属白盒测试：`SrvEntry`、两个注册表的内部字段对它开放为 `pub(super)`。
 
 ### 8.2 公共 util
 
@@ -512,7 +515,7 @@ Windows 文本适配器：`src/cmd/ipconfig.rs` 解析中英文 `ipconfig /all`�
 | builder | `builder.rs` | TCP/UDP 稳定 ID、端口、双向组、UDP 限流/WiFi 豁免、同 /24、ping、IPv6 |
 | executor | `executor.rs` | ResultDb 保存/加载、刚写入 PASS 命中、未知 ID、失败覆盖 |
 | UI | `ui.rs` | 跨机优先、同机配对顺序、UNKNOWN 过滤 |
-| iperf | `cmd/iperf.rs` | TCP/UDP 结果解析、Gbits/sec 与 MBytes/sec 换算、无测量数据的错误输出、瞬态错误判定、client/server 参数构造 |
+| iperf | `cmd/iperf/tests.rs` | TCP/UDP 结果解析、Gbits/sec 与 MBytes/sec 换算、无测量数据的错误输出、瞬态错误判定、client/server 参数构造 |
 | ping | `ping.rs` | 中文/英文/BSD、全丢、不可达假成功、部分成功 |
 | Windows parser | `cmd/ipconfig.rs`、`cmd/netsh.rs` | 中英文适配器、WiFi 状态/频段 |
 | NIC 分类 | `nic/classify.rs` | 角色、排序、WiFi 名称；USB 4000/4001/8999/12000 与以太网 8999/9000/12001 分类样例 |
@@ -639,8 +642,8 @@ Windows 文本适配器：`src/cmd/ipconfig.rs` 解析中英文 `ipconfig /all`�
 | 配置字段/默认 | `config.rs` | `config.rs`、`config.example.json`、README，以及 `main.rs`、`master/ui.rs`、`master/builder.rs`、`master/executor.rs`、`agent/server.rs` 中对应消费者 |
 | HTTP DTO/端点 | `protocol.rs` 或 `agent/server.rs` | `http_client.rs`、`master/ui.rs`、`master/executor.rs`、对应实现及 `agent/server.rs` 的解析/错误包装测试 |
 | 任务数量/顺序/ID/端口 | `builder.rs` | `builder.rs`、`master/ui.rs`、`executor.rs`、executor 的 `sort_key` 构造与 `report.rs` |
-| PASS/并发/监控/截图/RESUME | `executor.rs` | `executor.rs`、builder Unit/legs、`cmd/iperf.rs`、`ping.rs`、`nic/monitor.rs`、`screenshot.rs`、agent 对应端点及 `report.rs` |
-| iperf 命令/解析/进程 | `cmd/iperf.rs` | `cmd/iperf.rs`、`protocol.rs`、`agent/server.rs`、`master/executor.rs`、`util::run_streaming` |
+| PASS/并发/监控/截图/RESUME | `executor.rs` | `executor.rs`、builder Unit/legs、`cmd/iperf/`、`ping.rs`、`nic/monitor.rs`、`screenshot.rs`、agent 对应端点及 `report.rs` |
+| iperf 命令/解析/进程 | `cmd/iperf/` 下对应职责的文件（args / parse / server / client / jobs） | `cmd/iperf/tests.rs`、`protocol.rs`、`agent/server.rs`、`master/executor.rs`、`inner/adb_client.rs`（复用 client 执行与重试）、`cmd/ctstraffic.rs`（复用作业管理）、`util::run_streaming` |
 | ping 命令/解析 | `ping.rs` | `ping.rs`、`protocol.rs`、`agent/server.rs`、`executor.rs` |
 | NIC 角色 | `nic/classify.rs` | `nic/classify.rs`、`nic/mod.rs`、Windows/macOS 扫描、`builder.rs` 及 UI 角色选择 |
 | 平台采集/监控 | `nic/mod.rs`、`nic/scan_windows.rs`、`nic/scan_macos.rs`、`nic/monitor.rs`、`cmd/ipconfig.rs`、`cmd/netsh.rs` | Windows GNU/MSVC；`ipconfig.rs`、`netsh.rs`、`scan_macos.rs`、`monitor.rs`，以及 main/agent/executor 调用方 |
