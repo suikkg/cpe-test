@@ -1406,18 +1406,18 @@ fn server_readiness_probe_succeeds_on_a_listener_and_times_out_without_one() {
     wait_server_tcp_ready("127.0.0.1".into(), port, Duration::from_secs(5), || Ok(()))
         .expect("有监听时应当就绪");
     assert!(started.elapsed() < Duration::from_secs(2));
-
     drop(listener);
+
+    // 「没人监听」用 0 号端口：谁都不能在它上面监听，连接在各平台都立刻失败。
+    // 不能用刚关掉的那个端口——测试并行跑，别的用例随时可能拿到它并开始监听。
     let started = Instant::now();
-    let error = wait_server_tcp_ready("127.0.0.1".into(), port, Duration::from_millis(600), || {
-        Ok(())
-    })
-    .expect_err("没人监听时必须超时");
+    let error = wait_server_tcp_ready("127.0.0.1".into(), 0, Duration::from_millis(600), || Ok(()))
+        .expect_err("没人监听时必须超时");
     assert!(error.contains("未响应 TCP connect"), "{error}");
     assert!(started.elapsed() >= Duration::from_millis(600));
 
     // 子进程先退出时立刻把原因交回去，不等满时限。
-    let error = wait_server_tcp_ready("127.0.0.1".into(), port, Duration::from_secs(5), || {
+    let error = wait_server_tcp_ready("127.0.0.1".into(), 0, Duration::from_secs(5), || {
         Err("server 已退出".into())
     })
     .expect_err("子进程退出必须立刻报错");
