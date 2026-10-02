@@ -192,7 +192,7 @@ fn expand_cts_udp(x: &mut Expansion<'_>, route: &Route<'_>, gate: &mut TopologyG
         }
         if let Some(error) = &setup_error {
             x.notices.push(format!(
-                "{} CTS UDP {} 配置非法，将记录 SETUP_ERROR: {error}",
+                "{} CTS {} 配置非法，将记录 SETUP_ERROR: {error}",
                 spec.name,
                 profile.label()
             ));
@@ -214,10 +214,17 @@ fn expand_cts_udp(x: &mut Expansion<'_>, route: &Route<'_>, gate: &mut TopologyG
                 )
             };
             if streams == 0 {
+                // 只有配置合法、路径上限有值且容不下单流时才会落到 0 流，
+                // 所以两个数在这里都有；说出来人才知道该调档位还是换链路。
+                let ceiling = rate::path_payload_ceiling_mbps(&src.nic, &dst.nic, &spec.rate_check)
+                    .unwrap_or_default();
+                let per_stream = bandwidth.map(|value| value.mbps).unwrap_or_default();
                 x.notices.push(format!(
-                    "跳过 {} CTS UDP {}：路径上限不足以承载单流",
+                    "跳过 {} CTS {}：{} -> {} 路径上限约 {ceiling:.0}Mbps，容不下单流 {per_stream:.0}Mbps",
                     spec.name,
-                    profile.label()
+                    profile.label(),
+                    src.nic.name,
+                    dst.nic.name
                 ));
                 legs.clear();
                 break;

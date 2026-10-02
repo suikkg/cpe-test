@@ -122,16 +122,16 @@ plan-tcp TCP -w 256m -P 32：-w 256m × 32 流 = 8.59GB socket 缓冲，相当�
 plan-tcp：双向 RX 合计门限 1800Mbps 已盖掉逐方向门限 ab 900Mbps：本单元只比一次合计，两条腿各自不再判定。要逐方向把关，请清掉合计门限。
 plan-tcp：双向 RX 合计门限 1800Mbps 已盖掉逐方向门限 ba 900Mbps：本单元只比一次合计，两条腿各自不再判定。要逐方向把关，请清掉合计门限。
 plan-udp UDP -b 2500m -l 1400：eth0 -> eth1 路径上限不足，-b 由 2500Mbps 裁剪到 1000Mbps
-UDP -b 100m -l 1200 UDP 4 条流 × 100Mbps 灌不到 900Mbps 门限（含 5% 余量至少要 10 条并发流）。按当前配置这一腿的有效判定窗口永远形不成，结果会稳定落在「无法评价 / EFFECTIVE_WINDOW_SHORT」。把流数提到 10、调大每流 -b，或把门限降到 381Mbps 以下。
-跳过 plan-udp 的 iperf UDP profile UDP -b abc：无法解析 UDP 带宽 abc；带宽格式非法，未生成任务
-UDP -b 300m -l 1200 -w 4m UDP 3 条流 × 300Mbps 灌不到 900Mbps 门限（含 5% 余量至少要 4 条并发流）。按当前配置这一腿的有效判定窗口永远形不成，结果会稳定落在「无法评价 / EFFECTIVE_WINDOW_SHORT」。把流数提到 4、调大每流 -b，或把门限降到 857Mbps 以下。
+plan-udp UDP -b 100m -l 1200：eth0 -> eth1 4 条流 × 100Mbps 灌不到 900Mbps 门限（含 5% 余量至少要 10 条并发流）。按当前配置这一腿的有效判定窗口永远形不成，结果会稳定落在「无法评价 / EFFECTIVE_WINDOW_SHORT」。把流数提到 10、调大每流 -b，或把门限降到 381Mbps 以下。
+跳过 plan-udp 的 iperf UDP -b abc：无法解析 UDP 带宽 abc；带宽格式非法，未生成任务
+plan-udp UDP -b 300m -l 1200 -w 4m：eth0 -> eth1 3 条流 × 300Mbps 灌不到 900Mbps 门限（含 5% 余量至少要 4 条并发流）。按当前配置这一腿的有效判定窗口永远形不成，结果会稳定落在「无法评价 / EFFECTIVE_WINDOW_SHORT」。把流数提到 4、调大每流 -b，或把门限降到 857Mbps 以下。
 plan-udp：接收口 eth0 门限按协商速率换算：2500Mbps × 90% = 2250Mbps
 plan-udp：门限 2250Mbps 超过这条链路的物理上限（eth1 上限 1000Mbps）；本条按 95% 折算到 950Mbps 判定
 plan-cts CTS TCP 配置非法，将记录 SETUP_ERROR: CTS TCP socket buffer "bogus" 非法: 无法解析 socket buffer: bogus
-跳过 plan-cts CTS UDP UDP -b 3000m：路径上限不足以承载单流
+跳过 plan-cts CTS UDP -b 3000m：eth0 -> eth0 路径上限约 2600Mbps，容不下单流 3000Mbps
 跳过 plan-cts-cross-subnet 的 ctsTraffic：两端 IPv4 不同 /24 (192.168.1.2 vs 192.168.9.3)，无法直连灌包
 plan-cts-cross-subnet CTS TCP 配置非法，将记录 SETUP_ERROR: CTS TCP socket buffer "bogus" 非法: 无法解析 socket buffer: bogus
-plan-cts-invalid CTS UDP UDP -b 500m 配置非法，将记录 SETUP_ERROR: duration 超出 ctsTraffic 允许范围；ctsTraffic udp_frame_rate 必须大于 0，当前为 0
+plan-cts-invalid CTS UDP -b 500m 配置非法，将记录 SETUP_ERROR: duration 超出 ctsTraffic 允许范围；ctsTraffic udp_frame_rate 必须大于 0，当前为 0
 跳过 plan-no-v6 主控 eth0(192.168.1.2, 2500Mbps) -> 辅测 eth0(192.168.1.3, 2500Mbps) IPv6：两端缺少可用的 IPv6 地址
 跳过 plan-cross-subnet 的 iperf：两端 IPv4 不同网段 (192.168.1.2 vs 192.168.9.3)，无法直连灌包（ping 不受限）
 --- next_port=56060

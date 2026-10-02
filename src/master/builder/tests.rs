@@ -1916,7 +1916,7 @@ fn invalid_iperf_udp_bandwidth_skips_profile_before_execution() {
         assert_eq!(port, PORT_BASE, "跳过 profile 不应消耗端口");
         assert!(notices.iter().any(|notice| {
             notice.contains("跳过")
-                && notice.contains("iperf UDP profile")
+                && notice.contains(&format!("iperf UDP -b {invalid}："))
                 && notice.contains(invalid)
                 && notice.contains("带宽格式非法")
                 && notice.contains("未生成任务")
@@ -3266,6 +3266,12 @@ fn a_stream_count_that_can_never_reach_the_target_is_called_out_before_the_run()
         .find(|line| line.contains("灌不到") && line.contains("850"))
         .unwrap_or_else(|| panic!("必须在计划期点名，实际提示：{notices:#?}"));
     assert!(hit.contains("至少要 3 条"), "要说清到底需要几条：{hit}");
+    // 和其他计划提示一样以任务名开头、点名哪条链路：一份套件几十条任务，
+    // 只写档位的话分不清是哪一条在说。
+    assert!(
+        hit.starts_with("t UDP -b 300m：eth0 -> eth0 2 条流"),
+        "要说清是哪个任务、哪条链路：{hit}"
+    );
     assert!(
         hit.contains("EFFECTIVE_WINDOW_SHORT"),
         "要把「跑完会得到哪个原因码」写出来，否则用户仍然会去查采样窗口：{hit}"

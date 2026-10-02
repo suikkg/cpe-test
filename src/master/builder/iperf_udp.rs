@@ -27,7 +27,7 @@ pub(super) fn expand_iperf_udp(x: &mut Expansion<'_>, route: &Route<'_>) {
             Ok(value) => value,
             Err(error) => {
                 x.notices.push(format!(
-                    "跳过 {} 的 iperf UDP profile {}：{error}；带宽格式非法，未生成任务",
+                    "跳过 {} 的 iperf {}：{error}；带宽格式非法，未生成任务",
                     spec.name,
                     prof.label()
                 ));
@@ -147,7 +147,10 @@ pub(super) fn expand_iperf_udp(x: &mut Expansion<'_>, route: &Route<'_>) {
                 offered_per_stream_mbps,
             };
             if let Some(msg) = unreachable_target_notice(
+                &spec.name,
                 &leg_label,
+                s,
+                d,
                 n,
                 target,
                 offered_per_stream_mbps,
@@ -208,8 +211,12 @@ pub(super) fn expand_iperf_udp(x: &mut Expansion<'_>, route: &Route<'_>) {
 /// 一轮 180s 预设的 UDP 单元会**全部**这样跑完再报「无法
 /// 评价」，而拿到的原因码指向采样窗口，不指向真因。
 /// 公式复用执行端那一份，不在这里重写。
+#[allow(clippy::too_many_arguments)]
 fn unreachable_target_notice(
+    spec_name: &str,
     leg_label: &str,
+    sender: &Endpoint,
+    receiver: &Endpoint,
     n: u32,
     target: Option<f64>,
     offered_per_stream_mbps: Option<f64>,
@@ -231,12 +238,13 @@ fn unreachable_target_notice(
         return None;
     };
     Some(format!(
-        "{} UDP {n} 条流 × {per_stream:.0}Mbps 灌不到 {target:.0}Mbps 门限\
+        "{spec_name} {leg_label}：{} -> {} {n} 条流 × {per_stream:.0}Mbps 灌不到 {target:.0}Mbps 门限\
          （含 {:.0}% 余量至少要 {required} 条并发流）。\
          按当前配置这一腿的有效判定窗口永远形不成，结果会稳定落在\
          「无法评价 / EFFECTIVE_WINDOW_SHORT」。把流数提到 {required}、\
          调大每流 -b，或把门限降到 {:.0}Mbps 以下。",
-        leg_label,
+        sender.nic.name,
+        receiver.nic.name,
         rate_check.offered_headroom_pct.max(0.0),
         per_stream * n as f64 / (1.0 + rate_check.offered_headroom_pct.max(0.0) / 100.0),
     ))
