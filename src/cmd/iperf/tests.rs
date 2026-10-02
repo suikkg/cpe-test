@@ -155,7 +155,7 @@ use crate::protocol::{
     IperfClientOut, IperfClientReq, IperfClientStartReq, IperfClientStatusOut, IperfEventKind,
     IperfFlowEvent, IperfServerStartReq,
 };
-use crate::util::{CmdOut, ProcessExecutor, ProcessSpec};
+use crate::util::{BoundedOutput, CmdOut, OutputLimit, ProcessExecutor, ProcessSpec};
 use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::AtomicUsize;
@@ -168,6 +168,7 @@ struct FakeProcessExecutor {
     forceflush: bool,
     lines: Vec<String>,
     stream_out: Mutex<Option<CmdOut>>,
+    streamed_specs: Mutex<Vec<ProcessSpec>>,
 }
 
 impl FakeProcessExecutor {
@@ -176,6 +177,7 @@ impl FakeProcessExecutor {
             forceflush,
             lines,
             stream_out: Mutex::new(Some(stream_out)),
+            streamed_specs: Mutex::new(Vec::new()),
         }
     }
 }
@@ -191,11 +193,12 @@ impl ProcessExecutor for FakeProcessExecutor {
 
     fn run_streaming(
         &self,
-        _spec: &ProcessSpec,
+        spec: &ProcessSpec,
         _timeout: Duration,
         _cancel: Option<&AtomicBool>,
         on_line: &mut dyn FnMut(&str, Instant),
     ) -> CmdOut {
+        self.streamed_specs.lock().unwrap().push(spec.clone());
         let started = Instant::now();
         for (index, line) in self.lines.iter().enumerate() {
             on_line(line, started + Duration::from_millis(index as u64));
@@ -638,7 +641,7 @@ fn register_test_server(mgr: &IperfServerMgr, req: &IperfServerStartReq, child: 
         SrvEntry {
             child,
             watchdog: None,
-            output: Arc::new(Mutex::new(Vec::new())),
+            output: Arc::new(Mutex::new(BoundedOutput::new(Some(OUTPUT_LIMIT)))),
             readers: Vec::new(),
             started: Instant::now(),
             expires_at: lease_deadline(req.lease_secs).unwrap(),
@@ -688,7 +691,7 @@ fn server_stop_confirms_process_exit_and_releases_port() {
         SrvEntry {
             child,
             watchdog: None,
-            output: Arc::new(Mutex::new(Vec::new())),
+            output: Arc::new(Mutex::new(BoundedOutput::new(Some(OUTPUT_LIMIT)))),
             readers: Vec::new(),
             started: Instant::now(),
             expires_at: lease_deadline(60).unwrap(),
@@ -1306,4 +1309,70 @@ fn client_worker_panic_still_notifies_and_can_be_reaped() {
         .unwrap();
     let stopped = mgr.stop_checked(&id, Duration::from_secs(2)).unwrap();
     assert!(stopped.terminated);
+}
+
+/// client 流式执行时带着输出上限：不带的话 `-P 32` 跑到 9 小时左右，一份输出就
+/// 超过主控读响应的上限，结果读不回来（见 `OUTPUT_LIMIT`）。
+#[test]
+fn the_client_streams_iperf_with_the_bounded_output_limit() {
+    let executor = FakeProcessExecutor::new(
+        false,
+        vec!["[  5]   0.00-1.00   sec   283 MBytes  2372 Mbits/sec".into()],
+        CmdOut {
+            ok: true,
+            stdout: TCP_SAMPLE.into(),
+            ..Default::default()
+        },
+    );
+    let req = IperfClientReq {
+        dst: "192.168.1.3".into(),
+        bind_ip: "192.168.1.2".into(),
+        port: 56000,
+        duration: 10,
+        ..Default::default()
+    };
+    let out = run_client_controlled_inner(&executor, false, "iperf3", &req, None, |_| {}, |_| {});
+    assert!(out.ok, "{}", out.output);
+    let specs = executor.streamed_specs.lock().unwrap();
+    assert_eq!(specs.len(), 1);
+    assert_eq!(specs[0].stdout_limit, Some(OUTPUT_LIMIT));
+}
+
+/// 封顶只省略中间的逐秒行：判定读的汇总行在末尾，省略后解析结果与完整文本逐项相同。
+#[test]
+fn a_bounded_iperf_output_still_yields_the_same_summary() {
+    let limit = OutputLimit {
+        head_bytes: 512,
+        tail_bytes: 2048,
+    };
+    for sample in [TCP_RETR_SUM_SAMPLE, UDP_SAMPLE] {
+        let (head, summary) = sample
+            .split_once("- - - - - - - - - - - - - - - - - - - - - - - - -")
+            .expect("样本里有汇总分隔线");
+        let mut full = head.to_string();
+        for second in 0..50_000 {
+            full.push_str(&format!(
+                "[  5] {second:>5}.00-{:>5}.00 sec   112 MBytes   940 Mbits/sec\n",
+                second + 1
+            ));
+        }
+        full.push_str("- - - - - - - - - - - - - - - - - - - - - - - - -");
+        full.push_str(summary);
+
+        let mut bounded = BoundedOutput::new(Some(limit));
+        for line in full.split_inclusive('\n') {
+            bounded.push(line);
+        }
+        let rendered = bounded.render();
+        assert!(rendered.len() < limit.head_bytes + limit.tail_bytes + 200);
+        assert!(rendered.contains("中间省略"), "{rendered}");
+
+        let (whole, kept) = (parse_output(&full), parse_output(&rendered));
+        assert_eq!(kept.sender_mbps, whole.sender_mbps);
+        assert_eq!(kept.receiver_mbps, whole.receiver_mbps);
+        assert_eq!(kept.tcp_retransmits, whole.tcp_retransmits);
+        assert_eq!(kept.udp_lost_datagrams, whole.udp_lost_datagrams);
+        assert_eq!(kept.udp_total_datagrams, whole.udp_total_datagrams);
+        assert!(kept.receiver_mbps.is_some());
+    }
 }

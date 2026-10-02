@@ -3,11 +3,12 @@
 use super::args::{cmdline, server_args};
 use super::{
     lease_deadline, lifecycle_lock_index, lock_recover, validate_lifecycle_id,
-    LifecycleCleanupResult, LIFECYCLE_LOCK_STRIPES, LIFECYCLE_TOMBSTONE_TTL,
+    LifecycleCleanupResult, LIFECYCLE_LOCK_STRIPES, LIFECYCLE_TOMBSTONE_TTL, OUTPUT_LIMIT,
 };
 use crate::protocol::{IperfServerStartReq, IperfServerStopOut};
 use crate::util::{
-    configure_managed_command, decode_bytes, spawn_managed_watchdog, ManagedChildWatchdog,
+    configure_managed_command, decode_bytes, spawn_managed_watchdog, BoundedOutput,
+    ManagedChildWatchdog,
 };
 use std::collections::HashMap;
 use std::io::BufReader;
@@ -25,7 +26,7 @@ pub(super) struct SrvEntry {
     pub(super) child: Child,
     pub(super) watchdog: Option<ManagedChildWatchdog>,
     /// 收集到的输出（reader thread 写入）
-    pub(super) output: Arc<Mutex<Vec<u8>>>,
+    pub(super) output: Arc<Mutex<BoundedOutput>>,
     pub(super) readers: Vec<std::thread::JoinHandle<()>>,
     pub(super) started: Instant,
     pub(super) expires_at: Option<Instant>,
@@ -229,7 +230,7 @@ impl IperfServerMgr {
             }
         };
 
-        let output_arc: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let output_arc = Arc::new(Mutex::new(BoundedOutput::new(Some(OUTPUT_LIMIT))));
         {
             let mut g = lock_recover(&self.inner);
             g.insert(
@@ -272,7 +273,7 @@ impl IperfServerMgr {
                         let mut line = Vec::new();
                         match std::io::BufRead::read_until(&mut reader, b'\n', &mut line) {
                             Ok(0) | Err(_) => break,
-                            Ok(_) => lock_recover(&stdout_output).extend_from_slice(&line),
+                            Ok(_) => lock_recover(&stdout_output).push(&decode_bytes(&line)),
                         }
                     }
                 })
@@ -293,11 +294,8 @@ impl IperfServerMgr {
                         let mut line = Vec::new();
                         match std::io::BufRead::read_until(&mut reader, b'\n', &mut line) {
                             Ok(0) | Err(_) => break,
-                            Ok(_) => {
-                                let mut output = lock_recover(&stderr_output);
-                                output.extend_from_slice(b"[stderr] ");
-                                output.extend_from_slice(&line);
-                            }
+                            Ok(_) => lock_recover(&stderr_output)
+                                .push(&format!("[stderr] {}", decode_bytes(&line))),
                         }
                     }
                 })
@@ -656,8 +654,8 @@ fn finish_server_output(entry: &mut SrvEntry) -> String {
     for reader in entry.readers.drain(..) {
         let _ = reader.join();
     }
-    let output = lock_recover(&entry.output).clone();
-    format!("$ {}\n{}", entry.cmd, decode_bytes(&output))
+    let output = lock_recover(&entry.output).render();
+    format!("$ {}\n{}", entry.cmd, output)
 }
 
 fn server_probe_addresses(bind_ip: &str, port: u16) -> Result<Vec<SocketAddr>, String> {

@@ -14,6 +14,7 @@
 //!
 //! 本文件只留 server 与作业两套注册表共用的生命周期工具。
 
+use crate::util::OutputLimit;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::{Mutex, MutexGuard};
@@ -35,6 +36,25 @@ pub use client::{run_client, run_client_controlled};
 pub use jobs::IperfClientJobMgr;
 pub use parse::{parse_output, IperfParsed};
 pub use server::IperfServerMgr;
+
+/// iperf3 client / server 的文本输出各自最多保留多少（开头 + 结尾，中间按行省略）。
+///
+/// `-i 1` 每秒每流一行，`-P 32` 每秒 33 行、约 3KB。不设上限时跑到 9 小时左右，
+/// 一份输出就超过主控读响应的 `http_client::MAX_RESPONSE_BYTES`：server 停止与
+/// client 结果的响应读不回来，被当成「停止未确认」；而长时长单元本来就是测热衰减的
+/// 预期用法。保住的是首尾——判定只读末尾的汇总行，开头是连接信息；中间的逐秒行
+/// 在 client 一侧另有流事件逐条记录（判定窗口用的就是它），server 一侧只作排障参考。
+/// 结尾 8 MiB 能原样留下 `-P 32` 约 45 分钟、单流约 24 小时的逐秒输出。
+pub(crate) const OUTPUT_LIMIT: OutputLimit = OutputLimit {
+    head_bytes: 256 * 1024,
+    tail_bytes: 8 * 1024 * 1024,
+};
+
+// client 最多三次尝试的输出拼在同一份结果里，仍要远小于响应上限。
+const _: () = assert!(
+    3 * (OUTPUT_LIMIT.head_bytes + OUTPUT_LIMIT.tail_bytes)
+        < crate::http_client::MAX_RESPONSE_BYTES / 2
+);
 
 const LIFECYCLE_TOMBSTONE_TTL: Duration = Duration::from_secs(10 * 60);
 const LIFECYCLE_LOCK_STRIPES: usize = 64;

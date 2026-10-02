@@ -130,13 +130,14 @@ impl ProcessExecutor for Executor<'_> {
             closed: false,
         };
         let script = client_script(spec, &lease.dir, timeout.as_secs().saturating_add(5));
-        let mut out = crate::util::run_streaming_controlled_timed(
-            &self.adb.program,
+        // 上限跟着调用方给的规格走（板侧 iperf client 与本机 client 同一个上限）。
+        let adb = ProcessSpec::new(
+            self.adb.program.clone(),
             &["-s", &self.adb.serial, "shell", &script],
-            timeout,
-            cancel,
-            on_line,
-        );
+        )
+        .with_stdout_limit(spec.stdout_limit);
+        let mut out =
+            crate::util::SystemProcessExecutor.run_streaming(&adb, timeout, cancel, on_line);
         // ADB 进程退出码不能代表老板侧 shell 的命令退出码。
         match adb::parse_shell_output(&out.stdout) {
             Ok(text) => out.stdout = text,

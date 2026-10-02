@@ -2,8 +2,9 @@
 
 use super::args::{client_args, cmdline, supports_forceflush, supports_forceflush_with};
 use super::parse::classify_live_line;
+use super::OUTPUT_LIMIT;
 use crate::protocol::{IperfClientOut, IperfClientReq, IperfEventKind, IperfFlowEvent};
-use crate::util::{run_streaming_controlled_timed_with, ProcessExecutor, SystemProcessExecutor};
+use crate::util::{ProcessExecutor, ProcessSpec, SystemProcessExecutor};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -112,24 +113,18 @@ where
         output: String::new(),
     };
     let mut attempt_history = Vec::new();
+    let spec = ProcessSpec::new(bin, &args_ref).with_stdout_limit(Some(OUTPUT_LIMIT));
     for attempt in 1..=CLIENT_RETRIES {
-        let out = run_streaming_controlled_timed_with(
-            executor,
-            bin,
-            &args_ref,
-            timeout,
-            cancel,
-            |line, observed_at| {
-                on_line(line);
-                let elapsed_ms = observed_at
-                    .saturating_duration_since(started)
-                    .as_millis()
-                    .min(u64::MAX as u128) as u64;
-                if let Some(event) = classify_live_line(line, elapsed_ms) {
-                    on_event(event);
-                }
-            },
-        );
+        let out = executor.run_streaming(&spec, timeout, cancel, &mut |line, observed_at| {
+            on_line(line);
+            let elapsed_ms = observed_at
+                .saturating_duration_since(started)
+                .as_millis()
+                .min(u64::MAX as u128) as u64;
+            if let Some(event) = classify_live_line(line, elapsed_ms) {
+                on_event(event);
+            }
+        });
         let merged = out.merged();
         append_attempt_output(&mut attempt_history, attempt, &merged);
         last = IperfClientOut {

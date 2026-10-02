@@ -213,6 +213,8 @@ impl CmdOut {
 pub struct ProcessSpec {
     pub program: String,
     pub args: Vec<String>,
+    /// 流式执行时 stdout 最多保留多少；`None` 为全部保留。
+    pub stdout_limit: Option<OutputLimit>,
 }
 
 impl ProcessSpec {
@@ -220,7 +222,81 @@ impl ProcessSpec {
         Self {
             program: program.into(),
             args: args.iter().map(|arg| (*arg).to_string()).collect(),
+            stdout_limit: None,
         }
+    }
+
+    pub fn with_stdout_limit(mut self, limit: Option<OutputLimit>) -> Self {
+        self.stdout_limit = limit;
+        self
+    }
+}
+
+/// 子进程输出的保留上限：开头留 `head_bytes`、结尾留 `tail_bytes`，中间按整行省略。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputLimit {
+    pub head_bytes: usize,
+    pub tail_bytes: usize,
+}
+
+/// 按行收集子进程输出；超过 `OutputLimit` 时只留开头与结尾，并写明中间省略了多少。
+///
+/// 不设上限时与直接拼接逐字相同。结尾按整行保留，至少留最后一行——汇总行、
+/// 完成标记这类必须读到的东西都在最后。
+#[derive(Debug, Default)]
+pub struct BoundedOutput {
+    limit: Option<OutputLimit>,
+    head: String,
+    tail: VecDeque<String>,
+    tail_bytes: usize,
+    elided_lines: u64,
+    elided_bytes: u64,
+}
+
+impl BoundedOutput {
+    pub fn new(limit: Option<OutputLimit>) -> Self {
+        Self {
+            limit,
+            ..Self::default()
+        }
+    }
+
+    pub fn push(&mut self, chunk: &str) {
+        let Some(limit) = self.limit else {
+            self.head.push_str(chunk);
+            return;
+        };
+        if self.tail.is_empty() && self.head.len() + chunk.len() <= limit.head_bytes {
+            self.head.push_str(chunk);
+            return;
+        }
+        self.tail_bytes += chunk.len();
+        self.tail.push_back(chunk.to_string());
+        while self.tail_bytes > limit.tail_bytes && self.tail.len() > 1 {
+            if let Some(dropped) = self.tail.pop_front() {
+                self.tail_bytes -= dropped.len();
+                self.elided_lines += 1;
+                self.elided_bytes += dropped.len() as u64;
+            }
+        }
+    }
+
+    pub fn render(&self) -> String {
+        let mut out = String::with_capacity(self.head.len() + self.tail_bytes + 64);
+        out.push_str(&self.head);
+        if self.elided_lines > 0 {
+            if !out.is_empty() && !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str(&format!(
+                "……（输出过长，中间省略 {} 行、{} 字节）……\n",
+                self.elided_lines, self.elided_bytes
+            ));
+        }
+        for line in &self.tail {
+            out.push_str(line);
+        }
+        out
     }
 }
 
@@ -257,7 +333,14 @@ impl ProcessExecutor for SystemProcessExecutor {
         on_line: &mut dyn FnMut(&str, Instant),
     ) -> CmdOut {
         let args: Vec<&str> = spec.args.iter().map(String::as_str).collect();
-        run_streaming_system(&spec.program, &args, timeout, cancel, on_line)
+        run_streaming_system(
+            &spec.program,
+            &args,
+            timeout,
+            cancel,
+            spec.stdout_limit,
+            on_line,
+        )
     }
 }
 
@@ -456,6 +539,7 @@ fn run_streaming_system<F: FnMut(&str, Instant)>(
     args: &[&str],
     timeout: Duration,
     cancel: Option<&AtomicBool>,
+    stdout_limit: Option<OutputLimit>,
     mut on_line: F,
 ) -> CmdOut {
     let Some(deadline) = Instant::now().checked_add(timeout) else {
@@ -564,7 +648,7 @@ fn run_streaming_system<F: FnMut(&str, Instant)>(
         }
     };
 
-    let mut collected = String::new();
+    let mut collected = BoundedOutput::new(stdout_limit);
     let mut timed_out = false;
     let mut cancelled = false;
     let mut callback_panic = None;
@@ -605,7 +689,7 @@ fn run_streaming_system<F: FnMut(&str, Instant)>(
         match rx.recv_timeout(wait) {
             Ok((bytes, observed_at)) => {
                 let s = decode_bytes(&bytes);
-                collected.push_str(&s);
+                collected.push(&s);
                 if let Err(payload) =
                     catch_unwind(AssertUnwindSafe(|| on_line(s.trim_end(), observed_at)))
                 {
@@ -672,7 +756,7 @@ fn run_streaming_system<F: FnMut(&str, Instant)>(
     // reader 退出后 channel 不再产生新数据，此时排空才不会漏掉最后几行。
     while let Ok((bytes, observed_at)) = rx.try_recv() {
         let s = decode_bytes(&bytes);
-        collected.push_str(&s);
+        collected.push(&s);
         if callback_panic.is_none() {
             if let Err(payload) =
                 catch_unwind(AssertUnwindSafe(|| on_line(s.trim_end(), observed_at)))
@@ -696,7 +780,7 @@ fn run_streaming_system<F: FnMut(&str, Instant)>(
         ok,
         timed_out,
         cancelled,
-        stdout: collected,
+        stdout: collected.render(),
         stderr,
     }
 }
@@ -1415,5 +1499,42 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         let _ = std::fs::remove_file(marker);
+    }
+
+    #[test]
+    fn unbounded_output_is_the_plain_concatenation() {
+        let mut output = BoundedOutput::new(None);
+        for line in ["a\n", "b\n", "c"] {
+            output.push(line);
+        }
+        assert_eq!(output.render(), "a\nb\nc");
+    }
+
+    #[test]
+    fn bounded_output_keeps_both_ends_and_says_what_it_dropped() {
+        let mut output = BoundedOutput::new(Some(OutputLimit {
+            head_bytes: 6,
+            tail_bytes: 6,
+        }));
+        for line in ["h1\n", "h2\n", "m1\n", "m2\n", "m3\n", "t1\n", "t2\n"] {
+            output.push(line);
+        }
+        assert_eq!(
+            output.render(),
+            "h1\nh2\n……（输出过长，中间省略 3 行、9 字节）……\nt1\nt2\n"
+        );
+    }
+
+    #[test]
+    fn bounded_output_never_drops_the_last_line() {
+        let mut output = BoundedOutput::new(Some(OutputLimit {
+            head_bytes: 0,
+            tail_bytes: 4,
+        }));
+        output.push("first\n");
+        output.push("a final summary line longer than the tail budget");
+        let rendered = output.render();
+        assert!(rendered.ends_with("a final summary line longer than the tail budget"));
+        assert!(rendered.contains("中间省略 1 行、6 字节"), "{rendered}");
     }
 }
