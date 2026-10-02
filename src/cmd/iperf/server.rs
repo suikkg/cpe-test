@@ -697,7 +697,7 @@ fn server_probe_addresses(bind_ip: &str, port: u16) -> Result<Vec<SocketAddr>, S
 }
 
 /// TCP connect 探测 iperf3 server 是否已就绪（兼容 IPv4 / IPv6，跨平台）
-fn wait_server_tcp_ready<F>(
+pub(super) fn wait_server_tcp_ready<F>(
     bind_ip: String,
     port: u16,
     timeout: StdDuration,
@@ -709,17 +709,17 @@ where
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         confirm_child_running()?;
+        // 绑定地址解析出几个就探几个，任何一个连得上就算就绪。原先注释写「取第一个」、
+        // 代码取的却是最后一个；IP 字面量只解析出一个地址，两者一样，主机名才会不同。
         let addrs = server_probe_addresses(&bind_ip, port)?;
-        // 取第一个可用的地址
-        if let Some(sa) = addrs.last() {
-            match TcpStream::connect_timeout(sa, StdDuration::from_secs(1)) {
-                Ok(_) => return Ok(()),
-                Err(_e) => {
-                    // ConnectionRefused 正常（server 还没好）
-                    std::thread::sleep(StdDuration::from_millis(200));
-                }
-            }
+        if addrs
+            .iter()
+            .any(|address| TcpStream::connect_timeout(address, StdDuration::from_secs(1)).is_ok())
+        {
+            return Ok(());
         }
+        // ConnectionRefused 正常（server 还没好）
+        std::thread::sleep(StdDuration::from_millis(200));
     }
     Err(format!(
         "iperf3 server 端口 {port} 在 {:.1} 秒内未响应 TCP connect",

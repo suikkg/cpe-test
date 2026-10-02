@@ -74,26 +74,7 @@ pub fn parse_output(text: &str) -> IperfParsed {
         let mut last: Option<f64> = None;
         for cap in rate_re.captures_iter(&line) {
             let num: f64 = cap[1].replace(',', ".").parse().unwrap_or(0.0);
-            let unit = &cap[2];
-            let kind = &cap[3];
-            // iperf3 的两套单位不是同一个进制：bit 单位（Kbits/Mbits/Gbits）
-            // 按 1000 进位，Byte 单位（KBytes/MBytes/GBytes）按 1024 进位。
-            // 实测：一条 100 Mbits/sec 的流，`-f M` 打印成 11.9 MBytes/sec
-            // （100e6/8/1048576 = 11.92）。两边都按 1000 算的话，
-            // M 档要低报 4.6%、G 档低报 7.0%——这个量级恰好像测量噪声，
-            // 不会触发任何断言，却会让工具自报速率和网卡口径互相矛盾。
-            let scale = if kind == "Bytes" { 1024.0 } else { 1000.0 };
-            let mut mbps = match unit {
-                "K" => num * scale / 1_000_000.0,
-                "M" => num * scale * scale / 1_000_000.0,
-                "G" => num * scale * scale * scale / 1_000_000.0,
-                "T" => num * scale * scale * scale * scale / 1_000_000.0,
-                _ => num / 1_000_000.0,
-            };
-            if kind == "Bytes" {
-                mbps *= 8.0;
-            }
-            last = Some(mbps);
+            last = Some(rate_mbps(num, &cap[2], &cap[3]));
         }
         // 多流时 `[SUM]` 行排在各流之后，多次 attempt 时后一次排在前一次之后，
         // 「后出现的覆盖前面的」因此与速率、丢包两处的取值规则完全一致。
@@ -133,6 +114,32 @@ pub fn parse_output(text: &str) -> IperfParsed {
     p
 }
 
+/// iperf3 打印的一个速率（数值、量级前缀、`bits` / `Bytes`）换算成 Mbps。
+///
+/// 两套单位不是同一个进制：bit 单位（Kbits/Mbits/Gbits）按 1000 进位，Byte 单位
+/// （KBytes/MBytes/GBytes）按 1024 进位。实测：一条 100 Mbits/sec 的流，`-f M`
+/// 打印成 11.9 MBytes/sec（100e6/8/1048576 = 11.92）。两边都按 1000 算的话，
+/// M 档要低报 4.6%、G 档低报 7.0%——这个量级恰好像测量噪声，不会触发任何断言，
+/// 却会让工具自报速率和网卡口径互相矛盾。
+///
+/// 汇总解析（`parse_output`）与逐行实时事件（`live_rate`）共用这一份：实时那份
+/// 以前按 1000 进位算 Byte 单位，同一行文本在两处换算出不同的速率。
+fn rate_mbps(num: f64, unit: &str, kind: &str) -> f64 {
+    let scale = if kind == "Bytes" { 1024.0 } else { 1000.0 };
+    let mbps = match unit {
+        "K" => num * scale / 1_000_000.0,
+        "M" => num * scale * scale / 1_000_000.0,
+        "G" => num * scale * scale * scale / 1_000_000.0,
+        "T" => num * scale * scale * scale * scale / 1_000_000.0,
+        _ => num / 1_000_000.0,
+    };
+    if kind == "Bytes" {
+        mbps * 8.0
+    } else {
+        mbps
+    }
+}
+
 fn live_rate(line: &str) -> Option<f64> {
     static RATE_RE: OnceLock<Regex> = OnceLock::new();
     let re = RATE_RE.get_or_init(|| {
@@ -140,17 +147,7 @@ fn live_rate(line: &str) -> Option<f64> {
     });
     let cap = re.captures_iter(line).last()?;
     let num: f64 = cap[1].replace(',', ".").parse().ok()?;
-    let mut mbps = match &cap[2] {
-        "K" => num / 1000.0,
-        "M" => num,
-        "G" => num * 1000.0,
-        "T" => num * 1_000_000.0,
-        _ => num / 1_000_000.0,
-    };
-    if &cap[3] == "Bytes" {
-        mbps *= 8.0;
-    }
-    Some(mbps)
+    Some(rate_mbps(num, &cap[2], &cap[3]))
 }
 
 pub(super) fn classify_live_line(line: &str, elapsed_ms: u64) -> Option<IperfFlowEvent> {

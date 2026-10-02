@@ -1376,3 +1376,50 @@ fn a_bounded_iperf_output_still_yields_the_same_summary() {
         assert!(kept.receiver_mbps.is_some());
     }
 }
+
+/// 实时事件与汇总解析对同一行文本换算出同一个速率。
+///
+/// 实时那份以前按 1000 进位算 Byte 单位：`11.9 MBytes/sec` 在汇总里约 100 Mbps、
+/// 在流事件里只有 95.2 Mbps，进度页和报告的工具自报速率对不上。
+#[test]
+fn live_events_and_the_summary_convert_rates_identically() {
+    for line in [
+        "[  5]   1.00-2.00   sec  11.9 MBytes  11.9 MBytes/sec",
+        "[  5]   1.00-2.00   sec  1.09 GBytes  9.35 Gbits/sec",
+        "[  5]   1.00-2.00   sec   112 MBytes   940 Mbits/sec",
+        "[  5]   1.00-2.00   sec  1.20 MBytes  9600 Kbits/sec",
+    ] {
+        let live = classify_live_line(line, 0)
+            .and_then(|event| event.mbps)
+            .expect(line);
+        let summary = parse_output(line).last_mbps.expect(line);
+        assert_eq!(live, summary, "{line}");
+    }
+}
+
+/// 就绪探测：有人监听就立刻返回；没人监听时按给定时限报超时，不提前误报、也不卡住。
+#[test]
+fn server_readiness_probe_succeeds_on_a_listener_and_times_out_without_one() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    let started = Instant::now();
+    wait_server_tcp_ready("127.0.0.1".into(), port, Duration::from_secs(5), || Ok(()))
+        .expect("有监听时应当就绪");
+    assert!(started.elapsed() < Duration::from_secs(2));
+
+    drop(listener);
+    let started = Instant::now();
+    let error = wait_server_tcp_ready("127.0.0.1".into(), port, Duration::from_millis(600), || {
+        Ok(())
+    })
+    .expect_err("没人监听时必须超时");
+    assert!(error.contains("未响应 TCP connect"), "{error}");
+    assert!(started.elapsed() >= Duration::from_millis(600));
+
+    // 子进程先退出时立刻把原因交回去，不等满时限。
+    let error = wait_server_tcp_ready("127.0.0.1".into(), port, Duration::from_secs(5), || {
+        Err("server 已退出".into())
+    })
+    .expect_err("子进程退出必须立刻报错");
+    assert_eq!(error, "server 已退出");
+}

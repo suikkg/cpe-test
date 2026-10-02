@@ -475,9 +475,9 @@ Windows 文本适配器：`src/cmd/ipconfig.rs` 解析中英文 `ipconfig /all`�
 并 `pub use` 外部用到的符号；实现按职责分在 `src/cmd/iperf/`，外部路径仍是 `crate::cmd::iperf::*`：
 
 - `args`：server/client 参数构造；TCP 用 `-P`，UDP 用 `-u` 加额外 `-b/-l`；`extra` 不许覆盖的受控参数（`RESERVED_CLIENT_FLAGS`）。
-- `parse`：`IperfParsed` 和最佳 sender/receiver/measurement 判定；文本速率、Bytes/bits、单位换算和 UDP 丢包解析；运行中逐行的实时事件（`classify_live_line`）。
+- `parse`：`IperfParsed` 和最佳 sender/receiver/measurement 判定；文本速率、Bytes/bits、单位换算和 UDP 丢包解析；运行中逐行的实时事件（`classify_live_line`）。汇总与实时两处共用 `rate_mbps` 一份单位换算（bit 按 1000、Byte 按 1024 进位）。
 - `server`：`IperfServerMgr`。不带 request_id 的旧协议同端口先停旧 server，带 request_id 的按 request/owner 幂等；后台收集 stdout/stderr，TCP connect 探测 ready，主动 stop/kill，sweep/stop_all。
-- 就绪探测（`server`）：IPv6 zone 解析成 scope id（数字索引，或 unix 上按接口名查），每轮重新解析地址，connect 超时 1 秒、失败后 200ms 再试，总超时 15 秒；Windows 不带 zone 的 link-local 只等 300ms 并确认进程存活。
+- 就绪探测（`server`）：IPv6 zone 解析成 scope id（数字索引，或 unix 上按接口名查），每轮重新解析地址并逐个尝试全部解析结果（任一连上即就绪），connect 超时 1 秒、都失败后 200ms 再试，总超时 15 秒；Windows 不带 zone 的 link-local 只等 300ms 并确认进程存活。
 - `client`：瞬态错误和重试，最多 3 次，单次总超时为 duration+120 秒，保留实时输出和 stderr；事件时间轴对齐（`align_event_to_epoch`）。
 - `jobs`：`IperfClientJobMgr`，异步 client 作业（`/iperf/client/start` 立即返回 job id）、租约、tombstone、owner 清理；CTS 经 `start_external_request` 复用同一套。
 - 文本输出上限 `iperf::OUTPUT_LIMIT`：client（经 `ProcessSpec::stdout_limit`，内环 ADB 执行器同样转发）与 server 各自只留开头与结尾、中间按行省略（`util::BoundedOutput`）。判定只读末尾汇总行；不封顶时 `-P 32` 约 9 小时就超过主控读响应的 `http_client::MAX_RESPONSE_BYTES`，server 停止 / client 结果读不回来。「三次尝试之和小于响应上限的一半」是编译期断言。ctsTraffic 的输出解析要扫全部状态行，不封顶。
