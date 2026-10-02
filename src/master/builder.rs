@@ -1000,22 +1000,13 @@ impl Expansion<'_> {
         }
     }
 
-    /// 门限来自协商速率百分比时，把算式说出来（见 `policy::note_rx_target`）。
-    /// 两条 iperf 路径调用它；ctsTraffic 的两条路径不调用。
-    fn note_rx_target(&mut self, spec_name: &str, policy: &rate::LinkPolicy) {
-        note_rx_target(
-            &mut self.notices,
-            &mut self.rx_target_notes,
-            spec_name,
-            policy,
-        );
-    }
-
     /// 一条腿的判定模式与门限。
     ///
-    /// 四种吞吐后端共用这一段：按 `leg_rate_plan` 定门限，把「最终门限为什么不是
-    /// 配置里那个」作为提示说出来，再给预览补一行最终生效的门限。它以前在
-    /// `build_units` 里逐字抄了四份，改一份漏三份，四种后端就各说各的门限。
+    /// 四种吞吐后端共用这一段：门限来自协商速率百分比时先把算式说出来，按
+    /// `leg_rate_plan` 定门限，把「最终门限为什么不是配置里那个」作为提示说出来，
+    /// 再给预览补一行最终生效的门限。它以前在 `build_units` 里逐字抄了四份，
+    /// 改一份漏三份：ctsTraffic 那两份就漏了算式提示，同一个按百分比得出的门限，
+    /// iperf 单元说得出来历、CTS 单元说不出。
     fn leg_rate(
         &mut self,
         route: &Route<'_>,
@@ -1025,6 +1016,12 @@ impl Expansion<'_> {
         dst: &Endpoint,
         target_lines: &mut Vec<String>,
     ) -> (RateMode, Option<f64>) {
+        note_rx_target(
+            &mut self.notices,
+            &mut self.rx_target_notes,
+            &route.spec.name,
+            policy,
+        );
         let plan = leg_rate_plan(
             route.spec,
             policy,

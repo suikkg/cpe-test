@@ -3973,3 +3973,47 @@ fn unrecognised_axis_values_are_reported_instead_of_silently_dropped() {
         "{notices:?}"
     );
 }
+
+/// 门限按协商速率百分比换算时，四种吞吐后端都要把算式说出来。
+///
+/// 这段提示以前只在两条 iperf 路径上调用：同一个 `rx_target_percent`，iperf 单元
+/// 的计划提示里写着「2500Mbps × 80% = 2000Mbps」，CTS 单元按同一个 2000 判定，却
+/// 一句来历都没有——Wi-Fi 重新协商后门限变了，只配了 CTS 的人看不出为什么。
+#[test]
+fn a_percentage_derived_target_is_explained_for_every_traffic_backend() {
+    for (kind, transport) in [
+        ("iperf", "tcp"),
+        ("iperf", "udp"),
+        ("ctstraffic", "tcp"),
+        ("ctstraffic", "udp"),
+    ] {
+        let mut spec = base_spec();
+        spec.kinds = vec![kind.into()];
+        spec.transports = vec![transport.into()];
+        spec.link_profiles = LinkProfiles {
+            by_role: Vec::new(),
+            by_nic: vec![NicProfile {
+                host: "agent".into(),
+                name: "eth0".into(),
+                ipv4: "192.168.1.3".into(),
+                rx_target_percent: Some(80.0),
+                ..Default::default()
+            }],
+        };
+        let mut port = PORT_BASE;
+        let (units, notices) = build_units(&[spec], true, &mut port);
+        assert_eq!(units.len(), 1, "{kind}/{transport}");
+        let target = match &units[0].legs[0].kind {
+            LegKind::IperfSingle(task) => task.rx_target_mbps,
+            LegKind::IperfGroup { streams, .. } => streams[0].rx_target_mbps,
+            LegKind::CtsTraffic(task) => task.rx_target_mbps,
+            LegKind::Ping(_) => None,
+        };
+        assert_eq!(target, Some(2000.0), "{kind}/{transport}");
+        assert_eq!(
+            notices,
+            vec!["t：接收口 eth0 门限按协商速率换算：2500Mbps × 80% = 2000Mbps".to_string()],
+            "{kind}/{transport}"
+        );
+    }
+}

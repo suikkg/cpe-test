@@ -122,7 +122,6 @@ pub(super) fn expand_iperf_udp(x: &mut Expansion<'_>, route: &Route<'_>) {
                 extra.push(w.clone());
             }
             let flow_direction = route.flow_direction(tag);
-            x.note_rx_target(&spec.name, &leg_policy);
             let (effective_mode, target) =
                 x.leg_rate(route, &leg_policy, &flow_direction, s, d, &mut target_lines);
             // offered 必须跟着实际下发的 -b 走，否则

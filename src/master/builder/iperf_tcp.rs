@@ -62,7 +62,6 @@ pub(super) fn expand_iperf_tcp(x: &mut Expansion<'_>, route: &Route<'_>) {
         for (s, d, tag) in pairs {
             let flow_direction = route.flow_direction(tag);
             let leg_policy = link_policy(spec, s, d);
-            x.note_rx_target(&spec.name, &leg_policy);
             let (effective_mode, target) =
                 x.leg_rate(route, &leg_policy, &flow_direction, s, d, &mut target_lines);
             let t = IperfTask {
