@@ -1059,6 +1059,51 @@ pub fn md5_hex(s: &str) -> String {
     format!("{:x}", md5::compute(s.as_bytes()))
 }
 
+/// 生成一枚随机的控制台访问口令。
+///
+/// 用在「没人显式给 `--ui-token` / `CPE_UI_TOKEN`」时：此前这种情况回落到
+/// 公开的出厂默认 `cpetest`，于是同网段任何知道这个工具的人都能打开控制台
+/// （控制台能改配置、发起测试、下载 config）。改成每次启动现生成、随启动地址
+/// 的 `?token=` 一起打印，浏览器照常被 `console::open_url` 自动带着它打开，
+/// 使用上无感，但默认不再有公开口令这个口子。
+///
+/// 熵来自标准库的 [`RandomState`]：它的文档保证「以随机密钥初始化」——这正是
+/// `HashMap` 抗 HashDoS 的前提，必须是真随机，不是实现细节。各平台下它读的是
+/// 操作系统的 CSPRNG。我们只取一次 128 位 OS 熵（一个 `RandomState`），再用它
+/// 作密钥对计数器求哈希铺满口令长度，所以不引入任何第三方随机数依赖，也符合
+/// 「单文件、运行期零第三方运行时」。
+///
+/// 字母表去掉了 `0/1/l/o/i` 这些抄起来会混的字符；24 个字符 × 每字符 5 位
+/// = 120 位的取值空间，对一枚局域网口令是用不完的强度。
+pub fn generate_console_token() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+
+    const ALPHABET: &[u8] = b"abcdefghjkmnpqrstuvwxyz23456789";
+    const LEN: usize = 24;
+
+    // 一个 RandomState = 一次 OS 熵抽取（128 位）；下面所有字符都从它派生，
+    // 口令强度取决于这一次抽取，不依赖「每次 new 都重抽」这类未承诺的行为。
+    let state = RandomState::new();
+    let mut token = String::with_capacity(LEN);
+    let mut counter: u64 = 0;
+    while token.len() < LEN {
+        let mut hasher = state.build_hasher();
+        hasher.write_u64(counter);
+        counter += 1;
+        let mut value = hasher.finish();
+        // 64 位里能稳稳取 12 个 5 位片段（60 位），取够就换下一个计数器。
+        for _ in 0..12 {
+            token.push(ALPHABET[(value % ALPHABET.len() as u64) as usize] as char);
+            value /= ALPHABET.len() as u64;
+            if token.len() >= LEN {
+                break;
+            }
+        }
+    }
+    token
+}
+
 /// 临时目录里的文件路径
 #[cfg(target_os = "macos")]
 pub fn temp_file(name: &str) -> std::path::PathBuf {
@@ -1068,6 +1113,23 @@ pub fn temp_file(name: &str) -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 随机口令：长度/字母表稳定，且两次启动不相同（否则「随机」是假的，
+    /// 等于又退回一个固定公开口令）。
+    #[test]
+    fn generated_console_tokens_are_well_formed_and_not_constant() {
+        const ALPHABET: &[u8] = b"abcdefghjkmnpqrstuvwxyz23456789";
+        let a = generate_console_token();
+        assert_eq!(a.len(), 24, "口令长度应固定为 24：{a}");
+        assert!(
+            a.bytes().all(|b| ALPHABET.contains(&b)),
+            "口令只能用无歧义字母表：{a}"
+        );
+        // 现生成多枚，至少有一枚与首枚不同。RandomState 每次 new 读一次 OS 熵，
+        // 全部相等的概率可忽略；若真全相等，说明熵源失效，必须露头。
+        let differs = (0..8).any(|_| generate_console_token() != a);
+        assert!(differs, "多次生成得到了同一枚口令，随机性可能失效");
+    }
 
     enum ScriptedAction {
         Emit {

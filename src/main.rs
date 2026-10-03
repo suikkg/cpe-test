@@ -183,9 +183,15 @@ fn real_main(args: Vec<String>) -> i32 {
                 .unwrap_or(DEFAULT_UI_PORT);
             // token 走命令行会留在 shell 历史和 ps 的命令行列里，同机的别人
             // 看得到，所以两个都支持环境变量。
+            //
+            // 都没给时**现生成一枚随机口令**，不再回落到公开的出厂默认 `cpetest`：
+            // 那个值写在源码、文档和发布包里，等于默认把控制台（能改配置、发起
+            // 测试、下载 config）的口令公开给同网段。随机口令跟着启动地址的
+            // `?token=` 打印、浏览器自动带着打开，使用无感。显式 `--ui-token ""`
+            // 仍是「关闭认证」（只在回环放行，见 webui 启动处的拦截）。
             let ui_token = flag_value(&f, "ui-token")
                 .or_else(|| std::env::var("CPE_UI_TOKEN").ok())
-                .unwrap_or_else(|| config::DEFAULT_TOKEN.to_string());
+                .unwrap_or_else(util::generate_console_token);
             master::webui::run(master::webui::UiOpts {
                 bind: flag_value(&f, "ui-bind").unwrap_or_else(|| "127.0.0.1".into()),
                 port,
@@ -242,8 +248,9 @@ fn real_main(args: Vec<String>) -> i32 {
                     port: DEFAULT_UI_PORT,
                     config_path: None,
                     agent_token: std::env::var("CPE_AGENT_TOKEN").ok(),
+                    // 同上：没给 CPE_UI_TOKEN 就现生成随机口令，不回落公开默认值。
                     ui_token: std::env::var("CPE_UI_TOKEN")
-                        .unwrap_or_else(|_| config::DEFAULT_TOKEN.to_string()),
+                        .unwrap_or_else(|_| util::generate_console_token()),
                 }),
             }
         }
@@ -359,6 +366,7 @@ fn print_help() {
       --ui-bind IP            控制台监听地址 (默认 127.0.0.1；IPv6 直接写 ::1 或 ::)
                               非回环地址必须同时给 --ui-token，否则拒绝启动
       --ui-token SECRET       浏览器打开控制台的口令；也可用 CPE_UI_TOKEN 环境变量
+                              不给时每次启动现生成一枚随机口令，随启动地址打印
   cpe_test agent              辅测机启动常驻服务 (默认端口 28801)
       --port N                指定监听端口
       --token SECRET          共享访问令牌（agent 与主控必须一致；不配置则不启用认证）

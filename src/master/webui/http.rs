@@ -229,6 +229,48 @@ pub(super) fn cookie_token(request: &Request) -> Option<String> {
     })
 }
 
+/// `Host` 头是否安全——挡 DNS 重绑定（DNS rebinding）。
+///
+/// 攻击形状：某个恶意站点把自己的域名解析到受害者的控制台地址（回环或内网 IP），
+/// 等 TTL 过期后让受害者浏览器里的 JS 对「同源」的控制台发请求。浏览器此时发出的
+/// `Host` 头是**攻击者的域名**，而控制台从来只按 IP 访问（启动打印的就是 IP，
+/// `--ui-bind` 收的也是 IP），所以：只放行 IP 字面量和 `localhost`，带 DNS 域名
+/// 的请求一律拒。IP 字面量不经过 DNS，没法被重绑定，所以正常的
+/// `http://<本机IP>:端口` 访问（含从别的电脑连 `0.0.0.0` 绑定）不受影响。
+///
+/// 缺省/空 `Host` 放行：浏览器发 fetch 时必带 `Host` 且是源站域名、JS 改不了它，
+/// 所以重绑定攻击永远带着域名；而命令行等原生客户端可能不带，不该被这道门误伤。
+pub(super) fn host_header_is_safe(request: &Request) -> bool {
+    host_value_is_safe(header_value(request, "Host").as_deref())
+}
+
+/// [`host_header_is_safe`] 的纯函数内核，便于穷举各种 `Host` 写法。
+pub(crate) fn host_value_is_safe(raw: Option<&str>) -> bool {
+    let Some(raw) = raw else {
+        return true;
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return true;
+    }
+    // 去掉端口，兼顾 `[v6]:port`：裸 IPv6 必须带方括号，没括号的多冒号写法
+    // 本就不合法，会在下面的 IP 解析里落空而被拒。
+    let host = if let Some(rest) = raw.strip_prefix('[') {
+        match rest.split_once(']') {
+            Some((inner, _)) => inner,
+            None => return false,
+        }
+    } else {
+        match raw.rsplit_once(':') {
+            Some((h, port)) if !h.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => h,
+            _ => raw,
+        }
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host.parse::<std::net::Ipv4Addr>().is_ok()
+        || host.parse::<std::net::Ipv6Addr>().is_ok()
+}
+
 /// 自定义头会让跨站 fetch 先触发 CORS 预检；本服务不开放 CORS，因此网页不能
 /// 趁用户开着本地控制台时从别的站点静默发起测试。原生程序仍可显式带头调用。
 pub(super) fn has_console_request_header(request: &Request) -> bool {
@@ -361,6 +403,16 @@ pub(super) fn handle(mut request: Request, console: &Arc<Console>) {
         .map(|(_, q)| q.to_string())
         .unwrap_or_default();
     let trusted_post = *request.method() != Method::Post || has_console_request_header(&request);
+    // DNS 重绑定这道门排在鉴权之前，但它只会**拒绝**、永远不授予访问——
+    // 带域名的请求在这里就被挡掉，不进任何 handler、不碰口令，所以它不违反
+    // 「鉴权先于路由」那条铁律（那条防的是「未认证却被放行」，方向相反）。
+    if !host_header_is_safe(&request) {
+        let body = crate::protocol::err_json(
+            "拒绝该 Host：控制台只按 IP 访问，请用启动时打印的地址（形如 http://本机IP:端口）打开",
+        );
+        let _ = request.respond(json_response(body).with_status_code(403));
+        return;
+    }
     // 鉴权先于一切，页面本身也不例外：页面里带着给 API 用的口令，
     // 放行未认证的 GET / 等于把口令发给任何来问的人。
     let header_token = header_value(&request, "X-CPE-Token");

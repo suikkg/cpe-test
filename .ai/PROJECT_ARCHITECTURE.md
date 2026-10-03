@@ -474,7 +474,7 @@ Windows 文本适配器：`src/cmd/ipconfig.rs` 解析中英文 `ipconfig /all`�
 `src/cmd/iperf.rs` 只放 server 与作业两套注册表共用的生命周期工具（ID 校验、租约截止、分段锁），
 并 `pub use` 外部用到的符号；实现按职责分在 `src/cmd/iperf/`，外部路径仍是 `crate::cmd::iperf::*`：
 
-- `args`：server/client 参数构造；TCP 用 `-P`，UDP 用 `-u` 加额外 `-b/-l`；`extra` 不许覆盖的受控参数（`RESERVED_CLIENT_FLAGS`）。
+- `args`：server/client 参数构造；TCP 用 `-P`，UDP 用 `-u` 加额外 `-b/-l`；`extra` 不许覆盖的受控参数（`RESERVED_CLIENT_FLAGS`）。该黑名单有两类：改**测量口径**的（`-c/-B/-p/-t/-i/-f/-u/-4/-6`）和碰**文件系统**的（`-F/--file`、`-I/--pidfile`、`--logfile`）。后一类是安全边界而非口径——`extra` 原样进 agent 执行的命令行，`-F` 会把 agent 本机文件原样灌给对端 server（持令牌者整份取走，已本地复现），`-I/--logfile` 让 agent 往任意路径写；即使没有本地调用方也必须挡，它是协议边界对任何调用方的约束。守在 `cmd::iperf::tests::file_system_flags_are_blocked_in_every_spelling` 与 `a_file_exfiltration_attempt_is_refused_before_it_runs`。
 - `parse`：`IperfParsed` 和最佳 sender/receiver/measurement 判定；文本速率、Bytes/bits、单位换算和 UDP 丢包解析；运行中逐行的实时事件（`classify_live_line`）。汇总与实时两处共用 `rate_mbps` 一份单位换算（bit 按 1000、Byte 按 1024 进位）。
 - `server`：`IperfServerMgr`。不带 request_id 的旧协议同端口先停旧 server，带 request_id 的按 request/owner 幂等；后台收集 stdout/stderr，TCP connect 探测 ready，主动 stop/kill，sweep/stop_all。
 - 就绪探测（`server`）：IPv6 zone 解析成 scope id（数字索引，或 unix 上按接口名查），每轮重新解析地址并逐个尝试全部解析结果（任一连上即就绪），connect 超时 1 秒、都失败后 200ms 再试，总超时 15 秒；Windows 不带 zone 的 link-local 只等 300ms 并确认进程存活。
@@ -584,6 +584,20 @@ Windows 文本适配器：`src/cmd/ipconfig.rs` 解析中英文 `ipconfig /all`�
 - WebUI 的 Wi-Fi 门限以“主控频段 × 辅测频段”为一组，每组两个单向门限（主控→辅测、辅测→主控）加**一个双向 RX 合计门限**；界面只按当前两端实际频段组合去重显示。旧的两个「每方向双向门限」按两者之和迁移成合计，只填过一个方向的不推导。旧发送频段规则和具体网口覆盖只作 request.json 读取兼容，新项目不再创建。
 - 频段在**存储与比较**上一律是稳定枚举 `wifi_2_4g` / `wifi_5g` / `wifi_6g` / `unknown`（Rust `plan::canonical_wifi_band`，TS `canonicalWifiBand`），界面再渲染成 `2.4G / 5G / 6G`。展示文案是最容易被改的东西，而改完之后频段规则会**静默失效**——找不到规则不报错，只是门限没了。
 - 门限的最终生效值必须能在预览上直接看到（`PlannedUnit::targets`）。`RateTargets::for_direction("ab")` 是 `ab.or(forward)`，所以「`forward` 字段还在」不能证明它还在生效；补兜底门限一律走 `fill_direction_target`，它按 `for_direction` 的结果判断，不看某个字段填没填。
+- **控制台访问口令默认随机，不回落公开值**（`util::generate_console_token`）。没给
+  `--ui-token` / `CPE_UI_TOKEN` 时每次启动现生成一枚随机口令（熵取自标准库 `RandomState`
+  读的 OS CSPRNG，不引入第三方依赖），随启动地址的 `?token=` 打印、浏览器自动带着打开。
+  以前这里回落到公开默认 `cpetest`，而控制台能改配置、发起测试、下载 config，等于默认把
+  钥匙交给同网段。`cpetest`（`config::DEFAULT_TOKEN`）**只**保留为 agent 共享令牌的默认值
+  （两机零配置互连靠它，随机化会断掉这条通路）——两者口径分开，别再合并。守在
+  `util::tests::generated_console_tokens_are_well_formed_and_not_constant`。
+- **控制台只认按 IP 访问的 `Host`，带 DNS 域名一律拒**（`webui::http::host_header_is_safe`
+  / 纯函数核 `host_value_is_safe`）。这是 DNS 重绑定的防线：攻击站点把域名解析到控制台
+  地址、诱浏览器发「同源」请求时，`Host` 带的是攻击者域名；控制台从来只按 IP 访问（启动
+  打印、`--ui-bind` 都是 IP），所以只放行 IP 字面量与 `localhost`，缺省/空 `Host` 放行
+  （原生客户端可能不带，而浏览器必带且 JS 改不了）。这道门排在鉴权之前但**只拒不授**，
+  不违反「鉴权先于路由」（方向相反）。守在
+  `webui::tests::the_host_gate_allows_ips_and_localhost_but_rejects_dns_names`。
 - **控制台的判定基线是内置默认值，不是 `config.json`**（`webui::console_baseline_config`）。隐式加载的那份只留下「这台机器接在哪个网络上」：`agent_host` / `agent_port` / `agent_token` / `ipv4_prefixes` / `require_same_subnet_for_iperf`。`rate_check` 的门限与负载上限、`link_profiles.by_role`、`ctstraffic` 参数以前是从这份文件原样带进每一轮控制台运行的——同一份项目在「exe 旁边放了 config.json」的机器和没放的机器上判定口径不同，而项目文件里看不出来。`--config` 是**显式**选择，整份生效；区别不在文件内容，在于人有没有做这个选择。守在 `an_implicitly_loaded_config_only_contributes_connection_identity`。
 - 项目文件 `project_version: 3` 是**完整有效快照**，分两层：`execution_defaults` / `acceptance` 是界面态（导出前经 `resolveEffectiveGlobals` 把留空的格子换算成真正会用的值），`master_config` 是**解析后的主控配置**（`RunRequest::master_config`）。后者用白名单 `MASTER_CONFIG_KEYS = [link_profiles, iperf, ctstraffic, ping]` 裁出来，在后端经 **深合并** 覆盖基线。
   - 为什么整块而不是逐字段：界面上没有输入框却决定判定与灌包的参数有几十个（`rate_check` 的负载上限/余量/并发流下限、`link_profiles.by_role` 的角色配对门限、`ctstraffic` 的帧率与缓冲深度），逐字段加通道永远追不完，漏一个就是一次静默的口径漂移。

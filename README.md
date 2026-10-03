@@ -245,15 +245,31 @@ Rust **682/682**（macOS）/ **686/686**（Arch Linux，差 4 已逐项归因）
 - **基线 TCP+UDP 的 UDP 出厂档位**改为 `-b 2500m -l 14k -w 256m` 单流。
 - **「参数配方」改称「参数配置」**，TCP/UDP 配方相应改称 TCP/UDP 配置。
 - **ping 次数默认 180**（原 100），`config.json` 的 `ping.count` 默认值同步。
-- **默认口令 `cpetest`**：agent 认证与控制台访问共用同一个出厂默认值（`config::DEFAULT_TOKEN`），
-  两端都不改就能直接连上。此前默认是**完全不认证**，agent 又默认监听 `0.0.0.0`；而发布包里的
-  `start_ui.bat` / `start_agent.bat` 早就写着 `cpetest`——双击 .bat 有口令、直接跑 exe 完全不认证，
-  同一个包里两条启动路径行为不一致，现在对齐了。这个口令挡的是**误连**不是攻击：它写在源码、
-  文档和发布包里，是公开值，本工具面向隔离测试网自用，按此取舍。
+- **agent 共享令牌默认 `cpetest`**：agent 认证用这个出厂默认值（`config::DEFAULT_TOKEN`），
+  主控与辅测两端都不改就能直接连上。此前默认是**完全不认证**，agent 又默认监听 `0.0.0.0`；
+  而发布包里的 `start_agent.bat` 早就写着 `cpetest`，现在对齐了。它挡的是两台机器之间的**误连**
+  不是攻击：这个值写在源码、文档和发布包里，是公开值，本工具面向隔离测试网自用，按此取舍。
   只有把 `agent_token` 显式写成空串才关闭认证（serde 的 default 只在字段**缺失**时生效，
-  所以随包的 `config.example.json` / `config.minimal.json` 也都改成了 `"cpetest"`，
+  所以随包的 `config.example.json` / `config.minimal.json` 也都写成 `"cpetest"`，
   否则照抄的人拿到的是「显式关闭认证」）。
   辅测机地址进入 HTTP `Host` 头，最长 256 字节；令牌进入 `Authorization` 头，最长 4096 字节。两者都不能包含控制字符，超限或含换行的值会在连接前拒绝。
+- **控制台访问口令不再用公开默认值，改为每次启动随机生成**：`cpe_test ui` 没给
+  `--ui-token` / `CPE_UI_TOKEN` 时，现生成一枚随机口令（`util::generate_console_token`，
+  熵取自标准库 `RandomState` 读的 OS CSPRNG，不引入第三方依赖），随启动打印的地址以
+  `?token=` 一起给出，浏览器被自动带着打开，使用无感。此前这里回落到公开的 `cpetest`——
+  控制台能改配置、发起测试、下载 config，等于默认把它的钥匙交给同网段。显式
+  `--ui-token ""` 仍是「关闭认证」，且只在回环放行。控制台口令**有意不进 config.json**
+  （控制台自己就提供下载 config，写进去等于当场泄露），所以它不走 `agent_token` 那条默认链。
+- **借 agent 的 iperf `extra` 读写本机任意文件的口子已堵**：`/iperf/client/*` 的 `extra`
+  会被原样拼进 agent 要执行的 iperf3 命令行，而受控参数黑名单（`RESERVED_CLIENT_FLAGS`）
+  原来只挡会改测量口径的那几个，漏了会碰文件系统的 `-F/--file`（把 agent 本机文件原样
+  灌给对端 server，持令牌者可整份取走——已本地复现）、`-I/--pidfile`、`--logfile`（往任意
+  路径写、把输出引走）。现在这三个也在黑名单里，三种拼法（分开/粘着/带等号）都认。
+- **控制台只接受按 IP 访问，带 DNS 域名的 `Host` 一律拒（防 DNS 重绑定）**：恶意站点把
+  自己的域名解析到控制台地址、诱使受害者浏览器发「同源」请求这一类攻击，发出的 `Host`
+  头是攻击者的域名；控制台从来只按 IP 访问（启动打印、`--ui-bind` 都是 IP），所以只放行
+  IP 字面量与 `localhost`。正常的 `http://<本机IP>:端口`（含从别的电脑连 `0.0.0.0` 绑定）
+  不受影响。
 - **agent 认证提到读请求体之前，请求体上限 100 MiB → 1 MiB**：此前请求体在校验 token
   **之前**就被完整读进内存，且 `from_utf8_lossy(..).into_owned()` 又拷一份，未认证的同网段
   主机可以逼着 agent 峰值分配 `16 worker × 100 MiB × 2 ≈ 3.2 GiB`。agent 的每个端点收的

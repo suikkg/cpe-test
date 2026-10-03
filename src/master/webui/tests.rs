@@ -2791,6 +2791,38 @@ fn the_console_accepts_its_token_from_query_header_or_bearer() {
     assert!(!ok("mytoken=s3cr3t", None, None), "后缀撞名不算带对口令");
 }
 
+/// DNS 重绑定这道门：IP 字面量与 localhost 放行，带域名的一律拒。
+///
+/// 正常访问全是 IP（启动打印的就是 IP，`--ui-bind` 收的也是 IP），所以不误伤；
+/// 重绑定攻击带的是攻击者的域名（浏览器把源站域名放进 `Host`，JS 改不了），
+/// 落到这里被拒。缺省/空 `Host` 放行，给不带 `Host` 的原生客户端留路。
+#[test]
+fn the_host_gate_allows_ips_and_localhost_but_rejects_dns_names() {
+    for ok in [
+        None,
+        Some(""),
+        Some("127.0.0.1"),
+        Some("127.0.0.1:28800"),
+        Some("192.168.1.5:28800"),
+        Some("localhost"),
+        Some("localhost:28800"),
+        Some("[::1]"),
+        Some("[::1]:28800"),
+        Some("[fe80::1]:28800"),
+    ] {
+        assert!(host_value_is_safe(ok), "应放行：{ok:?}");
+    }
+    for bad in [
+        Some("evil.com"),
+        Some("evil.com:28800"),
+        Some("console.attacker.example"),
+        Some("[not-an-ip]"),
+        Some("fe80::1"), // 裸 IPv6 不合法，按拒处理
+    ] {
+        assert!(!host_value_is_safe(bad), "应拒绝：{bad:?}");
+    }
+}
+
 /// 畸形的百分号转义不能让控制台崩掉——这段输入来自网络。
 ///
 /// `%` 后面跟多字节字符时，按 `&str` 下标切那两位会切在字符中间直接 panic；

@@ -43,6 +43,48 @@ fn reserved_client_flags_are_caught_in_every_spelling() {
     }
 }
 
+/// 文件系统访问面必须被挡下——这是安全边界，不是测量口径。
+///
+/// `-F`/`--file` 会让 client 把 agent 本机的任意文件原样灌给对端 server
+/// （本地已复现一次整份取走）；`-I`/`--pidfile`、`--logfile` 让 agent 往任意
+/// 路径写文件。持令牌者经 `/iperf/client/*` 送这些进来等于拿到 agent 的任意
+/// 文件读写，所以三种拼法（分开、粘着、带等号）一个都不能漏。
+#[test]
+fn file_system_flags_are_blocked_in_every_spelling() {
+    for spelling in [
+        "-F",
+        "-F/etc/passwd",
+        "--file",
+        "--file=/etc/passwd",
+        "-I",
+        "-I/tmp/pid",
+        "--pidfile",
+        "--pidfile=/tmp/pid",
+        "--logfile",
+        "--logfile=/tmp/out",
+    ] {
+        let hits = reserved_flags_in_extra(&[spelling.to_string()]);
+        assert_eq!(hits.len(), 1, "{spelling} 应当被挡下，实得 {hits:?}");
+    }
+}
+
+/// 复现攻击形状：攻击者把 agent 本机文件当作 `-F` 的内容外带。
+/// `check_client_extra` 必须在命令拼出去之前就拒绝。
+#[test]
+fn a_file_exfiltration_attempt_is_refused_before_it_runs() {
+    let attack = IperfClientReq {
+        dst: "10.0.0.9".into(),
+        bind_ip: "127.0.0.1".into(),
+        port: 5201,
+        duration: 5,
+        udp: false,
+        v6: false,
+        extra: vec!["-F".into(), "/etc/shadow".into()],
+    };
+    let error = check_client_extra(&attack).expect_err("-F 外带文件必须被挡下");
+    assert!(error.contains("-F"), "报错要点名被挡的参数: {error}");
+}
+
 /// 合法的档位参数一个都不许被误伤。
 ///
 /// 这里最容易踩的是大小写：iperf3 的 `-b`（速率）和 `-B`（绑定地址）是两个
