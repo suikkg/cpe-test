@@ -765,25 +765,54 @@ fn server_stop_confirms_process_exit_and_releases_port() {
     assert!(replay.terminated);
 }
 
+/// 在一个空闲的 IPv4 回环端口上起真实 iperf3 server，返回实际用的请求与 `start` 的结果。
+///
+/// 「先 bind 0 拿端口、关掉、再让 iperf3 去 bind」中间有个空档，而且这个空档里有一次
+/// 进程创建（Windows 上几十毫秒）：测试并行跑，别的用例或本机其他进程的出站连接随时
+/// 可能拿到这个刚释放的临时端口。实机 Windows 门禁撞上过一次（`Address already in use`，
+/// 端口 64888）。iperf3 是外部进程，接不过一个已经 bind 好的 socket，所以只在「端口被抢」
+/// 时换个端口重来；别的启动失败照常原样报出。
+fn start_real_server_on_a_free_port(
+    mgr: &IperfServerMgr,
+    bin: &str,
+    request_id: &str,
+    owner_id: &str,
+) -> (IperfServerStartReq, String) {
+    let mut last_error = String::new();
+    for attempt in 0..5 {
+        let reservation = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = reservation.local_addr().unwrap().port();
+        drop(reservation);
+        let req = IperfServerStartReq {
+            bind_ip: "127.0.0.1".into(),
+            port,
+            v6: false,
+            request_id: format!("{request_id}-{attempt}"),
+            owner_id: owner_id.into(),
+            lease_secs: 60,
+        };
+        match mgr.start(bin, &req) {
+            Ok(out) => return (req, out),
+            Err(error) if error.contains("Address already in use") => last_error = error,
+            Err(error) => panic!("{error}"),
+        }
+    }
+    panic!("连续 5 个空闲端口都被抢走：{last_error}");
+}
+
 #[test]
 fn real_iperf_server_start_replay_stop_and_rebind_when_available() {
     let Some(bin) = crate::cmd::tools::find_iperf3() else {
         return;
     };
-    let reservation = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-    let port = reservation.local_addr().unwrap().port();
-    drop(reservation);
     let mgr = IperfServerMgr::new();
-    let req = IperfServerStartReq {
-        bind_ip: "127.0.0.1".into(),
-        port,
-        v6: false,
-        request_id: "real-iperf-server".into(),
-        owner_id: "owner-real-iperf-server".into(),
-        lease_secs: 60,
-    };
-
-    let first = mgr.start(&bin, &req).unwrap();
+    let (req, first) = start_real_server_on_a_free_port(
+        &mgr,
+        &bin,
+        "real-iperf-server",
+        "owner-real-iperf-server",
+    );
+    let port = req.port;
     let replay = mgr.start(&bin, &req).unwrap();
     assert_eq!(first, replay);
     let stopped = mgr
@@ -801,19 +830,10 @@ fn real_iperf_client_cancel_waits_for_process_reap_when_available() {
     let Some(bin) = crate::cmd::tools::find_iperf3() else {
         return;
     };
-    let reservation = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
-    let port = reservation.local_addr().unwrap().port();
-    drop(reservation);
     let servers = IperfServerMgr::new();
-    let server_req = IperfServerStartReq {
-        bind_ip: "127.0.0.1".into(),
-        port,
-        v6: false,
-        request_id: "real-client-server".into(),
-        owner_id: "owner-real-client".into(),
-        lease_secs: 60,
-    };
-    servers.start(&bin, &server_req).unwrap();
+    let (server_req, _) =
+        start_real_server_on_a_free_port(&servers, &bin, "real-client-server", "owner-real-client");
+    let port = server_req.port;
 
     let clients = IperfClientJobMgr::new();
     let id = clients
