@@ -127,8 +127,8 @@ impl Ctx {
         let (src_addr, dst_addr) = if v6 {
             let addrs = v6_addrs(&src.nic, &dst.nic)?;
             (
-                add_zone(&addrs.client_bind, &src.nic.zone, src.side),
-                add_zone(&addrs.client_target, &src.nic.zone, src.side),
+                self.add_zone(&addrs.client_bind, &src.nic.zone, src.side),
+                self.add_zone(&addrs.client_target, &src.nic.zone, src.side),
             )
         } else {
             (src.nic.ipv4.clone(), dst.nic.ipv4.clone())

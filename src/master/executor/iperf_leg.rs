@@ -19,9 +19,9 @@ impl Ctx {
             let v = v6_addrs(&t.src.nic, &t.dst.nic)
                 .ok_or_else(|| "两端缺少可用 IPv6 地址".to_string())?;
             (
-                add_zone(&v.client_bind, &t.src.nic.zone, t.src.side),
-                add_zone(&v.client_target, &t.src.nic.zone, t.src.side),
-                add_zone(&v.server_bind, &t.dst.nic.zone, t.dst.side),
+                self.add_zone(&v.client_bind, &t.src.nic.zone, t.src.side),
+                self.add_zone(&v.client_target, &t.src.nic.zone, t.src.side),
+                self.add_zone(&v.server_bind, &t.dst.nic.zone, t.dst.side),
             )
         } else {
             (

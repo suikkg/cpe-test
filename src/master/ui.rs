@@ -758,6 +758,7 @@ pub fn run_master(opts: MasterOpts) -> i32 {
         .any(|capability| capability == crate::protocol::PING_DF_CAPABILITY);
     let ctx = Ctx {
         agent_ping_df,
+        agent_os: health.os.clone(),
         agent_host: agent_host.clone(),
         agent_port: cfg.agent_port,
         cfg: cfg.clone(),

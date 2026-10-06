@@ -485,17 +485,17 @@ impl Ctx {
             let addrs = v6_addrs(&client_endpoint.nic, &server_endpoint.nic)
                 .ok_or_else(|| "ctsTraffic 两端缺少可用 IPv6 地址".to_string())?;
             (
-                add_zone(
+                self.add_zone(
                     &addrs.client_bind,
                     &client_endpoint.nic.zone,
                     client_endpoint.side,
                 ),
-                add_zone(
+                self.add_zone(
                     &addrs.client_target,
                     &client_endpoint.nic.zone,
                     client_endpoint.side,
                 ),
-                add_zone(
+                self.add_zone(
                     &addrs.server_bind,
                     &server_endpoint.nic.zone,
                     server_endpoint.side,

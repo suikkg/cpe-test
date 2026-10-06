@@ -243,6 +243,7 @@ fn isolated_ctx(agent_port: u16) -> (Ctx, PathBuf) {
     let _ = std::fs::create_dir_all(&run_dir);
     let ctx = Ctx {
         agent_ping_df: true,
+        agent_os: String::new(),
         topology: None,
         agent_host: "127.0.0.1".into(),
         agent_port,
@@ -2733,6 +2734,23 @@ fn iperf_single_udp_only_counts_started_and_reaped_processes_as_safe_attempts() 
         ..Default::default()
     };
     assert_eq!(iperf_client_setup_error(&connection_refused), None);
+
+    // 本机没有这个源地址：两种平台措辞都要认成执行环境问题（实机原文）。
+    for local_bind_failure in [
+        "iperf3: error - unable to connect to server - server may have stopped running or use a different port, firewall issue, etc.: Can't assign requested address",
+        "iperf3: error - unable to connect to server - server may have stopped running or use a different port, firewall issue, etc.: Cannot assign requested address",
+    ] {
+        let client = IperfClientOut {
+            process_started: Some(true),
+            cleanup_confirmed: Some(true),
+            output: local_bind_failure.into(),
+            ..Default::default()
+        };
+        assert!(
+            iperf_client_setup_error(&client).is_some(),
+            "{local_bind_failure}"
+        );
+    }
 
     let cleanup_unknown = IperfClientOut {
         process_started: Some(true),
@@ -5551,6 +5569,7 @@ fn preflight_block_takes_priority_over_resume_pass() {
     crate::cancel::test_guard();
     let ctx = Ctx {
         agent_ping_df: true,
+        agent_os: String::new(),
         topology: None,
         agent_host: "127.0.0.1".into(),
         agent_port: 1,
@@ -7123,5 +7142,41 @@ fn row_raws_keep_only_the_embedded_copy_once_the_raw_record_is_on_disk() {
         row_raws(false, raws.clone()),
         raws,
         "没落盘时不许丢任何内容"
+    );
+}
+
+#[test]
+fn link_local_zones_follow_the_platform_that_runs_the_command_not_the_master() {
+    // Windows 的 iperf3 / ping 不认 `%xx`；macOS / Linux 不带 zone 绑不上 link-local。
+    assert!(!os_needs_v6_zone("windows"));
+    assert!(!os_needs_v6_zone(" Windows "));
+    assert!(os_needs_v6_zone("macos"));
+    assert!(os_needs_v6_zone("linux"));
+    assert_eq!(with_zone("fe80::1", "en0", true), "fe80::1%en0");
+    assert_eq!(with_zone("fe80::1", "en0", false), "fe80::1");
+    assert_eq!(with_zone("fe80::1", "", true), "fe80::1");
+    assert_eq!(with_zone("2408::5", "en0", true), "2408::5");
+
+    let (mut ctx, _) = isolated_ctx(1);
+    // 实机上撞到的组合：Windows 主控 + macOS 辅测，辅测端执行的命令必须带 zone。
+    ctx.agent_os = "macos".into();
+    assert_eq!(ctx.add_zone("fe80::28", "en0", Side::Agent), "fe80::28%en0");
+    // 反过来：macOS 主控 + Windows 辅测，辅测端的命令不能带 zone。
+    ctx.agent_os = "windows".into();
+    assert_eq!(ctx.add_zone("fe80::ace1", "4", Side::Agent), "fe80::ace1");
+    // 主控这一端只看本机平台，与对端是什么无关。
+    let local_needs = os_needs_v6_zone(&crate::util::os_name());
+    for agent in ["windows", "macos", ""] {
+        ctx.agent_os = agent.into();
+        assert_eq!(
+            ctx.add_zone("fe80::1", "7", Side::Master),
+            if local_needs { "fe80::1%7" } else { "fe80::1" }
+        );
+    }
+    // 对端没报平台（agent_os 为空）时按主控本机处理。
+    ctx.agent_os.clear();
+    assert_eq!(
+        ctx.add_zone("fe80::1", "7", Side::Agent),
+        if local_needs { "fe80::1%7" } else { "fe80::1" }
     );
 }

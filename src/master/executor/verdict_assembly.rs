@@ -48,7 +48,12 @@ pub(super) fn iperf_client_setup_error(client: &IperfClientOut) -> Option<String
         "unrecognized option",
         "option requires an argument",
         "unable to parse",
+        // EADDRNOTAVAIL：本机没有这个源地址，是执行环境问题，不是被测设备不通。
+        // glibc / cygwin 写 `Cannot`，macOS / BSD 的 strerror 写 `Can't`——
+        // 只认前者时，macOS 端执行的单流 UDP 绑定失败会被判成 RATE_FAIL
+        // （SINGLE_UDP_STREAM_FAILED），而同根因的 server 侧判 SETUP_ERROR。
         "cannot assign requested address",
+        "can't assign requested address",
         "unable to bind",
         "no such device",
         "无法识别的选项",

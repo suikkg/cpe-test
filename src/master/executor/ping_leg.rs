@@ -112,8 +112,8 @@ impl Ctx {
         let (src_addr, dst_addr) = if t.v6 {
             match v6_addrs(&t.src.nic, &t.dst.nic) {
                 Some(v) => {
-                    let bind = add_zone(&v.client_bind, &t.src.nic.zone, t.src.side);
-                    let target = add_zone(&v.client_target, &t.src.nic.zone, t.src.side);
+                    let bind = self.add_zone(&v.client_bind, &t.src.nic.zone, t.src.side);
+                    let target = self.add_zone(&v.client_target, &t.src.nic.zone, t.src.side);
                     (bind, target)
                 }
                 None => (String::new(), String::new()),

@@ -91,6 +91,12 @@ pub struct Ctx {
     /// 照常分片发出去并报成功，据此得到的「大包能过」是个听上去很确定的错答案。
     /// `false` 时探测不跑，诊断里写明原因——宁可没有结果，也不要一个不能信的数。
     pub agent_ping_df: bool,
+    /// 对端 agent 在 `/health` 里报的平台（`windows` / `macos` / `linux`）。
+    ///
+    /// 只用来决定在辅测端执行的命令里 v6 link-local 带不带 `%zone`
+    /// （[`Ctx::add_zone`]）。和 `agent_ping_df` 一样在建 Ctx 时定死一次。
+    /// 为空时按主控本机平台处理（与两端同平台的旧口径一致）。
+    pub agent_os: String,
     /// 结构化运行状态的汇报口（ADR-2）。
     ///
     /// `None` = 没人要听（命令行直跑）。回调点全部挂在**既有的** `logln` 处，
@@ -536,6 +542,17 @@ where
 }
 
 impl Ctx {
+    /// 给在 `side` 那一端执行的命令准备 v6 地址：zone 带不带看那一端的平台。
+    pub(super) fn add_zone(&self, addr: &str, zone: &str, side: Side) -> String {
+        let local = crate::util::os_name();
+        let os = match side {
+            Side::Master => local.as_str(),
+            Side::Agent if self.agent_os.trim().is_empty() => local.as_str(),
+            Side::Agent => self.agent_os.as_str(),
+        };
+        with_zone(addr, zone, os_needs_v6_zone(os))
+    }
+
     // ---------------- agent HTTP ----------------
 
     /// 把上一次落盘之后新增的行追加进 `runs/<run>/rows.jsonl`。
