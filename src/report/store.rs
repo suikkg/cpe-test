@@ -87,6 +87,8 @@ pub struct ReportMetaRecord {
     pub elapsed: String,
     pub counter_source_caveat: String,
     pub run_health: String,
+    /// 旧目录没有这个字段，读回来是空列表（报告里就不出这一段）。
+    pub plan_notices: Vec<String>,
 }
 
 impl From<&ReportMeta> for ReportMetaRecord {
@@ -100,6 +102,7 @@ impl From<&ReportMeta> for ReportMetaRecord {
             elapsed: meta.elapsed.clone(),
             counter_source_caveat: meta.counter_source_caveat.clone(),
             run_health: meta.run_health.clone(),
+            plan_notices: meta.plan_notices.clone(),
         }
     }
 }
@@ -115,6 +118,7 @@ impl From<ReportMetaRecord> for ReportMeta {
             elapsed: record.elapsed,
             counter_source_caveat: record.counter_source_caveat,
             run_health: record.run_health,
+            plan_notices: record.plan_notices,
         }
     }
 }
@@ -465,6 +469,9 @@ mod tests {
                 master_pc: "MASTER".into(),
                 agent_pc: "AGENT".into(),
                 started: "2026-08-30 10:11:12".into(),
+                plan_notices: vec![
+                    "门限 1180Mbps 超过这条链路的物理上限；按 95% 折算到 950Mbps 判定".into(),
+                ],
                 ..Default::default()
             },
             total_units: 42,
@@ -482,6 +489,8 @@ mod tests {
         assert_eq!(back.plan_hash, meta.plan_hash);
         assert_eq!(back.total_units, 42);
         assert_eq!(back.report.master_pc, "MASTER");
+        // 计划提示跟着 meta 走，重放出的报告才能说清门限被折算过。
+        assert_eq!(back.report.plan_notices, meta.report.plan_notices);
         // 判定计数必须完整往返：历史列表就是靠它显示通过率的，丢一个字段
         // 那一列就会集体变成 0，而 0 和「没跑过」在屏幕上长得一样。
         assert_eq!(back.verdict_totals, meta.verdict_totals);
@@ -502,6 +511,8 @@ mod tests {
             crate::report::VerdictTotals::default()
         );
         assert_eq!(forward.total_units, 0);
+        // 升级前的 meta 没有计划提示，读回来是空列表，报告里不出这一段。
+        assert!(forward.report.plan_notices.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

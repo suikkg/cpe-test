@@ -982,6 +982,33 @@ fn sampling_caveat_is_shown_only_when_the_platform_actually_differs() {
     assert!(noisy.contains("netstat 子进程"));
 }
 
+/// 计划展开时的提示要跟着报告走：配 1180 被折算成 950 判 PASS，报告上只看到 950
+/// 的话，读报告的人无从知道门限被改过（实机 A1-C06 撞到过）。
+#[test]
+fn plan_notices_reach_the_report_escaped_and_only_when_there_are_any() {
+    let detail = traffic_detail("unit-notice", (0, 0, 0, 0));
+    let quiet = render_with_meta(
+        vec![detail.clone(), unit_summary("unit-notice", Verdict::Pass)],
+        &ReportMeta::default(),
+    );
+    assert!(!quiet.contains("计划提示"));
+
+    let noisy = render_with_meta(
+        vec![detail, unit_summary("unit-notice", Verdict::Pass)],
+        &ReportMeta {
+            plan_notices: vec![
+                "C06b：门限 1180Mbps 超过这条链路的物理上限；本条按 95% 折算到 950Mbps 判定".into(),
+                "<script>x</script>".into(),
+            ],
+            ..Default::default()
+        },
+    );
+    assert!(noisy.contains("计划提示</strong>（2 条）"));
+    assert!(noisy.contains("折算到 950Mbps"));
+    assert!(noisy.contains("&lt;script&gt;x&lt;/script&gt;"));
+    assert!(!noisy.contains("<script>x</script>"));
+}
+
 #[test]
 fn screenshot_thumbnail_and_text_link_to_original_image() {
     let html = screenshot_link("./iperf_outputs/shot&1.png", "主控截图");

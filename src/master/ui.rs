@@ -242,7 +242,16 @@ pub fn compare_runs(baseline: &Path, current: &Path) -> i32 {
                     outcome.ambiguous
                 );
             }
-            compare_exit_code(outcome.has_regression, outcome.ambiguous)
+            if outcome.disappeared > 0 {
+                println!(
+                    "基线里有 {} 个单元在本轮没有结果（计划改了或中途停止），本次对比不完整。",
+                    outcome.disappeared
+                );
+            }
+            compare_exit_code(
+                outcome.has_regression,
+                outcome.ambiguous + outcome.disappeared,
+            )
         }
         Err(error) => {
             eprintln!("{error}");
@@ -253,13 +262,16 @@ pub fn compare_runs(baseline: &Path, current: &Path) -> i32 {
 
 /// 对比的退出码：0 = 无回归且对比完整；1 = 有回归；2 = 无回归但对比不完整（或出错）。
 ///
+/// 「不完整」= 有无法唯一匹配的记录，或基线里的单元在本轮没有结果。后者以前不算：
+/// 一轮跑到一半崩掉、只剩前一半单元，对比照样报 0「无回归」，接在 CI 上等于放行。
+///
 /// **确定的回归优先于「不完整」。** 先判不完整的话，只要基线里有一条旧 PING
 /// （6.5.0 之前的明细不带次数，必然无法唯一匹配），一次真正的判定变坏也只能
 /// 拿到 2，接在 CI 上分不出「设备退化了」和「历史数据不全」。
-pub(crate) fn compare_exit_code(has_regression: bool, ambiguous: usize) -> i32 {
+pub(crate) fn compare_exit_code(has_regression: bool, incomplete: usize) -> i32 {
     if has_regression {
         1
-    } else if ambiguous > 0 {
+    } else if incomplete > 0 {
         2
     } else {
         0
@@ -826,6 +838,7 @@ pub fn run_master(opts: MasterOpts) -> i32 {
             .unwrap_or_default()
             .to_string(),
         run_health: sum.run_health_banner(),
+        plan_notices: plan.notices().to_vec(),
     };
     {
         // 写报告是最后一次取这把锁：即使前面某个单元 panic 毒化了它，也必须
@@ -1769,6 +1782,117 @@ mod tests {
         assert_eq!(last_agent_host_at(&real), Some("192.168.8.101".into()));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 本轮比基线少了单元（崩在半路、计划被悄悄缩小）不能报「对比完整、无回归」。
+    ///
+    /// 实机上撞到过：删掉一个单元的 rows.jsonl 对比基线，摘要写着「本轮缺失 1」，
+    /// 退出码却是 0——接在 CI 上，一轮只跑了一半的结果会被当成通过放行。
+    #[test]
+    fn a_run_missing_baseline_units_is_an_incomplete_comparison_not_a_pass() {
+        use crate::report::store;
+        use crate::report::{Row, RowBackend, RowDirection, RowProtocol, RowSide};
+        use crate::verdict::Verdict;
+
+        let root = std::env::temp_dir().join(format!(
+            "cpe_compare_missing_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let write_run = |name: &str, units: &[(&str, Verdict)]| {
+            let dir = root.join(name);
+            std::fs::create_dir_all(&dir).expect("run dir");
+            for (seq, (window, verdict)) in units.iter().enumerate() {
+                let base = Row {
+                    parent_id: format!("unit-{window}"),
+                    link_group: "SGMII ↔ SGMII".into(),
+                    ip: "V4".into(),
+                    protocol: RowProtocol::Tcp,
+                    backend: RowBackend::Iperf3,
+                    direction: RowDirection::Single,
+                    src_side: RowSide::Master,
+                    src_iface: "eth0".into(),
+                    dst_side: RowSide::Agent,
+                    dst_iface: "en0".into(),
+                    required_seconds: Some(30.0),
+                    unit_seq: seq,
+                    ..Default::default()
+                };
+                let detail = Row {
+                    sort_key: (seq, 0, 0, 0),
+                    param: format!("-w {window}"),
+                    task_id: format!("unit-{window}-flow"),
+                    ..base.clone()
+                };
+                let summary = Row {
+                    sort_key: (seq, usize::MAX, 0, 0),
+                    task: format!("IPERF V4 TCP -w {window}"),
+                    task_id: format!("unit-{window}"),
+                    verdict: *verdict,
+                    rx_avg: Some(940.0),
+                    target_mbps: Some(500.0),
+                    is_unit_summary: true,
+                    ..base
+                };
+                store::append_rows(&dir, &[detail, summary]).expect("append");
+            }
+            store::write_meta(
+                &dir,
+                &store::RunMeta {
+                    schema_version: store::SCHEMA_VERSION,
+                    run_id: name.into(),
+                    plan_hash: "same-plan".into(),
+                    report: Default::default(),
+                    total_units: units.len(),
+                    verdict_totals: Default::default(),
+                },
+            )
+            .expect("meta");
+            dir
+        };
+        let all = [
+            ("64k", Verdict::Pass),
+            ("1m", Verdict::Pass),
+            ("4m", Verdict::Pass),
+        ];
+        let baseline = write_run("baseline", &all);
+        let same = write_run("same", &all);
+        let half = write_run("half", &all[..2]);
+        let regressed_and_half = write_run(
+            "regressed_and_half",
+            &[("64k", Verdict::RateFail), ("1m", Verdict::Pass)],
+        );
+        let more = write_run(
+            "more",
+            &[
+                ("64k", Verdict::Pass),
+                ("1m", Verdict::Pass),
+                ("4m", Verdict::Pass),
+                ("8m", Verdict::Pass),
+            ],
+        );
+
+        assert_eq!(compare_runs(&baseline, &same), 0, "完全一致 → 0");
+        assert_eq!(
+            compare_runs(&baseline, &half),
+            2,
+            "本轮少了基线单元 → 不完整"
+        );
+        assert_eq!(
+            compare_runs(&baseline, &regressed_and_half),
+            1,
+            "确定的回归仍然优先于不完整"
+        );
+        assert_eq!(
+            compare_runs(&baseline, &more),
+            0,
+            "本轮只多不少不影响完整性"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// 崩溃恢复的端到端保证：run 目录里有 rows.jsonl，就能放出一份完整报告。

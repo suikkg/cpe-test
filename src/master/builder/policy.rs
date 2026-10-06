@@ -104,6 +104,8 @@ pub(crate) enum RxTargetSource {
     SingleDirection,
     /// 按网口门限与负载（含百分比换算）。
     NicPolicy,
+    /// 角色配对门限（`link_profiles.by_role`，来自项目 / 主控配置）。
+    RolePolicy,
     /// Wi-Fi 频段表 / 全局门限 / 旧项目带来的任务 targets——它们最终都落在
     /// `rate_targets` 上（界面上那两格单向门限走的是 `SingleDirection`）。
     ScenarioTargets,
@@ -120,6 +122,7 @@ impl RxTargetSource {
             RxTargetSource::BidirDirection => "双向方向门限",
             RxTargetSource::SingleDirection => "单向方向门限",
             RxTargetSource::NicPolicy => "按网口门限",
+            RxTargetSource::RolePolicy => "角色配对门限",
             RxTargetSource::ScenarioTargets => "任务/频段/全局门限",
             RxTargetSource::Derived => "内置推导",
             RxTargetSource::None => "未配置门限",
@@ -215,7 +218,11 @@ pub(super) fn leg_rate_plan(
     }
     let target = leg_rx_target(spec, policy, flow_direction, bidir, src, dst);
     let source = if policy.rx_target_mbps.is_some() {
-        RxTargetSource::NicPolicy
+        if policy.rx_target_from_role {
+            RxTargetSource::RolePolicy
+        } else {
+            RxTargetSource::NicPolicy
+        }
     } else if spec.rate_targets.for_direction(flow_direction).is_some() {
         RxTargetSource::ScenarioTargets
     } else if target.is_some() {
@@ -335,6 +342,11 @@ pub(crate) struct UdpLoad {
     pub streams: u32,
     /// 单流带宽被路径上限压低时，记下原始请求值，供任务标签与报表说明。
     pub clipped_from_mbps: Option<f64>,
+    /// 流数被路径上限压低时，记下原始请求的流数，供计划提示说明。
+    ///
+    /// 和 `clipped_from_mbps` 对称：以前只有压 `-b` 才出提示，请求 5 流、按路径上限
+    /// 只跑 3 流时一个字都没有，单元标题里的 `×3流` 是唯一线索。
+    pub clipped_from_streams: Option<u32>,
 }
 
 impl UdpLoad {
@@ -370,6 +382,7 @@ pub(crate) fn udp_load_for_leg(
         mbps: requested.mbps,
         streams,
         clipped_from_mbps: None,
+        clipped_from_streams: (streams < want).then_some(want),
     };
     // `explicit` = 这条链路在 link_profiles 里被专门指定过带宽。
     // 那是操作者对这条链路的明确判断，自动裁剪不该覆盖它——裁剪是给
@@ -392,6 +405,7 @@ pub(crate) fn udp_load_for_leg(
         mbps: bits_per_second as f64 / 1_000_000.0,
         streams: 1,
         clipped_from_mbps: Some(requested.mbps),
+        clipped_from_streams: (want > 1).then_some(want),
     }
 }
 
@@ -479,10 +493,19 @@ pub(super) fn udp_clip_notice(
     receiver: &Endpoint,
     load: &UdpLoad,
 ) -> Option<String> {
-    load.clipped_from_mbps.map(|from| {
+    let mut changes = Vec::new();
+    if let Some(from) = load.clipped_from_mbps {
+        changes.push(format!("-b 由 {from:.0}Mbps 裁剪到 {:.0}Mbps", load.mbps));
+    }
+    if let Some(from) = load.clipped_from_streams {
+        changes.push(format!("流数由 {from} 降到 {}", load.streams));
+    }
+    (!changes.is_empty()).then(|| {
         format!(
-            "{spec_name} {label}：{} -> {} 路径上限不足，-b 由 {:.0}Mbps 裁剪到 {:.0}Mbps",
-            sender.nic.name, receiver.nic.name, from, load.mbps
+            "{spec_name} {label}：{} -> {} 路径上限不足，{}",
+            sender.nic.name,
+            receiver.nic.name,
+            changes.join("，")
         )
     })
 }

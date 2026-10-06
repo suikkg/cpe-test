@@ -1510,7 +1510,10 @@ fn ctstraffic_udp_uses_one_strict_bandwidth_for_bps_stream_limit_and_offered_rat
     let mut port = PORT_BASE;
     let (units, notices) = build_units(&[spec], true, &mut port);
 
-    assert!(notices.is_empty());
+    assert!(
+        notices.iter().all(|line| line.contains("流数由 3 降到")),
+        "只该有流数被路径上限压低的提示：{notices:?}"
+    );
     assert_eq!(units.len(), 1);
     let LegKind::CtsTraffic(task) = &units[0].legs[0].kind else {
         panic!("expect CTS UDP task");
@@ -2150,6 +2153,54 @@ fn link_profiles_drive_both_bandwidth_and_target_end_to_end() {
     assert_eq!(task.rate_mode, RateMode::Verify, "有目标就该进 verify");
 }
 
+/// 预览上的门限来源要分清单口覆盖与角色配对。
+///
+/// 实机 B2-03：接收口没有任何「按网口门限」，`by_role` 给的 350 在计划页上却标成
+/// 「按网口门限」，人会去那张表里找一个不存在的数。
+#[test]
+fn a_role_pair_target_is_not_labelled_as_a_per_nic_target() {
+    let role_only = |by_nic: Vec<NicProfile>| {
+        let mut spec = base_spec();
+        spec.src = ep(Side::Master, "以太网", "SGMII1G", "192.168.8.103", 1000);
+        spec.dst = ep(Side::Master, "WLAN", "WIFI5G", "192.168.8.108", 2402);
+        spec.directions = vec!["ab".into(), "ba".into()];
+        spec.link_profiles = LinkProfiles {
+            by_role: vec![RoleProfile {
+                pair: "SGMII1G<->WIFI5G".into(),
+                rx_target_mbps: RateTargets {
+                    ab: Some(400.0),
+                    ba: Some(350.0),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            by_nic,
+        };
+        let mut port = PORT_BASE;
+        let (units, _) = build_units(&[spec], true, &mut port);
+        units
+            .iter()
+            .flat_map(|unit| unit.target_lines.clone())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        role_only(Vec::new()),
+        vec![
+            "A→B 门限 400Mbps（角色配对门限）".to_string(),
+            "B→A 门限 350Mbps（角色配对门限）".to_string(),
+        ]
+    );
+    // 接收口 WLAN 有单口覆盖时，A→B 那一腿才是「按网口门限」。
+    let lines = role_only(vec![NicProfile {
+        host: "master".into(),
+        name: "WLAN".into(),
+        rx_target_mbps: Some(500.0),
+        ..Default::default()
+    }]);
+    assert_eq!(lines[0], "A→B 门限 500Mbps（按网口门限）");
+    assert_eq!(lines[1], "B→A 门限 350Mbps（角色配对门限）");
+}
+
 /// 关掉 limit_udp_by_link_speed 时不得擅自改写用户填的 -b。
 #[test]
 fn test_udp_bandwidth_is_untouched_when_limit_is_off() {
@@ -2312,7 +2363,8 @@ fn rndis_is_clipped_by_its_own_negotiated_rate() {
     spec.udp_profiles = vec![UdpProfile::bw("500m")];
     let mut port = PORT_BASE;
     let (units, notices) = build_units(&[spec], true, &mut port);
-    assert!(notices.is_empty());
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert!(notices[0].contains("流数由 20 降到 7"), "{notices:?}");
     match &units[0].legs[0].kind {
         LegKind::IperfGroup { streams, .. } => assert_eq!(streams.len(), 7),
         _ => panic!("expect group"),
@@ -2472,7 +2524,11 @@ fn test_evb_auto_direction_targets() {
 fn build_single_udp_id(spec: SpecNorm, first_port: u16) -> String {
     let mut port = first_port;
     let (units, notices) = build_units(&[spec], true, &mut port);
-    assert!(notices.is_empty());
+    // 流数被路径上限压低时会有一条说明，除此之外不该有别的提示。
+    assert!(
+        notices.iter().all(|line| line.contains("流数由")),
+        "{notices:?}"
+    );
     assert_eq!(units.len(), 1);
     units[0].id.clone()
 }

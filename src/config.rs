@@ -1111,7 +1111,8 @@ pub fn load_config_checked(
                 Err(e) => {
                     if explicit.is_some() {
                         return Err(format!(
-                            "配置文件 {} 解析失败: {e}\n                             这是 --config 明确指定的那一份，不会退回默认配置继续跑——\
+                            "配置文件 {} 解析失败: {e}\n   \
+                             这是 --config 明确指定的那一份，不会退回默认配置继续跑——\
                              用默认门限跑完一整轮，报告上不会有任何地方提到配置没生效。",
                             p.display()
                         ));

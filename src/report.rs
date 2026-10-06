@@ -985,6 +985,17 @@ summary:focus-visible, a:focus-visible, .table-scroll:focus-visible, .overview-s
         ));
     }
 
+    if !meta.plan_notices.is_empty() {
+        h.push_str(&format!(
+            "<details class=\"plan-notices\"><summary><strong>计划提示</strong>（{} 条）</summary><ul>",
+            meta.plan_notices.len()
+        ));
+        for notice in &meta.plan_notices {
+            h.push_str(&format!("<li>{}</li>", esc(notice)));
+        }
+        h.push_str("</ul></details>\n");
+    }
+
     h.push_str(
         "<div class=\"report-tools\"><button type=\"button\" data-toggle-all=\"open\">展开全部</button>\
          <button type=\"button\" data-toggle-all=\"close\">收起全部</button>\

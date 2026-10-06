@@ -189,6 +189,11 @@ fn write_overview_sheet(
     } else {
         meta.run_health.clone()
     };
+    let plan_notices = if meta.plan_notices.is_empty() {
+        "无".to_string()
+    } else {
+        meta.plan_notices.join("；")
+    };
     // 抬头信息放在数据下方，不占用可筛选的行区。
     let info = [
         ("主控", meta.master_pc.as_str()),
@@ -198,6 +203,7 @@ fn write_overview_sheet(
         ("结束", meta.finished.as_str()),
         ("耗时", meta.elapsed.as_str()),
         ("运行健康", run_health.as_str()),
+        ("计划提示", plan_notices.as_str()),
     ];
     let format = header_format();
     for (offset, (label, value)) in info.iter().enumerate() {

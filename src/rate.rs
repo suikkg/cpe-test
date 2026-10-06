@@ -131,6 +131,12 @@ pub struct LinkPolicy {
     /// 协商速率会变，尤其 Wi-Fi。同一份配置两次跑出不同门限时，把算式摆在
     /// 计划提示里是唯一能让人看懂的办法。
     pub rx_target_note: Option<String>,
+    /// `rx_target_mbps` 来自角色配对（`by_role`）而不是单口覆盖（`by_nic`）。
+    ///
+    /// 计划页要把门限来源说对：两层在界面上不是一回事——单口覆盖是「按网口门限」
+    /// 那张表，角色配对只来自项目 / 主控配置，没有输入框。标成「按网口门限」，
+    /// 人会去那张表里找一个根本不存在的数。
+    pub rx_target_from_role: bool,
 }
 
 /// 把一条单口覆盖的门限设置换算成绝对 Mbps。
@@ -230,14 +236,17 @@ pub fn resolve_link_policy(
     let (nic_target, rx_target_note) = receiver_profile
         .map(|profile| nic_rx_target(profile, dst))
         .unwrap_or((None, None));
-    let rx_target_mbps = nic_target
-        .or_else(|| {
-            profiles.by_role.iter().find_map(|profile| {
-                let direction = role_pair_direction(&profile.pair, src, dst)?;
-                profile.rx_target_mbps.for_direction(direction)
-            })
+    let role_target = || {
+        profiles.by_role.iter().find_map(|profile| {
+            let direction = role_pair_direction(&profile.pair, src, dst)?;
+            profile.rx_target_mbps.for_direction(direction)
         })
+    };
+    let rx_target_from_role = nic_target.is_none();
+    let rx_target_mbps = nic_target
+        .or_else(role_target)
         .filter(|value| value.is_finite() && *value > 0.0);
+    let rx_target_from_role = rx_target_from_role && rx_target_mbps.is_some();
 
     let sender_profile = profiles
         .by_nic
@@ -267,6 +276,7 @@ pub fn resolve_link_policy(
         udp_bandwidth,
         udp_length,
         rx_target_note,
+        rx_target_from_role,
     }
 }
 
