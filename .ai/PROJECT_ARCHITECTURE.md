@@ -42,6 +42,7 @@
 
 **本轮新增/改动的不变量**：
 
+- 计划提示（门限按链路上限折算、UDP `-b` / 流数被路径上限裁剪、被跳过的项目）随 `meta.json` 的 `report.plan_notices` 落盘，HTML 报告顶部折叠显示、Excel 抬头一行。以前只进运行日志，配 1180 被折算成 950 判 PASS 时报告上看不出门限被改过；流数被裁（5→3）时连日志都没有提示（`udp_clip_notice` 只管 `-b`）。
 - `report::verdict_totals` 是报告顶部八格与 `meta.json` 判定计数的**唯一**来源。
   它刻意**不写成 `match verdict => field += 1`**——那个形状是 `RunSummary::bump` /
   `RunCounts::bump` 的专利，`the_verdict_to_counter_mapping_has_no_third_copy` 禁止第三份。
@@ -52,7 +53,7 @@
 - `NicInfo` 的无线上下文（`wifi_ssid` / `wifi_signal_pct` / `wifi_channel` / `wifi_radio`）
   是**对外 JSON 兼容面**，全部 `#[serde(default)]`。它**刻意不并进 `NicInfo::brief()`**：
   `brief()` 参与 `Unit.title`，而标题进了
-  `the_full_unit_expansion_is_byte_stable` 的全量快照，也进每一份历史报告的抬头。
+  `the_full_unit_expansion_is_byte_stable` 的全量快照，也进每一份历史报告的抬头。信号百分比 `wifi_signal_pct` 同样不进计划指纹（`plan::canonical_unit_for_fingerprint` 把它和 `speed_mbps` 一起抹掉）：它每次扫描都在跳，漏进去时带 Wi-Fi 口的控制台运行约一半被闸门判「计划已过期」；SSID / 信道 / 射频模式变了仍算真实变化。守在 `a_wifi_signal_reading_does_not_expire_the_confirmed_plan`。
 - **两个导入判别器的键集必须零交集**。子网 `import::INNER_ONLY_KEYS` 与内环
   `config::SUBNET_ONLY_KEYS` 都靠「这些键对方一个都没有」来认形状；出现同名字段，
   两个导入口就开始互相拒收对方的文件，而报出来的是一句听上去很确定的错话。
@@ -81,6 +82,7 @@
   整段探测按 `PROBE_CHUNK_SECS` 切段——`ping::run` 不可打断时，一条 2 秒就失败的
   腿要白等满整个计划时长，而点了「跳过当前单元」之后灌包作业被杀、探针还在 ping，
   那个按钮等于没按。agent 的 `/ping` 是同步 HTTP、没有取消通道，段边界就是它的上界。
+- **人主动掐断的单元在报告上要说是人掐的**（`executor::operator_interruption_note`，只走诊断通道、不改判定）：跳过一律说明；停止（控制台「停止」或 Ctrl+C）只在本单元确有腿被掐断（行的执行状态 `Cancelled`）时说明——停止恰好落在跑完的单元之后，那个单元的结论照常成立。以前停止掐断的单元只剩 SETUP_ERROR / IPERF_EXEC_FAILED 加 iperf 输出最后一行，读起来像环境故障。守在 `an_operator_stop_is_explained_only_on_the_unit_it_cut_short`。
 - **「跳过当前单元」清取消位时要检查两遍**（`cancel::resume_after_skip`）。
   「先看有没有人要停，再清取消位」是 check-then-store：`request_cancel` 恰好落在
   这两步之间时，它设的 `RUN_CANCELLED` 会被那次 `store(false)` 抹掉，而
@@ -138,7 +140,9 @@ TCP 和 UDP 两条路径上得到相反的结论。
    计数器零增长、有没有起过流）。形不成就是 `NOT_EVALUATED` / `SETUP_ERROR`。
    「有没有起过流」只问**有没有**：UDP 窗口只要求有流在跑，流数不足（配少了、
    中途掉了几条）只作诊断，和 TCP/CTS 同口径（2026-10 用户确认的口径 B）。
-   计数器零增长（最长一段超过窗口 5%）由 `RateStats::stall_evidence` 分辨：
+   计数器零增长（最长一段超过窗口 5%，**且长于一个采样间隔**——`RateStats::sample_resolution_ms`，
+   带 1.5 倍抖动余量；≥20 s 的窗口不受影响，10 s 窗口里单个零样本不再判停滞，守在
+   `a_single_zero_sample_in_a_short_window_is_below_the_sampling_resolution`）由 `RateStats::stall_evidence` 分辨：
    工具侧同期也没数据在走 → 真断流，零是真实值，往下照常验收；工具侧仍在走 →
    计数器没记账；对不上时间 → 无法区分。后两种判 `COUNTER_STALLED`。
    旁证来自 `cmd::iperf_window::iperf_tool_trace`（server 逐秒行用 client 的时钟
@@ -146,6 +150,12 @@ TCP 和 UDP 两条路径上得到相反的结论。
    **只决定这道门槛**。以前一律判 `COUNTER_STALLED`：第 10 秒就掉线的 CPE 永远
    拿不到 RATE_FAIL，报告还说「平均速率不可信」。守在
    `a_real_outage_is_judged_by_the_average_instead_of_blamed_on_the_counter`。
+   **整窗真断流同理**：旁证确认零是真实值时，平均值低于有效下限（`MIN_VALID_RX_MBPS`）
+   也照常进验收（有门限 → RATE_FAIL，无门限 → MEASURED），不再判
+   NIC_RATE_MISSING「没有可用的 RX 速率」——那句话和同行诊断「零是真实值」自相矛盾，
+   verify 下一条从头到尾不通的方向永远拿不到 RATE_FAIL（2026-10 用户确认）。没有零增长段、
+   或没有旁证时，低于下限仍是「没采到流量」。守在
+   `a_confirmed_whole_window_outage_is_judged_by_its_near_zero_average`。
 2. **验收层**——`evaluate_rx_acceptance(mode, target, rx_stats)`，四种结果封闭：
    无有效 RX → `NOT_EVALUATED`；无门限 → `MEASURED`；`RX >= 门限` → `PASS`；
    `RX < 门限` → `RATE_FAIL`。它**不接受**发送端参数，所以「TX 影响了判定」在类型上就不可能。
@@ -552,7 +562,7 @@ Windows 文本适配器：`src/cmd/ipconfig.rs` 解析中英文 `ipconfig /all`�
 
 ### 11.1 必须保持
 
-- 两轮对比使用 `Row.comparison_identity`（`ComparisonIdentity` / `ComparisonLeg`），由 `executor::row::unit_row` 从计划保存单元方向、轮次、各腿端点及参数/时长；不改变 `Leg.tag`、行级方向或 RESUME 身份。历史缺字段时只从完整类型化明细还原，重复或不完整的键全部保留并标记 `DeltaKind::Ambiguous`，禁止覆盖或任意配对；`Ambiguous` 排在 `Regressed` / `SlowerButStillSameVerdict` 之后。任一轮判定为 SKIP（只来自 RESUME 复用）的对齐项归为 `DeltaKind::Resumed`，不算回归也不算转好。CLI 退出码由 `master::ui::compare_exit_code` 决定：有回归 1，无回归但不完整 2，否则 0（回归优先）；API 附加 `ambiguous` 与 `resumed` 计数。
+- 两轮对比使用 `Row.comparison_identity`（`ComparisonIdentity` / `ComparisonLeg`），由 `executor::row::unit_row` 从计划保存单元方向、轮次、各腿端点及参数/时长；不改变 `Leg.tag`、行级方向或 RESUME 身份。历史缺字段时只从完整类型化明细还原，重复或不完整的键全部保留并标记 `DeltaKind::Ambiguous`，禁止覆盖或任意配对；`Ambiguous` 排在 `Regressed` / `SlowerButStillSameVerdict` 之后。任一轮判定为 SKIP（只来自 RESUME 复用）的对齐项归为 `DeltaKind::Resumed`，不算回归也不算转好。CLI 退出码由 `master::ui::compare_exit_code` 决定：有回归 1，无回归但不完整 2，否则 0（回归优先）；「不完整」= 有 `Ambiguous` 项**或**基线单元在本轮 `Disappeared`（后者以前不算，半截的 run 会拿到 0 被 CI 放行，守在 `a_run_missing_baseline_units_is_an_incomplete_comparison_not_a_pass`）；API 附加 `ambiguous` 与 `resumed` 计数。
 - 子网扫描统一调用 `InfoReq::for_scan`：空前缀显式全扫，有前缀照常过滤。预览和执行启动都验证完整扫描能力，`LiveTopology` 复用相同请求构造，不添加额外轮询。旧 `/info` 缺省请求仍回落到 agent 默认前缀。
 - 组合场景的启动结果未知由 `state/inner::scenarioStartPhase` 持续保存，`scenarioBlocksActions` 统一拦截冲突操作；断线只续接状态查询，不重发启动。**确认起跑只认状态里带回的本次启动令牌**（`scenario::Request::start_token`，`valid_start_token` 校验，`/api/scenario/status` 原样带回）：不再拿「场景 ID 与开始前不同」判断——初次状态读取失败时基准是空串，任何旧场景都会被误认。别的页面起的场景在跑时保持未确认。单次空闲不解除未知，明确重新准备（`prepareAfterUnknownScenario`）只清本地状态，并**同时作废内环与子网预览**；401 进入统一会话失效流程。监控每条轮询链绑定 `pollEpoch`，停止即作废，旧请求成功/失败都不得改状态或续接。
 - `/api/skip-unit` 必须提供 `run_id` / `unit_seq`；`RunStatusRecorder::request_skip` 与 `unit_started` / `unit_finished` 共用状态锁，目标核验和取消信号写入不可分离，同一目标只写一次。执行器在发布下一单元之前消耗前一单元的 skip，停止/退出始终优先。
@@ -595,14 +605,15 @@ Windows 文本适配器：`src/cmd/ipconfig.rs` 解析中英文 `ipconfig /all`�
 
 - 主流程从 56000 开始递增分配端口，达到 65535 后回绕到 56000；TCP 使用一个 client 的 `-P`，UDP 多流使用独立进程/端口；bidir 始终是 `[ab,ba]` 两腿。
 - 稳定 ID 模板和字段顺序见 `builder.rs`；其输入构造还包括 `ep_id` TCP profile 名，以及 `config.rs`/`builder.rs` 的 UDP profile 名。改变模板、字段顺序或任一输入规范会让历史 RESUME 不再命中。
-- IPv4 同 /24 门禁只限制跨机 iperf；ping 不受限。IPv6 优先双端 link-local，其次 global；macOS 执行时加 zone，Windows 不加。
+- 每个单元开跑前的网卡重扫（`builder::refresh_unit_endpoints`）按接口名核对端点，但**跳过网关诊断合成的目的端点**（`Endpoint::is_gateway_stand_in`，角色 `diagnostics::GATEWAY_STAND_IN_ROLE`）：它代表「这块网卡的 IPv4 网关」，不是主机上的网卡，按名字找必然落空。以前两端都在线时网关诊断一律被判 NIC_DISAPPEARED「网关已消失」而跳过，只有重扫本身失败（辅测机已死）时才跑得到。守在 `gateway_diagnostics_survive_the_pre_unit_nic_refresh`。
+- IPv4 同 /24 门禁只限制跨机 iperf；ping 不受限。IPv6 优先双端 link-local，其次 global；`%zone` 按**执行命令的那一端**的平台决定（`Ctx::add_zone`：主控侧看本机，辅测侧看 `/health` 报的 `agent_os`）——Windows 不加，macOS / Linux 加。以前按主控编译平台一刀切，Windows 主控 + macOS 辅测时辅测端的 ping6 / iperf3 全部绑定失败，守在 `link_local_zones_follow_the_platform_that_runs_the_command_not_the_master`。
 - UDP 限流按每条腿的发送 NIC；WiFi/未知速率不裁剪；任一腿不能承载 profile 就跳过整个 Unit。
 - PASS 规则：ping 见 `ping.rs` 与 `executor.rs`；iperf core、单流、组内流、组汇总和 Unit 分别见 `executor.rs`；组合计行在 `executor.rs` 标记，并由 `report.rs` 排除在报告总数外。
-- RESUME 是 Unit 级；当前由 `executor/db::resume_age_is_fresh` 按实际时长严格小于 24 小时判断，并容忍未来时间 60 秒。agent HTTP 线程池固定 16 worker，但 iperf3/CTS 的 client 作业各自跑在独立命名线程（`iperf-client-<id>`）上，`/iperf/client/start` 立即返回 job id，**并发流数不受 16 的限制**；每 30 秒 sweep，server/monitor 最大存活分别为 10/30 分钟（`agent/server.rs`）。
+- RESUME 是 Unit 级；当前由 `executor/db::resume_age_is_fresh` 按实际时长严格小于 24 小时判断，并容忍未来时间 60 秒。agent HTTP 线程池固定 16 worker，但 iperf3/CTS 的 client 作业各自跑在独立命名线程（`iperf-client-<id>`）上，`/iperf/client/start` 立即返回 job id，**并发流数不受 16 的限制**；每 30 秒 sweep。资源主要按**租约**回收：主控下发的租约 = 单元时长 + `RESOURCE_LEASE_GRACE_SECS`（300 s，`master/executor.rs`），过期后由下一次 sweep 收掉；`SERVER_MAX_AGE` / `CLIENT_JOB_MAX_AGE` / `MONITOR_MAX_AGE`（均为 90000 s，`agent/server.rs`）只是租约之外的兜底上限。控制台监控另有一层：页面 90 s 不轮询即停（`MONITOR_IDLE_TIMEOUT`），给 agent 的兜底租约 180 s（`UI_MONITOR_LEASE_SECS`）。主控本机起的 iperf3 / ctsTraffic 在 Windows 上加入进程级 `KILL_ON_JOB_CLOSE` Job（`util::spawn_managed_watchdog`），主控被强杀时随之退出，不再留下占端口的孤儿。
 - 对外 JSON 字段即使当前生产代码没有本地消费者，也属于协议兼容面；删除/重命名要同步所有端点和版本策略。
 - WebUI 的 Wi-Fi 门限以“主控频段 × 辅测频段”为一组，每组两个单向门限（主控→辅测、辅测→主控）加**一个双向 RX 合计门限**；界面只按当前两端实际频段组合去重显示。旧的两个「每方向双向门限」按两者之和迁移成合计，只填过一个方向的不推导。旧发送频段规则和具体网口覆盖只作 request.json 读取兼容，新项目不再创建。
 - 频段在**存储与比较**上一律是稳定枚举 `wifi_2_4g` / `wifi_5g` / `wifi_6g` / `unknown`（Rust `plan::canonical_wifi_band`，TS `canonicalWifiBand`），界面再渲染成 `2.4G / 5G / 6G`。展示文案是最容易被改的东西，而改完之后频段规则会**静默失效**——找不到规则不报错，只是门限没了。
-- 门限的最终生效值必须能在预览上直接看到（`PlannedUnit::targets`）。`RateTargets::for_direction("ab")` 是 `ab.or(forward)`，所以「`forward` 字段还在」不能证明它还在生效；补兜底门限一律走 `fill_direction_target`，它按 `for_direction` 的结果判断，不看某个字段填没填。
+- 门限的最终生效值必须能在预览上直接看到（`PlannedUnit::targets`），来源标签要分清单口覆盖（「按网口门限」）与角色配对（「角色配对门限」，`LinkPolicy::rx_target_from_role`）——角色配对只来自项目 / 主控配置、界面上没有输入框，标成「按网口门限」会让人去那张表里找一个不存在的数。守在 `a_role_pair_target_is_not_labelled_as_a_per_nic_target`。`RateTargets::for_direction("ab")` 是 `ab.or(forward)`，所以「`forward` 字段还在」不能证明它还在生效；补兜底门限一律走 `fill_direction_target`，它按 `for_direction` 的结果判断，不看某个字段填没填。
 - **控制台访问口令默认随机，不回落公开值**（`util::generate_console_token`）。没给
   `--ui-token` / `CPE_UI_TOKEN` 时每次启动现生成一枚随机口令（熵取自标准库 `RandomState`
   读的 OS CSPRNG，不引入第三方依赖），随启动地址的 `?token=` 打印、浏览器自动带着打开。
@@ -661,7 +672,12 @@ Windows 文本适配器：`src/cmd/ipconfig.rs` 解析中英文 `ipconfig /all`�
     掉到 95% 以下整条腿无法评价。
   - 工具自报速率只作展示，但口径要对：`IperfParsed::best_receiver` 只认 receiver 汇总行，
     拿不到就留空（以前退回 client 最后一行，即发送端某一秒的速率）；ctsTraffic 的发送 /
-    接收速率取有流量状态行的平均（以前取峰值那一秒），没有状态行才退回摘要。
+    接收速率取有流量状态行的平均（以前取峰值那一秒），没有状态行才退回摘要。两列各取
+    **承载那一列的一侧**（`cmd::ctstraffic::rates_by_side`：TCP client 发、server 收；UDP
+    server 发、client 收），不把两侧输出合并后按列平均——TCP 对端首秒有几十字节握手、UDP
+    两侧共用一列 Bits/Sec（server 那侧是发送速率），合并平均实测偏低 0.05–3.6%。守在
+    `tool_rates_come_from_the_side_that_carries_each_column` 与执行器的接线断言
+    `cts_rows_take_tool_rates_from_the_carrying_side`。
   - server 逐秒记录按区间长度认汇总行（`MAX_INTERVAL_LINE_MS`）：iperf3 3.1.x 的 UDP
     汇总行不带 `sender` / `receiver` 字样，混进逐秒记录会让断流旁证判反、窗口覆盖率被凑满，
     还会触发「新测试从 0 计时」把前面的逐秒行清空。
@@ -740,3 +756,5 @@ Windows 文本适配器：`src/cmd/ipconfig.rs` 解析中英文 `ipconfig /all`�
 ### CTS 过程事件口径
 
 `cmd::ctstraffic::classify_line` 忽略工具的 Network Errors/Data Errors 星号说明行，仍保留以星号开头的真实故障；TCP client 的过程速率来自 SendBps，TCP server 来自 RecvBps，均转换为 Mbps。接收端事件不可用发送列代替。由 `real_cts_legends_and_receiver_status_preserve_event_meaning` 保证，真实故障行仍保留错误事件。
+
+状态行的事件时刻取行内 TimeSlice（`cmd::ctstraffic::status_elapsed_ms`：进程创建前取零点 + TimeSlice，再与到达时刻取小值），不取读到它的时刻。ctsTraffic 的 stdout 接管道时块缓冲，实机上 TimeSlice 1～25 s 的行在第 27 s 才一次性到达；按到达时刻算，30 s 的单元只剩约 4 s 有效窗口、CTS 一律 NOT_EVALUATED。零点早于 ctsTraffic 内部计时起点，所以投影是真实时刻的下界，误差不超过进程启动延迟。由 `block_buffered_status_lines_keep_their_own_time_slice` 与 `cts_status_lines_restored_from_time_slice_give_a_complete_window` 保证；`cts_effective_window` 对「事件证据不足」仍不猜窗口。
