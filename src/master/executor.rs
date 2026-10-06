@@ -390,6 +390,31 @@ impl LegOutcome {
     }
 }
 
+/// 人主动掐断的单元在报告上要说清楚是人掐的（只进诊断，不改判定）。
+///
+/// - 跳过：一律说明——跳过本来就意味着这一条没跑完；
+/// - 停止（控制台「停止」或 Ctrl+C）：只在确有腿被掐断时说明。停止落在一个
+///   已经跑完的单元之后，那个单元的结论照常成立，不该被这句话抹黑。
+fn operator_interruption_note(
+    skipped: bool,
+    stop_requested: bool,
+    legs_cut_short: bool,
+) -> Option<&'static str> {
+    if skipped {
+        Some(
+            "本单元被操作员手动跳过：下面的失败来自被主动掐断的作业，\
+             不是被测设备的结论。要复测请单独重跑这一条。",
+        )
+    } else if stop_requested && legs_cut_short {
+        Some(
+            "本单元在运行中被操作员停止（控制台「停止」或 Ctrl+C）：下面的失败来自\
+             被主动掐断的作业，不是被测设备的结论。要复测请单独重跑这一条。",
+        )
+    } else {
+        None
+    }
+}
+
 /// 灌包「死流」的两层熔断计数器。**纯状态机**：不碰进程、不碰网络、不碰行。
 ///
 /// 抽出来是因为分组这一层**测不到**：它与全局那一层的区别只在「有链路还活着」
@@ -1077,13 +1102,21 @@ impl Ctx {
             // 走**诊断**通道而不是改写判定：判定说的是「这次跑出了什么」，
             // 而这一行确实什么都没跑出来。改成 PASS/SKIP 就是在判定之后再叠
             // 一层，正是 ADR-17 一直在防的方向。
-            if crate::cancel::take_skip_unit() && crate::cancel::resume_after_skip() {
-                unit_diagnostics.insert(
-                    0,
-                    "本单元被操作员手动跳过：下面的失败来自被主动掐断的作业，\
-                     不是被测设备的结论。要复测请单独重跑这一条。"
-                        .into(),
-                );
+            //
+            // 「停止」（控制台按钮或 Ctrl+C）同理：被掐断的那个单元以前只剩一句
+            // IPERF_EXEC_FAILED 加 iperf 输出的最后一行，读起来像环境故障。
+            // 只在确有腿被掐断时才说——停止恰好落在一个已经跑完的单元之后，
+            // 那个单元的结论照常成立。
+            let skipped = crate::cancel::take_skip_unit() && crate::cancel::resume_after_skip();
+            let legs_cut_short = self.outcomes_were_cut_short(&outcomes);
+            if let Some(note) = operator_interruption_note(
+                skipped,
+                crate::cancel::is_stop_requested(),
+                legs_cut_short,
+            ) {
+                unit_diagnostics.insert(0, note.into());
+            }
+            if skipped {
                 logln("  (已按请求跳过本单元，队列继续)");
             }
             // 单元级「结论的理由」只算一次，报告行和进度页共用。
@@ -1210,6 +1243,17 @@ impl Ctx {
             }
         }
         sum
+    }
+
+    /// 本单元有没有腿是被取消掐断的（行的执行状态为 `Cancelled`）。
+    fn outcomes_were_cut_short(&self, outcomes: &[LegOutcome]) -> bool {
+        let rows = lock_recover(&self.rows);
+        outcomes.iter().any(|outcome| {
+            outcome.main_rows.iter().any(|index| {
+                rows.get(*index)
+                    .is_some_and(|row| row.execution_status == ExecutionStatus::Cancelled)
+            })
+        })
     }
 
     fn outcomes_have_usable_traffic_measurement(&self, outcomes: &[LegOutcome]) -> bool {

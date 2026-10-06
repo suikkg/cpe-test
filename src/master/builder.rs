@@ -65,6 +65,10 @@ impl Endpoint {
     pub fn key(&self) -> String {
         format!("{}:{}:{}", self.side.cn(), self.nic.name, self.nic.ipv4)
     }
+    /// 网关诊断合成出来的目的端点（「<网卡> 的 IPv4 网关」），不是主机上的网卡。
+    pub(crate) fn is_gateway_stand_in(&self) -> bool {
+        self.nic.role == diagnostics::GATEWAY_STAND_IN_ROLE
+    }
 }
 
 /// 规范化后的测试规格（配置文件 tests[] 与交互菜单都产出它）
@@ -378,6 +382,12 @@ pub fn refresh_unit_endpoints(
 ) -> Vec<NicDrift> {
     let mut drifts: Vec<NicDrift> = Vec::new();
     for_each_endpoint_mut(unit, |ep| {
+        // 网关诊断的目的端是合成出来的，重扫结果里永远没有一块叫
+        // 「以太网 的 IPv4 网关」的网卡。按接口名去找它，两端都在线时每个网关
+        // 诊断都会被判成「网卡已消失」而跳过——实机 A1-S09W 三条全军覆没。
+        if ep.is_gateway_stand_in() {
+            return;
+        }
         let host = match ep.side {
             Side::Master => master,
             Side::Agent => agent,

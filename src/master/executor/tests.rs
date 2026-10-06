@@ -7245,3 +7245,40 @@ fn cts_rows_take_tool_rates_from_the_carrying_side() {
         "cts.rs 不再按侧取工具速率，报告会回到合并平均"
     );
 }
+
+/// 人主动掐断的单元要在报告上说清楚是人掐的。
+///
+/// 实机（控制台「停止」30 次、Ctrl+C 中止浸泡）：被掐断的单元只剩
+/// SETUP_ERROR / IPERF_EXEC_FAILED 加 iperf 输出的最后一行，读起来像环境故障；
+/// 「跳过」早就有一句说明，「停止」没有。停止落在一个已经跑完的单元之后时，
+/// 那个单元的结论照常成立，不能被这句话抹黑。
+#[test]
+fn an_operator_stop_is_explained_only_on_the_unit_it_cut_short() {
+    let skip = operator_interruption_note(true, false, true).unwrap();
+    assert!(skip.contains("手动跳过"), "{skip}");
+    assert_eq!(operator_interruption_note(true, false, false), Some(skip));
+
+    let stop = operator_interruption_note(false, true, true).unwrap();
+    assert!(stop.contains("被操作员停止"), "{stop}");
+    assert!(stop.contains("不是被测设备的结论"), "{stop}");
+
+    assert_eq!(
+        operator_interruption_note(false, true, false),
+        None,
+        "停止落在跑完的单元之后，不许给它扣帽子"
+    );
+    assert_eq!(operator_interruption_note(false, false, true), None);
+    assert_eq!(operator_interruption_note(false, false, false), None);
+
+    // 单元收尾确实按「这一格有没有腿被掐断」去问，而不是只看停止位。
+    let source = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/master/executor.rs"),
+    )
+    .expect("read executor.rs");
+    let call = source
+        .find("operator_interruption_note(\n                skipped,")
+        .expect("单元收尾必须经 operator_interruption_note 补说明");
+    let window = &source[call..call + 200];
+    assert!(window.contains("is_stop_requested()"), "{window}");
+    assert!(window.contains("legs_cut_short"), "{window}");
+}

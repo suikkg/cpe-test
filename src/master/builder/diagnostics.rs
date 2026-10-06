@@ -23,6 +23,11 @@ pub(super) fn subnet_ping_key(src: &Endpoint, dst: &Endpoint, payload: u32) -> S
 /// 折中是**带命名空间的键**：既和真实链路组分得开，又保留了它从哪来。
 const DIAGNOSTIC_GROUP_PREFIX: &str = "[故障诊断]";
 
+/// 网关诊断里那个合成目的端点的角色。它代表「这块网卡的 IPv4 网关」，不是哪台
+/// 主机上的网卡，所以开跑前的网卡重扫不能拿接口名去找它（见
+/// `Endpoint::is_gateway_stand_in`）。
+pub(crate) const GATEWAY_STAND_IN_ROLE: &str = "GATEWAY";
+
 fn diagnostic_link_group(origin: &str, src: &Endpoint, dst: &Endpoint) -> String {
     let origin = origin.trim();
     if !origin.is_empty() {
@@ -161,7 +166,7 @@ pub fn build_traffic_failure_diagnostics(selected_units: &[Unit]) -> Vec<Unit> {
             nic: NicInfo {
                 name: format!("{} 的 IPv4 网关", endpoint.nic.name),
                 description: "IPv4 默认网关".into(),
-                role: "GATEWAY".into(),
+                role: GATEWAY_STAND_IN_ROLE.into(),
                 ipv4: gateway.clone(),
                 ..Default::default()
             },

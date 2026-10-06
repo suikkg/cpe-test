@@ -4320,3 +4320,47 @@ fn every_plan_notice_carries_the_kind_the_console_acts_on() {
         "{texts:#?}"
     );
 }
+
+/// 网关诊断开跑前的网卡重扫不能把合成的「网关」端点当成网卡去找。
+///
+/// 实机 A1-S09W：两端都在线、三块网卡的网关都是 192.168.8.1，三条网关诊断却全部
+/// 判 NIC_DISAPPEARED「以太网 的 IPv4 网关 已消失」——重扫按接口名找
+/// 「以太网 的 IPv4 网关」，当然找不到。真实的源网卡仍然要照常刷新与核对。
+#[test]
+fn gateway_diagnostics_survive_the_pre_unit_nic_refresh() {
+    let mut spec = base_spec();
+    spec.src = ep(Side::Master, "以太网", "SGMII1G", "192.168.8.103", 1000);
+    spec.dst = ep(Side::Agent, "en0", "SGMII1G", "192.168.8.102", 1000);
+    spec.src.nic.gateway_v4 = "192.168.8.1".into();
+    spec.dst.nic.gateway_v4 = "192.168.8.1".into();
+    let mut port = PORT_BASE;
+    let (units, _) = build_units(&[spec.clone()], true, &mut port);
+    let gateway_units: Vec<Unit> = build_traffic_failure_diagnostics(&units)
+        .into_iter()
+        .filter(|unit| {
+            matches!(&unit.legs[0].kind,
+                LegKind::Ping(task) if task.purpose == PingPurpose::GatewayDiagnostic)
+        })
+        .collect();
+    assert_eq!(gateway_units.len(), 2, "两端各一条网关诊断");
+
+    let master = host_with("master", vec![spec.src.nic.clone()]);
+    let agent = host_with("agent", vec![spec.dst.nic.clone()]);
+    for unit in &gateway_units {
+        let mut unit = unit.clone();
+        let drifts = refresh_unit_endpoints(&mut unit, &master, &agent);
+        assert!(drifts.is_empty(), "{}：{drifts:?}", unit.title);
+        let LegKind::Ping(task) = &unit.legs[0].kind else {
+            unreachable!()
+        };
+        assert_eq!(task.dst.nic.ipv4, "192.168.8.1", "目的端仍是网关地址");
+    }
+
+    // 源网卡真的不见了，照样判消失——跳过的只是合成端点。
+    let mut unit = gateway_units[0].clone();
+    let empty = host_with("master", Vec::new());
+    let drifts = refresh_unit_endpoints(&mut unit, &empty, &empty);
+    assert_eq!(drifts.len(), 1, "{drifts:?}");
+    assert!(drifts[0].is_gone());
+    assert!(!drifts[0].describe().contains("网关"), "{drifts:?}");
+}
