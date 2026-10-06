@@ -7274,7 +7274,9 @@ fn an_operator_stop_is_explained_only_on_the_unit_it_cut_short() {
     let source = std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/master/executor.rs"),
     )
-    .expect("read executor.rs");
+    .expect("read executor.rs")
+    // Windows 上 `core.autocrlf=true` 检出的是 CRLF，多行匹配前先归一（CI 的 Windows 构建撞上过）。
+    .replace("\r\n", "\n");
     let call = source
         .find("operator_interruption_note(\n                skipped,")
         .expect("单元收尾必须经 operator_interruption_note 补说明");
