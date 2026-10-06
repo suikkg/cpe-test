@@ -78,10 +78,21 @@ impl ManagedChildWatchdog {
     }
 }
 
-/// 为目标子进程创建跨平台补偿 watchdog。
-pub fn spawn_managed_watchdog(target_pid: u32) -> std::io::Result<Option<ManagedChildWatchdog>> {
+/// 为目标子进程装上「父进程死了它也得跟着退出」的保证。
+///
+/// - Linux：内核死亡信号（`configure_managed_command` 里设）；
+/// - macOS / 其他 Unix：同包 watchdog 监听存活 pipe；
+/// - Windows：把子进程加入一个进程级、`KILL_ON_JOB_CLOSE` 的 Job Object。
+///
+/// Windows 这一支以前什么都不做，只有 agent 在启动时把自己整个放进 Job
+/// （`initialize_agent_process_lifetime`）；主控（`master` / `ui` / `inner`）在本机起的
+/// iperf3 / ctsTraffic 在主控被强杀后成了孤儿，继续占着端口，下一轮同端口的单元
+/// 直接 SETUP_ERROR（实机 A1-S06）。这里只托管工具子进程、不把主控自己放进 Job：
+/// 主控还会打开报告、拉起浏览器，那些进程不能随主控退出被一起杀掉。
+pub fn spawn_managed_watchdog(child: &Child) -> std::io::Result<Option<ManagedChildWatchdog>> {
     #[cfg(all(unix, not(target_os = "linux"), not(test)))]
     {
+        let target_pid = child.id();
         let exe = std::env::current_exe()?;
         let mut command = Command::new(exe);
         command
@@ -100,10 +111,100 @@ pub fn spawn_managed_watchdog(target_pid: u32) -> std::io::Result<Option<Managed
             keepalive: Some(keepalive),
         }))
     }
-    #[cfg(any(target_os = "linux", windows, test))]
+    #[cfg(windows)]
     {
-        let _ = target_pid;
+        windows_tool_job::assign(child);
         Ok(None)
+    }
+    #[cfg(any(target_os = "linux", all(test, not(windows))))]
+    {
+        let _ = child;
+        Ok(None)
+    }
+}
+
+/// 主控本机工具子进程共用的 Job Object（见 [`spawn_managed_watchdog`]）。
+#[cfg(windows)]
+mod windows_tool_job {
+    use std::os::windows::io::AsRawHandle;
+    use std::process::Child;
+    use std::sync::OnceLock;
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    /// 句柄以整数保存：`HANDLE` 包的是裸指针，不能放进 static。整个进程生命期
+    /// 都不关闭，进程退出时由系统关闭句柄，并按 KILL_ON_JOB_CLOSE 回收所有成员。
+    static JOB: OnceLock<Result<usize, String>> = OnceLock::new();
+    static WARNED: OnceLock<()> = OnceLock::new();
+
+    fn job() -> Result<HANDLE, String> {
+        JOB.get_or_init(|| unsafe {
+            let job = CreateJobObjectW(None, PCWSTR::null())
+                .map_err(|error| format!("创建工具 Job Object 失败: {error}"))?;
+            let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+            .map_err(|error| format!("配置工具 Job Object 失败: {error}"))?;
+            Ok(job.0 as usize)
+        })
+        .clone()
+        .map(|raw| HANDLE(raw as *mut core::ffi::c_void))
+    }
+
+    /// 尽力而为：挂不进 Job（例如所在的外层 Job 不允许嵌套）只告警一次、照常跑。
+    /// 这是「主控崩溃后的兜底回收」，为它把正常的一轮测试判成起不来是本末倒置。
+    pub(super) fn assign(child: &Child) {
+        let result = job().and_then(|job| unsafe {
+            AssignProcessToJobObject(job, HANDLE(child.as_raw_handle()))
+                .map_err(|error| format!("工具进程加入 Job Object 失败: {error}"))
+        });
+        if let Err(error) = result {
+            if WARNED.set(()).is_ok() {
+                eprintln!("!! {error}；主控异常退出时本机工具进程可能残留");
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use windows::Win32::Foundation::BOOL;
+        use windows::Win32::System::JobObjects::IsProcessInJob;
+
+        /// 主控被强杀后本机工具不能变成孤儿（实机 A1-S06：被杀主控留下的 iperf3
+        /// server 一直占着端口，下一轮同端口单元 SETUP_ERROR）。经托管入口起的
+        /// 工具子进程必须落在 `KILL_ON_JOB_CLOSE` 的 Job 里。
+        #[test]
+        fn managed_tool_children_join_the_kill_on_close_job() {
+            let mut child = std::process::Command::new("cmd")
+                .args(["/C", "ping -n 5 127.0.0.1 >NUL"])
+                .spawn()
+                .expect("spawn child");
+            let managed = crate::util::spawn_managed_watchdog(&child).expect("manage child");
+            assert!(managed.is_none(), "Windows 不另起 watchdog 进程");
+            let mut inside = BOOL(0);
+            let checked = unsafe {
+                IsProcessInJob(
+                    HANDLE(child.as_raw_handle()),
+                    job().expect("tool job"),
+                    &mut inside,
+                )
+            };
+            let _ = child.kill();
+            let _ = child.wait();
+            checked.expect("IsProcessInJob");
+            assert!(inside.as_bool(), "工具子进程必须在工具 Job 里");
+        }
     }
 }
 
@@ -418,7 +519,7 @@ fn run_cmd_system(prog: &str, args: &[&str], timeout: Duration) -> CmdOut {
             }
         }
     };
-    let mut watchdog = match spawn_managed_watchdog(child.id()) {
+    let mut watchdog = match spawn_managed_watchdog(&child) {
         Ok(watchdog) => watchdog,
         Err(error) => {
             let cleanup_errors = terminate_and_reap(&mut child);
@@ -569,7 +670,7 @@ fn run_streaming_system<F: FnMut(&str, Instant)>(
             }
         }
     };
-    let mut watchdog = match spawn_managed_watchdog(child.id()) {
+    let mut watchdog = match spawn_managed_watchdog(&child) {
         Ok(watchdog) => watchdog,
         Err(error) => {
             let cleanup_errors = terminate_and_reap(&mut child);

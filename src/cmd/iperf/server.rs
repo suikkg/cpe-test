@@ -221,7 +221,7 @@ impl IperfServerMgr {
         let mut child = command
             .spawn()
             .map_err(|e| format!("启动 iperf3 server 失败: {e} (命令: {cmd_str})"))?;
-        let watchdog = match spawn_managed_watchdog(child.id()) {
+        let watchdog = match spawn_managed_watchdog(&child) {
             Ok(watchdog) => watchdog,
             Err(error) => {
                 let _ = child.kill();
