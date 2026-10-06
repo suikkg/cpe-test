@@ -383,8 +383,10 @@ pub fn parse_output(text: &str, protocol: CtsTrafficProtocol) -> CtsTrafficParse
     // 接收」列因此系统性偏高，而同样两列在 iperf 行上是平均值，读报告的人拿它
     // 和网卡 RX 平均对照时会以为网卡漏记了。判定只看网卡口径，不受影响。
     //
-    // 只平均有流量的行：客户端和服务端的状态行混在同一段文本里，某一列在对端
-    // 那一侧恒为零。也不优先用摘要的「总字节 ÷ Total Time」：Total Time 含建连
+    // 只平均有流量的行：某一列在不承载数据的那一侧基本为零。「基本」而不是
+    // 「恒」——TCP 对端首秒有几十字节握手，UDP 两侧共用一列 Bits/Sec，所以
+    // client 与 server 合并成一段文本时这里的平均是混的；执行器的报告速率走
+    // `rates_by_side`，按承载那一列的一侧单独取。也不优先用摘要的「总字节 ÷ Total Time」：Total Time 含建连
     // 与缓冲时间（实测 UDP 60 秒流的 Total Time 是 61.3 秒），比网卡判定窗口长。
     // 没有任何状态行（进程被杀、输出截断）才退回摘要。
     let status_mean = |values: &[f64]| {
@@ -426,6 +428,33 @@ pub fn parse_output(text: &str, protocol: CtsTrafficProtocol) -> CtsTrafficParse
         || lower.contains("time limit of")
         || lower.contains("timelimit reached");
     parsed
+}
+
+/// 工具自报的（发送，接收）速率，各取**承载那一列的那一侧**的输出。
+///
+/// 自动任务都是单向数据流：TCP（Push）client 发、server 收；UDP server 发、
+/// client 收（与 `build_args` 设 socket buffer 的分侧一致）。把两侧输出合并
+/// 再按列平均会混进不属于这一列的行：
+///
+/// - TCP 对端首秒有几十字节握手（实测 client 的接收列 `36`），作为「有流量」
+///   的一行进了接收平均，30 秒单元整体偏低 1/28；
+/// - UDP 状态行只有一列 Bits/Sec，server 那一侧是**发送**速率，连同它首秒的
+///   爬升一起进了「接收」平均。
+///
+/// 某一侧一行状态都没有（进程被杀、输出截断）时返回 `None`，由调用方退回
+/// 合并解析的结果。
+pub fn rates_by_side(
+    client_output: &str,
+    server_output: &str,
+    protocol: CtsTrafficProtocol,
+) -> (Option<f64>, Option<f64>) {
+    let client = parse_output(client_output, protocol);
+    let server = parse_output(server_output, protocol);
+    match protocol {
+        CtsTrafficProtocol::Tcp => (client.send_mbps, server.recv_mbps),
+        // UDP 的那一列 `parse_output` 记在 `recv_mbps` 上；在 server 一侧它是发送速率。
+        CtsTrafficProtocol::Udp => (server.recv_mbps, client.recv_mbps),
+    }
 }
 
 fn classify_line(line: &str, req: &CtsTrafficReq, elapsed_ms: u64) -> Option<IperfFlowEvent> {
@@ -471,10 +500,27 @@ fn classify_line(line: &str, req: &CtsTrafficReq, elapsed_ms: u64) -> Option<Ipe
     };
     (mbps > 0.0).then(|| IperfFlowEvent {
         kind: IperfEventKind::Traffic,
-        elapsed_ms,
+        elapsed_ms: status_elapsed_ms(values[0], elapsed_ms),
         mbps: Some(mbps),
         line: line.to_string(),
     })
+}
+
+/// 状态行的发生时刻：取行内 TimeSlice（ctsTraffic 自启动以来的累计秒数），不取读到它的时刻。
+///
+/// ctsTraffic 的标准输出接到管道上是块缓冲的：实机上 TimeSlice 1～25 s 的状态行在
+/// 第 27 s 一次性到达、其余在进程退出时到达。按到达时刻当事件时间，流量事件全挤在
+/// 最后几秒，30 s 的单元算出 4 s 有效窗口，CTS 单元一律 NOT_EVALUATED（实机 B1-F03）。
+///
+/// `elapsed_ms` 的零点取在进程创建之前，必然早于 ctsTraffic 内部计时的起点，所以
+/// TimeSlice 投影出的时刻是真实时刻的下界，误差不超过进程启动延迟；再与到达时刻取
+/// 小值，保证投影出来的时刻不会晚于这一行被读到的时刻。
+fn status_elapsed_ms(time_slice_secs: f64, arrival_ms: u64) -> u64 {
+    if !time_slice_secs.is_finite() || time_slice_secs < 0.0 {
+        return arrival_ms;
+    }
+    let projected = (time_slice_secs * 1_000.0).round().min(u64::MAX as f64) as u64;
+    projected.min(arrival_ms)
 }
 
 pub fn run_controlled<F>(
@@ -606,6 +652,43 @@ pub fn start_managed_job(
 
 #[cfg(test)]
 mod tests {
+    /// 实机 B1-F03：client 的状态行在管道里被块缓冲，TimeSlice 1～25 s 的行在第
+    /// 27.096 s 一次性到达。事件时间必须按 TimeSlice 还原，而不是全部记成 27.096 s。
+    #[test]
+    fn block_buffered_status_lines_keep_their_own_time_slice() {
+        let req = CtsTrafficReq {
+            role: CtsTrafficRole::Client,
+            protocol: CtsTrafficProtocol::Tcp,
+            ..Default::default()
+        };
+        let burst_arrival_ms = 27_096;
+        let lines = [
+            (
+                "      1.014    106796997            0          1          0         0          0",
+                1_014,
+            ),
+            (
+                "     10.016    106537001            0          1          0         0          0",
+                10_016,
+            ),
+            (
+                "     25.017    105356172            0          1          0         0          0",
+                25_017,
+            ),
+        ];
+        for (line, expected_ms) in lines {
+            let event = classify_line(line, &req, burst_arrival_ms).expect("traffic event");
+            assert_eq!(event.kind, IperfEventKind::Traffic);
+            assert_eq!(event.elapsed_ms, expected_ms, "{line}");
+        }
+        // 投影不得晚于被读到的时刻（时钟抖动或异常行）。
+        let late = classify_line("     30.000    100000000 0 1 0 0 0", &req, 29_500).unwrap();
+        assert_eq!(late.elapsed_ms, 29_500);
+        // 逗号小数点的 locale 同样认。
+        let comma = classify_line("      2,005    106796997 0 1 0 0 0", &req, 27_096).unwrap();
+        assert_eq!(comma.elapsed_ms, 2_005);
+    }
+
     /// 逗号在这个文件里有两种含义，两处都要钉住，否则哪天改动一处
     /// 会把另一处悄悄带偏。
     #[test]
@@ -776,6 +859,48 @@ Total Time : 61273 ms.
         );
         assert_eq!(parsed.send_mbps, Some(1_000.0), "平均而不是峰值 1200");
         assert_eq!(parsed.recv_mbps, Some(1_000.0));
+    }
+
+    /// 形状取自实机日志（R-B1-F03A）：TCP client 首秒接收列有 36 字节握手，
+    /// UDP server 的 Bits/Sec 是发送速率、首秒只有 26.7 Mbps 的爬升。
+    #[test]
+    fn tool_rates_come_from_the_side_that_carries_each_column() {
+        let tcp_client = " 0.004 0 0 0 0 0 0\n\
+                           1.017 125000000 36 1 0 0 0\n\
+                           2.008 125000000 0 1 0 0 0\n";
+        let tcp_server = " 0.005 0 0 0 0 0 0\n\
+                           1.012 36 100000000 1 0 0 0\n\
+                           2.006 0 125000000 1 0 0 0\n";
+        let (send, recv) = rates_by_side(tcp_client, tcp_server, CtsTrafficProtocol::Tcp);
+        assert_eq!(send, Some(1_000.0));
+        assert_eq!(recv, Some(900.0), "server 两行 800 / 1000 的平均");
+        let merged = parse_output(
+            &format!("{tcp_client}\n{tcp_server}"),
+            CtsTrafficProtocol::Tcp,
+        );
+        assert!(
+            merged.recv_mbps.unwrap() < 700.0,
+            "合并平均会把 client 的 36 字节当成一行流量"
+        );
+
+        let udp_server = " 0.014 0 0 0 0 0 0\n\
+                           1.027 26653504 1 0 0 0 0\n\
+                           2.022 100000000 1 0 0 0 0\n";
+        let udp_client = " 0.015 0 1 0 0 0 0\n\
+                           1.024 100000000 1 2 0 0 0\n\
+                           2.020 98000000 1 101 0 0 0\n";
+        let (send, recv) = rates_by_side(udp_client, udp_server, CtsTrafficProtocol::Udp);
+        assert_eq!(recv, Some(99.0), "只平均 client（接收侧）的 Bits/Sec");
+        assert!(
+            (send.unwrap() - 63.326752).abs() < 1e-6,
+            "server 一侧是发送速率"
+        );
+
+        assert_eq!(
+            rates_by_side("", "", CtsTrafficProtocol::Tcp),
+            (None, None),
+            "没有状态行时交给调用方退回合并解析"
+        );
     }
 
     #[test]

@@ -7180,3 +7180,68 @@ fn link_local_zones_follow_the_platform_that_runs_the_command_not_the_master() {
         if local_needs { "fe80::1%7" } else { "fe80::1" }
     );
 }
+
+/// 实机 B1-F03：状态行按 TimeSlice 还原时刻之后，30 s 的 CTS 单元要能得到完整窗口。
+/// 以前事件按到达时刻记，全部挤在第 27 s 与退出前，窗口只剩约 4 s，CTS 一律 NOT_EVALUATED。
+#[test]
+fn cts_status_lines_restored_from_time_slice_give_a_complete_window() {
+    let started_ms = 752;
+    let mut events = vec![IperfFlowEvent {
+        kind: IperfEventKind::Started,
+        elapsed_ms: started_ms,
+        ..Default::default()
+    }];
+    for second in 1..=33u64 {
+        events.push(IperfFlowEvent {
+            kind: IperfEventKind::Traffic,
+            elapsed_ms: started_ms + second * 1_000 + 14,
+            mbps: Some(850.0),
+            ..Default::default()
+        });
+    }
+    events.push(IperfFlowEvent {
+        kind: IperfEventKind::Ended,
+        elapsed_ms: 34_103,
+        ..Default::default()
+    });
+    let window = cts_effective_window(&events, 30, 1_000, 3);
+    assert!(window.complete, "{window:?}");
+    assert_eq!(window.end_ms - window.start_ms, 30_000);
+    assert!(window.start_ms >= started_ms + 3_000, "起流爬升段要扣掉");
+    assert!(window.end_ms <= 34_103);
+}
+
+/// 三条吞吐路径的腿级行都要带上 RX 分布四项，且取自同一个 `rx_stats`。
+///
+/// 实机 B1-F04：CTS 行的中位 / P95 / 最小 / 最大一直是空的——`rx_stats` 早就算好了，
+/// 只是 CTS 构造行时没填，HTML 与 Excel 这四列对 CTS 永远空白，而 iperf 行有值。
+#[test]
+fn every_throughput_path_fills_the_rx_distribution_columns() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/master/executor");
+    for file in ["iperf_leg.rs", "udp.rs", "cts.rs"] {
+        let text = std::fs::read_to_string(root.join(file)).expect("read source");
+        for field in [
+            "rx_median: rx_stats.median_mbps",
+            "rx_p95: rx_stats.p95_mbps",
+            "rx_min: rx_stats.min_mbps",
+            "rx_max: rx_stats.max_mbps",
+        ] {
+            assert!(text.contains(field), "{file} 构造报告行时漏了 `{field}`");
+        }
+    }
+}
+
+/// CTS 报告行的工具速率按承载那一列的一侧取（`ctstraffic::rates_by_side`）。
+///
+/// 实机 B3-C04：合并 client 与 server 输出再按列平均，TCP 接收列混进对端握手
+/// 字节、UDP 接收列混进 server 的发送速率，报告的工具速率偏低 0.05–3.6%。
+/// 这一步只在执行器里接线，删掉它不会让任何解析测试变红。
+#[test]
+fn cts_rows_take_tool_rates_from_the_carrying_side() {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/master/executor/cts.rs");
+    let text = std::fs::read_to_string(path).expect("read source");
+    assert!(
+        text.contains("ctstraffic::rates_by_side("),
+        "cts.rs 不再按侧取工具速率，报告会回到合并平均"
+    );
+}

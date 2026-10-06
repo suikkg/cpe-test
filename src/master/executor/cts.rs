@@ -785,7 +785,12 @@ impl Ctx {
         let (server_cancelled_before_stop, server_unexpected_failure) =
             cts_server_pre_stop_failures(&server_stop);
         let combined_output = format!("{}\n{}", client_run.client.output, server_output);
-        let parsed = ctstraffic::parse_output(&combined_output, protocol);
+        let mut parsed = ctstraffic::parse_output(&combined_output, protocol);
+        // 合并文本只用来收计数器；速率按承载那一列的一侧取，合并平均会混进对端的行。
+        let (send_mbps, recv_mbps) =
+            ctstraffic::rates_by_side(&client_run.client.output, &server_output, protocol);
+        parsed.send_mbps = send_mbps.or(parsed.send_mbps);
+        parsed.recv_mbps = recv_mbps.or(parsed.recv_mbps);
         let traffic_established = parsed.has_measurement(protocol);
         let traffic_window = cts_effective_window(
             &events,
@@ -1394,6 +1399,12 @@ impl Ctx {
             tx_avg: tx_stats.avg_mbps,
             tx_p10: tx_stats.p10_mbps,
             rx_p10: rx_stats.p10_mbps,
+            // 分布四项和 iperf / UDP 两条路径同源（同一个 `rx_stats`）。以前 CTS 漏填，
+            // 报告与 Excel 的中位 / P95 / 最小 / 最大对 CTS 行一直是空白。
+            rx_median: rx_stats.median_mbps,
+            rx_p95: rx_stats.p95_mbps,
+            rx_min: rx_stats.min_mbps,
+            rx_max: rx_stats.max_mbps,
             effective_seconds: Some(
                 selected
                     .traffic_window
