@@ -92,6 +92,13 @@ pub(crate) struct RateStats {
     ///
     /// 默认 `Unknown`：没补旁证的路径维持「零增长就不下结论」的保守口径。
     pub stall_evidence: StallEvidence,
+    /// 采样分辨率：监控的名义采样间隔（毫秒），`0` = 未知。
+    ///
+    /// 零增长最短也只能量到一个采样间隔——计数器在这一拍里没动，到底停了 1 ms
+    /// 还是整整一拍，样本分不出来。停滞门槛按窗口的 5% 算时，10 秒窗口的门槛
+    /// 只有 0.5 秒，比分辨率还细：一个零样本（Wi-Fi 计数器批量记账时常见）就占
+    /// 10%，整条腿判 COUNTER_STALLED（实机 X-A1-F02）。所以门槛不低于这个分辨率。
+    pub sample_resolution_ms: u64,
 }
 
 impl RateStats {
@@ -109,8 +116,22 @@ impl RateStats {
 
     /// 零增长够长、而且没有证据证明它是真断流——这时不能拿平均值下结论。
     pub(crate) fn stall_blocks_verdict(&self) -> bool {
+        self.stall_exceeds_threshold() && self.stall_evidence != StallEvidence::TrafficStopped
+    }
+
+    /// 最长零增长段是否越过停滞门槛：超过窗口的 5%，**并且**长于一个采样间隔。
+    ///
+    /// 「长于一个采样间隔」带 1.5 倍余量：样本间隔有几毫秒到十几毫秒的抖动
+    /// （实测 1007–1015 ms），一个零样本的段长会略超名义间隔；连续两个零样本
+    /// （约 2 个间隔）才算。≥20 秒的窗口 5% 已经不小于一个间隔，行为不变。
+    pub(crate) fn stall_exceeds_threshold(&self) -> bool {
+        let stall_ms = self
+            .stall_span_ms
+            .map_or(0, |(start, end)| end.saturating_sub(start));
+        // 分辨率未知（0）时维持原口径，只看窗口比例。
         self.stalled_ratio > 1.0 - MIN_RATE_SAMPLE_COVERAGE
-            && self.stall_evidence != StallEvidence::TrafficStopped
+            && (self.sample_resolution_ms == 0
+                || stall_ms as f64 > self.sample_resolution_ms as f64 * 1.5)
     }
 }
 
@@ -515,10 +536,16 @@ pub(crate) fn evaluate_rx_acceptance(
             ),
         );
     }
-    let Some(rx_avg) = stats
-        .avg_mbps
-        .filter(|value| value.is_finite() && *value > MIN_VALID_RX_MBPS)
-    else {
+    // 有效下限（MIN_VALID_RX_MBPS）是为了不把「没采到流量」当成速率；但旁证已经
+    // 确认那段零增长是真断流（工具侧同期也没有数据）时，接近零的平均值就是这条
+    // 方向真实的吞吐——整个窗口都不通的方向照常进验收，有门限判 RATE_FAIL。
+    // 以前这里一律判 NIC_RATE_MISSING「没有可用的 RX 速率」，和同一行诊断
+    // 「零是真实值」自相矛盾，verify 下一条从头到尾不通的方向永远拿不到
+    // RATE_FAIL（实机 X-B2-01 双向 v6 UDP -l 14k）。
+    let real_outage = stats.stall_evidence == StallEvidence::TrafficStopped;
+    let Some(rx_avg) = stats.avg_mbps.filter(|value| {
+        value.is_finite() && (*value > MIN_VALID_RX_MBPS || (real_outage && *value >= 0.0))
+    }) else {
         return VerdictResult::not_evaluated(
             ReasonCode::NicRateMissing,
             "有效流量窗口内没有可用的接收端 OS 网卡 RX 速率",
@@ -572,9 +599,7 @@ pub(crate) fn rx_acceptance_diagnostics(
     offered_floor: Option<f64>,
 ) -> Vec<String> {
     let mut out = Vec::new();
-    if stats.stalled_ratio > 1.0 - MIN_RATE_SAMPLE_COVERAGE
-        && stats.stall_evidence == StallEvidence::TrafficStopped
-    {
+    if stats.stall_exceeds_threshold() && stats.stall_evidence == StallEvidence::TrafficStopped {
         out.push(format!(
             "接收端网卡计数器连续 {:.1}% 的时间零增长，工具侧同期也没有数据在走：\
              按真实断流计入平均（这段时间的零是真实值）",
@@ -947,6 +972,7 @@ pub(crate) fn monitor_rate_stats(
             .clamp(0.0, 1.0),
         stall_span_ms: stall,
         stall_evidence: StallEvidence::Unknown,
+        sample_resolution_ms: nominal_interval_ms.unwrap_or(0),
     }
 }
 
@@ -1537,6 +1563,97 @@ mod tests {
         assert!(stats.stalled_ratio < 0.05, "{}", stats.stalled_ratio);
         let (verdict, _, _) = nic_rx(RateMode::Observe, None, &stats);
         assert_eq!(verdict, Verdict::Measured);
+    }
+
+    /// 停滞门槛不低于采样分辨率：10 秒窗口里**一个**零样本（约 1 个采样间隔）
+    /// 不再判 COUNTER_STALLED；连续两个零样本照判。实机 X-A1-F02：Wi-Fi 双向
+    /// v6 TCP、10 s 单元，一个 1 秒零样本就占 10% 而判了停滞。
+    #[test]
+    fn a_single_zero_sample_in_a_short_window_is_below_the_sampling_resolution() {
+        let window = EffectiveWindow {
+            start_ms: 0,
+            end_ms: 10_000,
+            available_secs: 10.0,
+            required_secs: 10,
+            complete: true,
+        };
+        let stats_with_zeros = |zeros: &[u64]| {
+            let samples = (1..=10)
+                .map(|i| sample(i * 1_000, if zeros.contains(&i) { 0 } else { 25_000_000 }))
+                .collect();
+            monitor_rate_stats(
+                &MonitorStopOut {
+                    samples,
+                    ..Default::default()
+                },
+                &window,
+                true,
+                0,
+            )
+        };
+        let one = stats_with_zeros(&[5]);
+        assert_eq!(one.sample_resolution_ms, 1_000, "分辨率要从样本里带出来");
+        assert!(one.stalled_ratio > 0.05, "{}", one.stalled_ratio);
+        assert!(!one.stall_blocks_verdict(), "一个零样本不到一个分辨率");
+        assert_eq!(nic_rx(RateMode::Observe, None, &one).0, Verdict::Measured);
+
+        let two = stats_with_zeros(&[5, 6]);
+        assert!(two.stall_blocks_verdict(), "连续两个零样本照判停滞");
+        assert_eq!(
+            nic_rx(RateMode::Observe, None, &two).1,
+            ReasonCode::CounterStalled
+        );
+    }
+
+    /// 旁证确认整段是真断流时，接近零的平均值照常进验收：有门限判 RATE_FAIL、
+    /// 没门限判 MEASURED。以前一律 NIC_RATE_MISSING「没有可用的 RX 速率」，
+    /// 和同一行诊断「零是真实值」自相矛盾（实机 X-B2-01 双向 v6 UDP -l 14k）。
+    #[test]
+    fn a_confirmed_whole_window_outage_is_judged_by_its_near_zero_average() {
+        let dead = RateStats {
+            avg_mbps: Some(0.0001),
+            coverage: 1.0,
+            stalled_ratio: 0.6,
+            stall_span_ms: Some((0, 12_000)),
+            sample_resolution_ms: 1_000,
+            stall_evidence: StallEvidence::TrafficStopped,
+            ..Default::default()
+        };
+        let fail = evaluate_rx_acceptance(RateMode::Verify, Some(100.0), &dead);
+        assert_eq!(fail.verdict, Verdict::RateFail);
+        assert_eq!(fail.code, ReasonCode::RxBelowTarget);
+        assert_eq!(
+            evaluate_rx_acceptance(RateMode::Observe, None, &dead).verdict,
+            Verdict::Measured
+        );
+
+        // 没有旁证（或旁证说工具仍在走）照旧不下结论；根本没有平均值照旧是缺速率。
+        let unknown = RateStats {
+            stall_evidence: StallEvidence::Unknown,
+            ..dead.clone()
+        };
+        assert_eq!(
+            evaluate_rx_acceptance(RateMode::Verify, Some(100.0), &unknown).code,
+            ReasonCode::CounterStalled
+        );
+        let no_average = RateStats {
+            avg_mbps: None,
+            ..dead.clone()
+        };
+        assert_eq!(
+            evaluate_rx_acceptance(RateMode::Verify, Some(100.0), &no_average).code,
+            ReasonCode::NicRateMissing
+        );
+        // 没有任何零增长段时，低于下限仍是「没采到流量」，不是真断流。
+        let quiet = RateStats {
+            avg_mbps: Some(0.0001),
+            coverage: 1.0,
+            ..Default::default()
+        };
+        assert_eq!(
+            evaluate_rx_acceptance(RateMode::Verify, Some(100.0), &quiet).code,
+            ReasonCode::NicRateMissing
+        );
     }
 
     #[test]
