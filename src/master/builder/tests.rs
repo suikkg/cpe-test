@@ -1033,6 +1033,36 @@ fn a_wifi_rate_that_only_moved_the_displayed_number_keeps_the_plan_valid() {
     assert_ne!(fast[0].id, slow[0].id, "resume identity 仍然记着协商速率");
 }
 
+/// Wi-Fi 信号百分比只是遥测，每次扫描都会跳；它不能让闸门把同一份计划判成过期。
+///
+/// 实机 B4-S02：控制台连上时扫到 WLAN 信号 95%，开跑前重扫是 93%，约一半的控制台
+/// 运行在 `run_master` 里被「执行计划与复核页确认的不一致」挡下。信道变了则是真实的
+/// 环境变化，指纹照样要变。
+#[test]
+fn a_wifi_signal_reading_does_not_expire_the_confirmed_plan() {
+    let wifi_with = |signal: Option<u32>, channel: Option<u32>| {
+        let mut spec = base_spec();
+        spec.src = ep(Side::Master, "en0", "SGMII1G", "192.168.8.100", 1000);
+        let mut dst = ep(Side::Agent, "en1", "WIFI5G", "192.168.8.104", 2401);
+        dst.nic.wifi_signal_pct = signal;
+        dst.nic.wifi_channel = channel;
+        spec.dst = dst;
+        let mut port = PORT_BASE;
+        let (units, _) = build_units(&[spec], true, &mut port);
+        crate::master::plan::units_fingerprint(&units)
+    };
+    assert_eq!(
+        wifi_with(Some(95), Some(48)),
+        wifi_with(Some(93), Some(48)),
+        "只有信号读数变了，闸门不该拦"
+    );
+    assert_ne!(
+        wifi_with(Some(95), Some(48)),
+        wifi_with(Some(95), Some(149)),
+        "换了信道是真实的环境变化"
+    );
+}
+
 /// 反过来：协商速率**真的**改变了执行内容时，指纹必须变。
 ///
 /// RNDIS 是跟随协商速率裁剪的那一类（见 `rate::nic_payload_ceiling_mbps`

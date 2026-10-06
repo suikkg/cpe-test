@@ -105,7 +105,18 @@ export function reconcile(): void {
 
 watch(
   () => [session.connection, session.local, session.topologyStale, session.scanning, session.localError],
-  () => { if (plan.pendingImportTopology) reconcile(); },
+  () => {
+    if (plan.pendingImportTopology) {
+      reconcile();
+      return;
+    }
+    // 计划页只在挂载时对一次账的话，连接扫描晚到（点完「连接」马上进计划页）或者
+    // 停在计划页期间拓扑变了，网口列表就一直停在旧拓扑：实机上只剩同机 1 对，
+    // 跨机 4 对要离开再进来才出现。只认可信快照：扫描中、重扫失败标旧时不动，
+    // 免得拿半截或过期的网卡表裁掉已有选择。
+    if (session.scanning || session.topologyStale) return;
+    reconcile();
+  },
   { deep: true },
 );
 

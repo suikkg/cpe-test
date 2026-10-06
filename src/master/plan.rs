@@ -142,7 +142,8 @@ pub fn config_fingerprint(cfg: &Config) -> String {
 /// 1. 端点的 `NicInfo.speed_mbps`；
 /// 2. 单元标题里那句 `en1(192.168.8.104, 2401Mbps, 5GHz)`；
 /// 3. `Unit.id`——它是 RESUME identity，而速率是**有意**记进去的
-///    （换了链路速率的 PASS 不该被复用）。
+///    （换了链路速率的 PASS 不该被复用）；
+/// 4. 后来加的无线上下文 `NicInfo.wifi_signal_pct`，每次扫描都在变，同一个坑又从这里漏了一次。
 ///
 /// 于是闸门把**每一次**带 Wi-Fi 口的控制台运行都判成「计划已过期」：
 /// 实测两次开跑的 `config_hash` 完全相同、单元指纹却不同，日志固定停在
@@ -163,6 +164,10 @@ fn canonical_unit_for_fingerprint(unit: &Unit) -> Unit {
     unit.target_lines.clear();
     crate::master::builder::for_each_endpoint_mut(&mut unit, |endpoint| {
         endpoint.nic.speed_mbps = 0;
+        // 信号百分比是同一类遥测：相邻两次扫描就在 93 / 95 之间跳，不影响跑什么、
+        // 怎么判。漏掉它，带 Wi-Fi 口的控制台运行约一半被判「计划已过期」（实机
+        // B4-S02）。SSID / 信道 / 射频模式变了是真实的环境变化，仍然进指纹。
+        endpoint.nic.wifi_signal_pct = None;
     });
     unit
 }

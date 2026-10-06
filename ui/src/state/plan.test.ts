@@ -10,6 +10,7 @@ import {
   plan,
   previewIsCurrent,
   projectNotices,
+  reconcile,
   reset,
 } from './plan';
 import { session, reset as resetSession } from './session';
@@ -17,6 +18,7 @@ import bootstrapFixture from '../api/__fixtures__/bootstrap_out.json';
 import { emptyPlan, ensureDefaults } from '../domain/plan-build';
 import { serializeProject } from '../domain/project';
 import { emptyGlobals } from '../domain/globals';
+import type { NicInfo } from '../api/dto';
 
 describe('离线导入的延后校验', () => {
   beforeEach(() => { reset(); resetSession(); });
@@ -358,5 +360,44 @@ describe('仅本轮强制档位', () => {
     const req = buildRunRequest();
     expect(req.force_udp_bandwidth).toBe('500m');
     expect(req.force_tcp_window).toBe('64k');
+  });
+});
+
+describe('计划页挂着时拓扑变了', () => {
+  const nic = (name: string, role: string, ipv4: string): NicInfo => ({
+    name, description: '', role, ipv4, gateway_v4: '', ipv6_ll: '', ipv6_global: '', zone: '',
+    speed_mbps: 1000, is_wifi: role.startsWith('WIFI'), wifi_band: '', ifindex: 1,
+  });
+  const master = [nic('以太网', 'SGMII1G', '192.168.8.103'), nic('WLAN', 'WIFI5G', '192.168.8.108')];
+  const agent = [nic('en0', 'SGMII1G', '192.168.8.102'), nic('en1', 'WIFI5G', '192.168.8.106')];
+  const pairs = () => plan.linkSets.flatMap((set) => set.pair_refs);
+  beforeEach(() => { reset(); resetSession(); });
+
+  // 实机 A1-U05：点完「连接」马上进计划页，挂载时扫描还没回来，只按本机网卡对了账；
+  // 连接回来之后列表不变，跨机 4 对要离开再进来才出现。
+  it('连接扫描晚到：不用离开再进入，跨机网口自动出现', async () => {
+    session.local = { host: { interfaces: master } } as never;
+    reconcile();
+    expect(pairs()).toHaveLength(1);
+    session.connection = { master: { interfaces: master }, agent: { interfaces: agent } } as never;
+    await nextTick();
+    expect(pairs()).toHaveLength(6);
+    expect(pairs().filter((ref) => ref.dst.startsWith('agent:'))).toHaveLength(5);
+    resetSession();
+  });
+
+  it('扫描中或重扫失败标旧时不按半截拓扑对账', async () => {
+    session.connection = { master: { interfaces: master }, agent: { interfaces: agent } } as never;
+    await nextTick();
+    expect(pairs()).toHaveLength(6);
+    session.scanning = true;
+    session.connection = { master: { interfaces: master }, agent: { interfaces: [] } } as never;
+    await nextTick();
+    expect(pairs()).toHaveLength(6);
+    session.scanning = false;
+    session.topologyStale = true;
+    await nextTick();
+    expect(pairs()).toHaveLength(6);
+    resetSession();
   });
 });
