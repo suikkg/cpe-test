@@ -39,8 +39,11 @@ pub(super) fn cts_effective_window(
     events: &[IperfFlowEvent],
     required_secs: u64,
     status_update_ms: u64,
+    // 起流爬升段，从流量起点往后扣掉，不进平均。
+    settle_secs: u64,
 ) -> EffectiveWindow {
     let required_ms = required_secs.saturating_mul(1_000);
+    let settle_ms = settle_secs.saturating_mul(1_000);
     let Some(end_ms) = events
         .iter()
         .filter(|event| event.kind == IperfEventKind::Ended)
@@ -91,7 +94,7 @@ pub(super) fn cts_effective_window(
             && end_ms
                 .saturating_sub(start_ms)
                 .saturating_add(WINDOW_COMPLETE_TOLERANCE_MS)
-                >= required_ms
+                >= required_ms.saturating_add(settle_ms)
     };
 
     // 首条状态行表示前一个 StatusUpdate 周期，通常比 Connection 更接近数据起点。
@@ -100,12 +103,15 @@ pub(super) fn cts_effective_window(
     let complete_start_ms = event_start_ms
         .filter(|start_ms| spans_required(*start_ms))
         .or_else(|| connected_ms.filter(|start_ms| spans_required(*start_ms)));
-    let start_ms = complete_start_ms.unwrap_or_else(|| {
-        first_traffic_ms
-            .or(connected_ms)
-            .or(started_ms)
-            .unwrap_or(end_ms)
-    });
+    let start_ms = complete_start_ms
+        .unwrap_or_else(|| {
+            first_traffic_ms
+                .or(connected_ms)
+                .or(started_ms)
+                .unwrap_or(end_ms)
+        })
+        .saturating_add(settle_ms)
+        .min(end_ms);
     let available_ms = end_ms.saturating_sub(start_ms);
     let complete = complete_start_ms.is_some()
         && available_ms.saturating_add(WINDOW_COMPLETE_TOLERANCE_MS) >= required_ms;
@@ -120,6 +126,51 @@ pub(super) fn cts_effective_window(
         available_secs: available_ms as f64 / 1_000.0,
         required_secs,
         complete,
+    }
+}
+
+/// ctsTraffic 一次尝试的工具侧旁证（见 `RateStats::with_tool_trace`）。
+///
+/// 状态行每 `status_update_ms` 一条，只有速率大于零的行才发事件；汇报过的时间
+/// 取这次尝试的整段真实流量窗口（截断前）。UDP 是 server 发、client 收，client
+/// 的状态行就是接收端；TCP Push 是 client 发，状态行只能当发送端证据。
+pub(super) fn cts_tool_trace(
+    events: &[IperfFlowEvent],
+    window: &EffectiveWindow,
+    status_update_ms: u64,
+    udp: bool,
+) -> ToolTrace {
+    if window.available_secs <= 0.0 || status_update_ms == 0 {
+        return ToolTrace::default();
+    }
+    let reported_end = window
+        .start_ms
+        .saturating_add((window.available_secs * 1_000.0).round() as u64);
+    let timeline = ToolTimeline {
+        reported: vec![(window.start_ms, reported_end)],
+        flowing: events
+            .iter()
+            .filter(|event| {
+                event.kind == IperfEventKind::Traffic && event.mbps.is_some_and(|rate| rate > 0.0)
+            })
+            .map(|event| {
+                (
+                    event.elapsed_ms.saturating_sub(status_update_ms),
+                    event.elapsed_ms,
+                )
+            })
+            .collect(),
+    };
+    if udp {
+        ToolTrace {
+            receiver: timeline,
+            ..Default::default()
+        }
+    } else {
+        ToolTrace {
+            sender: timeline,
+            ..Default::default()
+        }
     }
 }
 
@@ -197,6 +248,9 @@ pub(super) fn select_udp_effective_windows(
 }
 
 /// 单条方向腿的有效窗口：只看这条腿自己的活跃流和自己的接收端采样。
+///
+/// 返回的窗口已扣掉 settle、截到要求时长；[`leg_active_span`] 给的是截断前
+/// 那一段，双向合计要拿两条腿的这一段求交集。
 pub(super) fn leg_effective_window(
     leg_pos: usize,
     plan: &UdpLegPlan,
@@ -205,10 +259,22 @@ pub(super) fn leg_effective_window(
     rate_cfg: &RateCheckCfg,
     required_secs: u64,
 ) -> EffectiveWindow {
-    let empty = EffectiveWindow {
+    window_from_span(
+        leg_active_span(leg_pos, plan, results, monitors, rate_cfg),
         required_secs,
-        ..Default::default()
-    };
+    )
+}
+
+/// 这条腿能拿来判定的整段时间：有流在跑、接收端有采样、已扣掉 settle，
+/// **没有**截到要求时长。`None` = 一刻都不满足。
+pub(super) fn leg_active_span(
+    leg_pos: usize,
+    plan: &UdpLegPlan,
+    results: &[UdpFlowRun],
+    monitors: &HashMap<String, MonitorStopOut>,
+    rate_cfg: &RateCheckCfg,
+) -> Option<(u64, u64)> {
+    let empty = None;
     let Some(first) = plan.streams.first() else {
         return empty;
     };
@@ -234,23 +300,24 @@ pub(super) fn leg_effective_window(
         .saturating_mul(2)
         .max(1_500);
 
-    let required = required_udp_streams(
-        plan.streams.len(),
-        rate_cfg,
-        first.rx_target_mbps,
-        first.offered_per_stream_mbps,
-    );
+    // 窗口只问「这一刻有没有流在跑、有没有采样」，**不问够不够几条**。
+    //
+    // 这里以前要求「同时活跃的流 ≥ 目标推算的必需流数」。于是流数配少了
+    // （2 × 1000m 去测 2000 门限，按 5% 余量要 3 条）这一腿**每次**都判
+    // EFFECTIVE_WINDOW_SHORT；10 条掉了 2 条、剩下 8 条照样跑满并且 RX 达标，
+    // 也一样无法评价。报告把原因指向采样窗口，而 TCP/CTS 对同一件事只记一条
+    // 「灌包强度不足」的诊断后照常按 RX 判——同一个事实在三条链上两种结论，
+    // 正是 ADR-17 要消灭的形状。流数不足现在只走 `udp_leg_diagnostics`。
     let active_intervals: Vec<_> = results
         .iter()
         .filter(|flow| flow.leg_pos == leg_pos)
         .filter_map(flow_active_interval)
         .collect();
     let eligible = |t: u64| -> bool {
-        let active = active_intervals
+        active_intervals
             .iter()
-            .filter(|(start, end)| *start <= t && t < *end)
-            .count();
-        active >= required && nearest_valid_sample(&samples, t, sample_tolerance_ms).is_some()
+            .any(|(start, end)| *start <= t && t < *end)
+            && nearest_valid_sample(&samples, t, sample_tolerance_ms).is_some()
     };
 
     // 活跃流数只在起流/停流边界变化，采样可用性只在距样本超过容差时变化。
@@ -294,34 +361,10 @@ pub(super) fn leg_effective_window(
     }
 
     if best_end <= best_start {
-        return EffectiveWindow {
-            required_secs,
-            ..Default::default()
-        };
+        return None;
     }
-
     let scored_start = best_start
         .saturating_add(rate_cfg.settle_secs.saturating_mul(1_000))
         .min(best_end);
-    let available_ms = best_end.saturating_sub(scored_start);
-    let available_secs = available_ms as f64 / 1000.0;
-    // 与 iperf/CTS 同一个容差（ADR-12）。此前这里是零容差，于是 179.95 秒的
-    // UDP 腿判 EFFECTIVE_WINDOW_SHORT，而同样的 TCP 腿 PASS——同一件事在两条
-    // 链上两个结论。
-    let complete = available_ms.saturating_add(WINDOW_COMPLETE_TOLERANCE_MS)
-        >= required_secs.saturating_mul(1_000);
-    let scored_end = if complete {
-        scored_start
-            .saturating_add(required_secs.saturating_mul(1_000))
-            .min(best_end)
-    } else {
-        best_end
-    };
-    EffectiveWindow {
-        start_ms: scored_start,
-        end_ms: scored_end,
-        available_secs,
-        required_secs,
-        complete,
-    }
+    Some((scored_start, best_end))
 }

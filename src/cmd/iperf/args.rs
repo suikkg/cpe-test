@@ -29,7 +29,8 @@ pub fn server_args(req: &IperfServerStartReq) -> Vec<String> {
 ///
 /// - `-f`：解析器按 `-f m` 的输出形状读速率。换成 `-f M`（Byte）会走进另一条
 ///   进制分支，`-f k`/`-f g` 则直接换了量级。
-/// - `-t`：执行侧的有效窗口、覆盖率门槛、`est_secs` 全按下发的 duration 算。
+/// - `-t`：执行侧按 `iperf_window::traffic_process_secs` 下发（要求时长 + 起流
+///   爬升 + 双向余量），有效窗口、覆盖率门槛、`est_secs` 都建立在这个时长上。
 /// - `-i`：1 秒一行是逐样本时间线（`raws`、截图对齐）的前提。
 /// - `-p` / `-B`：端口与绑定地址是资源租约和端点身份的一部分，改了它们，
 ///   agent 侧记的那份 owner/lease 就对不上真实进程了。

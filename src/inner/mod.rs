@@ -875,10 +875,11 @@ fn run_unit(context: &UnitContext<'_>, unit: &Unit) -> Result<UnitRow, String> {
             })
         }
     };
-    // server 停稳之后再读日志，否则拿到的是半截输出。
+    // server 停稳之后再读日志，否则拿到的是半截输出。判定要用完整日志（逐秒接收
+    // 记录、断流旁证），裁剪只在写进报告时做。
     let mut raw = raw;
     for (leg, log) in raw.iter_mut().zip(logs.iter()) {
-        leg.server_log = clip_log(&std::fs::read_to_string(log).unwrap_or_default());
+        leg.server_log = std::fs::read_to_string(log).unwrap_or_default();
     }
     let mut row = assemble_unit(cfg, link, unit, preflight, raw);
     if let Err(error) = &server_cleanup {
@@ -975,13 +976,15 @@ fn run_legs(
                 .iter()
                 .zip(owners)
                 .map(|(leg, owner)| {
-                    let request = client_request_for_addresses(
+                    let mut request = client_request_for_addresses(
                         cfg,
                         &preflight.addresses,
                         unit.protocol,
                         leg.flow,
                         leg.port,
                     );
+                    // 多跑起流爬升段、双向多跑交集余量；判定窗口仍截到配置时长。
+                    request.duration = plan::client_secs(cfg, unit);
                     let remote = remote.clone();
                     scope.spawn(move || {
                         let out = if leg.flow.receiver_is_board() {
@@ -1281,26 +1284,21 @@ fn start_sampler(
 ///
 /// 双向并发的结论只能建立在两条腿真的同时在跑的那一段上。没有交集就说明
 /// 这不是并发——那时两条腿都拿不到有效窗口，判定自然落到 NOT_EVALUATED。
-fn overlap_window(windows: &[EffectiveWindow]) -> Option<EffectiveWindow> {
-    if windows.len() != 2 {
+///
+/// 交集取在两条腿**截断前**的真实流量区间上，再从交集起点截出配置时长。
+/// 以前取的是各自截断后的窗口：两条腿都是 `-t 配置时长`，只要起跑差超过
+/// 100ms 交集就不够长，于是重叠窗口几乎从来不「完整」；而判定又不看完整与否，
+/// 只有 5 秒重叠的双向单元照样下结论。现在双向腿多跑
+/// [`BIDIR_OVERLAP_MARGIN_SECS`]，交集够长才算完整，不够长就不下结论。
+fn overlap_window(spans: &[Option<(u64, u64)>], required_secs: u64) -> Option<EffectiveWindow> {
+    if spans.len() != 2 {
         return None;
     }
-    let start = windows.iter().map(|w| w.start_ms).max()?;
-    let end = windows.iter().map(|w| w.end_ms).min()?;
-    if end <= start {
-        return None;
-    }
-    let required_secs = windows.first().map(|w| w.required_secs).unwrap_or_default();
-    let available_ms = end - start;
-    Some(EffectiveWindow {
-        start_ms: start,
-        end_ms: end,
-        available_secs: available_ms as f64 / 1_000.0,
+    let span = crate::cmd::iperf_window::overlap_span(spans)?;
+    Some(crate::cmd::iperf_window::window_from_span(
+        Some(span),
         required_secs,
-        complete: available_ms
-            .saturating_add(crate::cmd::iperf_window::WINDOW_COMPLETE_TOLERANCE_MS)
-            >= required_secs.saturating_mul(1_000),
-    })
+    ))
 }
 
 fn assemble_unit(
@@ -1310,19 +1308,38 @@ fn assemble_unit(
     preflight: &LinkPreflight,
     raw: Vec<LegRaw>,
 ) -> UnitRow {
-    let windows: Vec<EffectiveWindow> = raw
+    // 每条腿的真实流量区间：`raw_spans` 是工具汇总覆盖的整段，`spans` 再扣掉
+    // 起流爬升，判定窗口取后者。没有吞吐测量就没有区间。双向时每条腿先各扣
+    // 各的爬升再求交集：后起跑的那条腿在交集起点正在爬升。
+    let raw_spans: Vec<Option<(u64, u64)>> = raw
         .iter()
         .map(|leg| {
-            let parsed = iperf::parse_output(&leg.client.output);
-            crate::cmd::iperf_window::iperf_effective_window(
+            crate::cmd::iperf_window::iperf_measured_span(
                 &leg.events,
                 cfg.duration_secs,
-                parsed.has_measurement(),
+                0,
+                iperf::parse_output(&leg.client.output).has_measurement(),
             )
         })
         .collect();
+    let spans: Vec<Option<(u64, u64)>> = raw_spans
+        .iter()
+        .map(|span| crate::cmd::iperf_window::settled_span(*span, plan::SETTLE_SECS))
+        .collect();
+    // 工具汇总能代表双向并发，只有一种情况：两条腿的汇总覆盖的是同一段。
+    let raw_overlap = unit
+        .is_bidir()
+        .then(|| crate::cmd::iperf_window::overlap_span(&raw_spans))
+        .flatten();
+    let windows: Vec<EffectiveWindow> = spans
+        .iter()
+        .map(|span| crate::cmd::iperf_window::window_from_span(*span, cfg.duration_secs))
+        .collect();
     // 双向：两条腿共用同一段重叠窗口；单向：各用自己的。
-    let shared = unit.is_bidir().then(|| overlap_window(&windows)).flatten();
+    let shared = unit
+        .is_bidir()
+        .then(|| overlap_window(&spans, cfg.duration_secs))
+        .flatten();
     let overlap_secs = shared.as_ref().map(|window| window.available_secs);
     let mut legs = Vec::new();
     let mut measurements = Vec::new();
@@ -1337,8 +1354,23 @@ fn assemble_unit(
         };
         // 本腿自己的窗口在上面已经算过一次（`windows[index]`）；再算一遍要重新
         // 解析一遍客户端输出，而那份输出在 3600 秒 `-i 1` 的一轮里是几千行。
-        let (row, measurement) =
-            assemble_leg(cfg, link, unit, preflight, item, &window, &windows[index]);
+        // 工具汇总能代表双向并发，只有一种情况：本腿汇总覆盖的整段就是两腿的交集。
+        let tolerance = crate::cmd::iperf_window::WINDOW_COMPLETE_TOLERANCE_MS;
+        let tool_covers_overlap = match (raw_spans[index], raw_overlap) {
+            (Some(own), Some(overlap)) => {
+                own.0.abs_diff(overlap.0) <= tolerance && own.1.abs_diff(overlap.1) <= tolerance
+            }
+            _ => false,
+        };
+        let (row, measurement) = assemble_leg(
+            cfg,
+            link,
+            unit,
+            preflight,
+            item,
+            &window,
+            tool_covers_overlap,
+        );
         legs.push(row);
         measurements.push(measurement);
     }
@@ -1346,7 +1378,8 @@ fn assemble_unit(
     if unit.is_bidir() {
         match overlap_secs {
             Some(secs) => diagnostics.push(format!(
-                "双向两条腿的共同有效重叠窗口 {secs:.2}s，两条腿的速率都只取这一段。"
+                "双向两条腿真实流量重叠 {secs:.2}s，两条腿的速率都取其中同一段 {}s。",
+                cfg.duration_secs
             )),
             None => diagnostics.push(
                 "双向两条腿没有可证明的时间重叠，本单元不构成并发，两条腿都不形成有效结论。".into(),
@@ -1464,24 +1497,85 @@ fn assemble_leg(
     preflight: &LinkPreflight,
     raw: &LegRaw,
     window: &EffectiveWindow,
-    own_window: &EffectiveWindow,
+    // 双向时：本腿 receiver 汇总覆盖的整段（未扣爬升、未截断）恰好就是两腿的交集。
+    tool_covers_overlap: bool,
 ) -> (LegRow, LegMeasurement) {
     // 客户端输出只解析一次：这里以前解析三遍（本腿窗口一次、工具速率一次、
     // 诊断一次），三份结果完全相同。
     let parsed = iperf::parse_output(&raw.client.output);
     let cutoff = crate::cmd::iperf_window::iperf_baseline_cutoff_ms(&raw.events);
-    let stats = monitor_rate_stats(&raw.samples, window, true, cutoff);
+    // 计数器零增长时，用接收端 server 日志（以及 TCP 的发送端逐秒行）分辨
+    // 「真断流」和「计数器没记账」。日志按首尾裁剪过，缺掉的中段不算汇报过，
+    // 落在那里的零增长维持「无法区分」。
+    let server_lines = crate::cmd::iperf_window::server_intervals(&raw.server_log);
+    let trace = crate::cmd::iperf_window::iperf_tool_trace(
+        &raw.events,
+        &server_lines,
+        cfg.duration_secs,
+        unit.protocol.is_udp(),
+    );
+    let stats = monitor_rate_stats(&raw.samples, window, true, cutoff).with_tool_trace(&trace);
     let nic_target = raw.plan.nic_target_mbps;
+    // 没跑满的窗口不下结论，和子网同一条规则。
+    //
+    // 以前窗口不完整只记一条诊断：20 秒的上行跑到第 10 秒被重置，网卡口径
+    // 在剩下那 1 秒（没有汇总行时窗口塌成最后一条逐秒行）上照样判了 PASS。
+    let acceptance = if window.complete {
+        // Auto 保留显式门限；无门限只测量，不进入 Verify 的 TARGET_MISSING 分支。
+        evaluate_rx_acceptance(crate::config::RateMode::Auto, nic_target, &stats)
+    } else {
+        crate::verdict::VerdictResult::not_evaluated(
+            crate::reason::ReasonCode::IperfEffectiveWindowShort,
+            format!(
+                "有效时长 {:.2}s，短于配置的 {}s；不在没跑满的窗口上下结论",
+                window.available_secs, window.required_secs
+            ),
+        )
+    };
     let nic = NicView {
         avg_mbps: stats.avg_mbps,
-        // Auto 保留显式门限；无门限只测量，不进入 Verify 的 TARGET_MISSING 分支。
-        acceptance: evaluate_rx_acceptance(crate::config::RateMode::Auto, nic_target, &stats),
+        acceptance,
     };
-    // 工具口径：先认发送端 client 回传的 receiver 汇总；丢失时再取本腿接收端 server 日志。
+    // 工具口径首选接收端 server 的逐秒记录，在**判定窗口**上求平均：和网卡口径
+    // 同一段时间——扣掉起流爬升，双向时就是两条腿的共同窗口。
+    //
+    // 以前只认全程 receiver 汇总：它覆盖整次运行，含爬升，也裁不到双向的共同
+    // 窗口，于是 `tool` 策略下的双向单元只要两条腿起跑差 100ms 以上就无法评价
+    // （ADB 起的板侧 client 和本机 client 实际总差几百毫秒）。
     let streams = cfg.streams(unit.protocol);
-    let mut tool_rate =
+    let tolerance = crate::cmd::iperf_window::WINDOW_COMPLETE_TOLERANCE_MS;
+    let windowed = if window.complete {
+        crate::cmd::iperf_window::receiver_rate_over(
+            &raw.events,
+            &server_lines,
+            streams,
+            (window.start_ms, window.end_ms),
+        )
+        .map(|mbps| measure::ToolRate {
+            mbps,
+            aggregate: if streams > 1 {
+                measure::Aggregate::Sum
+            } else {
+                measure::Aggregate::Single
+            },
+            origin: if raw.plan.flow.receiver_is_board() {
+                ToolOrigin::BoardServerWindow
+            } else {
+                ToolOrigin::PcServerWindow
+            },
+            span_ms: Some(window.end_ms.saturating_sub(window.start_ms)),
+        })
+    } else {
+        Err(format!(
+            "有效窗口 {:.2}s 短于配置的 {}s",
+            window.available_secs, window.required_secs
+        ))
+    };
+    // 退路：全程 receiver 汇总。先认发送端 client 回传的；丢失时再取本腿接收端
+    // server 日志。
+    let mut summary =
         measure::parse_receiver_summary(&raw.client.output, streams, ToolOrigin::ClientSummary);
-    if tool_rate.is_err() && !raw.server_log.trim().is_empty() {
+    if summary.is_err() && !raw.server_log.trim().is_empty() {
         if let Ok(rate) = measure::parse_receiver_summary(
             &raw.server_log,
             streams,
@@ -1491,27 +1585,45 @@ fn assemble_leg(
                 ToolOrigin::PcServerLog
             },
         ) {
-            tool_rate = Ok(rate);
+            summary = Ok(rate);
         }
     }
-    let receiver_note = match &tool_rate {
-        Ok(rate) => format!("取自{}", rate.origin.label()),
-        Err(error) => format!("未取到可信的 receiver 汇总：{error}"),
+    // 中途退出时 server 仍可能打出一条只覆盖前几秒的 receiver 汇总；拿它当
+    // 本腿速率，等于在一轮没跑满的测试上下结论。
+    let required_ms = cfg.duration_secs.saturating_mul(1_000);
+    let summary = summary.and_then(|rate| match rate.span_ms {
+        Some(span_ms) if span_ms.saturating_add(tolerance) < required_ms => Err(format!(
+            "receiver 汇总只覆盖 {:.2}s，短于配置的 {}s；这一轮没跑满",
+            span_ms as f64 / 1_000.0,
+            cfg.duration_secs
+        )),
+        _ => Ok(rate),
+    });
+    // 展示：能拿到哪个就写哪个，首选窗口内的逐秒平均。
+    let tool = ToolView {
+        rate: match (&windowed, &summary) {
+            (Ok(rate), _) | (Err(_), Ok(rate)) => Ok(rate.clone()),
+            (Err(window_error), Err(summary_error)) => {
+                Err(format!("{window_error}；{summary_error}"))
+            }
+        },
     };
-    let tool = ToolView { rate: tool_rate };
-    // 全程 receiver 汇总无法裁成重叠区间。只在两腿窗口与汇总窗口对齐时
-    // 允许它参与双向验收；原始工具速率仍保留在诊断字段。
-    let tolerance = crate::cmd::iperf_window::WINDOW_COMPLETE_TOLERANCE_MS;
-    let tool_for_verdict = if unit.is_bidir()
-        && (window.end_ms <= window.start_ms
-            || own_window.start_ms.abs_diff(window.start_ms) > tolerance
-            || own_window.end_ms.abs_diff(window.end_ms) > tolerance)
-    {
-        ToolView {
-            rate: Err("工具 receiver 汇总覆盖的是本腿全程，不能代表双向共同重叠窗口".into()),
-        }
-    } else {
-        tool.clone()
+    let receiver_note = match &tool.rate {
+        Ok(rate) => format!("取自{}", rate.origin.label()),
+        Err(error) => format!("未取到可信的接收端速率：{error}"),
+    };
+    // 判定：全程汇总裁不到双向的共同窗口。只有两条腿的汇总覆盖的是同一段（本腿
+    // 的整段就是两腿的交集）时，两个汇总才是同一段时间里的并发测量。
+    let tool_for_verdict = ToolView {
+        rate: match windowed {
+            Ok(rate) => Ok(rate),
+            Err(window_error) if unit.is_bidir() && !tool_covers_overlap => Err(format!(
+                "{window_error}；全程 receiver 汇总覆盖的是本腿全程，不能代表双向共同窗口"
+            )),
+            Err(window_error) => {
+                summary.map_err(|summary_error| format!("{window_error}；{summary_error}"))
+            }
+        },
     };
     let measurement = measure::select_leg(
         link.measurement,
@@ -1616,7 +1728,7 @@ fn assemble_leg(
                 .flatten(),
         },
         client: raw.client.clone(),
-        server_log: raw.server_log.clone(),
+        server_log: clip_log(&raw.server_log),
         rx_samples: Some(raw.samples.clone()),
     };
     (row, measurement)

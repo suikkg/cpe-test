@@ -86,6 +86,142 @@ pub(crate) struct RateStats {
     /// unit-114-115 里 `rx_bytes` 在 elapsed 7078ms 之后 193 秒纹丝不动，
     /// 覆盖率却是 100%——光看覆盖率永远发现不了这件事。
     pub stalled_ratio: f64,
+    /// 最长那段零增长的起止（监控时间轴毫秒）；没有零增长就是 `None`。
+    pub stall_span_ms: Option<(u64, u64)>,
+    /// 工具侧对那段零增长的旁证，由调用方用 [`RateStats::with_tool_trace`] 补上。
+    ///
+    /// 默认 `Unknown`：没补旁证的路径维持「零增长就不下结论」的保守口径。
+    pub stall_evidence: StallEvidence,
+}
+
+impl RateStats {
+    /// 用工具侧的逐段记录回答「那段零增长是不是真断流」。
+    ///
+    /// 它**只**回答这一个问题：旁证不参与和门限的比较，也不改平均值——
+    /// 平均值仍然只来自接收端网卡计数器（ADR-17）。
+    pub(crate) fn with_tool_trace(mut self, trace: &ToolTrace) -> Self {
+        self.stall_evidence = self
+            .stall_span_ms
+            .map(|span| trace.stall_evidence(span))
+            .unwrap_or_default();
+        self
+    }
+
+    /// 零增长够长、而且没有证据证明它是真断流——这时不能拿平均值下结论。
+    pub(crate) fn stall_blocks_verdict(&self) -> bool {
+        self.stalled_ratio > 1.0 - MIN_RATE_SAMPLE_COVERAGE
+            && self.stall_evidence != StallEvidence::TrafficStopped
+    }
+}
+
+/// 接收端计数器零增长的那一段里，工具侧看到了什么。
+///
+/// 「计数器一个字节都没动」有两种完全相反的解释：链路真的断了（被测设备掉线、
+/// 重启），或者这块网卡的计数器没记这条路径上的包。前者是被测设备的失败，
+/// 后者是测量失效。以前两者一律判 `COUNTER_STALLED / NOT_EVALUATED`，于是
+/// 一台中途掉线的 CPE 永远拿不到 RATE_FAIL，报告还告诉读者「平均速率不可信」，
+/// 排查方向正好指反；中途断 20 秒、平均仍达标的链路也拿不到 PASS。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum StallEvidence {
+    /// 没有能对上这段时间的工具记录。
+    #[default]
+    Unknown,
+    /// 工具同期也没有数据在走：零增长是真实断流，零是真实值。
+    TrafficStopped,
+    /// 工具同期仍有数据在走：计数器没记账。
+    TrafficContinued,
+}
+
+/// 一份工具侧逐段记录，已投影到监控时间轴。
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ToolTimeline {
+    /// 工具汇报过的时间段（含速率为零的段）。
+    pub reported: Vec<(u64, u64)>,
+    /// 其中速率大于零的段。
+    pub flowing: Vec<(u64, u64)>,
+}
+
+/// 一条腿的工具侧旁证。
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ToolTrace {
+    /// 接收端的逐段记录（iperf3 server、ctsTraffic UDP 的 client）。首选：它直接
+    /// 回答「这段时间收没收到」。
+    pub receiver: ToolTimeline,
+    /// 发送端的逐段记录，**只对 TCP 有意义**：路径断了收不到 ACK，发送端写不进
+    /// socket，速率随之归零。UDP 发送端恒速发包，证明不了对端收没收到——
+    /// 构造方不得给 UDP 填这一项。
+    pub sender: ToolTimeline,
+}
+
+impl ToolTrace {
+    pub(crate) fn stall_evidence(&self, span: (u64, u64)) -> StallEvidence {
+        match self.receiver.evidence(span) {
+            StallEvidence::Unknown => self.sender.evidence(span),
+            known => known,
+        }
+    }
+
+    /// 多条流（UDP 组）的旁证合并：任一条流在走，网卡就该记到账。
+    pub(crate) fn merge<'a>(traces: impl IntoIterator<Item = &'a ToolTrace>) -> ToolTrace {
+        let mut merged = ToolTrace::default();
+        for trace in traces {
+            for (into, from) in [
+                (&mut merged.receiver, &trace.receiver),
+                (&mut merged.sender, &trace.sender),
+            ] {
+                into.reported.extend_from_slice(&from.reported);
+                into.flowing.extend_from_slice(&from.flowing);
+            }
+        }
+        merged
+    }
+}
+
+impl ToolTimeline {
+    /// 工具的汇报要覆盖零增长那段的至少三分之二才下判断；汇报里有数据在走的
+    /// 时间占汇报时间三分之二以上算「仍在走」，三分之一以下算「也停了」，
+    /// 中间地带不猜。两条线都留出一个汇报周期的对齐误差：逐秒行与网卡样本
+    /// 各自按 1 秒取整，掉线那一秒两边都可能只记了半截。
+    fn evidence(&self, span: (u64, u64)) -> StallEvidence {
+        let (start, end) = span;
+        let length = end.saturating_sub(start);
+        if length == 0 {
+            return StallEvidence::Unknown;
+        }
+        let reported = covered_ms(&self.reported, span);
+        if reported.saturating_mul(3) < length.saturating_mul(2) {
+            return StallEvidence::Unknown;
+        }
+        let flowing = covered_ms(&self.flowing, span);
+        if flowing.saturating_mul(3) >= reported.saturating_mul(2) {
+            StallEvidence::TrafficContinued
+        } else if flowing.saturating_mul(3) <= reported {
+            StallEvidence::TrafficStopped
+        } else {
+            StallEvidence::Unknown
+        }
+    }
+}
+
+/// `intervals` 与 `span` 交集的总时长；区间之间的重叠只计一次
+/// （多流时每条流的逐秒行和 `[SUM]` 行覆盖同一段）。
+fn covered_ms(intervals: &[(u64, u64)], span: (u64, u64)) -> u64 {
+    let mut clipped: Vec<(u64, u64)> = intervals
+        .iter()
+        .map(|(s, e)| ((*s).max(span.0), (*e).min(span.1)))
+        .filter(|(s, e)| e > s)
+        .collect();
+    clipped.sort_unstable();
+    let mut total = 0u64;
+    let mut cursor = span.0;
+    for (s, e) in clipped {
+        let s = s.max(cursor);
+        if e > s {
+            total += e - s;
+            cursor = e;
+        }
+    }
+    total
 }
 
 #[derive(Debug, Clone, Default)]
@@ -331,10 +467,13 @@ pub(crate) fn offered_floor_mbps(target_mbps: Option<f64>, headroom_pct: f64) ->
 /// RX 平均 <  门限      → RATE_FAIL
 /// ```
 ///
-/// 「有效 RX 平均值」只有三条门槛，全部落在**接收端**：计数器不能整窗停滞、
-/// 平均值要存在且高于有效流量下限、RX 采样覆盖率要够。三条都过了就必须给出
-/// PASS/FAIL——这是用户确认过的验收规则：**RX 平均达到门限就是 PASS，不看其他
-/// 指标**。
+/// 「有效 RX 平均值」只有三条门槛，全部落在**接收端**：计数器的零增长要么够短、
+/// 要么有工具旁证证明那是真断流（[`StallEvidence`]）；平均值要存在且高于有效流量
+/// 下限；RX 采样覆盖率要够。三条都过了就必须给出 PASS/FAIL——这是用户确认过的
+/// 验收规则：**RX 平均达到门限就是 PASS，不看其他指标**。
+///
+/// 工具旁证（`RateStats::stall_evidence`）只回答「那段零是不是真的」，决定的是
+/// 第一条门槛过没过；它不进平均值，也不参与和门限的比较。
 ///
 /// 因此这里**看不到**发送端：TX 覆盖率、TX-P10、offered 负载、滚动窗口覆盖、
 /// UDP 丢包、工具退出状态一律不进这个函数，它们由
@@ -353,12 +492,25 @@ pub(crate) fn evaluate_rx_acceptance(
     //
     // 门槛与采样覆盖率共用同一个常量：窗口里至少 95% 的时间要有真实推进的
     // 计数，剩下 5% 留给起流/收尾的空档。
-    if stats.stalled_ratio > 1.0 - MIN_RATE_SAMPLE_COVERAGE {
+    //
+    // 零增长有两种相反的解释（见 [`StallEvidence`]）。工具侧确认同期也没有数据
+    // 在走，零就是真实值，往下照常按平均值判；工具侧同期仍有流量、或者对不上
+    // 这段时间，才不下结论。旁证只回答「这段零是不是真的」，不参与门限比较。
+    if stats.stall_blocks_verdict() {
+        let why = match stats.stall_evidence {
+            StallEvidence::TrafficContinued => {
+                "工具侧同期仍有数据在走，是这块网卡的计数器没记这条路径上的包"
+            }
+            _ => {
+                "可能是链路断流，也可能是计数器没记账；工具侧没有能对上这段时间的\
+                 逐段记录，无法区分"
+            }
+        };
         return VerdictResult::not_evaluated(
             ReasonCode::CounterStalled,
             format!(
-                "判定窗口内接收端 OS 网卡计数器有 {:.1}% 的时间零增长（采到了样本，\
-                 但字节计数一直没推进），本轮平均速率不可信",
+                "判定窗口内接收端 OS 网卡计数器连续 {:.1}% 的时间零增长：{why}；\
+                 本轮平均速率不能当结论",
                 stats.stalled_ratio * 100.0
             ),
         );
@@ -420,6 +572,15 @@ pub(crate) fn rx_acceptance_diagnostics(
     offered_floor: Option<f64>,
 ) -> Vec<String> {
     let mut out = Vec::new();
+    if stats.stalled_ratio > 1.0 - MIN_RATE_SAMPLE_COVERAGE
+        && stats.stall_evidence == StallEvidence::TrafficStopped
+    {
+        out.push(format!(
+            "接收端网卡计数器连续 {:.1}% 的时间零增长，工具侧同期也没有数据在走：\
+             按真实断流计入平均（这段时间的零是真实值）",
+            stats.stalled_ratio * 100.0
+        ));
+    }
     let Some(target) = target else {
         return out;
     };
@@ -470,7 +631,13 @@ pub(crate) fn rx_acceptance_diagnostics(
         // 不达标时同样会跑：run_20260905_125327_5940 里 116 条掉坑诊断有 110
         // 条挂在 RATE_FAIL 行上，和同一行的「网卡 RX 平均 948.658Mbps 低于目标
         // 1800.000Mbps」正面打架。判定没错，但读报告的人会先怀疑数据。
-        let verdict_note = if stats
+        //
+        // 计数器零增长挡住了判定时，前两句都不成立：这一行根本没有按平均值
+        // 下结论。以前照样印「平均值已达标，故不改写判定」，和同一行的
+        // NOT_EVALUATED 正面矛盾。
+        let verdict_note = if stats.stall_blocks_verdict() {
+            "本行因计数器零增长未按平均值下结论，这里只说明零增长落在哪几秒"
+        } else if stats
             .avg_mbps
             .is_some_and(|avg| avg.is_finite() && avg >= target)
         {
@@ -758,6 +925,7 @@ pub(crate) fn monitor_rate_stats(
                 .saturating_add(1)
         })
         .unwrap_or(0);
+    let stall = longest_zero_delta_run(out, window, rx);
     let rolling_coverage = if expected_rolling_windows == 0 {
         0.0
     } else {
@@ -775,12 +943,14 @@ pub(crate) fn monitor_rate_stats(
         coverage: (covered_ms as f64 / window_ms as f64).min(1.0),
         rolling_coverage,
         baseline_mbps: baseline,
-        stalled_ratio: (longest_zero_delta_run_ms(out, window, rx) as f64 / covered_ms as f64)
+        stalled_ratio: (stall.map_or(0, |(start, end)| end - start) as f64 / covered_ms as f64)
             .clamp(0.0, 1.0),
+        stall_span_ms: stall,
+        stall_evidence: StallEvidence::Unknown,
     }
 }
 
-/// 判定窗口内计数器**连续零增长**的最长一段时长（毫秒）。
+/// 判定窗口内计数器**连续零增长**的最长一段：`(起点, 起点 + 累计时长)`。
 ///
 /// 看的是 `*_delta_bytes == 0` 这个原始事实，而不是扣完背景之后的速率：
 /// 速率为 0 可能只是背景扣除的结果，计数器零增长则是硬事实——这一秒里
@@ -788,7 +958,11 @@ pub(crate) fn monitor_rate_stats(
 ///
 /// 取「最长连续一段」而不是零样本总数，是为了区分两种形态：
 /// 起流前后各零几秒是正常的（分散的短段），而中途卡死不动是异常的（一整段）。
-fn longest_zero_delta_run_ms(out: &MonitorStopOut, window: &EffectiveWindow, rx: bool) -> u64 {
+fn longest_zero_delta_run(
+    out: &MonitorStopOut,
+    window: &EffectiveWindow,
+    rx: bool,
+) -> Option<(u64, u64)> {
     // 分子和平均值的分母必须使用同一段时间：边界样本先裁窗、乱序先排序，
     // 重复或重叠的时间只计一次。无数据的间隔不能把两个短停顿拼成连续停滞。
     let mut intervals: Vec<_> = out
@@ -814,8 +988,9 @@ fn longest_zero_delta_run_ms(out: &MonitorStopOut, window: &EffectiveWindow, rx:
         })
         .collect();
     intervals.sort_by_key(|(start_ms, end_ms, _)| (*start_ms, *end_ms));
-    let mut longest = 0u64;
-    let mut current = 0u64;
+    // 段长按「去重后的覆盖时长」累加，起点取这一段第一个零样本的起点。
+    let mut longest: Option<(u64, u64, u64)> = None;
+    let mut current: Option<(u64, u64)> = None;
     let mut covered_until_ms = window.start_ms;
     for (start_ms, end_ms, zero_delta) in intervals {
         let non_overlapping_start_ms = start_ms.max(covered_until_ms);
@@ -823,17 +998,23 @@ fn longest_zero_delta_run_ms(out: &MonitorStopOut, window: &EffectiveWindow, rx:
             continue;
         }
         if start_ms > covered_until_ms.saturating_add(ROLLING_COVERAGE_TOLERANCE_MS) {
-            current = 0;
+            current = None;
         }
         if zero_delta {
-            current = current.saturating_add(end_ms - non_overlapping_start_ms);
-            longest = longest.max(current);
+            let (run_start, run_ms) = current.unwrap_or((non_overlapping_start_ms, 0));
+            let run_ms = run_ms.saturating_add(end_ms - non_overlapping_start_ms);
+            current = Some((run_start, run_ms));
+            if longest.is_none_or(|(_, _, best)| run_ms > best) {
+                longest = Some((run_start, end_ms, run_ms));
+            }
         } else {
-            current = 0;
+            current = None;
         }
         covered_until_ms = end_ms;
     }
-    longest
+    // 返回的区间长度就是累加时长：段内不允许有超过容差的缺口，
+    // 容差以内的毫秒舍入缝隙按「起点 + 时长」收拢，分子与平均值的分母同口径。
+    longest.map(|(start, _, run_ms)| (start, start.saturating_add(run_ms)))
 }
 
 #[cfg(test)]
@@ -1128,6 +1309,166 @@ mod tests {
             valid: true,
             ..Default::default()
         }
+    }
+
+    /// 每秒一个样本，`rate(second)` 给出该秒的 Mbps；0 就是计数器真的没动。
+    fn per_second(seconds: u64, rate: impl Fn(u64) -> f64) -> MonitorStopOut {
+        MonitorStopOut {
+            samples: (1..=seconds)
+                .map(|second| sample(second * 1_000, (rate(second) * 1_000_000.0 / 8.0) as u64))
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    fn whole(seconds: u64) -> EffectiveWindow {
+        EffectiveWindow {
+            start_ms: 0,
+            end_ms: seconds * 1_000,
+            available_secs: seconds as f64,
+            required_secs: seconds,
+            complete: true,
+        }
+    }
+
+    /// 接收端 server 逐秒行：`flowing(second)` 为假的那几秒速率为零。
+    fn server_trace(seconds: u64, flowing: impl Fn(u64) -> bool) -> ToolTrace {
+        let lines: Vec<(u64, u64)> = (0..seconds)
+            .map(|second| (second * 1_000, (second + 1) * 1_000))
+            .collect();
+        ToolTrace {
+            receiver: ToolTimeline {
+                flowing: lines
+                    .iter()
+                    .copied()
+                    .filter(|(start, _)| flowing(start / 1_000 + 1))
+                    .collect(),
+                reported: lines,
+            },
+            ..Default::default()
+        }
+    }
+
+    /// **端到端**：真实断流必须照常判 PASS / RATE_FAIL，不能被当成计数器失效。
+    ///
+    /// 以前「计数器连续零增长超过窗口 5%」一律 `COUNTER_STALLED / NOT_EVALUATED`：
+    /// 中途断 20 秒、平均仍有 2311 的链路拿不到 PASS；第 10 秒就掉线的 CPE
+    /// 拿不到 RATE_FAIL，报告还说「平均速率不可信」。守 PASS 这一半的老用例
+    /// （`a_mid_run_outage_still_reaches_the_report_even_though_the_average_passed`）
+    /// 是手工拼的 `RateStats`，停滞比例直接写 0，从来没经过这条路径。
+    #[test]
+    fn a_real_outage_is_judged_by_the_average_instead_of_blamed_on_the_counter() {
+        let target = 2_000.0;
+        let outage = |second: u64| (61..=80).contains(&second);
+        let out = per_second(180, |second| if outage(second) { 0.0 } else { 2_600.0 });
+        let stats = monitor_rate_stats(&out, &whole(180), true, 0)
+            .with_tool_trace(&server_trace(180, |second| !outage(second)));
+        assert_eq!(stats.stall_span_ms, Some((60_000, 80_000)));
+        assert_eq!(stats.stall_evidence, StallEvidence::TrafficStopped);
+        let judged = evaluate_rx_acceptance(RateMode::Verify, Some(target), &stats);
+        assert_eq!(judged.verdict, Verdict::Pass, "{}", judged.detail);
+        let notes = rx_acceptance_diagnostics(&stats, &stats, Some(target), None);
+        assert!(
+            notes.iter().any(|line| line.contains("按真实断流计入平均")),
+            "{notes:?}"
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|line| line.contains("RX_OUTAGE") && line.contains("平均值已达标")),
+            "{notes:?}"
+        );
+
+        // 第 10 秒起整条链路没了：平均 217，必须是 RATE_FAIL。
+        let out = per_second(120, |second| if second <= 10 { 2_600.0 } else { 0.0 });
+        let stats = monitor_rate_stats(&out, &whole(120), true, 0)
+            .with_tool_trace(&server_trace(120, |second| second <= 10));
+        let judged = evaluate_rx_acceptance(RateMode::Verify, Some(target), &stats);
+        assert_eq!(judged.verdict, Verdict::RateFail, "{}", judged.detail);
+        assert_eq!(judged.code, ReasonCode::RxBelowTarget);
+    }
+
+    /// 计数器没记账（工具侧同期一直在收）仍然不能下结论；对不上时间的也不猜。
+    #[test]
+    fn a_frozen_counter_or_an_unexplained_stall_still_blocks_the_verdict() {
+        let target = 2_000.0;
+        let frozen = |second: u64| (61..=80).contains(&second);
+        let out = per_second(180, |second| if frozen(second) { 0.0 } else { 2_600.0 });
+
+        let continued = monitor_rate_stats(&out, &whole(180), true, 0)
+            .with_tool_trace(&server_trace(180, |_| true));
+        assert_eq!(continued.stall_evidence, StallEvidence::TrafficContinued);
+        let judged = evaluate_rx_acceptance(RateMode::Verify, Some(target), &continued);
+        assert_eq!(judged.verdict, Verdict::NotEvaluated);
+        assert_eq!(judged.code, ReasonCode::CounterStalled);
+        assert!(judged.detail.contains("计数器没记"), "{}", judged.detail);
+
+        // 没有旁证：同样不下结论，但要说清两种可能都在。
+        let unknown = monitor_rate_stats(&out, &whole(180), true, 0);
+        let judged = evaluate_rx_acceptance(RateMode::Verify, Some(target), &unknown);
+        assert_eq!(judged.verdict, Verdict::NotEvaluated);
+        assert!(judged.detail.contains("无法区分"), "{}", judged.detail);
+        // 同一行的掉坑诊断不许再说「平均值已达标，故不改写判定」。
+        let notes = rx_acceptance_diagnostics(&unknown, &unknown, Some(target), None);
+        let outage = notes
+            .iter()
+            .find(|line| line.contains("RX_OUTAGE"))
+            .unwrap_or_else(|| panic!("{notes:?}"));
+        assert!(!outage.contains("平均值已达标"), "{outage}");
+        assert!(outage.contains("未按平均值下结论"), "{outage}");
+
+        // server 日志按首尾裁剪、中段缺失：缺掉的那几秒不算汇报过，不许当成「停了」。
+        let mut truncated = server_trace(180, |_| true);
+        truncated
+            .receiver
+            .reported
+            .retain(|(start, _)| !(50_000..90_000).contains(start));
+        truncated
+            .receiver
+            .flowing
+            .retain(|(start, _)| !(50_000..90_000).contains(start));
+        let stats = monitor_rate_stats(&out, &whole(180), true, 0).with_tool_trace(&truncated);
+        assert_eq!(stats.stall_evidence, StallEvidence::Unknown);
+    }
+
+    /// 发送端旁证只在接收端说不上话时才用，并且多流的重叠行只计一次。
+    #[test]
+    fn tool_evidence_prefers_the_receiver_and_counts_overlapping_lines_once() {
+        let span = (10_000, 16_000);
+        let sender_says_flowing = ToolTimeline {
+            reported: vec![(0, 30_000)],
+            flowing: (0..30).map(|s| (s * 1_000, (s + 1) * 1_000)).collect(),
+        };
+        let receiver_says_stopped = ToolTimeline {
+            reported: (0..30).map(|s| (s * 1_000, (s + 1) * 1_000)).collect(),
+            flowing: (0..30)
+                .filter(|s| !(10..16).contains(s))
+                .map(|s| (s * 1_000, (s + 1) * 1_000))
+                .collect(),
+        };
+        let trace = ToolTrace {
+            receiver: receiver_says_stopped,
+            sender: sender_says_flowing.clone(),
+        };
+        assert_eq!(trace.stall_evidence(span), StallEvidence::TrafficStopped);
+        let sender_only = ToolTrace {
+            sender: sender_says_flowing,
+            ..Default::default()
+        };
+        assert_eq!(
+            sender_only.stall_evidence(span),
+            StallEvidence::TrafficContinued
+        );
+
+        // 每秒一条单流行 + 一条 [SUM] 行：覆盖同一段，不能算成两倍。
+        assert_eq!(
+            covered_ms(&[(10_000, 11_000), (10_000, 11_000)], span),
+            1_000
+        );
+        assert_eq!(
+            covered_ms(&[(9_000, 12_000), (11_000, 20_000)], span),
+            6_000
+        );
     }
 
     /// 取自 run_20260825_215915_7684 的 unit-114-115：前 6 秒 rx_bytes 正常

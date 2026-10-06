@@ -7,6 +7,7 @@
 use super::*;
 // 仅测试用到的采样统计层符号；产品码不需要，放这里避免非测试构建报未用导入。
 use super::db::resume_age_is_fresh;
+use crate::cmd::iperf_window::{iperf_effective_window, receiver_rate_over, ServerInterval};
 use crate::master::builder::{Endpoint, PingPurpose, PingTask};
 
 use crate::master::rate_window::{
@@ -47,6 +48,7 @@ fn unit_panic_is_converted_cleanup_runs_and_next_unit_can_continue() {
                 rx_avg: None,
                 main_rows: Vec::new(),
                 tag: String::new(),
+                traffic: None,
             }]
         },
         || Err("synthetic cleanup failure".into()),
@@ -1143,12 +1145,14 @@ fn unit_summary_metrics_preserve_single_and_bidirectional_nic_rx() {
             rx_avg: Some(950.0),
             main_rows: vec![ab_row],
             tag: "ab".into(),
+            traffic: None,
         },
         LegOutcome {
             judgement: VerdictResult::new(Verdict::RateFail, ReasonCode::RxBelowTarget, "ba low"),
             rx_avg: Some(780.0),
             main_rows: vec![ba_row],
             tag: "ba".into(),
+            traffic: None,
         },
     ];
     {
@@ -1187,6 +1191,7 @@ fn unit_summary_metrics_preserve_single_and_bidirectional_nic_rx() {
         rx_avg: None,
         main_rows: vec![ping_row],
         tag: String::new(),
+        traffic: None,
     }]);
     assert_eq!(ping_directions.len(), 1);
     assert_eq!(ping_directions[0].streams, None);
@@ -1332,7 +1337,7 @@ fn cts_monitor_and_client_start_delays_share_one_leg_epoch() {
             ..Default::default()
         },
     ];
-    let window = cts_effective_window(&events, 10, 1_000);
+    let window = cts_effective_window(&events, 10, 1_000, 0);
     assert_eq!(window.start_ms, 2_500);
     assert_eq!(window.end_ms, 12_500);
     assert_eq!(window.available_secs, 11.0);
@@ -1432,7 +1437,7 @@ fn cts_effective_window_does_not_guess_a_buffered_output_window() {
             ..Default::default()
         },
     ];
-    let window = cts_effective_window(&events, 10, 1_000);
+    let window = cts_effective_window(&events, 10, 1_000, 0);
     assert_eq!((window.start_ms, window.end_ms), (12_100, 12_500));
     assert_eq!(window.available_secs, 0.4);
     assert!(!window.complete);
@@ -1466,7 +1471,7 @@ fn cts_effective_window_does_not_treat_a_long_handshake_as_buffered_output() {
 
     // client 正常结束且有工具测量，也只能证明进程完整运行；Connection/Traffic
     // 并未集中在退出前，不能用 Ended-duration 把前面的握手空窗扩成数据窗口。
-    let window = cts_effective_window(&events, 10, 1_000);
+    let window = cts_effective_window(&events, 10, 1_000, 0);
     assert_eq!((window.start_ms, window.end_ms), (8_000, 13_000));
     assert_eq!(window.available_secs, 5.0);
     assert!(!window.complete);
@@ -1497,7 +1502,7 @@ fn cts_effective_window_prefers_status_period_after_connection_handshake() {
             ..Default::default()
         },
     ];
-    let window = cts_effective_window(&events, 10, 1_000);
+    let window = cts_effective_window(&events, 10, 1_000, 0);
     assert_eq!((window.start_ms, window.end_ms), (2_500, 12_500));
     assert!(window.complete);
 }
@@ -1540,7 +1545,7 @@ fn cts_total_time_is_not_used_as_data_window_evidence() {
     ];
     // client 的 Total Time 与合并摘要中的 server 生命周期都不是纯数据时长，
     // 不能用来补齐事件证据只有 0.4 秒的窗口。
-    let server_window = cts_effective_window(&events, 10, 1_000);
+    let server_window = cts_effective_window(&events, 10, 1_000, 0);
     assert_eq!(
         (server_window.start_ms, server_window.end_ms),
         (12_100, 12_500)
@@ -1670,7 +1675,7 @@ fn artifact_tcp_rx_baseline_uses_client_start_not_inferred_window() {
             ..Default::default()
         },
     ];
-    let window = iperf_effective_window(&events, 180, true);
+    let window = iperf_effective_window(&events, 180, 0, true);
     assert_eq!((window.start_ms, window.end_ms), (2_898, 182_898));
     assert_eq!(iperf_baseline_cutoff_ms(&events), 551);
 
@@ -2385,7 +2390,7 @@ fn cts_effective_window_tolerates_millisecond_rounding_only() {
             ..Default::default()
         },
     ];
-    let rounded = cts_effective_window(&events, 10, 1_000);
+    let rounded = cts_effective_window(&events, 10, 1_000, 0);
     assert_eq!((rounded.start_ms, rounded.end_ms), (2_000, 11_999));
     assert_eq!(rounded.available_secs, 9.999);
     assert!(rounded.complete);
@@ -2403,6 +2408,7 @@ fn cts_effective_window_tolerates_millisecond_rounding_only() {
         ],
         10,
         1_000,
+        0,
     );
     assert!(!clearly_short.complete);
 }
@@ -2432,7 +2438,7 @@ fn cts_effective_window_does_not_expand_an_early_exit() {
             ..Default::default()
         },
     ];
-    let window = cts_effective_window(&events, 10, 1_000);
+    let window = cts_effective_window(&events, 10, 1_000, 0);
     assert_eq!((window.start_ms, window.end_ms), (2_500, 8_000));
     assert_eq!(window.available_secs, 5.5);
     assert!(!window.complete);
@@ -2474,8 +2480,12 @@ fn cts_monitor_failures_keep_specific_result_semantics() {
     let issue = cts_monitor_runtime_issue(&runtime, &window).expect("runtime issue");
     assert_eq!(issue.code, ReasonCode::CtsMonitorRuntimeError);
     assert!(issue.detail.contains("counter reset"));
+    // 窗口内的读数失败按 RX 采样覆盖率处理，和 iperf 链同一口径，不单独否决；
+    // 这一份样本全是无效的，覆盖率为零，验收层自己会判无法评价。
+    assert!(cts_monitor_issue_verdict(&issue).is_none());
+    let stats = monitor_rate_stats(&runtime, &window, true, 0);
     assert_eq!(
-        cts_monitor_issue_verdict(&issue).unwrap().verdict,
+        evaluate_rx_acceptance(RateMode::Observe, None, &stats).verdict,
         Verdict::NotEvaluated
     );
 
@@ -2489,6 +2499,60 @@ fn cts_monitor_failures_keep_specific_result_semantics() {
     assert_eq!(judgement.verdict, Verdict::SetupError);
     assert_eq!(judgement.code, ReasonCode::CtsMonitorStartFailed);
     assert_eq!(judgement.detail, "interface not found");
+}
+
+/// 窗口内一次读数失败：下一拍的字节差覆盖了缺口，覆盖率仍是 100%——和 iperf
+/// 链一样照常判定，不再整行无法评价。
+#[test]
+fn a_single_failed_read_inside_the_cts_window_does_not_veto_the_verdict() {
+    let window = EffectiveWindow {
+        start_ms: 2_000,
+        end_ms: 12_000,
+        available_secs: 10.0,
+        required_secs: 10,
+        complete: true,
+    };
+    let samples: Vec<MonitorSample> = (3..=12)
+        .map(|second| match second {
+            6 => MonitorSample {
+                elapsed_ms: 6_000,
+                interval_ms: 1_000,
+                valid: false,
+                error: "GetIfTable2 transient failure".into(),
+                ..Default::default()
+            },
+            // 恢复样本：字节差和时长都从上一次成功读数算起，覆盖 [5s, 7s)。
+            7 => MonitorSample {
+                elapsed_ms: 7_000,
+                interval_ms: 2_000,
+                rx_delta_bytes: 25_000_000,
+                rx_mbps: 100.0,
+                valid: true,
+                ..Default::default()
+            },
+            _ => MonitorSample {
+                elapsed_ms: second * 1_000,
+                interval_ms: 1_000,
+                rx_delta_bytes: 12_500_000,
+                rx_mbps: 100.0,
+                valid: true,
+                ..Default::default()
+            },
+        })
+        .collect();
+    let output = MonitorStopOut {
+        samples,
+        errors: vec!["GetIfTable2 transient failure".into()],
+        ..Default::default()
+    };
+    let issue = cts_monitor_runtime_issue(&output, &window).expect("runtime issue");
+    assert!(cts_monitor_issue_verdict(&issue).is_none());
+    let stats = monitor_rate_stats(&output, &window, true, 0);
+    assert_eq!(stats.coverage, 1.0);
+    assert_eq!(
+        evaluate_rx_acceptance(RateMode::Verify, Some(90.0), &stats).verdict,
+        Verdict::Pass
+    );
 }
 
 #[test]
@@ -2586,6 +2650,7 @@ fn ctstraffic_builder_setup_error_returns_before_agent_or_cts_start() {
             owner_id: "cts-builder-setup-owner",
             lease_secs: 1,
         },
+        Instant::now(),
     );
 
     assert_eq!(outcome.verdict(), Verdict::SetupError);
@@ -3068,8 +3133,13 @@ fn test_discovery_stages_are_quartered() {
     );
 }
 
+/// 流数不足**不**让窗口作废（ADR-17，用户确认的口径 B）。
+///
+/// 窗口以前要求「同时活跃的流 ≥ 目标推算的必需流数」：2 条里掉 1 条，这条腿
+/// 就判 EFFECTIVE_WINDOW_SHORT，哪怕剩下那条照样跑满、RX 也达标。TCP/CTS 对
+/// 同一件事只记诊断——现在 UDP 也一样，掉流由 `udp_leg_diagnostics` 报出来。
 #[test]
-fn test_bidir_5_and_2_streams_require_both_streams_on_small_leg() {
+fn test_bidir_small_leg_keeps_its_window_when_one_of_its_streams_fails() {
     let master = endpoint(Side::Master, "master0", "192.168.1.2");
     let agent = endpoint(Side::Agent, "agent0", "192.168.1.3");
     let plans = vec![
@@ -3096,16 +3166,26 @@ fn test_bidir_5_and_2_streams_require_both_streams_on_small_leg() {
     }
     assert_eq!(windows.concurrency_secs, 180.0);
 
-    let failed_small_leg_flow = results
-        .iter_mut()
-        .find(|flow| flow.leg_pos == 1 && flow.stream_pos == 1)
-        .unwrap();
-    failed_small_leg_flow.raw_ok = false;
-    failed_small_leg_flow.events.clear();
+    let fail = |results: &mut Vec<UdpFlowRun>, stream_pos: usize| {
+        let flow = results
+            .iter_mut()
+            .find(|flow| flow.leg_pos == 1 && flow.stream_pos == stream_pos)
+            .unwrap();
+        flow.raw_ok = false;
+        flow.events.clear();
+    };
+    fail(&mut results, 1);
     let windows =
         select_udp_effective_windows(&plans, &results, &monitors, &RateCheckCfg::default());
+    // 2 条掉 1 条：剩下那条全程在跑，窗口照样完整，结论交给 RX。
+    assert!(windows.per_leg[1].complete, "{:?}", windows.per_leg[1]);
+    assert_eq!(windows.per_leg[1].available_secs, 184.0);
+    assert_eq!(windows.concurrency_secs, 180.0);
 
-    // 小腿的流数不够，这条腿没结论——这一条不变。
+    // 小腿两条全掉：这条腿一刻都没有流，没结论——这一条不变。
+    fail(&mut results, 0);
+    let windows =
+        select_udp_effective_windows(&plans, &results, &monitors, &RateCheckCfg::default());
     assert!(!windows.per_leg[1].complete);
     assert_eq!(windows.per_leg[1].available_secs, 0.0);
 
@@ -3130,24 +3210,26 @@ fn test_leg_window_shortens_only_for_the_direction_that_dropped_early() {
         udp_plan(0, "ab", 2, &master, &agent, 180),
         udp_plan(1, "ba", 2, &agent, &master, 180),
     ];
-    let mut results = Vec::new();
-    for (leg_pos, plan) in plans.iter().enumerate() {
-        for (stream_pos, task) in plan.streams.iter().enumerate() {
-            let end_ms = if leg_pos == 1 && stream_pos == 1 {
-                175_000
-            } else {
-                190_000
-            };
-            results.push(udp_flow(leg_pos, stream_pos, task, 1_000, end_ms, true));
+    let run = |ba_ends: [u64; 2]| {
+        let mut results = Vec::new();
+        for (leg_pos, plan) in plans.iter().enumerate() {
+            for (stream_pos, task) in plan.streams.iter().enumerate() {
+                let end_ms = if leg_pos == 1 {
+                    ba_ends[stream_pos]
+                } else {
+                    190_000
+                };
+                results.push(udp_flow(leg_pos, stream_pos, task, 1_000, end_ms, true));
+            }
         }
-    }
-    let monitors = HashMap::from([
-        (agent.key(), monitor_until(190_000, 2_000.0, 2_000.0)),
-        (master.key(), monitor_until(190_000, 2_000.0, 2_000.0)),
-    ]);
-    let windows =
-        select_udp_effective_windows(&plans, &results, &monitors, &RateCheckCfg::default());
-    // ba 腿有一条流 175s 就停了，只有这条腿的窗口被截短。
+        let monitors = HashMap::from([
+            (agent.key(), monitor_until(190_000, 2_000.0, 2_000.0)),
+            (master.key(), monitor_until(190_000, 2_000.0, 2_000.0)),
+        ]);
+        select_udp_effective_windows(&plans, &results, &monitors, &RateCheckCfg::default())
+    };
+    // ba 腿两条流都在 175s 停了，只有这条腿的窗口被截短。
+    let windows = run([175_000, 175_000]);
     assert!(!windows.per_leg[1].complete);
     assert_eq!(windows.per_leg[1].available_secs, 169.0);
     // ab 腿全程正常，不受影响。
@@ -3155,6 +3237,11 @@ fn test_leg_window_shortens_only_for_the_direction_that_dropped_early() {
     assert_eq!(windows.per_leg[0].available_secs, 184.0);
     // 两条腿确实重叠过，重叠时长取交集。
     assert_eq!(windows.concurrency_secs, 169.0);
+
+    // 只停一条：另一条还在跑，窗口不截短——掉流只作诊断。
+    let windows = run([190_000, 175_000]);
+    assert!(windows.per_leg[1].complete);
+    assert_eq!(windows.per_leg[1].available_secs, 184.0);
 }
 
 #[test]
@@ -3734,6 +3821,7 @@ fn healthy_stats(rx_mbps: f64) -> RateStats {
         window_start_ms: 0,
         baseline_mbps: 0.0,
         stalled_ratio: 0.0,
+        ..Default::default()
     }
 }
 
@@ -3768,6 +3856,7 @@ fn client_tail_failure_after_full_window_keeps_nic_verdict() {
         tx_stats: &rx,
         offered_floor: None,
         client_tail: TAIL_HANDSHAKE_ERROR,
+        setup_error: None,
         rx_monitor: None,
     });
     let (verdict, code, detail) = (judged.verdict, judged.code, judged.detail);
@@ -3806,6 +3895,7 @@ fn tail_failure_downgrade_never_upgrades_a_failing_rate() {
         tx_stats: &below,
         offered_floor: None,
         client_tail: TAIL_HANDSHAKE_ERROR,
+        setup_error: None,
         rx_monitor: None,
     });
     let (verdict, code) = (judged.verdict, judged.code);
@@ -3832,6 +3922,7 @@ fn tail_failure_downgrade_never_upgrades_a_failing_rate() {
         tx_stats: &dead,
         offered_floor: None,
         client_tail: TAIL_HANDSHAKE_ERROR,
+        setup_error: None,
         rx_monitor: None,
     });
     let (verdict, code) = (judged.verdict, judged.code);
@@ -4101,6 +4192,7 @@ fn an_unusable_window_still_reports_what_the_nic_actually_saw() {
         tx_stats: &RateStats::default(),
         offered_floor: None,
         client_tail: "",
+        setup_error: None,
         rx_monitor: Some(&monitor),
     });
     let (verdict, code, detail) = (judged.verdict, judged.code, judged.detail);
@@ -4131,15 +4223,21 @@ fn an_unusable_window_without_samples_stays_silent() {
         tx_stats: &RateStats::default(),
         offered_floor: None,
         client_tail: "",
+        setup_error: None,
         rx_monitor: None,
     });
     let detail = judged.detail;
     assert!(!detail.contains("全程"), "{detail}");
 }
 
-/// 窗口没攒够就失败的，仍然是环境错误——降级只对「已经跑满」生效。
+/// 窗口没攒够就失败的，要分清两件事：
+///
+/// - 执行环境没搭起来（进程没起来、回收未确认、被取消、参数错误）→ SETUP_ERROR；
+/// - 跑出过流量、环境也没问题，只是 iperf3 中途退出（被测设备重启、链路断开）→
+///   有效窗口不足。以前这一类也判 SETUP_ERROR，而 UDP 与 CTS 对同一件事判的是
+///   窗口不足；熔断计数还会把它记成「一个测量都没产生」。
 #[test]
-fn client_failure_before_a_full_window_is_still_a_setup_error() {
+fn a_client_that_exits_after_traffic_is_a_short_window_not_a_setup_error() {
     let rx = healthy_stats(500.0);
     let short = EffectiveWindow {
         start_ms: 0,
@@ -4148,22 +4246,32 @@ fn client_failure_before_a_full_window_is_still_a_setup_error() {
         required_secs: 180,
         complete: false,
     };
-    let judged = iperf_flow_verdict(IperfFlowVerdictIn {
-        raw_ok: false,
-        measurement: true,
-        effective_window: &short,
-        required_secs: 180,
-        rate_mode: RateMode::Observe,
-        rx_target_mbps: None,
-        rx_stats: &rx,
-        tx_stats: &rx,
-        offered_floor: None,
-        client_tail: "iperf3: error - unable to connect to server",
-        rx_monitor: None,
-    });
-    let (verdict, code) = (judged.verdict, judged.code);
-    assert_eq!(verdict, Verdict::SetupError);
-    assert_eq!(code, ReasonCode::IperfExecFailed);
+    let judge = |setup_error: Option<String>| {
+        iperf_flow_verdict(IperfFlowVerdictIn {
+            raw_ok: false,
+            measurement: true,
+            effective_window: &short,
+            required_secs: 180,
+            rate_mode: RateMode::Observe,
+            rx_target_mbps: None,
+            rx_stats: &rx,
+            tx_stats: &rx,
+            offered_floor: None,
+            client_tail: "iperf3: error - control socket has closed unexpectedly",
+            setup_error,
+            rx_monitor: None,
+        })
+    };
+
+    let exited = judge(None);
+    assert_eq!(exited.verdict, Verdict::NotEvaluated);
+    assert_eq!(exited.code, ReasonCode::IperfEffectiveWindowShort);
+    assert!(exited.detail.contains("中途退出"), "{}", exited.detail);
+
+    let broken = judge(Some("client 进程回收未确认".into()));
+    assert_eq!(broken.verdict, Verdict::SetupError);
+    assert_eq!(broken.code, ReasonCode::IperfExecFailed);
+    assert!(broken.detail.contains("回收未确认"), "{}", broken.detail);
 }
 
 #[test]
@@ -4301,7 +4409,7 @@ fn short_reported_interval_stays_short_instead_of_falling_back_to_process_lifeti
     // 必须按行内 175 秒裁剪，而不是回退成 client 进程寿命 190 秒 —— 后者会把
     // 短测量补成完整窗口，还把 startup 爬升算进 RX 平均。
     assert_eq!(flow_active_interval(&flow), Some((24_990, 199_990)));
-    let window = iperf_effective_window(&flow.events, 180, true);
+    let window = iperf_effective_window(&flow.events, 180, 0, true);
     assert!(
         !window.complete,
         "175 秒测量不能被判成完整 180 秒窗口: {window:?}"
@@ -4330,6 +4438,323 @@ fn longest_reported_interval_wins_over_a_later_per_second_interval_line() {
     );
 
     assert_eq!(flow_active_interval(&flow), Some((20_000, 200_000)));
+}
+
+/// 进程实际跑多久：多跑一段起流爬升（判定窗口扣掉它），配了双向合计门限的单元
+/// 再多跑一小段凑交集；iperf UDP 组的爬升由组调度器自己扣，这里不重复。
+#[test]
+fn traffic_processes_run_past_the_required_duration_only_where_needed() {
+    let cfg = Config::default();
+    let settle = cfg.iperf.rate_check.settle_secs;
+    let margin = crate::cmd::iperf_window::BIDIR_OVERLAP_MARGIN_SECS;
+    assert!(settle > 0, "默认就要扣起流爬升");
+
+    let mut total = ctstraffic_unit("margin", false);
+    total.bidir = true;
+    total.bidir_total_target_mbps = Some(1_500.0);
+    let mut per_direction = total.clone();
+    per_direction.bidir_total_target_mbps = None;
+    let mut one_way = ctstraffic_unit("margin-one-way", false);
+    one_way.bidir_total_target_mbps = Some(1_500.0);
+
+    let secs = |unit: &Unit| {
+        traffic_process_secs(180, traffic_settle_secs(&cfg), needs_overlap_margin(unit))
+    };
+    assert_eq!(secs(&total), 180 + settle + margin);
+    assert_eq!(secs(&per_direction), 180 + settle);
+    assert_eq!(secs(&one_way), 180 + settle);
+}
+
+/// TCP 起流爬升不进平均：窗口从真实流量起点扣掉 settle，再截出要求时长。
+///
+/// 以前 TCP 窗口从 iperf3 的 0.00 秒算起，慢启动和窗口增长那几秒的低速全进了
+/// 平均，Wi-Fi 上能压低一两个百分点；UDP 早就扣了 settle，两条链口径不一。
+#[test]
+fn the_tcp_ramp_is_cut_from_the_window() {
+    // client 跑 185 秒（要求 180 + settle 5），汇总行按时到达，偏移 1_000。
+    let events = vec![
+        IperfFlowEvent {
+            kind: IperfEventKind::Started,
+            elapsed_ms: 500,
+            ..Default::default()
+        },
+        IperfFlowEvent {
+            kind: IperfEventKind::Traffic,
+            elapsed_ms: 2_000,
+            mbps: Some(300.0),
+            line: "[  5]   0.00-1.00   sec  35.8 MBytes   300 Mbits/sec".into(),
+        },
+        IperfFlowEvent {
+            kind: IperfEventKind::Traffic,
+            elapsed_ms: 186_000,
+            mbps: Some(880.0),
+            line: "[  5]   0.00-185.00 sec  19.0 GBytes   880 Mbits/sec   sender".into(),
+        },
+        IperfFlowEvent {
+            kind: IperfEventKind::Ended,
+            elapsed_ms: 186_300,
+            ..Default::default()
+        },
+    ];
+    // 前 5 秒爬升（300），之后稳定 900。
+    let output = MonitorStopOut {
+        samples: (1..=187)
+            .map(|second| {
+                let mbps = if second <= 6 { 300.0 } else { 900.0 };
+                MonitorSample {
+                    elapsed_ms: second * 1_000,
+                    interval_ms: 1_000,
+                    rx_delta_bytes: (mbps * 125_000.0) as u64,
+                    rx_mbps: mbps,
+                    valid: true,
+                    ..Default::default()
+                }
+            })
+            .collect(),
+        ..Default::default()
+    };
+
+    let settled = iperf_effective_window(&events, 180, 5, true);
+    assert!(settled.complete, "{settled:?}");
+    assert_eq!((settled.start_ms, settled.end_ms), (6_000, 186_000));
+    let stats = monitor_rate_stats(&output, &settled, true, 500);
+    assert_eq!(stats.avg_mbps, Some(900.0));
+
+    // 不扣的话窗口从 1_000 开始，爬升段进了平均。
+    let raw = iperf_effective_window(&events, 180, 0, true);
+    let with_ramp = monitor_rate_stats(&output, &raw, true, 500);
+    assert!(with_ramp.avg_mbps.unwrap() < 900.0);
+
+    // 进程没多跑（只跑了要求时长）就凑不够：扣掉爬升后窗口不完整。
+    let mut short = events.clone();
+    short[2].line = "[  5]   0.00-180.00 sec  18.5 GBytes   880 Mbits/sec   sender".into();
+    short[2].elapsed_ms = 181_000;
+    short[3].elapsed_ms = 181_300;
+    assert!(!iperf_effective_window(&short, 180, 5, true).complete);
+}
+
+/// CTS TCP 同样扣起流爬升；事件证据要覆盖「要求时长 + 爬升」才算完整。
+#[test]
+fn the_cts_window_cuts_the_ramp_and_needs_it_covered() {
+    let events = |ended_ms: u64| {
+        vec![
+            IperfFlowEvent {
+                kind: IperfEventKind::Started,
+                elapsed_ms: 500,
+                ..Default::default()
+            },
+            IperfFlowEvent {
+                kind: IperfEventKind::Connected,
+                elapsed_ms: 1_000,
+                ..Default::default()
+            },
+            IperfFlowEvent {
+                kind: IperfEventKind::Ended,
+                elapsed_ms: ended_ms,
+                ..Default::default()
+            },
+        ]
+    };
+    let window = cts_effective_window(&events(16_000), 10, 1_000, 5);
+    assert!(window.complete, "{window:?}");
+    assert_eq!((window.start_ms, window.end_ms), (6_000, 16_000));
+
+    let short = cts_effective_window(&events(12_000), 10, 1_000, 5);
+    assert!(!short.complete, "{short:?}");
+    assert_eq!(short.start_ms, 6_000);
+}
+
+/// `count` 条逐秒行（`--forceflush` 下按时到达），**不带**汇总行。
+fn interval_only_events(count: u64, ended_at_ms: u64) -> Vec<IperfFlowEvent> {
+    let mut events = vec![
+        IperfFlowEvent {
+            kind: IperfEventKind::Started,
+            elapsed_ms: 1_000,
+            ..Default::default()
+        },
+        IperfFlowEvent {
+            kind: IperfEventKind::Connected,
+            elapsed_ms: 1_100,
+            ..Default::default()
+        },
+    ];
+    events.extend((0..count).map(|second| IperfFlowEvent {
+        kind: IperfEventKind::Traffic,
+        elapsed_ms: 1_200 + (second + 1) * 1_000 + 30,
+        mbps: Some(941.0),
+        line: format!(
+            "[  5] {second}.00-{}.00  sec   112 MBytes   941 Mbits/sec",
+            second + 1
+        ),
+    }));
+    events.push(IperfFlowEvent {
+        kind: IperfEventKind::Ended,
+        elapsed_ms: ended_at_ms,
+        ..Default::default()
+    });
+    events
+}
+
+/// iperf3 在发 TEST_END 时连接被重置，会在打印汇总行**之前**退出。
+///
+/// 以前窗口取「最长的一行」，逐秒行每行 1 秒，跑满 180 秒的测量只剩最后
+/// 1 秒——整段数据被当成窗口不足，`IPERF_SUMMARY_LOST` 那条保住网卡口径的
+/// 路径在这种最常见的形态下永远走不到。
+#[test]
+fn a_full_run_without_a_summary_line_keeps_its_whole_window() {
+    let events = interval_only_events(180, 1_200 + 180_000 + 400);
+    let window = iperf_effective_window(&events, 180, 0, true);
+    assert!(window.complete, "{window:?}");
+    assert_eq!(window.end_ms - window.start_ms, 180_000);
+    assert!((window.available_secs - 180.0).abs() < 1e-9);
+
+    // 端到端：收尾失败、窗口完整 → 判定仍然只看网卡口径。
+    let rx = healthy_stats(1_067.902);
+    let judged = iperf_flow_verdict(IperfFlowVerdictIn {
+        raw_ok: false,
+        measurement: true,
+        effective_window: &window,
+        required_secs: 180,
+        rate_mode: RateMode::Verify,
+        rx_target_mbps: Some(1_000.0),
+        rx_stats: &rx,
+        tx_stats: &rx,
+        offered_floor: None,
+        client_tail: TAIL_HANDSHAKE_ERROR,
+        setup_error: None,
+        rx_monitor: None,
+    });
+    assert_eq!(judged.verdict, Verdict::Pass, "{}", judged.detail);
+    assert!(
+        judged.detail.contains("IPERF_SUMMARY_LOST"),
+        "{}",
+        judged.detail
+    );
+}
+
+/// 中途退出的测量照样是短的：逐秒行只覆盖到第 10 秒，窗口就只有 10 秒。
+#[test]
+fn a_run_that_aborted_early_without_a_summary_stays_short() {
+    let events = interval_only_events(10, 1_200 + 10_000 + 400);
+    let window = iperf_effective_window(&events, 180, 0, true);
+    assert!(!window.complete);
+    assert!((window.available_secs - 10.0).abs() < 1e-9, "{window:?}");
+}
+
+/// server 输出的逐秒行投影到监控时间轴；同一个 server 上 client 重试之前那次
+/// 测试的行要丢掉；UDP 不填发送端（恒速发包证明不了对端收没收到）。
+#[test]
+fn the_iperf_tool_trace_reads_the_server_timeline_of_the_last_test_only() {
+    let events = interval_only_events(180, 1_200 + 180_000 + 400);
+    let mut server = String::from(
+        "Server listening on 5201\n\
+         [  5]   0.00-1.00   sec  50.0 MBytes   419 Mbits/sec\n\
+         [  5]   1.00-2.00   sec  50.0 MBytes   419 Mbits/sec\n\
+         Accepted connection from 192.168.1.2\n",
+    );
+    for second in 0..180u64 {
+        let rate = if (60..80).contains(&second) {
+            "0.00 Bytes  0.00 bits/sec"
+        } else {
+            "112 MBytes   941 Mbits/sec"
+        };
+        server.push_str(&format!(
+            "[  5] {second}.00-{}.00  sec  {rate}\n",
+            second + 1
+        ));
+    }
+    server.push_str("[  5]   0.00-180.04 sec  19.7 GBytes   941 Mbits/sec   receiver\n");
+
+    // 每条逐秒行到达时刻 = 1_200 + 行终点 + 30，偏移就是 1_230。
+    let server = server_intervals(&server);
+    let tcp = iperf_tool_trace(&events, &server, 180, false);
+    assert_eq!(
+        tcp.receiver.reported.len(),
+        180,
+        "只留最后一次测试，汇总行不算"
+    );
+    assert_eq!(tcp.receiver.reported[0], (1_230, 2_230));
+    assert_eq!(tcp.receiver.flowing.len(), 160);
+    assert!(!tcp.receiver.flowing.contains(&(61_230, 62_230)));
+    assert_eq!(tcp.sender.reported, vec![(1_230, 181_230)]);
+    assert_eq!(tcp.sender.flowing.len(), 180);
+    assert_eq!(
+        tcp.stall_evidence((61_230, 81_230)),
+        crate::master::rate_window::StallEvidence::TrafficStopped,
+        "接收端说这 20 秒没收到，就是真断流"
+    );
+
+    // iperf3 3.1.x 的 UDP 汇总行不带 sender/receiver 字样：按区间长度认出来，
+    // 不当成一条横跨全程的「逐秒行」。
+    // 这一条从 0 秒开始，混进来还会触发「新测试从 0 重新计时」把前面的逐秒行清掉。
+    let old_udp_summary = server_intervals(
+        "[  5]   0.00-1.00   sec   112 MBytes   941 Mbits/sec  0.010 ms  0/80000 (0%)\n\
+         [  5]   1.00-2.00   sec  0.00 Bytes  0.00 bits/sec  0.010 ms  0/0 (0%)\n\
+         [  5]   2.00-3.00   sec   112 MBytes   941 Mbits/sec  0.010 ms  0/80000 (0%)\n\
+         [  5]   0.00-3.00   sec   224 MBytes   627 Mbits/sec  0.010 ms  0/160000 (0%)\n",
+    );
+    assert_eq!(old_udp_summary.len(), 3, "{old_udp_summary:?}");
+    assert!(old_udp_summary
+        .iter()
+        .all(|line| line.end_ms - line.start_ms <= 1_000));
+    assert_eq!(old_udp_summary[1].mbps, 0.0, "断流那一秒必须留着");
+
+    let udp = iperf_tool_trace(&events, &server, 180, true);
+    assert!(udp.sender.reported.is_empty() && udp.sender.flowing.is_empty());
+    assert_eq!(udp.receiver.flowing.len(), 160);
+}
+
+/// 工具口径能裁到任意时间段的只有接收端逐秒记录：在判定窗口上求时间加权平均，
+/// 多流只认 `[SUM]`，覆盖不够或对不上时钟就拒绝，不猜。
+#[test]
+fn the_receiver_rate_over_a_window_comes_from_server_interval_lines() {
+    let events = interval_only_events(30, 1_200 + 30_000 + 400);
+    // 偏移 1_230（见 interval_only_events）；前 5 秒爬升 300，之后 900。
+    let single: String = (0..30u64)
+        .map(|second| {
+            let rate = if second < 5 { "300" } else { "900" };
+            format!(
+                "[  5] {second}.00-{}.00  sec  100 MBytes  {rate} Mbits/sec\n",
+                second + 1
+            )
+        })
+        .collect();
+    let lines = server_intervals(&single);
+    let steady = (6_230, 26_230);
+    assert_eq!(receiver_rate_over(&events, &lines, 1, steady), Ok(900.0));
+    let with_ramp = receiver_rate_over(&events, &lines, 1, (1_230, 21_230)).unwrap();
+    assert!(with_ramp < 900.0, "{with_ramp}");
+
+    // 多流：只认 [SUM] 行，逐流行不重复计。
+    let multi: String = (0..30u64)
+        .map(|second| {
+            let next = second + 1;
+            format!(
+                "[  5] {second}.00-{next}.00 sec 50 MBytes 450 Mbits/sec\n\
+                 [  7] {second}.00-{next}.00 sec 50 MBytes 450 Mbits/sec\n\
+                 [SUM] {second}.00-{next}.00 sec 100 MBytes 900 Mbits/sec\n"
+            )
+        })
+        .collect();
+    assert_eq!(
+        receiver_rate_over(&events, &server_intervals(&multi), 2, steady),
+        Ok(900.0)
+    );
+    // 多流却没有 [SUM] 行：不拿单流行冒充合计。
+    assert!(receiver_rate_over(&events, &lines, 2, steady).is_err());
+
+    // 中段缺了 10 秒记录：覆盖不足，拒绝。
+    let gapped: Vec<ServerInterval> = lines
+        .iter()
+        .copied()
+        .filter(|line| !(10_000..20_000).contains(&line.start_ms))
+        .collect();
+    let error = receiver_rate_over(&events, &gapped, 1, steady).unwrap_err();
+    assert!(error.contains("覆盖"), "{error}");
+
+    // client 一条逐秒行都没有：对不上时钟，拒绝。
+    let no_clock = vec![events[0].clone(), events.last().unwrap().clone()];
+    assert!(receiver_rate_over(&no_clock, &lines, 1, steady).is_err());
 }
 
 #[test]
@@ -4362,7 +4787,7 @@ fn tcp_rate_uses_only_the_event_proven_effective_window() {
             ..Default::default()
         },
     ];
-    let window = iperf_effective_window(&events, 10, true);
+    let window = iperf_effective_window(&events, 10, 0, true);
     assert_eq!(window.start_ms, 2_000);
     assert_eq!(window.end_ms, 12_000);
     assert_eq!(window.available_secs, 10.0);
@@ -4418,7 +4843,7 @@ fn tcp_rate_uses_only_the_event_proven_effective_window() {
     assert_eq!(stats.p10_mbps, Some(100.0));
     assert_ne!(stats.avg_mbps, Some(output.avg_mbps));
 
-    let missing = iperf_effective_window(&events, 10, false);
+    let missing = iperf_effective_window(&events, 10, 0, false);
     assert_eq!(missing.available_secs, 0.0);
     assert!(!missing.complete);
 }
@@ -4456,6 +4881,7 @@ fn test_unit_reason_matches_aggregate_verdict_priority() {
             rx_avg: None,
             main_rows: vec![],
             tag: "AB".into(),
+            traffic: None,
         },
         LegOutcome {
             judgement: VerdictResult::new(
@@ -4466,6 +4892,7 @@ fn test_unit_reason_matches_aggregate_verdict_priority() {
             rx_avg: None,
             main_rows: vec![],
             tag: "BA".into(),
+            traffic: None,
         },
     ];
     let verdict = aggregate_unit_verdict(&outcomes);
@@ -4490,6 +4917,7 @@ fn hard_single_udp_failure_beats_other_direction_not_evaluated() {
             rx_avg: None,
             main_rows: vec![],
             tag: "ab".into(),
+            traffic: None,
         },
         LegOutcome {
             judgement: VerdictResult::new(
@@ -4500,6 +4928,7 @@ fn hard_single_udp_failure_beats_other_direction_not_evaluated() {
             rx_avg: Some(100.0),
             main_rows: vec![],
             tag: "ba".into(),
+            traffic: None,
         },
     ];
     let verdict = aggregate_unit_verdict(&outcomes);
@@ -4521,6 +4950,7 @@ fn hard_single_udp_failure_beats_other_direction_not_evaluated() {
             rx_avg: Some(700.0),
             main_rows: vec![],
             tag: "ab".into(),
+            traffic: None,
         },
         LegOutcome {
             judgement: VerdictResult::new(
@@ -4531,6 +4961,7 @@ fn hard_single_udp_failure_beats_other_direction_not_evaluated() {
             rx_avg: Some(700.0),
             main_rows: vec![],
             tag: "ba".into(),
+            traffic: None,
         },
     ];
     let verdict = aggregate_unit_verdict(&cts_outcomes);
@@ -4635,12 +5066,14 @@ fn missing_ab_row_is_restored_without_duplicating_existing_ba_row() {
             rx_avg: None,
             main_rows: vec![],
             tag: "ab".into(),
+            traffic: None,
         },
         LegOutcome {
             judgement: VerdictResult::new(Verdict::Pass, ReasonCode::None, String::new()),
             rx_avg: Some(500.0),
             main_rows: vec![ba_row],
             tag: "ba".into(),
+            traffic: None,
         },
     ];
 
@@ -4696,6 +5129,7 @@ fn unit_panic_is_expanded_to_both_direction_rows_without_generic_duplicate() {
         rx_avg: None,
         main_rows: vec![],
         tag: String::new(),
+        traffic: None,
     }];
 
     ctx.ensure_traffic_outcome_rows(0, &unit, &mut outcomes);
@@ -4757,6 +5191,7 @@ fn unit_panic_reuses_a_committed_ab_row_and_only_fills_missing_ba() {
         rx_avg: None,
         main_rows: vec![],
         tag: String::new(),
+        traffic: None,
     }];
 
     ctx.ensure_traffic_outcome_rows(0, &unit, &mut outcomes);
@@ -5486,6 +5921,7 @@ fn ctstraffic_row_is_counted_as_a_usable_traffic_measurement() {
         rx_avg: None,
         main_rows: vec![row_index],
         tag: "ab".into(),
+        traffic: None,
     }];
 
     assert!(ctx.outcomes_have_usable_traffic_measurement(&outcomes));
@@ -5773,6 +6209,76 @@ fn ctstraffic_raw_record_contains_server_client_events_and_error() {
 }
 
 #[test]
+fn independent_monitor_snapshots_do_not_overwrite_saved_samples() {
+    let (mut ctx, db_path) = isolated_ctx(0);
+    let nonce = RESOURCE_OWNER_SEQ.fetch_add(1, Ordering::SeqCst);
+    let run_dir = std::env::temp_dir().join(format!(
+        "cpe_monitor_snapshot_test_{}_{}",
+        std::process::id(),
+        nonce
+    ));
+    ctx.outdir = run_dir.join("iperf_outputs");
+    let first = MonitorStopOut {
+        avg_mbps: 100.0,
+        tx_avg_mbps: 90.0,
+        seconds: 1.0,
+        bytes: 12_500_000,
+        tx_bytes: 11_250_000,
+        samples: vec![],
+        errors: vec![],
+    };
+    let mut second = first.clone();
+    second.avg_mbps = 200.0;
+    let first_link = ctx.save_monitor_samples(
+        "bidir-unit",
+        Side::Agent,
+        "en0",
+        "agent-endpoint",
+        137,
+        &first,
+    );
+    let second_link = ctx.save_monitor_samples(
+        "bidir-unit",
+        Side::Agent,
+        "en0",
+        "agent-endpoint",
+        137,
+        &second,
+    );
+    assert_ne!(first_link, second_link);
+    assert_eq!(
+        std::fs::read_to_string(run_dir.join(first_link.trim_start_matches("./"))).unwrap(),
+        build_monitor_samples_csv(Side::Agent.cn(), "en0", 137, &first)
+    );
+    assert_eq!(
+        std::fs::read_to_string(run_dir.join(second_link.trim_start_matches("./"))).unwrap(),
+        build_monitor_samples_csv(Side::Agent.cn(), "en0", 137, &second)
+    );
+    let shifted_link = ctx.save_monitor_samples(
+        "bidir-unit",
+        Side::Agent,
+        "en0",
+        "agent-endpoint",
+        138,
+        &first,
+    );
+    assert_ne!(first_link, shifted_link);
+    assert_eq!(
+        first_link,
+        ctx.save_monitor_samples(
+            "bidir-unit",
+            Side::Agent,
+            "en0",
+            "agent-endpoint",
+            137,
+            &first
+        )
+    );
+    let _ = std::fs::remove_dir_all(run_dir);
+    let _ = std::fs::remove_file(db_path);
+}
+
+#[test]
 fn nic_sample_csv_keeps_counter_deltas_rates_validity_and_errors() {
     let out = MonitorStopOut {
         avg_mbps: 100.0,
@@ -5975,7 +6481,7 @@ fn socket_buffer_drain_does_not_drag_the_window_past_the_end_of_traffic() {
         ..Default::default()
     });
 
-    let window = iperf_effective_window(&events, 60, true);
+    let window = iperf_effective_window(&events, 60, 0, true);
     assert!(window.complete, "60 秒测量必须判成完整窗口: {window:?}");
     // 汇总行的行内区间 0.00-60.01 投影回监控时间轴 = [2.246s, 62.256s]，
     // 判定窗口取其中前 60 秒。
@@ -6024,7 +6530,7 @@ fn clock_offset_falls_back_to_arrival_time_when_every_line_arrives_in_one_block(
             ..Default::default()
         },
     ];
-    let window = iperf_effective_window(&events, 10, true);
+    let window = iperf_effective_window(&events, 10, 0, true);
     assert_eq!((window.start_ms, window.end_ms), (2_400, 12_400));
     assert!(window.complete);
 }

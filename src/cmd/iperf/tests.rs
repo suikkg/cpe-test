@@ -189,7 +189,6 @@ fn bit_formatted_rates_keep_their_decimal_base() {
 
 use super::args::*;
 use super::client::*;
-use super::jobs::*;
 use super::parse::*;
 use super::server::*;
 use super::*;
@@ -1464,4 +1463,24 @@ fn server_readiness_probe_succeeds_on_a_listener_and_times_out_without_one() {
     })
     .expect_err("子进程退出必须立刻报错");
     assert_eq!(error, "server 已退出");
+}
+
+/// 「接收」只认 receiver 汇总行：结果交换失败、汇总行没打出来时，client 输出里
+/// 只剩发送端的逐秒行，不能拿其中最后一秒冒充接收端速率。
+#[test]
+fn the_receiver_rate_never_falls_back_to_a_sender_interval_line() {
+    let parsed = parse_output(
+        "[  5]   0.00-1.00   sec   119 MBytes  1000 Mbits/sec\n\
+         [  5]   1.00-2.00   sec   119 MBytes  1000 Mbits/sec\n\
+         iperf3: error - unable to send control message\n",
+    );
+    assert!(parsed.has_measurement());
+    assert_eq!(parsed.best_receiver(), None);
+    assert_eq!(parsed.best_sender(), Some(1000.0));
+
+    let with_summary = parse_output(
+        "[  5]   0.00-2.00   sec   238 MBytes  1000 Mbits/sec  0.010 ms  0/1000 (0%)  sender\n\
+         [  5]   0.00-2.00   sec   143 MBytes   600 Mbits/sec  0.010 ms  400/1000 (40%)  receiver\n",
+    );
+    assert_eq!(with_summary.best_receiver(), Some(600.0));
 }

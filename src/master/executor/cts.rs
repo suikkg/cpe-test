@@ -217,8 +217,12 @@ pub(super) fn cts_monitor_runtime_issue(
             affects_verdict: true,
         });
     }
+    // 采样过程中的个别读数失败**不单独否决**判定，和 iperf/UDP 链同一口径：
+    // 失败那一拍不进统计，下一次成功读数的字节差覆盖整段缺口，真正丢掉的时间
+    // 由 RX 采样覆盖率把关（不足 95% 判 SAMPLE_COVERAGE_LOW）。这里以前是窗口内
+    // 只要出现一个无效样本就整行 NOT_EVALUATED，而同样的一拍落在 iperf 腿上
+    // 照常判 PASS/FAIL——同一个事实，两个后端两种结论。
     (!details.is_empty()).then(|| {
-        let affects_verdict = !window_details.is_empty();
         let diagnostic_only_details: Vec<&str> = details
             .iter()
             .filter(|detail| !window_details.iter().any(|window| window == *detail))
@@ -226,26 +230,27 @@ pub(super) fn cts_monitor_runtime_issue(
             .collect();
         CtsMonitorIssue {
             code: ReasonCode::CtsMonitorRuntimeError,
-            detail: if affects_verdict {
-                let mut detail = format!(
-                    "CTS 接收端网卡监控在有效流量窗口内运行异常: {}",
-                    window_details.join("；")
-                );
-                if !diagnostic_only_details.is_empty() {
-                    detail.push_str(&format!(
-                        "；窗口外或无法定位时间的监控异常（仅诊断）: {}",
-                        diagnostic_only_details.join("；")
-                    ));
-                }
-                detail
-            } else {
+            detail: if window_details.is_empty() {
                 format!(
                     "CTS 接收端网卡监控在有效流量窗口外记录到异常，不影响本轮主判定: {}",
                     details.join("；")
                 )
+            } else {
+                let mut detail = format!(
+                    "CTS 接收端网卡监控在有效流量窗口内记录到异常（缺口已计入 RX 采样覆盖率，\
+                     不单独否决判定）: {}",
+                    window_details.join("；")
+                );
+                if !diagnostic_only_details.is_empty() {
+                    detail.push_str(&format!(
+                        "；窗口外或无法定位时间的监控异常: {}",
+                        diagnostic_only_details.join("；")
+                    ));
+                }
+                detail
             },
             setup_error: false,
-            affects_verdict,
+            affects_verdict: false,
         }
     })
 }
@@ -450,6 +455,7 @@ impl Ctx {
                             owner_id,
                             lease_secs,
                         },
+                        Instant::now(),
                     ));
                 }
                 LegKind::IperfSingle(_) | LegKind::IperfGroup { .. } | LegKind::CtsTraffic(_) => {
@@ -781,8 +787,12 @@ impl Ctx {
         let combined_output = format!("{}\n{}", client_run.client.output, server_output);
         let parsed = ctstraffic::parse_output(&combined_output, protocol);
         let traffic_established = parsed.has_measurement(protocol);
-        let traffic_window =
-            cts_effective_window(&events, task.duration, u64::from(task.status_update_ms));
+        let traffic_window = cts_effective_window(
+            &events,
+            task.duration,
+            u64::from(task.status_update_ms),
+            traffic_settle_secs(&self.cfg),
+        );
         let process_started_confirmed = client_run.client.process_started == Some(true);
         let process_cleanup_confirmed = client_run.client.cleanup_confirmed == Some(true);
         let (server_process_started_confirmed, server_process_cleanup_confirmed) =
@@ -864,6 +874,7 @@ impl Ctx {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn run_ctstraffic_leg(
         &self,
         useq: usize,
@@ -872,6 +883,7 @@ impl Ctx {
         tag: &str,
         task: &CtsTrafficTask,
         lifecycle: LifecycleLease<'_>,
+        unit_epoch: Instant,
     ) -> LegOutcome {
         let time = now_full();
         if let Some(error) = &task.setup_error {
@@ -895,7 +907,7 @@ impl Ctx {
             task.port,
             task.duration
         ));
-        let (server_req, client_req) = match self.build_cts_requests(task) {
+        let (mut server_req, mut client_req) = match self.build_cts_requests(task) {
             Ok(value) => value,
             Err(error) => {
                 return self.push_cts_setup_error_row(
@@ -910,6 +922,15 @@ impl Ctx {
                 );
             }
         };
+        // 扣起流爬升、双向合计单元凑交集，两者都要进程多跑；判定窗口仍按
+        // `task.duration` 截。
+        let process_secs = traffic_process_secs(
+            task.duration,
+            traffic_settle_secs(&self.cfg),
+            needs_overlap_margin(unit),
+        );
+        server_req.duration_secs = process_secs;
+        client_req.duration_secs = process_secs;
         let (server_side, client_side) = if task.udp {
             (task.src.side, task.dst.side)
         } else {
@@ -939,8 +960,8 @@ impl Ctx {
 
         // 所有 CTS 事件和网卡样本都对齐到同一个 leg epoch。远端 monitor
         // 的真实启动由响应中的 elapsed_ms 与成功调用自身耗时做有界估计，
-        // 不再用 RPC 往返中点猜测零点。
-        let leg_epoch = Instant::now();
+        // 不再用 RPC 往返中点猜测零点。零点由单元给：双向两条腿共用一个。
+        let leg_epoch = unit_epoch;
         let monitor_start_before_ms = leg_epoch.elapsed().as_millis().min(u64::MAX as u128) as u64;
         let mut monitor_issue = None::<CtsMonitorIssue>;
         let mon_id = match self.mon_start(
@@ -1075,10 +1096,17 @@ impl Ctx {
                 .and_then(|output| cts_monitor_runtime_issue(output, &selected.traffic_window));
         }
         let baseline_cutoff_ms = cts_baseline_cutoff_ms(&attempts);
+        let tool_trace = cts_tool_trace(
+            &selected.events,
+            &selected.traffic_window,
+            u64::from(task.status_update_ms),
+            task.udp,
+        );
         let rx_stats = mon_out
             .as_ref()
             .map(|output| {
                 monitor_rate_stats(output, &selected.traffic_window, true, baseline_cutoff_ms)
+                    .with_tool_trace(&tool_trace)
             })
             .unwrap_or_default();
         let tx_stats = tx_mon_out
@@ -1268,6 +1296,13 @@ impl Ctx {
             ));
         }
         leg_diagnostics.extend(cts_udp_loss_diagnostics(task.udp, loss_limit, loss));
+        // 没有否决判定的监控异常也要能在报告上看到，不能只留在原始记录里。
+        if let Some(issue) = monitor_issue
+            .as_ref()
+            .filter(|issue| !issue.affects_verdict)
+        {
+            leg_diagnostics.push(format!("{}: {}", issue.code, issue.detail));
+        }
         let (verdict, reason_code) = (judgement.verdict, judgement.code);
         let reason_detail = judgement.detail.clone();
         let mut raw_diagnostics = Vec::new();
@@ -1359,7 +1394,12 @@ impl Ctx {
             tx_avg: tx_stats.avg_mbps,
             tx_p10: tx_stats.p10_mbps,
             rx_p10: rx_stats.p10_mbps,
-            effective_seconds: Some(selected.traffic_window.available_secs),
+            effective_seconds: Some(
+                selected
+                    .traffic_window
+                    .available_secs
+                    .min(task.duration as f64),
+            ),
             required_seconds: Some(task.duration as f64),
             sample_coverage: Some(rx_stats.coverage),
             window_start_ms: Some(selected.traffic_window.start_ms),
@@ -1394,11 +1434,24 @@ impl Ctx {
                 task_id: md5_hex(&format!("{}|{}|ctstraffic", unit.id, tag)),
             })
         });
+        let traffic = mon_out.as_ref().map(|output| LegTraffic {
+            span: (measurement && selected.traffic_window.available_secs > 0.0).then(|| {
+                let start = selected.traffic_window.start_ms;
+                let available_ms =
+                    (selected.traffic_window.available_secs * 1_000.0).round() as u64;
+                (start, start.saturating_add(available_ms))
+            }),
+            required_secs: task.duration,
+            rx_monitor: output.clone(),
+            baseline_cutoff_ms,
+            tool_trace: tool_trace.clone(),
+        });
         LegOutcome {
             judgement: judgement.with_diagnostics(leg_diagnostics),
             rx_avg,
             main_rows: vec![idx],
             tag: tag.to_string(),
+            traffic,
         }
     }
 
@@ -1459,6 +1512,7 @@ impl Ctx {
             rx_avg: None,
             main_rows: vec![idx],
             tag: tag.to_string(),
+            traffic: None,
         }
     }
 

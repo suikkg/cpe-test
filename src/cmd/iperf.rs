@@ -34,6 +34,7 @@ pub(crate) use args::supports_forceflush_with;
 pub(crate) use client::{align_event_to_epoch, run_client_controlled_inner};
 pub use client::{run_client, run_client_controlled};
 pub use jobs::IperfClientJobMgr;
+pub(crate) use parse::interval_rate_mbps;
 pub use parse::{parse_output, IperfParsed};
 pub use server::IperfServerMgr;
 

@@ -123,11 +123,11 @@ pub(super) fn format_iperf_progress(snapshot: &IperfProgressSnapshot<'_>) -> Str
 }
 
 pub(super) fn is_live_progress_rate_line(line: &str, parallel_streams: usize) -> bool {
-    let lower = line.to_lowercase();
-    if lower.contains(" sender") || lower.contains(" receiver") {
+    if crate::cmd::iperf_window::is_summary_line(line) {
         return false;
     }
-    iperf_interval_ms(line).is_some() && (parallel_streams <= 1 || lower.contains("[sum]"))
+    iperf_interval_ms(line).is_some()
+        && (parallel_streams <= 1 || line.to_lowercase().contains("[sum]"))
 }
 
 pub(super) fn tcp_parallel_streams(extra: &[String]) -> usize {

@@ -140,6 +140,13 @@ pub struct BoardCounters {
 }
 
 impl NicCounterReader for BoardCounters {
+    /// 自研 CPE 可能跑 32 位内核加老驱动，`/proc/net/dev` 与 sysfs 的字节数满
+    /// 4 GiB 就回绕：2.5G 线速下约 14 秒一次。不认回绕的话每次都按「复位」丢掉
+    /// 一拍，覆盖率掉到 95% 以下，整条腿判无法评价。
+    fn may_wrap_at_32_bits(&self) -> bool {
+        true
+    }
+
     fn read_counters(&self, iface: &str) -> Result<(u64, u64), String> {
         match self.source {
             // iface 只用于本地精确匹配，不拼入远端 shell。

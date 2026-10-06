@@ -142,7 +142,7 @@ fn expand_cts_tcp(x: &mut Expansion<'_>, route: &Route<'_>, gate: &mut TopologyG
             route_str
         );
         let id = cts_resume_unit_id(spec, ip_tag, dir, &legs);
-        let est_secs = cts_estimated_secs(spec, &setup_error);
+        let est_secs = cts_estimated_secs(route, &setup_error);
         x.units
             .push(route.unit(id, title, target_lines, legs, est_secs));
     }
@@ -310,17 +310,19 @@ fn expand_cts_udp(x: &mut Expansion<'_>, route: &Route<'_>, gate: &mut TopologyG
             route_str
         );
         let id = cts_resume_unit_id(spec, ip_tag, dir, &legs);
-        let est_secs = cts_estimated_secs(spec, &setup_error);
+        let est_secs = cts_estimated_secs(route, &setup_error);
         x.units
             .push(route.unit(id, title, target_lines, legs, est_secs));
     }
 }
 
 /// 配置非法的单元不起进程，执行器立刻报 SETUP_ERROR，按 1 秒估。
-fn cts_estimated_secs(spec: &SpecNorm, setup_error: &Option<String>) -> u64 {
+///
+/// 进程要多跑起流爬升段，双向合计单元再多跑交集余量（与执行端同一份算法）。
+fn cts_estimated_secs(route: &Route<'_>, setup_error: &Option<String>) -> u64 {
     if setup_error.is_some() {
         1
     } else {
-        spec.duration.saturating_add(15)
+        route.single_process_secs().saturating_add(15)
     }
 }

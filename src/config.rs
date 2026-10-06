@@ -954,15 +954,15 @@ impl Config {
             problems.push("iperf.duration 为 0：不会产生任何有效测量窗口".into());
         } else if rc.settle_secs >= duration {
             problems.push(format!(
-                "iperf.rate_check.settle_secs={} 不小于 iperf.duration={}：丢弃 settle 后不会\
-                 剩下任何有效窗口，所有吞吐单元都会变成 NOT_EVALUATED",
+                "iperf.rate_check.settle_secs={} 不小于 iperf.duration={}：每个灌包单元先丢掉的\
+                 稳定等待比要计分的时长还长，进程会白跑这么久，多半是写错了",
                 rc.settle_secs, duration
             ));
         }
         if rc.background_secs.saturating_add(rc.settle_secs) >= duration && duration > 0 {
             problems.push(format!(
                 "iperf.rate_check.background_secs={} + settle_secs={} 不小于 duration={}：\
-                 基线采样与 settle 会吃掉整个测量窗口",
+                 UDP 单元不计分的基线采样与稳定等待比计分时长还长，多半是写错了",
                 rc.background_secs, rc.settle_secs, duration
             ));
         }
@@ -1408,7 +1408,7 @@ mod tests {
         let ok = Config::default();
         assert!(ok.validate().is_empty(), "{:?}", ok.validate());
 
-        // settle 吃掉整个窗口：每个吞吐单元都会静默变成 NOT_EVALUATED。
+        // settle 不短于要计分的时长：进程会相应多跑，但这样的配置多半是写错了。
         let mut settle = Config::default();
         settle.iperf.duration = 10;
         settle.iperf.rate_check.settle_secs = 10;

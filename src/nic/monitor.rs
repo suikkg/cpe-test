@@ -209,6 +209,8 @@ impl StopSignal {
 struct CounterState {
     rx: u64,
     tx: u64,
+    /// 计数可能 32 位回绕（见 `NicCounterReader::may_wrap_at_32_bits`）。
+    wraps_at_32_bits: bool,
     /// 字节差的基准时刻，只能在成功读取计数器后推进。
     baseline_at: Instant,
     /// 最近一次读取尝试的时刻，用于描述失败样本自身的采样间隔。
@@ -225,6 +227,27 @@ struct MonitorLoopContext {
     /// 一路长跑的监控能攒出几万条一模一样的字符串，而消费侧只用得上
     /// `latest_error` 和一个计数。裁掉正文、保住计数。
     errors_total: Arc<AtomicU64>,
+    /// 计数可能 32 位回绕（见 `NicCounterReader::may_wrap_at_32_bits`）。
+    wraps_at_32_bits: bool,
+}
+
+/// 32 位计数器补一圈之后，折算速率超过它就不当回绕、仍按复位处理。
+///
+/// 2^32 字节在 1 秒采样周期里是 34 Gbit；被测链路最高万兆，取两倍半的余量。
+/// 复位（接口重启归零）补一圈通常会折算出几十 Gbit/s，落在这条线以上。
+const MAX_PLAUSIBLE_WRAP_BPS: f64 = 25e9;
+
+/// 相邻两次读数之间的字节增量；`None` = 计数倒退且不是 32 位回绕（复位）。
+fn counter_delta(previous: u64, current: u64, wraps_at_32_bits: bool, dt_secs: f64) -> Option<u64> {
+    if current >= previous {
+        return Some(current - previous);
+    }
+    let fits_32 = previous <= u64::from(u32::MAX) && current <= u64::from(u32::MAX);
+    if !wraps_at_32_bits || !fits_32 {
+        return None;
+    }
+    let wrapped = current + (1u64 << 32) - previous;
+    (wrapped as f64 * 8.0 / dt_secs <= MAX_PLAUSIBLE_WRAP_BPS).then_some(wrapped)
 }
 
 /// `errors` 里最多保留多少条。只有最后一条会被展示，留一小段是为了
@@ -250,9 +273,10 @@ fn record_counter_result(
         Ok((rx, tx)) => {
             let measured = now.duration_since(state.baseline_at);
             let dt = measured.as_secs_f64().max(0.001);
-            let counters_ok = rx >= state.rx && tx >= state.tx;
-            let rx_delta = if counters_ok { rx - state.rx } else { 0 };
-            let tx_delta = if counters_ok { tx - state.tx } else { 0 };
+            let deltas = counter_delta(state.rx, rx, state.wraps_at_32_bits, dt)
+                .zip(counter_delta(state.tx, tx, state.wraps_at_32_bits, dt));
+            let counters_ok = deltas.is_some();
+            let (rx_delta, tx_delta) = deltas.unwrap_or((0, 0));
             let error = if counters_ok {
                 String::new()
             } else {
@@ -316,6 +340,7 @@ fn run_monitor_loop<F>(
     let mut state = CounterState {
         rx: start_rx,
         tx: start_tx,
+        wraps_at_32_bits: context.wraps_at_32_bits,
         baseline_at: t0,
         attempted_at: t0,
     };
@@ -456,6 +481,7 @@ impl MonitorMgr {
         let t0 = self.clock.now();
         let clock_thread = Arc::clone(&self.clock);
         let reader_thread = Arc::clone(&self.reader);
+        let wraps_at_32_bits = self.reader.may_wrap_at_32_bits();
         let handle = std::thread::spawn(move || {
             run_monitor_loop(
                 MonitorLoopContext {
@@ -463,6 +489,7 @@ impl MonitorMgr {
                     samples: samples_thread,
                     errors: errors_thread,
                     errors_total: errors_total_thread,
+                    wraps_at_32_bits,
                 },
                 start_rx,
                 start_tx,
@@ -933,6 +960,7 @@ en0        1500  192.168.8     192.168.8.100     9219567     - 9083840014  52962
                 samples: Arc::clone(&samples),
                 errors: Arc::clone(&errors),
                 errors_total: Arc::new(AtomicU64::new(0)),
+                wraps_at_32_bits: false,
             },
             1_000,
             2_000,
@@ -961,12 +989,60 @@ en0        1500  192.168.8     192.168.8.100     9219567     - 9083840014  52962
         assert!(errors.lock().unwrap().is_empty());
     }
 
+    /// 32 位计数器回绕要补一圈算进增量；复位（接口重启归零）不能被当成回绕。
+    /// 64 位计数器倒退一律是复位。
+    #[test]
+    fn a_32_bit_counter_wrap_is_counted_but_a_reset_is_not() {
+        let t0 = Instant::now();
+        let state = |wraps_at_32_bits: bool, rx: u64| CounterState {
+            rx,
+            tx: 0,
+            wraps_at_32_bits,
+            baseline_at: t0,
+            attempted_at: t0,
+        };
+        let one_second = t0 + Duration::from_secs(1);
+        // 2.5G 线速一秒约 312.5 MB：跨过 2^32 之后读到一个小数。
+        let before = u64::from(u32::MAX) - 100_000_000;
+        let after = 212_500_000 - 100_000_001;
+        let (wrapped, error) =
+            record_counter_result(Ok((after, 0)), one_second, t0, &mut state(true, before));
+        assert!(wrapped.valid, "{error:?}");
+        assert_eq!(wrapped.rx_delta_bytes, 212_500_000);
+        assert!((wrapped.rx_mbps - 1_700.0).abs() < 1e-9);
+
+        // 复位：读数从 1 GB 掉回几 KB，补一圈要 26 Gbit/s，不可能是真流量。
+        let (reset, error) = record_counter_result(
+            Ok((5_000, 0)),
+            one_second,
+            t0,
+            &mut state(true, 1_000_000_000),
+        );
+        assert!(!reset.valid);
+        assert!(error.is_some());
+
+        // 不会回绕的计数器（Windows / macOS / 64 位 Linux）：倒退一律是复位。
+        let (unwrapped, _) =
+            record_counter_result(Ok((after, 0)), one_second, t0, &mut state(false, before));
+        assert!(!unwrapped.valid);
+
+        // 读数超出 32 位范围就不是 32 位计数器，倒退只可能是复位。
+        let (wide, _) = record_counter_result(
+            Ok((10, 0)),
+            one_second,
+            t0,
+            &mut state(true, u64::from(u32::MAX) + 10),
+        );
+        assert!(!wide.valid);
+    }
+
     #[test]
     fn recovery_sample_uses_last_successful_counter_and_time() {
         let t0 = Instant::now();
         let mut state = CounterState {
             rx: 1_000_000,
             tx: 2_000_000,
+            wraps_at_32_bits: false,
             baseline_at: t0,
             attempted_at: t0,
         };
@@ -1042,6 +1118,7 @@ en0        1500  192.168.8     192.168.8.100     9219567     - 9083840014  52962
                 samples: Arc::clone(&samples),
                 errors: Arc::clone(&errors),
                 errors_total: Arc::new(AtomicU64::new(0)),
+                wraps_at_32_bits: false,
             },
             1_000,
             2_000,
@@ -1187,6 +1264,7 @@ en0        1500  192.168.8     192.168.8.100     9219567     - 9083840014  52962
             samples: Arc::new(Mutex::new(Vec::new())),
             errors: Arc::clone(&errors),
             errors_total: Arc::clone(&errors_total),
+            wraps_at_32_bits: false,
         };
         let pushes = MONITOR_MAX_KEPT_ERRORS + 500;
         for i in 0..pushes {

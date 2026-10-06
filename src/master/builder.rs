@@ -281,8 +281,8 @@ pub struct Unit {
     pub target_lines: Vec<String>,
     /// 双向单元的「两端 RX 合计」门限；`None` = 按每方向门限判定。
     ///
-    /// 判定入口在 `executor::bidir_total_verdict`：两条腿都形成有效 RX 平均后，
-    /// **只比一次** `AB.rx_avg + BA.rx_avg >= 门限`。
+    /// 判定入口在 `executor::verdict_assembly::bidir_total`：在两条腿同时在跑的
+    /// 那一段上重算两端 RX，**只比一次** `AB + BA >= 门限`。
     pub bidir_total_target_mbps: Option<f64>,
     /// 规范方向：`ab` / `ba` / `bidir`；诊断类单元为空。
     ///
@@ -1119,6 +1119,22 @@ struct Route<'a> {
 }
 
 impl Route<'_> {
+    /// 这个组合是不是「按两端 RX 合计判定」的双向单元。和
+    /// `executor::needs_overlap_margin` 读的是同一件事：`Unit::bidir_total_target_mbps`
+    /// 就是由下面 `unit()` 按这个条件填的。
+    fn needs_overlap_margin(&self) -> bool {
+        self.bidir && self.spec.rate_target_bidir_total.is_some()
+    }
+
+    /// 单进程灌包（iperf TCP、CTS）的进程时长；iperf UDP 组有自己的估时。
+    fn single_process_secs(&self) -> u64 {
+        crate::cmd::iperf_window::traffic_process_secs(
+            self.spec.duration,
+            self.spec.rate_check.settle_secs,
+            self.needs_overlap_margin(),
+        )
+    }
+
     /// 这条腿的流向：双向取腿标签（ab / ba），单向就是单元方向。
     fn flow_direction(&self, tag: &str) -> String {
         if self.bidir {

@@ -6,7 +6,8 @@ use crate::clock::{ManualClock, SystemClock};
 use crate::cmd::ctstraffic;
 use crate::cmd::iperf::{self, IperfClientJobMgr, IperfServerMgr};
 use crate::cmd::iperf_window::{
-    iperf_active_interval, iperf_baseline_cutoff_ms, iperf_effective_window, iperf_interval_ms,
+    iperf_active_interval, iperf_baseline_cutoff_ms, iperf_interval_ms, iperf_measured_span,
+    iperf_tool_trace, overlap_span, server_intervals, traffic_process_secs, window_from_span,
     WINDOW_COMPLETE_TOLERANCE_MS,
 };
 use crate::cmd::tools::{find_ctstraffic, find_iperf3};
@@ -19,7 +20,7 @@ use crate::master::builder::{
 use crate::master::rate_window::rate_excursion;
 use crate::master::rate_window::{
     evaluate_rx_acceptance, monitor_rate_stats, nearest_valid_sample, percentile, EffectiveWindow,
-    RateStats, MIN_VALID_RX_MBPS,
+    RateStats, ToolTimeline, ToolTrace, MIN_VALID_RX_MBPS,
 };
 use crate::master::run_status::{CurrentUnit, RunObserver, UnitStatus};
 use crate::nic::monitor::MonitorMgr;
@@ -203,6 +204,19 @@ fn unit_resource_owner(unit: &Unit, sequence: usize) -> String {
     )
 }
 
+/// 配了双向合计门限的单元：合计只在两条腿的交集上算，两条腿要多跑一小段
+/// （见 `cmd::iperf_window::traffic_process_secs`）。
+fn needs_overlap_margin(unit: &Unit) -> bool {
+    unit.bidir && unit.bidir_total_target_mbps.is_some()
+}
+
+/// 起流头 `settle_secs` 秒不计入平均：TCP 有慢启动和窗口爬升，Wi-Fi 的速率自适应
+/// 对任何流量都要先收敛一会儿。iperf TCP、CTS TCP/UDP 都走这里；iperf UDP 组由
+/// 组调度器（`window::leg_active_span`）按同一个参数扣。
+fn traffic_settle_secs(cfg: &Config) -> u64 {
+    cfg.iperf.rate_check.settle_secs
+}
+
 fn unit_resource_lease_secs(unit: &Unit) -> u64 {
     unit.est_secs
         .saturating_add(RESOURCE_LEASE_GRACE_SECS)
@@ -336,6 +350,24 @@ struct LegOutcome {
     rx_avg: Option<f64>,
     main_rows: Vec<usize>,
     tag: String,
+    /// 双向合计要在两条腿的**共同**时间段上重算 RX；灌包腿把重算所需的事实留在
+    /// 这里。`None` = 这条腿没有可用的接收端采样（或不是灌包腿）。
+    traffic: Option<LegTraffic>,
+}
+
+/// 一条灌包腿在单元时间轴上的原始事实，供双向合计重算。
+///
+/// 腿级判定各用各的窗口（一条腿失败不能抹掉另一条腿的数据，见 D1）；而合计
+/// 只有在两条腿**同时**在跑的那一段上才有意义——Wi-Fi 上两个方向抢同一块空口，
+/// 各自窗口里单独跑的那几秒会把合计抬高。所以合计不复用腿级的 `rx_avg`。
+#[derive(Debug, Clone)]
+struct LegTraffic {
+    /// 本腿截断前的真实流量区间（单元时间轴）。
+    span: Option<(u64, u64)>,
+    required_secs: u64,
+    rx_monitor: MonitorStopOut,
+    baseline_cutoff_ms: u64,
+    tool_trace: ToolTrace,
 }
 
 impl LegOutcome {
@@ -440,6 +472,7 @@ fn preflight_block_outcome(tag: &str, block: &IperfPreflightBlock) -> LegOutcome
         rx_avg: None,
         main_rows: Vec::new(),
         tag: tag.to_string(),
+        traffic: None,
     }
 }
 
@@ -475,6 +508,7 @@ where
                 rx_avg: None,
                 main_rows: vec![],
                 tag: String::new(),
+                traffic: None,
             }]
         }
     };
@@ -495,6 +529,7 @@ where
             rx_avg: None,
             main_rows: vec![],
             tag: "cleanup".into(),
+            traffic: None,
         });
     }
     outcomes
@@ -848,11 +883,17 @@ impl Ctx {
                     } else if let Some(plans) = self.udp_leg_plans(unit) {
                         self.run_udp_unit(useq, unit, &plans, &owner_id, lease_secs)
                     } else if unit.legs.len() <= 1 {
+                        let epoch = Instant::now();
                         unit.legs
                             .iter()
-                            .map(|leg| self.run_leg(useq, unit, 0, leg, &owner_id, lease_secs))
+                            .map(|leg| {
+                                self.run_leg(useq, unit, 0, leg, &owner_id, lease_secs, epoch)
+                            })
                             .collect()
                     } else {
+                        // 两条腿共用一个时间零点：双向合计要在两条腿真实流量的
+                        // 交集上重算，各用各的零点就没法求交集。
+                        let epoch = Instant::now();
                         std::thread::scope(|s| {
                             let handles: Vec<_> = unit
                                 .legs
@@ -861,7 +902,9 @@ impl Ctx {
                                 .map(|(li, leg)| {
                                     let owner_id = owner_id.clone();
                                     s.spawn(move || {
-                                        self.run_leg(useq, unit, li, leg, &owner_id, lease_secs)
+                                        self.run_leg(
+                                            useq, unit, li, leg, &owner_id, lease_secs, epoch,
+                                        )
                                     })
                                 })
                                 .collect();
@@ -886,6 +929,7 @@ impl Ctx {
                                         rx_avg: None,
                                         main_rows: vec![],
                                         tag: leg.tag.clone(),
+                                        traffic: None,
                                     })
                                 })
                                 .collect()
@@ -925,14 +969,15 @@ impl Ctx {
             // 那条链能说出到底是哪条腿、什么原因，比一句「合计缺数据」有用。
             // 腿级聚合永远算一遍：合计判定要不要让位给它，取决于它是不是更具体。
             let aggregated = aggregate_unit_verdict(&outcomes);
-            let bidir_total = unit
+            let bidir = unit
                 .bidir_total_target_mbps
-                .map(|target| bidir_total_verdict(&outcomes, target))
+                .map(|target| bidir_total(&outcomes, target))
                 // 腿级的 SETUP_ERROR / NOT_EVALUATED 说得出「哪条腿、什么原因」，
                 // 比一句「合计缺数据」有用，所以让它说话。除此之外一律由合计拍板
                 // ——包括合计自己判 NOT_EVALUATED（缺一个方向就是形不成合计，
                 // 这时**不许**退回两条腿各自的 MEASURED 假装一切正常）。
                 .filter(|_| !matches!(aggregated, Verdict::SetupError | Verdict::NotEvaluated));
+            let bidir_total = bidir.as_ref().map(|total| &total.judgement);
             let unit_verdict = bidir_total
                 .as_ref()
                 .map(|judgement| judgement.verdict)
@@ -1057,11 +1102,10 @@ impl Ctx {
             //
             // 两处各算一遍的话，进度页和报告会对同一个单元报两个数，
             // 而那种不一致没人会去核对。
-            let unit_rx_avg = bidir_total
-                .is_some()
-                .then(|| bidir_total_rx_avg(&outcomes))
-                .flatten()
-                .or_else(|| single_direction.and_then(|direction| direction.rx_avg));
+            let unit_rx_avg = match &bidir {
+                Some(total) => total.total_mbps,
+                None => single_direction.and_then(|direction| direction.rx_avg),
+            };
             let unit_target_mbps = bidir_total_target
                 .or_else(|| single_direction.and_then(|direction| direction.target_mbps));
             logln(&format!("  ==> 单元结果: {}", unit_verdict.label()));
@@ -1272,6 +1316,7 @@ impl Ctx {
                         rx_avg: committed_rx_avg,
                         main_rows: committed_rows,
                         tag: leg.tag.clone(),
+                        traffic: None,
                     });
                 }
                 continue;
@@ -1296,6 +1341,7 @@ impl Ctx {
                     rx_avg: None,
                     main_rows: vec![row],
                     tag: leg.tag.clone(),
+                    traffic: None,
                 });
             }
         }
@@ -1438,6 +1484,7 @@ impl Ctx {
         }))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn run_leg(
         &self,
         useq: usize,
@@ -1446,6 +1493,7 @@ impl Ctx {
         leg: &Leg,
         owner_id: &str,
         lease_secs: u64,
+        epoch: Instant,
     ) -> LegOutcome {
         match &leg.kind {
             LegKind::Ping(t) => self.run_ping_leg(useq, unit, lidx, &leg.tag, t),
@@ -1459,6 +1507,7 @@ impl Ctx {
                     owner_id,
                     lease_secs,
                 },
+                epoch,
             ),
             LegKind::CtsTraffic(t) => self.run_ctstraffic_leg(
                 useq,
@@ -1470,6 +1519,7 @@ impl Ctx {
                     owner_id,
                     lease_secs,
                 },
+                epoch,
             ),
             LegKind::IperfGroup { .. } => {
                 let detail = "UDP 并发组未进入统一调度器（空流组、混合协议或内部任务结构异常）";
@@ -1483,6 +1533,7 @@ impl Ctx {
                     rx_avg: None,
                     main_rows: vec![],
                     tag: leg.tag.clone(),
+                    traffic: None,
                 }
             }
         }

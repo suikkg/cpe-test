@@ -360,7 +360,7 @@ pub fn disposition_advice(reason_code: ReasonCode) -> Option<&'static str> {
             "本轮网卡采样不完整，数据不足以判定性能。检查测试期间是否重启/切换过网卡，然后重跑。这不是速率不达标。"
         }
         ReasonCode::CounterStalled => {
-            "样本采齐了但网卡字节计数长时间不动，说明测试中途链路已经没有流量。先确认被测设备是否掉线或重启，再重跑；这一轮的平均速率不能当结论。"
+            "样本采齐了但网卡字节计数长时间不动，而工具侧同期仍有流量、或者对不上这段时间：可能是这块网卡的计数器没记这条路径上的包，也可能是链路断流但没有可对照的记录。这一轮的平均速率不能当结论，核对接收端网卡与路由后重跑。工具侧确认同期也没有流量时按真实断流判定，不会出现本原因。"
         }
         ReasonCode::EffectiveWindowShort
         | ReasonCode::IperfEffectiveWindowShort

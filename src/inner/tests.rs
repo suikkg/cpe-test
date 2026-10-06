@@ -61,6 +61,8 @@ fn assembled_bidir(strategy: Measurement, down_start: u64, total: bool) -> UnitR
     }
     let plan = plan::build(&cfg).unwrap();
     let unit = &plan.units[0];
+    // client 实际跑的时长：配置 20 秒 + TCP 起流爬升 + 双向交集余量。
+    let run_secs = plan::client_secs(&cfg, unit);
     let raw = unit
         .legs
         .iter()
@@ -85,12 +87,12 @@ fn assembled_bidir(strategy: Measurement, down_start: u64, total: bool) -> UnitR
                     },
                     IperfFlowEvent {
                         kind: IperfEventKind::Ended,
-                        elapsed_ms: start + 20_000,
+                        elapsed_ms: start + run_secs * 1_000,
                         ..Default::default()
                     },
                 ],
                 samples: MonitorStopOut {
-                    samples: (1..=20)
+                    samples: (1..=run_secs)
                         .map(|second| MonitorSample {
                             elapsed_ms: start + second * 1000,
                             interval_ms: 1000,
@@ -127,7 +129,8 @@ fn disjoint_bidirectional_legs_never_produce_an_acceptance_or_total() {
         Measurement::Tool,
     ] {
         for total in [false, true] {
-            let row = assembled_bidir(strategy, 24_000, total);
+            // 下行在上行跑完之后才起跑：两条腿没有一刻同时在跑。
+            let row = assembled_bidir(strategy, 40_000, total);
             assert_eq!(row.verdict, "NOT_EVALUATED", "{strategy:?}, {total}");
             assert_eq!(row.total_mbps, None);
             assert!(row
@@ -142,13 +145,23 @@ fn disjoint_bidirectional_legs_never_produce_an_acceptance_or_total() {
 
 #[test]
 fn tool_whole_run_summaries_cannot_be_added_as_partial_overlap_rates() {
+    // 下行晚 10 秒起跑：各扣 5 秒爬升后只重叠 15 秒，配置 20 秒。
     let row = assembled_bidir(Measurement::Tool, 13_000, true);
-    assert_eq!(row.overlap_secs, Some(10.0));
+    assert_eq!(row.overlap_secs, Some(15.0));
     assert_eq!(row.verdict, "NOT_EVALUATED");
     assert_eq!(row.total_mbps, None);
     assert!(row.legs.iter().all(|leg| leg.tool.receiver_mbps.is_some()));
+    // 网卡口径同样不在半截重叠上下结论：配置 20 秒、两腿只重叠 15 秒，
+    // 和子网「有效窗口不足」一样是无法评价。以前这里判 PASS——判定不看
+    // 窗口完整与否，用户拿到的是一个只有一半时长作证的结论。
     let nic = assembled_bidir(Measurement::NicStrict, 13_000, true);
-    assert_eq!(nic.verdict, "PASS", "可信重叠 RX 达标仍然通过");
+    assert_eq!(nic.verdict, "NOT_EVALUATED");
+    assert!(nic
+        .legs
+        .iter()
+        .all(|leg| leg.reason == "IPERF_EFFECTIVE_WINDOW_SHORT"));
+    let aligned = assembled_bidir(Measurement::NicStrict, 3_000, true);
+    assert_eq!(aligned.verdict, "PASS", "完整重叠、RX 达标仍然通过");
 }
 
 #[test]
@@ -1259,20 +1272,27 @@ fn a_bidirectional_total_only_adds_two_receivers_of_the_same_source_layer() {
 
 #[test]
 fn bidirectional_legs_are_measured_against_the_common_overlap_window_or_nothing() {
-    let window = |start: u64, end: u64| EffectiveWindow {
-        start_ms: start,
-        end_ms: end,
-        available_secs: (end - start) as f64 / 1000.0,
-        required_secs: 20,
-        complete: true,
-    };
-    let shared = overlap_window(&[window(1_000, 21_000), window(1_500, 21_500)]).unwrap();
+    // 两条腿都只跑配置时长、起跑差 500ms：交集只有 19.5 秒，不算完整。
+    let shared = overlap_window(&[Some((1_000, 21_000)), Some((1_500, 21_500))], 20).unwrap();
     assert_eq!((shared.start_ms, shared.end_ms), (1_500, 21_000));
     assert!((shared.available_secs - 19.5).abs() < 1e-9);
     assert!(!shared.complete, "重叠不足配置时长就不算完整");
+    // 多跑了 BIDIR_OVERLAP_MARGIN_SECS：交集够长，从交集起点截出配置时长。
+    let margin = crate::cmd::iperf_window::BIDIR_OVERLAP_MARGIN_SECS * 1_000;
+    let shared = overlap_window(
+        &[
+            Some((1_000, 21_000 + margin)),
+            Some((1_500, 21_500 + margin)),
+        ],
+        20,
+    )
+    .unwrap();
+    assert!(shared.complete);
+    assert_eq!((shared.start_ms, shared.end_ms), (1_500, 21_500));
     // 没有交集 = 这两条腿根本不是同时在跑，不给合计窗口。
-    assert!(overlap_window(&[window(0, 10_000), window(11_000, 21_000)]).is_none());
-    assert!(overlap_window(&[]).is_none());
+    assert!(overlap_window(&[Some((0, 10_000)), Some((11_000, 21_000))], 20).is_none());
+    assert!(overlap_window(&[Some((0, 10_000)), None], 20).is_none());
+    assert!(overlap_window(&[], 20).is_none());
 }
 
 #[test]
@@ -2325,4 +2345,263 @@ fn inner_multinic_binding_keeps_host_interface_addresses_and_report_identity_tog
                 .contains("未唯一匹配"));
         }
     }
+}
+
+/// 20 秒的上行跑到第 10 秒被重置（CPE 重启）：不论按网卡还是按工具口径，
+/// 都不能在没跑满的测试上下结论。
+///
+/// 以前两条路都会判 PASS：没有汇总行时窗口塌成最后一条逐秒行，网卡口径在
+/// 那 1 秒上判了 PASS（窗口不完整只记一条诊断）；工具口径则直接收下 server
+/// 打出的那条只覆盖 10 秒的 receiver 汇总。
+#[test]
+fn an_upload_that_aborted_halfway_is_never_judged() {
+    use crate::protocol::{IperfEventKind, MonitorSample};
+    for strategy in [Measurement::NicStrict, Measurement::Tool] {
+        let mut cfg = example();
+        cfg.links.truncate(1);
+        cfg.protocols = vec![Protocol::Tcp];
+        cfg.tcp_streams = Some(1);
+        cfg.duration_secs = 20;
+        cfg.directions = vec![Direction::Upload];
+        cfg.links[0].measurement = strategy;
+        cfg.links[0].upload_min_mbps = Some(800.0);
+        if strategy != Measurement::NicStrict {
+            cfg.links[0].tool_upload_min_mbps = Some(800.0);
+        }
+        let plan = plan::build(&cfg).unwrap();
+        let unit = &plan.units[0];
+        let start = 3_000u64;
+        let mut output = String::new();
+        let mut events = vec![IperfFlowEvent {
+            kind: IperfEventKind::Started,
+            elapsed_ms: start,
+            ..Default::default()
+        }];
+        for second in 0..10u64 {
+            let line = format!(
+                "[  5] {second}.00-{}.00  sec   112 MBytes   941 Mbits/sec",
+                second + 1
+            );
+            output.push_str(&line);
+            output.push('\n');
+            events.push(IperfFlowEvent {
+                kind: IperfEventKind::Traffic,
+                elapsed_ms: start + 5 + (second + 1) * 1_000,
+                mbps: Some(941.0),
+                line,
+            });
+        }
+        output.push_str("iperf3: error - control socket has closed unexpectedly\n");
+        events.push(IperfFlowEvent {
+            kind: IperfEventKind::Ended,
+            elapsed_ms: start + 10_600,
+            ..Default::default()
+        });
+        let raw: Vec<LegRaw> = unit
+            .legs
+            .iter()
+            .map(|leg| LegRaw {
+                plan: leg.clone(),
+                receiver: "test".into(),
+                receiver_host: "test".into(),
+                counter_source: None,
+                client: IperfClientOut {
+                    ok: false,
+                    output: output.clone(),
+                    ..Default::default()
+                },
+                events: events.clone(),
+                samples: MonitorStopOut {
+                    samples: (1..=25)
+                        .map(|second| MonitorSample {
+                            elapsed_ms: start + second * 1_000,
+                            interval_ms: 1_000,
+                            rx_mbps: if second <= 10 { 900.0 } else { 0.0 },
+                            rx_delta_bytes: if second <= 10 { 112_500_000 } else { 0 },
+                            valid: true,
+                            ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                },
+                server_log: "[  5]   0.00-10.00  sec  1.10 GBytes   941 Mbits/sec   receiver\n"
+                    .into(),
+            })
+            .collect();
+        let row = assemble_unit(
+            &cfg,
+            &cfg.links[0],
+            unit,
+            &LinkPreflight {
+                board_iface: "br0".into(),
+                counter_source: Some(CounterSource::ProcNetDev),
+                addresses: TrafficAddresses::ipv4(&cfg.links[0]),
+            },
+            raw,
+        );
+        assert_eq!(
+            row.verdict, "NOT_EVALUATED",
+            "{strategy:?}: {} {}",
+            row.reason, row.detail
+        );
+        // 逐秒行覆盖 10 秒，再扣掉 TCP 起流爬升。
+        let expected = 10.0 - plan::SETTLE_SECS as f64;
+        assert!(
+            (row.legs[0].effective_secs - expected).abs() < 0.1,
+            "没有汇总行时窗口取逐秒行覆盖的整段（扣掉爬升）：{}",
+            row.legs[0].effective_secs
+        );
+    }
+}
+
+/// client 实际跑多久：多跑起流爬升段（判定窗口扣掉它，TCP/UDP 同样），双向再多跑
+/// 一小段凑交集——不多跑的话交集永远差起跑先后那几百毫秒，每个双向单元都会落到
+/// 「有效窗口不足」。
+#[test]
+fn client_runs_cover_the_ramp_and_the_bidirectional_overlap() {
+    let mut cfg = example();
+    cfg.links.truncate(1);
+    cfg.protocols = vec![Protocol::Tcp, Protocol::Udp];
+    cfg.udp_mbps = Some(100.0);
+    cfg.duration_secs = 20;
+    cfg.directions = vec![Direction::Upload, Direction::Bidir];
+    let plan = plan::build(&cfg).unwrap();
+    let margin = crate::cmd::iperf_window::BIDIR_OVERLAP_MARGIN_SECS;
+    let settle = plan::SETTLE_SECS;
+    let durations: Vec<(Protocol, bool, u64)> = plan
+        .units
+        .iter()
+        .map(|unit| {
+            (
+                unit.protocol,
+                unit.is_bidir(),
+                plan::client_secs(&cfg, unit),
+            )
+        })
+        .collect();
+    for expected in [
+        (Protocol::Tcp, false, 20 + settle),
+        (Protocol::Tcp, true, 20 + settle + margin),
+        (Protocol::Udp, false, 20 + settle),
+        (Protocol::Udp, true, 20 + settle + margin),
+    ] {
+        assert!(
+            durations.contains(&expected),
+            "{expected:?} / {durations:?}"
+        );
+    }
+}
+
+/// `tool` 策略的双向单元：两条腿起跑差 1 秒（ADB 起的板侧 client 和本机 client
+/// 实际总有这么一截）。工具口径改用接收端 server 逐秒记录在共同窗口上求平均后，
+/// 这样的单元能正常判定；以前只认全程汇总，只要起跑差超过 100ms 就无法评价。
+#[test]
+fn a_tool_strategy_bidir_unit_is_judged_on_the_receivers_per_second_rates() {
+    use crate::protocol::{IperfEventKind, MonitorSample};
+    let mut cfg = example();
+    cfg.links.truncate(1);
+    cfg.protocols = vec![Protocol::Tcp];
+    cfg.tcp_streams = Some(1);
+    cfg.duration_secs = 20;
+    cfg.directions = vec![Direction::Bidir];
+    cfg.links[0].measurement = Measurement::Tool;
+    cfg.links[0].tool_upload_min_mbps = Some(800.0);
+    cfg.links[0].tool_download_min_mbps = Some(800.0);
+    cfg.links[0].tool_bidir_total_min_mbps = Some(1_600.0);
+    let plan = plan::build(&cfg).unwrap();
+    let unit = &plan.units[0];
+    let run_secs = plan::client_secs(&cfg, unit);
+
+    let leg_raw = |leg: &LegPlan, start: u64, steady_mbps: f64| {
+        let mut events = vec![IperfFlowEvent {
+            kind: IperfEventKind::Started,
+            elapsed_ms: start,
+            ..Default::default()
+        }];
+        let mut client = String::new();
+        let mut server = String::from("Accepted connection from 192.168.8.100\n");
+        for second in 0..run_secs {
+            // 起流头 5 秒爬升，之后稳态。
+            let rate = if second < plan::SETTLE_SECS {
+                200.0
+            } else {
+                steady_mbps
+            };
+            let line = format!(
+                "[  5] {second}.00-{}.00  sec  100 MBytes  {rate} Mbits/sec",
+                second + 1
+            );
+            client.push_str(&line);
+            client.push('\n');
+            server.push_str(&line);
+            server.push('\n');
+            events.push(IperfFlowEvent {
+                kind: IperfEventKind::Traffic,
+                elapsed_ms: start + 5 + (second + 1) * 1_000,
+                mbps: Some(rate),
+                line,
+            });
+        }
+        events.push(IperfFlowEvent {
+            kind: IperfEventKind::Ended,
+            elapsed_ms: start + run_secs * 1_000 + 300,
+            ..Default::default()
+        });
+        LegRaw {
+            plan: leg.clone(),
+            receiver: "test".into(),
+            receiver_host: "test".into(),
+            counter_source: None,
+            client: IperfClientOut {
+                ok: true,
+                output: client,
+                ..Default::default()
+            },
+            events,
+            samples: MonitorStopOut {
+                samples: (1..=run_secs)
+                    .map(|second| MonitorSample {
+                        elapsed_ms: start + second * 1_000,
+                        interval_ms: 1_000,
+                        rx_mbps: steady_mbps,
+                        rx_delta_bytes: (steady_mbps * 125_000.0) as u64,
+                        valid: true,
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+            server_log: server,
+        }
+    };
+    let assemble = |steady_mbps: f64| {
+        let raw = vec![
+            leg_raw(&unit.legs[0], 3_000, steady_mbps),
+            leg_raw(&unit.legs[1], 4_000, steady_mbps),
+        ];
+        assemble_unit(
+            &cfg,
+            &cfg.links[0],
+            unit,
+            &LinkPreflight {
+                board_iface: "br0".into(),
+                counter_source: Some(CounterSource::ProcNetDev),
+                addresses: TrafficAddresses::ipv4(&cfg.links[0]),
+            },
+            raw,
+        )
+    };
+
+    let row = assemble(900.0);
+    assert_eq!(row.verdict, "PASS", "{} {}", row.reason, row.detail);
+    // 爬升段被扣掉：两条腿都是 900，合计正好 1800。
+    assert_eq!(row.total_mbps, Some(1_800.0));
+    assert!(row
+        .legs
+        .iter()
+        .all(|leg| leg.tool.receiver_note.contains("逐秒接收记录")));
+
+    // 同一形状、稳态不够：照常判 RATE_FAIL，而不是无法评价。
+    let row = assemble(700.0);
+    assert_eq!(row.verdict, "RATE_FAIL", "{} {}", row.reason, row.detail);
 }

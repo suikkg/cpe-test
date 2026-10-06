@@ -132,7 +132,7 @@ fn capture_windows() -> Result<Vec<u8>, String> {
             return Err("GetDIBits 失败：未能读出位图像素".into());
         }
         // BGRA -> RGBA
-        for px in buf.chunks_exact_mut(4) {
+        for px in buf.as_chunks_mut::<4>().0 {
             px.swap(0, 2);
             px[3] = 255;
         }

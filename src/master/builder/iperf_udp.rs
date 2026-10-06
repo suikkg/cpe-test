@@ -149,14 +149,10 @@ pub(super) fn expand_iperf_udp(x: &mut Expansion<'_>, route: &Route<'_>) {
 
 /// **计划期就要说清「这几条流灌不到这个门限」。**
 ///
-/// 执行端要求「所有必需流并发活跃」才算有效判定窗口，
-/// 而必需流数按 `target×(1+余量)/每流负载` 上取整。配少了
-/// 就不是「勉强够呛」，而是那个窗口**永远形不成**：整条腿
-/// 稳定判 NOT_EVALUATED/EFFECTIVE_WINDOW_SHORT。
-///
-/// 现场代价是这条链路完全确定、却只能事后才知道：真机上
-/// 一轮 180s 预设的 UDP 单元会**全部**这样跑完再报「无法
-/// 评价」，而拿到的原因码指向采样窗口，不指向真因。
+/// 必需流数按 `target×(1+余量)/每流负载` 上取整。配少了，发出去的
+/// 总负载本身就低于门限，接收端 RX 几乎必然跟着低于门限、判 RATE_FAIL——
+/// 那是配置决定的结果，不是设备测出来的。执行端只把「流数不足」记成
+/// 诊断（ADR-17），不会改判，所以这句话必须在跑之前说。
 /// 公式复用执行端那一份，不在这里重写。
 #[allow(clippy::too_many_arguments)]
 fn unreachable_target_notice(
@@ -187,8 +183,8 @@ fn unreachable_target_notice(
     Some(format!(
         "{spec_name} {leg_label}：{} -> {} {n} 条流 × {per_stream:.0}Mbps 灌不到 {target:.0}Mbps 门限\
          （含 {:.0}% 余量至少要 {required} 条并发流）。\
-         按当前配置这一腿的有效判定窗口永远形不成，结果会稳定落在\
-         「无法评价 / EFFECTIVE_WINDOW_SHORT」。把流数提到 {required}、\
+         按当前配置发出去的总负载就低于门限，接收端 RX 大概率达不到，\
+         会判「速率不达标 / RX_BELOW_TARGET」。把流数提到 {required}、\
          调大每流 -b，或把门限降到 {:.0}Mbps 以下。",
         sender.nic.name,
         receiver.nic.name,

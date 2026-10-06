@@ -135,7 +135,17 @@ TCP 和 UDP 两条路径上得到相反的结论。
 现在的结构是：
 
 1. **前提层**——这一轮能不能形成可信的接收端 RX 平均值（有效窗口、采样覆盖率、
-   计数器是否整窗停滞、有没有起过流）。形不成就是 `NOT_EVALUATED` / `SETUP_ERROR`。
+   计数器零增长、有没有起过流）。形不成就是 `NOT_EVALUATED` / `SETUP_ERROR`。
+   「有没有起过流」只问**有没有**：UDP 窗口只要求有流在跑，流数不足（配少了、
+   中途掉了几条）只作诊断，和 TCP/CTS 同口径（2026-10 用户确认的口径 B）。
+   计数器零增长（最长一段超过窗口 5%）由 `RateStats::stall_evidence` 分辨：
+   工具侧同期也没数据在走 → 真断流，零是真实值，往下照常验收；工具侧仍在走 →
+   计数器没记账；对不上时间 → 无法区分。后两种判 `COUNTER_STALLED`。
+   旁证来自 `cmd::iperf_window::iperf_tool_trace`（server 逐秒行用 client 的时钟
+   偏移投影；TCP 另有发送端逐秒行）与 `executor::window::cts_tool_trace`，
+   **只决定这道门槛**。以前一律判 `COUNTER_STALLED`：第 10 秒就掉线的 CPE 永远
+   拿不到 RATE_FAIL，报告还说「平均速率不可信」。守在
+   `a_real_outage_is_judged_by_the_average_instead_of_blamed_on_the_counter`。
 2. **验收层**——`evaluate_rx_acceptance(mode, target, rx_stats)`，四种结果封闭：
    无有效 RX → `NOT_EVALUATED`；无门限 → `MEASURED`；`RX >= 门限` → `PASS`；
    `RX < 门限` → `RATE_FAIL`。它**不接受**发送端参数，所以「TX 影响了判定」在类型上就不可能。
@@ -163,11 +173,20 @@ Wi-Fi 7 的 MLO 都成立；断言「半双工」会在 MLO/STR 的设备上站�
 「全双工」更是纯推断。同理，界面与报告一律按「是不是 Wi-Fi 互测」分流，不按双工。新增
 `TestSpec::rate_target_bidir_total_mbps` → `SpecNorm::rate_target_bidir_total` →
 `Unit::bidir_total_target_mbps`，判定入口是
-`executor::verdict_assembly::bidir_total_verdict`：
+`executor::verdict_assembly::bidir_total`（同时给出判定和报告行填的合计值）：
 
 ```text
 双向有效吞吐 = AB 方向接收端 RX 平均 + BA 方向接收端 RX 平均
+              （两者都取两条腿同时在跑的同一段时间）
 ```
+
+合计**不复用**腿级 `rx_avg`：腿级各用各的窗口（D1，一条腿失败不抹掉另一条腿），
+而合计要在两条腿截断前的真实流量区间的交集上、从交集起点截出要求时长，用各自的
+接收端样本（`LegOutcome::traffic`）重算。以前直接相加各自窗口的平均：一条腿起流
+重试晚了十几秒，两边各混进一段单独跑的时间，Wi-Fi 上合计被抬高；重叠为零时就是
+两次单独跑相加。为了让交集够长，配了合计门限的单元 TCP/CTS 两条腿各多跑
+`cmd::iperf_window::BIDIR_OVERLAP_MARGIN_SECS`（`executor::traffic_process_secs`），
+双向两条腿共用一个时间零点；交集不够要求时长 → `EFFECTIVE_WINDOW_SHORT`。
 
 用两端 **RX** 相加而不是 TX+RX：同一个包在发送侧 TX 和接收侧 RX 各记一次，
 相加是重复计数；TX 还会混进背景流量和 socket 缓冲里从未上线的字节。
@@ -566,7 +585,7 @@ Windows 文本适配器：`src/cmd/ipconfig.rs` 解析中英文 `ipconfig /all`�
 
 - 内环扫描选择由纯函数 `domain/inner-setup::innerNicChoices` / `linksFromInnerChoices` 生成，默认展示 192.168 网段或仅 IPv6 的有效电脑网口并隐藏常见隧道/虚拟口，其他候选须显式展开；完整扫描不被裁剪，板侧全部系统接口与测试网口数分开；用户明确选择后由 `state/inner::addInnerScannedLinks` 添加，按电脑、接口名和 IPv4 去重，不把扫描结果全量加入。`innerSetupIssues` 同源生成缺项与修复定位；`InnerView` 参数区用一句话说明上下行的统计口径。`InnerLinkTable` 批量设置只处理当前显示且 enabled 的行，扫描发现网卡不等于链路预检通过。
 
-- ADB 内环入口 `inner::run_cli` 与 `inner::webui::Controller` 共用 `inner::perform`，独立严格配置 `inner::config::InnerConfig`、项目标识 `cpe-inner-project` 与 schema `version: 3`（兼容 v1/v2），不混入子网 Config/Unit；内环单元有独立稳定身份和 24 小时 PASS RESUME，绝不命中子网历史。分层固定：`config` 定义 schema 与 v1→v2 迁移（`protocol`→`protocols`、`board_interface`→`board_rx_interface`，补 `enabled`/`measurement`/`repeats`/`resume`；顺序单向**绝不**迁成 `bidir`，策略保持 `nic_strict`）；`plan` 是**全仓唯一**的笛卡尔积，页面预览、执行器、进度和报告都消费它，展开顺序为 网口 → IP 版本 → 协议 → 方向 → 轮次；`adb` 适配板侧设备（接口清单、桥成员、`/proc/net/dev` 与 sysfs 两条读取路径、按端口起 server）；`measure` 是纯策略层，来源选择与门限配对只在这里；`mod` 只负责按计划起流采样；`report`/`history` 输出与历史。`inner::remote` 根据链路 host 使用现有 agent client/monitor/owner cleanup 协议，令牌不序列化。`inner::adb` 仅经 ADB 确认自有 server 就绪，不要求主控能路由到被测 LAN；前台 shell 使用本次 PID、停止标记和有限租约回收，未确认回收时停止后续起流。发送端始终运行普通 client：上行 PC client → 板侧 server，下行板侧 client → PC server，不使用 `-R`；`inner::adb_client` 经公共 ProcessExecutor 复用 iperf 参数/重试/事件解析，`inner::receiver_server` 按方向管理本机/agent/板侧 server，server owner 与 client/monitor owner 隔离以便停止后先收日志；接收端按数据走向定（上行采板侧 RX，下行采网口所在电脑 RX），不按谁跑 client 推断。`enabled: false` 的网口保留配置但不执行、不预检，其引用的辅测机也不进连接门禁——无 agent 或 agent 离线都不阻断本机测试。`bidir` 是一个含两条腿的单元：两腿各占 `port` / `port+1`、独立 job 与日志、在作用域线程里同时起流，按两腿有效窗口的**交集**计算，一腿失败置位单元取消位停止对向并定向回收。`-P`/`-w`/`-b`/`-l` 按协议分开配置，`tcp_window` / `udp_length` 走 `config::size_token` 白名单、`board_rx_interface` 走 `config::iface_word` 白名单后才拼进命令行或 sysfs 路径。测量策略 `nic_strict` / `nic_preferred` / `tool` 决定来源：网卡口径始终单独留存并仍由 `rate_window::evaluate_rx_acceptance` 产出，字段语义不变；兜底整条腿只选一次来源并记录原因，**可信低速不触发兜底**，工具口径**不继承**网卡门限（无工具门限只出 MEASURED）；工具速率只认真正的 receiver 汇总（多流须有 `[SUM]`），不取 sender / interval 末行；双向合计只相加同来源层次的两端接收速率，配了合计门限才按合计判一次。`max_udp_loss_pct` 超限仅追加 `UDP_LOSS_HIGH`，不推翻速率判定。板侧 server 原文按首尾裁剪后随腿进报告。`inner` 与子网共用纯 `cmd::iperf_window` 和 `rate_window`，不调用子网执行器。`master::webui::http` 在既有鉴权后转发 `/api/inner/*`（含 `plan` 预览与 `runs*` 历史，历史目录名按白名单精确比对、不做路径拼接）；两类启动共用 run_gate 防止并发占线，但配置、运行状态和取消标志分开；组合入口 `/api/scenario/*` 按子网后内环顺序执行，并在 `scenarios/` 保存两份原始配置，历史恢复默认打开两段各自的 RESUME。内环输出 `inner_runs`（`report.html`/`result.json`/`summary.json`/`config.json`/`units.jsonl`），子网历史仍只读 `runs`；历史「装载配置」只回配置不直接开跑。前端 `state/inner`、`domain/inner`、`views/inner/*` 不读写子网计划/连接/运行状态；独立草稿键与导入导出，误导入不得改写另一模式的配置；计划预览来自后端，前端不自算笛卡尔积。
+- ADB 内环入口 `inner::run_cli` 与 `inner::webui::Controller` 共用 `inner::perform`，独立严格配置 `inner::config::InnerConfig`、项目标识 `cpe-inner-project` 与 schema `version: 3`（兼容 v1/v2），不混入子网 Config/Unit；内环单元有独立稳定身份和 24 小时 PASS RESUME，绝不命中子网历史。分层固定：`config` 定义 schema 与 v1→v2 迁移（`protocol`→`protocols`、`board_interface`→`board_rx_interface`，补 `enabled`/`measurement`/`repeats`/`resume`；顺序单向**绝不**迁成 `bidir`，策略保持 `nic_strict`）；`plan` 是**全仓唯一**的笛卡尔积，页面预览、执行器、进度和报告都消费它，展开顺序为 网口 → IP 版本 → 协议 → 方向 → 轮次；`adb` 适配板侧设备（接口清单、桥成员、`/proc/net/dev` 与 sysfs 两条读取路径、按端口起 server）；`measure` 是纯策略层，来源选择与门限配对只在这里；`mod` 只负责按计划起流采样；`report`/`history` 输出与历史。`inner::remote` 根据链路 host 使用现有 agent client/monitor/owner cleanup 协议，令牌不序列化。`inner::adb` 仅经 ADB 确认自有 server 就绪，不要求主控能路由到被测 LAN；前台 shell 使用本次 PID、停止标记和有限租约回收，未确认回收时停止后续起流。发送端始终运行普通 client：上行 PC client → 板侧 server，下行板侧 client → PC server，不使用 `-R`；`inner::adb_client` 经公共 ProcessExecutor 复用 iperf 参数/重试/事件解析，`inner::receiver_server` 按方向管理本机/agent/板侧 server，server owner 与 client/monitor owner 隔离以便停止后先收日志；接收端按数据走向定（上行采板侧 RX，下行采网口所在电脑 RX），不按谁跑 client 推断。`enabled: false` 的网口保留配置但不执行、不预检，其引用的辅测机也不进连接门禁——无 agent 或 agent 离线都不阻断本机测试。`bidir` 是一个含两条腿的单元：两腿各占 `port` / `port+1`、独立 job 与日志、在作用域线程里同时起流，按两腿截断前真实流量区间的**交集**计算（两条腿先各自扣掉起流爬升 `plan::SETTLE_SECS`；两条腿各多跑 `BIDIR_OVERLAP_MARGIN_SECS`，交集从起点截出配置时长；交集不够长就不下结论；工具口径同样取共同窗口，见下），一腿失败置位单元取消位停止对向并定向回收。网卡口径与子网同规则：有效窗口不完整判 `IPERF_EFFECTIVE_WINDOW_SHORT`，不在没跑满的窗口上下结论；工具口径的 receiver 汇总覆盖不到配置时长（中途退出时 server 仍可能打出一条只覆盖前几秒的汇总）同样拒收。`-P`/`-w`/`-b`/`-l` 按协议分开配置，`tcp_window` / `udp_length` 走 `config::size_token` 白名单、`board_rx_interface` 走 `config::iface_word` 白名单后才拼进命令行或 sysfs 路径。测量策略 `nic_strict` / `nic_preferred` / `tool` 决定来源：网卡口径始终单独留存并仍由 `rate_window::evaluate_rx_acceptance` 产出，字段语义不变；兜底整条腿只选一次来源并记录原因，**可信低速不触发兜底**，工具口径**不继承**网卡门限（无工具门限只出 MEASURED）；工具速率首选接收端 server 逐秒记录在判定窗口上的时间加权平均（`cmd::iperf_window::receiver_rate_over`；多流只认 `[SUM]` 行，覆盖不足 95% 拒收），和网卡口径同一段时间，双向时就是共同窗口；拿不到才退回全程 receiver 汇总（含起流爬升，双向时只有两条腿汇总覆盖同一段才可用）。两者都只认接收端，不取 sender / interval 末行。以前只认全程汇总，`tool` 策略的双向单元只要两条腿起跑差 100ms 以上就无法评价；守在 `a_tool_strategy_bidir_unit_is_judged_on_the_receivers_per_second_rates`；双向合计只相加同来源层次的两端接收速率，配了合计门限才按合计判一次。`max_udp_loss_pct` 超限仅追加 `UDP_LOSS_HIGH`，不推翻速率判定。板侧 server 原文按首尾裁剪后随腿进报告；判定（逐秒接收记录、断流旁证）用裁剪前的完整日志。`inner` 与子网共用纯 `cmd::iperf_window` 和 `rate_window`，不调用子网执行器。`master::webui::http` 在既有鉴权后转发 `/api/inner/*`（含 `plan` 预览与 `runs*` 历史，历史目录名按白名单精确比对、不做路径拼接）；两类启动共用 run_gate 防止并发占线，但配置、运行状态和取消标志分开；组合入口 `/api/scenario/*` 按子网后内环顺序执行，并在 `scenarios/` 保存两份原始配置，历史恢复默认打开两段各自的 RESUME。内环输出 `inner_runs`（`report.html`/`result.json`/`summary.json`/`config.json`/`units.jsonl`），子网历史仍只读 `runs`；历史「装载配置」只回配置不直接开跑。前端 `state/inner`、`domain/inner`、`views/inner/*` 不读写子网计划/连接/运行状态；独立草稿键与导入导出，误导入不得改写另一模式的配置；计划预览来自后端，前端不自算笛卡尔积。
 
 - 项目导入通过 `domain/import-topology::reconcileImportedTopology` 区分未知快照与成功扫描的空网卡表；只清理确认缺失的端点，并提示被删除的集合/绑定。绑定的显式 `pair_ids` 清空时必须删除该绑定，不能变成整集合分配。手工集合协调保留 pair ID 和端点方向。待校验状态随草稿保存，并在取得可信拓扑后自动校验。
 
@@ -612,6 +631,42 @@ Windows 文本适配器：`src/cmd/ipconfig.rs` 解析中英文 `ipconfig /all`�
 - 内环双向无共同窗口时两腿均无有效判定；工具全程汇总仅在本腿窗口与共同窗口边界相差不超过 `cmd::iperf_window::WINDOW_COMPLETE_TOLERANCE_MS` 时参与双向验收，否则仅留作诊断。`LinkPreflight.counter_source` 可为空：严格策略拒绝，工具及优先网卡策略通过 `Sampler::Unavailable` 留存采样失败原因。板侧清单合并 sysfs、proc 与地址表，各读取路径独立降级。前端计划响应须同时匹配请求序号和当前配置快照才可落地。
 
 - 内环 UI 的统计口径：上行板侧桥（默认 `br0`）RX、下行所选 PC 网口 RX、双向两者各一腿。界面不提供板侧成员口映射或候选，桥名称保留可编辑以适配机型；历史配置字段保持兼容。
+
+- **速率统计的几条窗口规则**（2026-10 速率统计审查）：
+  - 没有 iperf3 汇总行时（结果交换前就失败，发 TEST_END 时连接被重置），有效区间取
+    逐秒行**合起来**覆盖的整段（`cmd::iperf_window::iperf_active_interval`）。以前取
+    「最长的一行」，跑满 180 秒的测量只剩最后 1 秒，`IPERF_SUMMARY_LOST` 保住网卡
+    口径的那条路径在最常见的形态下走不到。守在
+    `a_full_run_without_a_summary_line_keeps_its_whole_window`。
+  - 「区间 → 判定窗口」只有 `cmd::iperf_window::window_from_span` 一份（iperf 单腿、
+    UDP 腿、双向合计、内环重叠共用）；UDP 截断前的区间是
+    `executor::window::leg_active_span`。
+  - CTS 窗口内的个别监控读数失败不再单独否决判定：缺口由 RX 采样覆盖率把关，和
+    iperf/UDP 同口径；异常照样进诊断列。
+  - 起流头 `settle_secs` 秒不进平均，所有后端、所有协议同一规则：iperf3 TCP、CTS
+    TCP/UDP 的判定窗口从真实流量起点扣掉它（内环 TCP/UDP 用 `inner::plan::SETTLE_SECS`），
+    进程相应多跑这一段。以前只有子网 iperf UDP 扣，同一条链路的数字在后端之间不可比。
+    「进程实际跑多久」只有 `cmd::iperf_window::traffic_process_secs` 一份：执行端用它
+    下发 `-t` / `TimeLimit`，builder 与内环计划用它估时（`est_secs` 进两份全量快照）。
+    子网 iperf UDP 组由组调度器（`executor::window::leg_active_span`）按同一个参数扣。
+  - iperf3 TCP 跑出过流量、执行环境也没问题、只是中途退出（被测设备重启、链路断开）
+    判 `IPERF_EFFECTIVE_WINDOW_SHORT`，不再判 `SETUP_ERROR`——和 UDP、CTS 对同一件事的
+    结论一致，熔断计数也不再把它记成「一个测量都没产生」。真正的环境问题由
+    `IperfFlowVerdictIn::setup_error`（`iperf_client_setup_error` + server 停止未确认）
+    单独给出，仍判 `SETUP_ERROR`。
+  - 板侧计数器可能是 32 位（32 位内核 + 老驱动），满 4 GiB 回绕：
+    `NicCounterReader::may_wrap_at_32_bits`（只有 `inner::adb::BoardCounters` 为真）打开后，
+    `nic::monitor::counter_delta` 把「前后都在 32 位范围内、补一圈折算不超过 25 Gbit/s」的
+    倒退按回绕补算，其余仍按复位丢掉那一拍。不认回绕时 2.5G 线速约 14 秒丢一拍，覆盖率
+    掉到 95% 以下整条腿无法评价。
+  - 工具自报速率只作展示，但口径要对：`IperfParsed::best_receiver` 只认 receiver 汇总行，
+    拿不到就留空（以前退回 client 最后一行，即发送端某一秒的速率）；ctsTraffic 的发送 /
+    接收速率取有流量状态行的平均（以前取峰值那一秒），没有状态行才退回摘要。
+  - server 逐秒记录按区间长度认汇总行（`MAX_INTERVAL_LINE_MS`）：iperf3 3.1.x 的 UDP
+    汇总行不带 `sender` / `receiver` 字样，混进逐秒记录会让断流旁证判反、窗口覆盖率被凑满，
+    还会触发「新测试从 0 计时」把前面的逐秒行清空。
+  - 已知、未修正的口径偏差：TCP 双向时接收端网卡 RX 里混有对向那条腿的 ACK（约为
+    对向吞吐的百分之一二，网卡计数器分不开）。
 
 - **防复发的五条机制**（2026-09-10 那轮横扫的产物；它们守的是「下一处」，不是已修的那几处）：
   - 历史目录的类型判断只有一种形状——不跟随符号链接的那种。枚举/打包/落盘历史的
@@ -677,3 +732,11 @@ Windows 文本适配器：`src/cmd/ipconfig.rs` 解析中英文 `ipconfig /all`�
 - `inner::webui::Controller::status` 以 `run_id` 和 `units_from` 配对续传；缺失或跨轮标识、越界游标均回完整列表，不能将上一轮的行数当作新一轮的游标。
 - `inner::report::write_atomic` 同目录写完再替换，保证并发下载只看到完整旧版或新版。`save_progress` 每单元追加 JSONL、刷新摘要；重产物在单元边界按 30 秒间隔节流，`save` 收尾必写。这不是每 30 秒的后台定时刷新，最长陈旧时间受下一单元耗时影响。
 - `history::Summary::finished` 为可选字段；新记录明确区分收尾与中间态，旧记录未知，不能从 `error == None` 推断完成。内环目前只提供 HTML/JSON，无 Excel 出口；子网 Excel 继续由 `report::xlsx` 输出。
+
+### 网卡原始样本快照身份
+
+`master::executor::artifact::Ctx::save_monitor_samples` 的附件身份包含端点和完整 CSV 内容摘要（含时间零点偏移）。双向 TCP 在同一网卡上的独立监控快照必须保存为不同附件，禁止后保存的快照覆盖前一条报告行的原始证据；相同快照可复用同一附件。由 `independent_monitor_snapshots_do_not_overwrite_saved_samples` 验证。
+
+### CTS 过程事件口径
+
+`cmd::ctstraffic::classify_line` 忽略工具的 Network Errors/Data Errors 星号说明行，仍保留以星号开头的真实故障；TCP client 的过程速率来自 SendBps，TCP server 来自 RecvBps，均转换为 Mbps。接收端事件不可用发送列代替。由 `real_cts_legends_and_receiver_status_preserve_event_meaning` 保证，真实故障行仍保留错误事件。

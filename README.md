@@ -1172,7 +1172,7 @@ ctsTraffic 是 Windows 专用高级吞吐/可靠性工具，不是 iperf3 的替
 - 是否真正灌通只认工具自身的 rate、bytes、successful frames/datagrams 等证据；NIC RX 即使有背景流量也不能证明 CTS 连接已经建立。NIC 仅在工具已证明起流后用于验证正式目标吞吐、采样覆盖和稳定性。
 - CTS 的接收端网卡样本与 client 事件统一对齐到每条测试腿的时间轴，只统计 `Connected`/首条有效状态到 `Ended` 推导出的真实数据窗口，不计入 monitor RPC、进程启动、握手、状态轮询或清理。`Total Time`、正常退出或疑似 stdout 缓冲都不会被用来补齐无法证明的数据时长；事件窗口不足时明确记录 `CTSTRAFFIC_EFFECTIVE_WINDOW_SHORT`。监控无样本时不会再回退到包含预热和清理的全生命周期平均值；启动、停止、运行采样失败会分别记录 `CTSTRAFFIC_MONITOR_START_FAILED`、`CTSTRAFFIC_MONITOR_STOP_FAILED`、`CTSTRAFFIC_MONITOR_RUNTIME_ERROR` 或 `CTSTRAFFIC_MONITOR_NO_SAMPLES`。
 - 单连接在全部尝试均安全完成后仍没有 CTS 自身测量时，记录 `RATE_FAIL / CTSTRAFFIC_SINGLE_UDP_STREAM_FAILED`。平台、工具、参数、进程启动/状态查询、显式取消或清理未确认等在尚无测量时仍记录 `SETUP_ERROR`；一旦某轮已有工具测量，server 在显式停止前异常退出/超时或其他 CTS 运行错误会记录 `RATE_FAIL / CTSTRAFFIC_RUNTIME_ERRORS`，并按该轮真实 UDP 丢帧和目标速率判定，不用后续重试掩盖结果。
-- CTS 不套用 iperf3 的“每个连接展开成独立进程”、settle、5 秒滚动 P10 和分阶段 `discover` 实现；CTS 使用 `discover` 时按固定 `Connections` 的能力测量记录为 `MEASURED`。两者只共享上述 UDP 单流硬连通与安全生命周期原则。
+- CTS 不套用 iperf3 的“每个连接展开成独立进程”、5 秒滚动 P10 和分阶段 `discover` 实现（起流头 `settle_secs` 秒不计入平均这一条和 iperf3 相同）；CTS 使用 `discover` 时按固定 `Connections` 的能力测量记录为 `MEASURED`。两者只共享上述 UDP 单流硬连通与安全生命周期原则。
 - iperf3 与 ctsTraffic 的连接模型、截止方式和 UDP 帧模型不同。报告可以并列保留两者，但不应把数值当成同一实现语义下的直接替换结果。
 
 CTS 专用默认项：
@@ -1199,10 +1199,9 @@ UDP 单流、并发组和双向测试现在走同一套调度器：先把所有�
 - 是否灌通只认 iperf3 自身 rate、bytes 或 datagrams 等输出证据，背景 NIC 流量不能把失败尝试变成成功。一旦某轮已有工具测量，就按该轮真实运行错误、UDP 丢包和目标速率继续判定，不靠额外重试掩盖真实结果。
 - HTTP 传输重试复用同一个 `request_id`，因此 start 响应丢失不会重复创建进程；测试单元结束、报错或 panic 时还会按唯一 `owner_id` 批量清理 server/client/monitor。动态 lease 是断联后的最后兜底，不会用固定短 TTL 误杀合法长测。
 - agent 启动的长生命周期流量进程受父进程生命周期保护：Linux 使用父死亡信号，Windows 使用 Job Object，macOS/其他 Unix 使用同包 watchdog。agent 被强制终止后，iperf3/ctsTraffic 不应继续占用端口；恢复重跑无需人工 `kill` 残留进程。
-- 2 条流的方向最低要求仍是 2 条。若最终只有 1 条成功，结果是 `NOT_EVALUATED / ACTIVE_STREAMS_LOW`，表示负载搭建不足，不会用单流速率误判 CPE 为 `RATE_FAIL`。
-- 默认 `min_active_ratio=0.9`：5 条流要求至少 4 条，20 条要求至少 18 条；已知目标还会叠加 `ceil(目标 × 1.05 / 单流带宽)` 的 offered-load 要求。
-- 运行中不阻塞等待并提前锁死窗口；结束后统一取满足活跃流条件的最长连续区间，迟到或提前结束只会如实改变该区间边界。
-- 双向结果分别判断 AB/BA 目标，但使用“两边都达到各自最低活跃流数”的共同窗口，避免一边已满载、另一边仍在爬升时提前计分。
+- 流数不足**只作诊断**，和 TCP/CTS 同一口径：多流里有几条没起来或中途掉了、或者配置的流数本身就少于门限推算需要的数，都只记一条「灌包强度不足」，结论仍按接收端 RX 平均与门限比较。默认 `min_active_ratio=0.9`（5 条要求 4 条、20 条要求 18 条），已知目标还会叠加 `ceil(目标 × 1.05 / 单流带宽)`；这两个数只用来写诊断和计划期提示，不再决定窗口。
+- 有效窗口取「有流在跑、接收端有采样」的最长连续区间，起点再扣掉 `settle_secs`；迟到或提前结束只会如实改变该区间边界。一条腿的流全部没起来，这条腿才没有窗口。
+- 双向两条腿各用自己的窗口判定（一条腿失败不会抹掉另一条腿的数据）。配了双向 RX 合计门限时，合计只在两条腿**同时在跑**的那一段上重算两端 RX 再相加；TCP/CTS 两条腿各多跑 5 秒（UDP 本来就多跑），交集不够要求时长就不形成合计。
 
 #### 网卡实测速率与 iperf 时间区间
 
@@ -1311,10 +1310,10 @@ EVB 自动目标可以在全局配置中调整：
 | `sample_interval_ms` | 1000 | RX/TX 连续采样周期，限制为 200～5000ms |
 | `background_secs` | 3 | 起流前背景基线采样；统计会扣除中位背景流量 |
 | `startup_timeout_secs` | 15 | 允许失败流快速重试及建立共同窗口的启动阶段 |
-| `settle_secs` | 5 | 达到最低活跃流数后丢弃的稳定等待时间 |
+| `settle_secs` | 5 | 起流头这几秒不计入平均（TCP 慢启动与窗口爬升、Wi-Fi 速率自适应收敛）。所有后端、所有协议同一规则：iperf3 UDP 组从有流在跑算起，iperf3 TCP 与 CTS 从流量起点算起；单进程灌包相应多跑这么久（`-t` / `TimeLimit` / `StreamLength` = 时长 + settle） |
 | `launch_interval_ms` | 50 | 流之间错峰启动间隔；双向按流序号交错 |
-| `min_concurrent_streams` | 2 | 多流测试允许正式计分的绝对最低流数 |
-| `min_active_ratio` | 0.9 | 请求流数的最低活跃比例 |
+| `min_concurrent_streams` | 2 | 多流测试的最低流数；低于它只记「灌包强度不足」诊断 |
+| `min_active_ratio` | 0.9 | 请求流数的最低活跃比例；低于它只记诊断，不改判定 |
 | `offered_headroom_pct` | 5 | 验证目标所需的发送负载余量 |
 | `flow_retries` | 1 | UDP 额外重试预算；一般为“初次尝试 + `flow_retries`”，iperf3 单流和 CTS `Connections:1` 每方向总尝试数强制为 `max(flow_retries + 1, 3)` |
 | `discovery_step_secs` | 10 | discover 每个负载阶梯的保持时间 |

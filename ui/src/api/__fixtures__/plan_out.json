@@ -1,8 +1,8 @@
 {
-  "est_full_secs": 158,
-  "est_total_secs": 158,
+  "est_full_secs": 163,
+  "est_total_secs": 163,
   "notices": [],
-  "plan_hash": "e0d10f0b55eac9b2143e0eda8c081c68",
+  "plan_hash": "524283760938a8e9fc7485b8a075f992",
   "sections": [
     {
       "link_set_id": "set-a",
@@ -87,7 +87,7 @@
   "ui_plan_supported": true,
   "units": [
     {
-      "est_secs": 70,
+      "est_secs": 75,
       "load": [
         "A→B -w 4m -P 10"
       ],

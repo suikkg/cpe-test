@@ -976,15 +976,46 @@ impl Ctx {
                 .unwrap_or(effective_window.start_ms);
             let baseline_cutoff_ms =
                 iperf_baseline_cutoff_ms(leg_flows.iter().flat_map(|flow| flow.events.iter()));
+            // 每条流的 server 逐秒行合起来回答「零增长那段有没有在收」；UDP 发送端
+            // 恒速发包，证明不了接收端，所以 `iperf_tool_trace` 不填发送端。
+            let flow_traces: Vec<ToolTrace> = leg_flows
+                .iter()
+                .filter(|flow| flow.raw_ok)
+                .map(|flow| {
+                    iperf_tool_trace(
+                        &flow.events,
+                        &server_intervals(&flow.server_output),
+                        flow.task.duration,
+                        true,
+                    )
+                })
+                .collect();
+            let tool_trace = ToolTrace::merge(&flow_traces);
             let rx_stats = monitor_outputs
                 .get(&first.dst.key())
-                .map(|out| monitor_rate_stats(out, &effective_window, true, baseline_cutoff_ms))
+                .map(|out| {
+                    monitor_rate_stats(out, &effective_window, true, baseline_cutoff_ms)
+                        .with_tool_trace(&tool_trace)
+                })
                 .unwrap_or_default();
             let tx_stats = monitor_outputs
                 .get(&first.src.key())
                 .map(|out| monitor_rate_stats(out, &effective_window, false, baseline_cutoff_ms))
                 .unwrap_or_default();
             let rx_avg = rx_stats.avg_mbps;
+            let traffic = monitor_outputs.get(&first.dst.key()).map(|out| LegTraffic {
+                span: leg_active_span(
+                    leg_pos,
+                    plan,
+                    &results,
+                    &monitor_outputs,
+                    &self.cfg.iperf.rate_check,
+                ),
+                required_secs: effective_window.required_secs,
+                rx_monitor: out.clone(),
+                baseline_cutoff_ms,
+                tool_trace: tool_trace.clone(),
+            });
             let offered_floor = crate::master::rate_window::offered_floor_mbps(
                 first.rx_target_mbps,
                 self.cfg.iperf.rate_check.offered_headroom_pct,
@@ -1275,6 +1306,7 @@ impl Ctx {
                 rx_avg,
                 main_rows: vec![idx],
                 tag: plan.tag.clone(),
+                traffic,
             });
         }
         outcomes

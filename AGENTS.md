@@ -70,6 +70,10 @@ shasum -a 256 dist/cpe_test-v<版本号>-windows-config-docs.zip   # 必须等�
    由此推出**两条不许破坏的推论**（ADR-17，详见 `.ai/PROJECT_ARCHITECTURE.md`）：
 
    - 「接收端采样不可信必须判 NOT_EVALUATED 而不是 RATE_FAIL」能被单独审；
+     唯一的旁证入口是 `RateStats::stall_evidence`：接收端计数器长时间零增长时，
+     用工具侧逐秒记录（接收端 server 优先，TCP 才用发送端）分辨「真断流」与
+     「计数器没记账」。旁证**只决定这一道门槛**，不进平均值、不参与和门限比较；
+     真断流照常按平均值判 PASS/RATE_FAIL，分不清就维持 NOT_EVALUATED；
    - **判定之后不许再改写结果**。UDP 丢包、CTS 丢帧、TX 负载、滚动窗口、
      中途掉速、工具退出状态、起流数不足，全部走 `VerdictResult::diagnostics`。
      历史上正是这些「判定后再叠一层」的代码让同一种故障在 TCP 和 UDP 路径上

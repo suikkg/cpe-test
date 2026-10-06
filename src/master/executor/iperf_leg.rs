@@ -52,25 +52,35 @@ impl Ctx {
     }
 
     /// 核心执行：server(dst侧) -> client(src侧) -> 停 server。不含监控。
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn exec_iperf_core<F>(
         &self,
         t: &IperfTask,
+        // client `-t`；通常就是 `t.duration`，双向合计单元会多跑一小段。
+        process_secs: u64,
         owner_id: &str,
         lease_secs: u64,
         epoch: &Instant,
         mut on_event: F,
-    ) -> (bool, iperf::IperfParsed, IperfClientOut, String)
+    ) -> (bool, iperf::IperfParsed, IperfClientOut, String, bool)
     where
         F: FnMut(IperfFlowEvent),
     {
-        let (sreq, creq) = match self.build_iperf_requests(t, t.duration, owner_id, lease_secs, 0) {
+        let (sreq, creq) = match self.build_iperf_requests(t, process_secs, owner_id, lease_secs, 0)
+        {
             Ok(v) => v,
             Err(e) => {
                 let out = IperfClientOut {
                     output: e,
                     ..Default::default()
                 };
-                return (false, iperf::IperfParsed::default(), out, String::new());
+                return (
+                    false,
+                    iperf::IperfParsed::default(),
+                    out,
+                    String::new(),
+                    true,
+                );
             }
         };
         if let Err(e) = self.server_start(t.dst.side, &sreq) {
@@ -83,7 +93,13 @@ impl Ctx {
                 output: format!("(iperf3 server 启动失败: {e})"),
                 ..Default::default()
             };
-            return (false, iperf::IperfParsed::default(), out, String::new());
+            return (
+                false,
+                iperf::IperfParsed::default(),
+                out,
+                String::new(),
+                true,
+            );
         }
         let client_call_offset_ms = epoch.elapsed().as_millis().min(u64::MAX as u128) as u64;
         let mut local_event_origin_ms = None::<u64>;
@@ -118,9 +134,10 @@ impl Ctx {
         };
         let parsed = iperf::parse_output(&client.output);
         let raw_ok = client.ok && !client.timed_out && !client.cancelled && stop_ok;
-        (raw_ok, parsed, client, server_out)
+        (raw_ok, parsed, client, server_out, stop_ok)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn run_iperf_single(
         &self,
         useq: usize,
@@ -129,6 +146,7 @@ impl Ctx {
         tag: &str,
         t: &IperfTask,
         lifecycle: LifecycleLease<'_>,
+        unit_epoch: Instant,
     ) -> LegOutcome {
         let time = now_full();
         logln(&format!(
@@ -143,7 +161,12 @@ impl Ctx {
         // monitor 和 iperf client 事件必须对齐到同一个 leg epoch，
         // 否则 server 启动、RPC 延迟和停止清理都会混入 TCP 平均速率。
         // 远端 monitor 零点由响应 elapsed_ms 有界估计，不再用 RPC 中点猜测。
-        let leg_epoch = Instant::now();
+        // 零点由单元给：双向两条腿共用一个，合计才能在交集上重算。
+        let leg_epoch = unit_epoch;
+        // 起流爬升不进平均：判定窗口从真实流量起点扣掉 settle，进程跟着多跑这一段。
+        let settle_secs = traffic_settle_secs(&self.cfg);
+        let process_secs =
+            traffic_process_secs(t.duration, settle_secs, needs_overlap_margin(unit));
         let monitor_start_before_ms = leg_epoch.elapsed().as_millis().min(u64::MAX as u128) as u64;
         let mon_id = match self.mon_start(
             t.dst.side,
@@ -192,106 +215,108 @@ impl Ctx {
         // 一条 2 秒就失败的腿要白等满整个计划时长。见 `latency.rs` 模块文档。
         let probe_stop = AtomicBool::new(false);
         let live_for_probe = Arc::clone(&live);
-        let (raw_ok, parsed, client, server_out, load_latency) = std::thread::scope(|scope| {
-            let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
-            // 负载下时延探针与灌包**同起同落**。它是这一层唯一有资格并发跑的
-            // 额外流量：32 字节、约 1 秒一拍，相对 Gbps 级灌包可以忽略。
-            // 默认关着（`ping.probe_during_traffic`），开着时结果也只进诊断。
-            let latency = scope.spawn(|| {
-                self.probe_load_latency(&t.src, &t.dst, t.v6, t.duration, &probe_stop, || {
-                    let state = lock_recover(&live_for_probe);
-                    state.connected || state.active
-                })
-            });
-            let progress = scope.spawn(move || {
-                let mut monitor_enabled = mon_id_for_progress.is_some();
-                loop {
-                    match done_rx.recv_timeout(Duration::from_secs(1)) {
-                        Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                    }
-                    let state = live_for_progress
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .clone();
-                    let mut monitor_error = String::new();
-                    let nic_rx_mbps = if monitor_enabled {
-                        match mon_id_for_progress.as_deref() {
-                            Some(id) => match self.mon_status(t.dst.side, id) {
-                                Ok(status) => match status.latest_sample {
-                                    Some(sample) if sample.valid => Some(sample.rx_mbps),
-                                    Some(sample) => {
-                                        monitor_error = if sample.error.is_empty() {
-                                            "网卡样本无效".into()
-                                        } else {
-                                            sample.error
-                                        };
-                                        None
-                                    }
-                                    None => {
-                                        monitor_error = "等待首个网卡样本".into();
+        let (raw_ok, parsed, client, server_out, stop_ok, load_latency) =
+            std::thread::scope(|scope| {
+                let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+                // 负载下时延探针与灌包**同起同落**。它是这一层唯一有资格并发跑的
+                // 额外流量：32 字节、约 1 秒一拍，相对 Gbps 级灌包可以忽略。
+                // 默认关着（`ping.probe_during_traffic`），开着时结果也只进诊断。
+                let latency = scope.spawn(|| {
+                    self.probe_load_latency(&t.src, &t.dst, t.v6, t.duration, &probe_stop, || {
+                        let state = lock_recover(&live_for_probe);
+                        state.connected || state.active
+                    })
+                });
+                let progress = scope.spawn(move || {
+                    let mut monitor_enabled = mon_id_for_progress.is_some();
+                    loop {
+                        match done_rx.recv_timeout(Duration::from_secs(1)) {
+                            Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                        }
+                        let state = live_for_progress
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .clone();
+                        let mut monitor_error = String::new();
+                        let nic_rx_mbps = if monitor_enabled {
+                            match mon_id_for_progress.as_deref() {
+                                Some(id) => match self.mon_status(t.dst.side, id) {
+                                    Ok(status) => match status.latest_sample {
+                                        Some(sample) if sample.valid => Some(sample.rx_mbps),
+                                        Some(sample) => {
+                                            monitor_error = if sample.error.is_empty() {
+                                                "网卡样本无效".into()
+                                            } else {
+                                                sample.error
+                                            };
+                                            None
+                                        }
+                                        None => {
+                                            monitor_error = "等待首个网卡样本".into();
+                                            None
+                                        }
+                                    },
+                                    Err(error) => {
+                                        monitor_enabled = false;
+                                        monitor_error = error;
                                         None
                                     }
                                 },
-                                Err(error) => {
-                                    monitor_enabled = false;
-                                    monitor_error = error;
-                                    None
-                                }
-                            },
-                            None => None,
-                        }
-                    } else {
-                        None
-                    };
-                    let active = usize::from(
-                        (!state.ended && state.active)
-                            || nic_rx_mbps.is_some_and(|rate| rate > MIN_VALID_RX_MBPS),
-                    );
-                    logln(&format_iperf_progress(&IperfProgressSnapshot {
-                        protocol: progress_protocol,
-                        tag: &progress_tag,
-                        active,
-                        total: 1,
-                        connected: usize::from(state.connected),
-                        ended: usize::from(state.ended),
-                        nic_rx_mbps,
-                        iperf_mbps: active_iperf_rate(&state),
-                        errors: usize::from(!state.error.is_empty()),
-                        monitor_error,
-                    }));
-                }
-            });
-            let result = self.exec_iperf_core(
-                t,
-                lifecycle.owner_id,
-                lifecycle.lease_secs,
-                &leg_epoch,
-                |event| {
-                    {
-                        let mut state =
-                            live.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                        if event.kind != IperfEventKind::Traffic
-                            || is_live_progress_rate_line(&event.line, parallel_streams)
-                        {
-                            apply_flow_event(&mut state, &event);
-                        }
+                                None => None,
+                            }
+                        } else {
+                            None
+                        };
+                        let active = usize::from(
+                            (!state.ended && state.active)
+                                || nic_rx_mbps.is_some_and(|rate| rate > MIN_VALID_RX_MBPS),
+                        );
+                        logln(&format_iperf_progress(&IperfProgressSnapshot {
+                            protocol: progress_protocol,
+                            tag: &progress_tag,
+                            active,
+                            total: 1,
+                            connected: usize::from(state.connected),
+                            ended: usize::from(state.ended),
+                            nic_rx_mbps,
+                            iperf_mbps: active_iperf_rate(&state),
+                            errors: usize::from(!state.error.is_empty()),
+                            monitor_error,
+                        }));
                     }
-                    events.push(event);
-                },
-            );
-            let _ = done_tx.send(());
-            let _ = progress.join();
-            // 灌包已经结束，探针不必再发包了。正常收尾时它多半已经自己跑完
-            // （`count` 就是计划时长，而灌包还多花了起流和收尾的时间）；
-            // 提前失败时这一下就是那条「别再等了」的指令。
-            probe_stop.store(true, Ordering::SeqCst);
-            // 探针线程 panic 一律按「没探到」处理：它是诊断，不该弄死一条
-            // 已经跑出数的腿。
-            let load_latency = latency.join().ok().flatten();
-            let (raw_ok, parsed, client, server_out) = result;
-            (raw_ok, parsed, client, server_out, load_latency)
-        });
+                });
+                let result = self.exec_iperf_core(
+                    t,
+                    process_secs,
+                    lifecycle.owner_id,
+                    lifecycle.lease_secs,
+                    &leg_epoch,
+                    |event| {
+                        {
+                            let mut state =
+                                live.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                            if event.kind != IperfEventKind::Traffic
+                                || is_live_progress_rate_line(&event.line, parallel_streams)
+                            {
+                                apply_flow_event(&mut state, &event);
+                            }
+                        }
+                        events.push(event);
+                    },
+                );
+                let _ = done_tx.send(());
+                let _ = progress.join();
+                // 灌包已经结束，探针不必再发包了。正常收尾时它多半已经自己跑完
+                // （`count` 就是计划时长，而灌包还多花了起流和收尾的时间）；
+                // 提前失败时这一下就是那条「别再等了」的指令。
+                probe_stop.store(true, Ordering::SeqCst);
+                // 探针线程 panic 一律按「没探到」处理：它是诊断，不该弄死一条
+                // 已经跑出数的腿。
+                let load_latency = latency.join().ok().flatten();
+                let (raw_ok, parsed, client, server_out, stop_ok) = result;
+                (raw_ok, parsed, client, server_out, stop_ok, load_latency)
+            });
         let rx_origin_offset_ms = mon_id.as_ref().map(|(_, offset)| *offset).unwrap_or(0);
         let tx_origin_offset_ms = tx_mon_id.as_ref().map(|(_, offset)| *offset).unwrap_or(0);
         let mon_out =
@@ -320,12 +345,20 @@ impl Ctx {
                     }
                 },
             );
-        let effective_window =
-            iperf_effective_window(&events, t.duration, parsed.has_measurement());
+        // 真实流量区间扣掉起流爬升；双向合计也在这一段的交集上算。
+        let measured_span =
+            iperf_measured_span(&events, t.duration, settle_secs, parsed.has_measurement());
+        let effective_window = window_from_span(measured_span, t.duration);
         let baseline_cutoff_ms = iperf_baseline_cutoff_ms(&events);
+        // 计数器零增长时用来分辨「真断流」和「计数器没记账」的工具侧旁证。
+        let tool_trace =
+            iperf_tool_trace(&events, &server_intervals(&server_out), t.duration, t.udp);
         let rx_stats = mon_out
             .as_ref()
-            .map(|output| monitor_rate_stats(output, &effective_window, true, baseline_cutoff_ms))
+            .map(|output| {
+                monitor_rate_stats(output, &effective_window, true, baseline_cutoff_ms)
+                    .with_tool_trace(&tool_trace)
+            })
             .unwrap_or_default();
         // 同一块网卡时 TX 与 RX 取自同一份样本，只是读另一个计数器方向。
         let tx_stats = tx_mon_out
@@ -338,6 +371,13 @@ impl Ctx {
             .map(|output| monitor_rate_stats(output, &effective_window, false, baseline_cutoff_ms))
             .unwrap_or_default();
         let rx_avg = rx_stats.avg_mbps;
+        let traffic = mon_out.as_ref().map(|output| LegTraffic {
+            span: measured_span,
+            required_secs: t.duration,
+            rx_monitor: output.clone(),
+            baseline_cutoff_ms,
+            tool_trace: tool_trace.clone(),
+        });
         let nic_samples_rx = mon_out
             .as_ref()
             .map(|out| {
@@ -383,6 +423,9 @@ impl Ctx {
                 self.cfg.iperf.rate_check.offered_headroom_pct,
             ),
             client_tail: client.output.lines().last().unwrap_or_default(),
+            setup_error: iperf_client_setup_error(&client).or_else(|| {
+                (!stop_ok).then(|| "iperf3 server 停止未确认，禁止复用端口".to_string())
+            }),
             rx_monitor: mon_out.as_ref(),
         });
         let (verdict, reason_code) = (judgement.verdict, judgement.code);
@@ -477,7 +520,8 @@ impl Ctx {
             rx_p95: rx_stats.p95_mbps,
             rx_min: rx_stats.min_mbps,
             rx_max: rx_stats.max_mbps,
-            effective_seconds: Some(effective_window.available_secs),
+            // 判定实际用到的时长，和 UDP 组一致：多跑的爬升段、双向余量不算在内。
+            effective_seconds: Some(effective_window.available_secs.min(t.duration as f64)),
             required_seconds: Some(t.duration as f64),
             sample_coverage: Some(rx_stats.coverage),
             window_start_ms: Some(effective_window.start_ms),
@@ -524,6 +568,7 @@ impl Ctx {
             rx_avg,
             main_rows: vec![idx],
             tag: tag.to_string(),
+            traffic,
         }
     }
 

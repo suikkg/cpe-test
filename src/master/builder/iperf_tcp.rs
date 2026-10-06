@@ -98,7 +98,9 @@ pub(super) fn expand_iperf_tcp(x: &mut Expansion<'_>, route: &Route<'_>) {
             route_str
         );
         let id = tcp_resume_unit_id_v2(spec, ip_tag, dir, &pname, &legs);
+        // 进程时长（含起流爬升、双向交集余量）与执行端同一份算法，再加启停开销。
+        let est_secs = route.single_process_secs().saturating_add(10);
         x.units
-            .push(route.unit(id, title, target_lines, legs, spec.duration + 10));
+            .push(route.unit(id, title, target_lines, legs, est_secs));
     }
 }

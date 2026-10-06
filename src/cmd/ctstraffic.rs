@@ -345,16 +345,17 @@ pub fn parse_output(text: &str, protocol: CtsTrafficProtocol) -> CtsTrafficParse
         .filter_map(|value| value.as_str().replace(',', ".").parse::<f64>().ok())
         .max_by(f64::total_cmp);
 
+    // 状态行速率按列收集，最后求平均；见下面「工具自报速率取全程平均」。
+    let mut status_send: Vec<f64> = Vec::new();
+    let mut status_recv: Vec<f64> = Vec::new();
     for line in text.lines() {
         let Some(values) = status_values(line) else {
             continue;
         };
         match protocol {
             CtsTrafficProtocol::Tcp if values.len() >= 3 => {
-                let send = values[1] * 8.0 / 1_000_000.0;
-                let recv = values[2] * 8.0 / 1_000_000.0;
-                parsed.send_mbps = Some(parsed.send_mbps.unwrap_or(0.0).max(send));
-                parsed.recv_mbps = Some(parsed.recv_mbps.unwrap_or(0.0).max(recv));
+                status_send.push(values[1] * 8.0 / 1_000_000.0);
+                status_recv.push(values[2] * 8.0 / 1_000_000.0);
                 if values.len() >= 7 {
                     parsed.max_active_streams = parsed.max_active_streams.max(values[3] as usize);
                     parsed.status_network_errors =
@@ -364,8 +365,7 @@ pub fn parse_output(text: &str, protocol: CtsTrafficProtocol) -> CtsTrafficParse
                 }
             }
             CtsTrafficProtocol::Udp if values.len() >= 2 => {
-                let recv = values[1] / 1_000_000.0;
-                parsed.recv_mbps = Some(parsed.recv_mbps.unwrap_or(0.0).max(recv));
+                status_recv.push(values[1] / 1_000_000.0);
                 if values.len() >= 7 {
                     parsed.max_active_streams = parsed.max_active_streams.max(values[2] as usize);
                     parsed.status_protocol_errors =
@@ -376,19 +376,51 @@ pub fn parse_output(text: &str, protocol: CtsTrafficProtocol) -> CtsTrafficParse
         }
     }
 
-    if let Some(time_ms) = parsed.total_time_ms.filter(|value| *value > 0) {
-        let seconds = time_ms as f64 / 1_000.0;
-        if parsed.send_mbps.unwrap_or(0.0) <= 0.0 {
-            parsed.send_mbps = parsed
-                .total_bytes_sent
-                .map(|bytes| bytes as f64 * 8.0 / seconds / 1_000_000.0);
+    // 工具自报速率取**有流量时段的平均**：状态行（每 `StatusUpdate` 一条）里
+    // 速率大于零的那些行求平均。
+    //
+    // 以前取的是状态行里的**最大值**，也就是峰值那一秒：报告上 CTS 行的「发送 /
+    // 接收」列因此系统性偏高，而同样两列在 iperf 行上是平均值，读报告的人拿它
+    // 和网卡 RX 平均对照时会以为网卡漏记了。判定只看网卡口径，不受影响。
+    //
+    // 只平均有流量的行：客户端和服务端的状态行混在同一段文本里，某一列在对端
+    // 那一侧恒为零。也不优先用摘要的「总字节 ÷ Total Time」：Total Time 含建连
+    // 与缓冲时间（实测 UDP 60 秒流的 Total Time 是 61.3 秒），比网卡判定窗口长。
+    // 没有任何状态行（进程被杀、输出截断）才退回摘要。
+    let status_mean = |values: &[f64]| {
+        if values.is_empty() {
+            return None;
         }
-        if parsed.recv_mbps.unwrap_or(0.0) <= 0.0 {
-            parsed.recv_mbps = parsed
-                .total_bytes_recv
-                .map(|bytes| bytes as f64 * 8.0 / seconds / 1_000_000.0);
-        }
-    }
+        let flowing: Vec<f64> = values
+            .iter()
+            .copied()
+            .filter(|value| *value > 0.0)
+            .collect();
+        Some(if flowing.is_empty() {
+            0.0
+        } else {
+            flowing.iter().sum::<f64>() / flowing.len() as f64
+        })
+    };
+    let summary_rate = |bytes: Option<u64>| {
+        let seconds = parsed.total_time_ms.filter(|value| *value > 0)? as f64 / 1_000.0;
+        bytes.map(|bytes| bytes as f64 * 8.0 / seconds / 1_000_000.0)
+    };
+    let pick = |status: Option<f64>, summary: Option<f64>| {
+        status
+            .filter(|value| *value > 0.0)
+            .or(summary.filter(|value| *value > 0.0))
+            .or(status)
+            .or(summary)
+    };
+    parsed.send_mbps = pick(
+        status_mean(&status_send),
+        summary_rate(parsed.total_bytes_sent),
+    );
+    parsed.recv_mbps = pick(
+        status_mean(&status_recv),
+        summary_rate(parsed.total_bytes_recv),
+    );
     let lower = text.to_ascii_lowercase();
     parsed.time_limit_reached = lower.contains("time-limit of")
         || lower.contains("time limit of")
@@ -398,6 +430,13 @@ pub fn parse_output(text: &str, protocol: CtsTrafficProtocol) -> CtsTrafficParse
 
 fn classify_line(line: &str, req: &CtsTrafficReq, elapsed_ms: u64) -> Option<IperfFlowEvent> {
     let lower = line.to_ascii_lowercase();
+    // ctsTraffic 的星号说明行含 failed/error，但不代表实际故障。
+    if ["* network errors -", "* data errors -"]
+        .iter()
+        .any(|prefix| lower.trim_start().starts_with(prefix))
+    {
+        return None;
+    }
     if lower.contains("connection established") {
         return Some(IperfFlowEvent {
             kind: IperfEventKind::Connected,
@@ -420,7 +459,13 @@ fn classify_line(line: &str, req: &CtsTrafficReq, elapsed_ms: u64) -> Option<Ipe
     }
     let values = status_values(line)?;
     let mbps = match req.protocol {
-        CtsTrafficProtocol::Tcp if values.len() >= 3 => values[1] * 8.0 / 1_000_000.0,
+        CtsTrafficProtocol::Tcp if values.len() >= 3 => {
+            let counter = match req.role {
+                CtsTrafficRole::Client => values[1],
+                CtsTrafficRole::Server => values[2],
+            };
+            counter * 8.0 / 1_000_000.0
+        }
         CtsTrafficProtocol::Udp if values.len() >= 2 => values[1] / 1_000_000.0,
         _ => return None,
     };
@@ -564,6 +609,42 @@ mod tests {
     /// 逗号在这个文件里有两种含义，两处都要钉住，否则哪天改动一处
     /// 会把另一处悄悄带偏。
     #[test]
+    fn real_cts_legends_and_receiver_status_preserve_event_meaning() {
+        let req = CtsTrafficReq {
+            role: CtsTrafficRole::Server,
+            protocol: CtsTrafficProtocol::Tcp,
+            ..Default::default()
+        };
+        for legend in [
+            "* Network Errors - cumulative count of failed IO patterns due to Winsock errors",
+            "* Data Errors - cumulative count of failed IO patterns due to data errors",
+        ] {
+            assert!(classify_line(legend, &req, 1000).is_none());
+        }
+        let event = classify_line("1.000 0 1250000 1 0 0 0", &req, 1000).unwrap();
+        assert_eq!(event.kind, IperfEventKind::Traffic);
+        assert_eq!(event.mbps, Some(10.0));
+        let client = CtsTrafficReq {
+            role: CtsTrafficRole::Client,
+            ..req.clone()
+        };
+        let event = classify_line("1.000 1250000 0 1 0 0 0", &client, 1000).unwrap();
+        assert_eq!(event.mbps, Some(10.0));
+        assert_eq!(
+            classify_line("**** connection failed: 10061", &req, 1000)
+                .unwrap()
+                .kind,
+            IperfEventKind::Error
+        );
+        assert_eq!(
+            classify_line("connection failed: 10061", &req, 1000)
+                .unwrap()
+                .kind,
+            IperfEventKind::Error
+        );
+    }
+
+    #[test]
     fn a_comma_means_a_decimal_point_in_status_rows_and_a_group_separator_in_summaries() {
         // 状态行：逗号是小数点。
         assert_eq!(parse_status_number("1,000"), Some(1.0));
@@ -679,6 +760,22 @@ Total Time : 61273 ms.
         assert!((udp.recv_mbps.unwrap() - 24.99984).abs() < 0.001);
         assert_eq!(udp.udp_dropped_frames, Some(1));
         assert_eq!(udp.udp_dropped_pct, Some(0.027778));
+    }
+
+    /// 工具自报速率是有流量时段的平均，不是峰值那一秒；对端那一侧恒为零的
+    /// 状态行（客户端、服务端输出合并解析）不拉低平均。
+    #[test]
+    fn the_tool_rate_is_the_average_of_flowing_status_lines_not_the_peak() {
+        let parsed = parse_output(
+            "[1.000] 100000000 0 8 1 0 0\n\
+             [2.000] 125000000 0 8 2 0 0\n\
+             [3.000] 150000000 0 8 3 0 0\n\
+             [1.000] 0 125000000 8 1 0 0\n\
+             [2.000] 0 125000000 8 2 0 0\n",
+            CtsTrafficProtocol::Tcp,
+        );
+        assert_eq!(parsed.send_mbps, Some(1_000.0), "平均而不是峰值 1200");
+        assert_eq!(parsed.recv_mbps, Some(1_000.0));
     }
 
     #[test]

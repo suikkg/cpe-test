@@ -43,7 +43,13 @@ impl Source {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolOrigin {
+    /// 板侧接收端 server 的逐秒记录，在判定窗口上求平均。首选：和网卡口径是
+    /// 同一段时间（扣掉起流爬升，双向时是两腿的共同窗口）。
+    BoardServerWindow,
+    /// PC 接收端 server 的逐秒记录，在判定窗口上求平均。
+    PcServerWindow,
     /// 发送端 client 输出里的 receiver 汇总行（含 server 回传的接收结果）。
+    /// 覆盖整次运行（含起流爬升），只在逐秒记录用不上时作退路。
     ClientSummary,
     /// 本单元独占的板侧 server 原文。仅在 client 侧汇总丢失时使用。
     BoardServerLog,
@@ -54,9 +60,11 @@ pub enum ToolOrigin {
 impl ToolOrigin {
     pub fn label(self) -> &'static str {
         match self {
-            Self::ClientSummary => "发送端 client 的 receiver 汇总行",
-            Self::BoardServerLog => "本单元独占的板侧 server 原文",
-            Self::PcServerLog => "本单元独占的 PC server 原文",
+            Self::BoardServerWindow => "板侧 server 逐秒接收记录（判定窗口内）",
+            Self::PcServerWindow => "PC server 逐秒接收记录（判定窗口内）",
+            Self::ClientSummary => "发送端 client 的 receiver 汇总行（全程）",
+            Self::BoardServerLog => "本单元独占的板侧 server 原文（全程汇总）",
+            Self::PcServerLog => "本单元独占的 PC server 原文（全程汇总）",
         }
     }
 }
@@ -76,6 +84,10 @@ pub struct ToolRate {
     pub mbps: f64,
     pub aggregate: Aggregate,
     pub origin: ToolOrigin,
+    /// 取用的那条汇总行覆盖的时长（毫秒）。中途退出时 server 仍可能打出一条
+    /// 只覆盖前几秒的汇总，调用方据此拒收；不进结果文件。
+    #[serde(skip_serializing)]
+    pub span_ms: Option<u64>,
 }
 
 /// 从 iperf3 文本里取**接收端**汇总速率。
@@ -92,8 +104,8 @@ pub fn parse_receiver_summary(
     streams: u32,
     origin: ToolOrigin,
 ) -> Result<ToolRate, String> {
-    let mut sum: Option<f64> = None;
-    let mut singles: Vec<f64> = Vec::new();
+    let mut sum: Option<(f64, Option<u64>)> = None;
+    let mut singles: Vec<(f64, Option<u64>)> = Vec::new();
     for raw in text.lines() {
         let line = strip_ansi(raw);
         if !line.contains("receiver") {
@@ -102,13 +114,15 @@ pub fn parse_receiver_summary(
         let Some(mbps) = last_rate_mbps(&line) else {
             continue;
         };
+        let span_ms = crate::cmd::iperf_window::iperf_interval_ms(&line)
+            .map(|(start, end)| end.saturating_sub(start));
         if line.contains("[SUM]") {
-            sum = Some(mbps);
+            sum = Some((mbps, span_ms));
         } else {
-            singles.push(mbps);
+            singles.push((mbps, span_ms));
         }
     }
-    let (mbps, aggregate) = match (sum, singles.len()) {
+    let ((mbps, span_ms), aggregate) = match (sum, singles.len()) {
         (Some(value), _) => (value, Aggregate::Sum),
         (None, 0) => return Err("原文里没有 receiver 汇总行".into()),
         (None, 1) if streams == 1 => (singles[0], Aggregate::Single),
@@ -126,6 +140,7 @@ pub fn parse_receiver_summary(
         mbps,
         aggregate,
         origin,
+        span_ms,
     })
 }
 
@@ -168,7 +183,7 @@ impl NicView {
     /// 判据只有一个来源：验收有没有走到「能给出速率结论」那一步。
     /// PASS / RATE_FAIL / MEASURED 都意味着三道门槛（计数器没停滞、平均值
     /// 有效、覆盖率够）都过了；NOT_EVALUATED 意味着没过。与子网
-    /// `bidir_total_rx_avg` 用的是同一条判据。
+    /// `bidir_total` 用的是同一条判据。
     pub fn trusted(&self) -> bool {
         matches!(
             self.acceptance.verdict,

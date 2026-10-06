@@ -2427,7 +2427,11 @@ fn ctstraffic_single_udp_estimate_matches_one_attempt_and_bidir_is_parallel() {
     let (oneway_units, notices) = build_units(&[spec.clone()], true, &mut port);
     assert!(notices.is_empty());
     assert_eq!(oneway_units.len(), 1);
-    assert_eq!(oneway_units[0].est_secs, 25);
+    // 时长 + 起流头 settle 秒（不计入平均，进程要多跑这一段）+ 启停开销。
+    assert_eq!(
+        oneway_units[0].est_secs,
+        spec.duration + spec.rate_check.settle_secs + 15
+    );
 
     spec.directions = vec!["bidir".into()];
     let mut port = PORT_BASE;
@@ -2560,7 +2564,7 @@ fn a_direction_without_a_bidirectional_threshold_falls_back_to_the_normal_chain(
 /// 配了「双向 RX 合计」门限时，两条腿**没有自己的门限**，也不许因此变成
 /// `TARGET_MISSING`。
 ///
-/// 判定在单元级只做一次合计比对（`executor::bidir_total_verdict`）。给腿
+/// 判定在单元级只做一次合计比对（`executor::verdict_assembly::bidir_total`）。给腿
 /// 留一个每方向门限，报告上会出现「AB 判 RATE_FAIL、单元判 PASS」这种自相
 /// 矛盾的两行；只清门限不改模式，显式配 `verify` 的用户会拿到一整轮
 /// `NOT_EVALUATED / TARGET_MISSING`——腿本来就不该有目标，这不是缺配置。
@@ -2702,8 +2706,8 @@ fn udp_resume_id_is_independent_of_tcp_stream_configuration() {
     base.streams = 20;
     base.tcp_streams = 20;
     // 16/15 而不是 4/3：EVB 的 ab 门限是 6400Mbps，每流 500Mbps 时至少要
-    // 14 条并发流才够灌到它。4 条在计划期就会被判成「这一腿的有效判定窗口
-    // 永远形不成」并收到提示，而 `build_single_udp_id` 要求一份**干净**的
+    // 14 条并发流才够灌到它。4 条在计划期就会收到「灌不到门限」的
+    // 提示，而 `build_single_udp_id` 要求一份**干净**的
     // 构建——这条测试问的是 resume identity，不该顺带背上一个不可行的负载。
     // 两个数仍然只差 1，「改了 UDP 流数身份就得变」的判据一个字没动。
     base.udp_streams = 16;
@@ -3237,14 +3241,13 @@ fn every_rx_target_layer_yields_to_the_one_above_it() {
 /// **流数灌不到门限时，计划期就要说**（回归方案 CFG-07 / PLAN-12）。
 ///
 /// 真机复现（run_20260906_175551，macOS ↔ Arch）：`udp_streams=2`、每流
-/// `-b 300m`、门限 850Mbps。执行端要求「所有必需流并发活跃」才算有效判定
-/// 窗口，而必需流数 = ceil(850 × 1.05 / 300) = 3 > 2——那个窗口**永远形不成**，
-/// 整条腿稳定判 `NOT_EVALUATED / EFFECTIVE_WINDOW_SHORT`。
+/// `-b 300m`、门限 850Mbps。必需流数 = ceil(850 × 1.05 / 300) = 3 > 2，
+/// 发出去的总负载只有 600Mbps。当时执行端还把「必需流数」当成有效窗口的
+/// 门槛，整条腿稳定判 `NOT_EVALUATED / EFFECTIVE_WINDOW_SHORT`；现在流数不足
+/// 只作诊断，RX 照常和门限比，结果是几乎必然的 `RATE_FAIL`。
 ///
-/// 三件事让它比「配错了」更值得挡：①完全确定，不是概率性的；②计划期
-/// 已知全部输入，本可以提前算出来；③用户拿到的原因码指向采样窗口，
-/// 而真因是流数不够——排查方向被带偏一整层。180s 的 Windows 预设下，
-/// 这会让一轮里**每一个** UDP 单元都白跑。
+/// 两种结果都由配置决定、计划期就算得出来，所以仍然要在跑之前点名，
+/// 并把「跑完会得到哪个结论」写出来——否则用户会去怀疑被测设备。
 #[test]
 fn a_stream_count_that_can_never_reach_the_target_is_called_out_before_the_run() {
     let under_provisioned = |streams: u32, bandwidth: &str, target: f64| {
@@ -3273,8 +3276,8 @@ fn a_stream_count_that_can_never_reach_the_target_is_called_out_before_the_run()
         "要说清是哪个任务、哪条链路：{hit}"
     );
     assert!(
-        hit.contains("EFFECTIVE_WINDOW_SHORT"),
-        "要把「跑完会得到哪个原因码」写出来，否则用户仍然会去查采样窗口：{hit}"
+        hit.contains("RX_BELOW_TARGET") && !hit.contains("EFFECTIVE_WINDOW_SHORT"),
+        "要把「跑完会得到哪个原因码」写出来；流数不足不再让窗口作废：{hit}"
     );
 
     // 够了就不许聒噪：4 × 300 = 1200 > 892.5。

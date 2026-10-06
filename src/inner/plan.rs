@@ -12,6 +12,28 @@ use std::collections::HashSet;
 pub const UNIT_OVERHEAD_SECS: u64 = 20;
 /// 双向单元要多起一套 server、多回收一条腿。
 pub const BIDIR_EXTRA_OVERHEAD_SECS: u64 = 8;
+/// 起流头这几秒不计入平均：TCP 的慢启动和窗口增长、Wi-Fi 的速率自适应都要先
+/// 收敛一会儿。判定窗口从流量起点扣掉这一段，client 跟着多跑这一段。与子网
+/// `iperf.rate_check.settle_secs` 的默认值一致、TCP/UDP 同样扣；内环配置刻意不带
+/// 子网的判定参数块，所以这里是常量。
+pub const SETTLE_SECS: u64 = 5;
+
+/// client 实际跑多久：配置时长 + 起流爬升 + 双向交集余量（判定窗口仍截到
+/// 配置时长）。算法与子网共用 `cmd::iperf_window::traffic_process_secs`。
+pub fn client_secs(cfg: &InnerConfig, unit: &Unit) -> u64 {
+    crate::cmd::iperf_window::traffic_process_secs(cfg.duration_secs, SETTLE_SECS, unit.is_bidir())
+}
+
+/// 一个单元的预计耗时；计划预览和「去掉 RESUME 命中后还剩多久」共用。
+fn unit_estimated_secs(cfg: &InnerConfig, unit: &Unit) -> u64 {
+    client_secs(cfg, unit)
+        + UNIT_OVERHEAD_SECS
+        + if unit.is_bidir() {
+            BIDIR_EXTRA_OVERHEAD_SECS
+        } else {
+            0
+        }
+}
 
 /// 一条腿：一个数据走向、一个板侧端口、一个接收端。
 #[derive(Debug, Clone, Serialize)]
@@ -277,15 +299,7 @@ pub fn build(cfg: &InnerConfig) -> Result<Plan, String> {
     }
     let estimated_secs = units
         .iter()
-        .map(|unit| {
-            cfg.duration_secs
-                + UNIT_OVERHEAD_SECS
-                + if unit.is_bidir() {
-                    BIDIR_EXTRA_OVERHEAD_SECS
-                } else {
-                    0
-                }
-        })
+        .map(|unit| unit_estimated_secs(cfg, unit))
         .sum();
     Ok(Plan {
         uses_master: links.iter().any(|&i| cfg.links[i].host == "master"),
@@ -448,15 +462,7 @@ pub fn preview_with_resumed(
         .units
         .iter()
         .filter(|unit| resumed.contains(&unit.id))
-        .map(|unit| {
-            cfg.duration_secs
-                + UNIT_OVERHEAD_SECS
-                + if unit.is_bidir() {
-                    BIDIR_EXTRA_OVERHEAD_SECS
-                } else {
-                    0
-                }
-        })
+        .map(|unit| unit_estimated_secs(cfg, unit))
         .sum::<u64>();
     Ok(Preview {
         links: plan.links.len(),

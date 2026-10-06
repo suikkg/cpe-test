@@ -404,6 +404,7 @@ impl Ctx {
             rx_avg: None,
             main_rows: vec![idx],
             tag: tag.to_string(),
+            traffic: None,
         }
     }
 }

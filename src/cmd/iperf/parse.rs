@@ -29,8 +29,13 @@ impl IperfParsed {
     pub fn best_sender(&self) -> Option<f64> {
         self.sender_mbps.or(self.last_mbps)
     }
+    /// 接收端速率：**只认 receiver 汇总行**。
+    ///
+    /// 以前拿不到汇总时退回「最后一行的速率」。client 输出的最后一行是发送端的
+    /// 逐秒行（或者某一秒的残帧），于是报告「接收」列填上了发送端的数——UDP 丢包
+    /// 时两者能差出几百 Mbps，看上去像是收全了。拿不到就是拿不到，留空。
     pub fn best_receiver(&self) -> Option<f64> {
-        self.receiver_mbps.or(self.last_mbps)
+        self.receiver_mbps
     }
     pub fn has_measurement(&self) -> bool {
         [self.sender_mbps, self.receiver_mbps, self.last_mbps]
@@ -148,6 +153,11 @@ fn live_rate(line: &str) -> Option<f64> {
     let cap = re.captures_iter(line).last()?;
     let num: f64 = cap[1].replace(',', ".").parse().ok()?;
     Some(rate_mbps(num, &cap[2], &cap[3]))
+}
+
+/// 一行 iperf3 输出里的速率（行内最后一个 `bits/sec` / `Bytes/sec`），单位 Mbps。
+pub(crate) fn interval_rate_mbps(line: &str) -> Option<f64> {
+    live_rate(line)
 }
 
 pub(super) fn classify_live_line(line: &str, elapsed_ms: u64) -> Option<IperfFlowEvent> {

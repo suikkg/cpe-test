@@ -91,6 +91,7 @@ pub(super) fn row_has_usable_traffic_measurement(row: &Row) -> bool {
 ///
 /// ```text
 /// 双向有效吞吐 = AB 方向接收端 RX 平均 + BA 方向接收端 RX 平均
+///               （两者都取两条腿同时在跑的同一段时间）
 /// ```
 ///
 /// 为什么不是 TX+RX：同一个包在发送侧 TX 和接收侧 RX 各记一次，相加就是重复
@@ -113,37 +114,50 @@ fn bidir_legs(outcomes: &[LegOutcome]) -> Option<(&LegOutcome, &LegOutcome)> {
     }
 }
 
-/// 双向有效吞吐 = 两端接收端 RX 平均之和。
+/// 双向合计的结论，连同判定用的那个合计值。
+pub(super) struct BidirTotal {
+    pub judgement: VerdictResult,
+    /// 判定用的合计值；形不成时 `None`。
+    ///
+    /// 报告行填的必须是这同一个数，否则报告上会出现「判定说合计 950 达标、
+    /// RX 平均列却是另一个数」——所以它和判定从同一个函数里出来。
+    pub total_mbps: Option<f64>,
+}
+
+/// 双向有效吞吐 = 两条腿**同时在跑的那一段**上，两端接收端 RX 平均之和。
 ///
-/// **全仓唯一定义**：判定（[`bidir_total_verdict`]）和报告行填的必须是同一个
-/// 数，否则报告上会出现「判定说合计 950 达标、RX 平均列却是另一个数」。
-/// 任一方向形不成可信的 RX 平均值就返回 `None`——这时合计不成立，不猜。
-pub(super) fn bidir_total_rx_avg(outcomes: &[LegOutcome]) -> Option<f64> {
-    let (ab, ba) = bidir_legs(outcomes)?;
+/// **全仓唯一定义**。以前直接把两条腿各自窗口的 `rx_avg` 相加：两个窗口
+/// 各自挑、从不对齐（TCP 两条腿连时间零点都不是同一个），一条腿起流重试晚了
+/// 十几秒，两边就各混进一段单独跑的时间；Wi-Fi 上两个方向抢同一块空口，
+/// 单独跑的那几秒更快，合计因此被抬高。重叠为零时，合计就是两次单独跑相加。
+/// 内环早就按交集算，同一个 ADR-18 指标在两条路径上口径不一。
+///
+/// 现在：两条腿截断前的真实流量区间求交集，从交集起点截出要求时长，在这一段上
+/// 用两条腿各自的接收端样本重算 RX。交集不够长、或任一腿在这一段上形不成可信
+/// 的 RX 平均值，合计就不成立——这时**不猜**。
+pub(super) fn bidir_total(outcomes: &[LegOutcome], total_target: f64) -> BidirTotal {
+    let not_formed = |code: ReasonCode, detail: String| BidirTotal {
+        judgement: VerdictResult::not_evaluated(code, detail),
+        total_mbps: None,
+    };
+    let Some((ab, ba)) = bidir_legs(outcomes) else {
+        return not_formed(
+            ReasonCode::NicRateMissing,
+            "双向 RX 合计需要 AB 与 BA 两个方向的结果，本单元缺少其中一个".into(),
+        );
+    };
     // 「这条腿测出数了吗」只有一个答案来源：腿级判定有没有走到验收那一步。
-    // Measured / Pass / RateFail 都意味着已经形成可信的 RX 平均值。
     let usable = |outcome: &LegOutcome| {
         matches!(
             outcome.verdict(),
             Verdict::Pass | Verdict::RateFail | Verdict::Measured
         )
     };
-    if !usable(ab) || !usable(ba) {
-        return None;
-    }
-    let (ab_rx, ba_rx) = (ab.rx_avg?, ba.rx_avg?);
-    (ab_rx.is_finite() && ba_rx.is_finite()).then_some(ab_rx + ba_rx)
-}
-
-pub(super) fn bidir_total_verdict(outcomes: &[LegOutcome], total_target: f64) -> VerdictResult {
-    let Some((ab, ba)) = bidir_legs(outcomes) else {
-        return VerdictResult::not_evaluated(
-            ReasonCode::NicRateMissing,
-            "双向 RX 合计需要 AB 与 BA 两个方向的结果，本单元缺少其中一个",
-        );
-    };
-    let Some(total) = bidir_total_rx_avg(outcomes) else {
-        return VerdictResult::not_evaluated(
+    let (Some(ab_traffic), Some(ba_traffic)) = (
+        ab.traffic.as_ref().filter(|_| usable(ab)),
+        ba.traffic.as_ref().filter(|_| usable(ba)),
+    ) else {
+        return not_formed(
             ReasonCode::NicRateMissing,
             format!(
                 "双向 RX 合计需要两个方向都形成可信的 RX 平均值：AB={} ({}), BA={} ({})",
@@ -154,14 +168,71 @@ pub(super) fn bidir_total_verdict(outcomes: &[LegOutcome], total_target: f64) ->
             ),
         );
     };
-    let (ab_rx, ba_rx) = (ab.rx_avg.unwrap_or_default(), ba.rx_avg.unwrap_or_default());
-    let detail = format!(
-        "双向 RX 合计 {total:.3}Mbps（AB {ab_rx:.3} + BA {ba_rx:.3}），门限 {total_target:.3}Mbps"
+    let required_secs = ab_traffic.required_secs.max(ba_traffic.required_secs);
+    let window = window_from_span(
+        overlap_span(&[ab_traffic.span, ba_traffic.span]),
+        required_secs,
     );
-    if total >= total_target {
+    if !window.complete {
+        return not_formed(
+            ReasonCode::EffectiveWindowShort,
+            format!(
+                "两条腿真实流量只同时跑了 {:.1}s，短于要求的 {required_secs}s；双向合计只能\
+                 在两条腿同时在跑的那一段上算，各自单独跑的时间会把合计抬高",
+                window.available_secs
+            ),
+        );
+    }
+    let leg_rx = |traffic: &LegTraffic| {
+        let stats = monitor_rate_stats(
+            &traffic.rx_monitor,
+            &window,
+            true,
+            traffic.baseline_cutoff_ms,
+        )
+        .with_tool_trace(&traffic.tool_trace);
+        let acceptance = evaluate_rx_acceptance(RateMode::Observe, None, &stats);
+        stats
+            .avg_mbps
+            .filter(|_| acceptance.verdict == Verdict::Measured)
+            .ok_or(acceptance)
+    };
+    let mut rates = Vec::with_capacity(2);
+    for (side, traffic) in [("AB", ab_traffic), ("BA", ba_traffic)] {
+        match leg_rx(traffic) {
+            Ok(rate) => rates.push(rate),
+            Err(why) => {
+                return not_formed(
+                    why.code,
+                    format!(
+                        "{side} 在两条腿共同的窗口上形不成可信的 RX 平均值（{}）：{}",
+                        why.code, why.detail
+                    ),
+                )
+            }
+        }
+    }
+    let (ab_rx, ba_rx) = (rates[0], rates[1]);
+    let total = ab_rx + ba_rx;
+    if !total.is_finite() {
+        return not_formed(
+            ReasonCode::NoValidMeasurement,
+            format!("双向 RX 合计不是有限值（AB {ab_rx:.3} + BA {ba_rx:.3}）"),
+        );
+    }
+    let detail = format!(
+        "双向 RX 合计 {total:.3}Mbps（AB {ab_rx:.3} + BA {ba_rx:.3}，取两条腿同时在跑的 \
+         {:.1}s），门限 {total_target:.3}Mbps",
+        window.end_ms.saturating_sub(window.start_ms) as f64 / 1_000.0
+    );
+    let judgement = if total >= total_target {
         VerdictResult::pass().with_diagnostics(vec![detail])
     } else {
         VerdictResult::rate_fail(ReasonCode::RxBelowTarget, detail)
+    };
+    BidirTotal {
+        judgement,
+        total_mbps: Some(total),
     }
 }
 
@@ -258,6 +329,9 @@ pub(crate) struct IperfFlowVerdictIn<'a> {
     pub offered_floor: Option<f64>,
     /// client 输出的最后一行，用作 setup 错误的可读细节。
     pub client_tail: &'a str,
+    /// 执行环境本身的问题（进程没起来、回收/停止未确认、被取消、参数错误）；
+    /// `None` = 环境没问题，`raw_ok` 为假只是 iperf3 自己非正常退出。
+    pub setup_error: Option<String>,
     /// 接收端 monitor 的完整采样输出，仅用于窗口不足时给一个定位数字。
     pub rx_monitor: Option<&'a MonitorStopOut>,
 }
@@ -310,13 +384,22 @@ pub(crate) fn iperf_flow_verdict(input: IperfFlowVerdictIn<'_>) -> VerdictResult
         tx_stats,
         offered_floor,
         client_tail,
+        setup_error,
         rx_monitor,
     } = input;
 
     let summary_lost_after_full_run = !raw_ok && measurement && effective_window.complete;
+    // 跑出过流量、执行环境也没问题，只是 iperf3 中途退出（被测设备重启、链路断开）。
+    //
+    // 以前这一类和「环境没搭起来」一起判 SETUP_ERROR：报告让人去查 PC 和工具，
+    // 熔断计数把一条跑了上百秒才断的链路记成「一个测量都没产生」。而 UDP 与
+    // CTS 对同一件事判的是「有效窗口不足」——三条链两个结论。现在三条链一致。
+    let exited_early_after_traffic =
+        !raw_ok && measurement && !effective_window.complete && setup_error.is_none();
 
-    if !raw_ok && !summary_lost_after_full_run {
-        return VerdictResult::setup_error(ReasonCode::IperfExecFailed, client_tail.to_string());
+    if !raw_ok && !summary_lost_after_full_run && !exited_early_after_traffic {
+        let detail = setup_error.unwrap_or_else(|| client_tail.to_string());
+        return VerdictResult::setup_error(ReasonCode::IperfExecFailed, detail);
     }
     if !measurement {
         // 「工具没产生吞吐测量」= **执行环境的事实**，不是被测设备的性能结论。
@@ -340,10 +423,15 @@ pub(crate) fn iperf_flow_verdict(input: IperfFlowVerdictIn<'_>) -> VerdictResult
         );
     }
     if !effective_window.complete {
+        let early_exit = if exited_early_after_traffic {
+            format!("iperf3 中途退出（{}）；", client_tail.trim())
+        } else {
+            String::new()
+        };
         return VerdictResult::not_evaluated(
             ReasonCode::IperfEffectiveWindowShort,
             format!(
-                "iperf3 真实流量事件窗口仅 {:.3}s，短于要求的 {}s；未把 server 启动、连接或清理时间计入平均速率{}",
+                "{early_exit}iperf3 真实流量事件窗口仅 {:.3}s，短于要求的 {}s；未把 server 启动、连接或清理时间计入平均速率{}",
                 effective_window.available_secs,
                 required_secs,
                 lifecycle_rx_hint(rx_monitor)
@@ -698,6 +786,7 @@ mod tests {
             tx_stats: &tx,
             offered_floor: None,
             client_tail: "",
+            setup_error: None,
             rx_monitor: None,
         });
         let (verdict, code, detail) = (judged.verdict, judged.code, judged.detail);
@@ -859,20 +948,58 @@ mod tests {
         );
     }
 
-    fn measured_leg(tag: &str, rx: f64) -> LegOutcome {
+    /// 每秒一个接收端样本，`rate(second)` 给出该秒 Mbps。
+    fn rx_monitor(seconds: u64, rate: impl Fn(u64) -> f64) -> MonitorStopOut {
+        MonitorStopOut {
+            samples: (1..=seconds)
+                .map(|second| {
+                    let mbps = rate(second);
+                    MonitorSample {
+                        elapsed_ms: second * 1_000,
+                        interval_ms: 1_000,
+                        rx_delta_bytes: (mbps * 1_000_000.0 / 8.0) as u64,
+                        rx_mbps: mbps,
+                        valid: true,
+                        ..Default::default()
+                    }
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// 合计门限单元里的一条腿：只测量，带着在 `span` 上的接收端样本。
+    fn traffic_leg(
+        tag: &str,
+        rx_avg: f64,
+        span: (u64, u64),
+        monitor: MonitorStopOut,
+    ) -> LegOutcome {
         LegOutcome {
             judgement: VerdictResult::measured(ReasonCode::TargetUnknown, "只测量"),
-            rx_avg: Some(rx),
+            rx_avg: Some(rx_avg),
             main_rows: Vec::new(),
             tag: tag.to_string(),
+            traffic: Some(LegTraffic {
+                span: Some(span),
+                required_secs: 180,
+                rx_monitor: monitor,
+                baseline_cutoff_ms: 0,
+                tool_trace: ToolTrace::default(),
+            }),
         }
+    }
+
+    /// 全程恒速、两条腿同时跑满 185 秒。
+    fn measured_leg(tag: &str, rx: f64) -> LegOutcome {
+        traffic_leg(tag, rx, (0, 185_000), rx_monitor(185, |_| rx))
     }
 
     /// Wi-Fi 双向按**两端 RX 合计**判定：不要求两个方向各达到一半。
     #[test]
     fn a_bidirectional_unit_passes_on_the_sum_of_both_receivers() {
         let outcomes = vec![measured_leg("ab", 720.0), measured_leg("ba", 230.0)];
-        let judgement = bidir_total_verdict(&outcomes, 900.0);
+        let judgement = bidir_total(&outcomes, 900.0).judgement;
         assert_eq!(
             judgement.verdict,
             Verdict::Pass,
@@ -890,7 +1017,7 @@ mod tests {
     #[test]
     fn a_bidirectional_unit_fails_when_the_sum_is_short() {
         let outcomes = vec![measured_leg("ab", 600.0), measured_leg("ba", 200.0)];
-        let judgement = bidir_total_verdict(&outcomes, 900.0);
+        let judgement = bidir_total(&outcomes, 900.0).judgement;
         assert_eq!(judgement.verdict, Verdict::RateFail);
         assert_eq!(judgement.code, ReasonCode::RxBelowTarget);
         assert!(judgement.detail.contains("800.000"), "{judgement:?}");
@@ -901,21 +1028,21 @@ mod tests {
     /// 单元汇总行以前 `rx_avg` 走 `single_direction`（双向恒为 `None`），而
     /// `target_mbps` 填了合计门限——报告和 Excel 上于是出现「目标 1000 /
     /// RX 平均 空」这种自相矛盾的一行，判定用的那个数只以文字形式存在于
-    /// 原因列里。`bidir_total_rx_avg` 是这个数的唯一定义，两边共用。
+    /// 原因列里。`bidir_total` 同时给出判定和这个数，两边共用。
     #[test]
     fn the_number_the_verdict_used_is_the_number_the_row_shows() {
         let outcomes = vec![measured_leg("ab", 720.0), measured_leg("ba", 230.0)];
-        assert_eq!(bidir_total_rx_avg(&outcomes), Some(950.0));
+        assert_eq!(bidir_total(&outcomes, 900.0).total_mbps, Some(950.0));
 
         // 形不成合计时也不能给报告一个半真半假的数。
         let one_way = vec![measured_leg("ab", 720.0)];
-        assert_eq!(bidir_total_rx_avg(&one_way), None);
+        assert_eq!(bidir_total(&one_way, 900.0).total_mbps, None);
 
         let mut untrusted = vec![measured_leg("ab", 720.0), measured_leg("ba", 230.0)];
         untrusted[1].judgement =
             VerdictResult::not_evaluated(ReasonCode::NicRateMissing, "采样不可信");
         assert_eq!(
-            bidir_total_rx_avg(&untrusted),
+            bidir_total(&untrusted, 900.0).total_mbps,
             None,
             "有一条腿没形成可信的 RX 平均值，合计就不成立"
         );
@@ -926,14 +1053,14 @@ mod tests {
     fn a_bidirectional_unit_without_both_receivers_is_not_evaluated() {
         let only_ab = vec![measured_leg("ab", 720.0)];
         assert_eq!(
-            bidir_total_verdict(&only_ab, 900.0).verdict,
+            bidir_total(&only_ab, 900.0).judgement.verdict,
             Verdict::NotEvaluated
         );
 
         let mut missing_rx = vec![measured_leg("ab", 720.0), measured_leg("ba", 230.0)];
-        missing_rx[1].rx_avg = None;
+        missing_rx[1].traffic = None;
         assert_eq!(
-            bidir_total_verdict(&missing_rx, 900.0).verdict,
+            bidir_total(&missing_rx, 900.0).judgement.verdict,
             Verdict::NotEvaluated
         );
 
@@ -942,7 +1069,7 @@ mod tests {
         untrusted[1].judgement =
             VerdictResult::not_evaluated(ReasonCode::CounterStalled, "计数器停滞");
         assert_eq!(
-            bidir_total_verdict(&untrusted, 900.0).verdict,
+            bidir_total(&untrusted, 900.0).judgement.verdict,
             Verdict::NotEvaluated
         );
     }
@@ -959,10 +1086,55 @@ mod tests {
         // 单元不能因此显示成「测过了、只是没门限」。
         assert_eq!(aggregate_unit_verdict(&only_ab), Verdict::Measured);
         assert_eq!(
-            bidir_total_verdict(&only_ab, 900.0).verdict,
+            bidir_total(&only_ab, 900.0).judgement.verdict,
             Verdict::NotEvaluated,
             "缺一个方向就是形不成合计"
         );
+    }
+
+    /// 合计只取两条腿**同时在跑**的那一段。
+    ///
+    /// BA 起流晚了 20 秒：这 20 秒 AB 独占空口跑到 1200，之后两边抢空口各
+    /// 700 / 250。以前直接把各自窗口的平均相加——AB 的窗口把那 20 秒单独跑的
+    /// 时间也算了进去（平均约 756），合计约 1006，门限 1000 判 PASS；两条腿
+    /// 真正并发时的合计只有 950。
+    #[test]
+    fn the_total_only_counts_the_time_both_legs_were_running() {
+        let ab = traffic_leg(
+            "ab",
+            (20.0 * 1_200.0 + 160.0 * 700.0) / 180.0,
+            (0, 205_000),
+            rx_monitor(205, |second| if second <= 20 { 1_200.0 } else { 700.0 }),
+        );
+        let ba = traffic_leg(
+            "ba",
+            250.0,
+            (20_000, 205_000),
+            rx_monitor(205, |second| if second <= 20 { 0.0 } else { 250.0 }),
+        );
+        let old_sum = ab.rx_avg.unwrap() + ba.rx_avg.unwrap();
+        assert!(old_sum > 1_000.0, "前提：老算法会判 PASS（{old_sum}）");
+
+        let total = bidir_total(&[ab, ba], 1_000.0);
+        assert_eq!(total.total_mbps, Some(950.0));
+        assert_eq!(total.judgement.verdict, Verdict::RateFail);
+        assert!(
+            total.judgement.detail.contains("180.0s"),
+            "{}",
+            total.judgement.detail
+        );
+    }
+
+    /// 两条腿交集不够要求时长（一条腿重试晚了大半程）：合计不成立，不拿两次
+    /// 单独跑相加充数。
+    #[test]
+    fn legs_that_barely_overlapped_do_not_form_a_total() {
+        let ab = traffic_leg("ab", 900.0, (0, 185_000), rx_monitor(300, |_| 900.0));
+        let ba = traffic_leg("ba", 900.0, (100_000, 285_000), rx_monitor(300, |_| 900.0));
+        let total = bidir_total(&[ab, ba], 1_000.0);
+        assert_eq!(total.judgement.verdict, Verdict::NotEvaluated);
+        assert_eq!(total.judgement.code, ReasonCode::EffectiveWindowShort);
+        assert_eq!(total.total_mbps, None);
     }
 
     fn full_window() -> EffectiveWindow {
@@ -1239,6 +1411,7 @@ mod tests {
             tx_stats: &busy,
             offered_floor: None,
             client_tail: "",
+            setup_error: None,
             rx_monitor: None,
         });
         assert_ne!(
@@ -1262,5 +1435,34 @@ mod tests {
             Verdict::Pass,
             "同样的 RX，流真的起来了就该 PASS——否则上面三条断言什么都没证明"
         );
+    }
+    /// 流数不足（配少了、或中途掉了几条）只作诊断：RX 达标照样 PASS，
+    /// 不达标就是 RATE_FAIL——和 TCP/CTS 对同一件事的结论一致（口径 B）。
+    #[test]
+    fn a_stream_shortfall_is_a_diagnostic_on_both_sides_of_the_target() {
+        let window = full_window();
+        let tx = healthy(2_100.0);
+        for (rx_mbps, expected) in [(2_400.0, Verdict::Pass), (1_500.0, Verdict::RateFail)] {
+            let rx = healthy(rx_mbps);
+            for (total, success, required) in [(2, 2, 3), (10, 8, 9)] {
+                let judged = udp_leg_verdict(&UdpLegFacts {
+                    streams_total: total,
+                    streams_success: success,
+                    streams_required: required,
+                    rx_target_mbps: Some(2_000.0),
+                    offered_floor: Some(2_100.0),
+                    ..facts(&rx, &tx, &window)
+                });
+                assert_eq!(judged.verdict, expected, "{total}/{success}/{required}");
+                assert!(
+                    judged
+                        .diagnostics
+                        .iter()
+                        .any(|line| line.contains("灌包强度不足只作诊断")),
+                    "{:?}",
+                    judged.diagnostics
+                );
+            }
+        }
     }
 }
