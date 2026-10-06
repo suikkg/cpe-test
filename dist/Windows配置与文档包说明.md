@@ -1,13 +1,13 @@
-# cpe_test v6.5.2 Windows 配置与文档包
+# cpe_test v6.6.0 Windows 配置与文档包
 
-仓库中的 `cpe_test-v6.5.2-windows-config-docs.zip` 是便于从 Git 直接下载的
+仓库中的 `cpe_test-v6.6.0-windows-config-docs.zip` 是便于从 Git 直接下载的
 Windows 配置、说明文档和启动脚本资料包。包内文件由仓库当前版本生成，并由 CI
 逐文件与源码副本比对，避免配置或文档过期。
 
 这个资料包**不包含可执行程序或吞吐工具**：
 
 - 不包含 `cpe_test.exe`；请从 GitHub Release 下载正式
-  `cpe_test-v6.5.2-windows-x86_64.zip`，或自行编译。
+  `cpe_test-v6.6.0-windows-x86_64.zip`，或自行编译。
 - 不包含 `ctsTraffic.exe`；正式 Windows Release ZIP 会捆绑固定并校验过的
   Microsoft ctsTraffic 2.0.4.0 x64。
 - 不包含 `iperf3.exe` 及其 DLL；需要 iperf3 测试时，请放入完整的 Windows
@@ -27,6 +27,10 @@ Windows 配置、说明文档和启动脚本资料包。包内文件由仓库当
   换一台主控导入不会改判定口径。Wi-Fi 门限按实际频段组合保存两个单向门限和一个双向 RX 合计门限。
 - `start_ui.bat`（图形控制台）、`start_agent.bat`、`start_master.bat`、`start_master_select_config.bat`。
 - iperf3/ctsTraffic 放置说明、MIT 许可证和第三方声明。
+
+## v6.6.0 行为要点
+
+判定更贴近实际：中途或整段断流按平均值照常判 PASS / RATE_FAIL，不再一律「无法评价」；10 秒这类短单元不会因计数器偶尔一秒没动就判停滞。Windows 主控被强行关掉时，本机的 iperf3 / ctsTraffic 随之退出，不再占着端口影响下一轮。控制台测带 Wi-Fi 的网口不再被误报「计划已变化」而拒绝开跑；连接完成后计划页自动出现跨机网口对。命令行 ctsTraffic 不再一律「有效窗口不足」。报告顶部列出计划提示（门限按链路上限折算、UDP 流数被压低），人为停止的单元会注明是人停的。
 
 ## v6.5.2 更新
 
