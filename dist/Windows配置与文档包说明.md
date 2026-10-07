@@ -1,13 +1,13 @@
-# cpe_test v6.6.0 Windows 配置与文档包
+# cpe_test v6.6.1 Windows 配置与文档包
 
-仓库中的 `cpe_test-v6.6.0-windows-config-docs.zip` 是便于从 Git 直接下载的
+仓库中的 `cpe_test-v6.6.1-windows-config-docs.zip` 是便于从 Git 直接下载的
 Windows 配置、说明文档和启动脚本资料包。包内文件由仓库当前版本生成，并由 CI
 逐文件与源码副本比对，避免配置或文档过期。
 
 这个资料包**不包含可执行程序或吞吐工具**：
 
 - 不包含 `cpe_test.exe`；请从 GitHub Release 下载正式
-  `cpe_test-v6.6.0-windows-x86_64.zip`，或自行编译。
+  `cpe_test-v6.6.1-windows-x86_64.zip`，或自行编译。
 - 不包含 `ctsTraffic.exe`；正式 Windows Release ZIP 会捆绑固定并校验过的
   Microsoft ctsTraffic 2.0.4.0 x64。
 - 不包含 `iperf3.exe` 及其 DLL；需要 iperf3 测试时，请放入完整的 Windows
@@ -27,6 +27,10 @@ Windows 配置、说明文档和启动脚本资料包。包内文件由仓库当
   换一台主控导入不会改判定口径。Wi-Fi 门限按实际频段组合保存两个单向门限和一个双向 RX 合计门限。
 - `start_ui.bat`（图形控制台）、`start_agent.bat`、`start_master.bat`、`start_master_select_config.bat`。
 - iperf3/ctsTraffic 放置说明、MIT 许可证和第三方声明。
+
+## v6.6.1 行为要点
+
+双向合计展示与判定共用共同窗口值，重复规格不再混为一个单元。吞吐起流前采集背景，双向两腿协调后起流；截图在整个单元收尾后采集，同机端只截一次，失败原因可见。截图默认统一开启，草稿与历史仍恢复保存值。Excel 增加 Ping RTT 列，生成失败清理旧文件，重放保持浮点精度；HTML 补操作员中断说明。RX 判定规则与 RESUME 身份保持不变。SSH 启动的 Windows 主控可能无法截图；锁屏、多屏、真实 Excel/WPS 等专项覆盖仍有缺口。
 
 ## v6.6.0 行为要点
 

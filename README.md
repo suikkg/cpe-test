@@ -30,6 +30,16 @@
 
 结果保存在 `inner_runs/inner_*/` 下的 `report.html`、`result.json`、`summary.json`、`config.json` 与 `units.jsonl`，不进入子网 `runs`。左侧「历史」的「内环」标签可以列出历次运行、下载报告，或把当时的配置装载回内环页重新生成计划——装载配置后默认打开内环 RESUME，仍需重新预览并点击开始；隔夜的网口拓扑可能已经变了，该看到的是预览里的差异。组合场景记录保存在 `scenarios/`，在「历史」的「组合场景」标签载入子网计划与内环配置后再次执行。退出码 0 表示完成且 PASS/MEASURED（探测模式为能力探测成功），1 表示 RATE_FAIL/NOT_EVALUATED，2 表示配置、环境、取消或回收失败。内环使用自己的 HTML/JSON 报告，目前没有 Excel 出口；内环 RESUME 与子网 RESUME 分开计算。每单元追加 JSONL 并更新摘要；HTML/完整 JSON 在单元结束时按 30 秒间隔节流更新，收尾必写，因此运行中的下载可能落后于界面已完成数量。历史记录显示明确的收尾状态，旧记录未提供状态时显示未知。
 
+## v6.6.1
+
+修复速率背景采集、截图和报告出口的一致性，不改变 RX 判定规则或既有 RESUME 身份。
+
+- 双向合计门限旁与 Excel 合计列使用共同窗口的实际判定值；重复规格按执行序保留独立结果，历史重放同步修正判定计数。
+- 所有吞吐后端在起流前采集背景，TCP/CTS 双向完成背景阶段后同步起流；截图移到整个单元收尾，同机端只截一次，失败原因进入报告。
+- 截图默认统一开启，显式关闭、草稿和历史保存值仍受尊重；帮助补齐 `--screenshot`。
+- Excel 增加 Ping RTT 数值列，生成失败清理旧文件；修复浮点数重放末位变化，HTML 补单元级操作员中断说明。
+- 回归记录见 [专项修复记录](docs/testing/rate-screenshot-report-fixes-2026-10-07.md)。已完成双机短测和报告重放；锁屏、多活动显示器、真实 Excel/WPS 等覆盖缺口仍保留，不等于完整专项验收通过。
+
 ## v6.6.0
 
 速率统计口径审查与 Windows 实机全面验证（Mac + Windows 双机两种主控方向、Windows 单机）中发现问题的修复。
@@ -788,7 +798,7 @@ CPE（Customer Premises Equipment）子网测试工具用于在**两台电脑之
 ```
 cpe_test.exe          ← 本工具（单文件）
 iperf3.exe            ← 从 iperf.fr 下载（只测 Ping/ctsTraffic 可不放）
-ctsTraffic.exe        ← v6.6.0 Windows Release 已捆绑（仅 Windows 10+）
+ctsTraffic.exe        ← v6.6.1 Windows Release 已捆绑（仅 Windows 10+）
 start_agent.bat       ← 辅测机双击
 start_ui.bat          ← 主控机双击（图形控制台，推荐）
 start_master.bat      ← 主控机双击（命令行问答式）
@@ -1619,7 +1629,7 @@ cargo build --release --locked
 
 自行编译后，把 `cpe_test.exe`、启动脚本和所需吞吐工具放到两台 Windows 电脑同一目录：
 iperf3 测试需要完整的 iperf3 Windows 发行包；ctsTraffic 测试需要 `ctsTraffic.exe`。
-官方 v6.6.0 Windows Release ZIP 已捆绑固定且校验过的 ctsTraffic 2.0.4.0，但由于发行包差异不内置 iperf3。
+官方 v6.6.1 Windows Release ZIP 已捆绑固定且校验过的 ctsTraffic 2.0.4.0，但由于发行包差异不内置 iperf3。
 
 ### GitHub Actions CI
 
@@ -1642,7 +1652,7 @@ Windows ZIP 包含启动脚本、四份配置、固定 CTS 二进制和第三方
 `tar.gz` 保留 `cpe_test` 可执行位。发布作业会再次核对资产名称、数量、内部结构和哈希。
 
 仓库同时跟踪一份不含可执行程序的
-[`cpe_test-v6.6.0-windows-config-docs.zip`](dist/cpe_test-v6.6.0-windows-config-docs.zip)，
+[`cpe_test-v6.6.1-windows-config-docs.zip`](dist/cpe_test-v6.6.1-windows-config-docs.zip)，
 便于直接从 Git 下载 Windows 配置、文档和启动脚本。其 SHA-256 位于同目录的
 `.zip.sha256` 文件；CI 会逐文件确认压缩包内容与仓库源文件一致。需要开箱即用的程序、
 固定版 ctsTraffic 和许可证全集时，仍应下载上面的正式 Windows Release ZIP。
