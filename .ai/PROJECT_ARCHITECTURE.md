@@ -605,6 +605,8 @@ Windows 文本适配器：`src/cmd/ipconfig.rs` 解析中英文 `ipconfig /all`�
 
 - 主流程从 56000 开始递增分配端口，达到 65535 后回绕到 56000；TCP 使用一个 client 的 `-P`，UDP 多流使用独立进程/端口；bidir 始终是 `[ab,ba]` 两腿。
 - 稳定 ID 模板和字段顺序见 `builder.rs`；其输入构造还包括 `ep_id` TCP profile 名，以及 `config.rs`/`builder.rs` 的 UDP profile 名。改变模板、字段顺序或任一输入规范会让历史 RESUME 不再命中。
+- 报告 `model::group_rows` 对重复执行的稳定身份另加 `sort_key` 单元序作为运行内分组键，不修改任务或 RESUME 身份。配了双向合计门限的报告展示只取汇总行保存的共同窗口 RX 值，不以各腿平均之和替代。
+- 执行器 `baseline` 在起流前等待非零背景阶段至少覆盖一个采样周期；TCP/CTS 双向两腿经 `BaselineGate` 同步，提前返回或 panic 由参与者析构释放另一腿。截图统一在 `execute_unit_safely` 返回、全部腿及资源清理结束后由 `artifact::capture_unit_screenshots` 执行，按腿的唯一端采集；`Row` 和 `DirectionSummary` 的 `screenshot_errors` 保留失败原因，不参与判定。
 - 每个单元开跑前的网卡重扫（`builder::refresh_unit_endpoints`）按接口名核对端点，但**跳过网关诊断合成的目的端点**（`Endpoint::is_gateway_stand_in`，角色 `diagnostics::GATEWAY_STAND_IN_ROLE`）：它代表「这块网卡的 IPv4 网关」，不是主机上的网卡，按名字找必然落空。以前两端都在线时网关诊断一律被判 NIC_DISAPPEARED「网关已消失」而跳过，只有重扫本身失败（辅测机已死）时才跑得到。守在 `gateway_diagnostics_survive_the_pre_unit_nic_refresh`。
 - IPv4 同 /24 门禁只限制跨机 iperf；ping 不受限。IPv6 优先双端 link-local，其次 global；`%zone` 按**执行命令的那一端**的平台决定（`Ctx::add_zone`：主控侧看本机，辅测侧看 `/health` 报的 `agent_os`）——Windows 不加，macOS / Linux 加。以前按主控编译平台一刀切，Windows 主控 + macOS 辅测时辅测端的 ping6 / iperf3 全部绑定失败，守在 `link_local_zones_follow_the_platform_that_runs_the_command_not_the_master`。
 - UDP 限流按每条腿的发送 NIC；WiFi/未知速率不裁剪；任一腿不能承载 profile 就跳过整个 Unit。

@@ -239,10 +239,47 @@ pub fn load_meta(dir: &Path) -> std::io::Result<RunMeta> {
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
+/// 重放修正历史分组计数时只更新这一字段，保留未知元信息和计划总数。
+pub fn refresh_verdict_totals(
+    dir: &Path,
+    totals: &crate::report::VerdictTotals,
+) -> std::io::Result<()> {
+    let path = meta_path(dir);
+    existing_regular_file(&path)?;
+    let mut meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)?)?;
+    let object = meta.as_object_mut().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "meta.json 不是对象")
+    })?;
+    object.insert("verdict_totals".into(), serde_json::to_value(totals)?);
+    std::fs::write(path, serde_json::to_string_pretty(&meta)?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::report::{RowBackend, RowDirection, RowProtocol, RowSide};
+
+    #[test]
+    fn refreshing_totals_preserves_unknown_meta_fields_and_plan_identity() {
+        let dir = temp_dir("refresh-totals");
+        std::fs::write(meta_path(&dir), r#"{"total_units":10,"plan_hash":"old","future":{"keep":true},"verdict_totals":{"total":1}}"#).unwrap();
+        refresh_verdict_totals(
+            &dir,
+            &crate::report::VerdictTotals {
+                total: 2,
+                pass: 2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let meta: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(meta_path(&dir)).unwrap()).unwrap();
+        assert_eq!(meta["future"]["keep"], true);
+        assert_eq!(meta["plan_hash"], "old");
+        assert_eq!(meta["total_units"], 10);
+        assert_eq!(meta["verdict_totals"]["total"], 2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
     use crate::verdict::{ExecutionStatus, Verdict};
 
     fn temp_dir(tag: &str) -> PathBuf {

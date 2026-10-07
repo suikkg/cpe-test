@@ -47,6 +47,7 @@ pub struct DirectionSummary {
     /// 该方向主行的截图路径；概览把接收速率和截图并排展示。
     pub screenshot_master: String,
     pub screenshot_agent: String,
+    pub screenshot_errors: Vec<String>,
     /// 该方向主行的接收端逐样本 CSV 路径。概览的缩略曲线从它读。
     ///
     /// 和截图同一个道理：概览要展示的东西，得先在这一层能拿到。
@@ -291,6 +292,8 @@ pub struct Row {
     pub screenshot_master: String,
     /// 辅测端截图路径
     pub screenshot_agent: String,
+    /// 按端保存截图失败原因；空列表兼容旧报告与未尝试截图的行。
+    pub screenshot_errors: Vec<String>,
     pub command: String,
     /// 独立落盘的 iperf client/server/事件原始记录。
     pub raw_log: String,
@@ -408,12 +411,26 @@ pub(super) fn row_unit_key(row: &Row) -> String {
 
 pub(super) fn group_rows(rows: &[Row]) -> Vec<UnitGroup<'_>> {
     let mut groups: Vec<UnitGroup<'_>> = Vec::new();
+    let mut sequences =
+        std::collections::BTreeMap::<String, std::collections::BTreeSet<usize>>::new();
+    for row in rows {
+        sequences
+            .entry(row_unit_key(row))
+            .or_default()
+            .insert(row.sort_key.0);
+    }
     // HTML、Excel、两轮对比都接受落盘顺序，统一按实际执行序还原。
     // 只排序引用，避免复制每行携带的原始输出。
     let mut ordered: Vec<_> = rows.iter().collect();
     ordered.sort_by_key(|row| row.sort_key);
     for row in ordered {
-        let key = row_unit_key(row);
+        let identity = row_unit_key(row);
+        // 保持普通历史报告的锚点；只有身份重复执行时才按运行序拆分。
+        let key = if sequences[&identity].len() > 1 {
+            format!("{identity}:seq={}", row.sort_key.0)
+        } else {
+            identity
+        };
         let index = groups
             .iter()
             .position(|group| group.key == key)
@@ -614,6 +631,7 @@ impl Row {
             ping_max: self.ping_max,
             screenshot_master: self.screenshot_master.clone(),
             screenshot_agent: self.screenshot_agent.clone(),
+            screenshot_errors: self.screenshot_errors.clone(),
             nic_samples_rx: self.nic_samples_rx.clone(),
         }
     }
@@ -720,6 +738,11 @@ pub(super) fn merge_missing_direction_fields(
             .screenshot_agent
             .clone_from(&fallback.screenshot_agent);
     }
+    if target.screenshot_errors.is_empty() {
+        target
+            .screenshot_errors
+            .clone_from(&fallback.screenshot_errors);
+    }
     // 逐样本 CSV 路径和截图路径同一个道理：升级前落盘的 `direction_summaries`
     // 里没有这个字段，读回来是空串。不从明细行回填的话，**重放旧 run 目录时
     // 概览的曲线列会整列消失**——而那些目录里 CSV 明明还在。
@@ -751,9 +774,15 @@ pub(super) fn group_direction_summaries(group: &UnitGroup<'_>) -> Vec<DirectionS
 
 /// 双向单元的两个接收方向 RX 平均合计。
 ///
-/// HTML 与 Excel 都展示这个诊断值，判定仍然逐方向进行；把合计放在模型层，
-/// 避免两个结果出口各自挑 AB/BA 或各自处理缺失值。
+/// 配了合计门限时只取执行器保存的共同窗口判定值，缺失时不得以腿平均之和替代。
+/// 未配合计门限时，两个方向各自窗口的平均之和只作诊断。
 pub(super) fn bidirectional_rx_average_sum(group: &UnitGroup<'_>) -> Option<f64> {
+    if let Some(summary) = group
+        .summary
+        .filter(|row| row.target_mbps.is_some() && group_is_bidirectional(group))
+    {
+        return summary.rx_avg.filter(|value| value.is_finite());
+    }
     let directions = group_direction_summaries(group);
     let ab = directions
         .iter()

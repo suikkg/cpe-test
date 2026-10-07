@@ -52,6 +52,9 @@ pub(super) fn diagnostic_item(h: &mut String, label: &str, value: &str) {
 
 pub(super) fn diagnostic_availability(row: &Row) -> String {
     let mut available: Vec<String> = Vec::new();
+    if !row.screenshot_errors.is_empty() {
+        available.push("截图失败".into());
+    }
     if !row.screenshot_master.is_empty() {
         available.push("主控截图".into());
     }

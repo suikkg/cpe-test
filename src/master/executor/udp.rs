@@ -683,11 +683,14 @@ impl Ctx {
             }
         }
         // 采集空闲基线，后续统计会从 RX/TX 样本中扣除中位背景流量。
-        let background_secs = self.cfg.iperf.rate_check.background_secs.min(30);
-        if !monitor_ids.is_empty() && background_secs > 0 {
-            logln(&format!("    网卡基线采样 {background_secs}s..."));
-            std::thread::sleep(Duration::from_secs(background_secs));
-        }
+        self.collect_background(
+            !monitor_ids.is_empty(),
+            LifecycleLease {
+                owner_id,
+                lease_secs,
+                baseline: None,
+            },
+        );
 
         let live: Arc<Mutex<HashMap<(usize, usize), LiveFlowState>>> =
             Arc::new(Mutex::new(HashMap::new()));
@@ -1206,14 +1209,6 @@ impl Ctx {
                 });
             }
 
-            let (screenshot_master, screenshot_agent) = if self.cfg.screenshot {
-                self.take_screenshots(
-                    &[first.dst.side, first.src.side],
-                    &format!("{}_{}", unit.title, plan.tag),
-                )
-            } else {
-                (String::new(), String::new())
-            };
             let idx = self.push_row(Row {
                 verdict,
                 execution_status: if success == 0 {
@@ -1257,8 +1252,6 @@ impl Ctx {
                     .get(&leg_pos)
                     .cloned()
                     .unwrap_or_default(),
-                screenshot_master,
-                screenshot_agent,
                 is_grouptotal: true,
                 nic_samples_rx: monitor_sample_files
                     .get(&first.dst.key())

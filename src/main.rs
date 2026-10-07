@@ -349,7 +349,11 @@ fn run_monitor_mode(
 }
 
 fn print_help() {
-    println!(
+    println!("{}", help_text());
+}
+
+fn help_text() -> String {
+    format!(
         r#"CPE 子网测试工具 v{}
 
 吞吐后端:
@@ -382,6 +386,7 @@ fn print_help() {
       --config FILE           指定配置文件 (默认找 ./config.json)
       --auto                  免交互：按配置文件 tests 全部执行
       --resume                24小时内已 PASS 的任务跳过
+      --screenshot            开启吞吐截图（默认开启；config 中可关闭）
       --no-open               结束后不自动打开报告
       --prefix A.,B.          临时指定 IPv4 前缀过滤
   cpe_test inner --config FILE  ADB 内环测速（PC 网卡 ↔ 板侧 LAN 地址）
@@ -423,7 +428,7 @@ fn print_help() {
   task_results.json           跨运行结果库（RESUME 用）
 "#,
         env!("CARGO_PKG_VERSION")
-    );
+    )
 }
 
 /// 取一个「必须带值」的参数。
@@ -506,5 +511,14 @@ fn setup_console() {
         let _ = SetConsoleOutputCP(65001);
         let _ = SetConsoleCP(65001);
         let _ = windows::Win32::UI::WindowsAndMessaging::SetProcessDPIAware();
+    }
+}
+
+#[cfg(test)]
+mod screenshot_help_tests {
+    #[test]
+    fn help_documents_the_supported_screenshot_flag() {
+        assert!(super::help_text().contains("--screenshot"));
+        assert!(super::parse_flags(&["--screenshot".into()]).contains_key("screenshot"));
     }
 }

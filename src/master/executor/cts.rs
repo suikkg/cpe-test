@@ -454,6 +454,7 @@ impl Ctx {
                         LifecycleLease {
                             owner_id,
                             lease_secs,
+                            baseline: None,
                         },
                         Instant::now(),
                     ));
@@ -1008,6 +1009,7 @@ impl Ctx {
             }
         };
 
+        self.collect_background(mon_id.is_some() || tx_mon_id.is_some(), lifecycle);
         let mut attempts = Vec::with_capacity(max_attempts);
         for attempt in 0..max_attempts {
             let run = self.run_ctstraffic_attempt(
@@ -1329,14 +1331,6 @@ impl Ctx {
             &attempts,
             &raw_error,
         );
-        let (screenshot_master, screenshot_agent) = if self.cfg.screenshot {
-            self.take_screenshots(
-                &[task.dst.side, task.src.side],
-                &format!("{}_{}", unit.title, tag),
-            )
-        } else {
-            (String::new(), String::new())
-        };
         logln(&format!(
             "    结果: {} CTS自报发送={} 接收={} 网卡实测={} 活跃流={}/{}",
             verdict.label(),
@@ -1417,8 +1411,6 @@ impl Ctx {
             window_end_ms: Some(selected.traffic_window.end_ms),
             baseline_mbps: Some(rx_stats.baseline_mbps),
             rolling_coverage: Some(rx_stats.rolling_coverage),
-            screenshot_master,
-            screenshot_agent,
             raws,
             ..base_row(RowIdentity {
                 unit_seq: useq,

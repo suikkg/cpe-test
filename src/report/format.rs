@@ -37,11 +37,16 @@ pub(super) fn overview_shot(path: &str, label: &str) -> String {
     )
 }
 
-pub(super) fn overview_shot_cell(master: &str, agent: &str) -> String {
-    let shots = [overview_shot(master, "主控"), overview_shot(agent, "辅测")]
+pub(super) fn overview_shot_cell(master: &str, agent: &str, errors: &[String]) -> String {
+    let mut shots = [overview_shot(master, "主控"), overview_shot(agent, "辅测")]
         .into_iter()
         .filter(|shot| !shot.is_empty())
         .collect::<Vec<_>>();
+    shots.extend(
+        errors
+            .iter()
+            .map(|error| format!("<span class=\"shot-error\">{}</span>", esc(error))),
+    );
     if shots.is_empty() {
         NOT_COLLECTED.to_string()
     } else {

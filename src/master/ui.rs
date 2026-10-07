@@ -102,17 +102,23 @@ pub fn replay_report_into(dir: &Path) -> Result<ReplayOutcome, String> {
 
     let mut warnings = Vec::new();
     // meta.json 缺失不算致命：行数据才是主体，抬头信息缺了报告照样能看。
-    let meta = match store::load_meta(dir) {
-        Ok(meta) => meta,
+    let (meta, meta_loaded) = match store::load_meta(dir) {
+        Ok(meta) => (meta, true),
         Err(error) => {
             warnings.push(format!("读不到 meta.json（{error}），报告抬头信息将为空"));
-            store::RunMeta::default()
+            (store::RunMeta::default(), false)
         }
     };
     let report_meta: crate::report::ReportMeta = meta.report.clone().into();
     let out = dir.join("report.html");
     write_report(&out, &mut rows, &report_meta)
         .map_err(|error| format!("报告写入失败: {error}"))?;
+    let totals = crate::report::verdict_totals(&rows);
+    if meta_loaded && meta.verdict_totals != totals {
+        if let Err(error) = store::refresh_verdict_totals(dir, &totals) {
+            warnings.push(format!("meta.json 判定计数更新失败: {error}"));
+        }
+    }
 
     // Excel 是第二个出口，生成失败一律降级为警告（与正常收尾同处理）。
     let xlsx_path = dir.join("summary.xlsx");
@@ -1964,6 +1970,10 @@ mod tests {
         assert!(html.contains("MASTER"), "meta.json 里的主控名要进报告");
         // Excel 也一并重放。
         assert!(dir.join("summary.xlsx").exists(), "重放要顺带出 Excel");
+        let refreshed = store::load_meta(&dir).unwrap();
+        assert_eq!(refreshed.total_units, 10, "计划总数不能被完成数覆盖");
+        assert_eq!(refreshed.verdict_totals.total, 2);
+        assert_eq!(refreshed.verdict_totals.pass, 2);
 
         // 没有 rows.jsonl 的目录要给出可操作的报错，而不是 panic。
         let empty = dir.join("empty");

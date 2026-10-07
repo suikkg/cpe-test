@@ -81,17 +81,25 @@ describe('旧草稿里的链路范围', () => {
 describe('buildRunRequest', () => {
   beforeEach(reset);
 
+  it('首次默认、恢复默认及导入项目都开启截图，显式关闭仍进入请求', () => {
+    expect(buildRunRequest().screenshot).toBe(true);
+    plan.screenshot = false;
+    expect(buildRunRequest().screenshot).toBe(false);
+    expect(importProject(serializeProject(ensureDefaults(emptyPlan())))).toBe(true);
+    expect(buildRunRequest().screenshot).toBe(true);
+  });
+
   it('reset 会清掉执行态，避免测试或重新开始时沿用上一轮开关', () => {
     plan.duration = 600;
     plan.resume = true;
-    plan.screenshot = true;
+    plan.screenshot = false;
     plan.limitUdpByLinkSpeed = true;
 
     reset();
 
     expect(plan.duration).toBe(180);
     expect(plan.resume).toBe(false);
-    expect(plan.screenshot).toBe(false);
+    expect(plan.screenshot).toBe(true);
     expect(plan.limitUdpByLinkSpeed).toBe(false);
   });
 

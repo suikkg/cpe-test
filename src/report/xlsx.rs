@@ -97,6 +97,22 @@ fn write_opt_number(
 
 /// 生成 `summary.xlsx`。四张表：概览 / 逐行明细 / 按链路分组 / 失败清单。
 pub fn write_xlsx(path: &Path, rows: &[Row], meta: &ReportMeta) -> Result<(), String> {
+    let result = write_xlsx_inner(path, rows, meta);
+    if let Err(error) = result {
+        // 新 HTML 已发布时，旧 Excel 不能继续伪装成本次生成的结果。
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(cleanup) if cleanup.kind() == std::io::ErrorKind::NotFound => {}
+            Err(cleanup) => {
+                return Err(format!("{error}；残留 Excel 清理失败: {cleanup}"));
+            }
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn write_xlsx_inner(path: &Path, rows: &[Row], meta: &ReportMeta) -> Result<(), String> {
     let mut workbook = Workbook::new();
     let groups = group_rows(rows);
 
@@ -143,6 +159,9 @@ fn write_overview_sheet(
             "Ping 丢包(%)",
             "原因明细",
             "诊断(不参与判定)",
+            "Ping RTT 最小(ms)",
+            "Ping RTT 平均(ms)",
+            "Ping RTT 最大(ms)",
         ],
     )?;
 
@@ -175,10 +194,13 @@ fn write_overview_sheet(
         write_opt_number(sheet, line, 19, row.ping_loss)?;
         sheet.write_string(line, 20, &row.reason_detail)?;
         sheet.write_string(line, 21, row.diagnostics.join("；"))?;
+        write_opt_number(sheet, line, 22, row.ping_min)?;
+        write_opt_number(sheet, line, 23, row.ping_avg)?;
+        write_opt_number(sheet, line, 24, row.ping_max)?;
         line += 1;
     }
     if line > 1 {
-        sheet.autofilter(0, 0, line - 1, 21)?;
+        sheet.autofilter(0, 0, line - 1, 24)?;
     }
 
     // 「运行健康」在 HTML 报告里是一条红色横幅，正常时**不出现**——横幅缺席
@@ -256,6 +278,9 @@ fn write_detail_sheet(
             "执行状态",
             "原因明细",
             "诊断(不参与判定)",
+            "Ping RTT 最小(ms)",
+            "Ping RTT 平均(ms)",
+            "Ping RTT 最大(ms)",
         ],
     )?;
 
@@ -298,10 +323,13 @@ fn write_detail_sheet(
         sheet.write_string(line, 28, row.execution_status.label())?;
         sheet.write_string(line, 29, &row.reason_detail)?;
         sheet.write_string(line, 30, row.diagnostics.join("；"))?;
+        write_opt_number(sheet, line, 31, row.ping_min)?;
+        write_opt_number(sheet, line, 32, row.ping_avg)?;
+        write_opt_number(sheet, line, 33, row.ping_max)?;
         line += 1;
     }
     if line > 1 {
-        sheet.autofilter(0, 0, line - 1, 30)?;
+        sheet.autofilter(0, 0, line - 1, 33)?;
     }
     Ok(())
 }
@@ -584,6 +612,45 @@ mod tests {
     use crate::reason::ReasonCode;
     use crate::verdict::ExecutionStatus;
 
+    #[test]
+    fn failed_regeneration_removes_the_old_workbook() {
+        let path = temp_path("stale");
+        let mut rows = vec![summary(0, Verdict::Pass, "A")];
+        write_xlsx(&path, &rows, &ReportMeta::default()).unwrap();
+        rows[0].reason_detail = "x".repeat(32_768);
+        assert!(write_xlsx(&path, &rows, &ReportMeta::default()).is_err());
+        assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn ping_rtt_is_numeric_in_both_overview_and_details() {
+        let path = temp_path("rtt");
+        let mut detail = detail(0, Verdict::RateFail, "A");
+        detail.protocol = RowProtocol::Icmp;
+        detail.backend = RowBackend::Ping;
+        detail.ping_min = Some(1.25);
+        detail.ping_avg = Some(2.5);
+        detail.ping_max = Some(12.0);
+        let overview = Row {
+            is_unit_summary: true,
+            ..detail.clone()
+        };
+        write_xlsx(&path, &[detail, overview], &ReportMeta::default()).unwrap();
+        for (sheet, columns) in [
+            ("sheet1", ["W2", "X2", "Y2"]),
+            ("sheet2", ["AF2", "AG2", "AH2"]),
+        ] {
+            let xml = part_xml(&path, &format!("xl/worksheets/{sheet}.xml"));
+            for (address, expected) in columns.into_iter().zip(["1.25", "2.5", "12"]) {
+                let value = cell(&xml, address).unwrap();
+                assert!(value.contains(&format!("<v>{expected}</v>")));
+                assert!(!value.contains("t=\"s\""));
+            }
+        }
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
     fn temp_path(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "cpe_xlsx_test_{}_{}_{tag}",
@@ -702,7 +769,7 @@ mod tests {
         for name in ["概览", "逐行明细", "按链路分组", "失败清单"] {
             assert!(workbook.contains(&format!("name=\"{name}\"")));
         }
-        for (index, end) in [(1, "V3"), (2, "AE3"), (3, "R2"), (4, "K2")] {
+        for (index, end) in [(1, "Y3"), (2, "AH3"), (3, "R2"), (4, "K2")] {
             let sheet = part_xml(&path, &format!("xl/worksheets/sheet{index}.xml"));
             assert!(sheet.contains(&format!("<autoFilter ref=\"A1:{end}\"")));
             assert!(sheet.contains("state=\"frozen\""));
@@ -807,8 +874,8 @@ mod tests {
         assert_eq!(seen[1], ("eth1", Some(1821.0), Verdict::Pass));
         assert_eq!(
             bidirectional_rx_average_sum(&groups[0]),
-            Some(1838.0),
-            "概览里的双向 RX 合计必须和两个方向摘要共用同一口径"
+            Some(930.5),
+            "配合计门限时概览必须使用汇总行保存的共同窗口 RX"
         );
     }
 

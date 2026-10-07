@@ -1089,6 +1089,7 @@ fn a_bidirectional_unit_with_a_total_target_says_it_is_judged_once() {
         let mut summary = unit_summary("unit-bidir-total", Verdict::RateFail);
         summary.task = "双向 TCP".into();
         summary.target_mbps = total;
+        summary.rx_avg = Some(1447.094);
         summary.direction_summaries = vec![
             DirectionSummary {
                 tag: "AB".into(),
@@ -1817,12 +1818,16 @@ fn the_pass_rate_denominator_counts_only_the_units_that_got_a_verdict() {
 /// 统计按**单元**聚合，且 SKIP 不进总数——和报告顶部那八个格子同源。
 #[test]
 fn verdict_totals_aggregate_by_unit_and_keep_skips_out_of_the_total() {
+    let mut second = unit_summary("u2", Verdict::RateFail);
+    second.sort_key.0 = 1;
+    let mut skipped = unit_summary("u3", Verdict::Skip);
+    skipped.sort_key.0 = 2;
     let rows = vec![
         traffic_detail("u1", (0, 0, 0, 0)),
         unit_summary("u1", Verdict::Pass),
         traffic_detail("u2", (1, 0, 0, 0)),
-        unit_summary("u2", Verdict::RateFail),
-        unit_summary("u3", Verdict::Skip),
+        second,
+        skipped,
     ];
     let totals = crate::report::verdict_totals(&rows);
     assert_eq!(totals.pass, 1);
@@ -1953,4 +1958,91 @@ fn a_replayed_summary_backfills_the_sample_path_from_its_detail_rows() {
         merged[0].nic_samples_rx, "raw/rx.csv",
         "逐样本路径要从明细行回填，否则旧目录重放不出概览曲线"
     );
+}
+
+#[test]
+fn total_target_display_uses_the_common_window_not_the_sum_of_leg_averages() {
+    let mut summary = unit_summary("common-window", Verdict::RateFail);
+    summary.task = "双向 TCP".into();
+    summary.rx_avg = Some(900.0);
+    summary.target_mbps = Some(1000.0);
+    summary.direction_summaries = ["AB", "BA"]
+        .into_iter()
+        .map(|tag| DirectionSummary {
+            tag: tag.into(),
+            rx_avg: Some(600.0),
+            ..Default::default()
+        })
+        .collect();
+    let rows = vec![summary.clone()];
+    assert_eq!(
+        bidirectional_rx_average_sum(&group_rows(&rows)[0]),
+        Some(900.0)
+    );
+    let html = render(rows);
+    assert!(html.contains("bidir-rx-sum\">900.000 Mbps</span> / 门限 1000.000 Mbps"));
+    assert!(!html.contains("1200.000 Mbps"));
+    summary.rx_avg = None;
+    assert_eq!(
+        bidirectional_rx_average_sum(&group_rows(&[summary])[0]),
+        None
+    );
+}
+
+#[test]
+fn repeated_stable_ids_keep_independent_execution_groups_and_totals() {
+    let mut first = unit_summary("same-id", Verdict::Pass);
+    first.sort_key.0 = 0;
+    first.task = "first".into();
+    let mut second = first.clone();
+    second.sort_key.0 = 1;
+    second.task = "second".into();
+    second.verdict = Verdict::RateFail;
+    let mut first_detail = traffic_detail("same-id", (0, 0, 0, 0));
+    first_detail.rx_avg = Some(900.0);
+    let mut second_detail = first_detail.clone();
+    second_detail.sort_key.0 = 1;
+    second_detail.rx_avg = Some(100.0);
+    let rows = vec![second, first_detail, first, second_detail];
+    let groups = group_rows(&rows);
+    assert_eq!(groups.len(), 2);
+    assert_eq!(groups[0].details[0].rx_avg, Some(900.0));
+    assert_eq!(groups[1].details[0].rx_avg, Some(100.0));
+    assert_ne!(groups[0].key, groups[1].key);
+    let totals = verdict_totals(&rows);
+    assert_eq!(totals.total, 2);
+    assert_eq!(totals.pass, 1);
+    assert_eq!(totals.rate_fail, 1);
+}
+
+#[test]
+fn failed_screenshots_remain_visible_and_errors_are_escaped() {
+    let mut detail = traffic_detail("shot-failed", (0, 0, 0, 0));
+    detail.screenshot_errors = vec!["主控端截图失败: <no desktop>".into()];
+    let html = render(vec![detail]);
+    assert!(html.contains("<th scope=\"col\">截图</th>"));
+    assert!(html.contains("主控端截图失败: &lt;no desktop&gt;"));
+    assert!(!html.contains("<no desktop>"));
+}
+
+#[test]
+fn operator_notes_saved_only_on_the_unit_summary_are_rendered() {
+    let detail = traffic_detail("stopped", (0, 0, 0, 0));
+    let mut summary = unit_summary("stopped", Verdict::SetupError);
+    summary.diagnostics = vec!["操作员停止了当前单元 <test>".into()];
+    let html = render(vec![detail, summary]);
+    assert!(html.contains("操作员停止了当前单元 &lt;test&gt;"));
+}
+
+#[test]
+fn archived_rate_numbers_round_trip_without_changing_float_bits() {
+    for value in [984.1197986161959, 978.4499344862741, 0.9994333333333333] {
+        let row = Row {
+            rx_avg: Some(value),
+            ..Default::default()
+        };
+        let saved = serde_json::to_string(&row).unwrap();
+        let restored: Row = serde_json::from_str(&saved).unwrap();
+        assert_eq!(restored.rx_avg.unwrap().to_bits(), value.to_bits());
+    }
 }

@@ -43,7 +43,7 @@ function changeRunOptions(): void {
 function expectDefaultRunOptions(): void {
   expect(buildRunRequest()).toMatchObject({
     resume: false,
-    screenshot: false,
+    screenshot: true,
     probe_during_traffic: false,
     probe_path_mtu: false,
     force_tcp_window: '',

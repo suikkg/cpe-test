@@ -1181,6 +1181,23 @@ fn load_from(p: &Path) -> Result<Config, String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn shipped_subnet_configs_share_the_enabled_screenshot_default() {
+        for text in [
+            include_str!("../config.example.json"),
+            include_str!("../config.minimal.json"),
+            include_str!("../dist/configs/config-sgmii.json"),
+            include_str!("../dist/configs/config-wifi5g.json"),
+            include_str!("../dist/configs/config-10gusb.json"),
+            include_str!("../dist/configs/config-all-common.json"),
+            include_str!("../dist/configs/config-full-tcp-udp-ping.json"),
+        ] {
+            let config: Config = serde_json::from_str(text).unwrap();
+            assert_eq!(config.screenshot, Config::default().screenshot);
+            assert!(config.screenshot);
+        }
+    }
+
     /// 发布包里的 `config.minimal.json` 必须真的能跑：只填三项、其余走默认，
     /// 且不能因为携带 `_说明` 之类的注释键而解析失败。
     #[test]

@@ -36,7 +36,7 @@ export const plan = reactive({
   draftAt: null as number | null,
   duration: 180,
   resume: false,
-  screenshot: false,
+  screenshot: true,
   /** 灌包期间并发探负载下时延。默认关：打开它就改变了测量条件。 */
   probeDuringTraffic: false,
   /** 每个 ping 单元额外探一次路径 MTU（带 DF 位二分）。只进诊断。 */
@@ -311,7 +311,7 @@ export function invalidatePreview(): void {
 /** 项目不保存的本轮选项不能跟着切换项目；历史重跑则从归档显式恢复。 */
 function resetRunOptions(): void {
   plan.resume = false;
-  plan.screenshot = false;
+  plan.screenshot = true;
   plan.probeDuringTraffic = false;
   plan.probePathMtu = false;
   plan.forceTcpWindow = '';

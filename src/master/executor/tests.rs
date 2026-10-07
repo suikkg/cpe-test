@@ -28,6 +28,58 @@ use crate::protocol::NicInfo;
 use std::sync::atomic::AtomicUsize;
 
 #[test]
+fn same_host_screenshots_request_each_side_once_and_keep_failures() {
+    crate::cancel::test_guard();
+    let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+    let port = server.server_addr().to_ip().unwrap().port();
+    let worker = std::thread::spawn(move || {
+        let request = server
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        assert_eq!(request.url(), "/screenshot");
+        request
+            .respond(tiny_http::Response::from_string(
+                r#"{"ok":false,"error":"no desktop"}"#,
+            ))
+            .unwrap();
+        assert!(server
+            .recv_timeout(Duration::from_millis(100))
+            .unwrap()
+            .is_none());
+    });
+    let (ctx, db_path) = isolated_ctx(port);
+    let captured = ctx.take_screenshots(&[Side::Agent, Side::Agent], "same-host");
+    assert_eq!(captured.errors.len(), 1);
+    assert!(captured.errors[0].contains("no desktop"));
+    assert!(captured.master.is_empty());
+    assert!(captured.agent.is_empty());
+    worker.join().unwrap();
+    let _ = std::fs::remove_file(db_path);
+    let _ = std::fs::remove_dir_all(&ctx.run_dir);
+}
+
+#[test]
+fn screenshot_calls_are_only_made_after_the_unit_has_finished_all_legs() {
+    let executor = include_str!("../executor.rs");
+    let dispatch = executor
+        .find("let mut outcomes = execute_unit_safely(")
+        .unwrap();
+    let cleanup = executor[dispatch..].find("drop(resource_guard);").unwrap() + dispatch;
+    let screenshots = executor
+        .find("self.capture_unit_screenshots(unit, &mut outcomes)")
+        .unwrap();
+    assert!(screenshots > cleanup);
+    for source in [
+        include_str!("iperf_leg.rs"),
+        include_str!("cts.rs"),
+        include_str!("udp.rs"),
+    ] {
+        assert!(!source.contains("take_screenshots("));
+    }
+}
+
+#[test]
 fn unit_panic_is_converted_cleanup_runs_and_next_unit_can_continue() {
     let cleaned = std::sync::atomic::AtomicBool::new(false);
     let panic_outcomes = execute_unit_safely(
@@ -2650,6 +2702,7 @@ fn ctstraffic_builder_setup_error_returns_before_agent_or_cts_start() {
         LifecycleLease {
             owner_id: "cts-builder-setup-owner",
             lease_secs: 1,
+            baseline: None,
         },
         Instant::now(),
     );

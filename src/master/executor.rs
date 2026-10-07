@@ -120,6 +120,7 @@ struct UnitResourceGuard<'a> {
 struct LifecycleLease<'a> {
     owner_id: &'a str,
     lease_secs: u64,
+    baseline: Option<&'a baseline::BaselineParticipant<'a>>,
 }
 
 impl<'a> UnitResourceGuard<'a> {
@@ -929,13 +930,14 @@ impl Ctx {
                         unit.legs
                             .iter()
                             .map(|leg| {
-                                self.run_leg(useq, unit, 0, leg, &owner_id, lease_secs, epoch)
+                                self.run_leg(useq, unit, 0, leg, &owner_id, lease_secs, epoch, None)
                             })
                             .collect()
                     } else {
                         // 两条腿共用一个时间零点：双向合计要在两条腿真实流量的
                         // 交集上重算，各用各的零点就没法求交集。
                         let epoch = Instant::now();
+                        let baseline = baseline::BaselineGate::new(unit.legs.len());
                         std::thread::scope(|s| {
                             let handles: Vec<_> = unit
                                 .legs
@@ -943,9 +945,18 @@ impl Ctx {
                                 .enumerate()
                                 .map(|(li, leg)| {
                                     let owner_id = owner_id.clone();
+                                    let baseline = &baseline;
                                     s.spawn(move || {
+                                        let participant = baseline.participant();
                                         self.run_leg(
-                                            useq, unit, li, leg, &owner_id, lease_secs, epoch,
+                                            useq,
+                                            unit,
+                                            li,
+                                            leg,
+                                            &owner_id,
+                                            lease_secs,
+                                            epoch,
+                                            Some(&participant),
                                         )
                                     })
                                 })
@@ -994,6 +1005,10 @@ impl Ctx {
             // 否则双向测试会出现只有 BA 而 AB 整行消失的误导性结果。
             if is_traffic_unit {
                 self.ensure_traffic_outcome_rows(useq, unit, &mut outcomes);
+            }
+            // 所有腿及资源清理都已结束，截图及其网络响应不再进入对向测量窗口。
+            if is_traffic_unit && blocked.is_none() && self.cfg.screenshot {
+                self.capture_unit_screenshots(unit, &mut outcomes);
             }
 
             // 双向：互填「对向接收 Mbps」
@@ -1555,6 +1570,7 @@ impl Ctx {
         owner_id: &str,
         lease_secs: u64,
         epoch: Instant,
+        baseline: Option<&baseline::BaselineParticipant<'_>>,
     ) -> LegOutcome {
         match &leg.kind {
             LegKind::Ping(t) => self.run_ping_leg(useq, unit, lidx, &leg.tag, t),
@@ -1567,6 +1583,7 @@ impl Ctx {
                 LifecycleLease {
                     owner_id,
                     lease_secs,
+                    baseline,
                 },
                 epoch,
             ),
@@ -1579,6 +1596,7 @@ impl Ctx {
                 LifecycleLease {
                     owner_id,
                     lease_secs,
+                    baseline,
                 },
                 epoch,
             ),
@@ -1605,6 +1623,7 @@ impl Ctx {
 
 mod agent;
 mod artifact;
+mod baseline;
 mod cts;
 mod db;
 mod format;

@@ -871,7 +871,7 @@ cpe_test master             主控发起测试
     --auto                  免交互：按配置文件 tests 全部执行
     --resume                24 小时内已 PASS 的任务跳过
     --no-open               结束后不自动打开报告
-    --screenshot            每个吞吐任务后截图
+    --screenshot            开启吞吐截图（默认开启；config 中可关闭）
     --prefix A.,B.          临时指定 IPv4 前缀过滤
 
 cpe_test report <run目录>    从已有运行目录重放报告
@@ -1010,7 +1010,7 @@ JSON 标准没有注释，不能可靠地在同一个配置内用 `//`、`#` 或
   "ipv4_prefixes": ["192.168."],
   "require_same_subnet_for_iperf": true,
   "limit_udp_by_link_speed": true,
-  "screenshot": false,
+  "screenshot": true,
   "resume": false,
   "open_report": true,
   "keep_runs": 0,
@@ -1320,7 +1320,7 @@ EVB 自动目标可以在全局配置中调整：
 | 字段 | 默认 | 含义 |
 |------|------|------|
 | `sample_interval_ms` | 1000 | RX/TX 连续采样周期，限制为 200～5000ms |
-| `background_secs` | 3 | 起流前背景基线采样；统计会扣除中位背景流量 |
+| `background_secs` | 3 | 所有吞吐后端起流前采集背景基线；非零时至少等待一个采样周期，双向两腿都完成后才起流；统计扣除中位背景流量，0 禁用等待 |
 | `startup_timeout_secs` | 15 | 允许失败流快速重试及建立共同窗口的启动阶段 |
 | `settle_secs` | 5 | 起流头这几秒不计入平均（TCP 慢启动与窗口爬升、Wi-Fi 速率自适应收敛）。所有后端、所有协议同一规则：iperf3 UDP 组从有流在跑算起，iperf3 TCP 与 CTS 从流量起点算起；单进程灌包相应多跑这么久（`-t` / `TimeLimit` / `StreamLength` = 时长 + settle） |
 | `launch_interval_ms` | 50 | 流之间错峰启动间隔；双向按流序号交错 |

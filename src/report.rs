@@ -151,11 +151,12 @@ fn push_overview_table(h: &mut String, groups: &[&UnitGroup<'_>], charts: &Chart
             (group, unit_verdict, directions)
         })
         .collect();
-    // 截图默认开启，但关掉截图或纯 Ping 报告里整列都是「未采集」；那种情况下
-    // 这一列只会白占约 190px，直接不渲染。
+    // 未尝试截图时省略整列；尝试失败必须保留原因，不能伪装成没开截图。
     let has_shots = rendered.iter().any(|(_, _, directions)| {
         directions.iter().any(|direction| {
-            !direction.screenshot_master.is_empty() || !direction.screenshot_agent.is_empty()
+            !direction.screenshot_master.is_empty()
+                || !direction.screenshot_agent.is_empty()
+                || !direction.screenshot_errors.is_empty()
         })
     });
     // 曲线列与截图列同一个做法：整列都画不出来时（纯 Ping 报告、重放旧目录、
@@ -235,7 +236,11 @@ fn push_overview_table(h: &mut String, groups: &[&UnitGroup<'_>], charts: &Chart
             let shot_cell = if has_shots {
                 format!(
                     "<td class=\"shot-col\">{}</td>",
-                    overview_shot_cell(&direction.screenshot_master, &direction.screenshot_agent)
+                    overview_shot_cell(
+                        &direction.screenshot_master,
+                        &direction.screenshot_agent,
+                        &direction.screenshot_errors
+                    )
                 )
             } else {
                 String::new()
@@ -483,12 +488,19 @@ fn push_bidirectional_direction(
 ) {
     let tag = normalized_direction_tag(&direction.tag);
     let reason = direction_reason_text(direction, fallback_reason);
-    let shots = if direction.screenshot_master.is_empty() && direction.screenshot_agent.is_empty() {
+    let shots = if direction.screenshot_master.is_empty()
+        && direction.screenshot_agent.is_empty()
+        && direction.screenshot_errors.is_empty()
+    {
         String::new()
     } else {
         format!(
             "<span class=\"direction-summary-shots\">{}</span>",
-            overview_shot_cell(&direction.screenshot_master, &direction.screenshot_agent)
+            overview_shot_cell(
+                &direction.screenshot_master,
+                &direction.screenshot_agent,
+                &direction.screenshot_errors
+            )
         )
     };
     h.push_str(&format!(
@@ -533,7 +545,7 @@ fn push_bidirectional_summary(h: &mut String, group: &UnitGroup<'_>) {
             target
         ),
         None => format!(
-            "双向方向汇总（未设置合计门限，每个方向各自按接收端 RX 判定） · 双向 RX 平均合计 <span class=\"bidir-rx-sum\">{}</span>",
+            "双向方向汇总（未设置合计门限，每个方向各自按接收端 RX 判定） · 双向 RX 平均合计（各方向窗口，仅作诊断） <span class=\"bidir-rx-sum\">{}</span>",
             esc(&rx_sum)
         ),
     };
@@ -592,6 +604,9 @@ fn push_unit_list(h: &mut String, groups: &[&UnitGroup<'_>], charts: &Charts) {
             esc(&execution_meta),
         ));
         push_bidirectional_summary(h, group);
+        if let Some(summary) = group.summary {
+            push_non_verdict_diagnostics(h, summary);
+        }
         if group.details.is_empty() {
             h.push_str("<p class=\"summary-note\">本次没有执行行；请结合单元状态和原因查看。</p>");
         } else {
@@ -847,6 +862,7 @@ details.proto-section > summary.proto-toggle::marker { color: #1769aa; }
 .non-verdict-diagnostics b { display: block; margin-bottom: 3px; color: var(--muted); font-size: 12px; }
 .non-verdict-diagnostics ul { margin: 0; padding-left: 18px; }
 .non-verdict-diagnostics li { overflow-wrap: anywhere; }
+.shot-error { display: block; color: #b42318; overflow-wrap: anywhere; }
 .artifact-list { display: flex; flex-wrap: wrap; gap: 8px 12px; margin-top: 8px; }
 .command-block { margin-top: 8px; }
 .command { display: block; max-width: 100%; margin-top: 4px; padding: 7px; overflow-wrap: anywhere; border: 1px solid var(--line); background: #f7f9fb; white-space: pre-wrap; }

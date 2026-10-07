@@ -9,6 +9,21 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub(super) static SCREENSHOT_SEQ: AtomicUsize = AtomicUsize::new(0);
 
+#[derive(Default)]
+pub(super) struct ScreenshotCapture {
+    pub(super) master: String,
+    pub(super) agent: String,
+    pub(super) errors: Vec<String>,
+}
+
+impl ScreenshotCapture {
+    fn fail(&mut self, side: Side, detail: impl std::fmt::Display) {
+        let error = format!("{}端截图失败: {detail}", side.cn());
+        logln(&format!("    [截图] {error}"));
+        self.errors.push(error);
+    }
+}
+
 /// 标签部分的上限。
 ///
 /// 主战场是 Windows，那里没开长路径支持时 `CreateFileW` 卡在整条路径 260 个字符。
@@ -265,16 +280,55 @@ impl Ctx {
         self.write_output_artifact(&filename, &contents, "网卡原始样本")
     }
 
-    /// 两端都尝试截图，任一成功就保存。返回报告用相对路径（多个用分号隔开）
-    pub(super) fn take_screenshots(&self, sides: &[Side], label: &str) -> (String, String) {
-        let mut master = String::new();
-        let mut agent = String::new();
-        for side in sides.iter() {
+    /// 按已执行的方向补截图；不为前置拦截和合成的未执行行制造附件。
+    pub(super) fn capture_unit_screenshots(&self, unit: &Unit, outcomes: &mut [LegOutcome]) {
+        for outcome in outcomes {
+            let sides = {
+                let rows = lock_recover(&self.rows);
+                outcome
+                    .main_rows
+                    .iter()
+                    .filter_map(|index| rows.get(*index))
+                    .find(|row| row.required_seconds.is_some())
+                    .map(|row| [row.dst_side, row.src_side])
+            };
+            let Some(sides) = sides else { continue };
+            let sides: Vec<_> = sides
+                .into_iter()
+                .filter_map(|side| match side {
+                    crate::report::RowSide::Master => Some(Side::Master),
+                    crate::report::RowSide::Agent => Some(Side::Agent),
+                    crate::report::RowSide::Unknown => None,
+                })
+                .collect();
+            let capture = self.take_screenshots(&sides, &format!("{}_{}", unit.title, outcome.tag));
+            outcome.judgement.diagnostics.extend(capture.errors.clone());
+            let mut rows = lock_recover(&self.rows);
+            for index in &outcome.main_rows {
+                if let Some(row) = rows.get_mut(*index) {
+                    row.screenshot_master.clone_from(&capture.master);
+                    row.screenshot_agent.clone_from(&capture.agent);
+                    row.screenshot_errors.clone_from(&capture.errors);
+                    row.diagnostics.extend(capture.errors.clone());
+                }
+            }
+        }
+    }
+
+    /// 每个端只尝试一次，分别返回成功路径和可持久化的失败原因。
+    pub(super) fn take_screenshots(&self, sides: &[Side], label: &str) -> ScreenshotCapture {
+        let mut capture = ScreenshotCapture::default();
+        let mut seen = Vec::new();
+        for side in sides {
+            if seen.contains(side) {
+                continue;
+            }
+            seen.push(*side);
             let png: Vec<u8> = match side {
                 Side::Master => match crate::screenshot::capture_png() {
                     Ok(p) => p,
                     Err(e) => {
-                        logln(&format!("    [截图] 主控端截图失败，任务 [{}]: {e}", label));
+                        capture.fail(*side, e);
                         continue;
                     }
                 },
@@ -284,7 +338,7 @@ impl Ctx {
                     }) {
                         Ok(body) => body,
                         Err(e) => {
-                            logln(&format!("    [截图] 辅测请求序列化失败: {e}"));
+                            capture.fail(*side, format!("请求序列化失败: {e}"));
                             continue;
                         }
                     };
@@ -302,53 +356,45 @@ impl Ctx {
                             (s, t)
                         }
                         Err(e) => {
-                            logln(&format!("    [截图] 辅测请求失败: {e}"));
+                            capture.fail(*side, format!("请求失败: {e}"));
                             continue;
                         }
                     };
                     if status != 200 {
-                        logln(&format!(
-                            "    [截图] 辅测 HTTP {status}: {}",
-                            text_preview(&text, 200)
-                        ));
+                        capture.fail(
+                            *side,
+                            format!("HTTP {status}: {}", text_preview(&text, 200)),
+                        );
                         continue;
                     }
                     let resp: Resp<ScreenshotOut> = match serde_json::from_str(&text) {
                         Ok(r) => r,
                         Err(e) => {
-                            logln(&format!(
-                                "    [截图] JSON解析失败: {e}, raw前100字符: {}",
-                                text_preview(&text, 100)
-                            ));
+                            capture.fail(*side, format!("JSON解析失败: {e}"));
                             continue;
                         }
                     };
                     if !resp.ok {
-                        logln(&format!(
-                            "    [截图] 辅测截图错误: {}",
-                            resp.error.unwrap_or_default()
-                        ));
+                        capture.fail(*side, resp.error.unwrap_or_default());
                         continue;
                     }
                     let Some(data) = resp.data else {
-                        logln("    [截图] 辅测响应缺data");
+                        capture.fail(*side, "响应缺data");
                         continue;
                     };
                     let b64_len = data.image_b64.len();
                     match base64::engine::general_purpose::STANDARD.decode(data.image_b64) {
                         Ok(p) => p,
                         Err(e) => {
-                            logln(&format!(
-                                "    [截图] 辅测 base64 解码失败: {e}, len={b64_len}"
-                            ));
+                            capture.fail(*side, format!("base64 解码失败: {e}, len={b64_len}"));
                             continue;
                         }
                     }
                 }
             };
             let out_path = match side {
-                Side::Master => &mut master,
-                Side::Agent => &mut agent,
+                Side::Master => &mut capture.master,
+                Side::Agent => &mut capture.agent,
             };
             let fname =
                 screenshot_filename(label, *side, SCREENSHOT_SEQ.fetch_add(1, Ordering::Relaxed));
@@ -361,11 +407,7 @@ impl Ctx {
                 .open(&full)
                 .and_then(|mut file| file.write_all(&png));
             if let Err(e) = write_result {
-                logln(&format!(
-                    "    [截图] {}端截图写入失败 {}: {e}",
-                    side.cn(),
-                    full.display()
-                ));
+                capture.fail(*side, format!("写入失败 {}: {e}", full.display()));
                 continue;
             }
             if let Some(dir_name) = self.outdir.file_name() {
@@ -377,13 +419,9 @@ impl Ctx {
                     full.display()
                 ));
             } else {
-                logln(&format!(
-                    "    [截图] {}端截图文件已写入，但输出目录缺少可用目录名: {}",
-                    side.cn(),
-                    full.display()
-                ));
+                capture.fail(*side, "输出目录缺少可用目录名");
             }
         }
-        (master, agent)
+        capture
     }
 }

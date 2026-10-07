@@ -199,6 +199,7 @@ impl Ctx {
                 }
             }
         };
+        self.collect_background(mon_id.is_some() || tx_mon_id.is_some(), lifecycle);
         let live = Arc::new(Mutex::new(LiveFlowState::default()));
         let mut events = Vec::new();
         let parallel_streams = if t.udp {
@@ -456,15 +457,6 @@ impl Ctx {
             fmt_opt(rx_avg)
         ));
 
-        let (screenshot_master, screenshot_agent) = if self.cfg.screenshot {
-            self.take_screenshots(
-                &[t.dst.side, t.src.side],
-                &format!("{}_{}", unit.title, tag),
-            )
-        } else {
-            (String::new(), String::new())
-        };
-
         let kind_label = if unit.bidir {
             format!("★★双向灌包-{tag}")
         } else {
@@ -499,8 +491,6 @@ impl Ctx {
                 .as_ref()
                 .map(LoadLatency::describe)
                 .unwrap_or_default(),
-            screenshot_master,
-            screenshot_agent,
             command: client.cmd.clone(),
             raw_log,
             nic_samples_rx,
