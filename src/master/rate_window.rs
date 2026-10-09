@@ -592,7 +592,7 @@ pub(crate) fn evaluate_rx_acceptance(
 pub(crate) fn rx_acceptance_diagnostics(
     stats: &RateStats,
     tx_stats: &RateStats,
-    // **已经过 `effective_rate_target` 折算**的判定目标；`None` = 这一腿没有门限。
+    // **已经过 `effective_rate_target` 折算**的判定目标；`None` = 这一个方向没有门限。
     // 收目标本身而不是 `bool`：中途掉坑/断流的判据要拿它当参照。
     target: Option<f64>,
     // 验证目标所需的最低发送负载（目标 + 余量）；`None` = 没有 offered 参照。
@@ -1214,11 +1214,11 @@ mod tests {
         );
     }
 
-    /// **RX 已经达标的腿，永远不许被 offered 闸降级。**
+    /// **RX 已经达标的方向，永远不许被 offered 闸降级。**
     ///
     /// offered 闸的全部理由是「解释缺口」。R6 最初把它架在 `rx_avg < target`
     /// **外面**，于是它在没有缺口时也开火：TCP 不限速，链路上限贴着目标时
-    /// TX-P10 落在「目标 ~ 目标+余量」之间是常态，一条 RX 达标的腿就被判成
+    /// TX-P10 落在「目标 ~ 目标+余量」之间是常态，一条 RX 达标的方向就被判成
     /// NOT_EVALUATED / OFFERED_LOAD_LOW。
     ///
     /// 下面这组数就是 `evaluate_nic_rx` 自己注释里引用的那次 run：主控 WLAN
@@ -1252,8 +1252,8 @@ mod tests {
     /// 结构断言：装配层的三条契约各只能有一处定义（ADR-12）。
     ///
     /// 铁律 2 说「速率判定口径只有一份实现 = `master::rate_window`」，字面上一直
-    /// 成立——但 `rate_window` **之上**还有一层「腿级装配」：把窗口、覆盖率、
-    /// 目标、offered 负载、丢包组合成一条腿的结论。那一层曾经有三份实现
+    /// 成立——但 `rate_window` **之上**还有一层「方向级装配」：把窗口、覆盖率、
+    /// 目标、offered 负载、丢包组合成一个方向的结论。那一层曾经有三份实现
     /// （`udp_leg_verdict` / `iperf_flow_verdict` / CTS 的内联 if-else），
     /// 并且已经对同一事实给出过不同结论：
     ///
@@ -1322,7 +1322,7 @@ mod tests {
         }
         assert!(
             offenders.is_empty(),
-            "腿级判定装配层出现了第二份实现，这正是历史上两次静默错判的形状：{offenders:#?}"
+            "方向级判定装配层出现了第二份实现，这正是历史上两次静默错判的形状：{offenders:#?}"
         );
     }
 

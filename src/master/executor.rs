@@ -346,7 +346,7 @@ pub struct IperfPreflightBlock {
 }
 
 #[derive(Debug)]
-/// 一条腿跑完之后留下的东西：**判定结论 + 测到的量 + 落到报表哪几行**。
+/// 一个方向跑完之后留下的东西：**判定结论 + 测到的量 + 落到报表哪几行**。
 ///
 /// 三者分开摆是有意的。判定结论（`judgement`）由纯函数从「已确定的事实」
 /// 算出，不含执行状态；测量值（`rx_avg`）是执行留下的事实本身；`main_rows`
@@ -357,19 +357,19 @@ struct LegOutcome {
     rx_avg: Option<f64>,
     main_rows: Vec<usize>,
     tag: String,
-    /// 双向合计要在两条腿的**共同**时间段上重算 RX；灌包腿把重算所需的事实留在
-    /// 这里。`None` = 这条腿没有可用的接收端采样（或不是灌包腿）。
+    /// 双向合计要在两个方向的**共同**时间段上重算 RX；灌包方向把重算所需的事实留在
+    /// 这里。`None` = 这个方向没有可用的接收端采样（或不是灌包方向）。
     traffic: Option<LegTraffic>,
 }
 
-/// 一条灌包腿在单元时间轴上的原始事实，供双向合计重算。
+/// 一条灌包方向在单元时间轴上的原始事实，供双向合计重算。
 ///
-/// 腿级判定各用各的窗口（一条腿失败不能抹掉另一条腿的数据，见 D1）；而合计
-/// 只有在两条腿**同时**在跑的那一段上才有意义——Wi-Fi 上两个方向抢同一块空口，
-/// 各自窗口里单独跑的那几秒会把合计抬高。所以合计不复用腿级的 `rx_avg`。
+/// 方向级判定各用各的窗口（一个方向失败不能抹掉另一个方向的数据，见 D1）；而合计
+/// 只有在两个方向**同时**在跑的那一段上才有意义——Wi-Fi 上两个方向抢同一块空口，
+/// 各自窗口里单独跑的那几秒会把合计抬高。所以合计不复用方向级的 `rx_avg`。
 #[derive(Debug, Clone)]
 struct LegTraffic {
-    /// 本腿截断前的真实流量区间（单元时间轴）。
+    /// 本方向截断前的真实流量区间（单元时间轴）。
     span: Option<(u64, u64)>,
     required_secs: u64,
     rx_monitor: MonitorStopOut,
@@ -394,7 +394,7 @@ impl LegOutcome {
 /// 人主动掐断的单元在报告上要说清楚是人掐的（只进诊断，不改判定）。
 ///
 /// - 跳过：一律说明——跳过本来就意味着这一条没跑完；
-/// - 停止（控制台「停止」或 Ctrl+C）：只在确有腿被掐断时说明。停止落在一个
+/// - 停止（控制台「停止」或 Ctrl+C）：只在确有方向被掐断时说明。停止落在一个
 ///   已经跑完的单元之后，那个单元的结论照常成立，不该被这句话抹黑。
 fn operator_interruption_note(
     skipped: bool,
@@ -934,7 +934,7 @@ impl Ctx {
                             })
                             .collect()
                     } else {
-                        // 两条腿共用一个时间零点：双向合计要在两条腿真实流量的
+                        // 两个方向共用一个时间零点：双向合计要在两个方向真实流量的
                         // 交集上重算，各用各的零点就没法求交集。
                         let epoch = Instant::now();
                         let baseline = baseline::BaselineGate::new(unit.legs.len());
@@ -1006,7 +1006,7 @@ impl Ctx {
             if is_traffic_unit {
                 self.ensure_traffic_outcome_rows(useq, unit, &mut outcomes);
             }
-            // 所有腿及资源清理都已结束，截图及其网络响应不再进入对向测量窗口。
+            // 所有方向及资源清理都已结束，截图及其网络响应不再进入对向测量窗口。
             if is_traffic_unit && blocked.is_none() && self.cfg.screenshot {
                 self.capture_unit_screenshots(unit, &mut outcomes);
             }
@@ -1018,21 +1018,21 @@ impl Ctx {
             }
 
             // 双向合计门限存在时，**判定在单元级只做一次**：AB 接收端 RX +
-            // BA 接收端 RX 与门限比一次。两条腿此时本来就没有各自的门限
-            // （builder 的 `leg_rate_plan` 已经把它们落到 Observe），所以按腿
+            // BA 接收端 RX 与门限比一次。两个方向此时本来就没有各自的门限
+            // （builder 的 `leg_rate_plan` 已经把它们落到 Observe），所以按方向
             // 聚合出来的只会是 MEASURED——真正的结论必须在这里给。
             //
-            // 合计形不成时（有一条腿是 SETUP_ERROR / 采样不可信）退回按腿聚合：
-            // 那条链能说出到底是哪条腿、什么原因，比一句「合计缺数据」有用。
-            // 腿级聚合永远算一遍：合计判定要不要让位给它，取决于它是不是更具体。
+            // 合计形不成时（有一个方向是 SETUP_ERROR / 采样不可信）退回按方向聚合：
+            // 那条链能说出到底是哪个方向、什么原因，比一句「合计缺数据」有用。
+            // 方向级聚合永远算一遍：合计判定要不要让位给它，取决于它是不是更具体。
             let aggregated = aggregate_unit_verdict(&outcomes);
             let bidir = unit
                 .bidir_total_target_mbps
                 .map(|target| bidir_total(&outcomes, target))
-                // 腿级的 SETUP_ERROR / NOT_EVALUATED 说得出「哪条腿、什么原因」，
+                // 方向级的 SETUP_ERROR / NOT_EVALUATED 说得出「哪个方向、什么原因」，
                 // 比一句「合计缺数据」有用，所以让它说话。除此之外一律由合计拍板
                 // ——包括合计自己判 NOT_EVALUATED（缺一个方向就是形不成合计，
-                // 这时**不许**退回两条腿各自的 MEASURED 假装一切正常）。
+                // 这时**不许**退回两个方向各自的 MEASURED 假装一切正常）。
                 .filter(|_| !matches!(aggregated, Verdict::SetupError | Verdict::NotEvaluated));
             let bidir_total = bidir.as_ref().map(|total| &total.judgement);
             let unit_verdict = bidir_total
@@ -1094,7 +1094,7 @@ impl Ctx {
                     )
                 })
                 .collect();
-            // 诊断按腿汇总到单元行：判定只有一份，排障线索要能在概览上一次看全。
+            // 诊断按方向汇总到单元行：判定只有一份，排障线索要能在概览上一次看全。
             let mut unit_diagnostics: Vec<String> = outcomes
                 .iter()
                 .flat_map(|outcome| {
@@ -1120,7 +1120,7 @@ impl Ctx {
             //
             // 「停止」（控制台按钮或 Ctrl+C）同理：被掐断的那个单元以前只剩一句
             // IPERF_EXEC_FAILED 加 iperf 输出的最后一行，读起来像环境故障。
-            // 只在确有腿被掐断时才说——停止恰好落在一个已经跑完的单元之后，
+            // 只在确有方向被掐断时才说——停止恰好落在一个已经跑完的单元之后，
             // 那个单元的结论照常成立。
             let skipped = crate::cancel::take_skip_unit() && crate::cancel::resume_after_skip();
             let legs_cut_short = self.outcomes_were_cut_short(&outcomes);
@@ -1137,9 +1137,9 @@ impl Ctx {
             // 单元级「结论的理由」只算一次，报告行和进度页共用。
             //
             // 这两处以前各算各的：报告行走合计判定，进度页走 `unit_reason` /
-            // `reasons.first()` 的腿级理由。真机联调当场撞上——双向 UDP 单元
+            // `reasons.first()` 的方向级理由。真机联调当场撞上——双向 UDP 单元
             // 判定是 PASS，进度页却写着「ab:TARGET_UNKNOWN …因此不标记 PASS」。
-            // 腿本来就不该有目标（合计门限存在时 `leg_rate_plan` 把两条腿都落到
+            // 方向本来就不该有目标（合计门限存在时 `leg_rate_plan` 把两个方向都落到
             // Observe），那句话在单元这一层是自相矛盾的。
             let unit_reason_code = bidir_total
                 .as_ref()
@@ -1196,7 +1196,7 @@ impl Ctx {
                 // RX 平均 空」这种自相矛盾的一行。
                 rx_avg: unit_rx_avg,
                 rx_p10: single_direction.and_then(|direction| direction.rx_p10),
-                // 双向合计单元的「目标」就是那个合计门限——两条腿各自没有目标，
+                // 双向合计单元的「目标」就是那个合计门限——两个方向各自没有目标，
                 // 报告上必须能看到判定用的是哪个数。
                 target_mbps: unit_target_mbps,
                 sample_coverage: single_direction.and_then(|direction| direction.sample_coverage),
@@ -1238,7 +1238,7 @@ impl Ctx {
                         title: unit.title.clone(),
                         verdict: unit_verdict.label().to_string(),
                         reason_code: unit_reason_code.as_str().to_string(),
-                        // 失败清单一行一条，多腿的原因用 " | " 连起来的整串
+                        // 失败清单一行一条，多方向的原因用 " | " 连起来的整串
                         // 太长；这里只留第一段，完整的在报告里。合计拍板时那句
                         // 话本身就是完整的一条，不再截取。
                         reason_detail: bidir_reason_detail
@@ -1260,7 +1260,7 @@ impl Ctx {
         sum
     }
 
-    /// 本单元有没有腿是被取消掐断的（行的执行状态为 `Cancelled`）。
+    /// 本单元有没有方向是被取消掐断的（行的执行状态为 `Cancelled`）。
     fn outcomes_were_cut_short(&self, outcomes: &[LegOutcome]) -> bool {
         let rows = lock_recover(&self.rows);
         outcomes.iter().any(|outcome| {
@@ -1298,7 +1298,7 @@ impl Ctx {
                             + u8::from(row.sample_coverage.is_some())
                     })?;
                 // 指标部分只有一份实现：`Row::direction_summary()`。这里只覆盖
-                // 那四项执行侧更权威的字段——腿的判定结果比从行里反推准确
+                // 那四项执行侧更权威的字段——方向的判定结果比从行里反推准确
                 // （行可能是组合计，也可能因为重试有多条）。
                 let mut summary = row.direction_summary();
                 summary.tag = if outcome.tag.is_empty() {
@@ -1447,7 +1447,7 @@ impl Ctx {
     ) -> Option<usize> {
         // 端点不再从这里手抄成 6 个字符串：`base_row` 从 `Endpoint` 一次填齐，
         // 顺带把类型化的 `src_side`/`dst_side`/`link_group` 也带上。
-        // 唯一取不到端点的情况是空的 UDP 组（理论上不该有），那时回落到单元的腿。
+        // 唯一取不到端点的情况是空的 UDP 组（理论上不该有），那时回落到单元的方向。
         let (backend, backend_kind, ip, transport, protocol, param, requested_streams) =
             match &leg.kind {
                 LegKind::IperfSingle(task) => (

@@ -13,6 +13,7 @@ pub(crate) mod plan;
 mod receiver_server;
 mod remote;
 mod report;
+mod screenshot;
 pub(crate) mod webui;
 
 use crate::clock::SystemClock;
@@ -190,11 +191,14 @@ struct UnitRow {
     protocol: Protocol,
     direction: Direction,
     streams: u32,
+    parameters: config::Parameters,
+    bidir_targets: Option<plan::BidirTargets>,
     repeat: u32,
     measurement: Measurement,
     verdict: String,
     #[serde(default)]
     resumed: bool,
+    screenshot: Option<screenshot::Capture>,
     reason: String,
     detail: String,
     diagnostics: Vec<String>,
@@ -717,10 +721,11 @@ fn execute(
         }
         let preflight = &preflight[&(unit.link, unit.ip_version)];
         println!("{} · 第 {} 轮", unit.title(), unit.repeat);
-        let row = run_unit(
+        let effective_cfg = unit.parameters.apply(&report.config, unit.protocol);
+        let mut row = run_unit(
             &UnitContext {
                 adb: &adb,
-                cfg: &report.config,
+                cfg: &effective_cfg,
                 link,
                 preflight,
                 bin: &bin,
@@ -735,6 +740,9 @@ fn execute(
             },
             unit,
         )?;
+        if report.config.screenshot && !cancel.load(Ordering::SeqCst) {
+            row.screenshot = Some(screenshot::capture(&report.config, &row, dir));
+        }
         for leg in &row.legs {
             println!(
                 "  {} {}  来源={} 速率={}  网卡={} 工具={}  门限={:?}",
@@ -781,10 +789,13 @@ fn resumed_row(unit: &Unit) -> UnitRow {
         protocol: unit.protocol,
         direction: unit.direction,
         streams: unit.streams,
+        parameters: unit.parameters.clone(),
+        bidir_targets: unit.bidir_targets(),
         repeat: unit.repeat,
         measurement: unit.measurement,
         verdict: "PASS".into(),
         resumed: true,
+        screenshot: None,
         reason: "RESUME_SKIP".into(),
         detail: "24 小时内已有同一内环单元 PASS，本轮跳过（RESUME）".into(),
         diagnostics: vec!["复用历史 PASS；未重新起流".into()],
@@ -851,9 +862,9 @@ fn run_unit(context: &UnitContext<'_>, unit: &Unit) -> Result<UnitRow, String> {
                 // 先起来的那条腿要定向回收，不能留在板子上占端口。
                 let cleanup = stop_servers(&mut servers);
                 return Err(match cleanup {
-                    Ok(()) => format!("{} {} 腿: {error}", unit.title(), leg.flow.label()),
+                    Ok(()) => format!("{} {}: {error}", unit.title(), leg.flow.label()),
                     Err(other) => format!(
-                        "{} {} 腿: {error}；另有回收失败：{other}",
+                        "{} {}: {error}；另有回收失败：{other}",
                         unit.title(),
                         leg.flow.label()
                     ),
@@ -941,9 +952,9 @@ fn run_legs(
                 drop(samplers);
                 let cleanup = close_leases(&mut leases);
                 return Err(match cleanup {
-                    Ok(()) => format!("{} 腿的接收端采样起不来: {error}", leg.flow.label()),
+                    Ok(()) => format!("{}的接收端采样起不来: {error}", leg.flow.label()),
                     Err(other) => format!(
-                        "{} 腿的接收端采样起不来: {error}；另有回收失败：{other}",
+                        "{}的接收端采样起不来: {error}；另有回收失败：{other}",
                         leg.flow.label()
                     ),
                 });
@@ -1037,17 +1048,14 @@ fn run_legs(
         let (client, events) = match result {
             Ok(value) => value,
             Err(error) => {
-                failures.push(format!("{} 腿: {error}", leg.flow.label()));
+                failures.push(format!("{}: {error}", leg.flow.label()));
                 continue;
             }
         };
         let samples = match samples {
             Ok(samples) => samples,
             Err(error) => {
-                failures.push(format!(
-                    "{} 腿的接收端采样收不回来: {error}",
-                    leg.flow.label()
-                ));
+                failures.push(format!("{}的接收端采样收不回来: {error}", leg.flow.label()));
                 continue;
             }
         };
@@ -1378,11 +1386,12 @@ fn assemble_unit(
     if unit.is_bidir() {
         match overlap_secs {
             Some(secs) => diagnostics.push(format!(
-                "双向两条腿真实流量重叠 {secs:.2}s，两条腿的速率都取其中同一段 {}s。",
+                "双向两个方向真实流量重叠 {secs:.2}s，两个方向的速率都取其中同一段 {}s。",
                 cfg.duration_secs
             )),
             None => diagnostics.push(
-                "双向两条腿没有可证明的时间重叠，本单元不构成并发，两条腿都不形成有效结论。".into(),
+                "双向两个方向没有可证明的时间重叠，本单元不构成并发，两个方向都不形成有效结论。"
+                    .into(),
             ),
         }
     }
@@ -1419,7 +1428,7 @@ fn assemble_unit(
             legs.first().map(verdict_of).unwrap_or_else(|| {
                 crate::verdict::VerdictResult::not_evaluated(
                     crate::reason::ReasonCode::UnitDirectionResultMissing,
-                    "本单元没有产生任何一条腿的结果",
+                    "本单元没有产生任何方向的结果",
                 )
             }),
             None,
@@ -1436,10 +1445,13 @@ fn assemble_unit(
         protocol: unit.protocol,
         direction: unit.direction,
         streams: unit.streams,
+        parameters: unit.parameters.clone(),
+        bidir_targets: unit.bidir_targets(),
         repeat: unit.repeat,
         measurement: unit.measurement,
         verdict: verdict.verdict.label().into(),
         resumed: false,
+        screenshot: None,
         reason: verdict.code.to_string(),
         detail: verdict.detail,
         diagnostics,
@@ -1618,7 +1630,7 @@ fn assemble_leg(
         rate: match windowed {
             Ok(rate) => Ok(rate),
             Err(window_error) if unit.is_bidir() && !tool_covers_overlap => Err(format!(
-                "{window_error}；全程 receiver 汇总覆盖的是本腿全程，不能代表双向共同窗口"
+                "{window_error}；全程 receiver 汇总覆盖的是本方向全程，不能代表双向共同窗口"
             )),
             Err(window_error) => {
                 summary.map_err(|summary_error| format!("{window_error}；{summary_error}"))
@@ -1760,7 +1772,7 @@ fn fmt_rate(value: Option<f64>) -> String {
 }
 
 /// UDP 丢包诊断。和子网同一口径：超限只写诊断，不推翻速率判定——
-/// 达标与否只由本腿选中的接收速率来源决定。
+/// 达标与否只由本方向选中的接收速率来源决定。
 fn udp_loss_diagnostics(
     cfg: &InnerConfig,
     protocol: Protocol,

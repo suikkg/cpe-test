@@ -16,6 +16,7 @@ import { errorMessage } from '../../api/client';
 import InnerLinkTable from './InnerLinkTable.vue';
 import InnerLinkDetail from './InnerLinkDetail.vue';
 import InnerResults from './InnerResults.vue';
+import InnerParameterInput from './InnerParameterInput.vue';
 import { saveFile } from '../download';
 
 const props = defineProps<{ subnetRunning?: boolean }>();
@@ -125,7 +126,7 @@ onMounted(() => { loadInnerDraft(); void syncInnerStatus(); void syncScenarioSta
       </div>
     </header>
 
-    <p v-if="!inner.draftSaved" class="msg warn" role="status">配置不完整（缺网卡或所选 IP 版本的地址），草稿未保存，刷新会丢失。</p>
+    <p v-if="!inner.draftSaved" class="msg warn" role="status">配置不完整，草稿未保存，刷新会丢失。</p>
     <p v-if="inner.error" class="msg bad" role="alert">{{ inner.error }}</p>
     <p v-if="props.subnetRunning" class="msg warn" role="status">
       子网测试正在占用网口，结束后才能开始内环测试。
@@ -170,10 +171,10 @@ onMounted(() => { loadInnerDraft(); void syncInnerStatus(); void syncScenarioSta
       <template v-if="inner.capability">
         <p v-if="inner.capability.board_inventory_error" class="warn" role="status">板侧接口信息不完整：{{ inner.capability.board_inventory_error }}。请核对统计接口后重新扫描。</p>
         <p v-if="boardInterfaces.length" class="hint">板侧 LAN / 统计接口：<span v-for="(iface, index) in boardInterfaces" :key="iface.name">{{ index ? '；' : '' }}{{ iface.name }} · {{ [...iface.addresses, ...(iface.ipv6_addresses ?? [])].join('、') || '无独立 IP' }}</span></p>
-        <p v-else class="warn">未发现 192.168.* 的板侧 LAN 地址或统计接口，请展开完整清单核对。</p>
+        <p v-else class="warn">未发现板侧 LAN 地址或统计接口，请查看完整清单。</p>
       </template>
       <details v-if="inner.capability"><summary>查看板侧全部系统接口（{{ inner.capability.board_interfaces.length }} 个）</summary>
-        <p class="hint">这里是 CPE 的系统清单，实际参与测试的电脑网口以下方勾选为准。</p>
+        <p class="hint">CPE 系统接口；测试网口在下方选择。</p>
         <pre>{{ inner.capability.board_version }}</pre>
         <div class="board-inventory"><table class="data">
           <thead><tr><th scope="col">系统接口</th><th scope="col">IPv4 / IPv6</th><th scope="col">所属桥 / 成员</th></tr></thead>
@@ -222,23 +223,25 @@ onMounted(() => { loadInnerDraft(); void syncInnerStatus(); void syncScenarioSta
           </label>
         </fieldset>
       </div>
-      <p class="hint direction-guide">上行：电脑 → CPE，统计 CPE 板侧接收；下行：CPE → 电脑，统计所选电脑网卡接收；双向并发同时测上下行。</p>
+      <p class="hint direction-guide">上行：电脑 → CPE；下行：CPE → 电脑；双向：上下行同时运行。</p>
       <div class="inner-grid">
-        <label>每个方向测试时长（秒）<input v-model.number="inner.config.duration_secs" type="number" min="6" max="3600"></label>
-        <label>每个单元重复轮次<input v-model.number="inner.config.repeats" type="number" min="1" max="10"></label>
-        <label v-if="udp">UDP 每条流发送速率（Mbps，必填）<input v-model.number="inner.config.udp_mbps" type="number" min="0.01" step="any" placeholder="希望发送的速率"></label>
+        <label>测试时长（秒）<input v-model.number="inner.config.duration_secs" type="number" min="6" max="3600"></label>
+        <label>重复轮次<input v-model.number="inner.config.repeats" type="number" min="1" max="10"></label>
+        <p class="muted">多档参数用空格或逗号分隔，按组合测试。每项最多 16 档，整轮最多 4096 个单元。</p>
+        <label v-if="udp">UDP 每流速率（Mbps）<InnerParameterInput :config="inner.config" field="udp_mbps" axis="udp_rates_mbps" :numeric="true" /></label>
+        <label class="inner-check"><input v-model="inner.config.screenshot" type="checkbox">测试结束后截图（参与电脑，每单元一次）</label>
         <label class="inner-check"><input v-model="inner.config.resume" type="checkbox">跳过 24 小时内已通过的单元（RESUME）</label>
       </div>
       <details ref="advancedParams" class="advanced-settings">
         <summary>高级：并行流数、窗口、报文与端口</summary>
         <div class="inner-grid">
-          <label>并行流数（默认）<input v-model.number="inner.config.parallel" type="number" min="1" max="16"></label>
+          <label>默认流数<input v-model.number="inner.config.parallel" type="number" min="1" max="16"></label>
           <label>板侧起始端口<input v-model.number="inner.config.port" type="number" min="1024" max="65534"></label>
-          <label v-if="tcp">TCP 流数（可空，覆盖默认）<input v-model.number="inner.config.tcp_streams" type="number" min="1" max="16" placeholder="沿用并行流数"></label>
-          <label v-if="tcp">TCP 窗口 -w（可空）<input v-model="inner.config.tcp_window" placeholder="如 4m、64k"></label>
-          <label v-if="udp">UDP 流数（可空，覆盖默认）<input v-model.number="inner.config.udp_streams" type="number" min="1" max="16" placeholder="沿用并行流数"></label>
-          <label v-if="udp">UDP 报文长度 -l（可空）<input v-model="inner.config.udp_length" placeholder="如 1400、64"></label>
-          <label v-if="udp">UDP 丢包门槛 %（可空）<input v-model.number="inner.config.max_udp_loss_pct" type="number" min="0" max="100" step="any" placeholder="仅诊断，不推翻速率判定"></label>
+          <label v-if="tcp">TCP 流数<InnerParameterInput :config="inner.config" field="tcp_streams" axis="tcp_streams" :numeric="true" /></label>
+          <label v-if="tcp">TCP 窗口 -w<InnerParameterInput :config="inner.config" field="tcp_window" axis="tcp_windows" :numeric="false" /></label>
+          <label v-if="udp">UDP 流数<InnerParameterInput :config="inner.config" field="udp_streams" axis="udp_streams" :numeric="true" /></label>
+          <label v-if="udp">UDP 报文长度 -l<InnerParameterInput :config="inner.config" field="udp_length" axis="udp_lengths" :numeric="false" /></label>
+          <label v-if="udp">UDP 丢包门槛 %<input v-model.number="inner.config.max_udp_loss_pct" type="number" min="0" max="100" step="any" placeholder="仅诊断，不推翻速率判定"></label>
         </div>
       </details>
     </fieldset>
@@ -259,7 +262,7 @@ onMounted(() => { loadInnerDraft(); void syncInnerStatus(); void syncScenarioSta
         <template v-if="inner.preview">
           <p class="summary">
             <strong>{{ inner.preview.units }}</strong> 个单元（双向 {{ inner.preview.bidir_units }}）·
-            <strong>{{ inner.preview.legs }}</strong> 条数据腿 · {{ inner.preview.links }} 个网口 ·
+            <strong>{{ inner.preview.legs }}</strong> 个传输方向 · {{ inner.preview.links }} 个网口 ·
             约 {{ innerDuration(inner.preview.estimated_secs) }}
             <template v-if="inner.preview.resumed"> · RESUME 跳过 {{ inner.preview.resumed }}</template>
             · 参与：{{ [inner.preview.uses_master ? '本机' : '', ...inner.preview.agents].filter(Boolean).join('、') || '无' }}
@@ -272,9 +275,9 @@ onMounted(() => { loadInnerDraft(); void syncInnerStatus(); void syncScenarioSta
                 <strong>#{{ row.index }}</strong> {{ row.host }} / {{ row.link }} · IPv{{ row.ip_version ?? 4 }} · {{ PROTOCOL_LABEL[row.protocol] }} ·
                 {{ DIRECTION_LABEL[row.direction] }} · 第 {{ row.repeat }} 轮 · {{ MEASUREMENT_LABEL[row.measurement] }}<span v-if="row.resumed"> · RESUME 跳过</span><br>
                 <span v-for="leg in row.legs" :key="leg.flow" class="muted">
-                  {{ FLOW_LABEL[leg.flow] }} 腿 → 接收端 {{ leg.receiver }}，端口 {{ leg.port }}；
+                  {{ FLOW_LABEL[leg.flow] }} → 接收端 {{ leg.receiver }}，端口 {{ leg.port }}；
                 </span>
-                <span class="muted">{{ row.verdict_basis }}</span>
+                <span class="muted">{{ row.parameter_label }} · {{ row.verdict_basis }}</span>
               </p>
             </div>
           </details>

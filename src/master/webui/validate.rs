@@ -863,7 +863,7 @@ pub(super) fn validate_ui_plan(state: &UiState, plan: &UiPlan) -> Result<(), Str
                 }
                 // 填了某个方向的单向门限却没勾那个方向，是个看不见的错：那一格
                 // 在界面上只在勾了方向时才出现，服务端不说的话字段就静默失效。
-                // `both` 是「两条独立单向腿」的旧写法，计划期展开成 ab + ba，
+                // `both` 是「两条独立单向测试」的旧写法，计划期展开成 ab + ba，
                 // 所以它同时覆盖两个方向。
                 if !task
                     .directions

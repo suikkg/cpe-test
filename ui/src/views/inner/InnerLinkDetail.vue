@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue';
 import { inner } from '../../state/inner';
-import { INNER_MEASUREMENTS, MEASUREMENT_HINT, MEASUREMENT_LABEL, innerNicIpv6 } from '../../domain/inner';
+import { INNER_MEASUREMENTS, MEASUREMENT_HINT, MEASUREMENT_LABEL, innerNicIpv6, emptyInnerThresholds, PROTOCOL_LABEL } from '../../domain/inner';
 import type { InnerLink } from '../../domain/inner';
 import { innerBoardIpv6Choices, innerEndpointKey, innerNicChoices, innerNicOtherReason, innerSetupIssues, suggestedInnerBoardIpv6 } from '../../domain/inner-setup';
 
@@ -51,12 +51,12 @@ function changeHost(): void {
         <option value="">{{ nics.length ? '请选择实际接到 CPE 的网卡' : '尚无扫描结果，可重新扫描或手动填写' }}</option>
         <option v-for="choice in nics" :key="choice.key" :value="choice.key">{{ choice.nic.name }} · {{ choice.nic.ipv4 || innerNicIpv6(choice.nic) }}</option>
       </select></label>
-      <label v-if="v4">CPE LAN IPv4<input v-model="props.link.gateway" placeholder="如 192.168.0.1，按实际设备填写"><small class="muted">填 CPE 的 LAN 地址，不是电脑 IP，也不是 WAN 默认网关。</small></label>
+      <label v-if="v4">CPE LAN IPv4<input v-model="props.link.gateway" placeholder="如 192.168.0.1，按实际设备填写"><small class="muted">填写 CPE LAN 地址。</small></label>
       <label v-if="v6">电脑网卡 IPv6<input v-model="props.link.local_ipv6" list="inner-pc-ipv6" placeholder="从扫描选择或填写，例如 fe80::1234"><datalist id="inner-pc-ipv6"><option v-for="ip in nicIpv6" :key="ip" :value="ip" /></datalist></label>
       <label v-if="v6">CPE LAN IPv6<input v-model="props.link.gateway_ipv6" list="inner-board-ipv6" placeholder="从板侧扫描选择或按实际地址填写"><datalist id="inner-board-ipv6"><option v-for="choice in boardIpv6" :key="`${choice.name}:${choice.address}`" :value="choice.address">{{ choice.name }}</option></datalist></label>
     </div>
     <p class="identity">电脑网卡：<strong>{{ props.link.local_interface || '未选择' }}</strong><template v-if="v4">　IPv4：<strong>{{ props.link.local_ip || '未填写' }}</strong></template><template v-if="v6">　IPv6：<strong>{{ props.link.local_ipv6 || '未填写' }}</strong></template></p>
-    <p v-if="v6" class="muted">两端需同为链路本地地址（fe80::/10），或同为全局 / ULA 地址。填写实际 IPv6，不含 %接口或 /前缀。</p>
+    <p v-if="v6" class="muted">两端地址类型须一致：链路本地或全局 / ULA。IPv6 不含 %接口或 /前缀。</p>
     <label class="other-toggle"><input v-model="showOther" type="checkbox">显示此电脑的其他网段 / 隧道接口</label>
     <details :open="!nics.length" class="advanced">
       <summary>手动填写网卡{{ v4 ? '与 IPv4' : '' }}</summary>
@@ -74,11 +74,11 @@ function changeHost(): void {
         <option v-for="item in INNER_MEASUREMENTS" :key="item" :value="item">{{ MEASUREMENT_LABEL[item] }}</option>
       </select></label>
     </div>
-    <p class="muted">上行统计这里的板侧桥接口（如 br0、br-lan）接收，留空按板侧 LAN 地址自动识别；下行统计上面所选电脑网卡接收。</p>
+    <p class="muted">上行采板侧桥 RX，留空自动识别；下行采所选电脑网卡 RX。</p>
     <p class="muted">{{ MEASUREMENT_HINT[props.link.measurement] }}</p>
 
-    <h4>验收门限</h4>
-    <p class="muted">留空只测量。网卡口径与工具口径各设各的，工具速率不套用网卡门限。</p>
+    <h4>公共验收门限（TCP / UDP 默认）</h4>
+    <p class="muted">留空只测量；网卡和工具门限分别设置。</p>
     <div class="grid">
       <label>上行 · 网卡口径 Mbps<input v-model.number="props.link.upload_min_mbps" type="number" min="0.01" step="any" placeholder="留空仅测量"></label>
       <label>下行 · 网卡口径 Mbps<input v-model.number="props.link.download_min_mbps" type="number" min="0.01" step="any" placeholder="留空仅测量"></label>
@@ -88,6 +88,21 @@ function changeHost(): void {
       <label v-if="usesTool && bidir">双向合计 · 工具口径 Mbps<input v-model.number="props.link.tool_bidir_total_min_mbps" type="number" min="0.01" step="any" placeholder="留空只标 MEASURED"></label>
     </div>
     <p v-if="bidir" class="muted">双向合计门限留空时，按各方向门限分别判定。</p>
+    <section v-for="protocol in inner.config.protocols" :key="protocol">
+      <h4>{{ PROTOCOL_LABEL[protocol] }} 门限覆盖</h4>
+      <p class="muted">只作用于此网口的 {{ PROTOCOL_LABEL[protocol] }}；留空继承上面的公共门限。</p>
+      <button v-if="!props.link[protocol === 'tcp' ? 'tcp_thresholds' : 'udp_thresholds']" class="ghost small" @click="props.link[protocol === 'tcp' ? 'tcp_thresholds' : 'udp_thresholds'] = emptyInnerThresholds()">设置 {{ PROTOCOL_LABEL[protocol] }} 门限</button>
+      <template v-for="key in [protocol === 'tcp' ? 'tcp_thresholds' : 'udp_thresholds'] as const" :key="key">
+        <div v-if="props.link[key]" class="grid">
+          <label>{{ PROTOCOL_LABEL[protocol] }} 上行 · 网卡口径 Mbps<input v-model.number="props.link[key]!.upload_min_mbps" type="number" min="0.01" step="any" placeholder="继承公共门限"></label>
+          <label>{{ PROTOCOL_LABEL[protocol] }} 下行 · 网卡口径 Mbps<input v-model.number="props.link[key]!.download_min_mbps" type="number" min="0.01" step="any" placeholder="继承公共门限"></label>
+          <label v-if="bidir">{{ PROTOCOL_LABEL[protocol] }} 双向合计 · 网卡口径 Mbps<input v-model.number="props.link[key]!.bidir_total_min_mbps" type="number" min="0.01" step="any" placeholder="继承公共门限"></label>
+          <label v-if="usesTool">{{ PROTOCOL_LABEL[protocol] }} 上行 · 工具口径 Mbps<input v-model.number="props.link[key]!.tool_upload_min_mbps" type="number" min="0.01" step="any" placeholder="继承公共工具门限"></label>
+          <label v-if="usesTool">{{ PROTOCOL_LABEL[protocol] }} 下行 · 工具口径 Mbps<input v-model.number="props.link[key]!.tool_download_min_mbps" type="number" min="0.01" step="any" placeholder="继承公共工具门限"></label>
+          <label v-if="usesTool && bidir">{{ PROTOCOL_LABEL[protocol] }} 双向合计 · 工具口径 Mbps<input v-model.number="props.link[key]!.tool_bidir_total_min_mbps" type="number" min="0.01" step="any" placeholder="继承公共工具门限"></label>
+        </div>
+      </template>
+    </section>
     </details>
     <div class="bar"><button @click="emit('close')">完成，返回网口清单</button></div>
   </fieldset>

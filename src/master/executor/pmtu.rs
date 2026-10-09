@@ -126,7 +126,7 @@ impl Ctx {
                  路由器一律不分片，`ping -f`（Windows，文档标注 IPv4-only）和 \
                  `ping6 -D`（macOS，ping6 不认这个选项）都给不出可信结果——\
                  得到的「大包能过」和旧 agent 忽略 DF 位是同一个错答案。\
-                 这一腿的 IPv4 侧仍会正常探测。"
+                 这一方向的 IPv4 侧仍会正常探测。"
                 .into());
         }
         let (src_addr, dst_addr) = (src.nic.ipv4.clone(), dst.nic.ipv4.clone());

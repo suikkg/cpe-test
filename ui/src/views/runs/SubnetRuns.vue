@@ -159,7 +159,7 @@ async function compare(entry: RunEntry): Promise<void> {
       `判定变坏 ${out.regressed} · 速率下降 ${out.slower} · 判定转好 ${out.fixed} · 新增 ${out.added} · 缺失 ${out.disappeared} · RESUME 跳过 ${out.resumed ?? 0} · 无实质变化 ${out.unchanged} · 无法唯一匹配 ${out.ambiguous ?? 0}`,
     ];
     if (!out.same_plan) {
-      parts.push('两轮不是同一套计划，「新增/缺失」说的是计划差异，不是设备表现');
+      parts.push('两轮计划不同；新增和缺失表示计划变化。');
     }
     notice.value = parts.join('；');
     await load();
@@ -318,7 +318,7 @@ onMounted(load);
                   type="button"
                   class="ghost small"
                   :disabled="!!busy"
-                  title="按单元对齐，列出判定变坏 / 速率下降 / 转好 / 新增 / 缺失"
+                  title="按单元对比判定、速率和计划变化"
                   @click="compare(entry)"
                 >与基线对比</button>
               </div>

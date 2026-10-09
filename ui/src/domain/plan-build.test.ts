@@ -175,7 +175,7 @@ describe('分配表整列开关', () => {
 
 describe('方向词汇表', () => {
   it('both 与 bidir 是两件不同的事', () => {
-    // both = 两条独立的单向腿；bidir = 同一个双向并发单元。
+    // both = 两条独立的单向测试；bidir = 同一个双向并发单元。
     // 双向并发时两个方向的吞吐互相影响，跑出来的数完全不是一回事——
     // 把 both 显示成「双向」再保存回 bidir 会**改变执行语义**。
     expect(canonicalDirection('both')).toBe('both');

@@ -129,7 +129,7 @@ pub fn parse_receiver_summary(
         (None, found) => {
             return Err(format!(
                 "{streams} 条并发流找到 {found} 条 receiver 汇总行，却没有 [SUM] 合计行；\
-                 取其中任意一条都只是单流速率，不能当成本腿的接收速率"
+                 取其中任意一条都只是单流速率，不能当成本方向的接收速率"
             ));
         }
     };
@@ -178,7 +178,7 @@ pub struct NicView {
 }
 
 impl NicView {
-    /// 这一腿是否形成了可信的网卡 RX 平均值。
+    /// 这一个方向是否形成了可信的网卡 RX 平均值。
     ///
     /// 判据只有一个来源：验收有没有走到「能给出速率结论」那一步。
     /// PASS / RATE_FAIL / MEASURED 都意味着三道门槛（计数器没停滞、平均值
@@ -212,7 +212,7 @@ impl ToolView {
     }
 }
 
-/// 一条腿最终采用的测量结果。
+/// 一个方向最终采用的测量结果。
 #[derive(Debug, Clone)]
 pub struct LegMeasurement {
     pub source: Source,
@@ -242,7 +242,7 @@ fn tool_verdict(rate: &ToolRate, target: Option<f64>) -> VerdictResult {
         return VerdictResult::measured(
             ReasonCode::TargetUnknown,
             format!(
-                "{detail}；未配置工具口径门限，本腿只测量。\
+                "{detail}；未配置工具口径门限，本方向只测量。\
                  网卡口径验收未形成，不能视为通过网卡 RX 验收"
             ),
         );
@@ -258,20 +258,20 @@ fn tool_verdict(rate: &ToolRate, target: Option<f64>) -> VerdictResult {
     }
 }
 
-/// 本腿在合计判定的单元里只测量，不单独出结论。
+/// 本方向在合计判定的单元里只测量，不单独出结论。
 fn measured_for_total(source: Source, mbps: f64) -> VerdictResult {
     VerdictResult::measured(
         ReasonCode::TargetUnknown,
         format!(
-            "本腿接收速率 {mbps:.3}Mbps（{}）；本单元按双向合计判定一次，单腿不单独判定",
+            "本方向接收速率 {mbps:.3}Mbps（{}）；本单元按双向合计判定一次，单方向不单独判定",
             source.label()
         ),
     )
 }
 
-/// 选择来源并给出本腿结论。
+/// 选择来源并给出本方向结论。
 ///
-/// `total_mode` = 所属单元按双向合计判定，本腿只测量。
+/// `total_mode` = 所属单元按双向合计判定，本方向只测量。
 pub fn select_leg(
     strategy: Measurement,
     nic: &NicView,
@@ -368,7 +368,7 @@ fn nic_only(
 
 /// 双向合计。
 ///
-/// 只允许**同一来源层次**的两端接收速率相加：一腿网卡、一腿工具的「合计」
+/// 只允许**同一来源层次**的两端接收速率相加：一个方向使用网卡、另一个方向使用工具的「合计」
 /// 没有物理意义——字节计数记的是接口总流量，工具汇总记的是这条测试流的
 /// 应用层接收吞吐，把它们加起来得到的数不对应任何东西。
 pub fn total_verdict(
@@ -379,14 +379,14 @@ pub fn total_verdict(
     let [a, b] = legs else {
         return VerdictResult::not_evaluated(
             ReasonCode::UnitDirectionResultMissing,
-            "双向合计需要上行和下行两条腿的结果，本单元缺少其中一条",
+            "双向合计需要上行和下行的结果，本单元缺少其中一条",
         );
     };
     if a.source == Source::None || b.source == Source::None {
         return VerdictResult::not_evaluated(
             ReasonCode::NicRateMissing,
             format!(
-                "双向合计需要两条腿都有可信的接收速率：上行 {}，下行 {}",
+                "双向合计需要两个方向都有可信的接收速率：上行 {}，下行 {}",
                 a.source.label(),
                 b.source.label()
             ),
@@ -396,7 +396,7 @@ pub fn total_verdict(
         return VerdictResult::not_evaluated(
             ReasonCode::NicRateMissing,
             format!(
-                "两条腿的来源层次不同（上行 {}，下行 {}）；\
+                "两个方向的来源层次不同（上行 {}，下行 {}）；\
                  接口字节计数与工具接收汇总不是同一层的数值，不能相加",
                 a.source.label(),
                 b.source.label()
@@ -406,7 +406,7 @@ pub fn total_verdict(
     let (Some(up), Some(down)) = (a.mbps, b.mbps) else {
         return VerdictResult::not_evaluated(
             ReasonCode::NicRateMissing,
-            "双向合计缺少某条腿的接收速率",
+            "双向合计缺少某个方向的接收速率",
         );
     };
     let total = up + down;

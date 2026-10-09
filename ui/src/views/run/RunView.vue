@@ -35,7 +35,7 @@ function confirmNotRunning(): void {
 
     <p v-if="run.startError" class="msg bad" role="alert">{{ run.startError }}</p>
     <div v-if="run.startPhase === 'unknown'" class="msg warn" role="alert">
-      <p>「开始」请求没有拿到应答，无法确认这一轮是否已起跑。请勿重复开始；先在主控确认，再重新准备。</p>
+      <p>启动结果未确认，请勿重复启动。核实未运行后重新准备。</p>
       <button type="button" class="ghost small" @click="syncStatus">再同步一次运行状态</button>
       <button
         v-if="run.synced && !run.running && !run.refreshError"

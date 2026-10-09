@@ -517,7 +517,7 @@ fn the_same_unit_carries_the_same_number_in_every_section() {
     assert_eq!(
         html.matches("<span class=\"raw-seq\">#2</span>").count(),
         2,
-        "双向单元两条腿共用单元号"
+        "双向单元两个方向共用单元号"
     );
     // 区分标是 `kind_label`——和「逐行明细」那张表「类型」列一字不差。
     // 一个双向单元每条腿还会分「流明细」和「组合计」，光标 AB/BA 会出现
@@ -1070,7 +1070,7 @@ fn bidirectional_overview_keeps_ab_and_ba_separate() {
     assert!(html.contains("900.000 Mbps"));
     assert!(html.contains("800.000 Mbps"));
     assert!(html.contains("RX_P10_BELOW_TARGET"));
-    assert!(html.contains("双向方向汇总"));
+    assert!(html.contains("双向汇总"));
     assert!(html.contains("2 个方向执行行（AB / BA）"));
     // 仍按各自方向的接收端速率判定；合计只是结果里的诊断指标，不能替代任一方向。
     assert!(html.contains("双向 RX 平均合计"));
@@ -1078,7 +1078,7 @@ fn bidirectional_overview_keeps_ab_and_ba_separate() {
     assert!(html.contains("data-unit-id=\"unit-bidir\" open"));
 }
 
-/// 配了合计门限的双向单元，标题不能再说「每个方向各自按接收端 RX 判定」。
+/// 配了合计门限的双向单元，标题不能再说「按方向分别判定」。
 ///
 /// 真机联调时看到的：报告里判定确实走的是合计（`双向 RX 合计 1447.094…门限
 /// 1500`），标题却写着两条腿各自判定。合计门限存在时 `leg_rate_plan` 已经把
@@ -1113,11 +1113,11 @@ fn a_bidirectional_unit_with_a_total_target_says_it_is_judged_once() {
 
     let with_total = bidir(Some(1_500.0));
     assert!(
-        with_total.contains("按两端 RX 合计判定一次，两条腿只测量"),
+        with_total.contains("按两端 RX 合计判定一次"),
         "配了合计门限就要说清判定只做一次：{with_total}"
     );
     assert!(
-        !with_total.contains("每个方向各自按接收端 RX 判定"),
+        !with_total.contains("按方向分别判定"),
         "这句话在配了合计门限时是假的"
     );
     assert!(with_total.contains("门限 1500.000 Mbps"), "门限要写出来");
@@ -1128,7 +1128,7 @@ fn a_bidirectional_unit_with_a_total_target_says_it_is_judged_once() {
     // 光写「每个方向各自判定」读的人不知道还有合计门限这个选项、只是没设。
     let plain = bidir(None);
     assert!(
-        plain.contains("未设置合计门限，每个方向各自按接收端 RX 判定"),
+        plain.contains("未设合计门限，按方向分别判定"),
         "要说清是「没设合计门限」才按方向判，而不是只能按方向判：{plain}"
     );
 }

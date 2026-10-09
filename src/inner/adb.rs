@@ -537,10 +537,10 @@ pub struct Server {
 }
 
 impl Server {
-    /// 每条腿一套 server：独立端口、独立资源目录、独立日志。
+    /// 每个方向一套 server：独立端口、独立资源目录、独立日志。
     ///
-    /// 双向单元两条腿同时在跑，共用一个端口的话两股流会撞进同一个 server
-    /// 进程，日志和字节都分不出是哪条腿的。`owner` 已经把腿编进去了。
+    /// 双向单元两个方向同时在跑，共用一个端口的话两股流会撞进同一个 server
+    /// 进程，日志和字节都分不出是哪个方向的。`owner` 已经把方向编进去了。
     #[allow(clippy::too_many_arguments)]
     pub fn start(
         adb: &Adb,

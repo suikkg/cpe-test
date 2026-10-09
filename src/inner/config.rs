@@ -1,9 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-/// 内环项目当前 schema 版本。版本 1 是「固定上下行、板侧统计接口绑死在
+/// 内环项目当前 schema 版本：v4 增加多档位与协议门限。版本 1 是「固定上下行、板侧统计接口绑死在
 /// 网关归属口、只有网卡口径」那一代，导入时按 [`migrate_v1`] 升级。
-pub const PROJECT_VERSION: u32 = 3;
+pub const PROJECT_VERSION: u32 = 4;
 pub const PROJECT_KIND: &str = "cpe-inner-project";
 /// 地址最终进入 HTTP Host 头；DNS 名称的协议上限是 253 字节，给 IP/端口解析
 /// 和实现留一点余量，但不接受把整份请求体塞进一个主机名字段。
@@ -34,6 +34,8 @@ pub struct InnerConfig {
     pub directions: Vec<Direction>,
     /// 覆盖 `parallel` 的 TCP 并发流数；留空沿用 `parallel`。
     pub tcp_streams: Option<u32>,
+    /// 多档位轴；非空时覆盖对应旧单值，按协议叉乘展开。
+    pub parameter_options: ParameterOptions,
     /// 覆盖 `parallel` 的 UDP 并发流数；留空沿用 `parallel`。
     pub udp_streams: Option<u32>,
     /// TCP socket 缓冲（iperf3 `-w`），如 `4m`；留空用系统默认。
@@ -54,6 +56,8 @@ pub struct InnerConfig {
     /// 重跑时跳过 24 小时内已经 PASS 的同一内环单元。
     #[serde(default)]
     pub resume: bool,
+    /// 每个实际执行单元结束后截取参与电脑的桌面；失败只作诊断。
+    pub screenshot: bool,
     pub agents: Vec<AgentConfig>,
     pub links: Vec<Link>,
 }
@@ -70,6 +74,7 @@ impl Default for InnerConfig {
             ip_versions: vec![4],
             directions: vec![Direction::Upload, Direction::Download],
             tcp_streams: None,
+            parameter_options: ParameterOptions::default(),
             udp_streams: None,
             tcp_window: None,
             udp_mbps: None,
@@ -78,9 +83,87 @@ impl Default for InnerConfig {
             port: 56190,
             repeats: 1,
             resume: false,
+            screenshot: true,
             agents: Vec::new(),
             links: Vec::new(),
         }
+    }
+}
+
+/// 每条轴最多 16 档；空轴沿用旧单值，旧文件的实际参数与身份不变。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ParameterOptions {
+    pub tcp_streams: Vec<u32>,
+    pub udp_streams: Vec<u32>,
+    pub tcp_windows: Vec<String>,
+    pub udp_rates_mbps: Vec<f64>,
+    pub udp_lengths: Vec<String>,
+}
+
+/// 一个单元实际下发的参数，预览、执行与结果共用。
+#[derive(Debug, Clone, Serialize)]
+pub struct Parameters {
+    pub streams: u32,
+    pub tcp_window: Option<String>,
+    pub udp_mbps: Option<f64>,
+    pub udp_length: Option<String>,
+}
+impl Parameters {
+    pub fn apply(&self, cfg: &InnerConfig, protocol: Protocol) -> InnerConfig {
+        let mut next = cfg.clone();
+        next.parameter_options = ParameterOptions::default();
+        match protocol {
+            Protocol::Tcp => {
+                next.tcp_streams = Some(self.streams);
+                next.tcp_window = self.tcp_window.clone();
+            }
+            Protocol::Udp => {
+                next.udp_streams = Some(self.streams);
+                next.udp_mbps = self.udp_mbps;
+                next.udp_length = self.udp_length.clone();
+            }
+        }
+        next
+    }
+    pub fn label(&self, protocol: Protocol) -> String {
+        match protocol {
+            Protocol::Tcp => format!(
+                "-P {} / -w {}",
+                self.streams,
+                self.tcp_window.as_deref().unwrap_or("默认")
+            ),
+            Protocol::Udp => format!(
+                "-P {} / -b {} Mbps / -l {}",
+                self.streams,
+                self.udp_mbps.unwrap_or_default(),
+                self.udp_length.as_deref().unwrap_or("默认")
+            ),
+        }
+    }
+}
+
+/// 分协议覆盖；留空继承该网口的公共门限，工具口径仍独立。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Thresholds {
+    pub upload_min_mbps: Option<f64>,
+    pub download_min_mbps: Option<f64>,
+    pub bidir_total_min_mbps: Option<f64>,
+    pub tool_upload_min_mbps: Option<f64>,
+    pub tool_download_min_mbps: Option<f64>,
+    pub tool_bidir_total_min_mbps: Option<f64>,
+}
+impl Thresholds {
+    fn values(&self) -> [Option<f64>; 6] {
+        [
+            self.upload_min_mbps,
+            self.download_min_mbps,
+            self.bidir_total_min_mbps,
+            self.tool_upload_min_mbps,
+            self.tool_download_min_mbps,
+            self.tool_bidir_total_min_mbps,
+        ]
     }
 }
 
@@ -240,9 +323,32 @@ pub struct Link {
     pub tool_download_min_mbps: Option<f64>,
     #[serde(default)]
     pub tool_bidir_total_min_mbps: Option<f64>,
+    #[serde(default)]
+    pub tcp_thresholds: Option<Thresholds>,
+    #[serde(default)]
+    pub udp_thresholds: Option<Thresholds>,
 }
 
 impl Link {
+    pub fn for_protocol(&self, protocol: Protocol) -> Self {
+        let mut link = self.clone();
+        let overrides = match protocol {
+            Protocol::Tcp => &self.tcp_thresholds,
+            Protocol::Udp => &self.udp_thresholds,
+        };
+        if let Some(t) = overrides {
+            link.upload_min_mbps = t.upload_min_mbps.or(link.upload_min_mbps);
+            link.download_min_mbps = t.download_min_mbps.or(link.download_min_mbps);
+            link.bidir_total_min_mbps = t.bidir_total_min_mbps.or(link.bidir_total_min_mbps);
+            link.tool_upload_min_mbps = t.tool_upload_min_mbps.or(link.tool_upload_min_mbps);
+            link.tool_download_min_mbps = t.tool_download_min_mbps.or(link.tool_download_min_mbps);
+            link.tool_bidir_total_min_mbps = t
+                .tool_bidir_total_min_mbps
+                .or(link.tool_bidir_total_min_mbps);
+        }
+        link
+    }
+
     pub fn local_address(&self, ip_version: u8) -> IpAddr {
         if ip_version == 6 {
             self.local_ipv6.unwrap_or(Ipv6Addr::UNSPECIFIED).into()
@@ -526,6 +632,62 @@ pub fn iface_word(value: &str) -> bool {
 }
 
 impl InnerConfig {
+    pub fn parameter_variants(&self, protocol: Protocol) -> Vec<Parameters> {
+        let o = &self.parameter_options;
+        let streams = match protocol {
+            Protocol::Tcp => &o.tcp_streams,
+            Protocol::Udp => &o.udp_streams,
+        };
+        let streams = if streams.is_empty() {
+            vec![self.streams(protocol)]
+        } else {
+            streams.clone()
+        };
+        let sizes = match protocol {
+            Protocol::Tcp => &o.tcp_windows,
+            Protocol::Udp => &o.udp_lengths,
+        };
+        let sizes = if sizes.is_empty() {
+            vec![match protocol {
+                Protocol::Tcp => self.tcp_window.clone(),
+                Protocol::Udp => self.udp_length.clone(),
+            }]
+        } else {
+            sizes.iter().cloned().map(Some).collect()
+        };
+        let rates = if protocol == Protocol::Udp && !o.udp_rates_mbps.is_empty() {
+            o.udp_rates_mbps.iter().copied().map(Some).collect()
+        } else {
+            vec![self.udp_mbps]
+        };
+        let mut result = Vec::new();
+        for streams in streams {
+            for size in &sizes {
+                for &rate in &rates {
+                    result.push(Parameters {
+                        streams,
+                        tcp_window: if protocol == Protocol::Tcp {
+                            size.clone()
+                        } else {
+                            None
+                        },
+                        udp_mbps: if protocol == Protocol::Udp {
+                            rate
+                        } else {
+                            None
+                        },
+                        udp_length: if protocol == Protocol::Udp {
+                            size.clone()
+                        } else {
+                            None
+                        },
+                    });
+                }
+            }
+        }
+        result
+    }
+
     /// 该协议实际使用的并发流数：按协议覆盖优先，留空沿用 `parallel`。
     pub fn streams(&self, protocol: Protocol) -> u32 {
         match protocol {
@@ -599,11 +761,63 @@ impl InnerConfig {
                 return Err("按协议覆盖的并发流数需为 1..16，留空则沿用 parallel".into());
             }
         }
+        let o = &self.parameter_options;
+        for values in [&o.tcp_streams, &o.udp_streams] {
+            if values.len() > 16 || !unique(values) || values.iter().any(|v| !(1..=16).contains(v))
+            {
+                return Err("流数档位最多 16 项，不重复且为 1..16".into());
+            }
+        }
+        for values in [&o.tcp_windows, &o.udp_lengths] {
+            if values.len() > 16 || !unique(values) || values.iter().any(|v| !size_token(v)) {
+                return Err("窗口与包长档位最多 16 项，不重复且为数字加可选 k/m/g".into());
+            }
+        }
+        if o.udp_rates_mbps.len() > 16
+            || o.udp_rates_mbps
+                .iter()
+                .any(|v| !v.is_finite() || *v <= 0.0 || *v > 1e6)
+            || !unique(
+                &o.udp_rates_mbps
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .collect::<Vec<_>>(),
+            )
+        {
+            return Err("UDP 速率档位最多 16 项，不重复且为正数 Mbps（上限 1000000）".into());
+        }
+        if !self.protocols.contains(&Protocol::Tcp)
+            && (!o.tcp_streams.is_empty() || !o.tcp_windows.is_empty())
+        {
+            return Err("不测 TCP 时不接受 TCP 档位".into());
+        }
         let udp = self.protocols.contains(&Protocol::Udp);
+        if !udp
+            && (!o.udp_streams.is_empty()
+                || !o.udp_rates_mbps.is_empty()
+                || !o.udp_lengths.is_empty())
+        {
+            return Err("不测 UDP 时不接受 UDP 档位".into());
+        }
+        let variants: usize = self
+            .protocols
+            .iter()
+            .map(|&p| self.parameter_variants(p).len())
+            .sum();
+        if self.active_links().len()
+            * self.ip_versions.len()
+            * self.directions.len()
+            * self.repeats as usize
+            * variants
+            > 4096
+        {
+            return Err("内环计划最多 4096 个单元，请减少档位或重复轮次".into());
+        }
+
         if self
             .udp_mbps
             .is_some_and(|v| !v.is_finite() || v <= 0.0 || v > 1e6)
-            || (udp && self.udp_mbps.is_none())
+            || (udp && self.udp_mbps.is_none() && o.udp_rates_mbps.is_empty())
             || (!udp && self.udp_mbps.is_some())
         {
             return Err(
@@ -725,6 +939,28 @@ impl InnerConfig {
                             link.name
                         ));
                     }
+                }
+            }
+            for t in [&link.tcp_thresholds, &link.udp_thresholds]
+                .into_iter()
+                .flatten()
+            {
+                let values = t.values();
+                if values
+                    .iter()
+                    .flatten()
+                    .any(|v| !v.is_finite() || *v <= 0.0 || *v > 1e6)
+                {
+                    return Err(format!(
+                        "{}: 分协议门限需为正数 Mbps（上限 1000000）",
+                        link.name
+                    ));
+                }
+                if !link.measurement.uses_tool() && values[3..].iter().any(Option::is_some) {
+                    return Err(format!("{}: 网卡计数严格模式不接受工具口径门限", link.name));
+                }
+                if !bidir && (values[2].is_some() || values[5].is_some()) {
+                    return Err(format!("{}: 未勾选双向并发时不接受双向合计门限", link.name));
                 }
             }
             for target in [

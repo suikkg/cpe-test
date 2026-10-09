@@ -14,6 +14,36 @@ const NIC_ON_GROUPTOTAL: &str = "—（按方向统计，见组合计行）";
 const NOT_COLLECTED: &str = "未采集";
 const INSUFFICIENT_SAMPLES: &str = "样本不足";
 
+pub(crate) const RX_CHART_CSS: &str = chart::CHART_CSS;
+
+/// 内环报告复用同一 SVG 引擎；全采样期原始 RX 只作诊断，不猜判定窗口。
+pub(crate) fn render_monitor_rx_chart(
+    samples: &[crate::protocol::MonitorSample],
+    caption: &str,
+) -> String {
+    let mut samples: Vec<_> = samples
+        .iter()
+        .map(|sample| chart::RateSample {
+            elapsed_ms: sample.elapsed_ms,
+            mbps: if sample.rx_mbps.is_finite() {
+                sample.rx_mbps.max(0.0)
+            } else {
+                0.0
+            },
+            valid: sample.valid && sample.rx_mbps.is_finite(),
+        })
+        .collect();
+    samples.sort_by_key(|sample| sample.elapsed_ms);
+    chart::render_svg(chart::ChartInput {
+        samples: &samples,
+        target_mbps: None,
+        window_start_ms: None,
+        window_end_ms: None,
+        caption,
+        compact: false,
+    })
+}
+
 /// 报告渲染期从 run 目录读回来的逐样本数据，按 CSV 相对路径缓存。
 ///
 /// **一次性读完再渲染**，理由有两条：同一份 CSV 会被概览和明细各用一次，
@@ -169,7 +199,7 @@ fn push_overview_table(h: &mut String, groups: &[&UnitGroup<'_>], charts: &Chart
     let column_count = 12 + usize::from(has_shots) + usize::from(has_charts);
 
     h.push_str(
-        "<div class=\"overview-scroll\" role=\"region\" aria-labelledby=\"overview-heading\" tabindex=\"0\"><table class=\"overview-table\"><caption class=\"sr-only\">按测试单元和方向展示接收端网卡 RX 判定指标、发送端 TX 参考值、截图与判定原因</caption><colgroup><col class=\"c-seq\"><col class=\"c-verdict\"><col class=\"c-unit\"><col class=\"c-dir\"><col class=\"c-endpoints\"><col class=\"c-streams\"><col class=\"c-rate\"><col class=\"c-rate\"><col class=\"c-rate\"><col class=\"c-target\">",
+        "<div class=\"overview-scroll\" role=\"region\" aria-labelledby=\"overview-heading\" tabindex=\"0\"><table class=\"overview-table\"><caption class=\"sr-only\">按单元和方向显示 RX、TX、截图及判定原因</caption><colgroup><col class=\"c-seq\"><col class=\"c-verdict\"><col class=\"c-unit\"><col class=\"c-dir\"><col class=\"c-endpoints\"><col class=\"c-streams\"><col class=\"c-rate\"><col class=\"c-rate\"><col class=\"c-rate\"><col class=\"c-target\">",
     );
     if has_shots {
         h.push_str("<col class=\"c-shot\">");
@@ -540,17 +570,17 @@ fn push_bidirectional_summary(h: &mut String, group: &UnitGroup<'_>) {
     let bidir_total_target = group.summary.and_then(|summary| summary.target_mbps);
     let title = match bidir_total_target {
         Some(target) => format!(
-            "双向方向汇总（本单元按两端 RX 合计判定一次，两条腿只测量） · 双向 RX 平均合计 <span class=\"bidir-rx-sum\">{}</span> / 门限 {:.3} Mbps",
+            "双向汇总 · 按两端 RX 合计判定一次 · 双向 RX 平均合计 <span class=\"bidir-rx-sum\">{}</span> / 门限 {:.3} Mbps",
             esc(&rx_sum),
             target
         ),
         None => format!(
-            "双向方向汇总（未设置合计门限，每个方向各自按接收端 RX 判定） · 双向 RX 平均合计（各方向窗口，仅作诊断） <span class=\"bidir-rx-sum\">{}</span>",
+            "双向汇总 · 未设合计门限，按方向分别判定 · 双向 RX 平均合计，仅作诊断 <span class=\"bidir-rx-sum\">{}</span>",
             esc(&rx_sum)
         ),
     };
     h.push_str(&format!(
-        "<div class=\"direction-summary\" role=\"group\" aria-label=\"双向方向汇总\"><strong class=\"direction-summary-title\">{title}</strong>"
+        "<div class=\"direction-summary\" role=\"group\" aria-label=\"双向汇总\"><strong class=\"direction-summary-title\">{title}</strong>"
     ));
     push_bidirectional_direction(h, ab, &fallback_reason);
     push_bidirectional_direction(h, ba, &fallback_reason);
@@ -1015,7 +1045,7 @@ summary:focus-visible, a:focus-visible, .table-scroll:focus-visible, .overview-s
     h.push_str(
         "<div class=\"report-tools\"><button type=\"button\" data-toggle-all=\"open\">展开全部</button>\
          <button type=\"button\" data-toggle-all=\"close\">收起全部</button>\
-         <span class=\"tools-hint\">对本页所有可折叠区块生效（测试概览 / 逐行明细 / 原始输出，各自的 Ping·UDP·TCP 分节、每个单元、每段原始输出）</span></div>\n",
+         <span class=\"tools-hint\">展开或收起本页全部详情</span></div>\n",
     );
     // 逐样本 CSV 就在报告文件旁边的 run 目录里。读不到就不画图——
     // 单元测试写进临时目录、重放旧目录时 CSV 已被清掉，都是正常路径。

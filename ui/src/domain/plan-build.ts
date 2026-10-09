@@ -71,7 +71,7 @@ export interface UiTask {
   ping_count?: number;
   ping_payload_sizes?: number[];
   /**
-   * **单向**腿的接收门限（Mbps 绝对值），按方向分开填。
+   * **单向**方向的接收门限（Mbps 绝对值），按方向分开填。
    *
    * 和下面的双向门限是两件事，不能共用一个数：双向并发时两个方向互相抢，
    * 每个方向拿到的只有单向的一部分。
@@ -89,7 +89,7 @@ export interface UiTask {
    * 双向并发下**两端 RX 合计**的门限。
    *
    * 填了它，这个任务的双向单元只按 `AB 接收端 RX + BA 接收端 RX >= 门限`
-   * 判一次，两条腿各自只测量。Wi-Fi↔Wi-Fi 抢的是同一段空口时间，要求两个
+   * 判一次，两个方向各自只测量。Wi-Fi↔Wi-Fi 抢的是同一段空口时间，要求两个
    * 方向各达到一半没有物理依据。
    */
   rx_target_bidir_total?: string;
@@ -127,7 +127,7 @@ export interface UiPlan {
 /**
  * 方向的规范化。与后端 `canonical_ui_direction` 保持**同一套词义**。
  *
- * `both` 与 `bidir` 是两件不同的事：`both` 是两条独立的 A→B / B→A 单向腿，
+ * `both` 与 `bidir` 是两件不同的事：`both` 是两条独立的 A→B / B→A 单向测试，
  * `bidir` 是同一个双向并发单元。旧项目里两者都可能出现，把 `both` 显示成
  * 「双向」而在保存时悄悄改成 `bidir`，会**改变执行语义**——双向并发时两个
  * 方向的吞吐互相影响，跑出来的数完全不是一回事。
@@ -512,7 +512,7 @@ function newTask(plan: UiPlan, protocol: UiProtocol): UiTask {
     id,
     name: protocol.toUpperCase(),
     protocol,
-    // 默认两个单向而不是 bidir：`both`/两条单向腿与「双向并发」是两件不同的事，
+    // 默认两个单向而不是 bidir：`both`/两条单向测试与「双向并发」是两件不同的事，
     // 双向并发时两个方向的吞吐互相影响，跑出来的数完全不是一回事。
     directions: ['ab', 'ba'],
     ip: ['v4', 'v6'],
@@ -649,9 +649,9 @@ export function toggleTaskRecipe(
 }
 
 /**
- * 这个任务会不会真的跑 `direction` 这条**单向**腿。
+ * 这个任务会不会真的跑 `direction` 这条**单向**方向。
  *
- * `both` 是「两条独立单向腿」的旧写法（计划期展开成 ab + ba），所以它同时
+ * `both` 是「两条独立单向测试」的旧写法（计划期展开成 ab + ba），所以它同时
  * 覆盖两个方向——与后端 `normalized_ui_directions` 同一套词义。
  */
 export function taskUsesSingleDirection(task: UiTask, direction: 'ab' | 'ba'): boolean {
@@ -825,5 +825,5 @@ export function recipeSummary(recipe: UiRecipe, protocol: UiProtocol): string {
     if (recipe.windows?.length) parts.push(`-w ${recipe.windows.join('/')}`);
     if (recipe.udp_streams?.length) parts.push(`${recipe.udp_streams.join('/')} 流`);
   }
-  return parts.length ? parts.join(' · ') : '未填档位（等价于最朴素的一条）';
+  return parts.length ? parts.join(' · ') : '未填档位';
 }

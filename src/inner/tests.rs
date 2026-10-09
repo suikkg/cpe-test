@@ -650,7 +650,7 @@ fn the_plan_is_the_only_cartesian_product_and_keeps_the_user_order() {
     let plan = plan::build(&cfg).unwrap();
     // 网口 → 协议 → 方向 → 轮次，外层永远是网口。
     assert_eq!(plan.unit_count(), 2 * 2 * 3 * 2);
-    assert_eq!(plan.leg_count(), 2 * 2 * 4 * 2, "双向单元是两条腿");
+    assert_eq!(plan.leg_count(), 2 * 2 * 4 * 2, "双向单元是两个方向");
     assert_eq!(plan.bidir_units(), 2 * 2 * 2);
     let order: Vec<(&str, &str)> = plan
         .units
@@ -785,7 +785,7 @@ fn a_bidirectional_unit_is_one_unit_with_two_concurrent_legs_on_two_ports() {
     assert_eq!(unit.legs[1].flow, Flow::Down);
     assert_ne!(
         unit.legs[0].port, unit.legs[1].port,
-        "两条腿同时在跑，共用端口会把两股流灌进同一个 server"
+        "两个方向同时在跑，共用端口会把两股流灌进同一个 server"
     );
     assert_eq!(unit.legs[1].port, cfg.port + 1);
 
@@ -1524,13 +1524,21 @@ fn report_keeps_both_calibres_side_by_side_and_names_the_one_it_used() {
         protocol: Protocol::Udp,
         direction: Direction::Bidir,
         streams: 4,
+        bidir_targets: None,
+        parameters: config::Parameters {
+            streams: 1,
+            tcp_window: None,
+            udp_mbps: None,
+            udp_length: None,
+        },
         repeat: 1,
         measurement: Measurement::NicPreferred,
         verdict: "PASS".into(),
         resumed: false,
+        screenshot: None,
         reason: "PASS".into(),
         detail: "双向接收速率合计 1000.000Mbps".into(),
-        diagnostics: vec!["双向两条腿的共同有效重叠窗口 19.40s".into()],
+        diagnostics: vec!["双向两个方向的共同有效重叠窗口 19.40s".into()],
         total_mbps: Some(1000.0),
         total_target_mbps: Some(900.0),
         overlap_secs: Some(19.4),
@@ -1551,17 +1559,17 @@ fn report_keeps_both_calibres_side_by_side_and_names_the_one_it_used() {
         error: None,
     });
     for needle in [
-        "UDP",           // 协议列：一份报告里可能 TCP/UDP 混排
-        "双向并发",      // 方向语义不能退化成两条单向
-        "500.00",        // 工具发送
-        "488.10",        // 工具接收
-        "2.375%",        // 丢包率
-        "1000/42105",    // 丢包计数，百分比之外的原始证据
-        "487.50",        // 网卡 RX，验收口径
-        "网卡字节计数",  // 上行腿采用的来源
-        "工具接收汇总",  // 下行腿采用的来源
-        "1000.000 Mbps", // 双向合计
-        "19.40",         // 共同有效重叠
+        "UDP",          // 协议列：一份报告里可能 TCP/UDP 混排
+        "双向并发",     // 方向语义不能退化成两条单向
+        "500.00",       // 工具发送
+        "488.10",       // 工具接收
+        "2.375%",       // 丢包率
+        "1000/42105",   // 丢包计数，百分比之外的原始证据
+        "487.50",       // 网卡 RX，验收口径
+        "网卡字节计数", // 上行采用的来源
+        "工具接收汇总", // 下行采用的来源
+        "1000.00 Mbps", // 双向合计
+        "19.40",        // 共同有效重叠
         "客户端输出",
         "板侧 &lt;server&gt; 输出", // server 日志入报告且已转义
         "470.00",                   // RX 分布 P10
@@ -1618,10 +1626,18 @@ fn the_run_summary_counts_units_not_legs_and_keeps_the_failure_visible() {
                 protocol: Protocol::Tcp,
                 direction: Direction::Bidir,
                 streams: 1,
+                bidir_targets: None,
+                parameters: config::Parameters {
+                    streams: 1,
+                    tcp_window: None,
+                    udp_mbps: None,
+                    udp_length: None,
+                },
                 repeat: 1,
                 measurement: Measurement::NicStrict,
                 verdict: "PASS".into(),
                 resumed: false,
+                screenshot: None,
                 reason: "PASS".into(),
                 detail: String::new(),
                 diagnostics: Vec::new(),
@@ -1642,10 +1658,18 @@ fn the_run_summary_counts_units_not_legs_and_keeps_the_failure_visible() {
                 protocol: Protocol::Tcp,
                 direction: Direction::Upload,
                 streams: 1,
+                bidir_targets: None,
+                parameters: config::Parameters {
+                    streams: 1,
+                    tcp_window: None,
+                    udp_mbps: None,
+                    udp_length: None,
+                },
                 repeat: 1,
                 measurement: Measurement::NicStrict,
                 verdict: "NOT_EVALUATED".into(),
                 resumed: false,
+                screenshot: None,
                 reason: "NIC_RATE_MISSING".into(),
                 detail: String::new(),
                 diagnostics: Vec::new(),
@@ -1701,7 +1725,7 @@ fn bidirectional_aggregate_never_treats_a_missing_leg_as_pass() {
         &[sample_leg(Flow::Up, Source::Nic, 900.0)],
         &crate::verdict::VerdictResult::not_evaluated(
             crate::reason::ReasonCode::UnitDirectionResultMissing,
-            "双向合计需要上行和下行两条腿的结果，本单元缺少其中一条",
+            "双向合计需要上行和下行的结果，本单元缺少其中一条",
         ),
     );
     assert_eq!(result.verdict, Verdict::NotEvaluated);
@@ -1780,7 +1804,7 @@ fn server_lease_reaps_only_its_child_and_removes_its_resource_directory() {
     std::fs::remove_dir(base).unwrap();
 }
 
-fn unit_row(index: usize) -> UnitRow {
+pub(super) fn unit_row(index: usize) -> UnitRow {
     UnitRow {
         id: format!("unit-{index}"),
         index,
@@ -1790,10 +1814,18 @@ fn unit_row(index: usize) -> UnitRow {
         protocol: Protocol::Tcp,
         direction: Direction::Upload,
         streams: 1,
+        bidir_targets: None,
+        parameters: config::Parameters {
+            streams: 1,
+            tcp_window: None,
+            udp_mbps: None,
+            udp_length: None,
+        },
         repeat: 1,
         measurement: Measurement::NicPreferred,
         verdict: "MEASURED".into(),
         resumed: false,
+        screenshot: None,
         reason: "TARGET_UNKNOWN".into(),
         detail: "接收端网卡 RX 已测得".into(),
         diagnostics: Vec::new(),
@@ -2058,7 +2090,7 @@ fn ipv6_config_is_explicit_and_old_v2_projects_remain_ipv4_only() {
             .ip_versions,
         vec![4]
     );
-    assert_eq!(config::PROJECT_VERSION, 3);
+    assert_eq!(config::PROJECT_VERSION, 4);
 
     let mut cfg = dual_stack_example();
     cfg.ip_versions = vec![6];
@@ -2247,7 +2279,7 @@ fn ipv6_results_keep_version_in_reports_and_resume_rows() {
         units: vec![row],
         error: None,
     };
-    assert!(report::render(&report).contains("IPv6 / TCP"));
+    assert!(report::render(&report).contains("TCP / IPv6"));
 }
 
 #[test]
@@ -2492,7 +2524,7 @@ fn client_runs_cover_the_ramp_and_the_bidirectional_overlap() {
     }
 }
 
-/// `tool` 策略的双向单元：两条腿起跑差 1 秒（ADB 起的板侧 client 和本机 client
+/// `tool` 策略的双向单元：两个方向起跑差 1 秒（ADB 起的板侧 client 和本机 client
 /// 实际总有这么一截）。工具口径改用接收端 server 逐秒记录在共同窗口上求平均后，
 /// 这样的单元能正常判定；以前只认全程汇总，只要起跑差超过 100ms 就无法评价。
 #[test]
@@ -2594,7 +2626,7 @@ fn a_tool_strategy_bidir_unit_is_judged_on_the_receivers_per_second_rates() {
 
     let row = assemble(900.0);
     assert_eq!(row.verdict, "PASS", "{} {}", row.reason, row.detail);
-    // 爬升段被扣掉：两条腿都是 900，合计正好 1800。
+    // 爬升段被扣掉：两个方向都是 900，合计正好 1800。
     assert_eq!(row.total_mbps, Some(1_800.0));
     assert!(row
         .legs
@@ -2604,4 +2636,389 @@ fn a_tool_strategy_bidir_unit_is_judged_on_the_receivers_per_second_rates() {
     // 同一形状、稳态不够：照常判 RATE_FAIL，而不是无法评价。
     let row = assemble(700.0);
     assert_eq!(row.verdict, "RATE_FAIL", "{} {}", row.reason, row.detail);
+}
+
+#[test]
+fn parameter_axes_expand_commands_targets_and_resume_identities_together() {
+    let mut cfg = example();
+    cfg.links.truncate(1);
+    cfg.protocols = vec![Protocol::Tcp, Protocol::Udp];
+    cfg.directions = vec![Direction::Upload, Direction::Bidir];
+    cfg.udp_mbps = Some(100.0);
+    cfg.links[0].measurement = Measurement::NicPreferred;
+    cfg.links[0].tcp_thresholds = Some(config::Thresholds {
+        upload_min_mbps: Some(810.0),
+        bidir_total_min_mbps: Some(1500.0),
+        tool_upload_min_mbps: Some(710.0),
+        ..Default::default()
+    });
+    cfg.links[0].udp_thresholds = Some(config::Thresholds {
+        upload_min_mbps: Some(90.0),
+        bidir_total_min_mbps: Some(180.0),
+        tool_upload_min_mbps: Some(80.0),
+        ..Default::default()
+    });
+    cfg.parameter_options = config::ParameterOptions {
+        tcp_streams: vec![1, 4],
+        tcp_windows: vec!["64k".into(), "4m".into()],
+        udp_streams: vec![1, 2],
+        udp_rates_mbps: vec![100.0, 200.0],
+        udp_lengths: vec!["64".into(), "1400".into()],
+    };
+    let built = plan::build(&cfg).unwrap();
+    assert_eq!(built.unit_count(), 24);
+    assert_eq!(
+        built
+            .units
+            .iter()
+            .map(|u| &u.id)
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        24
+    );
+    for unit in &built.units {
+        let effective = unit.parameters.apply(&cfg, unit.protocol);
+        let request = client_request(&effective, &cfg.links[0], unit.protocol, Flow::Up, cfg.port);
+        assert_eq!(&request.extra[..2], &["-P", &unit.streams.to_string()]);
+        let udp = unit.protocol == Protocol::Udp;
+        assert_eq!(
+            unit.legs[0].nic_target_mbps,
+            Some(if udp { 90.0 } else { 810.0 })
+        );
+        assert_eq!(
+            unit.legs[0].tool_target_mbps,
+            Some(if udp { 80.0 } else { 710.0 })
+        );
+        if unit.is_bidir() {
+            assert_eq!(
+                unit.nic_total_target_mbps,
+                Some(if udp { 180.0 } else { 1500.0 })
+            );
+        }
+        if udp {
+            assert_eq!(
+                request.extra[3],
+                format!("{}M", unit.parameters.udp_mbps.unwrap())
+            );
+            assert_eq!(
+                request.extra[5],
+                unit.parameters.udp_length.as_ref().unwrap().as_str()
+            );
+        } else {
+            assert_eq!(
+                request.extra[3],
+                unit.parameters.tcp_window.as_ref().unwrap().as_str()
+            );
+        }
+    }
+    let preview = plan::preview(&cfg).unwrap();
+    assert_eq!(preview.rows.len(), built.unit_count());
+    assert!(preview
+        .rows
+        .iter()
+        .all(|r| r.parameter_label.contains("-P")));
+    let mut reordered = cfg.clone();
+    reordered.parameter_options.tcp_windows.reverse();
+    let ids = |c: &InnerConfig| {
+        plan::build(c)
+            .unwrap()
+            .units
+            .into_iter()
+            .map(|u| u.id)
+            .collect::<std::collections::HashSet<_>>()
+    };
+    assert_eq!(ids(&cfg), ids(&reordered));
+}
+
+#[test]
+fn explicit_single_axes_keep_legacy_resume_and_protocol_overrides_are_isolated() {
+    let mut cfg = example();
+    cfg.protocols = vec![Protocol::Tcp, Protocol::Udp];
+    cfg.udp_mbps = Some(100.0);
+    let legacy = plan::build(&cfg).unwrap();
+    cfg.parameter_options.tcp_streams = vec![cfg.streams(Protocol::Tcp)];
+    cfg.parameter_options.udp_streams = vec![cfg.streams(Protocol::Udp)];
+    cfg.parameter_options.udp_rates_mbps = vec![100.0];
+    let explicit = plan::build(&cfg).unwrap();
+    assert_eq!(
+        legacy.units.iter().map(|u| &u.id).collect::<Vec<_>>(),
+        explicit.units.iter().map(|u| &u.id).collect::<Vec<_>>()
+    );
+    cfg.links[0].udp_thresholds = Some(config::Thresholds {
+        upload_min_mbps: Some(12.0),
+        ..Default::default()
+    });
+    let changed = plan::build(&cfg).unwrap();
+    for (before, after) in explicit.units.iter().zip(&changed.units) {
+        if before.link != 0 || before.protocol == Protocol::Tcp {
+            assert_eq!(before.id, after.id);
+        } else {
+            assert_ne!(before.id, after.id);
+        }
+    }
+}
+
+#[test]
+fn invalid_axes_and_threshold_overrides_are_rejected_before_execution() {
+    let mut cfg = example();
+    cfg.parameter_options.tcp_streams = vec![1, 1];
+    assert!(plan::build(&cfg).is_err());
+    cfg.parameter_options.tcp_streams = vec![17];
+    assert!(plan::build(&cfg).is_err());
+    cfg.parameter_options.tcp_streams = vec![1];
+    cfg.parameter_options.tcp_windows = vec!["4m;reboot".into()];
+    assert!(plan::build(&cfg).is_err());
+    cfg.parameter_options = config::ParameterOptions::default();
+    cfg.links[0].tcp_thresholds = Some(config::Thresholds {
+        upload_min_mbps: Some(f64::NAN),
+        ..Default::default()
+    });
+    assert!(plan::build(&cfg).is_err());
+    cfg.links[0].tcp_thresholds = Some(config::Thresholds {
+        tool_upload_min_mbps: Some(10.0),
+        ..Default::default()
+    });
+    cfg.links[0].measurement = Measurement::NicStrict;
+    assert!(plan::build(&cfg).is_err());
+    cfg.links[0].tcp_thresholds = None;
+    cfg.protocols = vec![Protocol::Udp];
+    cfg.udp_mbps = None;
+    cfg.parameter_options.udp_rates_mbps = vec![100.0];
+    assert!(plan::build(&cfg).is_ok());
+    cfg.parameter_options.udp_rates_mbps = (1..=16).map(f64::from).collect();
+    cfg.parameter_options.udp_streams = (1..=16).collect();
+    cfg.parameter_options.udp_lengths = (1..=16).map(|n| n.to_string()).collect();
+    assert!(plan::build(&cfg).unwrap_err().contains("4096"));
+}
+
+fn readable_report_fixture() -> RunReport {
+    let mut cfg = example();
+    cfg.protocols = vec![Protocol::Tcp, Protocol::Udp];
+    cfg.directions = vec![Direction::Upload, Direction::Download, Direction::Bidir];
+    cfg.udp_mbps = Some(1000.0);
+    cfg.links[0].measurement = Measurement::NicPreferred;
+    cfg.links[1].measurement = Measurement::NicPreferred;
+    let mut total = unit_row(1);
+    total.direction = Direction::Bidir;
+    total.verdict = "PASS".into();
+    total.reason = "BIDIR_TOTAL_PASS".into();
+    total.detail = "两端接收速率合计达到网卡口径合计门限。".into();
+    total.total_mbps = Some(1875.0);
+    total.total_target_mbps = Some(1800.0);
+    total.overlap_secs = Some(20.0);
+    total.bidir_targets = Some(plan::BidirTargets {
+        nic_mbps: Some(1800.0),
+        tool_mbps: Some(1750.0),
+    });
+    total.parameters.tcp_window = Some("4m".into());
+    total.legs = vec![
+        sample_leg(Flow::Up, Source::Nic, 940.0),
+        sample_leg(Flow::Down, Source::Nic, 935.0),
+    ];
+    for leg in &mut total.legs {
+        leg.target_mbps = None;
+        leg.nic_target_mbps = None;
+        leg.nic_rx_mbps = leg.mbps;
+        let mbps = leg.mbps.unwrap();
+        leg.rx = RxDistribution {
+            p10_mbps: Some(mbps * 0.98),
+            median_mbps: Some(mbps),
+            p95_mbps: Some(mbps * 1.01),
+            min_mbps: Some(mbps * 0.95),
+            max_mbps: Some(mbps * 1.02),
+            rolling_coverage: 1.0,
+            stalled_ratio: 0.0,
+        };
+        leg.effective_secs = 20.0;
+        leg.coverage = 1.0;
+        leg.tool.sender_mbps = Some(mbps + 12.0);
+        leg.verdict = "MEASURED".into();
+        leg.nic_verdict = "MEASURED".into();
+        leg.tool.receiver_mbps = leg.mbps.map(|v| v * 0.995);
+        leg.detail = "按共同窗口测得接收速率，本方向只测量；双向合计在单元层验收。".into();
+        leg.rx_samples = Some(crate::protocol::MonitorStopOut {
+            samples: (0..=20)
+                .map(|i| crate::protocol::MonitorSample {
+                    elapsed_ms: i * 1000,
+                    rx_mbps: if i < 2 {
+                        600.0
+                    } else {
+                        leg.mbps.unwrap() + (i % 3) as f64 * 8.0
+                    },
+                    valid: i != 10,
+                    ..Default::default()
+                })
+                .collect(),
+            ..Default::default()
+        });
+    }
+    let mut failed = unit_row(2);
+    failed.protocol = Protocol::Udp;
+    failed.parameters.udp_mbps = Some(1000.0);
+    failed.parameters.udp_length = Some("1400".into());
+    failed.verdict = "RATE_FAIL".into();
+    failed.reason = "RATE_BELOW_TARGET".into();
+    failed.detail = "有效窗口平均接收速率 820.00 Mbps，低于 900.00 Mbps 门限。".into();
+    failed.legs[0].mbps = Some(820.0);
+    failed.legs[0].target_mbps = Some(900.0);
+    failed.legs[0].nic_rx_mbps = Some(820.0);
+    failed.legs[0].nic_target_mbps = Some(900.0);
+    failed.legs[0].nic_verdict = "RATE_FAIL".into();
+    failed.legs[0].verdict = "RATE_FAIL".into();
+    failed.legs[0].diagnostics =
+        vec!["UDP 丢包超出诊断门槛；速率判定仍只比较接收速率与门限。".into()];
+    let mut measured = unit_row(3);
+    measured.link = "Wi-Fi".into();
+    measured.host = "agent1".into();
+    measured.direction = Direction::Download;
+    measured.detail = "网卡采样不可用，使用工具接收速率；未设置工具门限。".into();
+    measured.legs = vec![sample_leg(Flow::Down, Source::Tool, 450.0)];
+    measured.legs[0].tool.receiver_mbps = Some(450.0);
+    measured.legs[0].nic_rx_mbps = None;
+    measured.legs[0].nic_verdict = "NOT_EVALUATED".into();
+    measured.legs[0].target_mbps = None;
+    measured.legs[0].verdict = "MEASURED".into();
+    let mut unknown = unit_row(4);
+    unknown.ip_version = 6;
+    unknown.verdict = "NOT_EVALUATED".into();
+    unknown.reason = "NIC_RATE_MISSING".into();
+    unknown.detail = "接收端采样覆盖不足，且没有可用的工具接收记录。".into();
+    unknown.legs[0].source = Source::None;
+    unknown.legs[0].mbps = None;
+    unknown.legs[0].nic_rx_mbps = None;
+    unknown.legs[0].coverage = 0.4;
+    unknown.legs[0].target_mbps = None;
+    let mut setup = unit_row(5);
+    setup.verdict = "SETUP_ERROR".into();
+    setup.reason = "UNIT_DIRECTION_RESULT_MISSING".into();
+    setup.detail = "接收端未就绪，未产生有效测量。".into();
+    setup.legs.clear();
+    let mut resumed = unit_row(6);
+    resumed.verdict = "PASS".into();
+    resumed.resumed = true;
+    resumed.reason = "RESUME_SKIP".into();
+    resumed.legs.clear();
+    RunReport {
+        schema_version: 3,
+        current: String::new(),
+        created_at: "布局预览 · 示例数据，非真实测试结果".into(),
+        config: cfg,
+        plan: None,
+        probe_only: false,
+        capability: None,
+        units: vec![total, failed, measured, unknown, setup, resumed],
+        error: None,
+    }
+}
+
+#[test]
+fn readable_inner_report_counts_units_and_exposes_the_actual_acceptance_basis() {
+    let report = readable_report_fixture();
+    let html = report::render(&report);
+    assert!(!html.contains("腿"), "报告只使用上行、下行及方向描述");
+    for needle in [
+        "测试概览",
+        "结果清单",
+        "单元明细",
+        "设备与配置",
+        "<dt>已记录单元</dt><dd>6</dd>",
+        "<dt>本轮达标</dt><dd>1</dd>",
+        "<dt>复用历史</dt><dd>1</dd>",
+        "50.0%",
+        "双向合计 1875.00 Mbps",
+        "合计门限 1800.00 Mbps",
+        "按两端 RX 合计判定",
+        "工具兜底",
+        "未设门限",
+        "未获取",
+        "本轮未重新测试",
+        "无测量结果",
+        "仅测量",
+        "无法评价",
+        "原始输出",
+        "含背景流量",
+        "class=\"rate-chart\"",
+    ] {
+        assert!(html.contains(needle), "报告缺少 {needle}");
+    }
+    let summary = html
+        .split("<section id=\"results\">")
+        .nth(1)
+        .unwrap()
+        .split("<section id=\"details\">")
+        .next()
+        .unwrap();
+    assert_eq!(summary.matches("<tr><td><a href=").count(), 6);
+    assert!(!summary.contains("客户端输出"), "原始输出不能挤进结果清单");
+    // SVG 引擎的不可信样本断口保留，两条腿各两段；不画虚构的判定窗口和门限。
+    assert_eq!(html.matches("<polyline class=\"rx\"").count(), 4);
+    assert!(!html.contains("class=\"target\""));
+    assert!(!html.contains("class=\"win\""));
+    if let Ok(path) = std::env::var("CPE_INNER_REPORT_PREVIEW") {
+        std::fs::write(path, html).unwrap();
+    }
+}
+
+#[test]
+fn inner_report_preserves_recorded_verdicts_and_does_not_sum_mixed_sources() {
+    let mut report = readable_report_fixture();
+    let unit = &mut report.units[0];
+    unit.legs[1].source = Source::Tool;
+    unit.total_mbps = None;
+    unit.total_target_mbps = None;
+    unit.verdict = "NOT_EVALUATED".into();
+    unit.detail = "两端来源不同，不能合计验收。".into();
+    let html = report::render(&report);
+    assert!(html.contains("未形成同来源合计"));
+    assert!(html.contains("配置网卡合计 1800.00 Mbps"));
+    assert!(!html.contains("双向合计 1875.00 Mbps"));
+    // 渲染层不比较速率或重算判定，也不能自行把只测量的数据判成 PASS。
+    let unit = &mut report.units[1];
+    unit.verdict = "MEASURED".into();
+    unit.legs[0].mbps = Some(9999.0);
+    let html = report::render(&report);
+    assert!(html.contains("<dt>本轮达标</dt><dd>0</dd>"));
+    assert!(html.contains("<dt>仅测量</dt><dd>2</dd>"));
+}
+
+#[test]
+fn inner_report_is_self_contained_and_escapes_identity_and_raw_output() {
+    let mut report = readable_report_fixture();
+    report.units[0].link = "<img src=x>".into();
+    report.units[0].parameters.tcp_window = Some("<script>alert(1)</script>".into());
+    let html = report::render(&report);
+    assert!(html.contains("&lt;img src=x&gt;"));
+    assert!(html.contains("&lt;script&gt;"));
+    for forbidden in [
+        "<script",
+        "<link",
+        "<img",
+        "@keyframes",
+        "backdrop-filter",
+        "@font-face",
+    ] {
+        assert!(!html.contains(forbidden));
+    }
+    assert!(html.contains("default-src 'none'"));
+}
+
+#[test]
+fn screenshot_option_defaults_matches_subnet_and_does_not_change_resume_identity() {
+    let mut cfg = example();
+    assert!(cfg.screenshot);
+    assert_eq!(cfg.screenshot, crate::config::Config::default().screenshot);
+    let before = plan::build(&cfg).unwrap();
+    cfg.screenshot = false;
+    let after = plan::build(&cfg).unwrap();
+    assert_eq!(
+        before.units.iter().map(|u| &u.id).collect::<Vec<_>>(),
+        after.units.iter().map(|u| &u.id).collect::<Vec<_>>()
+    );
+    let mut value = serde_json::to_value(&cfg).unwrap();
+    value.as_object_mut().unwrap().remove("screenshot");
+    assert!(
+        serde_json::from_value::<InnerConfig>(value)
+            .unwrap()
+            .screenshot
+    );
 }

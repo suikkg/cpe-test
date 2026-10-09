@@ -109,7 +109,7 @@ function remove(index: number, link: InnerLink): void {
   <div class="link-table">
     <section v-if="inner.capability" class="scan-picker" aria-label="从扫描结果添加网口">
       <strong>选择实际接到 CPE 的电脑网卡</strong>
-      <p class="muted">默认只列 192.168.* 和仅 IPv6 的网卡；添加后核对每个网口的 CPE LAN 地址，启动时还会检查链路。</p>
+      <p class="muted">默认显示 192.168.* 和仅 IPv6 的网卡。添加后核对 CPE LAN 地址。</p>
       <label v-if="otherCount" class="other-toggle"><input v-model="showOther" type="checkbox">显示其他网段 / 隧道接口（{{ otherCount }} 项）</label>
       <div v-if="choices.length" class="scan-options">
         <label v-for="choice in choices" :key="choice.key" class="scan-option">

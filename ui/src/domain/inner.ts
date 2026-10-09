@@ -1,8 +1,8 @@
 import type { HostInfo, NicInfo } from '../api/dto';
 
 export const INNER_KIND = 'cpe-inner-project';
-/** v3 增加 IP 版本；v1/v2 缺少版本选择时保持 IPv4。 */
-export const INNER_VERSION = 3;
+/** v4 增加多档位与协议门限；v3 增加 IP 版本，旧文件缺省 IPv4。 */
+export const INNER_VERSION = 4;
 export const INNER_DRAFT_KEY = 'cpe_inner_project_v1';
 export const INNER_DEFAULT_GATEWAY = '192.168.0.1';
 export const INNER_DEFAULT_BOARD_RX = 'br0';
@@ -12,9 +12,9 @@ export interface InnerAgent { id: string; address: string; port: number; token?:
 export type InnerProtocol = 'tcp' | 'udp';
 export type InnerIpVersion = 4 | 6;
 export const INNER_IP_VERSIONS: InnerIpVersion[] = [4, 6];
-/** 页面上的方向。`bidir` 是一个含上下行两条腿的单元，不是两次顺序单向。 */
+/** 页面上的方向。`bidir` 是一个含上行和下行的单元，不是两次顺序单向。 */
 export type InnerDirection = 'upload' | 'download' | 'bidir';
-/** 一条腿的数据走向。 */
+/** 一个方向的数据走向。 */
 export type InnerFlow = 'up' | 'down';
 /** 接收速率取自哪一层。 */
 export type InnerMeasurement = 'nic_strict' | 'nic_preferred' | 'tool';
@@ -30,9 +30,9 @@ export const MEASUREMENT_LABEL: Record<InnerMeasurement, string> = {
   tool: '工具接收速率',
 };
 export const MEASUREMENT_HINT: Record<InnerMeasurement, string> = {
-  nic_strict: '使用接收网卡速率判定；无法取得可信采样时标记为 NOT_EVALUATED。',
-  nic_preferred: '优先使用接收网卡速率；无法取得可信采样时改用工具接收速率，并应用工具门限。',
-  tool: '使用工具接收速率判定，需单独填写工具门限；网卡速率作为参考。',
+  nic_strict: '按接收网卡速率判定；采样不可信时无法评价。',
+  nic_preferred: '优先使用网卡速率；采样不可信时使用工具速率和工具门限。',
+  tool: '按工具接收速率和工具门限判定；网卡速率仅供参考。',
 };
 export const SOURCE_LABEL: Record<string, string> = {
   nic: '网卡字节计数',
@@ -40,6 +40,20 @@ export const SOURCE_LABEL: Record<string, string> = {
   none: '无可信来源',
 };
 
+export const INNER_THRESHOLD_KEYS = ['upload_min_mbps', 'download_min_mbps', 'bidir_total_min_mbps', 'tool_upload_min_mbps', 'tool_download_min_mbps', 'tool_bidir_total_min_mbps'] as const;
+export type InnerThresholds = Record<typeof INNER_THRESHOLD_KEYS[number], number | null>;
+export const emptyInnerThresholds = (): InnerThresholds => Object.fromEntries(INNER_THRESHOLD_KEYS.map(key => [key, null])) as InnerThresholds;
+export interface InnerParameterOptions { tcp_streams: number[]; udp_streams: number[]; tcp_windows: string[]; udp_rates_mbps: number[]; udp_lengths: string[] }
+export const emptyInnerParameterOptions = (): InnerParameterOptions => ({ tcp_streams: [], udp_streams: [], tcp_windows: [], udp_rates_mbps: [], udp_lengths: [] });
+export interface InnerParameters { streams: number; tcp_window: string | null; udp_mbps: number | null; udp_length: string | null }
+export function innerParameterLabel(p: InnerParameters, protocol: InnerProtocol): string {
+  return protocol === 'tcp' ? `-P ${p.streams} / -w ${p.tcp_window ?? '默认'}` : `-P ${p.streams} / -b ${p.udp_mbps} Mbps / -l ${p.udp_length ?? '默认'}`;
+}
+/** 不过滤非法项：拼错一个档位必须报错，不能悄悄少测。 */
+export function parseInnerParameterTokens(raw: string, numeric: boolean): string[] | number[] {
+  const tokens = raw.split(/[,，、\s]+/).filter(Boolean);
+  return numeric ? tokens.map(Number) : tokens;
+}
 export interface InnerLink {
   name: string;
   host: string;
@@ -62,9 +76,12 @@ export interface InnerLink {
   tool_upload_min_mbps: number | null;
   tool_download_min_mbps: number | null;
   tool_bidir_total_min_mbps: number | null;
+  tcp_thresholds?: InnerThresholds | null; udp_thresholds?: InnerThresholds | null;
 }
 
 export interface InnerConfig {
+  screenshot?: boolean;
+  parameter_options?: InnerParameterOptions;
   adb_path: string; serial: string; board_iperf: string; duration_secs: number;
   parallel: number; ip_versions: InnerIpVersion[]; protocols: InnerProtocol[]; directions: InnerDirection[];
   tcp_streams: number | null; udp_streams: number | null; tcp_window: string | null;
@@ -87,7 +104,7 @@ export interface InnerCapability {
   board_inventory_error?: string | null;
 }
 
-/** 一条腿的结果。网卡口径始终单独留一份，兜底用了工具也不会改写它。 */
+/** 一个方向的结果。网卡口径始终单独留一份，兜底用了工具也不会改写它。 */
 export interface InnerLeg {
   flow: InnerFlow; port: number; receiver: string; receiver_host: string;
   counter_source: string | null;
@@ -100,11 +117,14 @@ export interface InnerLeg {
   udp_loss_pct: number | null; udp_lost_datagrams: number | null; udp_total_datagrams: number | null;
 }
 
-/** 一行 = 一个测试单元。双向的两条腿挂在同一行下面。 */
+/** 一行 = 一个测试单元。双向的两个方向挂在同一行下面。 */
 export interface InnerUnit {
   id?: string; index: number; link: string; host: string; protocol: InnerProtocol; direction: InnerDirection;
   ip_version?: InnerIpVersion;
+  bidir_targets?: { nic_mbps: number | null; tool_mbps: number | null } | null;
+  parameters?: InnerParameters;
   streams: number; repeat: number; measurement: InnerMeasurement;
+  screenshot?: { host: string; path: string; error: string | null } | null;
   verdict: string; resumed?: boolean; reason: string; detail: string; diagnostics: string[];
   total_mbps: number | null; total_target_mbps: number | null; overlap_secs: number | null;
   legs: InnerLeg[];
@@ -140,6 +160,7 @@ export interface InnerPreviewLeg {
 export interface InnerPreviewRow {
   id?: string; index: number; link: string; host: string; protocol: InnerProtocol; direction: InnerDirection;
   ip_version?: InnerIpVersion;
+  parameters?: InnerParameters; parameter_label?: string;
   repeat: number; measurement: InnerMeasurement; legs: InnerPreviewLeg[]; verdict_basis: string; resumed?: boolean;
 }
 /** 计划预览由后端的 plan 模块产出——页面不再自己算一遍笛卡尔积。 */
@@ -157,11 +178,11 @@ export interface InnerRunEntry {
 }
 
 export function defaultInnerConfig(): InnerConfig {
-  return { adb_path: 'adb', serial: '', board_iperf: 'iperf3', duration_secs: 20,
+  return { parameter_options: emptyInnerParameterOptions(), adb_path: 'adb', serial: '', board_iperf: 'iperf3', duration_secs: 20,
     parallel: 1, ip_versions: [4], protocols: ['tcp'], directions: ['upload', 'download'],
     tcp_streams: null, udp_streams: null, tcp_window: null,
     udp_mbps: null, udp_length: null, max_udp_loss_pct: null,
-    port: 56190, repeats: 1, resume: false, agents: [], links: [] };
+    port: 56190, repeats: 1, resume: false, screenshot: true, agents: [], links: [] };
 }
 
 /** 与后端 `size_token` 同一条白名单：`-w` / `-l` 原样进 iperf3 命令行。 */
@@ -183,7 +204,7 @@ export function innerLink(host = 'master', nic?: NicInfo, name = 'ETH'): InnerLi
     local_ipv6: nic ? innerNicIpv6(nic) || null : null, gateway_ipv6: null,
     gateway: INNER_DEFAULT_GATEWAY, board_rx_interface: INNER_DEFAULT_BOARD_RX, measurement: 'nic_preferred',
     upload_min_mbps: null, download_min_mbps: null, bidir_total_min_mbps: null,
-    tool_upload_min_mbps: null, tool_download_min_mbps: null, tool_bidir_total_min_mbps: null };
+    tool_upload_min_mbps: null, tool_download_min_mbps: null, tool_bidir_total_min_mbps: null, tcp_thresholds: null, udp_thresholds: null };
 }
 
 function record(value: unknown): value is Record<string, unknown> {
@@ -330,21 +351,35 @@ export function parseInnerProject(text: string): InnerConfig {
   // 存得下、后端一跑就报错，人得在两处之间来回猜。
   if (!isAdbProgram(cfg.adb_path)) throw new Error('ADB 路径必须是本机上名为 adb 或 adb.exe 的文件（可带版本号如 adb-1.0.41，可含空格/反斜杠，不接受网络路径）');
   if (!innerSafeWord(cfg.board_iperf) || (cfg.serial !== '' && !innerSafeWord(cfg.serial))) throw new Error('序列号和板侧工具只能含字母、数字及 _./:-，且不能以 - 开头');
-  // 双向单元的两条腿各占一个端口，所以端口上限留一格给 port + 1。
+  // 双向单元的两个方向各占一个端口，所以端口上限留一格给 port + 1。
   if (!number(cfg.duration_secs, 6, 3600, true) || !number(cfg.parallel, 1, 16, true) || !number(cfg.port, 1024, 65534, true) || !number(cfg.repeats, 1, 10, true)) throw new Error('时长应为 6–3600 秒，并行流 1–16，端口 1024–65534（双向占用 port 与 port+1），重复轮次 1–10');
   const list = <T,>(values: unknown, allowed: readonly T[]): T[] => {
     if (!Array.isArray(values) || !values.length || values.length > allowed.length) throw new Error('IP 版本、协议和方向都至少选一项');
     if (new Set(values).size !== values.length || values.some((v) => !allowed.includes(v as T))) throw new Error('IP 版本、协议和方向不能重复或取未知值');
     return values as T[];
   };
+  if (typeof cfg.screenshot !== 'boolean') throw new Error('截图开关必须为布尔值');
   cfg.protocols = list(cfg.protocols, INNER_PROTOCOLS);
   cfg.ip_versions = list(cfg.ip_versions, INNER_IP_VERSIONS);
   cfg.directions = list(cfg.directions, INNER_DIRECTIONS);
   for (const streams of [cfg.tcp_streams, cfg.udp_streams]) {
     if (streams !== null && !number(streams, 1, 16, true)) throw new Error('按协议覆盖的并发流数应留空或为 1–16');
   }
+  const rawOptions: unknown = cfg.parameter_options;
+  if (!record(rawOptions)) throw new Error('打流档位必须是对象');
+  onlyKeys(rawOptions, Object.keys(emptyInnerParameterOptions()));
+  const options = { ...emptyInnerParameterOptions(), ...rawOptions };
+  for (const [key, values] of Object.entries(options)) {
+    if (!Array.isArray(values) || values.length > 16 || new Set<string | number>(values).size !== values.length) throw new Error('每项打流档位最多 16 项，且不能重复');
+    if (key === 'tcp_windows' || key === 'udp_lengths') {
+      if (values.some(v => typeof v !== 'string' || !innerSizeToken(v))) throw new Error('窗口和包长档位只能是数字加可选 k/m/g');
+    } else if (values.some(v => !number(v, Number.MIN_VALUE, key === 'udp_rates_mbps' ? 1e6 : 16, key !== 'udp_rates_mbps'))) throw new Error('流数档位应为 1–16；UDP 速率档位应为正数 Mbps（上限 1000000）');
+  }
+  cfg.parameter_options = options;
   const udp = cfg.protocols.includes('udp');
-  if (udp ? !number(cfg.udp_mbps, Number.MIN_VALUE, 1e6) : cfg.udp_mbps !== null) throw new Error('UDP 必须填写每条流的速率；不测 UDP 时不接受该项');
+  if (!cfg.protocols.includes('tcp') && (options.tcp_streams.length || options.tcp_windows.length)) throw new Error('不测 TCP 时不接受 TCP 档位');
+  if (!udp && (options.udp_streams.length || options.udp_rates_mbps.length || options.udp_lengths.length)) throw new Error('不测 UDP 时不接受 UDP 档位');
+  if ((cfg.udp_mbps !== null && !number(cfg.udp_mbps, Number.MIN_VALUE, 1e6)) || (udp ? cfg.udp_mbps === null && !options.udp_rates_mbps.length : cfg.udp_mbps !== null)) throw new Error('UDP 必须填写每条流的速率；不测 UDP 时不接受该项');
   for (const [label, value] of [['tcp_window', cfg.tcp_window], ['udp_length', cfg.udp_length]] as const) {
     if (value !== null && (typeof value !== 'string' || !innerSizeToken(value))) throw new Error(`${label} 只能是数字加可选的 k/m/g，例如 4m、1400`);
   }
@@ -405,6 +440,20 @@ export function parseInnerProject(text: string): InnerConfig {
       link.tool_upload_min_mbps, link.tool_download_min_mbps, link.tool_bidir_total_min_mbps]) {
       if (value !== null && !number(value, Number.MIN_VALUE, 1e6)) throw new Error('验收门限应留空或为正数 Mbps');
     }
+    for (const key of ['tcp_thresholds', 'udp_thresholds'] as const) {
+      const rawThresholds: unknown = link[key];
+      if (rawThresholds === null || rawThresholds === undefined) continue;
+      if (!record(rawThresholds)) throw new Error('分协议门限必须是对象');
+      onlyKeys(rawThresholds, [...INNER_THRESHOLD_KEYS]);
+      const thresholds = { ...emptyInnerThresholds(), ...rawThresholds } as InnerThresholds;
+      for (const key of INNER_THRESHOLD_KEYS) {
+        const value = thresholds[key];
+        if (value !== null && !number(value, Number.MIN_VALUE, 1e6)) throw new Error('分协议门限应留空或为正数 Mbps');
+        if (value !== null && key.startsWith('tool_') && link.measurement === 'nic_strict') throw new Error('网卡计数严格模式不接受工具口径门限');
+        if (value !== null && key.includes('bidir') && !bidir) throw new Error('未勾选双向并发时不接受双向合计门限');
+      }
+      link[key] = thresholds;
+    }
     // 严格模式永远走不到工具口径，配了工具门限就是配了个永不生效的数。
     if (link.measurement === 'nic_strict' && [link.tool_upload_min_mbps, link.tool_download_min_mbps, link.tool_bidir_total_min_mbps].some((v) => v !== null)) throw new Error(`${link.name}: 网卡计数严格模式不会用到工具口径，因此不接受工具口径门限`);
     if (!bidir && [link.bidir_total_min_mbps, link.tool_bidir_total_min_mbps].some((v) => v !== null)) throw new Error(`${link.name}: 未勾选双向并发时不接受双向合计门限`);
@@ -416,6 +465,10 @@ export function parseInnerProject(text: string): InnerConfig {
     names.add(link.name);
     return link;
   });
+  const axis = (values: unknown[]) => Math.max(1, values.length);
+  const variants = (cfg.protocols.includes('tcp') ? axis(options.tcp_streams) * axis(options.tcp_windows) : 0)
+    + (udp ? axis(options.udp_streams) * axis(options.udp_rates_mbps) * axis(options.udp_lengths) : 0);
+  if (cfg.links.filter(l => l.enabled).length * cfg.ip_versions.length * cfg.directions.length * cfg.repeats * variants > 4096) throw new Error('内环计划最多 4096 个单元，请减少档位或重复轮次');
   return cfg;
 }
 
@@ -435,7 +488,9 @@ export function normalizeInnerDraft(cfg: InnerConfig): InnerConfig {
   const tcp = cfg.protocols.includes('tcp');
   const udp = cfg.protocols.includes('udp');
   const bidir = cfg.directions.includes('bidir');
+  const options = { ...emptyInnerParameterOptions(), ...cfg.parameter_options };
   return { ...cfg,
+    parameter_options: { tcp_streams: tcp ? options.tcp_streams : [], tcp_windows: tcp ? options.tcp_windows : [], udp_streams: udp ? options.udp_streams : [], udp_rates_mbps: udp ? options.udp_rates_mbps : [], udp_lengths: udp ? options.udp_lengths : [] },
     tcp_streams: tcp ? num(cfg.tcp_streams) : null,
     udp_streams: udp ? num(cfg.udp_streams) : null,
     tcp_window: tcp ? text(cfg.tcp_window) : null,
@@ -445,7 +500,9 @@ export function normalizeInnerDraft(cfg: InnerConfig): InnerConfig {
     agents: cfg.agents.map((agent) => ({ ...agent, address: agent.address.trim() })),
     links: cfg.links.map((link) => {
       const tool = link.measurement !== 'nic_strict';
+      const cleanThresholds = (t: InnerThresholds | null | undefined): InnerThresholds | null => t ? Object.fromEntries(INNER_THRESHOLD_KEYS.map(key => [key, (key.startsWith('tool_') && !tool) || (key.includes('bidir') && !bidir) ? null : num(t[key])])) as InnerThresholds : null;
       return { ...link,
+        tcp_thresholds: cleanThresholds(link.tcp_thresholds), udp_thresholds: cleanThresholds(link.udp_thresholds),
         local_ip: link.local_ip.trim() || (cfg.ip_versions.includes(4) && link.enabled ? '' : '0.0.0.0'),
         gateway: link.gateway.trim() || (cfg.ip_versions.includes(4) && link.enabled ? '' : '0.0.0.0'),
         local_ipv6: text(link.local_ipv6), gateway_ipv6: text(link.gateway_ipv6),

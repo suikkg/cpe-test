@@ -34,6 +34,14 @@ impl Remote {
         path: &str,
         request: &impl Serialize,
     ) -> Result<T, String> {
+        self.post_with_timeout(path, request, Duration::from_secs(15))
+    }
+    pub fn post_with_timeout<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        request: &impl Serialize,
+        timeout: Duration,
+    ) -> Result<T, String> {
         let body = serde_json::to_string(request).map_err(|e| e.to_string())?;
         let (status, text) = crate::http_client::post_json_auth_with_transport(
             self.transport.as_ref(),
@@ -42,7 +50,7 @@ impl Remote {
             path,
             &body,
             &self.config.token,
-            Duration::from_secs(15),
+            timeout,
         )?;
         if status != 200 {
             return Err(format!(
@@ -221,6 +229,45 @@ mod tests {
     use crate::http_client::{HttpRequest, HttpResponse, Transport};
     use serde_json::json;
     use std::sync::Mutex;
+
+    struct ScreenshotAgent;
+    impl Transport for ScreenshotAgent {
+        fn send(&self, req: &HttpRequest, timeout: Duration) -> Result<HttpResponse, String> {
+            assert_eq!(req.path, "/screenshot");
+            assert_eq!(req.token.as_deref(), Some("test-secret"));
+            assert_eq!(timeout, Duration::from_secs(180));
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&req.body).unwrap()["label"],
+                "inner_unit_1"
+            );
+            Ok(HttpResponse::new(
+                200,
+                json!({"ok":true,"data":{"image_b64":"iVBORw0KGgo=","format":"png"}}).to_string(),
+            ))
+        }
+    }
+    #[test]
+    fn screenshot_uses_authenticated_agent_and_subnet_timeout() {
+        let remote = Remote::with_transport(
+            AgentConfig {
+                id: "agent1".into(),
+                address: "agent.example".into(),
+                port: 28801,
+                token: "test-secret".into(),
+            },
+            Arc::new(ScreenshotAgent),
+        );
+        let out: crate::protocol::ScreenshotOut = remote
+            .post_with_timeout(
+                "/screenshot",
+                &crate::protocol::ScreenshotReq {
+                    label: "inner_unit_1".into(),
+                },
+                Duration::from_secs(180),
+            )
+            .unwrap();
+        assert_eq!(out.format, "png");
+    }
 
     struct ScanAgent {
         supports_all: bool,

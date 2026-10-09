@@ -386,7 +386,7 @@ function cleanPlan(value: unknown, notices: string[]): UiPlan | { error: string 
   if (stripped.mode > 0) {
     notices.push(
       `已移除 ${stripped.mode} 处废弃的 mode 字段：档位由轴的取值个数决定（单值=钉死、多值=扫描），` +
-        `mode 从来没有被计划编译器读过。这个字段是旧版界面自动写进去的，不影响你的计划。`,
+        `已忽略旧版 mode 字段，不影响计划。`,
     );
   }
   return plan;
@@ -513,7 +513,7 @@ function noticeWifiMigrations(source: Record<string, unknown>, notices: string[]
   if (legacyDirectionalBidirNotice(source.wifi_band_thresholds)) {
     notices.push(
       '旧版按方向填的两个双向门限已迁移为「两端 RX 合计 = 两者之和」；' +
-        '只填过一个方向的规则没有推导合计，需要你自己确认一次。',
+        '仅配置了一个方向，请确认双向合计门限。',
     );
   }
   if (nonNegative(source.wifi_pair_bidir_rx_target_mbps) > 0) {

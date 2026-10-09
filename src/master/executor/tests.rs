@@ -3265,7 +3265,7 @@ fn test_bidir_small_leg_keeps_its_window_when_one_of_its_streams_fails() {
     // 10/12/34/36 就是这样丢掉了 8 行 493~923Mbps 的实测。
     assert!(
         windows.per_leg[0].complete,
-        "对向腿失败不得连坐抹掉本腿的有效窗口"
+        "对向方向失败不得连坐抹掉本方向的有效窗口"
     );
     assert_eq!(windows.per_leg[0].available_secs, 184.0);
 
@@ -3445,11 +3445,11 @@ fn a_missing_monitor_only_blanks_its_own_leg() {
     let windows =
         select_udp_effective_windows(&plans, &results, &monitors, &RateCheckCfg::default());
 
-    assert!(!windows.per_leg[0].complete, "ab 腿没有采样，无从判定");
+    assert!(!windows.per_leg[0].complete, "ab 方向没有采样，无从判定");
     assert_eq!(windows.per_leg[0].available_secs, 0.0);
     assert!(
         windows.per_leg[1].complete,
-        "ba 腿的采样是完整的，不能被对向的监控丢失连累"
+        "ba 方向的采样是完整的，不能被对向的监控丢失连累"
     );
     assert_eq!(windows.concurrency_secs, 0.0);
 }
@@ -4044,7 +4044,7 @@ fn the_unit_reason_has_one_source_for_both_the_report_and_the_progress_page() {
     // 出过问题的那一行：进度页直接取腿级理由，不看合计判定。
     assert!(
         !source.contains("reason_detail: reasons.first().cloned().unwrap_or_default()"),
-        "进度页不能再绕过合计判定直接取腿级理由"
+        "进度页不能再绕过合计判定直接取方向级理由"
     );
 }
 
@@ -6046,7 +6046,7 @@ fn progress_line_uses_nic_rate_and_only_active_iperf_rates() {
     assert!(line.contains("nic-rx=2368.4Mbps"));
     assert!(line.contains("iperf=2379.0Mbps"));
 
-    // 双向两腿并行输出重试日志，缺了方向前缀就无法把 attempt/retry 归到
+    // 双向的两个方向并行输出重试日志，缺了方向前缀就无法把 attempt/retry 归到
     // AB 还是 BA —— master.log 里两条 #1 会完全分不开。
     assert_eq!(fmt_tag_bracket("ab"), "[ab]");
     assert_eq!(fmt_tag_bracket("ba"), "[ba]");
@@ -6498,7 +6498,7 @@ fn every_production_row_is_built_through_the_shared_constructor() {
 #[test]
 fn socket_buffer_drain_does_not_drag_the_window_past_the_end_of_traffic() {
     // 现场回归：run_20260905_125327_5940 的 unit-112（★★双向 V4 TCP，
-    // 主控 以太网 5 ↔ 辅测 以太网 18）的 ba 腿。
+    // 主控 以太网 5 ↔ 辅测 以太网 18）的 ba 方向。
     //
     // `-w 256m -P 10` = 2.56GB socket 缓冲，client 的 `-t 60` 到点后还要十几秒
     // 排空；末尾两条逐秒行连同汇总行一起压到 74.635s 才吐出来。只用行内时长、
@@ -6893,7 +6893,7 @@ fn every_transport_shares_one_window_completeness_tolerance() {
         // 第四处：内环双向单元的重叠窗口（`overlap_window`）。它和三条链路
         // 推出来的窗口拿同一把尺子量「跑满没有」，量歪了同样是 PASS 对
         // EFFECTIVE_WINDOW_SHORT 的差别，只不过发生在双向单元和它自己的
-        // 两条腿之间。
+        // 两个方向之间。
         include_str!("../../inner/mod.rs"),
     ];
     let code: String = sources
@@ -7144,7 +7144,7 @@ fn comparison_identity_keeps_both_legs_without_changing_resume_or_leg_tags() {
 /// **流数不进对比身份。**
 ///
 /// 开着「按链路上限裁剪」时，UDP 的流数是 `floor(路径上限 / -b)`，路径上限跟着
-/// 协商速率走：同一条链路从 2.5G 降到 1G，4 条流可能变成 1 条，腿也从
+/// 协商速率走：同一条链路从 2.5G 降到 1G，4 条流可能变成 1 条，方向也从
 /// `IperfGroup` 变成 `IperfSingle`。按流展开参数的话，这条测试在两轮里就是两把键，
 /// 对比报告把一次掉速报成「本轮缺失 + 本轮新增」。
 #[test]
@@ -7264,7 +7264,7 @@ fn cts_status_lines_restored_from_time_slice_give_a_complete_window() {
     assert!(window.end_ms <= 34_103);
 }
 
-/// 三条吞吐路径的腿级行都要带上 RX 分布四项，且取自同一个 `rx_stats`。
+/// 三条吞吐路径的方向级行都要带上 RX 分布四项，且取自同一个 `rx_stats`。
 ///
 /// 实机 B1-F04：CTS 行的中位 / P95 / 最小 / 最大一直是空的——`rx_stats` 早就算好了，
 /// 只是 CTS 构造行时没填，HTML 与 Excel 这四列对 CTS 永远空白，而 iperf 行有值。
@@ -7323,7 +7323,7 @@ fn an_operator_stop_is_explained_only_on_the_unit_it_cut_short() {
     assert_eq!(operator_interruption_note(false, false, true), None);
     assert_eq!(operator_interruption_note(false, false, false), None);
 
-    // 单元收尾确实按「这一格有没有腿被掐断」去问，而不是只看停止位。
+    // 单元收尾确实按「这一格有没有方向被掐断」去问，而不是只看停止位。
     let source = std::fs::read_to_string(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/master/executor.rs"),
     )

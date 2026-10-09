@@ -868,7 +868,7 @@ mod tests {
         assert!(diff.has_regression());
     }
 
-    /// 6.5.1 写下的多流身份按流重复参数；新记录每条腿一项。两者必须对得上。
+    /// 6.5.1 写下的多流身份按流重复参数；新记录每个方向一项。两者必须对得上。
     #[test]
     fn a_6_5_1_identity_with_one_parameter_per_stream_still_lines_up() {
         let base = summary_only(&rows(&[("x", Verdict::Pass, Some(1900.0))]));

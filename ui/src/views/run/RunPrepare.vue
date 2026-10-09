@@ -235,7 +235,7 @@ onMounted(() => {
         <label class="check" title="打流期间每秒测一次 32 字节 Ping，结果只进诊断">
           <input v-model="plan.probeDuringTraffic" type="checkbox" />测负载下时延
         </label>
-        <label class="check" title="IPv4 Ping 单元额外探测不分片的最大包长，结果只进诊断">
+        <label class="check" title="IPv4 Ping 额外探测最大不分片包长，仅作诊断">
           <input v-model="plan.probePathMtu" type="checkbox" />探路径 MTU
         </label>
         <label class="check">

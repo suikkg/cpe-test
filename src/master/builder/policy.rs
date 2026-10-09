@@ -118,7 +118,7 @@ pub(crate) enum RxTargetSource {
 impl RxTargetSource {
     pub(crate) fn label(self) -> &'static str {
         match self {
-            RxTargetSource::BidirTotal => "双向 RX 合计门限（本腿只测量）",
+            RxTargetSource::BidirTotal => "双向 RX 合计门限（本方向只测量）",
             RxTargetSource::BidirDirection => "双向方向门限",
             RxTargetSource::SingleDirection => "单向方向门限",
             RxTargetSource::NicPolicy => "按网口门限",
@@ -187,7 +187,7 @@ pub(super) fn leg_rate_plan(
             .map(|per_direction| {
                 format!(
                     "双向 RX 合计门限 {total:.0}Mbps 已盖掉逐方向门限 {flow_direction} \
-                     {per_direction:.0}Mbps：本单元只比一次合计，两条腿各自不再判定。\
+                     {per_direction:.0}Mbps：本单元只比一次合计，两个方向各自不再判定。\
                      要逐方向把关，请清掉合计门限。"
                 )
             });
@@ -334,7 +334,7 @@ pub(super) fn cts_datagram_bytes(profile: &UdpProfile) -> Result<Option<u32>, St
         })
 }
 
-/// 一条方向腿实际下发的 UDP 负载：单流 `-b` 与流数。
+/// 一个方向实际下发的 UDP 负载：单流 `-b` 与流数。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct UdpLoad {
     pub bits_per_second: u64,
@@ -357,7 +357,7 @@ impl UdpLoad {
     }
 }
 
-/// 按整条路径的可信负载上限决定这条腿的 `-b` 和流数。
+/// 按整条路径的可信负载上限决定这个方向的 `-b` 和流数。
 ///
 /// 优先降流数（保持单流带宽不变），流数已经降到 1 仍然超限时才压 `-b`。
 ///
@@ -398,7 +398,7 @@ pub(crate) fn udp_load_for_leg(
     if fit >= 1.0 {
         return as_requested((fit as u32).clamp(1, want));
     }
-    // 单流就已经超过整条路径的可信上限：压 -b，而不是放弃这条腿。
+    // 单流就已经超过整条路径的可信上限：压 -b，而不是放弃这个方向。
     let bits_per_second = (ceiling * 1_000_000.0).round().max(1.0) as u64;
     UdpLoad {
         bits_per_second,
@@ -409,9 +409,9 @@ pub(crate) fn udp_load_for_leg(
     }
 }
 
-/// 一条 UDP 腿实际下发的负载。
+/// 一条 UDP 方向实际下发的负载。
 ///
-/// 链路策略给了这条腿的单流带宽就用它（明确配过的不再自动裁剪，见
+/// 链路策略给了这个方向的单流带宽就用它（明确配过的不再自动裁剪，见
 /// `udp_load_for_leg`），否则用档位带宽；再按整条路径的可信上限先降流数、
 /// 单流仍放不下才压 `-b`。
 ///
@@ -425,7 +425,7 @@ pub(super) fn udp_leg_load(
     requested: ParsedBandwidth,
     want_streams: u32,
 ) -> UdpLoad {
-    // 单口覆盖 / 角色配对可以改写这条腿的单流带宽；解析不了就退回全局档位，
+    // 单口覆盖 / 角色配对可以改写这个方向的单流带宽；解析不了就退回全局档位，
     // 绝不因为一个笔误让任务凭空消失。
     let configured = link_policy(spec, sender, receiver)
         .udp_bandwidth
@@ -441,9 +441,9 @@ pub(super) fn udp_leg_load(
     )
 }
 
-/// 一条 UDP 腿实际用的档位：发送口可以单独覆盖报文长度。
+/// 一条 UDP 方向实际用的档位：发送口可以单独覆盖报文长度。
 ///
-/// 同一条用例在不同网口上要用不同报文长度是常见需求。按腿算一次，标签和
+/// 同一条用例在不同网口上要用不同报文长度是常见需求。按方向算一次，标签和
 /// 命令都从这里取，免得两边各算一遍再对不上。
 pub(super) fn udp_leg_profile(
     spec: &SpecNorm,
@@ -460,7 +460,7 @@ pub(super) fn udp_leg_profile(
     }
 }
 
-/// 一条 UDP 腿的参数标签，必须反映**实际下发**的 -b 与 -l。
+/// 一条 UDP 方向的参数标签，必须反映**实际下发**的 -b 与 -l。
 ///
 /// 链路策略覆盖和路径裁剪都会改 -b，而报表里的「类型 / 参数」列是很多人唯一
 /// 会看的地方——那里印着 2.6G、命令行却是 1G，比不印更糟。裁剪与否只能问
@@ -518,7 +518,7 @@ pub(super) fn udp_clip_notice(
 /// 的地方——那里印着全局档位、命令行却是别的数，
 /// 会让人以为自己填的值没生效。
 ///
-/// 两条腿取值不同时退回档位标签：一个标题写不下
+/// 两个方向取值不同时退回档位标签：一个标题写不下
 /// 两个方向，逐行的 profile_label 里各自写着准确值。
 pub(super) fn udp_unit_label(
     prof: &UdpProfile,
@@ -545,7 +545,7 @@ pub(super) fn udp_unit_label(
     if !changed {
         return prof.label();
     }
-    // 两条腿取值不同就两个都印（顺序即腿序 ab/ba）：
+    // 两个方向取值不同就两个都印（顺序即方向序 ab/ba）：
     // 退回全局档位会显示一个谁都没在用的数。
     let bw = if uniform {
         format!("{effective:.0}m")

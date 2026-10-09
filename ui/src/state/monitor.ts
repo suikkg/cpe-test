@@ -61,7 +61,7 @@ watch(agentIdentity, () => {
   if (!previous.length) return;
   // 本机监控可以继续；旧辅测会话要按自己的 session ID 回收，不带新机器身份。
   monitor.sessions = monitor.sessions.filter((item) => item.side !== 'agent');
-  monitor.notice = '辅测机连接已切换，已结束旧辅测机的监控显示；请为当前辅测机重新选择网卡。';
+  monitor.notice = '辅测机已切换，请重新选择监控网卡。';
   if (!monitor.sessions.length) stopPolling();
   void Promise.allSettled(previous.map((item) => api.post('/api/monitor/stop', { session: item.session })));
 }, { flush: 'sync' });

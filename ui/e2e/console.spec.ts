@@ -325,3 +325,60 @@ test('单独运行的内环测试点「停止测试」真的发出停止请求',
   await page.getByRole('button', { name: '停止测试', exact: true }).click();
   await expect.poll(() => stops).toBe(1);
 });
+
+test('内环多档位输入保留分隔符，真实计划按网口协议门限展开并能保存恢复', async ({ page }) => {
+  await innerScan(page);
+  const screenshot = page.getByRole('checkbox', { name: '测试结束后截图（参与电脑，每单元一次）', exact: true });
+  await expect(screenshot).toBeChecked();
+  await screenshot.uncheck();
+  await scanInner(page);
+  await innerPicker(page).getByRole('checkbox', { name: /主控本机.*LAN-A/ }).check();
+  await page.getByRole('button', { name: '添加选中的 1 个网口' }).click();
+  await page.getByRole('checkbox', { name: 'IPv6', exact: true }).uncheck();
+  await page.getByRole('checkbox', { name: 'UDP', exact: true }).check();
+  await page.getByText('高级：统计接口、测量策略与验收门限', { exact: true }).click();
+  await page.getByRole('button', { name: '设置 TCP 门限', exact: true }).click();
+  await page.getByRole('button', { name: '设置 UDP 门限', exact: true }).click();
+  await page.getByLabel('TCP 上行 · 网卡口径 Mbps', { exact: true }).fill('800');
+  await page.getByLabel('UDP 上行 · 网卡口径 Mbps', { exact: true }).fill('90');
+  await page.getByLabel('UDP 上行 · 工具口径 Mbps', { exact: true }).fill('80');
+  await page.getByLabel('UDP 每流速率（Mbps）').fill('100，200');
+  await page.getByText('高级：并行流数、窗口、报文与端口', { exact: true }).click();
+  const streams = page.getByLabel('TCP 流数');
+  await streams.pressSequentially('1 4');
+  await expect(streams).toHaveValue('1 4');
+  await page.getByLabel('TCP 窗口 -w').fill('64k,4m');
+  await page.getByLabel('UDP 报文长度 -l').fill('64 1400');
+  await page.getByRole('button', { name: '刷新预览', exact: true }).click();
+  await page.getByText('逐单元清单（16 行）', { exact: true }).click();
+  const preview = page.getByRole('region', { name: '计划预览', exact: true });
+  await expect(preview).toContainText('-P 4 / -w 4m');
+  await expect(preview).toContainText('-b 200 Mbps / -l 1400');
+  await expect(preview).toContainText('800.000 Mbps');
+  await expect(preview).toContainText('90.000 Mbps');
+  await expect(preview).toContainText('80.000 Mbps');
+  await streams.fill('1 oops');
+  await expect(page.getByRole('button', { name: '刷新预览', exact: true })).toBeDisabled();
+  await streams.fill('1 4');
+  await page.waitForTimeout(300); // 草稿的既有去抖写入
+  await page.reload();
+  await nav(page, '内环测试').click();
+  await page.getByText('高级：并行流数、窗口、报文与端口', { exact: true }).click();
+  await expect(streams).toHaveValue('1, 4');
+  await expect(screenshot).not.toBeChecked();
+  await expect(page.getByLabel('UDP 每流速率（Mbps）')).toHaveValue('100, 200');
+});
+
+test('内环结果主行说明双向合计与无有效验收，历史复用不冒充本轮通过', async ({ page }) => {
+  await consoleApi(page);
+  const leg = (flow: 'up' | 'down', source: string) => ({ flow, port: flow === 'up' ? 56190 : 56191, receiver: flow === 'up' ? 'br0' : 'ETH', receiver_host: flow === 'up' ? '板侧' : 'master', counter_source: null, source, mbps: 900, target_mbps: null, fallback_reason: source === 'tool' ? '计数器不可用' : null, verdict: 'MEASURED', reason: 'TARGET_UNKNOWN', detail: '只记录接收速率', diagnostics: [], nic_rx_mbps: 900, nic_verdict: 'MEASURED', nic_reason: '', nic_target_mbps: null, coverage: 1, effective_secs: 20, required_secs: 20, tool_sender_mbps: 920, tool_receiver_mbps: 900, tool_receiver_note: 'receiver 记录', udp_loss_pct: null, udp_lost_datagrams: null, udp_total_datagrams: null });
+  const row = { index: 1, link: 'ETH', host: 'master', ip_version: 4, protocol: 'tcp', direction: 'bidir', streams: 1, parameters: { streams: 1, tcp_window: '4m', udp_mbps: null, udp_length: null }, bidir_targets: { nic_mbps: 1800, tool_mbps: 1700 }, repeat: 1, measurement: 'nic_preferred', verdict: 'NOT_EVALUATED', reason: 'BIDIR_SOURCE_MISMATCH', detail: '两端来源不同，不能合计验收', diagnostics: [], total_mbps: null, total_target_mbps: null, overlap_secs: 20, legs: [leg('up', 'nic'), leg('down', 'tool')] };
+  await page.route('**/api/inner/status*', route => success(route, { running: false, current: '', error: null, completed: 2, total: 2, units_from: 0, has_report: true, units: [row, { ...row, index: 2, resumed: true, verdict: 'PASS', legs: [] }] }));
+  await nav(page, '内环测试').click();
+  const results = page.getByRole('region', { name: '内环执行与结果' });
+  await expect(results).toContainText('双向合计 未获取 Mbps'); await expect(results).toContainText('配置网卡合计 1800.00 Mbps');
+  await expect(results).toContainText('无法评价（NOT_EVALUATED）'); await expect(results).toContainText('复用历史 PASS');
+  await expect(results.getByLabel('本轮结果概览')).toContainText('本轮达标0'); await expect(results).toContainText('-P 1 / -w 4m');
+  await results.getByText('测量依据与诊断', { exact: true }).first().click();
+  await expect(results).toContainText('已改用工具接收汇总：计数器不可用');
+});

@@ -118,7 +118,7 @@ export interface PlannedUnit {
   est_secs: number;
   resumed: boolean;
   load: string[];
-  /** 每条腿**最终**按什么门限判、门限来自哪一层。 */
+  /** 每个方向**最终**按什么门限判、门限来自哪一层。 */
   targets: string[];
 }
 

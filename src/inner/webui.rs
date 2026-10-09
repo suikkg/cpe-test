@@ -52,8 +52,11 @@ fn unit_json(unit: &UnitRow) -> Value {
         "streams": unit.streams,
         "repeat": unit.repeat,
         "measurement": unit.measurement,
+        "parameters": unit.parameters,
+        "bidir_targets": unit.bidir_targets,
         "verdict": unit.verdict,
         "resumed": unit.resumed,
+        "screenshot": unit.screenshot,
         "reason": unit.reason,
         "detail": unit.detail,
         "diagnostics": unit.diagnostics,
@@ -242,6 +245,20 @@ impl Controller {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn status_carries_actual_parameters_and_frozen_bidirectional_targets() {
+        let mut row = crate::inner::tests::unit_row(1);
+        row.parameters.tcp_window = Some("4m".into());
+        row.bidir_targets = Some(super::super::plan::BidirTargets {
+            nic_mbps: Some(1800.0),
+            tool_mbps: Some(1700.0),
+        });
+        let data = unit_json(&row);
+        assert_eq!(data["parameters"]["tcp_window"], "4m");
+        assert_eq!(data["bidir_targets"]["nic_mbps"], 1800.0);
+        assert_eq!(data["bidir_targets"]["tool_mbps"], 1700.0);
+    }
+
     #[test]
     fn status_cursor_cannot_mix_runs_or_skip_missing_rows() {
         let controller = Controller::default();

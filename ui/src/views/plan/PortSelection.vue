@@ -163,7 +163,7 @@ function changeTaskIp(taskId: string, ip: string): void {
     </div>
 
     <div v-if="!totalRows" class="empty-state">
-      <p>还没有可配对的网口：连接辅测机并扫描两端网卡；同一电脑上有两个网口也能配对。</p>
+      <p>请扫描网卡。可配对两台电脑的网口，或本机的两个网口。</p>
       <button type="button" @click="goto('connect')">去连接</button>
     </div>
     <p v-else-if="!shownRows.length" class="empty-state">

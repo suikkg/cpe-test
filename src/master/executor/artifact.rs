@@ -268,7 +268,7 @@ impl Ctx {
             Side::Agent => "agent",
         };
         let contents = build_monitor_samples_csv(side.cn(), iface, origin_offset_ms, out);
-        // 双向 TCP 的两条腿可为同一网卡启动独立监控，保存时必须区分样本快照。
+        // 双向 TCP 的两个方向可为同一网卡启动独立监控，保存时必须区分样本快照。
         let sample_identity = md5_hex(&format!("{endpoint_identity}|{}", md5_hex(&contents)));
         let filename = format!(
             "nic_samples_{}_{}_{}_{}.csv",

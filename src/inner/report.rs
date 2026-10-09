@@ -12,229 +12,367 @@ pub(super) fn escape(value: &str) -> String {
 }
 
 pub(super) fn render(report: &RunReport) -> String {
-    let mut html = String::from("<!doctype html><html lang=\"zh-CN\"><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'\"><title>CPE 内环测速</title><style>body{font:16px/1.6 'Segoe UI',sans-serif;max-width:1240px;margin:32px auto;padding:0 20px;color:#172033}table{border-collapse:collapse;width:100%}th,td{padding:10px;border-bottom:1px solid #ccc;text-align:left}th{white-space:nowrap}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f4f5f7;padding:16px}details{margin:16px 0}.error{color:#a32020}.table{overflow:auto}.num{text-align:right}.leg{color:#4a5568}</style><h1>CPE 内环测速</h1>");
+    let mut html = String::from("<!doctype html><html lang=\"zh-CN\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta http-equiv=\"Content-Security-Policy\" content=\"default-src 'none'; img-src data:; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'\"><title>CPE 内环测试报告</title><style>");
+    html.push_str(include_str!("report.css"));
+    html.push_str(crate::report::RX_CHART_CSS);
+    html.push_str("</style></head><body><main><header><h1>CPE 内环测试报告</h1>");
+    let state = if report.probe_only {
+        "仅能力探测，未灌包"
+    } else if report.error.is_some() {
+        "执行未完成"
+    } else if !report.current.is_empty() {
+        "测试进行中 · 当前为阶段结果"
+    } else {
+        "本轮已结束"
+    };
     let _ = write!(
         html,
-        "<p>{} · {}</p><p>PC 被测网卡 ↔ 板侧 LAN 地址；ADB 负责控制及板侧采样。\
-         接收速率优先取可信的接收接口字节计数；配置了兜底策略时才改用工具 receiver 汇总，\
-         并单独标注来源。工具口径与网卡口径的门限互相独立，工具数字不会套用网卡门限。</p>",
-        escape(&report.created_at),
-        if report.probe_only {
-            "仅能力探测，未灌包"
-        } else {
-            "按网口顺序串行执行，只有双向单元内部并发"
-        }
+        "<p class=\"run-meta\">{} · {state}</p>",
+        escape(&report.created_at)
     );
-    if let Some(preview) = &report.plan {
-        let _ = write!(
-            html,
-            "<p>本轮计划：{} 条网口 · {} 个单元（其中双向 {} 个）· {} 条数据腿 · 预估 {} 分钟。{}</p>",
-            preview.links,
-            preview.units,
-            preview.bidir_units,
-            preview.legs,
-            preview.estimated_secs.div_ceil(60),
-            if preview.skipped.is_empty() {
-                String::new()
-            } else {
-                format!("未参与本轮：{}（配置已保留）", escape(&preview.skipped.join("、")))
-            }
-        );
+    if !report.current.is_empty() {
+        let _ = write!(html, "<p>当前单元：{}</p>", escape(&report.current));
     }
     if let Some(error) = &report.error {
-        let _ = write!(html, "<p class=\"error\">执行未完成：{}</p>", escape(error));
-    }
-    html.push_str("<div class=\"table\"><table><tr><th>#</th><th>电脑 / 网口</th><th>协议</th><th>方向</th><th>轮次</th><th>接收端</th><th>速率 Mbps</th><th>来源</th><th>门限 Mbps</th><th>网卡 RX</th><th>工具接收</th><th>UDP 丢包</th><th>判定</th></tr>");
-    for unit in &report.units {
-        let span = unit.legs.len().max(1);
-        // 一条腿都没有的单元也要有一行。`assemble_unit` 专门为这种情况留了
-        // `UnitDirectionResultMissing` 的判定，而它同时计入 `summary.units` 和
-        // `summary.not_evaluated`；只按 legs 渲染的话，那个单元在表里根本不出现，
-        // 计数和看得见的行数对不上，还没有任何一处解释差在哪。
-        if unit.legs.is_empty() {
-            let _ = write!(
-                html,
-                "<tr><td class=\"num\">{}</td><td>{}<br>{}</td><td>IPv{} / {}</td><td>{}</td><td class=\"num\">{}</td><td colspan=\"7\">本单元没有产生任何一条腿的结果</td><td><strong>{}</strong><br>{}</td></tr>",
-                unit.index,
-                escape(&unit.host),
-                escape(&unit.link),
-                unit.ip_version,
-                unit.protocol.label(),
-                unit.direction.label(),
-                unit.repeat,
-                escape(&unit.verdict),
-                escape(&unit.reason)
-            );
-            continue;
-        }
-        for (index, leg) in unit.legs.iter().enumerate() {
-            html.push_str("<tr>");
-            if index == 0 {
-                let _ = write!(
-                    html,
-                    "<td rowspan=\"{span}\">{}</td><td rowspan=\"{span}\">{}<br>{}</td><td rowspan=\"{span}\">IPv{} / {}</td><td rowspan=\"{span}\">{}</td><td rowspan=\"{span}\" class=\"num\">{}</td>",
-                    unit.index,
-                    escape(&unit.host),
-                    escape(&unit.link),
-                    unit.ip_version,
-                unit.protocol.label(),
-                    unit.direction.label(),
-                    unit.repeat
-                );
-            }
-            let _ = write!(
-                html,
-                "<td class=\"leg\">{} · {} {}</td><td class=\"num\">{}</td><td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td>",
-                leg.flow.label(),
-                escape(&leg.receiver_host),
-                escape(&leg.receiver),
-                rate(leg.mbps),
-                escape(leg.source.label()),
-                rate(leg.target_mbps),
-                rate(leg.nic_rx_mbps),
-                rate(leg.tool.receiver_mbps),
-                loss(leg, unit)
-            );
-            if index == 0 {
-                let _ = write!(
-                    html,
-                    "<td rowspan=\"{span}\"><strong>{}</strong><br>{}</td>",
-                    escape(&unit.verdict),
-                    escape(&unit.reason)
-                );
-            }
-            html.push_str("</tr>");
-        }
-    }
-    html.push_str("</table></div>");
-    for unit in &report.units {
         let _ = write!(
             html,
-            "<details><summary>#{} {} / {} · IPv{} / {} · {} · 第 {} 轮 · {}</summary><p>{}: {}</p>",
-            unit.index,
-            escape(&unit.host),
-            escape(&unit.link),
-            unit.ip_version,
-                unit.protocol.label(),
-            unit.direction.label(),
-            unit.repeat,
-            escape(&unit.verdict),
-            escape(&unit.reason),
-            escape(&unit.detail)
+            "<p class=\"error notice\">执行未完成：{}。已完成单元保留各自结果。</p>",
+            escape(error)
         );
+    }
+    html.push_str("</header><nav aria-label=\"报告目录\"><a href=\"#overview\">测试概览</a><a href=\"#results\">结果清单</a><a href=\"#details\">单元明细</a><a href=\"#environment\">设备与配置</a></nav>");
+    render_overview(&mut html, report);
+    html.push_str("<section id=\"results\"><h2>结果清单</h2><p class=\"muted\">每行一个单元。点击序号查看详情。</p>");
+    if report.units.is_empty() {
+        html.push_str(if report.probe_only {
+            "<p class=\"notice\">本次只检查设备能力，没有产生吞吐测试结果。</p>"
+        } else {
+            "<p class=\"notice\">尚无已完成单元，不能据此判断是否达标。</p>"
+        });
+    } else {
+        let mut groups: Vec<(&str, &str)> = Vec::new();
+        for unit in &report.units {
+            if !groups.contains(&(unit.host.as_str(), unit.link.as_str())) {
+                groups.push((&unit.host, &unit.link));
+            }
+        }
+        for (host, link) in groups {
+            let _ = write!(
+                html,
+                "<h3>{} · {}</h3>",
+                escape(link),
+                escape(host_label(host))
+            );
+            html.push_str("<div class=\"table-scroll\" tabindex=\"0\" role=\"region\" aria-label=\"网口结果清单\"><table class=\"results\"><thead><tr><th scope=\"col\">单元</th><th scope=\"col\">协议 / IP</th><th scope=\"col\">方向 / 轮次</th><th scope=\"col\">打流参数</th><th scope=\"col\">接收速率 / 门限</th><th scope=\"col\">判定</th></tr></thead><tbody>");
+            for unit in report
+                .units
+                .iter()
+                .filter(|u| u.host == host && u.link == link)
+            {
+                let _ = write!(html, "<tr><td><a href=\"#unit-{}\">#{}</a></td><td>{} / IPv{}</td><td>{}<small>第 {} 轮</small></td><td class=\"parameters\">{}</td><td>{}</td><td>{}<p class=\"reason\">{}</p></td></tr>", unit.index, unit.index, unit.protocol.label(), unit.ip_version, unit.direction.label(), unit.repeat, escape(&parameter_label(unit)), acceptance_summary(report, unit), unit_badge(unit), escape(&unit_explanation(unit)));
+            }
+            html.push_str("</tbody></table></div>");
+        }
+    }
+    html.push_str("</section><section id=\"details\"><h2>单元明细</h2><p class=\"muted\">UDP 丢包、发送速率和曲线仅作诊断。</p>");
+    for unit in &report.units {
+        let _ = write!(html, "<article id=\"unit-{}\" class=\"unit\"><h3>#{unit_index} {} · {} / IPv{} · {} · 第 {} 轮 {}</h3><p class=\"parameters\">{}</p><div class=\"acceptance\">{}</div><p>{}</p>", unit.index, escape(&unit.link), unit.protocol.label(), unit.ip_version, unit.direction.label(), unit.repeat, unit_badge(unit), escape(&parameter_label(unit)), acceptance_summary(report, unit), escape(&unit_explanation(unit)), unit_index=unit.index);
         let _ = write!(
             html,
-            "<p>测量策略：{}。{}</p>",
-            escape(unit.measurement.label()),
-            match (unit.total_mbps, unit.total_target_mbps, unit.overlap_secs) {
-                (Some(total), target, overlap) => format!(
-                    "双向合计 {total:.3} Mbps，门限 {}；两条腿共同有效重叠 {}。",
-                    rate(target),
-                    overlap
-                        .map(|value| format!("{value:.2}s"))
-                        .unwrap_or_else(|| "无".into())
-                ),
-                (None, _, Some(overlap)) =>
-                    format!("双向两条腿共同有效重叠 {overlap:.2}s；未形成同来源合计。"),
-                _ => String::new(),
+            "<p class=\"muted\">测量策略：{}。{}</p>",
+            unit.measurement.label(),
+            if unit.direction.is_bidir() {
+                unit.overlap_secs
+                    .map(|v| format!("共同有效重叠 {v:.2}s。"))
+                    .unwrap_or_else(|| {
+                        if unit.resumed {
+                            "本轮未重新采样。".into()
+                        } else {
+                            "无可证明的共同测量窗口。".into()
+                        }
+                    })
+            } else {
+                String::new()
             }
         );
-        if !unit.diagnostics.is_empty() {
-            let _ = write!(html, "<pre>{}</pre>", escape(&unit.diagnostics.join("\n")));
+        if !unit.resumed && unit.legs.is_empty() {
+            html.push_str("<p class=\"notice\">无测量结果，请检查起流和执行环境。</p>");
         }
+        let _ = write!(
+            html,
+            "<p class=\"muted\">单元原因代码：{}</p>",
+            escape(&unit.reason)
+        );
+        diagnostics(&mut html, &unit.diagnostics);
         for leg in &unit.legs {
-            render_leg(&mut html, leg);
+            render_leg(&mut html, report, unit, leg);
         }
-        html.push_str("</details>");
+        if let Some(capture) = &unit.screenshot {
+            html.push_str(&super::screenshot::render(capture));
+        }
+        html.push_str("</article>");
     }
+    html.push_str("</section><section id=\"environment\"><h2>设备与配置</h2>");
     if let Some(capability) = &report.capability {
         let _ = write!(
             html,
-            "<details open><summary>设备能力与接口</summary><pre>{}</pre></details>",
+            "<details><summary>设备能力与接口</summary><pre>{}</pre></details>",
             escape(&serde_json::to_string_pretty(capability).unwrap_or_default())
         );
     }
-    let _ = write!(
-        html,
-        "<details><summary>本次配置</summary><pre>{}</pre></details></html>",
-        escape(&serde_json::to_string_pretty(&report.config).unwrap_or_default())
-    );
+    let _ = write!(html, "<details><summary>本次配置</summary><pre>{}</pre></details></section><footer>上行采 CPE RX；下行采电脑网卡 RX。</footer></main></body></html>", escape(&serde_json::to_string_pretty(&report.config).unwrap_or_default()));
     html
 }
 
-fn render_leg(html: &mut String, leg: &LegRow) {
-    let _ = write!(
-        html,
-        "<h4>{} 腿 · 端口 {} · 接收端 {} {}</h4><p>{}: {}</p>",
-        leg.flow.label(),
-        leg.port,
-        escape(&leg.receiver_host),
-        escape(&leg.receiver),
-        escape(&leg.reason),
-        escape(&leg.detail)
-    );
-    let _ = write!(
-        html,
-        "<p>采用来源：{}{}。网卡口径独立留存：RX 平均 {} Mbps，验收 {}（{}），门限 {}。工具口径：接收 {} Mbps（{}），发送 {} Mbps（仅诊断）。</p>",
-        escape(leg.source.label()),
-        leg.counter_source
-            .map(|source| format!("（读取路径 {}）", escape(source.label())))
-            .unwrap_or_default(),
-        rate(leg.nic_rx_mbps),
-        escape(&leg.nic_verdict),
-        escape(&leg.nic_reason),
-        rate(leg.nic_target_mbps),
-        rate(leg.tool.receiver_mbps),
-        escape(&leg.tool.receiver_note),
-        rate(leg.tool.sender_mbps)
-    );
-    let _ = write!(
-        html,
-        "<p>接收端 RX 分布 Mbps：P10 {} · 中位 {} · P95 {} · 最小 {} · 最大 {}；滚动窗口覆盖 {:.1}%，计数器零增长占比 {:.1}%。</p><p>有效时长 {:.2}s / 配置 {}s；采样覆盖 {:.1}%；背景扣除 {:.2} Mbps。</p>",
-        rate(leg.rx.p10_mbps),
-        rate(leg.rx.median_mbps),
-        rate(leg.rx.p95_mbps),
-        rate(leg.rx.min_mbps),
-        rate(leg.rx.max_mbps),
-        leg.rx.rolling_coverage * 100.0,
-        leg.rx.stalled_ratio * 100.0,
-        leg.effective_secs,
-        leg.required_secs,
-        leg.coverage * 100.0,
-        leg.background_mbps
-    );
-    let _ = write!(html, "<pre>{}</pre>", escape(&leg.diagnostics.join("\n")));
-    let _ = write!(
-        html,
-        "<p>{} iperf3 client：</p><pre>{}\n{}</pre><p>{} iperf3 server：</p><pre>{}</pre>",
-        if leg.flow.receiver_is_board() {
-            "PC 侧"
-        } else {
-            "板侧"
-        },
-        escape(&leg.client.cmd),
-        escape(&leg.client.output),
-        if leg.flow.receiver_is_board() {
-            "板侧"
-        } else {
-            "PC 侧"
-        },
-        escape(if leg.server_log.trim().is_empty() {
-            "（接收端 server 未产生输出）"
-        } else {
-            &leg.server_log
-        })
-    );
+fn host_label(host: &str) -> &str {
+    if host == "master" {
+        "主控本机"
+    } else {
+        host
+    }
 }
 
+fn verdict_label(verdict: &str) -> &str {
+    match verdict {
+        "PASS" => "达标",
+        "RATE_FAIL" => "未达标",
+        "MEASURED" => "仅测量",
+        "NOT_EVALUATED" => "无法评价",
+        "SETUP_ERROR" => "执行失败",
+        "SKIP" => "跳过",
+        _ => "未知状态",
+    }
+}
+fn badge(verdict: &str) -> String {
+    let tone = match verdict {
+        "PASS" => "pass",
+        "RATE_FAIL" => "fail",
+        "MEASURED" => "measured",
+        "NOT_EVALUATED" => "unknown",
+        "SETUP_ERROR" => "error",
+        _ => "unknown",
+    };
+    format!(
+        "<span class=\"badge {tone}\">{} <small>{}</small></span>",
+        verdict_label(verdict),
+        escape(verdict)
+    )
+}
+fn unit_badge(unit: &UnitRow) -> String {
+    if unit.resumed {
+        "<span class=\"badge resumed\">复用历史 PASS</span>".into()
+    } else {
+        badge(&unit.verdict)
+    }
+}
+fn parameter_label(unit: &UnitRow) -> String {
+    match unit.protocol {
+        super::config::Protocol::Tcp => format!(
+            "{} 条并发流；TCP 窗口 {}（-P {} / -w {}）",
+            unit.parameters.streams,
+            unit.parameters.tcp_window.as_deref().unwrap_or("系统默认"),
+            unit.parameters.streams,
+            unit.parameters.tcp_window.as_deref().unwrap_or("默认")
+        ),
+        super::config::Protocol::Udp => format!(
+            "{} 条并发流；每流 {} Mbps；包长 {}（-P {} / -b {} Mbps / -l {}）",
+            unit.parameters.streams,
+            rate(unit.parameters.udp_mbps),
+            unit.parameters.udp_length.as_deref().unwrap_or("工具默认"),
+            unit.parameters.streams,
+            rate(unit.parameters.udp_mbps),
+            unit.parameters.udp_length.as_deref().unwrap_or("默认")
+        ),
+    }
+}
+fn unit_explanation(unit: &UnitRow) -> String {
+    if unit.resumed {
+        return "复用 24 小时内的 PASS，本轮未重新测试。".into();
+    }
+    let prefix = match unit.verdict.as_str() {
+        "PASS" => "接收速率达到门限。",
+        "RATE_FAIL" => "接收速率低于门限。",
+        "MEASURED" => "未设门限，仅记录速率。",
+        "NOT_EVALUATED" => "无有效验收结果。",
+        "SETUP_ERROR" => "起流或执行环境失败。",
+        _ => "请查看本单元记录的判定原因。",
+    };
+    if unit.detail.is_empty() {
+        prefix.into()
+    } else {
+        format!("{prefix} {}", unit.detail)
+    }
+}
+/// 只解释已记录的判定；配置仅用来说明双向缺少有效合计时的验收方式。
+fn uses_total(report: &RunReport, unit: &UnitRow) -> bool {
+    unit.direction.is_bidir()
+        && (unit.total_target_mbps.is_some()
+            || unit.bidir_targets.is_some()
+            || report
+                .config
+                .links
+                .iter()
+                .find(|link| link.host == unit.host && link.name == unit.link)
+                .is_some_and(|link| {
+                    let link = link.for_protocol(unit.protocol);
+                    link.bidir_total_min_mbps.is_some()
+                        || (link.measurement.uses_tool()
+                            && link.tool_bidir_total_min_mbps.is_some())
+                }))
+}
+fn total_target_description(report: &RunReport, unit: &UnitRow) -> String {
+    if unit.total_target_mbps.is_some() {
+        return target(unit.total_target_mbps);
+    }
+    if let Some(t) = &unit.bidir_targets {
+        return format!(
+            "未能应用（配置网卡合计 {}；工具合计 {}）",
+            target(t.nic_mbps),
+            target(t.tool_mbps)
+        );
+    }
+    if let Some(link) = report
+        .config
+        .links
+        .iter()
+        .find(|link| link.host == unit.host && link.name == unit.link)
+    {
+        let link = link.for_protocol(unit.protocol);
+        return format!(
+            "未能应用（配置网卡合计 {}；工具合计 {}）",
+            target(link.bidir_total_min_mbps),
+            target(link.tool_bidir_total_min_mbps)
+        );
+    }
+    "未能应用".into()
+}
+fn acceptance_summary(report: &RunReport, unit: &UnitRow) -> String {
+    if unit.resumed {
+        return "<p class=\"muted\">本轮未重新测试</p>".into();
+    }
+    let mut out = String::new();
+    if uses_total(report, unit) {
+        let source = unit
+            .legs
+            .first()
+            .filter(|first| {
+                unit.legs.len() == 2
+                    && first.source != super::measure::Source::None
+                    && unit.legs.iter().all(|leg| leg.source == first.source)
+            })
+            .map(|leg| leg.source.label())
+            .unwrap_or("未形成同来源合计");
+        let _ = write!(out, "<p class=\"total\"><strong>双向合计 {} Mbps</strong> / 合计门限 {}</p><small>按两端 RX 合计判定一次 · {}</small>", rate(unit.total_mbps), total_target_description(report, unit), source);
+    } else if unit.direction.is_bidir() {
+        out.push_str("<p><strong>上下行分别判定</strong>，未设置双向合计门限</p>");
+    }
+    for leg in &unit.legs {
+        let _ = write!(out, "<p class=\"direction-rate\"><strong>{} {} Mbps</strong> / {}<small>{} · 接收端 {} {}</small></p>", leg.flow.label(), rate(leg.mbps), if uses_total(report, unit) { "仅测量，按合计验收".into() } else { if leg.source == super::measure::Source::None { "未形成有效验收".into() } else { format!("门限 {}", target(leg.target_mbps)) } }, leg.source.label(), escape(host_label(&leg.receiver_host)), escape(&leg.receiver));
+    }
+    if unit.legs.is_empty() {
+        out.push_str("<p class=\"muted\">无测量结果</p>");
+    }
+    out
+}
+fn render_overview(html: &mut String, report: &RunReport) {
+    let count = |label: &str| {
+        report
+            .units
+            .iter()
+            .filter(|unit| !unit.resumed && unit.verdict == label)
+            .count()
+    };
+    let resumed = report.units.iter().filter(|unit| unit.resumed).count();
+    let pass = count("PASS");
+    let fail = count("RATE_FAIL");
+    html.push_str("<section id=\"overview\"><h2>测试概览</h2><dl class=\"totals\">");
+    for (label, value) in [
+        ("已记录单元", report.units.len()),
+        ("本轮达标", pass),
+        ("未达标", fail),
+        ("仅测量", count("MEASURED")),
+        ("无法评价", count("NOT_EVALUATED")),
+        ("执行失败", count("SETUP_ERROR")),
+        ("复用历史", resumed),
+    ] {
+        let _ = write!(html, "<div><dt>{label}</dt><dd>{value}</dd></div>");
+    }
+    html.push_str("</dl>");
+    if pass + fail > 0 {
+        let _ = write!(html, "<p>本轮吞吐验收通过率 <strong>{:.1}%</strong>（{pass} / {}）。只统计本轮 PASS 与 RATE_FAIL；仅测量、无法评价、执行失败和历史复用不计入。</p>", pass as f64 * 100.0 / (pass+fail) as f64, pass+fail);
+    } else {
+        html.push_str("<p>本轮暂无吞吐验收结论。</p>");
+    }
+    if let Some(plan) = &report.plan {
+        let _ = write!(html, "<p class=\"muted\">计划 {} 条网口 / {} 个单元（双向 {} 个）/ {} 个传输方向；报告已记录 {} 个单元。</p>", plan.links, plan.units, plan.bidir_units, plan.legs, report.units.len());
+        if !plan.skipped.is_empty() {
+            let _ = write!(
+                html,
+                "<p class=\"muted\">未参与本轮：{}（配置已保留）</p>",
+                escape(&plan.skipped.join("、"))
+            );
+        }
+    }
+    html.push_str("<details class=\"reading-guide\"><summary>如何读这份报告</summary><ul><li>按网口、协议和方向查看接收速率与门限。</li><li>上行采 CPE RX；下行采电脑网卡 RX。</li><li>网卡和工具门限独立。采样不可信时才可使用工具兜底。</li><li>未设门限：只测量；未获取：无测量值；无法评价：无有效验收结果。</li><li>双向按同来源 RX 合计判定；未设合计门限时按上下行分别判定。</li></ul></details></section>");
+}
+fn diagnostics(html: &mut String, values: &[String]) {
+    if values.is_empty() {
+        return;
+    }
+    html.push_str("<details class=\"diagnostics\"><summary>诊断信息</summary><ul>");
+    for value in values {
+        let _ = write!(html, "<li>{}</li>", escape(value));
+    }
+    html.push_str("</ul></details>");
+}
+fn render_leg(html: &mut String, report: &RunReport, unit: &UnitRow, leg: &LegRow) {
+    let _ = write!(html, "<details class=\"leg-detail\"><summary>{} · 接收端 {} {} · {} Mbps · {}</summary><p><strong>数据方向：{}</strong>；接收端 {} {}，端口 {}。</p>", leg.flow.label(), escape(host_label(&leg.receiver_host)), escape(&leg.receiver), rate(leg.mbps), if uses_total(report, unit) { "仅测量，按合计判定".into() } else { format!("{}（{}）", verdict_label(&leg.verdict), escape(&leg.verdict)) }, if leg.flow.receiver_is_board() { "电脑 → CPE" } else { "CPE → 电脑" }, escape(host_label(&leg.receiver_host)), escape(&leg.receiver), leg.port);
+    let _ = write!(
+        html,
+        "<p>采用来源：<strong>{}</strong>；接收速率 {} Mbps；{}。</p><p>{}</p>",
+        leg.source.label(),
+        rate(leg.mbps),
+        if uses_total(report, unit) {
+            "按双向合计验收".into()
+        } else {
+            format!("验收门限 {}", target(leg.target_mbps))
+        },
+        escape(&leg.detail)
+    );
+    if let Some(reason) = &leg.fallback_reason {
+        let _ = write!(
+            html,
+            "<p class=\"notice\">工具兜底原因：{}</p>",
+            escape(reason)
+        );
+    }
+    html.push_str("<h4>两套测量口径</h4><div class=\"table-scroll\" tabindex=\"0\"><table><thead><tr><th scope=\"col\">口径</th><th scope=\"col\">接收速率 Mbps</th><th scope=\"col\">门限 / 判定</th><th scope=\"col\">来源说明</th></tr></thead><tbody>");
+    let _ = write!(html, "<tr><th scope=\"row\">网卡 RX</th><td class=\"num\">{}</td><td>{} / {}</td><td>{}</td></tr><tr><th scope=\"row\">工具接收</th><td class=\"num\">{}</td><td>{}</td><td>{}</td></tr></tbody></table></div>", rate(leg.nic_rx_mbps), target(leg.nic_target_mbps), badge(&leg.nic_verdict), leg.counter_source.map(|s| escape(s.label())).unwrap_or_else(|| "电脑网卡计数".into()), rate(leg.tool.receiver_mbps), if leg.source == super::measure::Source::Tool && !uses_total(report, unit) { format!("采用工具口径 / 门限 {}", target(leg.target_mbps)) } else { "参考值，采用来源见判定依据".into() }, escape(&leg.tool.receiver_note));
+    let _ = write!(html, "<h4>采样质量与诊断</h4><dl class=\"quality\"><div><dt>有效测量时长</dt><dd>{:.2}s / {}s</dd></div><div><dt>采样覆盖率</dt><dd>{:.1}%</dd></div><div><dt>背景扣除</dt><dd>{:.2} Mbps</dd></div><div><dt>工具发送（仅诊断）</dt><dd>{} Mbps</dd></div><div><dt>UDP 丢包（仅诊断）</dt><dd>{}</dd></div></dl><p class=\"muted\">接收端 RX 分布 Mbps：P10 {} · 中位 {} · P95 {} · 最小 {} · 最大 {}；滚动窗口覆盖 {:.1}%，计数器零增长占比 {:.1}%。</p>", leg.effective_secs, leg.required_secs, leg.coverage*100.0, leg.background_mbps, rate(leg.tool.sender_mbps), loss(leg, unit), rate(leg.rx.p10_mbps), rate(leg.rx.median_mbps), rate(leg.rx.p95_mbps), rate(leg.rx.min_mbps), rate(leg.rx.max_mbps), leg.rx.rolling_coverage*100.0, leg.rx.stalled_ratio*100.0);
+    if let Some(samples) = &leg.rx_samples {
+        let chart = crate::report::render_monitor_rx_chart(
+            &samples.samples,
+            "接收端网卡原始 RX（含背景流量，仅供诊断）",
+        );
+        if !chart.is_empty() {
+            let _ = write!(html, "<figure>{chart}<figcaption>原始 RX 曲线，仅作诊断。含背景和起流阶段；断口为无效采样。验收使用有效窗口平均速率。</figcaption></figure>");
+        }
+    }
+    diagnostics(html, &leg.diagnostics);
+    let _ = write!(html, "<p class=\"muted\">原因代码：{}；网卡独立判定：{}。</p><details class=\"raw\"><summary>原始输出：{} iperf3 client / {} iperf3 server</summary><h4>客户端命令与输出</h4><pre>{}\n{}</pre><h4>接收端 server 输出</h4><pre>{}</pre></details></details>", escape(&leg.reason), escape(&leg.nic_reason), if leg.flow.receiver_is_board() { "PC 侧" } else { "板侧" }, if leg.flow.receiver_is_board() { "板侧" } else { "PC 侧" }, escape(&leg.client.cmd), escape(&leg.client.output), escape(if leg.server_log.trim().is_empty() { "（接收端 server 未产生输出）" } else { &leg.server_log }));
+}
 fn rate(value: Option<f64>) -> String {
     value
         .map(|v| format!("{v:.2}"))
-        .unwrap_or_else(|| "未设置 / 未获取".into())
+        .unwrap_or_else(|| "未获取".into())
+}
+fn target(value: Option<f64>) -> String {
+    value
+        .map(|v| format!("{v:.2} Mbps"))
+        .unwrap_or_else(|| "未设门限".into())
 }
 
-/// 丢包只有拿到 receiver 汇总行才印数字。拿不到就印「未知」而不是 0%——
-/// 后者会让人以为这一档 UDP 是无损转发的。
+/// 丢包只有拿到 receiver 汇总行才印数字，缺项明确为未知。
 fn loss(leg: &LegRow, unit: &UnitRow) -> String {
     match (
         unit.protocol.is_udp(),
@@ -242,7 +380,7 @@ fn loss(leg: &LegRow, unit: &UnitRow) -> String {
         leg.tool.udp_lost_datagrams,
         leg.tool.udp_total_datagrams,
     ) {
-        (false, ..) => "—".into(),
+        (false, ..) => "—（不适用）".into(),
         (true, Some(pct), Some(lost), Some(total)) => format!("{pct:.3}%<br>{lost}/{total}"),
         (true, ..) => "未知".into(),
     }

@@ -182,8 +182,8 @@ pub(super) fn bidir_total(outcomes: &[LegOutcome], total_target: f64) -> BidirTo
         return not_formed(
             ReasonCode::EffectiveWindowShort,
             format!(
-                "两条腿真实流量只同时跑了 {:.1}s，短于要求的 {required_secs}s；双向合计只能\
-                 在两条腿同时在跑的那一段上算，各自单独跑的时间会把合计抬高",
+                "两个方向真实流量只同时跑了 {:.1}s，短于要求的 {required_secs}s；双向合计只能\
+                 在两个方向同时在跑的那一段上算，各自单独跑的时间会把合计抬高",
                 window.available_secs
             ),
         );
@@ -210,7 +210,7 @@ pub(super) fn bidir_total(outcomes: &[LegOutcome], total_target: f64) -> BidirTo
                 return not_formed(
                     why.code,
                     format!(
-                        "{side} 在两条腿共同的窗口上形不成可信的 RX 平均值（{}）：{}",
+                        "{side} 在两个方向共同的窗口上形不成可信的 RX 平均值（{}）：{}",
                         why.code, why.detail
                     ),
                 )
@@ -226,7 +226,7 @@ pub(super) fn bidir_total(outcomes: &[LegOutcome], total_target: f64) -> BidirTo
         );
     }
     let detail = format!(
-        "双向 RX 合计 {total:.3}Mbps（AB {ab_rx:.3} + BA {ba_rx:.3}，取两条腿同时在跑的 \
+        "双向 RX 合计 {total:.3}Mbps（AB {ab_rx:.3} + BA {ba_rx:.3}，取两个方向同时在跑的 \
          {:.1}s），门限 {total_target:.3}Mbps",
         window.end_ms.saturating_sub(window.start_ms) as f64 / 1_000.0
     );
@@ -410,7 +410,7 @@ pub(crate) fn iperf_flow_verdict(input: IperfFlowVerdictIn<'_>) -> VerdictResult
         // 「工具没产生吞吐测量」= **执行环境的事实**，不是被测设备的性能结论。
         //
         // 三条链此前对同一件事给了三个 verdict（ADR-12(b)）：
-        //   iperf 单腿 → RATE_FAIL / NO_VALID_MEASUREMENT
+        //   iperf 单方向 → RATE_FAIL / NO_VALID_MEASUREMENT
         //   UDP 组     → SETUP_ERROR / NO_STREAM_STARTED
         //   CTS        → SETUP_ERROR / CTS_NO_MEASUREMENT
         // 而 SETUP_ERROR 与 RATE_FAIL 在聚合优先级、处置建议、RunSummary
@@ -526,7 +526,7 @@ pub(super) fn active_rate_table(
 
 // ---------------- 结果库（RESUME 用） ----------------
 
-/// 一条 UDP 腿在**判定时刻**已经确定的全部事实。
+/// 一条 UDP 方向在**判定时刻**已经确定的全部事实。
 ///
 /// 判定需要的东西到这里全部是值：没有进程句柄、没有对端连接、没有 `&self`。
 /// 这不是为了好看——`run_udp_unit` 里那条一百多行的判定链此前和执行代码
@@ -545,7 +545,7 @@ pub(super) struct UdpLegFacts<'a> {
     pub single_stream_exhausted: bool,
     /// 单流 UDP 实际尝试了几次 client。
     pub single_attempts: usize,
-    /// 本腿的有效判定窗口。
+    /// 本方向的有效判定窗口。
     pub window: &'a EffectiveWindow,
     /// 接收端网卡统计——正式口径。
     pub rx: &'a RateStats,
@@ -561,11 +561,11 @@ pub(super) struct UdpLegFacts<'a> {
     pub rx_lifecycle_hint: &'a str,
 }
 
-/// UDP 腿的判定链。
+/// UDP 方向的判定链。
 ///
 /// 结构是**两层**，不是一条长链（ADR-17）：
 ///
-/// 1. 这一腿有没有产生「能形成有效 RX 平均值」的前提——client 起没起来、
+/// 1. 这一个方向有没有产生「能形成有效 RX 平均值」的前提——client 起没起来、
 ///    有效流量窗口够不够长。不够就是 `SETUP_ERROR` / `NOT_EVALUATED`，
 ///    因为根本没有可比的数。
 /// 2. 前提成立后，把 RX 统计交给全仓唯一的
@@ -595,11 +595,11 @@ pub(super) fn udp_leg_verdict(facts: &UdpLegFacts<'_>) -> VerdictResult {
         rx_lifecycle_hint,
     } = facts;
 
-    // 「这一腿到底有没有目标要比」只有一处定义（ADR-12）。
+    // 「这一个方向到底有没有目标要比」只有一处定义（ADR-12）。
     //
     // 这里以前是直接用 `rx_target_mbps` 的：全函数不出现 Observe/Discover，
-    // 于是显式配 `observe` 又能解析出目标时，同一台设备的 UDP 腿判 RATE_FAIL、
-    // 而 TCP/CTS 腿判 MEASURED。Discover 更糟——它本来就是**故意分阶梯灌不满**
+    // 于是显式配 `observe` 又能解析出目标时，同一台设备的 UDP 方向判 RATE_FAIL、
+    // 而 TCP/CTS 方向判 MEASURED。Discover 更糟——它本来就是**故意分阶梯灌不满**
     // 的模式，拿目标判它的 FAIL 是结构性误判。
     let effective_target = crate::rate::effective_rate_target(rate_mode, rx_target_mbps);
     // 目标没了，「需要灌到多少才算数」也就无从谈起：offered 负载只在有目标
@@ -660,17 +660,17 @@ struct UdpLegDiagnosticFacts<'a> {
     runtime_failures: usize,
     rx: &'a RateStats,
     tx: &'a RateStats,
-    /// 已折算的判定目标；`None` = 这一腿没有门限。
+    /// 已折算的判定目标；`None` = 这一个方向没有门限。
     target: Option<f64>,
     offered_floor: Option<f64>,
     udp_loss: Option<f64>,
     max_udp_loss_pct: Option<f64>,
 }
 
-/// UDP 腿的诊断线索。**没有一条会改写判定**。
+/// UDP 方向的诊断线索。**没有一条会改写判定**。
 ///
 /// 其中「丢包率超过限制」这条尤其要说清楚：它以前是一条 `RATE_FAIL` 分支，
-/// 会把 RX 已经达标的腿翻成失败。丢包率仍然是重要的排障信号，所以完整保留
+/// 会把 RX 已经达标的方向翻成失败。丢包率仍然是重要的排障信号，所以完整保留
 /// 数值和限制，只是不再决定 PASS/FAIL。
 fn udp_leg_diagnostics(facts: &UdpLegDiagnosticFacts<'_>) -> Vec<String> {
     let mut out = crate::master::rate_window::rx_acceptance_diagnostics(
@@ -764,7 +764,7 @@ mod tests {
 
     /// 「工具没产生吞吐测量」在三条链上必须是**同一个** verdict。
     ///
-    /// 行为变更（ADR-12(b)）：iperf 单腿从 `RATE_FAIL/NO_VALID_MEASUREMENT`
+    /// 行为变更（ADR-12(b)）：iperf 单方向从 `RATE_FAIL/NO_VALID_MEASUREMENT`
     /// 改为 `SETUP_ERROR/NO_VALID_MEASUREMENT`，与 UDP 组
     /// （`SETUP_ERROR/NO_STREAM_STARTED`）和 CTS（`SETUP_ERROR/CTS_NO_MEASUREMENT`）
     /// 对齐。SETUP_ERROR 与 RATE_FAIL 在聚合优先级、处置建议、`RunSummary`
@@ -779,7 +779,7 @@ mod tests {
         let rx = healthy(0.0);
         let tx = healthy(0.0);
 
-        // iperf 单腿：跑完了、没有自报测量。
+        // iperf 单方向：跑完了、没有自报测量。
         let judged = iperf_flow_verdict(IperfFlowVerdictIn {
             raw_ok: true,
             measurement: false,
@@ -836,11 +836,11 @@ mod tests {
 
     /// Observe / Discover 下，**三条链都不许拿目标判 FAIL**。
     ///
-    /// 行为变更（ADR-12(a)），方向是把误判改回正确：在此之前 UDP 腿自己内联了
+    /// 行为变更（ADR-12(a)），方向是把误判改回正确：在此之前 UDP 方向自己内联了
     /// 一条等价判定链，全函数不出现 Observe/Discover，直接拿 target 比。可达性
     /// 是实打实的——`rate::effective_mode` 只折叠 `Auto`、不清目标，所以显式配
-    /// `observe` 又能解析出目标时，**同一台设备的 UDP 腿判 RATE_FAIL、
-    /// TCP/CTS 腿判 MEASURED**。
+    /// `observe` 又能解析出目标时，**同一台设备的 UDP 方向判 RATE_FAIL、
+    /// TCP/CTS 方向判 MEASURED**。
     ///
     /// `Discover` 尤其严重：它的语义就是**故意分阶梯灌不满**去找拐点，拿目标
     /// 判它的 FAIL 是结构性误判，而且方向是「把配置意图写成 CPE 性能失败」。
@@ -911,12 +911,12 @@ mod tests {
         );
     }
 
-    /// **RX 已经达标的腿，永远不许被 offered 闸降级。**
+    /// **RX 已经达标的方向，永远不许被 offered 闸降级。**
     ///
     /// 与 `rate_window` 的同名测试是一对：offered 闸的全部理由是「解释缺口」，
     /// 没有缺口时它无话可说。这一条以前是破的——闸架在 `!rx_meets_target`
     /// **前面**，于是 TX-P10 落在「目标 ~ 目标+余量」之间（TCP 不限速、链路
-    /// 上限贴着目标时是常态）就足以把一条达标的腿判成 NOT_EVALUATED。
+    /// 上限贴着目标时是常态）就足以把一条达标的方向判成 NOT_EVALUATED。
     #[test]
     fn a_leg_that_met_its_target_is_never_downgraded_by_the_offered_gate() {
         let window = full_window();
@@ -973,7 +973,7 @@ mod tests {
         }
     }
 
-    /// 合计门限单元里的一条腿：只测量，带着在 `span` 上的接收端样本。
+    /// 合计门限单元里的一个方向：只测量，带着在 `span` 上的接收端样本。
     fn traffic_leg(
         tag: &str,
         rx_avg: f64,
@@ -995,7 +995,7 @@ mod tests {
         }
     }
 
-    /// 全程恒速、两条腿同时跑满 185 秒。
+    /// 全程恒速、两个方向同时跑满 185 秒。
     fn measured_leg(tag: &str, rx: f64) -> LegOutcome {
         traffic_leg(tag, rx, (0, 185_000), rx_monitor(185, |_| rx))
     }
@@ -1049,7 +1049,7 @@ mod tests {
         assert_eq!(
             bidir_total(&untrusted, 900.0).total_mbps,
             None,
-            "有一条腿没形成可信的 RX 平均值，合计就不成立"
+            "有一个方向没形成可信的 RX 平均值，合计就不成立"
         );
     }
 
@@ -1069,7 +1069,7 @@ mod tests {
             Verdict::NotEvaluated
         );
 
-        // 一条腿采样不可信：合计不成立，交回按腿聚合去说明原因。
+        // 一个方向采样不可信：合计不成立，交回按方向聚合去说明原因。
         let mut untrusted = vec![measured_leg("ab", 720.0), measured_leg("ba", 230.0)];
         untrusted[1].judgement =
             VerdictResult::not_evaluated(ReasonCode::CounterStalled, "计数器停滞");
@@ -1079,15 +1079,15 @@ mod tests {
         );
     }
 
-    /// 缺一个方向时**不许**退回两条腿各自的 `MEASURED` 假装一切正常。
+    /// 缺一个方向时**不许**退回两个方向各自的 `MEASURED` 假装一切正常。
     ///
-    /// 单元级的取舍规则是：腿级聚合出的 `SETUP_ERROR` / `NOT_EVALUATED` 更具体
-    /// （说得出哪条腿、什么原因），让它说话；除此之外一律由合计拍板——
+    /// 单元级的取舍规则是：方向级聚合出的 `SETUP_ERROR` / `NOT_EVALUATED` 更具体
+    /// （说得出哪个方向、什么原因），让它说话；除此之外一律由合计拍板——
     /// 包括合计自己判 `NOT_EVALUATED`。
     #[test]
     fn a_missing_direction_is_not_evaluated_rather_than_the_legs_own_measured() {
         let only_ab = vec![measured_leg("ab", 720.0)];
-        // 两条腿本身都只是 MEASURED，聚合出来也是 MEASURED——
+        // 两个方向本身都只是 MEASURED，聚合出来也是 MEASURED——
         // 单元不能因此显示成「测过了、只是没门限」。
         assert_eq!(aggregate_unit_verdict(&only_ab), Verdict::Measured);
         assert_eq!(
@@ -1097,11 +1097,11 @@ mod tests {
         );
     }
 
-    /// 合计只取两条腿**同时在跑**的那一段。
+    /// 合计只取两个方向**同时在跑**的那一段。
     ///
     /// BA 起流晚了 20 秒：这 20 秒 AB 独占空口跑到 1200，之后两边抢空口各
     /// 700 / 250。以前直接把各自窗口的平均相加——AB 的窗口把那 20 秒单独跑的
-    /// 时间也算了进去（平均约 756），合计约 1006，门限 1000 判 PASS；两条腿
+    /// 时间也算了进去（平均约 756），合计约 1006，门限 1000 判 PASS；两个方向
     /// 真正并发时的合计只有 950。
     #[test]
     fn the_total_only_counts_the_time_both_legs_were_running() {
@@ -1130,7 +1130,7 @@ mod tests {
         );
     }
 
-    /// 两条腿交集不够要求时长（一条腿重试晚了大半程）：合计不成立，不拿两次
+    /// 两个方向交集不够要求时长（一个方向重试晚了大半程）：合计不成立，不拿两次
     /// 单独跑相加充数。
     #[test]
     fn legs_that_barely_overlapped_do_not_form_a_total() {
@@ -1404,7 +1404,7 @@ mod tests {
         assert_eq!(single.verdict, Verdict::RateFail);
         assert_eq!(single.code, ReasonCode::SingleUdpStreamFailed);
 
-        // ---- iperf 单腿：跑完了但没有自报测量 ----
+        // ---- iperf 单方向：跑完了但没有自报测量 ----
         let iperf = iperf_flow_verdict(IperfFlowVerdictIn {
             raw_ok: true,
             measurement: false,

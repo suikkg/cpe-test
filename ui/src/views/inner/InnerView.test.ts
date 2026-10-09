@@ -95,8 +95,8 @@ describe('内环扫描清单的真实口径', () => {
     const inventory = html.match(/<details([^>]*)><summary[^>]*>查看板侧全部系统接口（46 个）<\/summary>([\s\S]*?)<\/details>/);
     expect(inventory).not.toBeNull();
     expect(inventory![1]).not.toMatch(/\bopen(?:[\s=>]|$)/);
-    expect(inventory![2]).toContain('这里是 CPE 的系统清单');
-    expect(inventory![2]).toContain('实际参与测试的电脑网口以下方勾选为准');
+    expect(inventory![2]).toContain('CPE 系统接口');
+    expect(inventory![2]).toContain('测试网口在下方选择');
     expect(inventory![2].match(/<tbody[^>]*>([\s\S]*?)<\/tbody>/)?.[1].match(/<tr\b/g)).toHaveLength(46);
     expect(scanPicker(html).match(/class="scan-option"/g)).toHaveLength(1);
     expect(html).toContain('共 0 条，本轮参与 0 条');
@@ -175,7 +175,7 @@ describe('内环双栈的表单、预览和结果', () => {
     expect(html).not.toContain('该电脑网卡 IPv4');
   });
 
-  it('逐单元预览保留服务端返回的 IP 版本，结果有腿和无腿两条渲染路径都标明版本', async () => {
+  it('逐单元预览保留服务端返回的 IP 版本，结果有方向和无方向两条渲染路径都标明版本', async () => {
     inner.preview = {
       links: 1, units: 2, legs: 2, bidir_units: 0, estimated_secs: 40,
       uses_master: true, agents: [], skipped: [], rows: [previewRow(1, 4), previewRow(2, 6)],
@@ -190,7 +190,7 @@ describe('内环双栈的表单、预览和结果', () => {
     expect(preview).toContain('LAN · IPv6 · TCP');
     expect(results.match(/TCP \/ IPv4/g)).toHaveLength(1);
     expect(results.match(/TCP \/ IPv6/g)).toHaveLength(2);
-    expect(results).toContain('本单元没有产生任何一条腿的结果');
+    expect(results).toContain('无测量结果');
   });
 
   it('升级前缺少 IP 版本的结果明确显示 IPv4', async () => {
@@ -210,4 +210,16 @@ it('未知启动显示查询状态，禁用开始，并仅在已读到空闲后�
   inner.scenarioLastReadIdle = true;
   html = await render();
   expect(html).toContain('已核实测试未运行，重新准备');
+});
+
+it('结果区将双向合计、采用来源和中文判定放在主行，历史复用单独统计', async () => {
+  const row = result(1, 4, [leg(), { ...leg(), flow: 'down', receiver_host: 'master', receiver: 'ETH' }]);
+  Object.assign(row, { direction: 'bidir', verdict: 'PASS', total_mbps: 1800, total_target_mbps: 1700, bidir_targets: { nic_mbps: 1700, tool_mbps: null } });
+  const resumed = result(2, 4, []); Object.assign(resumed, { verdict: 'PASS', resumed: true });
+  inner.status.units = [row, resumed];
+  const html = await render();
+  expect(html).toContain('双向合计 1800.00 Mbps'); expect(html).toContain('合计门限 1700.00 Mbps');
+  expect(html).toContain('按两端 RX 合计判定'); expect(html).toContain('达标（PASS）');
+  expect(html).toContain('复用历史 PASS'); expect(html).toMatch(/<dt[^>]*>本轮达标<\/dt><dd[^>]*>1<\/dd>/);
+  expect(html).toContain('测量依据与诊断');
 });

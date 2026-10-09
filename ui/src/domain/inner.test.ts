@@ -227,7 +227,7 @@ describe('内环项目隔离', () => {
     expect(parseInnerProject(JSON.stringify({ ...defaultInnerConfig(), directions: ['upload', 'download', 'bidir'] })).directions)
       .toEqual(['upload', 'download', 'bidir']);
   });
-  it('端口给双向的第二条腿留了一格，重复轮次有上限', () => {
+  it('端口给双向的第二个方向留了一格，重复轮次有上限', () => {
     for (const patch of [{ port: 65535 }, { port: 1023 }, { repeats: 0 }, { repeats: 11 }, { repeats: 1.5 }]) {
       expect(() => parseInnerProject(JSON.stringify({ ...defaultInnerConfig(), ...patch })), JSON.stringify(patch)).toThrow();
     }

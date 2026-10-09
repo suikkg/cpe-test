@@ -320,7 +320,7 @@ export async function syncScenarioStatus(retryWhenUnknown = false): Promise<void
     inner.scenario.error = status.error;
     if (status.error) inner.error = status.error;
     // 场景第二阶段仍由独立的内环控制器产出进度；场景轮询不能把内环轮询
-    // 链掐掉，否则页面只会显示「组合场景进行中」，单元和当前腿永远不更新。
+    // 链掐掉，否则页面只会显示「组合场景进行中」，单元和当前方向永远不更新。
     void syncInnerStatus();
     if (status.running || inner.scenarioStartPhase === 'unknown') {
       scheduleScenarioStatus();

@@ -220,7 +220,7 @@ pub(super) fn cts_monitor_runtime_issue(
     // 采样过程中的个别读数失败**不单独否决**判定，和 iperf/UDP 链同一口径：
     // 失败那一拍不进统计，下一次成功读数的字节差覆盖整段缺口，真正丢掉的时间
     // 由 RX 采样覆盖率把关（不足 95% 判 SAMPLE_COVERAGE_LOW）。这里以前是窗口内
-    // 只要出现一个无效样本就整行 NOT_EVALUATED，而同样的一拍落在 iperf 腿上
+    // 只要出现一个无效样本就整行 NOT_EVALUATED，而同样的一拍落在 iperf 方向上
     // 照常判 PASS/FAIL——同一个事实，两个后端两种结论。
     (!details.is_empty()).then(|| {
         let diagnostic_only_details: Vec<&str> = details
@@ -966,7 +966,7 @@ impl Ctx {
 
         // 所有 CTS 事件和网卡样本都对齐到同一个 leg epoch。远端 monitor
         // 的真实启动由响应中的 elapsed_ms 与成功调用自身耗时做有界估计，
-        // 不再用 RPC 往返中点猜测零点。零点由单元给：双向两条腿共用一个。
+        // 不再用 RPC 往返中点猜测零点。零点由单元给：双向两个方向共用一个。
         let leg_epoch = unit_epoch;
         let monitor_start_before_ms = leg_epoch.elapsed().as_millis().min(u64::MAX as u128) as u64;
         let mut monitor_issue = None::<CtsMonitorIssue>;

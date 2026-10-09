@@ -14,16 +14,16 @@
     leg tag="" single v6=true udp=false name=tcp_w64k_P32 label=TCP -w 64k -P 32 cmp=TCP -w 64k -P 32 辅测:eth0:192.168.1.3->主控:eth0:192.168.1.2 port=56006 dur=30 extra=[-w 64k -P 32] idx=0 mode=Observe target=None offered=None
 756ff4864987ebde5ade1858a450025c|IPERF V6 TCP -w 256m -P 32 | 辅测 eth0(192.168.1.3, 2500Mbps) -> 主控 eth0(192.168.1.2, 2500Mbps)|group=""|bidir=false|dir=ba|round=1|est=45|total=None|targets=["B→A 未配置门限"]
     leg tag="" single v6=true udp=false name=tcp_w256m_P32 label=TCP -w 256m -P 32 cmp=TCP -w 256m -P 32 辅测:eth0:192.168.1.3->主控:eth0:192.168.1.2 port=56007 dur=30 extra=[-w 256m -P 32] idx=0 mode=Observe target=None offered=None
-853c5894587db50ed937225bbb0db255|★★双向 IPERF V4 TCP -w 64k -P 32 | 主控 eth0(192.168.1.2, 2500Mbps) <-> 辅测 eth0(192.168.1.3, 2500Mbps)|group=""|bidir=true|dir=bidir|round=1|est=50|total=Some(1800.0)|targets=["A→B 双向 RX 合计门限（本腿只测量）", "B→A 双向 RX 合计门限（本腿只测量）"]
+853c5894587db50ed937225bbb0db255|★★双向 IPERF V4 TCP -w 64k -P 32 | 主控 eth0(192.168.1.2, 2500Mbps) <-> 辅测 eth0(192.168.1.3, 2500Mbps)|group=""|bidir=true|dir=bidir|round=1|est=50|total=Some(1800.0)|targets=["A→B 双向 RX 合计门限（本方向只测量）", "B→A 双向 RX 合计门限（本方向只测量）"]
     leg tag="ab" single v6=false udp=false name=tcp_w64k_P32 label=TCP -w 64k -P 32 cmp=TCP -w 64k -P 32 主控:eth0:192.168.1.2->辅测:eth0:192.168.1.3 port=56008 dur=30 extra=[-w 64k -P 32] idx=0 mode=Observe target=None offered=None
     leg tag="ba" single v6=false udp=false name=tcp_w64k_P32 label=TCP -w 64k -P 32 cmp=TCP -w 64k -P 32 辅测:eth0:192.168.1.3->主控:eth0:192.168.1.2 port=56009 dur=30 extra=[-w 64k -P 32] idx=0 mode=Observe target=None offered=None
-e596895986232f0997156b1c37f92917|★★双向 IPERF V4 TCP -w 256m -P 32 | 主控 eth0(192.168.1.2, 2500Mbps) <-> 辅测 eth0(192.168.1.3, 2500Mbps)|group=""|bidir=true|dir=bidir|round=1|est=50|total=Some(1800.0)|targets=["A→B 双向 RX 合计门限（本腿只测量）", "B→A 双向 RX 合计门限（本腿只测量）"]
+e596895986232f0997156b1c37f92917|★★双向 IPERF V4 TCP -w 256m -P 32 | 主控 eth0(192.168.1.2, 2500Mbps) <-> 辅测 eth0(192.168.1.3, 2500Mbps)|group=""|bidir=true|dir=bidir|round=1|est=50|total=Some(1800.0)|targets=["A→B 双向 RX 合计门限（本方向只测量）", "B→A 双向 RX 合计门限（本方向只测量）"]
     leg tag="ab" single v6=false udp=false name=tcp_w256m_P32 label=TCP -w 256m -P 32 cmp=TCP -w 256m -P 32 主控:eth0:192.168.1.2->辅测:eth0:192.168.1.3 port=56010 dur=30 extra=[-w 256m -P 32] idx=0 mode=Observe target=None offered=None
     leg tag="ba" single v6=false udp=false name=tcp_w256m_P32 label=TCP -w 256m -P 32 cmp=TCP -w 256m -P 32 辅测:eth0:192.168.1.3->主控:eth0:192.168.1.2 port=56011 dur=30 extra=[-w 256m -P 32] idx=0 mode=Observe target=None offered=None
-1f28b90ae771dbc1cfa3ae3dd7c6a6b3|★★双向 IPERF V6 TCP -w 64k -P 32 | 主控 eth0(192.168.1.2, 2500Mbps) <-> 辅测 eth0(192.168.1.3, 2500Mbps)|group=""|bidir=true|dir=bidir|round=1|est=50|total=Some(1800.0)|targets=["A→B 双向 RX 合计门限（本腿只测量）", "B→A 双向 RX 合计门限（本腿只测量）"]
+1f28b90ae771dbc1cfa3ae3dd7c6a6b3|★★双向 IPERF V6 TCP -w 64k -P 32 | 主控 eth0(192.168.1.2, 2500Mbps) <-> 辅测 eth0(192.168.1.3, 2500Mbps)|group=""|bidir=true|dir=bidir|round=1|est=50|total=Some(1800.0)|targets=["A→B 双向 RX 合计门限（本方向只测量）", "B→A 双向 RX 合计门限（本方向只测量）"]
     leg tag="ab" single v6=true udp=false name=tcp_w64k_P32 label=TCP -w 64k -P 32 cmp=TCP -w 64k -P 32 主控:eth0:192.168.1.2->辅测:eth0:192.168.1.3 port=56012 dur=30 extra=[-w 64k -P 32] idx=0 mode=Observe target=None offered=None
     leg tag="ba" single v6=true udp=false name=tcp_w64k_P32 label=TCP -w 64k -P 32 cmp=TCP -w 64k -P 32 辅测:eth0:192.168.1.3->主控:eth0:192.168.1.2 port=56013 dur=30 extra=[-w 64k -P 32] idx=0 mode=Observe target=None offered=None
-cc937688dac4094c7d3e15689fb0f0b4|★★双向 IPERF V6 TCP -w 256m -P 32 | 主控 eth0(192.168.1.2, 2500Mbps) <-> 辅测 eth0(192.168.1.3, 2500Mbps)|group=""|bidir=true|dir=bidir|round=1|est=50|total=Some(1800.0)|targets=["A→B 双向 RX 合计门限（本腿只测量）", "B→A 双向 RX 合计门限（本腿只测量）"]
+cc937688dac4094c7d3e15689fb0f0b4|★★双向 IPERF V6 TCP -w 256m -P 32 | 主控 eth0(192.168.1.2, 2500Mbps) <-> 辅测 eth0(192.168.1.3, 2500Mbps)|group=""|bidir=true|dir=bidir|round=1|est=50|total=Some(1800.0)|targets=["A→B 双向 RX 合计门限（本方向只测量）", "B→A 双向 RX 合计门限（本方向只测量）"]
     leg tag="ab" single v6=true udp=false name=tcp_w256m_P32 label=TCP -w 256m -P 32 cmp=TCP -w 256m -P 32 主控:eth0:192.168.1.2->辅测:eth0:192.168.1.3 port=56014 dur=30 extra=[-w 256m -P 32] idx=0 mode=Observe target=None offered=None
     leg tag="ba" single v6=true udp=false name=tcp_w256m_P32 label=TCP -w 256m -P 32 cmp=TCP -w 256m -P 32 辅测:eth0:192.168.1.3->主控:eth0:192.168.1.2 port=56015 dur=30 extra=[-w 256m -P 32] idx=0 mode=Observe target=None offered=None
 261afb922dd8cef99fc5b73cd59f79f6|★★双向 IPERF V4 TCP -P 1 | 主控 eth0(192.168.1.2, 2500Mbps) <-> 辅测 eth0(192.168.1.3, 2500Mbps)|group=""|bidir=true|dir=bidir|round=1|est=25|total=None|targets=["A→B 门限 1000Mbps（双向方向门限）", "B→A 门限 1000Mbps（双向方向门限）"]
@@ -124,8 +124,8 @@ de5d29055b6c651854f9270d2fe3131f|PING V4 -l 32 n=4 | 主控 eth0(192.168.1.2, 25
 --- notices
 plan-tcp 的 iperf TCP 流数配置非法，将按兼容范围使用 32 流: TCP streams 必须在 1..=32，当前为 40（来源 tcp_streams）
 plan-tcp TCP -w 256m -P 32：-w 256m × 32 流 = 8.59GB socket 缓冲，相当于这条链路 26.4 秒的流量。这些字节会被算进「工具自报发送」但未必上线，使 30s 的测试里「发送−接收」出现约 2291Mbps 的恒定虚高；判定用的接收端网卡口径不受影响。
-plan-tcp：双向 RX 合计门限 1800Mbps 已盖掉逐方向门限 ab 900Mbps：本单元只比一次合计，两条腿各自不再判定。要逐方向把关，请清掉合计门限。
-plan-tcp：双向 RX 合计门限 1800Mbps 已盖掉逐方向门限 ba 900Mbps：本单元只比一次合计，两条腿各自不再判定。要逐方向把关，请清掉合计门限。
+plan-tcp：双向 RX 合计门限 1800Mbps 已盖掉逐方向门限 ab 900Mbps：本单元只比一次合计，两个方向各自不再判定。要逐方向把关，请清掉合计门限。
+plan-tcp：双向 RX 合计门限 1800Mbps 已盖掉逐方向门限 ba 900Mbps：本单元只比一次合计，两个方向各自不再判定。要逐方向把关，请清掉合计门限。
 plan-udp UDP -b 2500m -l 1400：eth0 -> eth1 路径上限不足，-b 由 2500Mbps 裁剪到 1000Mbps，流数由 4 降到 1
 plan-udp UDP -b 100m -l 1200：eth0 -> eth1 4 条流 × 100Mbps 灌不到 900Mbps 门限（含 5% 余量至少要 10 条并发流）。按当前配置发出去的总负载就低于门限，接收端 RX 大概率达不到，会判「速率不达标 / RX_BELOW_TARGET」。把流数提到 10、调大每流 -b，或把门限降到 381Mbps 以下。
 跳过 plan-udp 的 iperf UDP -b abc：无法解析 UDP 带宽 abc；带宽格式非法，未生成任务

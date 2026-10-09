@@ -296,13 +296,13 @@ pub fn resolve_target_mbps(
     effective_rate_target(mode, resolved)
 }
 
-/// 这一腿在**判定时刻**真正生效的目标速率。
+/// 这一个方向在**判定时刻**真正生效的目标速率。
 ///
 /// **全仓唯一的一处**「Observe/Discover 下不拿目标判 FAIL」。
 ///
-/// 这条规则以前只写在 `evaluate_nic_rx` 里，而 UDP 腿有自己内联的一条等价链，
+/// 这条规则以前只写在 `evaluate_nic_rx` 里，而 UDP 方向有自己内联的一条等价链，
 /// 全函数不出现 `Observe`/`Discover`，直接拿 target 比——于是显式配 `observe`
-/// 又能解析出目标时，**同一台设备的 UDP 腿判 RATE_FAIL、TCP/CTS 腿判 MEASURED**。
+/// 又能解析出目标时，**同一台设备的 UDP 方向判 RATE_FAIL、TCP/CTS 方向判 MEASURED**。
 /// `Discover` 更严重：它本来就是**故意分阶梯灌不满**的模式，拿目标去判它的
 /// FAIL 是结构性误判，而且方向恰好是「把配置意图写成 CPE 性能失败」——
 /// 这套判定一直在防的那个方向。
@@ -523,7 +523,7 @@ mod tests {
             path_payload_ceiling_mbps(&nic("SGMII2.5G", 2500), &nic("10GETH", 10000), &cfg),
             Some(2600.0)
         );
-        // 协商速率读不出来时退回对端，而不是当成 0 把这条腿裁没。
+        // 协商速率读不出来时退回对端，而不是当成 0 把这个方向裁没。
         assert_eq!(
             path_payload_ceiling_mbps(&nic("RNDIS", 0), &nic("SGMII1G", 1000), &cfg),
             Some(1000.0)

@@ -429,7 +429,7 @@ pub fn disposition_advice(reason_code: ReasonCode) -> Option<&'static str> {
         }
         // —— 单条流没跑通：这一条流的事，别的流的结论仍然作数 ——
         ReasonCode::FlowFailed => {
-            "这一条流没跑通。先看同一腿其余流的结果：多数流正常说明是偶发，\
+            "这一条流没跑通。先看同一方向其余流的结果：多数流正常说明是偶发，\
              全部失败才需要怀疑链路或端口。"
         }
 
@@ -766,7 +766,7 @@ mod tests {
                     (Verdict::NotEvaluated, code),
                 ]),
                 Verdict::NotEvaluated,
-                "{code}：数据不可信时不能拿另一条腿下结论"
+                "{code}：数据不可信时不能拿另一个方向下结论"
             );
         }
 
@@ -778,7 +778,7 @@ mod tests {
                     (Verdict::NotEvaluated, code),
                 ]),
                 Verdict::RateFail,
-                "{code}：这是那条腿自己的配置问题，不该把确凿的不达标藏起来"
+                "{code}：这是那个方向自己的配置问题，不该把确凿的不达标藏起来"
             );
         }
 
@@ -875,7 +875,7 @@ mod tests {
                 Verdict::NotEvaluated,
                 ReasonCode::CounterStalled,
                 4,
-                "计数器停滞（会盖住别的腿）",
+                "计数器停滞（会盖住别的方向）",
             ),
             (
                 Verdict::NotEvaluated,
@@ -970,7 +970,7 @@ mod tests {
             }
         }
 
-        // 全部三元组：加进第三条腿不该让已经确定的胜者翻盘。
+        // 全部三元组：加进第三个方向不该让已经确定的胜者翻盘。
         for a in 0..ranked.len() {
             for b in 0..ranked.len() {
                 for c in 0..ranked.len() {
@@ -993,7 +993,7 @@ mod tests {
                 (Verdict::NotEvaluated, ReasonCode::CounterStalled),
             ]),
             Verdict::RateFail,
-            "单流硬失败必须排在「会盖住别的腿的判不了」前面，否则必须灌通的方向\
+            "单流硬失败必须排在「会盖住别的方向的判不了」前面，否则必须灌通的方向\
              没灌通会被采样问题吃掉"
         );
         assert_eq!(
@@ -1002,7 +1002,7 @@ mod tests {
                 (Verdict::NotEvaluated, ReasonCode::TargetMissing),
             ]),
             Verdict::RateFail,
-            "只是自己缺目标的那条腿，不许把另一条腿确凿的不达标从概览里抹掉"
+            "只是自己缺目标的那个方向，不许把另一个方向确凿的不达标从概览里抹掉"
         );
         assert_eq!(
             aggregate_verdict(vec![
@@ -1010,7 +1010,7 @@ mod tests {
                 (Verdict::NotEvaluated, ReasonCode::CounterStalled),
             ]),
             Verdict::NotEvaluated,
-            "反过来，采样塌了的那一段时间里另一条腿的数同样不可信，\
+            "反过来，采样塌了的那一段时间里另一个方向的数同样不可信，\
              拿它判 FAIL 就是把环境异常写成 CPE 性能失败"
         );
 

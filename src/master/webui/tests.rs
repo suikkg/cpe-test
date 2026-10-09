@@ -1330,7 +1330,7 @@ fn quick_plan_applies_request_level_ping_defaults() {
 
 /// 任务上的**单向**门限要一路走到 `TestSpec`，并且和双向那一套互不沾边。
 ///
-/// 缺了这一层时，1G 口与快口之间的单向腿只能拿按网口门限那个 1800/2000——
+/// 缺了这一层时，1G 口与快口之间的单向测试只能拿按网口门限那个 1800/2000——
 /// 那个数对这条路径物理上不成立，而界面上没有任何一格能改它。
 #[test]
 fn a_task_single_direction_target_reaches_the_spec_and_rejects_bad_input() {
@@ -1901,10 +1901,10 @@ fn explicit_bandwidth_on_every_sending_nic_opts_out_of_the_global_sweep() {
     );
 }
 
-/// 一边按网口固定、另一边留空时，留空腿仍需扫描全部全局档位；
+/// 一边按网口固定、另一边留空时，留空方向仍需扫描全部全局档位；
 /// 而被固定的那个方向不能跟着扫。
 ///
-/// 这两件事必须**逐方向**判断。按整对判断时，只要有一条腿没被覆盖就整对
+/// 这两件事必须**逐方向**判断。按整对判断时，只要有一个方向没被覆盖就整对
 /// 去扫档位，于是「ab 被发送端钉死」的那个方向会被复制成 N 个一模一样的
 /// 单元——3 档 × 180s 就是 6 分钟白跑，报告里还多出两行看着像 bug 的重复项。
 #[test]
@@ -1925,7 +1925,7 @@ fn a_one_sided_bandwidth_override_sweeps_only_the_unpinned_direction() {
     assert_eq!(
         pinned.udp_profiles.as_ref().map(Vec::len),
         Some(1),
-        "ab 的发送腿已被覆盖，扫档位只会生成重复单元"
+        "ab 的发送方向已被覆盖，扫档位只会生成重复单元"
     );
     let swept = cfg
         .tests
@@ -1935,7 +1935,7 @@ fn a_one_sided_bandwidth_override_sweeps_only_the_unpinned_direction() {
     assert_eq!(
         swept.udp_profiles.as_ref().map(Vec::len),
         Some(3),
-        "未覆盖的反向发送腿仍要跑 1m/500m/1G 三档"
+        "未覆盖的反向发送方向仍要跑 1m/500m/1G 三档"
     );
 
     // 真正要防的是队列里出现重复单元，所以一路建到 unit 再查。
@@ -3055,7 +3055,7 @@ fn the_plan_shows_the_parameters_each_leg_will_actually_use() {
     let (units, _) = build_units(&specs, cfg.require_same_subnet_for_iperf, &mut port);
     let lines = unit_load_lines(&units[0]);
 
-    assert_eq!(lines.len(), 1, "单向单元只有一条腿");
+    assert_eq!(lines.len(), 1, "单向单元只有一个方向");
     assert!(lines[0].contains("-b 500 Mbps"), "{lines:?}");
     assert!(lines[0].contains("-l 1200"), "{lines:?}");
     assert!(lines[0].contains("×3 流"), "{lines:?}");
@@ -3094,7 +3094,7 @@ fn the_preview_labels_the_direction_of_every_unit() {
             assert!(
                 lines.iter().any(|line| line.starts_with("A→B "))
                     && lines.iter().any(|line| line.starts_with("B→A ")),
-                "双向单元两条腿要分别标出方向：{lines:?}"
+                "双向单元两个方向要分别标出方向：{lines:?}"
             );
         } else {
             assert!(
@@ -4758,7 +4758,7 @@ fn a_per_nic_datagram_size_overrides_the_global_step() {
             ("WLAN 3".to_string(), "1400".to_string()),
             ("以太网 6".to_string(), "64".to_string()),
         ],
-        "发送口填了 -l 就用它的，没填的那条腿仍走全局档位"
+        "发送口填了 -l 就用它的，没填的那个方向仍走全局档位"
     );
 
     // 标签必须跟着实际下发值走，不然报表里印的 -l 和命令行对不上。
@@ -6027,7 +6027,7 @@ fn importing_never_backfills_a_target_the_row_cannot_run() {
     .expect("导入本身不做校验，必须成功");
     assert_eq!(
         out["pairs"][0]["rx_target_bidir_ab"], "",
-        "行里没有双向腿，双向门限就是死值，不许回填：{}",
+        "行里没有双向方向，双向门限就是死值，不许回填：{}",
         out["pairs"][0]
     );
     let replayed = request_from_import(&out);
@@ -6046,7 +6046,7 @@ fn importing_never_backfills_a_target_the_row_cannot_run() {
     .expect("导入必须成功");
     assert_eq!(
         out["pairs"][0]["rx_target_single_ab"], "",
-        "行里没有单向腿，单向门限同样是死值：{}",
+        "行里没有单向方向，单向门限同样是死值：{}",
         out["pairs"][0]
     );
     let replayed = request_from_import(&out);

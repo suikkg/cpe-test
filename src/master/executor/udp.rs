@@ -934,7 +934,7 @@ impl Ctx {
                 "    双向并发重叠: {:.1}s{}",
                 windows.concurrency_secs,
                 if windows.concurrency_secs <= 0.0 {
-                    "（两条腿没有真正同时在跑，各腿结论只代表单向条件）"
+                    "（两个方向没有真正同时在跑，各方向结论只代表单向条件）"
                 } else {
                     ""
                 }

@@ -1,6 +1,6 @@
 {
   "kind": "cpe-inner-project",
-  "version": 3,
+  "version": 4,
   "config": {
     "adb_path": "adb",
     "serial": "",
@@ -14,6 +14,13 @@
       "upload",
       "download"
     ],
+    "parameter_options": {
+      "tcp_streams": [],
+      "tcp_windows": [],
+      "udp_streams": [],
+      "udp_rates_mbps": [],
+      "udp_lengths": []
+    },
     "tcp_streams": null,
     "udp_streams": null,
     "tcp_window": null,
@@ -23,6 +30,7 @@
     "port": 56190,
     "repeats": 1,
     "resume": false,
+  "screenshot": true,
     "links": [
       {
         "name": "ETH",
@@ -33,6 +41,8 @@
         "gateway": "192.168.8.1",
         "board_rx_interface": "",
         "measurement": "nic_strict",
+        "tcp_thresholds": null,
+        "udp_thresholds": null,
         "upload_min_mbps": null,
         "download_min_mbps": null,
         "bidir_total_min_mbps": null,
@@ -51,6 +61,8 @@
         "gateway": "192.168.8.1",
         "board_rx_interface": "",
         "measurement": "nic_strict",
+        "tcp_thresholds": null,
+        "udp_thresholds": null,
         "upload_min_mbps": null,
         "download_min_mbps": null,
         "bidir_total_min_mbps": null,

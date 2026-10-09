@@ -3,7 +3,7 @@
 //! **全仓唯一的笛卡尔积**：页面预览、执行器、进度计数和报告都消费这一份
 //! 计划。此前四处各自算「链路 × 协议 × 方向」，只要有一处漏了新维度，
 //! 预览说 8 个单元、执行器跑 12 个、进度条却停在 8/8。
-use super::config::{Direction, Flow, InnerConfig, Link, Measurement, Protocol};
+use super::config::{Direction, Flow, InnerConfig, Link, Measurement, Parameters, Protocol};
 use serde::Serialize;
 use std::collections::HashSet;
 
@@ -48,6 +48,13 @@ pub struct LegPlan {
     pub tool_target_mbps: Option<f64>,
 }
 
+/// 记录本单元配置的双向合计门限，结果展示不能回读后来编辑过的配置。
+#[derive(Debug, Clone, Serialize)]
+pub struct BidirTargets {
+    pub nic_mbps: Option<f64>,
+    pub tool_mbps: Option<f64>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct Unit {
     /// 与端口、执行序号和链路列表位置无关的稳定身份，供内环 RESUME 使用。
@@ -62,6 +69,7 @@ pub struct Unit {
     pub protocol: Protocol,
     pub direction: Direction,
     pub streams: u32,
+    pub parameters: Parameters,
     pub measurement: Measurement,
     /// 第几轮重复，从 1 开始。
     pub repeat: u32,
@@ -74,6 +82,15 @@ pub struct Unit {
 }
 
 impl Unit {
+    pub fn bidir_targets(&self) -> Option<BidirTargets> {
+        (self.is_bidir()
+            && (self.nic_total_target_mbps.is_some() || self.tool_total_target_mbps.is_some()))
+        .then_some(BidirTargets {
+            nic_mbps: self.nic_total_target_mbps,
+            tool_mbps: self.tool_total_target_mbps,
+        })
+    }
+
     pub fn is_bidir(&self) -> bool {
         self.direction.is_bidir()
     }
@@ -248,50 +265,57 @@ pub fn build(cfg: &InnerConfig) -> Result<Plan, String> {
         let link = &cfg.links[link_index];
         for &ip_version in &cfg.ip_versions {
             for &protocol in &cfg.protocols {
-                for &direction in &cfg.directions {
-                    for repeat in 1..=cfg.repeats {
-                        let legs = direction
-                            .flows()
-                            .iter()
-                            .enumerate()
-                            .map(|(offset, &flow)| {
-                                let port =
-                                    cfg.port.checked_add(offset as u16).ok_or_else(|| {
-                                        "板侧端口加一后越界，请把起始端口调低".to_string()
-                                    })?;
-                                Ok(leg_plan(link, flow, port))
-                            })
-                            .collect::<Result<Vec<_>, String>>()?;
-                        units.push(Unit {
-                            id: unit_id(
-                                cfg,
-                                link,
+                let effective_link = link.for_protocol(protocol);
+                let link = &effective_link;
+                for parameters in cfg.parameter_variants(protocol) {
+                    let effective_cfg = parameters.apply(cfg, protocol);
+                    let cfg = &effective_cfg;
+                    for &direction in &cfg.directions {
+                        for repeat in 1..=cfg.repeats {
+                            let legs = direction
+                                .flows()
+                                .iter()
+                                .enumerate()
+                                .map(|(offset, &flow)| {
+                                    let port =
+                                        cfg.port.checked_add(offset as u16).ok_or_else(|| {
+                                            "板侧端口加一后越界，请把起始端口调低".to_string()
+                                        })?;
+                                    Ok(leg_plan(link, flow, port))
+                                })
+                                .collect::<Result<Vec<_>, String>>()?;
+                            units.push(Unit {
+                                id: unit_id(
+                                    cfg,
+                                    link,
+                                    ip_version,
+                                    protocol,
+                                    direction,
+                                    repeat,
+                                    cfg.streams(protocol),
+                                ),
+                                index: units.len() + 1,
+                                link: link_index,
+                                link_name: link.name.clone(),
+                                host: link.host.clone(),
                                 ip_version,
                                 protocol,
                                 direction,
+                                streams: cfg.streams(protocol),
+                                parameters: parameters.clone(),
+                                measurement: link.measurement,
                                 repeat,
-                                cfg.streams(protocol),
-                            ),
-                            index: units.len() + 1,
-                            link: link_index,
-                            link_name: link.name.clone(),
-                            host: link.host.clone(),
-                            ip_version,
-                            protocol,
-                            direction,
-                            streams: cfg.streams(protocol),
-                            measurement: link.measurement,
-                            repeat,
-                            legs,
-                            nic_total_target_mbps: direction
-                                .is_bidir()
-                                .then(|| link.total_target(false))
+                                legs,
+                                nic_total_target_mbps: direction
+                                    .is_bidir()
+                                    .then(|| link.total_target(false))
+                                    .flatten(),
+                                tool_total_target_mbps: (direction.is_bidir()
+                                    && link.measurement.uses_tool())
+                                .then(|| link.total_target(true))
                                 .flatten(),
-                            tool_total_target_mbps: (direction.is_bidir()
-                                && link.measurement.uses_tool())
-                            .then(|| link.total_target(true))
-                            .flatten(),
-                        });
+                            });
+                        }
                     }
                 }
             }
@@ -343,6 +367,8 @@ pub struct PreviewRow {
     pub direction: Direction,
     pub repeat: u32,
     pub measurement: Measurement,
+    pub parameters: Parameters,
+    pub parameter_label: String,
     pub legs: Vec<PreviewLeg>,
     /// 判定依据的人话描述，例如「网卡口径合计门限 900.000 Mbps」。
     pub verdict_basis: String,
@@ -377,7 +403,7 @@ fn verdict_basis(unit: &Unit) -> String {
                 unit.measurement.label()
             ),
             (nic, tool_total) => format!(
-                "按两端接收速率合计判定一次，两条腿只测量：网卡口径合计 {}，工具口径合计 {}",
+                "按两端接收速率合计判定一次，两个方向只测量：网卡口径合计 {}，工具口径合计 {}",
                 describe_target(nic),
                 describe_target(tool_total)
             ),
@@ -427,6 +453,8 @@ pub fn preview_with_resumed(
                 repeat: unit.repeat,
                 measurement: unit.measurement,
                 verdict_basis: verdict_basis(unit),
+                parameters: unit.parameters.clone(),
+                parameter_label: unit.parameters.label(unit.protocol),
                 resumed: resumed.contains(&unit.id),
                 legs: unit
                     .legs

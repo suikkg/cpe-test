@@ -201,7 +201,7 @@ const pingSizes = numbers('ping_payload_sizes');
 <template>
   <section class="panel">
     <h3>默认档位</h3>
-    <p class="hint">任务未选流量配置、或未填 Ping 参数时使用。多个档位用逗号分隔。</p>
+    <p class="hint">任务留空时使用默认参数。多个档位用逗号分隔。</p>
     <div class="grid">
       <label class="wide">
         <span>UDP 单流带宽 <code>-b</code></span>
@@ -283,7 +283,7 @@ const pingSizes = numbers('ping_payload_sizes');
 
   <section class="panel">
     <h3>Ping 阈值</h3>
-    <p class="hint">按链路类型 × 包长档位自动选择；灰字为默认值，填数值覆盖。所有档位都要求 0% 丢包。</p>
+    <p class="hint">按链路类型和包长选择门限。留空使用默认值；丢包要求为 0%。</p>
       <div class="policy-grid">
         <label class="bucket-rule">
           <span>small 最大字节</span>
@@ -324,7 +324,7 @@ const pingSizes = numbers('ping_payload_sizes');
 
   <section class="panel">
     <h3>Wi-Fi 互测门限</h3>
-    <p class="hint">按两端当前频段组合显示，单位 Mbps。双向并发按两端 RX 合计判定；留空只记录实测。</p>
+    <p class="hint">单位 Mbps。双向按两端 RX 合计判定；留空只测量。</p>
       <div v-if="wifiBandRows.length === 0" class="empty-inline">两端识别到 Wi-Fi 网口后显示门限表。</div>
       <div v-else class="table-scroll">
         <table class="ping-policy-table wifi-table wifi-matrix">

@@ -114,7 +114,7 @@ export function innerSetupIssues(config: InnerConfig): InnerSetupIssue[] {
     else if (config.ip_versions.includes(6) && link.enabled && canonicalInnerIpv6(link.local_ipv6) === canonicalInnerIpv6(link.gateway_ipv6)) issues.push({ message: `${prefix}：电脑 IPv6 和 CPE LAN IPv6 不能相同。`, action: '修改地址', target: 'links', linkIndex });
     else if (config.ip_versions.includes(6) && link.enabled && innerIpv6LinkLocal(link.local_ipv6) !== innerIpv6LinkLocal(link.gateway_ipv6)) issues.push({ message: `${prefix}：两端 IPv6 需同为链路本地地址或同为非链路本地地址。`, action: '修改地址', target: 'links', linkIndex });
   });
-  if (config.protocols.includes('udp') && !(Number(config.udp_mbps) > 0)) {
+  if (config.protocols.includes('udp') && !(Number(config.udp_mbps) > 0) && !config.parameter_options?.udp_rates_mbps.length) {
     issues.push({ message: '已选择 UDP，请填写每条流的发送速率。', action: '填写 UDP 速率', target: 'params' });
   }
   if (!issues.length) {

@@ -155,7 +155,7 @@ onMounted(() => {
       <SuiteEditor />
     </div>
     <div v-else id="plan-limits" role="tabpanel" aria-labelledby="plan-tab-limits">
-      <p class="hint precedence">门限优先级：任务上填的门限 › 按网口门限 › Wi-Fi 频段门限 › 默认。每个单元最终生效的门限在执行页预览里列出。</p>
+      <p class="hint precedence">门限优先级：任务上填的门限 › 按网口门限 › Wi-Fi 频段门限 › 默认。生效门限见执行页预览。</p>
       <NicPolicyTable />
       <GlobalDefaults />
     </div>

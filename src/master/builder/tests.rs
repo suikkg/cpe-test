@@ -124,7 +124,7 @@ fn the_builder_never_emits_iperf_flags_that_would_change_the_measurement() {
     for unit in &units {
         collect(unit, &mut tasks);
     }
-    assert!(!tasks.is_empty(), "应当有 iperf 腿");
+    assert!(!tasks.is_empty(), "应当有 iperf 方向");
     for (unit_id, extra) in &tasks {
         let hits = crate::cmd::iperf::reserved_flags_in_extra(extra);
         assert!(
@@ -425,7 +425,7 @@ fn iperf_task_fingerprint(task: &IperfTask) -> String {
     )
 }
 
-/// 计划快照里的一条腿。端点只记 `Endpoint::key()`，不展开 `NicInfo`：网卡字段的
+/// 计划快照里的一个方向。端点只记 `Endpoint::key()`，不展开 `NicInfo`：网卡字段的
 /// 增减与展开逻辑无关，不该让这份快照红。
 fn leg_fingerprint(leg: &Leg) -> String {
     let body = match &leg.kind {
@@ -494,7 +494,7 @@ fn leg_fingerprint(leg: &Leg) -> String {
 /// **展开结果的全量快照：命令参数、速率模式、门限、预览行与计划提示。**
 ///
 /// `the_full_unit_expansion_is_byte_stable` 只钉 RESUME 身份与端口——它红了意味着
-/// 用户的历史 PASS 全部失效。这一条钉的是「builder 到底展开出了什么」：每条腿
+/// 用户的历史 PASS 全部失效。这一条钉的是「builder 到底展开出了什么」：每个方向
 /// 下发的 `-w/-P/-b/-l`、CTS 的全部参数、判定模式与门限、`target_lines`、
 /// 以及提示信息的内容与顺序。两条分开，是因为它们红了的含义不同：这一条在
 /// 有意改文案或改参数时就该红，而那一条不该。
@@ -848,7 +848,7 @@ fn tcp_and_cts_rate_modes_resolve_targets_consistently() {
 
 /// 合计门限继续优先（判定口径不变），但「逐方向门限被它盖掉了」必须进
 /// 计划提示。run_20260905_125327_5940 里套件写了 ab/ba 各 900Mbps，频段表
-/// 里一条 bidir_total=900 就把两条腿的门限清空，单元按合计判成 PASS——
+/// 里一条 bidir_total=900 就把两个方向的门限清空，单元按合计判成 PASS——
 /// 两处配置都在，报告上却看不出是哪一处生效了。
 #[test]
 fn a_bidir_total_that_shadows_per_direction_targets_says_so_in_the_plan() {
@@ -861,7 +861,7 @@ fn a_bidir_total_that_shadows_per_direction_targets_says_so_in_the_plan() {
 
     let mut port = PORT_BASE;
     let (units, notices) = build_units(&[spec], true, &mut port);
-    // 判定口径一个字节都没改：两条腿仍然只测量，合计仍然是唯一结论。
+    // 判定口径一个字节都没改：两个方向仍然只测量，合计仍然是唯一结论。
     for leg in &units[0].legs {
         let LegKind::IperfSingle(task) = &leg.kind else {
             panic!("expected iperf legs");
@@ -928,7 +928,7 @@ fn a_target_above_the_path_ceiling_is_capped_and_the_formula_is_reported() {
 
 /// 同一条现场：封顶只能把 1800/2000 压到线速的 95%（950），压不出「这条
 /// 链路该验收多少」——16 个单元实测 934~984 就骑在 950 上。真正缺的是
-/// 「这条腿是哪一对网口」这一层：SGMII1G 做发送端时收口那个 1800/2000
+/// 「这个方向是哪一对网口」这一层：SGMII1G 做发送端时收口那个 1800/2000
 /// 对本条路径根本不成立，而按网口那张表一块网卡只能填一个数。
 /// 双向早就有这一层（`rate_targets_bidir`），单向此前没有。
 #[test]
@@ -996,7 +996,7 @@ fn single_and_bidir_pair_targets_do_not_leak_into_each_other() {
         let LegKind::IperfSingle(task) = &leg.kind else {
             panic!("expected iperf legs");
         };
-        assert_eq!(task.rx_target_mbps, Some(850.0), "{} 腿", leg.tag);
+        assert_eq!(task.rx_target_mbps, Some(850.0), "{} 方向", leg.tag);
     }
 }
 
@@ -2220,7 +2220,7 @@ fn a_role_pair_target_is_not_labelled_as_a_per_nic_target() {
             "B→A 门限 350Mbps（角色配对门限）".to_string(),
         ]
     );
-    // 接收口 WLAN 有单口覆盖时，A→B 那一腿才是「按网口门限」。
+    // 接收口 WLAN 有单口覆盖时，A→B 那一个方向才是「按网口门限」。
     let lines = role_only(vec![NicProfile {
         host: "master".into(),
         name: "WLAN".into(),
@@ -2246,7 +2246,7 @@ fn test_udp_bandwidth_is_untouched_when_limit_is_off() {
     assert!(notices.is_empty());
 }
 
-/// 双向单元的两条腿各按自己的路径上限裁剪：同一条链路两个方向的
+/// 双向单元的两个方向各按自己的路径上限裁剪：同一条链路两个方向的
 /// 能力可以差很多，共用一个 -b 没有物理依据。
 #[test]
 fn bidirectional_udp_clips_each_leg_against_its_own_path_ceiling() {
@@ -2260,7 +2260,7 @@ fn bidirectional_udp_clips_each_leg_against_its_own_path_ceiling() {
     let (units, _) = build_units(&[spec], true, &mut port);
     assert_eq!(units.len(), 1);
     assert_eq!(units[0].legs.len(), 2);
-    // 两条腿都受 1G 那一端约束，都要被压到 1000Mbps。
+    // 两个方向都受 1G 那一端约束，都要被压到 1000Mbps。
     for leg in &units[0].legs {
         let task = match &leg.kind {
             LegKind::IperfSingle(task) => task,
@@ -2268,7 +2268,7 @@ fn bidirectional_udp_clips_each_leg_against_its_own_path_ceiling() {
             _ => panic!("expect iperf leg"),
         };
         let pos = task.extra.iter().position(|arg| arg == "-b").unwrap();
-        assert_eq!(task.extra[pos + 1], "1000000000", "腿 {} 未裁剪", leg.tag);
+        assert_eq!(task.extra[pos + 1], "1000000000", "方向 {} 未裁剪", leg.tag);
         assert_eq!(
             task.offered_per_stream_mbps,
             Some(1000.0),
@@ -2482,7 +2482,7 @@ fn single_udp_estimate_matches_one_attempt_and_bidir_is_parallel() {
     assert_eq!(bidir_units[0].legs.len(), 2);
     assert_eq!(
         bidir_units[0].est_secs, oneway_estimate,
-        "AB/BA 双腿并行，估算不得按两条腿重复累计"
+        "AB/BA 双方向并行，估算不得按两个方向重复累计"
     );
 }
 
@@ -2611,7 +2611,7 @@ fn a_bidirectional_unit_uses_the_per_pair_threshold_and_a_one_way_unit_does_not(
     assert_eq!(
         targets("bidir"),
         vec![Some(1000.0), Some(800.0)],
-        "双向两条腿各取各的方向门限——双向并发时两个方向本来就能差很远"
+        "双向两个方向各取各的方向门限——双向并发时两个方向本来就能差很远"
     );
 }
 
@@ -2647,13 +2647,13 @@ fn a_direction_without_a_bidirectional_threshold_falls_back_to_the_normal_chain(
     );
 }
 
-/// 配了「双向 RX 合计」门限时，两条腿**没有自己的门限**，也不许因此变成
+/// 配了「双向 RX 合计」门限时，两个方向**没有自己的门限**，也不许因此变成
 /// `TARGET_MISSING`。
 ///
-/// 判定在单元级只做一次合计比对（`executor::verdict_assembly::bidir_total`）。给腿
+/// 判定在单元级只做一次合计比对（`executor::verdict_assembly::bidir_total`）。给方向
 /// 留一个每方向门限，报告上会出现「AB 判 RATE_FAIL、单元判 PASS」这种自相
 /// 矛盾的两行；只清门限不改模式，显式配 `verify` 的用户会拿到一整轮
-/// `NOT_EVALUATED / TARGET_MISSING`——腿本来就不该有目标，这不是缺配置。
+/// `NOT_EVALUATED / TARGET_MISSING`——方向本来就不该有目标，这不是缺配置。
 #[test]
 fn a_bidirectional_total_threshold_turns_both_legs_into_pure_measurement() {
     let mut spec = base_spec();
@@ -2679,22 +2679,26 @@ fn a_bidirectional_total_threshold_turns_both_legs_into_pure_measurement() {
     for leg in &unit.legs {
         match &leg.kind {
             LegKind::IperfSingle(task) => {
-                assert_eq!(task.rx_target_mbps, None, "{} 腿不该有自己的门限", leg.tag);
+                assert_eq!(
+                    task.rx_target_mbps, None,
+                    "{} 方向不该有自己的门限",
+                    leg.tag
+                );
                 assert_eq!(
                     task.rate_mode,
                     RateMode::Observe,
-                    "{} 腿必须落到 Observe，否则 verify 会判 TARGET_MISSING",
+                    "{} 方向必须落到 Observe，否则 verify 会判 TARGET_MISSING",
                     leg.tag
                 );
             }
-            other => panic!("预期 iperf 单流腿，实得 {other:?}"),
+            other => panic!("预期 iperf 单流方向，实得 {other:?}"),
         }
     }
 }
 
 /// 合计门限**必须**进 resume identity。
 ///
-/// 腿的 `rx_target_mbps` 现在是 `None`，那条既有的「门限变了 identity 就变」
+/// 方向的 `rx_target_mbps` 现在是 `None`，那条既有的「门限变了 identity 就变」
 /// 的通路在这里断了：不显式记的话，把合计从 900 改成 1200 之后 resume 会拿
 /// 按 900 判过的 PASS 顶掉这一轮。
 #[test]
@@ -3186,7 +3190,7 @@ fn test_v6_missing() {
 /// 印的来源**同时正确——数字对而来源印错，用户在计划页上照样查不出为什么。
 ///
 /// 单向链：单向方向门限 → 按网口 → 任务/全局 → （无）。
-/// 双向链：双向合计（本腿只测量） → 双向方向门限 → 按网口 → 任务/全局。
+/// 双向链：双向合计（本方向只测量） → 双向方向门限 → 按网口 → 任务/全局。
 #[test]
 fn every_rx_target_layer_yields_to_the_one_above_it() {
     // 路径两端都是 2.5G，让路径上限（0.95 × 2500 = 2375）高于以下所有门限，
@@ -3271,7 +3275,7 @@ fn every_rx_target_layer_yields_to_the_one_above_it() {
     assert_eq!(
         target,
         Some(900.0),
-        "双向腿只认双向方向门限；单向的 800 不许渗进来"
+        "双向方向只认双向方向门限；单向的 800 不许渗进来"
     );
     says(&lines, "900", "双向方向门限");
 
@@ -3286,19 +3290,19 @@ fn every_rx_target_layer_yields_to_the_one_above_it() {
     };
     assert_eq!(
         task.rx_target_mbps, None,
-        "配了两端 RX 合计，这一腿就没有自己的门限——否则会出现\
+        "配了两端 RX 合计，这一方向就没有自己的门限——否则会出现\
          「AB 判 RATE_FAIL、单元判 PASS」这种自相矛盾的两行"
     );
-    // 分工：builder 这一层**只**说「本腿只测量」——逐腿门限本来就不存在，
+    // 分工：builder 这一层**只**说「本方向只测量」——按方向门限本来就不存在，
     // 印一个数字反而是撒谎。合计那个数字是单元级的，由
     // `webui::plan::unit_target_lines` 在预览时补一行
     // 「AB 接收端 RX + BA 接收端 RX ≥ …」，那一层由
     // `wifi_band_thresholds_flow_into_targets_and_show_their_source` 守着。
-    // 这里钉住的是分界：本层不许把单元级门限混进逐腿行里。
-    says(&unit.target_lines, "本腿只测量", "双向 RX 合计门限");
+    // 这里钉住的是分界：本层不许把单元级门限混进按方向行里。
+    says(&unit.target_lines, "本方向只测量", "双向 RX 合计门限");
     assert!(
         !unit.target_lines.iter().any(|line| line.contains("1700")),
-        "逐腿行里冒出单元级的合计门限，会读成「这条腿按 1700 判」：{:?}",
+        "按方向行里冒出单元级的合计门限，会读成「这个方向按 1700 判」：{:?}",
         unit.target_lines
     );
     assert_eq!(unit.bidir_total_target_mbps, Some(1700.0));
@@ -3317,11 +3321,15 @@ fn every_rx_target_layer_yields_to_the_one_above_it() {
     let (bidir_target, _) = target_of(spec.clone(), true);
     assert_eq!(
         bidir_target, None,
-        "只填了单向门限时，双向腿必须是「没有门限」——\
+        "只填了单向门限时，双向方向必须是「没有门限」——\
          这正是 v6.2.8 分成两套的理由：850/850 的双向不该被 1800 的单向顶掉"
     );
     let (single_target, _) = target_of(spec, false);
-    assert_eq!(single_target, Some(800.0), "同一份 spec，单向腿仍然拿得到");
+    assert_eq!(
+        single_target,
+        Some(800.0),
+        "同一份 spec，单向方向仍然拿得到"
+    );
 }
 
 /// **流数灌不到门限时，计划期就要说**（回归方案 CFG-07 / PLAN-12）。
@@ -3329,7 +3337,7 @@ fn every_rx_target_layer_yields_to_the_one_above_it() {
 /// 真机复现（run_20260906_175551，macOS ↔ Arch）：`udp_streams=2`、每流
 /// `-b 300m`、门限 850Mbps。必需流数 = ceil(850 × 1.05 / 300) = 3 > 2，
 /// 发出去的总负载只有 600Mbps。当时执行端还把「必需流数」当成有效窗口的
-/// 门槛，整条腿稳定判 `NOT_EVALUATED / EFFECTIVE_WINDOW_SHORT`；现在流数不足
+/// 门槛，整个方向稳定判 `NOT_EVALUATED / EFFECTIVE_WINDOW_SHORT`；现在流数不足
 /// 只作诊断，RX 照常和门限比，结果是几乎必然的 `RATE_FAIL`。
 ///
 /// 两种结果都由配置决定、计划期就算得出来，所以仍然要在跑之前点名，
@@ -3425,7 +3433,7 @@ fn every_input_that_changes_what_runs_or_how_it_is_judged_changes_the_resume_id(
     // ---- 改了必须失效 ----
     let must_change: Vec<Tweak> = vec![
         (
-            "单向方向门限（本腿的实际验收线）",
+            "单向方向门限（本方向的实际验收线）",
             Box::new(|s: &mut SpecNorm| s.rate_targets_single.ab = Some(801.0)),
         ),
         (
@@ -3436,7 +3444,7 @@ fn every_input_that_changes_what_runs_or_how_it_is_judged_changes_the_resume_id(
             }),
         ),
         (
-            "按网口门限（同样能改出本腿的验收线）",
+            "按网口门限（同样能改出本方向的验收线）",
             Box::new(|s: &mut SpecNorm| {
                 s.rate_targets_single = Default::default();
                 s.rate_targets = Default::default();
@@ -3525,14 +3533,14 @@ fn every_input_that_changes_what_runs_or_how_it_is_judged_changes_the_resume_id(
             Box::new(|s: &mut SpecNorm| s.link_group = "有线 ↔ 有线".into()),
         ),
         (
-            "双向门限（本腿是单向，它一次都不会被查）",
+            "双向门限（本方向是单向，它一次都不会被查）",
             Box::new(|s: &mut SpecNorm| {
                 s.rate_targets_bidir.ab = Some(999.0);
                 s.rate_targets_bidir.ba = Some(999.0);
             }),
         ),
         (
-            "双向 RX 合计门限（同上，只对双向腿成立）",
+            "双向 RX 合计门限（同上，只对双向方向成立）",
             Box::new(|s: &mut SpecNorm| s.rate_target_bidir_total = Some(1700.0)),
         ),
     ];
@@ -3547,7 +3555,7 @@ fn every_input_that_changes_what_runs_or_how_it_is_judged_changes_the_resume_id(
         );
     }
 
-    // 双向腿是另一条链：那两层在这里必须**反过来**生效。
+    // 双向测试是另一条链：那两层在这里必须**反过来**生效。
     let bidir = || {
         let mut spec = baseline();
         spec.directions = vec!["bidir".into()];
@@ -3558,7 +3566,7 @@ fn every_input_that_changes_what_runs_or_how_it_is_judged_changes_the_resume_id(
     let bidir_id = id(bidir());
     let mut changed = bidir();
     changed.rate_targets_bidir.ab = Some(901.0);
-    assert_ne!(bidir_id, id(changed), "双向腿上，双向方向门限必须进身份");
+    assert_ne!(bidir_id, id(changed), "双向方向上，双向方向门限必须进身份");
     let mut changed = bidir();
     changed.rate_target_bidir_total = Some(1700.0);
     assert_ne!(
@@ -3567,8 +3575,8 @@ fn every_input_that_changes_what_runs_or_how_it_is_judged_changes_the_resume_id(
         "合计门限一配，这个单元就改成「按两端 RX 相加判一次」——\
          判定口径整个换了，绝不能复用逐方向那一次的 PASS"
     );
-    // **两个不同的合计值之间**也必须分得开。配了合计，逐腿门限就统一变成
-    // `None`（本腿只测量），于是 1700 和 1800 在逐腿身份上**一个字节都不差**
+    // **两个不同的合计值之间**也必须分得开。配了合计，按方向门限就统一变成
+    // `None`（本方向只测量），于是 1700 和 1800 在按方向身份上**一个字节都不差**
     // ——只有合计那一项自己能区分。少了它，把合计从 1700 调到 1800 重跑，
     // 整批单元会拿 1700 那次的 PASS 顶上来。
     let mut at_1700 = bidir();
@@ -3578,8 +3586,8 @@ fn every_input_that_changes_what_runs_or_how_it_is_judged_changes_the_resume_id(
     let (a, b) = (id(at_1700), id(at_1800));
     assert_ne!(
         a, b,
-        "合计门限 1700 与 1800 的 resume 身份相同。配了合计后逐腿门限都是 None，\
-         逐腿身份分不出这两者，必须靠合计自己进身份"
+        "合计门限 1700 与 1800 的 resume 身份相同。配了合计后按方向门限都是 None，\
+         按方向身份分不出这两者，必须靠合计自己进身份"
     );
 
     let mut changed = bidir();
@@ -3587,7 +3595,7 @@ fn every_input_that_changes_what_runs_or_how_it_is_judged_changes_the_resume_id(
     assert_eq!(
         bidir_id,
         id(changed),
-        "双向腿不读单向门限，改它不该让身份失效"
+        "双向方向不读单向门限，改它不该让身份失效"
     );
 }
 
@@ -3634,12 +3642,12 @@ fn traffic_arguments_are_separate_argv_entries_never_a_shell_string() {
     // `-b` 解析不出来时**整条单元都不产生**：那个字符串到不了命令行。
     assert!(
         first_task(&build("1m; rm -rf / #", None, None)).is_none(),
-        "带宽解析不出来却仍排出了灌包腿——那个字符串会一路走到 argv 上"
+        "带宽解析不出来却仍排出了灌包方向——那个字符串会一路走到 argv 上"
     );
 
     // `-l` / `-w` 不参与数值解析，会原样下发；它们必须各自是**一个**元素。
     let units = build("1m", Some("1200 && whoami"), Some("256k; id"));
-    let task = first_task(&units).expect("合法带宽下应有一条 iperf 腿");
+    let task = first_task(&units).expect("合法带宽下应有一条 iperf 方向");
 
     for needle in ["&& whoami", "; id"] {
         let hits: Vec<&String> = task
@@ -3663,7 +3671,7 @@ fn traffic_arguments_are_separate_argv_entries_never_a_shell_string() {
     // `-b` 是**解析后重新生成**的（`1m` → `1000000`），原串一个字节都不留；
     // `-l` / `-w` 不做数值解析，原样透传，但各自只占**一个** argv 元素。
     // 后者意味着怪写法会走到 iperf3 手上并被它拒绝——那是执行期报错，不是
-    // 注入；代价只是这一腿要跑起来才失败，而不是计划期就挡下。
+    // 注入；代价只是这一个方向要跑起来才失败，而不是计划期就挡下。
     for (flag, value) in [
         ("-b", "1000000"),
         ("-l", "1200 && whoami"),
@@ -3686,7 +3694,7 @@ fn traffic_arguments_are_separate_argv_entries_never_a_shell_string() {
 /// **裁流的两个边界：速率未知时不裁，单流灌不动时压带宽而不是丢单元**
 /// （回归方案 PLAN-05）。
 ///
-/// 逐腿裁剪、Wi-Fi 固定档、RNDIS/NCM/10GUSB 的特例各自已有测试，这里补的是
+/// 按方向裁剪、Wi-Fi 固定档、RNDIS/NCM/10GUSB 的特例各自已有测试，这里补的是
 /// 两端：
 ///
 /// **① 速率未知不许裁，但也不许因此放过已知的那端。**
@@ -3700,7 +3708,7 @@ fn traffic_arguments_are_separate_argv_entries_never_a_shell_string() {
 /// 就改成了压 `-b` 而不是跳过（见
 /// `test_udp_over_path_ceiling_clips_bandwidth_instead_of_skipping`），CTS 那条路
 /// 以前仍按旧规则把流数算到 0、整个单元跳过：同一条 1G 链路上 iperf 的 2.6G 档位
-/// 照测，CTS 的这一档整个消失。两条路现在共用 `udp_leg_load`；也不许留下没有腿的
+/// 照测，CTS 的这一档整个消失。两条路现在共用 `udp_leg_load`；也不许留下没有方向的
 /// 空单元——空单元会进计数、进报告、占一行，却什么都没跑。
 #[test]
 fn an_unknown_link_speed_is_never_clipped_and_cts_clips_instead_of_dropping_the_unit() {
@@ -3766,10 +3774,10 @@ fn an_unknown_link_speed_is_never_clipped_and_cts_clips_instead_of_dropping_the_
     );
     assert!(
         units.iter().all(|unit| !unit.legs.is_empty()),
-        "留下了一个没有腿的空单元：它会进计数、进报告、占一行，却什么都没跑"
+        "留下了一个没有方向的空单元：它会进计数、进报告、占一行，却什么都没跑"
     );
     let LegKind::CtsTraffic(task) = &units[0].legs[0].kind else {
-        panic!("应当是 CTS 腿：{:?}", units[0].legs[0].kind);
+        panic!("应当是 CTS 方向：{:?}", units[0].legs[0].kind);
     };
     assert_eq!(task.streams, 1, "先降流数，降到 1 仍放不下才压带宽");
     assert_eq!(
@@ -4237,7 +4245,7 @@ fn cts_udp_legs_follow_the_same_load_policy_as_iperf() {
                     task.bits_per_second,
                     task.datagram_bytes.map(|bytes| bytes.to_string()),
                 ),
-                LegKind::Ping(_) => panic!("不该有 ping 腿"),
+                LegKind::Ping(_) => panic!("不该有 ping 方向"),
             })
             .collect::<Vec<_>>()
     };
@@ -4252,7 +4260,7 @@ fn cts_udp_legs_follow_the_same_load_policy_as_iperf() {
             (2, Some(300_000_000), Some("1200".to_string())),
         ]
     );
-    assert_eq!(cts, iperf, "CTS 与 iperf 的每腿负载必须一致");
+    assert_eq!(cts, iperf, "CTS 与 iperf 的每方向负载必须一致");
 
     // 按网口改写的报文长度非法时，CTS 记 SETUP_ERROR，而不是悄悄用档位原值。
     let mut bad = spec.clone();
@@ -4261,7 +4269,7 @@ fn cts_udp_legs_follow_the_same_load_policy_as_iperf() {
     let mut port = PORT_BASE;
     let (units, notices) = build_units(&[bad], true, &mut port);
     let LegKind::CtsTraffic(task) = &units[0].legs[0].kind else {
-        panic!("应当是 CTS 腿");
+        panic!("应当是 CTS 方向");
     };
     assert!(task.setup_error.is_some(), "{task:?}");
     assert!(

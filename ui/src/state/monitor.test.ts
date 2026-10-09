@@ -58,7 +58,7 @@ describe('监控会话', () => {
     fetchMock.mockResolvedValue(ok({ master: { interfaces: [] }, agent: { interfaces: [] } }));
     await connect();
     expect(monitor.sessions.map((item) => item.session)).toEqual(['local']);
-    expect(monitor.notice).toContain('辅测机连接已切换');
+    expect(monitor.notice).toContain('辅测机已切换');
     const stops = fetchMock.mock.calls.filter(([url]) => String(url).startsWith('/api/monitor/stop'));
     expect(stops.map(([, options]) => JSON.parse(options.body))).toEqual([{ session: 'old-agent' }]);
 
