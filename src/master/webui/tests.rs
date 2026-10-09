@@ -4359,6 +4359,56 @@ fn the_console_refuses_to_pile_up_monitor_sessions() {
     );
 }
 
+/// 并发请求不能同时占用最后一个监控槽位。
+#[test]
+fn concurrent_monitor_starts_share_the_last_available_slot() {
+    let console = console_for_monitor_tests();
+    {
+        let mut monitors = lock_recover(&console.monitors);
+        for idx in 0..MONITOR_MAX_SESSIONS - 1 {
+            monitors.insert(
+                format!("existing-{idx}"),
+                MonitorSession {
+                    side: "master".into(),
+                    iface: "missing-interface".into(),
+                    stop: Arc::new(AtomicBool::new(false)),
+                    data: Arc::new(Mutex::new(MonitorData {
+                        running: true,
+                        ..Default::default()
+                    })),
+                    started: std::time::Instant::now(),
+                },
+            );
+        }
+    }
+    let barrier = std::sync::Barrier::new(16);
+    let admitted = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                scope.spawn(|| {
+                    barrier.wait();
+                    api_monitor_start(&console, r#"{"side":"master","iface":"missing-interface"}"#)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .filter_map(|handle| handle.join().unwrap().ok())
+            .collect::<Vec<_>>()
+    });
+    let count = lock_recover(&console.monitors).len();
+    // 即使断言失败，也先停止实际启动的采样线程。
+    for result in &admitted {
+        api_monitor_stop(
+            &console,
+            &serde_json::json!({"session": result["session"]}).to_string(),
+        )
+        .unwrap();
+    }
+    assert_eq!(admitted.len(), 1, "只有最后一个槽位可用");
+    assert_eq!(count, MONITOR_MAX_SESSIONS);
+}
+
 /// 临时 config 里带着 agent_token，而 /tmp 是全局可读的。
 #[cfg(unix)]
 #[test]

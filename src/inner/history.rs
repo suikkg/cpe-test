@@ -188,14 +188,17 @@ pub(super) fn config(body: &str) -> Result<serde_json::Value, String> {
 /// 只读取历史的 `result.json`，不把当前运行目录或半截 `units.jsonl` 当成可复用
 /// 证据；单元身份由计划模块生成，端口和执行序号变化不会影响命中。
 pub(super) fn fresh_pass_ids() -> HashSet<String> {
+    fresh_pass_ids_in(Path::new(super::RUNS_ROOT), SystemTime::now())
+}
+
+fn fresh_pass_ids_in(root: &Path, now: SystemTime) -> HashSet<String> {
     let mut ids = HashSet::new();
-    if !regular_dir(Path::new(super::RUNS_ROOT)) {
+    if !regular_dir(root) {
         return ids;
     }
-    let Ok(entries) = std::fs::read_dir(super::RUNS_ROOT) else {
+    let Ok(entries) = std::fs::read_dir(root) else {
         return ids;
     };
-    let now = SystemTime::now();
     for entry in entries.flatten() {
         let dir = entry.path();
         if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
@@ -243,7 +246,13 @@ pub(super) fn fresh_pass_ids() -> HashSet<String> {
             continue;
         };
         for unit in units {
-            if unit.get("verdict").and_then(serde_json::Value::as_str) == Some("PASS") {
+            // 跳过记录没有新的测量，不能以本轮文件时间给旧 PASS 续期。
+            // 旧结果缺少 resumed 时仍按实测处理，保留历史兼容性。
+            if unit.get("verdict").and_then(serde_json::Value::as_str) == Some("PASS")
+                && unit
+                    .get("resumed")
+                    .is_none_or(|value| value == &serde_json::Value::Bool(false))
+            {
                 if let Some(id) = unit.get("id").and_then(serde_json::Value::as_str) {
                     ids.insert(id.to_string());
                 }
@@ -251,4 +260,52 @@ pub(super) fn fresh_pass_ids() -> HashSet<String> {
         }
     }
     ids
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resumed_records_do_not_extend_the_original_pass_lifetime() {
+        let root = std::env::temp_dir().join(format!(
+            "inner-resume-age-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap()
+        ));
+        let measured = root.join("measured");
+        let resumed = root.join("resumed");
+        for dir in [&measured, &resumed] {
+            std::fs::create_dir_all(dir).unwrap();
+            std::fs::write(
+                dir.join("summary.json"),
+                serde_json::to_vec(&Summary {
+                    finished: Some(true),
+                    ..Default::default()
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        std::fs::write(measured.join("result.json"), r#"{"units":[{"id":"original","verdict":"PASS","resumed":false},{"id":"legacy","verdict":"PASS"},{"id":"failed","verdict":"RATE_FAIL","resumed":false}]}"#).unwrap();
+        std::fs::write(resumed.join("result.json"), r#"{"units":[{"id":"original","verdict":"PASS","resumed":true},{"id":"skip-only","verdict":"PASS","resumed":true},{"id":"invalid","verdict":"PASS","resumed":"false"}]}"#).unwrap();
+        let modified = std::fs::symlink_metadata(measured.join("result.json"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(
+            fresh_pass_ids_in(&root, modified),
+            HashSet::from(["original".into(), "legacy".into()])
+        );
+        assert!(
+            fresh_pass_ids_in(&root, modified + Duration::from_secs(24 * 60 * 60 + 1)).is_empty()
+        );
+        // 删除原始证据后，更新的跳过记录不能成为独立证据。
+        std::fs::remove_dir_all(measured).unwrap();
+        assert!(fresh_pass_ids_in(&root, SystemTime::now()).is_empty());
+        assert!(
+            fresh_pass_ids_in(&root, modified + Duration::from_secs(24 * 60 * 60 + 1)).is_empty()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

@@ -83,14 +83,14 @@ pub(super) fn api_monitor_start(
     let interval_ms = monitor_interval_ms(&req.side, req.interval_ms);
     // 先回收再看上限，且都放在起线程之前：撞上限时不该已经有一条线程
     // 在跑（本机那条会一直读计数器，辅测机那条还占着对面的 monitor 资源）。
-    {
-        let mut monitors = lock_recover(&console.monitors);
-        reap_dead_monitors(&mut monitors);
-        if monitors.len() >= MONITOR_MAX_SESSIONS {
-            return Err(format!(
-                "同时最多 {MONITOR_MAX_SESSIONS} 路监控；先停掉一路再开"
-            ));
-        }
+    // 检查、起线程和登记共用一次锁；否则多个 HTTP worker 可同时看到空槽。
+    // spawn 只创建线程，采样与远程请求均在线程内执行，不在此锁内等待。
+    let mut monitors = lock_recover(&console.monitors);
+    reap_dead_monitors(&mut monitors);
+    if monitors.len() >= MONITOR_MAX_SESSIONS {
+        return Err(format!(
+            "同时最多 {MONITOR_MAX_SESSIONS} 路监控；先停掉一路再开"
+        ));
     }
 
     let data = Arc::new(Mutex::new(MonitorData {
@@ -135,7 +135,7 @@ pub(super) fn api_monitor_start(
         return Err(format!("无法启动采样线程: {error}"));
     }
 
-    lock_recover(&console.monitors).insert(
+    monitors.insert(
         session.clone(),
         MonitorSession {
             side: req.side.clone(),

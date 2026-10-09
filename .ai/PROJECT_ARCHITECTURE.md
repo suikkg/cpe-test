@@ -539,7 +539,7 @@ Windows 文本适配器：`src/cmd/ipconfig.rs` 解析中英文 `ipconfig /all`�
 - 其他平台固定错误。
 - PNG 编码；测试在 解码回读 2x2 RGBA，而不只检查魔数。
 
-## 10. 测试覆盖索引（当前 Rust 全量 773 项；下表列出按模块维护的覆盖面）
+## 10. 测试覆盖索引（下表列出按模块维护的覆盖面）
 
 | 区域 | 测试位置 | 覆盖 |
 |---|---|---|
@@ -772,3 +772,8 @@ Windows 文本适配器：`src/cmd/ipconfig.rs` 解析中英文 `ipconfig /all`�
 `report::render_monitor_rx_chart` 与 `RX_CHART_CSS` 将已有 SVG 引擎提供给内环；使用全采样期原始 RX，不绘制推断的有效窗口或验收线，图注明确含背景流量、仅作诊断。有效样本的保峰降采样与不可信样本断口继续由 `report::chart` 单源实现。测量质量、诊断和原始输出分层折叠，既有落盘节流、JSON 字段与判定不变。
 
 - 内环截图由 `inner::screenshot` 在 `inner::execute` 的 `run_unit` 返回并完成资源回收后采集，每单元仅参与电脑一次；配置 `InnerConfig::screenshot` 默认开启，取消及 RESUME 不采集。复用 `screenshot::capture_png` 和 `inner::remote::Remote::post_with_timeout` 的已鉴权 `/screenshot`（180 秒）。`UnitRow::screenshot` 保存电脑、路径及错误；PNG 使用 `create_new`，报告内嵌 data URI，状态 API 仅返回元数据。截图失败不进入判定。
+
+### 内环复用有效期与监控并发上限
+
+- `inner::history::fresh_pass_ids` 仅从已收尾且无错误的历史实测 PASS 提取身份；`resumed=true` 不提供新证据，避免新生成的跳过记录刷新原始测量的 24 小时有效期。旧记录缺少 `resumed` 时保持兼容，显式非法类型拒绝复用。
+- `master::webui::monitor::api_monitor_start` 在同一次 `console.monitors` 加锁范围内检查上限、创建线程并登记会话。线程内采样与网络访问不持有此锁；线程创建失败不登记。并发请求最多占满 8 路会话，由 `concurrent_monitor_starts_share_the_last_available_slot` 验证。
