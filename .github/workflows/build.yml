@@ -278,6 +278,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+          components: clippy
 
       - name: Resolve package name
         id: package
@@ -314,6 +315,10 @@ jobs:
       - name: Test on Windows
         if: matrix.platform == 'windows-x86_64'
         run: cargo test --locked --target ${{ matrix.target }}
+
+      - name: Clippy on Windows
+        if: matrix.platform == 'windows-x86_64'
+        run: cargo clippy --locked --all-targets --target ${{ matrix.target }} -- -D warnings
 
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
@@ -666,23 +671,24 @@ jobs:
           # 版本号手写，跟着 release: 提交一起改（见上面 files: 那样短的输入
           # 才可以用表达式）。
           body: |
-            cpe_test v6.7.0 内环配置、报告与截图更新。
+            cpe_test v6.7.1 项目审查修复。
 
             ## 更新内容
 
-            - 内环支持多档参数，使用空格或逗号分隔，按协议组合测试。
-            - 每个网口可分别设置 TCP / UDP 门限，留空继承公共门限。
-            - 内环结果按网口展示参数、接收速率、门限与判定，双向明确区分合计和分别验收。
-            - 内环默认采集参与电脑的测试结束截图，图片嵌入离线报告；失败原因可见，不影响速率判定。
-            - 精简子网、内环、共用 UI 与报告说明，统一上行、下行和方向用词。
-            - 内环项目 version 4 兼容旧项目；旧单值参数保持 RESUME 身份，速率判定规则不变。
+            - 修复内环 RESUME 跳过记录延长旧 PASS 有效期的问题。只复用 24 小时内的实测 PASS；跳过记录不续期，原始证据过期或移除后重新测试。
+            - 修复并发启动实时监控突破 8 路会话上限的问题。上限检查与会话登记保持原子性。
+            - 新增两项在旧实现下失败的回归，同步操作说明、架构约束与 Windows 配置文档包。
+            - 保留内环多档参数、按网口 TCP / UDP 门限、默认截图及自包含报告，速率判定规则不变。
+
+            ## 验证
+
+            本地 988 项 Rust 测试、两平台全目标 clippy、549 项前端单测及 22 项真实 Chromium 回归通过。发布流水线补齐 Windows 原生全目标 clippy，并执行 Windows 原生测试与三平台构建。
 
             ## 使用
 
             主控和辅测机请使用同一版本。Windows 包包含 ctsTraffic 2.0.4.0；iperf3 需按包内说明放置。内环另需 adb 和板侧 iperf3。
 
-            新版报告适用于新生成的结果，已有历史 HTML 保留原文。Windows 桌面截图仍需在实际运行会话中确认。
-
+            本轮未进行真实 CPE 线速灌包及 Windows 桌面截图实测。
             三个平台归档的 SHA-256 见 SHA256SUMS。
           files: |
             release-assets/cpe_test-${{ github.ref_name }}-windows-x86_64.zip

@@ -1,8 +1,8 @@
 # CPE 测试工具 Windows 包
 
-> 如果你从 Git 仓库下载的是 `cpe_test-v6.7.0-windows-config-docs.zip`，那是一份只含
+> 如果你从 Git 仓库下载的是 `cpe_test-v6.7.1-windows-config-docs.zip`，那是一份只含
 > 配置、文档和启动脚本的资料包，不含 `cpe_test.exe`、`ctsTraffic.exe` 或 iperf3。
-> 开箱即用请下载 GitHub Release 的 `cpe_test-v6.7.0-windows-x86_64.zip`；也可以自行
+> 开箱即用请下载 GitHub Release 的 `cpe_test-v6.7.1-windows-x86_64.zip`；也可以自行
 > 编译程序后，把资料包内容与 exe 放到同一目录。
 
 将这个文件夹完整复制到**主控机**和**辅测机**。两台电脑必须使用同一个
@@ -11,7 +11,7 @@
 ## 包内文件与系统要求
 
 - `cpe_test.exe`：主控、agent、网卡扫描和监控共用的程序。
-- `ctsTraffic.exe`：Microsoft ctsTraffic 2.0.4.0 x64，随官方 v6.7.0 Windows 包固定捆绑并校验；仅支持 Windows 10 或更高版本。
+- `ctsTraffic.exe`：Microsoft ctsTraffic 2.0.4.0 x64，随官方 v6.7.1 Windows 包固定捆绑并校验；仅支持 Windows 10 或更高版本。
 - `start_*.bat`：双击启动脚本。`start_ui.bat` 是图形控制台，`start_master*.bat` 是命令行问答式。
 - `configs\`：SGMII、Wi-Fi、10GUSB 等具名配置。
 - `THIRD_PARTY_NOTICES.md` 及 CTS/WIL 许可文件：第三方归属和许可说明。
@@ -239,7 +239,7 @@ JSON 配置通过 `parameter_options` 设置数组：`tcp_streams`、`tcp_window
 
 内环与子网一样默认开启测试截图，可在内环打流设置中关闭（配置字段 `screenshot`，默认 `true`）。每个实际执行单元的全部流量结束并回收后，截取参与电脑的桌面一次；双向共用一张，RESUME 跳过及取消不截图。主控使用本机截图，辅测机使用已鉴权的截图接口。PNG 保存在本轮运行目录，HTML 报告内嵌截图，可单独离线查看；控制台显示保存状态或失败原因。截图失败不影响速率判定。截图对象为电脑桌面，板侧测量依据仍为采样和日志。
 
-Windows v6.7.0 正式安装包包含 `inner.example.json`，内环参数可参考该文件填写。
+Windows v6.7.1 正式安装包包含 `inner.example.json`，内环参数可参考该文件填写。
 
 ### 历史复用与实时监控限制
 
