@@ -249,8 +249,8 @@ pub(super) fn api_connect(console: &Arc<Console>, body: &str) -> Result<serde_js
 pub(super) fn api_plan(console: &Arc<Console>, body: &str) -> Result<serde_json::Value, String> {
     let req: RunRequest = serde_json::from_str(body).map_err(|e| format!("参数解析失败: {e}"))?;
     let state = lock_recover(&console.state);
-    if state.master.interfaces.is_empty() || state.agent.interfaces.is_empty() {
-        return Err("还没连上辅测机，先点「连接」".into());
+    if state.master.interfaces.is_empty() {
+        return Err("尚未扫描本机网卡，请先在连接页重新扫描".into());
     }
     let mut compiled = compile_request(&state, &req)?;
     let blocking_errors = compiled.blocking_errors(req.ui_plan.is_some());
@@ -309,8 +309,8 @@ pub(super) fn api_plan(console: &Arc<Console>, body: &str) -> Result<serde_json:
 pub(super) fn api_config(console: &Arc<Console>, body: &str) -> Result<serde_json::Value, String> {
     let req: RunRequest = serde_json::from_str(body).map_err(|e| format!("参数解析失败: {e}"))?;
     let state = lock_recover(&console.state);
-    if state.master.interfaces.is_empty() || state.agent.interfaces.is_empty() {
-        return Err("还没连上辅测机，先点「连接」".into());
+    if state.master.interfaces.is_empty() {
+        return Err("尚未扫描本机网卡，请先在连接页重新扫描".into());
     }
     let compiled = compile_request(&state, &req)?;
     serde_json::to_value(compiled.cfg).map_err(|error| format!("生成配置失败: {error}"))
@@ -353,9 +353,9 @@ fn api_run_impl(
     let confirmed_plan_hash;
     let cfg = {
         let state = lock_recover(&console.state);
-        if state.master.interfaces.is_empty() || state.agent.interfaces.is_empty() {
+        if state.master.interfaces.is_empty() {
             console.running.store(false, Ordering::SeqCst);
-            return Err("还没连上辅测机，先点「连接」".into());
+            return Err("尚未扫描本机网卡，请先在连接页重新扫描".into());
         }
         match compile_request(&state, &req) {
             Ok(compiled) => {

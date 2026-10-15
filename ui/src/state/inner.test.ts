@@ -1,12 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { defaultInnerConfig, innerLink, parseInnerProject, serializeInnerProject } from '../domain/inner';
+import { defaultInnerConfig, normalizeInnerDraft, innerLink, parseInnerProject, serializeInnerProject } from '../domain/inner';
 import type { InnerConfig, InnerLink } from '../domain/inner';
 import type { InnerCapability } from '../domain/inner';
 import { innerNicChoices } from '../domain/inner-setup';
 import {
   addInnerLink, addInnerScannedLinks, applyInnerBatch, importInner, inner, moveInnerLinkTo, probeInner, refreshInnerPlan,
   setInnerLinkEnabled, startInner, startSubnetThenInner, stopInner, syncInnerStatus, syncScenarioStatus,
-  loadInnerRunConfig, scenarioBlocksActions, prepareAfterUnknownScenario,
+  loadInnerRunConfig, scenarioBlocksActions, prepareAfterUnknownScenario, prepareAfterUnknownInner,
 } from './inner';
 import { buildRunRequest, plan as subnetPlan } from './plan';
 import { api } from '../api/client';
@@ -35,13 +35,34 @@ function link(patch: Partial<InnerLink> = {}): InnerLink {
 
 describe('内环独立状态与 API', () => {
   beforeEach(() => {
-    vi.clearAllMocks(); inner.config = defaultInnerConfig(); inner.busy = false; inner.synced = true; inner.error = '';
+    vi.clearAllMocks(); inner.startPhase = 'idle'; inner.config = defaultInnerConfig(); inner.busy = false; inner.synced = true; inner.error = '';
     inner.preview = null; inner.previewStale = true; inner.previewError = '';
     inner.status = { running: false, current: '', error: null, completed: 0, total: 0, units: [], has_report: false };
     inner.scenarioStartPhase = 'idle'; inner.scenarioLastReadIdle = false;
     inner.scenario = { running: false, id: '', phase: '', error: null, runs: [] };
     subnetPlan.preview = null; subnetPlan.previewRequestFingerprint = '';
     vi.mocked(api.get).mockResolvedValue(inner.status);
+  });
+  it('内环启动超时保持未知，只有本次令牌的状态才能解锁，期间不重复启动', async () => {
+    vi.useFakeTimers();
+    try {
+      inner.config.links = [link()]; inner.preview = { plan_hash: 'ready' } as never; inner.previewStale = false;
+      inner.previewFingerprint = JSON.stringify(normalizeInnerDraft(inner.config));
+      vi.mocked(api.post).mockRejectedValueOnce(new NetworkError('超时'));
+      await startInner();
+      const body = vi.mocked(api.post).mock.calls[0]![1] as { start_token: string };
+      expect(inner.startPhase).toBe('unknown'); expect(scenarioBlocksActions()).toBe(true);
+      await startInner(); expect(api.post).toHaveBeenCalledTimes(1);
+      vi.mocked(api.get).mockResolvedValue({ ...inner.status, start_token: 'old', units_from: 0 });
+      await syncInnerStatus(); expect(inner.startPhase).toBe('unknown');
+      vi.mocked(api.get).mockResolvedValue({ ...inner.status, start_token: body.start_token, units_from: 0 });
+      await syncInnerStatus(); expect(inner.startPhase).toBe('accepted');
+    } finally { vi.clearAllTimers(); vi.useRealTimers(); }
+  });
+  it('明确重新准备作废内环预览，不能拿事故前的预览直接开始', () => {
+    inner.startPhase = 'unknown'; inner.synced = true; inner.status.running = false;
+    inner.previewStale = false; prepareAfterUnknownInner();
+    expect(inner.startPhase).toBe('idle'); expect(inner.previewStale).toBe(true); expect(inner.preparing).toBe(true);
   });
   it('扫描选口只添加明确勾选的项，重复添加不覆盖配置也不启动测试', () => {
     inner.capability = { local: { interfaces: [
@@ -64,6 +85,7 @@ describe('内环独立状态与 API', () => {
     inner.config.links = [link()];
     // 状态响应独立于被 startInner 改动的对象。
     vi.mocked(api.get).mockResolvedValue({ ...inner.status });
+    inner.preview = { plan_hash: 'ready' } as never; inner.previewStale = false; inner.previewFingerprint = JSON.stringify(normalizeInnerDraft(inner.config));
     await startInner(); await stopInner();
     expect(vi.mocked(api.post).mock.calls.map(([path]) => path)).toEqual(['/api/inner/probe', '/api/inner/run', '/api/inner/stop']);
     // 带上了 units_from 游标，所以按前缀断言；要守的是「只碰内环命名空间」。
@@ -167,15 +189,15 @@ describe('内环独立状态与 API', () => {
     expect(inner.error).toBe('');
     expect(inner.busy).toBe(false);
   });
-  it('扫描仍暴露设备连接错误，不会偷偷替换辅测机或 ADB 设置', async () => {
+  it('扫描未引用的空辅测机配置不阻断本机且不改写连接设置', async () => {
     inner.config.agents = [{ id: 'agent-a', address: '', port: 28801, token: 'keep-token' }];
     vi.mocked(api.post).mockImplementationOnce(async (_path, body) => {
       parseInnerProject(JSON.stringify(body));
       return { serial: 'unexpected' };
     });
     await probeInner();
-    expect(inner.error).toContain('辅测机');
-    expect(inner.capability).toBeNull();
+    expect(inner.error).toBe('');
+    expect(inner.capability?.serial).toBe('unexpected');
     expect(inner.busy).toBe(false);
     expect(inner.config.agents[0]).toEqual({ id: 'agent-a', address: '', port: 28801, token: 'keep-token' });
   });

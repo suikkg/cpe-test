@@ -6,7 +6,7 @@ import type { VerdictFilter } from '../domain/progress';
  *
  *  「连接」合并了旧的本机/辅测机两页（两页的重扫是同一个请求）；「执行」合并了
  *  旧的执行/进度两页（开始之后本来就自动跳过去）。 */
-export type RegionId = 'connect' | 'plan' | 'run' | 'inner' | 'monitor' | 'history';
+export type RegionId = 'connect' | 'plan' | 'run' | 'inner' | 'inner-connect' | 'inner-plan' | 'monitor' | 'history';
 
 export interface RegionDef {
   id: RegionId;
@@ -19,7 +19,9 @@ export const REGIONS: readonly RegionDef[] = [
   { id: 'connect', label: '连接', group: 'flow' },
   { id: 'plan', label: '计划', group: 'flow' },
   { id: 'run', label: '执行', group: 'flow' },
-  { id: 'inner', label: '内环测试', group: 'inner' },
+  { id: 'inner-connect', label: '连接', group: 'inner' },
+  { id: 'inner-plan', label: '计划', group: 'inner' },
+  { id: 'inner', label: '执行', group: 'inner' },
   { id: 'monitor', label: '监控', group: 'tool' },
   { id: 'history', label: '历史', group: 'tool' },
 ];

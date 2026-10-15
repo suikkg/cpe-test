@@ -362,6 +362,9 @@ pub fn disposition_advice(reason_code: ReasonCode) -> Option<&'static str> {
         ReasonCode::CounterStalled => {
             "样本采齐了但网卡字节计数长时间不动，而工具侧同期仍有流量、或者对不上这段时间：可能是这块网卡的计数器没记这条路径上的包，也可能是链路断流但没有可对照的记录。这一轮的平均速率不能当结论，核对接收端网卡与路由后重跑。工具侧确认同期也没有流量时按真实断流判定，不会出现本原因。"
         }
+        ReasonCode::CounterOffPath => {
+            "工具侧同一段时间收到了流量，这块网卡的字节计数却远低于它：计数器不在这条流量的路径上（统计接口选错、流量走了另一块网卡，或硬件转发绕过了这块网卡的计数）。这一轮的平均速率不能当结论，核对接收端统计接口与路由后重跑。这不是速率不达标。"
+        }
         ReasonCode::EffectiveWindowShort
         | ReasonCode::IperfEffectiveWindowShort
         | ReasonCode::CtsEffectiveWindowShort => {

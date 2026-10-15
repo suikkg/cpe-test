@@ -25,7 +25,17 @@ pub fn client_secs(cfg: &InnerConfig, unit: &Unit) -> u64 {
 }
 
 /// 一个单元的预计耗时；计划预览和「去掉 RESUME 命中后还剩多久」共用。
-fn unit_estimated_secs(cfg: &InnerConfig, unit: &Unit) -> u64 {
+pub(super) fn unit_estimated_secs(cfg: &InnerConfig, unit: &Unit) -> u64 {
+    let cfg = unit.execution_config.as_deref().unwrap_or(cfg);
+    if unit.protocol == Protocol::Ping {
+        return unit.parameters.streams as u64
+            + UNIT_OVERHEAD_SECS
+            + if cfg.run_overrides.probe_path_mtu && unit.ip_version == 4 {
+                unit.legs.len() as u64 * 45
+            } else {
+                0
+            };
+    }
     client_secs(cfg, unit)
         + UNIT_OVERHEAD_SECS
         + if unit.is_bidir() {
@@ -59,6 +69,11 @@ pub struct BidirTargets {
 pub struct Unit {
     /// 与端口、执行序号和链路列表位置无关的稳定身份，供内环 RESUME 使用。
     pub id: String,
+    /// 套件任务溯源，不从标题反推。
+    pub origin: Option<super::workspace::Origin>,
+    pub round: u32,
+    #[serde(skip)]
+    pub execution_config: Option<std::sync::Arc<InnerConfig>>,
     /// 执行序号，从 1 开始，与页面预览和报告里的编号一致。
     pub index: usize,
     /// 在 `cfg.links` 中的下标。
@@ -69,6 +84,8 @@ pub struct Unit {
     pub protocol: Protocol,
     pub direction: Direction,
     pub streams: u32,
+    pub duration_secs: u64,
+    pub requested_parameters: Option<super::config::Parameters>,
     pub parameters: Parameters,
     pub measurement: Measurement,
     /// 第几轮重复，从 1 开始。
@@ -178,6 +195,17 @@ fn unit_id(
     streams: u32,
 ) -> String {
     let mut raw = String::from("inner-resume-v1|");
+    if protocol == Protocol::Udp {
+        if let Some(window) = &cfg.udp_window {
+            push_id_field(&mut raw, "udp_window", window);
+        }
+    }
+    if protocol == Protocol::Ping {
+        push_id_field(&mut raw, "ping", format!("{:?}", cfg.ping_options));
+        if let Some(policy) = &cfg.ping_policy {
+            push_id_field(&mut raw, "ping_policy", format!("{policy:?}"));
+        }
+    }
     push_id_field(&mut raw, "link", &link.name);
     push_id_field(&mut raw, "host", &link.host);
     push_id_field(&mut raw, "iface", &link.local_interface);
@@ -259,6 +287,9 @@ fn legacy_link_identity(link: &Link) -> String {
 /// 绝不同时灌包——板侧桥计数器会把两条链路的流量混在一起。
 pub fn build(cfg: &InnerConfig) -> Result<Plan, String> {
     cfg.validate()?;
+    if let Some(workspace) = &cfg.workspace {
+        return workspace.build(cfg);
+    }
     let links = cfg.active_links();
     let mut units = Vec::new();
     for &link_index in &links {
@@ -267,7 +298,15 @@ pub fn build(cfg: &InnerConfig) -> Result<Plan, String> {
             for &protocol in &cfg.protocols {
                 let effective_link = link.for_protocol(protocol);
                 let link = &effective_link;
-                for parameters in cfg.parameter_variants(protocol) {
+                for requested in cfg.parameter_variants(protocol) {
+                    let parameters =
+                        if protocol == Protocol::Udp && cfg.run_overrides.limit_udp_by_link_speed {
+                            super::options::clipped_parameters(link, &requested)
+                        } else {
+                            requested.clone()
+                        };
+                    let clipped = parameters.streams != requested.streams
+                        || parameters.udp_mbps != requested.udp_mbps;
                     let effective_cfg = parameters.apply(cfg, protocol);
                     let cfg = &effective_cfg;
                     for &direction in &cfg.directions {
@@ -281,19 +320,36 @@ pub fn build(cfg: &InnerConfig) -> Result<Plan, String> {
                                         cfg.port.checked_add(offset as u16).ok_or_else(|| {
                                             "板侧端口加一后越界，请把起始端口调低".to_string()
                                         })?;
-                                    Ok(leg_plan(link, flow, port))
+                                    let mut leg = leg_plan(link, flow, port);
+                                    if protocol == Protocol::Ping {
+                                        leg.nic_target_mbps = None;
+                                        leg.tool_target_mbps = None;
+                                    }
+                                    Ok(leg)
                                 })
                                 .collect::<Result<Vec<_>, String>>()?;
                             units.push(Unit {
-                                id: unit_id(
-                                    cfg,
-                                    link,
-                                    ip_version,
-                                    protocol,
-                                    direction,
-                                    repeat,
-                                    cfg.streams(protocol),
-                                ),
+                                origin: None,
+                                round: 1,
+                                execution_config: None,
+                                id: {
+                                    let id = unit_id(
+                                        cfg,
+                                        link,
+                                        ip_version,
+                                        protocol,
+                                        direction,
+                                        repeat,
+                                        cfg.streams(protocol),
+                                    );
+                                    if clipped {
+                                        crate::util::md5_hex(&format!(
+                                            "{id}|requested={requested:?}"
+                                        ))
+                                    } else {
+                                        id
+                                    }
+                                },
                                 index: units.len() + 1,
                                 link: link_index,
                                 link_name: link.name.clone(),
@@ -302,15 +358,18 @@ pub fn build(cfg: &InnerConfig) -> Result<Plan, String> {
                                 protocol,
                                 direction,
                                 streams: cfg.streams(protocol),
+                                duration_secs: cfg.duration_secs,
+                                requested_parameters: clipped.then_some(requested.clone()),
                                 parameters: parameters.clone(),
                                 measurement: link.measurement,
                                 repeat,
                                 legs,
-                                nic_total_target_mbps: direction
-                                    .is_bidir()
+                                nic_total_target_mbps: (direction.is_bidir()
+                                    && protocol != Protocol::Ping)
                                     .then(|| link.total_target(false))
                                     .flatten(),
                                 tool_total_target_mbps: (direction.is_bidir()
+                                    && protocol != Protocol::Ping
                                     && link.measurement.uses_tool())
                                 .then(|| link.total_target(true))
                                 .flatten(),
@@ -318,6 +377,18 @@ pub fn build(cfg: &InnerConfig) -> Result<Plan, String> {
                         }
                     }
                 }
+            }
+        }
+    }
+    if cfg.rounds > 1 {
+        let first = units.clone();
+        for round in 2..=cfg.rounds {
+            for original in &first {
+                let mut unit = original.clone();
+                unit.round = round;
+                unit.id = crate::util::md5_hex(&format!("{}|round={round}", original.id));
+                unit.index = units.len() + 1;
+                units.push(unit);
             }
         }
     }
@@ -341,6 +412,7 @@ pub fn build(cfg: &InnerConfig) -> Result<Plan, String> {
 /// 页面预览。执行前用它回答「这一轮到底要跑什么」，配置一改就重新算。
 #[derive(Debug, Clone, Serialize)]
 pub struct Preview {
+    pub plan_hash: String,
     pub links: usize,
     pub units: usize,
     pub legs: usize,
@@ -359,6 +431,8 @@ pub struct Preview {
 #[derive(Debug, Clone, Serialize)]
 pub struct PreviewRow {
     pub index: usize,
+    pub origin: Option<super::workspace::Origin>,
+    pub round: u32,
     pub id: String,
     pub link: String,
     pub host: String,
@@ -395,6 +469,9 @@ fn describe_target(target: Option<f64>) -> String {
 /// 判定依据。**只描述计划里已经确定的部分**：具体用网卡还是工具口径要等
 /// 跑完看计数是否可信，这里说的是「配了哪些门限、按合计还是按方向」。
 fn verdict_basis(unit: &Unit) -> String {
+    if unit.protocol == Protocol::Ping {
+        return "Ping 丢包、平均 RTT 与最大 RTT".into();
+    }
     let tool = unit.measurement.uses_tool();
     if unit.is_bidir() {
         return match (unit.nic_total_target_mbps, unit.tool_total_target_mbps) {
@@ -444,6 +521,8 @@ pub fn preview_with_resumed(
             let link = &cfg.links[unit.link];
             PreviewRow {
                 index: unit.index,
+                origin: unit.origin.clone(),
+                round: unit.round,
                 id: unit.id.clone(),
                 link: unit.link_name.clone(),
                 host: unit.host.clone(),
@@ -454,7 +533,22 @@ pub fn preview_with_resumed(
                 measurement: unit.measurement,
                 verdict_basis: verdict_basis(unit),
                 parameters: unit.parameters.clone(),
-                parameter_label: unit.parameters.label(unit.protocol),
+                parameter_label: if unit.protocol == Protocol::Ping {
+                    format!(
+                        "{} 次 / {} 字节",
+                        unit.parameters.streams,
+                        unit.parameters.udp_length.as_deref().unwrap_or("32")
+                    )
+                } else {
+                    match &unit.requested_parameters {
+                        Some(requested) => format!(
+                            "{}（请求 {}，按路径上限裁剪）",
+                            unit.parameters.label(unit.protocol),
+                            requested.label(unit.protocol)
+                        ),
+                        None => unit.parameters.label(unit.protocol),
+                    }
+                },
                 resumed: resumed.contains(&unit.id),
                 legs: unit
                     .legs
@@ -492,7 +586,15 @@ pub fn preview_with_resumed(
         .filter(|unit| resumed.contains(&unit.id))
         .map(|unit| unit_estimated_secs(cfg, unit))
         .sum::<u64>();
+    let plan_hash = crate::util::md5_hex(&format!(
+        "inner-ui-plan-v1|{}|probe-traffic={}|probe-mtu={}|udp-limit={}",
+        serde_json::to_string(&plan).map_err(|e| e.to_string())?,
+        cfg.run_overrides.probe_during_traffic,
+        cfg.run_overrides.probe_path_mtu,
+        cfg.run_overrides.limit_udp_by_link_speed
+    ));
     Ok(Preview {
+        plan_hash,
         links: plan.links.len(),
         units: plan.unit_count(),
         legs: plan.leg_count(),
@@ -503,8 +605,9 @@ pub fn preview_with_resumed(
         skipped: cfg
             .links
             .iter()
-            .filter(|link| !link.enabled)
-            .map(|link| link.name.clone())
+            .enumerate()
+            .filter(|(index, _)| !plan.links.contains(index))
+            .map(|(_, link)| link.name.clone())
             .collect(),
         rows,
         resumed: resumed_count,

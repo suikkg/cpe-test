@@ -1,3 +1,4 @@
+import { innerAssignedLinks } from './inner-workspace';
 import type { NicInfo } from '../api/dto';
 import {
   INNER_DEFAULT_BOARD_RX, canonicalInnerIpv6, innerIpv4, innerIpv6, innerIpv6LinkLocal, innerNicIpv6, innerLink, normalizeInnerDraft, parseInnerProject,
@@ -87,12 +88,25 @@ export interface InnerSetupIssue {
   action: string;
   target: 'device' | 'links' | 'params';
   linkIndex?: number;
+  workspaceTab?: 'ports' | 'content' | 'limits';
 }
 
 /** 将缺项定位到可编辑的网口；能力扫描和实际连通性不参与配置门禁。 */
 export function innerSetupIssues(config: InnerConfig): InnerSetupIssue[] {
   config = normalizeInnerDraft(config);
   const issues: InnerSetupIssue[] = [];
+  if (config.workspace) {
+    if (!innerAssignedLinks(config).length) issues.push({ message: '还没有向套件分配参与网口。', action: '分配网口', target: 'links', workspaceTab:'ports' });
+    try { parseInnerProject(JSON.stringify(config)); }
+    catch (error) {
+      const message = error instanceof Error ? error.message : '配置有误';
+      const linkIndex = config.links.findIndex(link => message.startsWith(`${link.name}:`));
+      const target = /ADB|序列号|板侧工具|辅测机/.test(message) ? 'device' : linkIndex >= 0 || /网口|链路|CPE LAN|IPv6.*地址/.test(message) ? 'links' : 'params';
+      issues.push({ message, action: target === 'device' ? '检查连接' : target === 'links' ? '编辑网口' : '检查测试内容', target,
+        linkIndex: linkIndex >= 0 ? linkIndex : undefined, workspaceTab: target === 'links' ? 'ports' : /Ping RTT|包长分档|默认/.test(message) ? 'limits' : 'content' });
+    }
+    return issues;
+  }
   if (!config.links.some((link) => link.enabled)) {
     issues.push({ message: '本轮还没有勾选参与测试的网口。', action: config.links.length ? '勾选网口' : '添加网口', target: 'links' });
   }
@@ -114,7 +128,7 @@ export function innerSetupIssues(config: InnerConfig): InnerSetupIssue[] {
     else if (config.ip_versions.includes(6) && link.enabled && canonicalInnerIpv6(link.local_ipv6) === canonicalInnerIpv6(link.gateway_ipv6)) issues.push({ message: `${prefix}：电脑 IPv6 和 CPE LAN IPv6 不能相同。`, action: '修改地址', target: 'links', linkIndex });
     else if (config.ip_versions.includes(6) && link.enabled && innerIpv6LinkLocal(link.local_ipv6) !== innerIpv6LinkLocal(link.gateway_ipv6)) issues.push({ message: `${prefix}：两端 IPv6 需同为链路本地地址或同为非链路本地地址。`, action: '修改地址', target: 'links', linkIndex });
   });
-  if (config.protocols.includes('udp') && !(Number(config.udp_mbps) > 0) && !config.parameter_options?.udp_rates_mbps.length) {
+  if (config.protocols.includes('udp') && !(Number(config.udp_mbps) > 0) && !config.parameter_options?.udp_rates_mbps.length && config.run_overrides?.udp_mbps == null) {
     issues.push({ message: '已选择 UDP，请填写每条流的发送速率。', action: '填写 UDP 速率', target: 'params' });
   }
   if (!issues.length) {

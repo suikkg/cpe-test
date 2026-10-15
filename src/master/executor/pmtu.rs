@@ -71,36 +71,7 @@ pub(super) struct PathMtu {
 /// 靠跑真链路验证不了——真链路的路径 MTU 是个固定值，测不出这几种情形。
 ///
 /// 返回 `(最大可过载荷, 探测轮数)`；下界都过不去时返回 `None`。
-pub(super) fn binary_search<F>(lo: u32, hi: u32, mut passes: F) -> Option<(u32, u32)>
-where
-    F: FnMut(u32) -> bool,
-{
-    let mut steps = 0u32;
-    // 先确认上界能不能过：整条链路都是标准以太网时这一步就结束了，
-    // 不必为常见情形付十几轮探测。
-    steps += 1;
-    if passes(hi) {
-        return Some((hi, steps));
-    }
-    // 再确认下界。下界都过不去说明这条链路根本不通（或者 ICMP 被墙），
-    // 那不是「路径 MTU 很小」，是探测本身没有意义。
-    steps += 1;
-    if !passes(lo) {
-        return None;
-    }
-    let (mut low, mut high) = (lo, hi);
-    // 不变式：`low` 能过，`high` 过不去。收敛到相邻即止。
-    while high - low > 1 {
-        let mid = low + (high - low) / 2;
-        steps += 1;
-        if passes(mid) {
-            low = mid;
-        } else {
-            high = mid;
-        }
-    }
-    Some((low, steps))
-}
+pub(super) use crate::ping::payload_search as binary_search;
 
 impl Ctx {
     /// 对一条链路做路径 MTU 探测。

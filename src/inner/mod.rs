@@ -6,15 +6,21 @@
 //! 判什么、按谁判一律不在这里决定。
 mod adb;
 mod adb_client;
+mod compare;
 pub(crate) mod config;
+mod diagnostics;
 mod history;
 mod measure;
+mod options;
+mod ping_unit;
 pub(crate) mod plan;
 mod receiver_server;
 mod remote;
 mod report;
 mod screenshot;
 pub(crate) mod webui;
+mod workspace;
+mod xlsx;
 
 use crate::clock::SystemClock;
 use crate::cmd::iperf;
@@ -68,6 +74,7 @@ struct AgentCapability {
 struct Capability {
     serial: String,
     board_version: String,
+    board_iperf_error: Option<String>,
     board_addresses: String,
     board_counters: String,
     /// 板侧接口清单：地址、桥成员关系、两条读取路径各自是否可用。
@@ -180,8 +187,31 @@ struct LegRow {
     rx_samples: Option<MonitorStopOut>,
 }
 
+impl LegRow {
+    /// 实际参与计算的时长。
+    ///
+    /// `effective_secs` 是截断前可用的流量时长（双向时是两条腿的重叠），对外 JSON
+    /// 保持这个含义；判定窗口从起点截出配置时长（`cmd::iperf_window::window_from_span`），
+    /// 所以计分时长是两者中较小的那个。报告把前者印成「有效测量时长 10.96s / 6s」时，
+    /// 读起来像按 11 秒算的，而速率其实只取了 6 秒。
+    fn scored_secs(&self) -> f64 {
+        self.effective_secs.min(self.required_secs as f64)
+    }
+}
+
+#[derive(Serialize)]
+struct PingRow {
+    flow: Flow,
+    result: crate::protocol::PingOut,
+}
+
 #[derive(Serialize)]
 struct UnitRow {
+    requested_parameters: Option<config::Parameters>,
+    duration_secs: u64,
+    origin: Option<workspace::Origin>,
+    round: u32,
+    ping: Vec<PingRow>,
     /// 与计划同源的稳定身份，供后续内环 RESUME 匹配。
     id: String,
     index: usize,
@@ -212,6 +242,7 @@ struct UnitRow {
 
 #[derive(Serialize)]
 struct RunReport {
+    current_unit: Option<usize>,
     schema_version: u32,
     current: String,
     created_at: String,
@@ -303,6 +334,15 @@ fn perform(
     cancel: &AtomicBool,
     observer: Observer<'_>,
 ) -> Result<(RunReport, PathBuf), String> {
+    perform_controlled(cfg, probe_only, cancel, observer, None)
+}
+fn perform_controlled(
+    cfg: InnerConfig,
+    probe_only: bool,
+    cancel: &AtomicBool,
+    observer: Observer<'_>,
+    skip: Option<&AtomicBool>,
+) -> Result<(RunReport, PathBuf), String> {
     let resumed = cfg.resume.then(history::fresh_pass_ids).unwrap_or_default();
     let preview = plan::preview_with_resumed(&cfg, &resumed)?;
     if !probe_only && preview.units == 0 {
@@ -321,6 +361,7 @@ fn perform(
     }
     std::fs::create_dir(&dir).map_err(|e| e.to_string())?;
     let mut report = RunReport {
+        current_unit: None,
         schema_version: 3,
         current: "正在检查 ADB 和本轮引用的电脑".into(),
         created_at: crate::util::now_full(),
@@ -332,10 +373,11 @@ fn perform(
         error: None,
     };
     observer(&report, &dir);
-    if let Err(error) = execute(&mut report, &dir, cancel, observer, &resumed) {
+    if let Err(error) = execute(&mut report, &dir, cancel, observer, &resumed, skip) {
         report.error = Some(error);
     }
     report.current.clear();
+    report.current_unit = None;
     if cancel.load(Ordering::SeqCst) && report.error.is_none() {
         report.error = Some("用户已取消内环测试".into());
     }
@@ -358,12 +400,26 @@ fn pause(duration: Duration, cancel: &AtomicBool) {
 /// `required` 为空表示这是页面上的一次设备扫描：所有配置的辅测机都试着连，
 /// 连不上只记状态，不让整次扫描失败。执行前的探测传入本轮实际引用的电脑，
 /// 未被引用的辅测机连碰都不碰。
-fn probe(adb: &Adb, cfg: &InnerConfig, required: Option<&[String]>) -> Result<Capability, String> {
-    let version = adb.shell(&format!("'{}' --version", cfg.board_iperf))?;
-    let help = adb.shell(&format!("'{}' --help", cfg.board_iperf))?;
-    if !help.contains("--client") || !help.contains("--server") || !help.contains("--bind") {
-        return Err("板侧工具缺少 iperf3 server/client/bind 能力，请检查 board_iperf 路径".into());
-    }
+fn probe(
+    adb: &Adb,
+    cfg: &InnerConfig,
+    required: Option<&[String]>,
+    tool_hosts: &std::collections::HashSet<String>,
+) -> Result<Capability, String> {
+    let tool = adb
+        .shell(&format!("'{}' --version", cfg.board_iperf))
+        .and_then(|version| {
+            let help = adb.shell(&format!("'{}' --help", cfg.board_iperf))?;
+            if !help.contains("--client") || !help.contains("--server") || !help.contains("--bind")
+            {
+                return Err("板侧工具缺少 iperf3 server/client/bind 能力".into());
+            }
+            Ok(version)
+        });
+    let (version, board_iperf_error) = match tool {
+        Ok(version) => (version, None),
+        Err(error) => (String::new(), Some(error)),
+    };
     let addresses = adb.shell("ip -o addr show")?;
     let counters = adb.shell("cat /proc/net/dev").unwrap_or_default();
     // 接口清单是「有更好、没有也能跑」：老板子没有 sysfs 时仍可只靠
@@ -394,7 +450,13 @@ fn probe(adb: &Adb, cfg: &InnerConfig, required: Option<&[String]>) -> Result<Ca
                     info: None,
                 };
             }
-            match remote::Remote::new(agent.clone()).info() {
+            let remote = remote::Remote::new(agent.clone());
+            let info = if tool_hosts.contains(&agent.id) {
+                remote.info()
+            } else {
+                remote.info_for_scan(false)
+            };
+            match info {
                 Ok(info) => AgentCapability {
                     id: agent.id.clone(),
                     status: HostStatus::Ready,
@@ -413,6 +475,7 @@ fn probe(adb: &Adb, cfg: &InnerConfig, required: Option<&[String]>) -> Result<Ca
     Ok(Capability {
         serial: adb.serial.clone(),
         board_version: version,
+        board_iperf_error,
         board_interfaces: adb::board_interfaces(&inventory, &addresses, &counters),
         board_inventory_error: inventory_error,
         board_addresses: addresses,
@@ -566,6 +629,7 @@ fn execute(
     cancel: &AtomicBool,
     observer: Observer<'_>,
     resumed: &std::collections::HashSet<String>,
+    skip: Option<&AtomicBool>,
 ) -> Result<(), String> {
     let mut built = plan::build(&report.config)?;
     // 全部单元都已有新鲜 PASS 时，RESUME 的语义就是「不再触碰测试设备」；
@@ -581,6 +645,7 @@ fn execute(
             if cancel.load(Ordering::SeqCst) {
                 return Err("用户已取消；已完成的结果保留".into());
             }
+            report.current_unit = (!resumed.contains(&unit.id)).then_some(unit.index);
             report.current = format!("{}/{} · {}", unit.index, built.units.len(), unit.title());
             observer(report, dir);
             report.units.push(resumed_row(unit));
@@ -615,6 +680,7 @@ fn execute(
             if cancel.load(Ordering::SeqCst) {
                 return Err("用户已取消；已完成的结果保留".into());
             }
+            report.current_unit = (!resumed.contains(&unit.id)).then_some(unit.index);
             report.current = format!("{}/{} · {}", unit.index, built.units.len(), unit.title());
             observer(report, dir);
             report.units.push(resumed_row(unit));
@@ -639,7 +705,23 @@ fn execute(
         .into_iter()
         .collect();
     let required = (!report.probe_only).then_some(required_agents.as_slice());
-    let capability = probe(&adb, &report.config, required)?;
+    let tool_hosts = built
+        .units
+        .iter()
+        .filter(|u| !resumed.contains(&u.id) && u.protocol != Protocol::Ping)
+        .map(|u| u.host.clone())
+        .collect();
+    let capability = probe(&adb, &report.config, required, &tool_hosts)?;
+    if !report.probe_only
+        && built
+            .units
+            .iter()
+            .any(|u| !resumed.contains(&u.id) && u.protocol != Protocol::Ping)
+    {
+        if let Some(error) = &capability.board_iperf_error {
+            return Err(format!("板侧 iperf3 未就绪：{error}"));
+        }
+    }
     println!(
         "ADB 设备: {}\n板侧工具: {}\n板侧地址:\n{}",
         capability.serial,
@@ -681,7 +763,13 @@ fn execute(
         .units
         .iter()
         .any(|unit| !resumed.contains(&unit.id) && report.config.links[unit.link].host == "master");
-    if bin.is_empty() && needs_master {
+    if bin.is_empty()
+        && needs_master
+        && built
+            .units
+            .iter()
+            .any(|u| u.protocol != Protocol::Ping && report.config.links[u.link].host == "master")
+    {
         return Err("本机未找到 iperf3".into());
     }
     // 先把所有参与链路验完，防止跑了一半才发现后面的网卡填错。
@@ -694,10 +782,18 @@ fn execute(
     let preflight: std::collections::HashMap<(usize, u8), LinkPreflight> = needed_versions
         .iter()
         .map(|&(index, version)| {
-            Ok((
-                (index, version),
-                preflight_version(&report.config.links[index], capability, version)?,
-            ))
+            Ok(((index, version), {
+                let mut link = report.config.links[index].clone();
+                if built
+                    .units
+                    .iter()
+                    .filter(|u| u.link == index && u.ip_version == version)
+                    .all(|u| u.protocol == Protocol::Ping)
+                {
+                    link.measurement = Measurement::Tool;
+                }
+                preflight_version(&link, capability, version)?
+            }))
         })
         .collect::<Result<_, String>>()?;
 
@@ -709,6 +805,7 @@ fn execute(
         if cancel.load(Ordering::SeqCst) {
             return Err("用户已取消；已完成的结果保留".into());
         }
+        report.current_unit = (!resumed.contains(&unit.id)).then_some(unit.index);
         report.current = format!("{}/{} · {}", unit.index, built.units.len(), unit.title());
         observer(report, dir);
         let link = &report.config.links[unit.link];
@@ -721,26 +818,62 @@ fn execute(
         }
         let preflight = &preflight[&(unit.link, unit.ip_version)];
         println!("{} · 第 {} 轮", unit.title(), unit.repeat);
-        let effective_cfg = unit.parameters.apply(&report.config, unit.protocol);
-        let mut row = run_unit(
-            &UnitContext {
-                adb: &adb,
-                cfg: &effective_cfg,
-                link,
-                preflight,
-                bin: &bin,
-                agent: report
-                    .config
-                    .agents
-                    .iter()
-                    .find(|agent| agent.id == link.host)
-                    .cloned(),
-                dir,
-                cancel,
-            },
-            unit,
-        )?;
-        if report.config.screenshot && !cancel.load(Ordering::SeqCst) {
+        let base_cfg = unit.execution_config.as_deref().unwrap_or(&report.config);
+        let effective_cfg = unit.parameters.apply(base_cfg, unit.protocol);
+        let combined = AtomicBool::new(cancel.load(Ordering::SeqCst));
+        let done = AtomicBool::new(false);
+        struct Finish<'a>(&'a AtomicBool);
+        impl Drop for Finish<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let result = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while !done.load(Ordering::SeqCst) {
+                    if cancel.load(Ordering::SeqCst)
+                        || skip.is_some_and(|s| s.load(Ordering::SeqCst))
+                    {
+                        combined.store(true, Ordering::SeqCst);
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+            });
+            let _finish = Finish(&done);
+            let result = run_unit(
+                &UnitContext {
+                    adb: &adb,
+                    cfg: &effective_cfg,
+                    link,
+                    preflight,
+                    bin: &bin,
+                    agent: report
+                        .config
+                        .agents
+                        .iter()
+                        .find(|agent| agent.id == link.host)
+                        .cloned(),
+                    dir,
+                    cancel: &combined,
+                    capability: Some(capability),
+                },
+                unit,
+            );
+            done.store(true, Ordering::SeqCst);
+            result
+        });
+        if cancel.load(Ordering::SeqCst) {
+            return Err("用户已取消；已完成的结果保留".into());
+        }
+        report.current_unit = None;
+        observer(report, dir);
+        let skipped = skip.is_some_and(|s| s.load(Ordering::SeqCst));
+        let mut row = completed_or_skipped(unit, result, skipped)?;
+        if report.config.screenshot
+            && unit.protocol != Protocol::Ping
+            && !skipped
+            && !cancel.load(Ordering::SeqCst)
+        {
             row.screenshot = Some(screenshot::capture(&report.config, &row, dir));
         }
         for leg in &row.legs {
@@ -775,12 +908,40 @@ fn can_skip_before_device_identification(
     !cfg.serial.trim().is_empty() && all_units_resumed(units, resumed)
 }
 
+fn completed_or_skipped(
+    unit: &Unit,
+    result: Result<UnitRow, String>,
+    skipped: bool,
+) -> Result<UnitRow, String> {
+    if !skipped {
+        return result;
+    }
+    if let Err(error) = result {
+        // 只有明确的取消结果可转换为跳过；执行/回收错误停止后续起流。
+        if error != "用户已取消" {
+            return Err(error);
+        }
+    }
+    let mut row = resumed_row(unit);
+    row.resumed = false;
+    row.verdict = "SKIP".into();
+    row.reason = "USER_SKIP".into();
+    row.detail = "用户跳过当前单元；不参与本轮验收".into();
+    row.diagnostics.clear();
+    Ok(row)
+}
+
 fn resumed_row(unit: &Unit) -> UnitRow {
     // RESUME 摘要只保存「这个单元曾 PASS」，不保存当时 NicPreferred 最终
     // 选的是哪一层。NicPreferred 仍以网卡门限为主；明确 Tool 才能确定使用
     // 工具合计门限。不能让明确的 Tool 单元在报告里显示成网卡门限。
     let total_target = unit.total_target(unit.measurement == Measurement::Tool);
     UnitRow {
+        requested_parameters: unit.requested_parameters.clone(),
+        duration_secs: unit.duration_secs,
+        origin: unit.origin.clone(),
+        round: unit.round,
+        ping: Vec::new(),
         id: unit.id.clone(),
         index: unit.index,
         link: unit.link_name.clone(),
@@ -806,6 +967,7 @@ fn resumed_row(unit: &Unit) -> UnitRow {
     }
 }
 
+#[derive(Clone)]
 struct UnitContext<'a> {
     adb: &'a Adb,
     cfg: &'a InnerConfig,
@@ -815,6 +977,7 @@ struct UnitContext<'a> {
     agent: Option<config::AgentConfig>,
     dir: &'a Path,
     cancel: &'a AtomicBool,
+    capability: Option<&'a Capability>,
 }
 
 /// 一条腿跑完之后拿到的原始数据，还没有经过来源选择。
@@ -827,13 +990,16 @@ struct LegRaw {
     events: Vec<IperfFlowEvent>,
     samples: MonitorStopOut,
     server_log: String,
+    diagnostics: Vec<String>,
 }
 
 fn run_unit(context: &UnitContext<'_>, unit: &Unit) -> Result<UnitRow, String> {
+    if unit.protocol == Protocol::Ping {
+        return ping_unit::run(context, unit);
+    }
     let UnitContext {
         cfg,
         link,
-        preflight,
         dir,
         cancel,
         ..
@@ -892,7 +1058,20 @@ fn run_unit(context: &UnitContext<'_>, unit: &Unit) -> Result<UnitRow, String> {
     for (leg, log) in raw.iter_mut().zip(logs.iter()) {
         leg.server_log = std::fs::read_to_string(log).unwrap_or_default();
     }
-    let mut row = assemble_unit(cfg, link, unit, preflight, raw);
+    let diagnostics: Vec<_> = raw.iter().flat_map(|r| r.diagnostics.clone()).collect();
+    let mut row = assemble_unit(cfg, link, unit, raw);
+    row.diagnostics.extend(diagnostics);
+    if cfg.run_overrides.limit_udp_by_link_speed
+        && unit.protocol == Protocol::Udp
+        && link
+            .pc_capacity
+            .as_ref()
+            .and_then(options::PcCapacity::ceiling)
+            .is_none()
+    {
+        row.diagnostics
+            .push("UDP_PATH_LIMIT_UNKNOWN：网口上限未知，按请求发送".into());
+    }
     if let Err(error) = &server_cleanup {
         row.diagnostics.push(error.clone());
     }
@@ -971,66 +1150,76 @@ fn run_legs(
     // 两条腿必须真的同时在跑，所以 client 放进作用域线程；再挂一个看门线程
     // 把全局取消镜像进单元取消位，让任一腿的失败也能停下对向。
     let done = AtomicBool::new(false);
-    let results: Vec<Result<(IperfClientOut, Vec<IperfFlowEvent>), String>> =
-        std::thread::scope(|scope| {
-            scope.spawn(|| {
-                while !done.load(Ordering::SeqCst) {
-                    if cancel.load(Ordering::SeqCst) {
-                        unit_cancel.store(true, Ordering::SeqCst);
-                        return;
-                    }
-                    std::thread::sleep(Duration::from_millis(100));
+    let results: Vec<Result<diagnostics::ClientRun, String>> = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while !done.load(Ordering::SeqCst) {
+                if cancel.load(Ordering::SeqCst) {
+                    unit_cancel.store(true, Ordering::SeqCst);
+                    return;
                 }
-            });
-            let handles: Vec<_> = unit
-                .legs
-                .iter()
-                .zip(owners)
-                .map(|(leg, owner)| {
-                    let mut request = client_request_for_addresses(
-                        cfg,
-                        &preflight.addresses,
-                        unit.protocol,
-                        leg.flow,
-                        leg.port,
-                    );
-                    // 多跑起流爬升段、双向多跑交集余量；判定窗口仍截到配置时长。
-                    request.duration = plan::client_secs(cfg, unit);
-                    let remote = remote.clone();
-                    scope.spawn(move || {
-                        let out = if leg.flow.receiver_is_board() {
-                            run_client(bin, remote.as_ref(), request, owner, epoch, unit_cancel)
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+        let handles: Vec<_> = unit
+            .legs
+            .iter()
+            .zip(owners)
+            .map(|(leg, owner)| {
+                let mut request = client_request_for_addresses(
+                    cfg,
+                    &preflight.addresses,
+                    unit.protocol,
+                    leg.flow,
+                    leg.port,
+                );
+                // 多跑起流爬升段、双向多跑交集余量；判定窗口仍截到配置时长。
+                request.duration = plan::client_secs(cfg, unit);
+                let remote = remote.clone();
+                scope.spawn(move || {
+                    let out = diagnostics::with_load_latency(context, unit, leg, |traffic| {
+                        if leg.flow.receiver_is_board() {
+                            run_client_observed(
+                                bin,
+                                remote.as_ref(),
+                                request,
+                                owner,
+                                epoch,
+                                unit_cancel,
+                                Some(traffic),
+                            )
                         } else {
-                            adb_client::run(
+                            adb_client::run_observed(
                                 context.adb,
                                 &cfg.board_iperf,
                                 &request,
                                 owner,
                                 epoch,
                                 unit_cancel,
+                                Some(traffic),
                             )
-                        };
-                        if out.as_ref().is_err_and(|_| true)
-                            || out.as_ref().is_ok_and(|(client, _)| !client.ok)
-                        {
-                            // 一腿倒了就停对向：半条腿的双向数据没有意义。
-                            unit_cancel.store(true, Ordering::SeqCst);
                         }
-                        out
-                    })
+                    });
+                    if out.as_ref().is_err_and(|_| true)
+                        || out.as_ref().is_ok_and(|(client, _, _)| !client.ok)
+                    {
+                        // 一腿倒了就停对向：半条腿的双向数据没有意义。
+                        unit_cancel.store(true, Ordering::SeqCst);
+                    }
+                    out
                 })
-                .collect();
-            let results: Vec<_> = handles
-                .into_iter()
-                .map(|handle| {
-                    handle
-                        .join()
-                        .unwrap_or_else(|_| Err("内环打流线程异常终止".into()))
-                })
-                .collect();
-            done.store(true, Ordering::SeqCst);
-            results
-        });
+            })
+            .collect();
+        let results: Vec<_> = handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .unwrap_or_else(|_| Err("内环打流线程异常终止".into()))
+            })
+            .collect();
+        done.store(true, Ordering::SeqCst);
+        results
+    });
 
     let mut raw = Vec::new();
     let mut failures = Vec::new();
@@ -1045,7 +1234,7 @@ fn run_legs(
                 })
             }
         });
-        let (client, events) = match result {
+        let (client, events, diagnostics) = match result {
             Ok(value) => value,
             Err(error) => {
                 failures.push(format!("{}: {error}", leg.flow.label()));
@@ -1077,6 +1266,7 @@ fn run_legs(
             events,
             samples,
             server_log: String::new(),
+            diagnostics,
         });
     }
     let cleanup = close_leases(&mut leases);
@@ -1103,16 +1293,17 @@ fn close_leases(leases: &mut Vec<remote::RemoteLease>) -> Result<(), String> {
     }
 }
 
-fn run_client(
+fn run_client_observed(
     bin: &str,
     remote: Option<&remote::Remote>,
     request: IperfClientReq,
     owner: &str,
     epoch: Instant,
     cancel: &AtomicBool,
+    traffic: Option<&AtomicBool>,
 ) -> Result<(IperfClientOut, Vec<IperfFlowEvent>), String> {
     if let Some(remote) = remote {
-        return remote.client(request, owner, epoch, cancel);
+        return remote.client_observed(request, owner, epoch, cancel, traffic);
     }
     let mut origin = None;
     let mut events = Vec::new();
@@ -1127,9 +1318,19 @@ fn run_client(
                 epoch.elapsed().as_millis() as u64,
                 &mut origin,
             );
+            if event.kind == crate::protocol::IperfEventKind::Traffic
+                && event.mbps.is_some_and(|v| v > 0.0)
+            {
+                if let Some(flag) = traffic {
+                    flag.store(true, Ordering::SeqCst);
+                }
+            }
             events.push(event);
         },
     );
+    if client.cleanup_confirmed == Some(false) {
+        return Err(format!("本机 iperf3 资源回收未确认：{}", client.output));
+    }
     Ok((client, events))
 }
 
@@ -1309,13 +1510,7 @@ fn overlap_window(spans: &[Option<(u64, u64)>], required_secs: u64) -> Option<Ef
     ))
 }
 
-fn assemble_unit(
-    cfg: &InnerConfig,
-    link: &Link,
-    unit: &Unit,
-    preflight: &LinkPreflight,
-    raw: Vec<LegRaw>,
-) -> UnitRow {
+fn assemble_unit(cfg: &InnerConfig, link: &Link, unit: &Unit, raw: Vec<LegRaw>) -> UnitRow {
     // 每条腿的真实流量区间：`raw_spans` 是工具汇总覆盖的整段，`spans` 再扣掉
     // 起流爬升，判定窗口取后者。没有吞吐测量就没有区间。双向时每条腿先各扣
     // 各的爬升再求交集：后起跑的那条腿在交集起点正在爬升。
@@ -1370,15 +1565,7 @@ fn assemble_unit(
             }
             _ => false,
         };
-        let (row, measurement) = assemble_leg(
-            cfg,
-            link,
-            unit,
-            preflight,
-            item,
-            &window,
-            tool_covers_overlap,
-        );
+        let (row, measurement) = assemble_leg(cfg, link, unit, item, &window, tool_covers_overlap);
         legs.push(row);
         measurements.push(measurement);
     }
@@ -1437,6 +1624,11 @@ fn assemble_unit(
     };
     diagnostics.extend(verdict.diagnostics.clone());
     UnitRow {
+        requested_parameters: unit.requested_parameters.clone(),
+        duration_secs: unit.duration_secs,
+        origin: unit.origin.clone(),
+        round: unit.round,
+        ping: Vec::new(),
         id: unit.id.clone(),
         index: unit.index,
         link: unit.link_name.clone(),
@@ -1506,7 +1698,6 @@ fn assemble_leg(
     cfg: &InnerConfig,
     link: &Link,
     unit: &Unit,
-    preflight: &LinkPreflight,
     raw: &LegRaw,
     window: &EffectiveWindow,
     // 双向时：本腿 receiver 汇总覆盖的整段（未扣爬升、未截断）恰好就是两腿的交集。
@@ -1646,11 +1837,10 @@ fn assemble_leg(
         unit.total_target(false).is_some() || unit.total_target(true).is_some(),
     );
 
+    // 诊断列只放这一条腿上真的发生了的事。接收端、计数来源和背景扣除值在报告的
+    // 「两套测量口径」「采样质量」里各有一格；每条腿都挂一句同样的说明，读的人
+    // 分不出哪条腿真的有问题。
     let mut diagnostics = measurement.verdict.diagnostics.clone();
-    diagnostics.push(
-        "接收速率为接口总流量减去起流前背景中位数；请保持其他业务空闲，多网卡同网段时核实路由。"
-            .into(),
-    );
     if let Some(reason) = &measurement.fallback_reason {
         diagnostics.push(format!(
             "MEASUREMENT_SOURCE_FALLBACK: 已改用{}，原因是网卡字节计数不可信（{reason}）。\
@@ -1658,13 +1848,7 @@ fn assemble_leg(
             measurement.source.label()
         ));
     }
-    if raw.plan.flow.receiver_is_board() {
-        diagnostics.push(format!(
-            "板侧 {} 通过 ADB 每秒读取 {}；网桥计数器可能合并成员口流量或受硬件卸载影响，本框架逐网口串行执行。",
-            preflight.board_iface,
-            preflight.counter_source.map(|source| source.label()).unwrap_or("不可用的字节计数来源")
-        ));
-    } else if link.host == "master" {
+    if !raw.plan.flow.receiver_is_board() && link.host == "master" {
         if let Some(caveat) = crate::nic::monitor::counter_source_caveat() {
             diagnostics.push(caveat.into());
         }
@@ -1838,12 +2022,16 @@ fn client_request_for_addresses(
 ) -> IperfClientReq {
     let mut extra = vec!["-P".into(), cfg.streams(protocol).to_string()];
     match protocol {
+        Protocol::Ping => {}
         Protocol::Tcp => {
             if let Some(window) = &cfg.tcp_window {
                 extra.extend(["-w".into(), window.clone()]);
             }
         }
         Protocol::Udp => {
+            if let Some(window) = &cfg.udp_window {
+                extra.extend(["-w".into(), window.clone()]);
+            }
             // 校验保证测 UDP 时 udp_mbps 必有值；缺了宁可不带 -b 让 iperf3 报错，
             // 也不悄悄按它 1 Mbps 的默认速率跑出一份看着正常的报告。
             if let Some(mbps) = cfg.udp_mbps {

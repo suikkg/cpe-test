@@ -516,12 +516,18 @@ pub(super) fn handle(mut request: Request, console: &Arc<Console>) {
     // 子资源，浏览器加载它们时不带自定义头——撞的是和控制台页面同一堵
     // 「鉴权先于路由」的墙（ADR-5 已否决同构方案）。
     if is_get {
-        if let Some(id) = path
+        let bundle_target = path
             .strip_prefix("/api/runs/")
             .and_then(|rest| rest.strip_suffix("/bundle.zip"))
-        {
+            .map(|id| (id, runs::resolve_run_dir(id)))
+            .or_else(|| {
+                path.strip_prefix("/api/inner/runs/")
+                    .and_then(|rest| rest.strip_suffix("/bundle.zip"))
+                    .map(|id| (id, console.inner.bundle_dir(id)))
+            });
+        if let Some((id, directory)) = bundle_target {
             // 白名单式解析：只认 `runs/` 下已经存在的目录名，不做路径拼接。
-            match runs::resolve_run_dir(id) {
+            match directory {
                 Some(dir) => match runs::build_bundle(&dir, id) {
                     // `bundle` 是临时 zip 的 RAII 守卫：`respond` 返回时响应连同
                     // 它持有的 File 已经析构，这时删才不会在 Windows 上撞
@@ -566,10 +572,17 @@ pub(super) fn handle(mut request: Request, console: &Arc<Console>) {
                     .unwrap_or(0),
                 query.split('&').find_map(|kv| kv.strip_prefix("run_id=")),
             )),
+            (true, _, "/api/inner/excel") => console.inner.excel(),
+            (_, true, "/api/inner/runs/compare") => console.inner.run_compare(&body),
+            (_, true, "/api/inner/runs/excel") => console.inner.run_excel(&body),
             (true, _, "/api/inner/report") => console.inner.report(),
             (true, _, "/api/inner/runs") => console.inner.runs(),
             (_, true, "/api/inner/runs/report") => console.inner.run_report(&body),
             (_, true, "/api/inner/runs/config") => console.inner.run_config(&body),
+            (_, true, "/api/inner/skip-unit") => {
+                let _gate = lock_recover(&console.run_gate);
+                console.inner.skip_unit(&body)
+            }
             (_, true, "/api/inner/plan") => console.inner.plan(&body),
             (_, true, "/api/inner/probe") => {
                 // 探测会占用 ADB 和板侧资源；它和启动必须在同一把门里
@@ -612,7 +625,20 @@ pub(super) fn handle(mut request: Request, console: &Arc<Console>) {
     } else if is_get && path == "/api/bootstrap" {
         api_bootstrap(console)
     } else if is_get && path == "/api/local" {
-        api_local()
+        api_local().inspect(|data| {
+            if let Some(host) = data
+                .get("host")
+                .and_then(|v| serde_json::from_value::<crate::protocol::HostInfo>(v.clone()).ok())
+            {
+                // 只换本机网卡快照，不碰 `cfg.ipv4_prefixes`：那是操作员的前缀设置，
+                // `/api/bootstrap` 回填前缀框读的就是它，在这里清掉的话刷新一次
+                // 前缀框就成了空（= 全部）。本机计划不套前缀由 `compile_request` 负责。
+                let mut state = lock_recover(&console.state);
+                if state.agent.interfaces.is_empty() {
+                    state.master = host;
+                }
+            }
+        })
     } else if is_post && path == "/api/connect" {
         api_connect(console, &body)
     } else if is_post && path == "/api/plan" {

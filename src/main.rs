@@ -7,6 +7,7 @@
 //!   cpe_test scan  [--prefix 192.168.,10.10.]   查看本机网卡识别结果
 
 mod agent;
+mod bundle;
 mod cancel;
 pub mod clock;
 mod cmd;
@@ -394,7 +395,7 @@ fn help_text() -> String {
       --resume                跳过 24 小时内已 PASS 的同一内环单元
       辅测机可选，只挂本机的网口能独立跑；未被勾选的网口引用的 agent 不连接
       方向含上行/下行/双向并发；双向是一个两个方向同时跑的单元，占 port 与 port+1
-      配置示例: inner.example.json（schema v2，旧的 v1 文件导入时自动升级）
+      配置示例: inner.example.json（schema v5，兼容 v1/v2/v3/v4 项目）
       结果在 inner_runs/inner_<时间>_<进程号>_<纳秒>/
    cpe_test report <run目录>    从已有运行目录重放报告
        用途: 主控崩溃后把已完成部分的完整报告放出来（结果每个单元都已落盘），

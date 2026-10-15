@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed, ref, watch } from 'vue';
-import { inner, innerProbeIdentity, addInnerLink, addInnerScannedLinks, applyInnerBatch, moveInnerLinkTo, setInnerLinkEnabled } from '../../state/inner';
+import { removeInnerLink } from '../../domain/inner-workspace';
+import { computed, ref } from 'vue';
+import { inner, addInnerLink, addInnerScannedLinks, applyInnerBatch, moveInnerLinkTo, setInnerLinkEnabled } from '../../state/inner';
 import type { InnerBatchPatch } from '../../state/inner';
 import { INNER_MEASUREMENTS, MEASUREMENT_LABEL, canonicalInnerIpv6, innerNicIpv6 } from '../../domain/inner';
 import type { NicInfo } from '../../api/dto';
@@ -13,11 +14,11 @@ const emit = defineEmits<{ (e: 'edit', link: InnerLink | null): void }>();
 const search = ref('');
 const hostFilter = ref('');
 const batchOpen = ref(false);
-const selectedNics = ref<string[]>([]);
+const selectedNics = computed({ get: () => inner.scannedSelection, set: (value: string[]) => { inner.scannedSelection = value; } });
 // 相同逻辑 ID 的新辅测机可能也有同名同 IP 网卡，旧勾选不能跟着连接身份迁移。
 // 同一连接上的重扫则保留稳定网口键，不依赖扫描顺序或可见筛选。
-watch(innerProbeIdentity, () => { selectedNics.value = []; }, { flush: 'sync' });
-const showOther = ref(false);
+
+const showOther = computed({ get: () => inner.showOtherScanned, set: (value: boolean) => { inner.showOtherScanned = value; } });
 const choices = computed(() => innerNicChoices(inner.capability, showOther.value));
 const otherCount = computed(() => innerNicChoices(inner.capability, true).length - innerNicChoices(inner.capability).length);
 const existingKeys = computed(() => new Set(inner.config.links.map((link) => innerEndpointKey(link.host, link.local_interface, link.local_ip, link.local_ipv6))));
@@ -99,9 +100,9 @@ function applyBatch(): void {
   applyInnerBatch(visibleEnabled.value, patch);
   batchOpen.value = false;
 }
-function remove(index: number, link: InnerLink): void {
+function remove(_index: number, link: InnerLink): void {
   if (props.editing === link) emit('edit', null);
-  inner.config.links.splice(index, 1);
+  removeInnerLink(inner.config, link.name);
 }
 </script>
 
@@ -117,7 +118,7 @@ function remove(index: number, link: InnerLink): void {
           <span><strong>{{ props.hosts.find(host => host.id === choice.host)?.label ?? choice.host }} · {{ choice.nic.name }}</strong><small>IPv4 {{ choice.nic.ipv4 || '未获取' }}</small><small>IPv6 {{ innerNicIpv6(choice.nic) || '未获取' }}</small><small v-if="existingKeys.has(choice.key)">已添加</small><small v-if="innerNicOtherReason(choice.nic)" class="warn">{{ innerNicOtherReason(choice.nic) }} · 请核对是否接到 CPE</small></span>
         </label>
       </div>
-      <p v-else class="muted">{{ showOther ? '未发现带有效 IP 的网卡。' : '未发现符合默认筛选的 192.168.* 或仅 IPv6 网卡。' }}请检查网线或 Wi-Fi 连接及电脑地址{{ otherCount && !showOther ? '，也可展开其他接口' : '' }}后重新选择。</p>
+      <p v-else class="muted">{{ showOther ? '未发现带有效 IP 的网卡。' : '未发现符合默认筛选的 192.168.* 或仅 IPv6 网卡。' }}{{ otherCount && !showOther ? `其他接口 ${otherCount} 个。` : '' }}</p>
       <button :disabled="props.disabled || !selectedCount || inner.config.links.length >= 32" @click="addSelected">添加选中的 {{ selectedCount }} 个网口</button>
       <small v-if="selectedCount > 32 - inner.config.links.length" class="muted">本次最多还能添加 {{ 32 - inner.config.links.length }} 个。</small>
     </section>
@@ -152,7 +153,7 @@ function remove(index: number, link: InnerLink): void {
       <div class="bar"><button class="primary" @click="applyBatch">应用到已勾选</button><button class="ghost" @click="batchOpen = false">取消</button></div>
     </fieldset>
 
-    <p v-if="!inner.config.links.length" class="muted">还没有网口：先扫描，再从扫描结果勾选，或手动添加。</p>
+    <p v-if="!inner.config.links.length" class="muted">暂无测试网口。</p>
     <div v-else class="scroll">
       <table>
         <thead><tr>

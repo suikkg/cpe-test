@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue';
+import { renameInnerLink } from '../../domain/inner-workspace';
 import { inner } from '../../state/inner';
 import { INNER_MEASUREMENTS, MEASUREMENT_HINT, MEASUREMENT_LABEL, innerNicIpv6, emptyInnerThresholds, PROTOCOL_LABEL } from '../../domain/inner';
 import type { InnerLink } from '../../domain/inner';
@@ -15,26 +16,27 @@ const nics = computed(() => {
     && (showOther.value || !innerNicOtherReason(choice.nic) || choice.key === selectedKey.value));
 });
 const selectedKey = computed(() => innerEndpointKey(props.link.host, props.link.local_interface, props.link.local_ip, props.link.local_ipv6));
-const v4 = computed(() => inner.config.ip_versions.includes(4));
-const v6 = computed(() => inner.config.ip_versions.includes(6));
+const v4 = computed(() => inner.config.ip_versions.includes(4) || !!inner.config.workspace?.suites.some(s => s.tasks.some(t => t.ip_versions.includes(4))));
+const v6 = computed(() => inner.config.ip_versions.includes(6) || !!inner.config.workspace?.suites.some(s => s.tasks.some(t => t.ip_versions.includes(6))));
 const boardIpv6 = computed(() => innerBoardIpv6Choices(inner.capability));
 const nicIpv6 = computed(() => [...new Set(innerNicChoices(inner.capability, true)
   .filter((choice) => choice.host === props.link.host && choice.nic.name === props.link.local_interface)
   .flatMap((choice) => [choice.nic.ipv6_ll, choice.nic.ipv6_global]).filter(Boolean))]);
 const linkIssues = computed(() => innerSetupIssues(inner.config).filter((issue) => issue.linkIndex === inner.config.links.indexOf(props.link)));
+const protocols = computed(() => [...new Set([...inner.config.protocols, ...(inner.config.workspace?.suites.flatMap(s => s.tasks.map(t => t.protocol)) ?? [])])].filter((p): p is 'tcp' | 'udp' => p !== 'ping'));
 const usesTool = computed(() => props.link.measurement !== 'nic_strict');
-const bidir = computed(() => inner.config.directions.includes('bidir'));
+const bidir = computed(() => inner.config.directions.includes('bidir') || !!inner.config.workspace?.suites.some(s => s.tasks.some(t => t.directions.includes('bidir'))));
 
 function selectNic(event: Event): void {
   const choice = nics.value.find((item) => item.key === (event.target as HTMLSelectElement).value);
   if (choice) {
-    Object.assign(props.link, { local_interface: choice.nic.name, local_ip: choice.nic.ipv4, local_ipv6: innerNicIpv6(choice.nic) || null });
+    Object.assign(props.link, { pc_capacity: { role: choice.nic.role ?? 'UNKNOWN', speed_mbps: choice.nic.speed_mbps ?? 0 }, local_interface: choice.nic.name, local_ip: choice.nic.ipv4, local_ipv6: innerNicIpv6(choice.nic) || null });
     if (!props.link.gateway_ipv6) props.link.gateway_ipv6 = suggestedInnerBoardIpv6(inner.capability, props.link);
   }
 }
 function changeHost(): void {
   // 换电脑就清掉网卡和源 IP：它们是上一台机器的身份，留着只会看起来像填好了。
-  Object.assign(props.link, { local_interface: '', local_ip: '', local_ipv6: null });
+  Object.assign(props.link, { pc_capacity: null, local_interface: '', local_ip: '', local_ipv6: null });
 }
 </script>
 
@@ -43,7 +45,7 @@ function changeHost(): void {
     <legend>编辑「{{ props.link.name }}」</legend>
     <p v-for="issue in linkIssues" :key="issue.message" class="warn">{{ issue.message }}</p>
     <div class="grid">
-      <label>网口名称<input v-model="props.link.name" placeholder="ETH / Wi-Fi / RNDIS"></label>
+      <label>网口名称<input  :value="props.link.name" @input="renameInnerLink(inner.config, props.link.name, ($event.target as HTMLInputElement).value)" placeholder="ETH / Wi-Fi / RNDIS"></label>
       <label>所在电脑<select v-model="props.link.host" @change="changeHost">
         <option v-for="host in props.hosts" :key="host.id" :value="host.id">{{ host.label }}</option>
       </select></label>
@@ -88,7 +90,7 @@ function changeHost(): void {
       <label v-if="usesTool && bidir">双向合计 · 工具口径 Mbps<input v-model.number="props.link.tool_bidir_total_min_mbps" type="number" min="0.01" step="any" placeholder="留空只标 MEASURED"></label>
     </div>
     <p v-if="bidir" class="muted">双向合计门限留空时，按各方向门限分别判定。</p>
-    <section v-for="protocol in inner.config.protocols" :key="protocol">
+    <section v-for="protocol in protocols" :key="protocol">
       <h4>{{ PROTOCOL_LABEL[protocol] }} 门限覆盖</h4>
       <p class="muted">只作用于此网口的 {{ PROTOCOL_LABEL[protocol] }}；留空继承上面的公共门限。</p>
       <button v-if="!props.link[protocol === 'tcp' ? 'tcp_thresholds' : 'udp_thresholds']" class="ghost small" @click="props.link[protocol === 'tcp' ? 'tcp_thresholds' : 'udp_thresholds'] = emptyInnerThresholds()">设置 {{ PROTOCOL_LABEL[protocol] }} 门限</button>

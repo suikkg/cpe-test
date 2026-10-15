@@ -5,90 +5,11 @@
 
 use super::*;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PingPayloadClass {
-    Small,
-    Medium,
-    Large,
-}
-impl PingPayloadClass {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Small => "small",
-            Self::Medium => "medium",
-            Self::Large => "large",
-        }
-    }
-}
-#[derive(Debug, Clone, Copy)]
-struct PingLatencyPolicy {
-    wifi: bool,
-    class: PingPayloadClass,
-    avg_rtt_ms: f64,
-    max_rtt_ms: f64,
-}
-fn nic_looks_wifi(nic: &NicInfo) -> bool {
-    if nic.is_wifi || !nic.wifi_band.trim().is_empty() {
-        return true;
-    }
-    let role = nic.role.to_ascii_lowercase();
-    let name = nic.name.to_ascii_lowercase();
-    let description = nic.description.to_ascii_lowercase();
-    role.contains("wifi")
-        || name.contains("wi-fi")
-        || name.contains("wifi")
-        || name.contains("wlan")
-        || description.contains("wi-fi")
-        || description.contains("wifi")
-        || description.contains("wireless")
-}
-fn classify_ping_payload(cfg: &crate::config::PingCfg, payload: u32) -> PingPayloadClass {
-    if payload <= cfg.small_max_bytes {
-        PingPayloadClass::Small
-    } else if payload <= cfg.medium_max_bytes {
-        PingPayloadClass::Medium
-    } else {
-        PingPayloadClass::Large
-    }
-}
-fn ping_latency_policy(
-    src: &NicInfo,
-    dst: &NicInfo,
-    payload: u32,
-    cfg: &crate::config::PingCfg,
-) -> PingLatencyPolicy {
-    let wifi = nic_looks_wifi(src) || nic_looks_wifi(dst);
-    let class = classify_ping_payload(cfg, payload);
-    let (avg_rtt_ms, max_rtt_ms) = match (wifi, class) {
-        (false, PingPayloadClass::Small) => (cfg.wired_small_avg_rtt_ms, cfg.max_rtt_ms),
-        (false, PingPayloadClass::Medium) => {
-            (cfg.wired_medium_avg_rtt_ms, cfg.wired_medium_max_rtt_ms)
-        }
-        (false, PingPayloadClass::Large) => {
-            (cfg.wired_large_avg_rtt_ms, cfg.wired_large_max_rtt_ms)
-        }
-        (true, PingPayloadClass::Small) => (cfg.wifi_small_avg_rtt_ms, cfg.wifi_small_max_rtt_ms),
-        (true, PingPayloadClass::Medium) => {
-            (cfg.wifi_medium_avg_rtt_ms, cfg.wifi_medium_max_rtt_ms)
-        }
-        (true, PingPayloadClass::Large) => (cfg.wifi_large_avg_rtt_ms, cfg.wifi_large_max_rtt_ms),
-    };
-    PingLatencyPolicy {
-        wifi,
-        class,
-        avg_rtt_ms,
-        max_rtt_ms,
-    }
-}
-fn ping_acceptance(out: &PingOut, policy: PingLatencyPolicy) -> bool {
-    let avg_ok = out
-        .rtt_avg
-        .is_some_and(|v| v.is_finite() && v <= policy.avg_rtt_ms);
-    let max_ok = out
-        .rtt_max
-        .is_some_and(|v| v.is_finite() && v <= policy.max_rtt_ms);
-    out.ok && out.sent > 0 && out.received == out.sent && avg_ok && max_ok
-}
+#[cfg(test)]
+use crate::ping::ping_acceptance;
+use crate::ping::ping_latency_policy;
+#[cfg(test)]
+use crate::ping::{classify_ping_payload, nic_looks_wifi, PingPayloadClass};
 
 impl Ctx {
     pub(super) fn run_ping_leg(
@@ -191,16 +112,11 @@ impl Ctx {
         let max_rtt_ok = out
             .rtt_max
             .is_some_and(|rtt| rtt.is_finite() && rtt <= max_rtt_ms);
-        let acceptance_ok = ping_acceptance(&out, latency_policy);
-
+        let (ping_verdict, ping_reason) = ping::acceptance_verdict(&out, latency_policy, exec_kind);
         let verdict = if gateway_missing {
             Verdict::NotEvaluated
-        } else if exec_kind.is_some() {
-            Verdict::SetupError
-        } else if acceptance_ok {
-            Verdict::Pass
         } else {
-            Verdict::RateFail
+            ping_verdict
         };
         let execution_status = if gateway_missing {
             ExecutionStatus::Partial
@@ -213,26 +129,14 @@ impl Ctx {
         };
         let reason_code = if gateway_missing {
             ReasonCode::GatewayNotFound
-        } else if exec_kind == Some(ping::PingExecErrorKind::Timeout) {
-            ReasonCode::PingTimeout
-        } else if exec_kind.is_some() {
-            ReasonCode::PingExecError
-        } else if acceptance_ok {
-            ReasonCode::PingOk
-        } else if !packet_loss_ok {
-            ReasonCode::PingPacketLossHigh
-        } else if out.rtt_avg.is_none() || out.rtt_max.is_none() {
-            ReasonCode::PingRttMissing
-        } else if !avg_rtt_ok {
-            ReasonCode::PingRttAvgExceeded
-        } else if !max_rtt_ok {
-            ReasonCode::PingRttMaxExceeded
-        } else {
+        } else if ping_reason == ReasonCode::PingUnreachable {
             match t.purpose {
-                PingPurpose::SubnetTest => ReasonCode::PingUnreachable,
+                PingPurpose::SubnetTest => ping_reason,
                 PingPurpose::SubnetDiagnostic => ReasonCode::PingSubnetUnreachable,
                 PingPurpose::GatewayDiagnostic => ReasonCode::PingGatewayUnreachable,
             }
+        } else {
+            ping_reason
         };
         let reason_detail = if gateway_missing {
             format!(

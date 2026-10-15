@@ -112,7 +112,7 @@ pub(super) fn api_import(console: &Arc<Console>, body: &str) -> Result<serde_jso
     // 交集），但报出来的是「没有任何可识别的配置项」这句泛泛的话，而不是
     // 「你导错地方了」。内环侧认子网用的是 11 个键的 `SUBNET_ONLY_KEYS`，
     // 这边只认 3 个，说不上对称——补齐之后两边给的提示才一样准。
-    const INNER_ONLY_KEYS: [&str; 9] = [
+    const INNER_ONLY_KEYS: [&str; 14] = [
         "adb_path",
         "board_iperf",
         "serial",
@@ -122,6 +122,11 @@ pub(super) fn api_import(console: &Arc<Console>, body: &str) -> Result<serde_jso
         "agents",
         "duration_secs",
         "repeats",
+        "workspace",
+        "ping_policy",
+        "run_overrides",
+        "ping_options",
+        "udp_window",
     ];
     if raw.get("kind").and_then(|v| v.as_str()) == Some(crate::inner::config::PROJECT_KIND)
         || INNER_ONLY_KEYS.iter().any(|key| raw.get(key).is_some())

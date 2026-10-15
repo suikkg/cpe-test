@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { computed, ref, watch } from 'vue';
 import { inner } from '../../state/inner';
-import { DIRECTION_LABEL, FLOW_LABEL, PROTOCOL_LABEL, SOURCE_LABEL, innerParameterLabel } from '../../domain/inner';
-import { innerRecordedCounts, innerVerdictLabel, innerUnitExplanation, innerUsesTotal, innerRateText, innerTargetText, innerTotalTargetText, innerFlowPath } from '../../domain/inner-report';
+import { DIRECTION_LABEL, FLOW_LABEL, PROTOCOL_LABEL, SOURCE_LABEL } from '../../domain/inner';
+import { innerRecordedParameterLabel, innerRecordedCounts, innerVerdictLabel, innerUnitExplanation, innerUsesTotal, innerRateText, innerTargetText, innerTotalTargetText, innerFlowPath, innerScoredSecs } from '../../domain/inner-report';
 import type { InnerLeg, InnerUnit } from '../../domain/inner';
 
 const PAGE = 20;
@@ -42,11 +42,11 @@ function loss(unit: InnerUnit, leg: InnerLeg): string {
     <dl v-if="inner.status.units.length" class="result-counts" aria-label="本轮结果概览">
       <div v-for="(value, label) in { '已记录单元': counts.total, '本轮达标': counts.pass, '未达标': counts.fail, '仅测量': counts.measured, '无法评价': counts.unknown, '执行失败': counts.error, '复用历史': counts.resumed }" :key="label"><dt>{{ label }}</dt><dd>{{ value }}</dd></div>
     </dl>
-    <p v-if="inner.status.units.length" class="muted">每行一个单元。历史复用不计入本轮达标。</p>
+    <p v-if="inner.status.units.length" class="muted">历史复用不计入本轮达标。</p>
     <div v-if="inner.status.units.length" class="bar filters">
       <label>判定<select v-model="verdictFilter">
         <option value="">全部</option>
-        <option v-for="v in ['PASS', 'RATE_FAIL', 'MEASURED', 'NOT_EVALUATED', 'SETUP_ERROR']" :key="v" :value="v">{{ innerVerdictLabel(v) }}（{{ v }}）</option>
+        <option v-for="v in ['PASS', 'RATE_FAIL', 'SKIP', 'MEASURED', 'NOT_EVALUATED', 'SETUP_ERROR']" :key="v" :value="v">{{ innerVerdictLabel(v) }}（{{ v }}）</option>
       </select></label>
       <label>网口<select v-model="linkFilter"><option value="">全部</option><option v-for="name in links" :key="name" :value="name">{{ name }}</option></select></label>
       <span class="muted">{{ filtered.length }} / {{ inner.status.units.length }} 个单元</span>
@@ -59,15 +59,16 @@ function loss(unit: InnerUnit, leg: InnerLeg): string {
           <tr v-for="unit in visible" :key="unit.index">
             <td class="num">{{ unit.index }}</td>
             <td>{{ unit.host === 'master' ? '主控本机' : unit.host }}<br><strong>{{ unit.link }}</strong></td>
-            <td>{{ PROTOCOL_LABEL[unit.protocol] }} / IPv{{ unit.ip_version ?? 4 }}<small v-if="unit.parameters" class="muted">{{ innerParameterLabel(unit.parameters, unit.protocol) }}</small></td>
-            <td>{{ DIRECTION_LABEL[unit.direction] }}<small>第 {{ unit.repeat }} 轮</small></td>
+            <td>{{ PROTOCOL_LABEL[unit.protocol] }} / IPv{{ unit.ip_version ?? 4 }}<small v-if="unit.parameters" class="muted">{{ innerRecordedParameterLabel(unit) }}</small></td>
+            <td>{{ DIRECTION_LABEL[unit.direction] }}<small>第 {{ unit.round ?? 1 }} 遍 · 重复 {{ unit.repeat }}</small><small v-if="unit.origin">{{ unit.origin.suite }} / {{ unit.origin.task }}</small></td>
             <td class="acceptance-cell">
               <p v-if="unit.resumed" class="muted">本轮未重新测试</p>
               <template v-else>
                 <template v-if="usesTotal(unit)"><strong>双向合计 {{ rate(unit.total_mbps) }} Mbps</strong><p>合计门限 {{ innerTotalTargetText(inner.config, unit) }}</p><small>按两端 RX 合计判定一次</small></template>
-                <strong v-else-if="unit.direction === 'bidir'">上下行分别判定</strong>
+                <strong v-else-if="unit.direction === 'bidir' && unit.protocol !== 'ping'">上下行分别判定</strong>
                 <p v-for="leg in unit.legs" :key="leg.flow"><strong>{{ FLOW_LABEL[leg.flow] }} {{ rate(leg.mbps) }} Mbps</strong> / {{ usesTotal(unit) ? '仅测量' : leg.source === 'none' ? '未形成有效验收' : '门限 ' + innerTargetText(leg.target_mbps) }}<small>{{ SOURCE_LABEL[leg.source] }} · {{ innerFlowPath(leg.flow) }} · 接收端 {{ leg.receiver_host }} {{ leg.receiver }}</small></p>
-                <p v-if="!unit.legs.length" class="muted">无测量结果</p>
+                <p v-for="ping in unit.ping ?? []" :key="ping.flow">{{ FLOW_LABEL[ping.flow] }}：丢包 {{ ping.result.loss_pct }}%；平均 RTT {{ ping.result.rtt_avg ?? '未获取' }} ms，最大 RTT {{ ping.result.rtt_max ?? '未获取' }} ms</p>
+                <p v-if="!unit.legs.length && !unit.ping?.length" class="muted">无测量结果</p>
               </template>
             </td>
             <td class="verdict-cell">
@@ -75,7 +76,7 @@ function loss(unit: InnerUnit, leg: InnerLeg): string {
               <p>{{ innerUnitExplanation(unit) }}</p>
               <details>
                 <summary>测量依据与诊断</summary>
-                <p v-if="unit.direction === 'bidir'">共同有效重叠 {{ unit.overlap_secs != null ? unit.overlap_secs.toFixed(2) + 's' : '未取得' }}。</p>
+                <p v-if="unit.direction === 'bidir' && unit.protocol !== 'ping'">共同有效重叠 {{ unit.overlap_secs != null ? unit.overlap_secs.toFixed(2) + 's' : '未取得' }}。</p>
                 <p v-for="(item, k) in unit.diagnostics" :key="`u${k}`">{{ item }}</p>
                 <div v-for="one in unit.legs" :key="one.flow" class="leg-evidence">
                   <h4>{{ FLOW_LABEL[one.flow] }} · {{ innerFlowPath(one.flow) }} · 端口 {{ one.port }}</h4>
@@ -83,7 +84,7 @@ function loss(unit: InnerUnit, leg: InnerLeg): string {
                   <p v-if="one.fallback_reason" class="fallback">已改用{{ SOURCE_LABEL[one.source] }}：{{ one.fallback_reason }}</p>
                   <p>网卡 RX {{ rate(one.nic_rx_mbps) }} Mbps，门限 {{ innerTargetText(one.nic_target_mbps) }}；{{ innerVerdictLabel(one.nic_verdict) }}（{{ one.nic_verdict }}）。</p>
                   <p>工具口径：接收 {{ rate(one.tool_receiver_mbps) }} Mbps；{{ one.tool_receiver_note }}。工具发送 {{ rate(one.tool_sender_mbps) }} Mbps（仅诊断）。</p>
-                  <p>UDP 丢包 {{ loss(unit, one) }}（仅诊断）。采样覆盖 {{ (one.coverage * 100).toFixed(1) }}%；有效时长 {{ one.effective_secs.toFixed(2) }}s / 配置 {{ one.required_secs }}s。</p>
+                  <p>UDP 丢包 {{ loss(unit, one) }}（仅诊断）。采样覆盖 {{ (one.coverage * 100).toFixed(1) }}%；有效时长 {{ innerScoredSecs(one).toFixed(2) }}s / 配置 {{ one.required_secs }}s。</p>
                   <p v-for="(item, k) in one.diagnostics" :key="k">{{ item }}</p>
                   <small>原因代码：{{ one.reason }}；网卡独立判定：{{ one.nic_reason }}</small>
                 </div>

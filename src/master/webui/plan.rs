@@ -1973,7 +1973,16 @@ impl CompiledPlan {
 
 pub(super) fn compile_request(state: &UiState, req: &RunRequest) -> Result<CompiledPlan, String> {
     validate_request(state, req)?;
-    let cfg = config_from_request(state, req)?;
+    let mut cfg = config_from_request(state, req)?;
+    if crate::config::local_only_tests(&cfg) {
+        cfg.agent_host.clear();
+        // 没连辅测机时本机网卡来自 `/api/local` 的全量扫描，前缀只在页面上筛显示。
+        // 执行端开跑与每个单元前都按 `cfg.ipv4_prefixes` 重扫本机：不清掉的话，
+        // 前缀外的本机网口在开跑时就「消失」了。前缀不进计划指纹，清掉不改 plan_hash。
+        cfg.ipv4_prefixes.clear();
+    } else if !cfg.tests.is_empty() && state.agent.interfaces.is_empty() {
+        return Err("所选任务包含辅测机网口，请先连接辅测机".into());
+    }
     let problems = cfg.validate();
     if !problems.is_empty() {
         return Err(format!("配置项异常：{}", problems.join("；")));
@@ -2048,7 +2057,11 @@ pub(super) fn compile_request(state: &UiState, req: &RunRequest) -> Result<Compi
     } else {
         vec![false; units.len()]
     };
-    let topology_fingerprint = topology_fingerprint(state);
+    let topology_fingerprint = if crate::config::local_only_tests(&cfg) {
+        crate::master::plan::topology_fingerprint(&state.master, &HostInfo::default())
+    } else {
+        topology_fingerprint(state)
+    };
     let execution_plan = ExecutionPlan::new(
         &cfg,
         topology_fingerprint.clone(),

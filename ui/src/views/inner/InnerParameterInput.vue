@@ -2,7 +2,7 @@
 import { computed, ref, watch } from 'vue';
 import { emptyInnerParameterOptions, parseInnerParameterTokens } from '../../domain/inner';
 import type { InnerConfig, InnerParameterOptions } from '../../domain/inner';
-const props = defineProps<{ config: InnerConfig; field: 'tcp_streams' | 'udp_streams' | 'tcp_window' | 'udp_mbps' | 'udp_length'; axis: keyof InnerParameterOptions; numeric: boolean }>();
+const props = defineProps<{ config: InnerConfig; field: 'tcp_streams' | 'udp_streams' | 'tcp_window' | 'udp_mbps' | 'udp_length' | 'udp_window'; axis: keyof InnerParameterOptions; numeric: boolean }>();
 const formatted = computed(() => {
   const values = props.config.parameter_options?.[props.axis];
   return values?.length ? values.join(', ') : String(props.config[props.field] ?? '');

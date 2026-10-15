@@ -245,7 +245,7 @@ onMounted(load);
     <p v-if="error" class="msg bad" role="alert">{{ error }}</p>
     <p v-if="notice" class="msg ok" role="status">{{ notice }}</p>
     <p v-if="baselineId" class="msg" role="status">
-      对比基线：<strong class="mono">{{ baselineId }}</strong>，在另一轮上点「与基线对比」。
+      对比基线：<strong class="mono">{{ baselineId }}</strong>。
       <button type="button" class="linklike" @click="baselineId = ''">取消基线</button>
     </p>
 

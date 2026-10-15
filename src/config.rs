@@ -1177,6 +1177,21 @@ fn load_from(p: &Path) -> Result<Config, String> {
     serde_json::from_str::<Config>(text).map_err(|e| e.to_string())
 }
 
+/// 只依据实际测试端点判断是否需要辅测机；不根据配置里残留的连接地址猜。
+pub(crate) fn local_only_tests(cfg: &Config) -> bool {
+    !cfg.tests.is_empty()
+        && cfg.tests.iter().all(|t| {
+            [&t.src, &t.dst].iter().all(|endpoint| {
+                endpoint.split_once(':').is_some_and(|(side, _)| {
+                    matches!(
+                        side.trim().to_ascii_lowercase().as_str(),
+                        "master" | "local" | "主控"
+                    )
+                })
+            })
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

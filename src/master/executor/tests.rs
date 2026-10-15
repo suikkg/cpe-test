@@ -4773,6 +4773,34 @@ fn the_iperf_tool_trace_reads_the_server_timeline_of_the_last_test_only() {
     let udp = iperf_tool_trace(&events, &server, 180, true);
     assert!(udp.sender.reported.is_empty() && udp.sender.flowing.is_empty());
     assert_eq!(udp.receiver.flowing.len(), 160);
+
+    // 接收端逐秒速率跟着投影走（判断计数器在不在路径上用）；发送端从不带速率。
+    assert_eq!(tcp.receiver.rates.len(), 180);
+    assert_eq!(tcp.receiver.rates[0], (1_230, 2_230, 941.0));
+    assert_eq!(tcp.receiver.rates[60], (61_230, 62_230, 0.0));
+    assert!(tcp.sender.rates.is_empty());
+}
+
+/// 多流时 server 每秒每条流一行、另有一行 `[SUM]`：速率只取合计行，否则同一秒
+/// 算两遍，工具值翻倍，计数器在不在路径上的判断跟着偏。
+#[test]
+fn the_receiver_rates_in_the_trace_take_only_the_sum_lines_of_a_multi_stream_test() {
+    let events = interval_only_events(10, 1_200 + 10_000 + 400);
+    let mut server = String::new();
+    for second in 0..10u64 {
+        let span = format!("{second}.00-{}.00  sec", second + 1);
+        server.push_str(&format!("[  5] {span}  50.0 MBytes   420 Mbits/sec\n"));
+        server.push_str(&format!("[  7] {span}  60.0 MBytes   500 Mbits/sec\n"));
+        server.push_str(&format!("[SUM] {span}   110 MBytes   920 Mbits/sec\n"));
+    }
+    let trace = iperf_tool_trace(&events, &server_intervals(&server), 10, false);
+    assert_eq!(trace.receiver.rates.len(), 10);
+    assert!(trace
+        .receiver
+        .rates
+        .iter()
+        .all(|(_, _, mbps)| *mbps == 920.0));
+    assert_eq!(trace.receiver.reported.len(), 30, "停滞旁证仍看全部逐秒行");
 }
 
 /// 工具口径能裁到任意时间段的只有接收端逐秒记录：在判定窗口上求时间加权平均，

@@ -95,8 +95,8 @@ describe('内环扫描清单的真实口径', () => {
     const inventory = html.match(/<details([^>]*)><summary[^>]*>查看板侧全部系统接口（46 个）<\/summary>([\s\S]*?)<\/details>/);
     expect(inventory).not.toBeNull();
     expect(inventory![1]).not.toMatch(/\bopen(?:[\s=>]|$)/);
-    expect(inventory![2]).toContain('CPE 系统接口');
-    expect(inventory![2]).toContain('测试网口在下方选择');
+    expect(inventory![2]).toContain('所属桥 / 成员');
+    expect(inventory![2]).not.toContain('测试网口在下方选择');
     expect(inventory![2].match(/<tbody[^>]*>([\s\S]*?)<\/tbody>/)?.[1].match(/<tr\b/g)).toHaveLength(46);
     expect(scanPicker(html).match(/class="scan-option"/g)).toHaveLength(1);
     expect(html).toContain('共 0 条，本轮参与 0 条');

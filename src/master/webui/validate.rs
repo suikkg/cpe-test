@@ -1168,9 +1168,28 @@ pub(super) fn validate_pair(
 
 /// 「网口与策略」那张表。
 pub(super) fn validate_nic_policies(state: &UiState, req: &RunRequest) -> Result<(), String> {
+    let references_agent = if let Some(plan) = &req.ui_plan {
+        plan.bindings.iter().any(|b| {
+            plan.link_sets
+                .iter()
+                .filter(|s| s.id == b.link_set_id)
+                .flat_map(|s| &s.pair_refs)
+                .filter(|p| b.pair_ids.is_empty() || b.pair_ids.contains(&p.id))
+                .any(|p| p.src.starts_with("agent:") || p.dst.starts_with("agent:"))
+        })
+    } else {
+        req.pairs
+            .iter()
+            .any(|p| p.src.starts_with("agent:") || p.dst.starts_with("agent:"))
+    };
     let mut seen = HashSet::new();
     for policy in &req.nic_policies {
-        if !endpoint_exists(state, &policy.endpoint) {
+        let unused_agent = !references_agent
+            && policy
+                .endpoint
+                .strip_prefix("agent:NAME=")
+                .is_some_and(|n| !n.is_empty());
+        if !endpoint_exists(state, &policy.endpoint) && !unused_agent {
             return Err(format!(
                 "网口策略已失效：{}。请刷新网口后重新填写",
                 policy.endpoint

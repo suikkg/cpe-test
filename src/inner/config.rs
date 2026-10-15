@@ -1,9 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-/// 内环项目当前 schema 版本：v4 增加多档位与协议门限。版本 1 是「固定上下行、板侧统计接口绑死在
+/// 内环项目当前 schema 版本：v5 增加工作台、整计划轮次、Ping 与本轮覆盖；v4 增加多档位与协议门限。版本 1 是「固定上下行、板侧统计接口绑死在
 /// 网关归属口、只有网卡口径」那一代，导入时按 [`migrate_v1`] 升级。
-pub const PROJECT_VERSION: u32 = 4;
+pub const PROJECT_VERSION: u32 = 5;
 pub const PROJECT_KIND: &str = "cpe-inner-project";
 /// 地址最终进入 HTTP Host 头；DNS 名称的协议上限是 253 字节，给 IP/端口解析
 /// 和实现留一点余量，但不接受把整份请求体塞进一个主机名字段。
@@ -44,6 +44,7 @@ pub struct InnerConfig {
     pub udp_mbps: Option<f64>,
     /// UDP 数据报载荷字节数（iperf3 `-l`），如 `1400`；留空用 iperf3 默认。
     pub udp_length: Option<String>,
+    pub udp_window: Option<String>,
     /// UDP 丢包诊断门槛（%）。与子网口径一致：超限只写诊断，
     /// 达标与否仍然只看本腿选中的接收速率来源。
     pub max_udp_loss_pct: Option<f64>,
@@ -60,6 +61,13 @@ pub struct InnerConfig {
     pub screenshot: bool,
     pub agents: Vec<AgentConfig>,
     pub links: Vec<Link>,
+    /// 完整工作台；缺省继续按旧配置展开。
+    pub workspace: Option<super::workspace::Workspace>,
+    /// 整份计划执行完后再重复，区别于旧 repeats 的逐单元重复。
+    pub rounds: u32,
+    pub ping_options: PingOptions,
+    pub ping_policy: Option<super::options::PingPolicy>,
+    pub run_overrides: super::options::RunOverrides,
 }
 
 impl Default for InnerConfig {
@@ -79,6 +87,7 @@ impl Default for InnerConfig {
             tcp_window: None,
             udp_mbps: None,
             udp_length: None,
+            udp_window: None,
             max_udp_loss_pct: None,
             port: 56190,
             repeats: 1,
@@ -86,6 +95,11 @@ impl Default for InnerConfig {
             screenshot: true,
             agents: Vec::new(),
             links: Vec::new(),
+            workspace: None,
+            rounds: 1,
+            ping_options: PingOptions::default(),
+            ping_policy: None,
+            run_overrides: super::options::RunOverrides::default(),
         }
     }
 }
@@ -99,15 +113,17 @@ pub struct ParameterOptions {
     pub tcp_windows: Vec<String>,
     pub udp_rates_mbps: Vec<f64>,
     pub udp_lengths: Vec<String>,
+    pub udp_windows: Vec<String>,
 }
 
 /// 一个单元实际下发的参数，预览、执行与结果共用。
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Parameters {
     pub streams: u32,
     pub tcp_window: Option<String>,
     pub udp_mbps: Option<f64>,
     pub udp_length: Option<String>,
+    pub udp_window: Option<String>,
 }
 impl Parameters {
     pub fn apply(&self, cfg: &InnerConfig, protocol: Protocol) -> InnerConfig {
@@ -118,16 +134,32 @@ impl Parameters {
                 next.tcp_streams = Some(self.streams);
                 next.tcp_window = self.tcp_window.clone();
             }
+            Protocol::Ping => {
+                next.ping_options = PingOptions {
+                    count: self.streams,
+                    payloads: vec![self
+                        .udp_length
+                        .as_deref()
+                        .and_then(|p| p.parse().ok())
+                        .unwrap_or(32)],
+                };
+            }
             Protocol::Udp => {
                 next.udp_streams = Some(self.streams);
                 next.udp_mbps = self.udp_mbps;
                 next.udp_length = self.udp_length.clone();
+                next.udp_window = self.udp_window.clone();
             }
         }
         next
     }
     pub fn label(&self, protocol: Protocol) -> String {
-        match protocol {
+        let label = match protocol {
+            Protocol::Ping => format!(
+                "{} 次 / {} 字节",
+                self.streams,
+                self.udp_length.as_deref().unwrap_or("32")
+            ),
             Protocol::Tcp => format!(
                 "-P {} / -w {}",
                 self.streams,
@@ -139,7 +171,13 @@ impl Parameters {
                 self.udp_mbps.unwrap_or_default(),
                 self.udp_length.as_deref().unwrap_or("默认")
             ),
+        };
+        if protocol == Protocol::Udp {
+            if let Some(window) = &self.udp_window {
+                return format!("{label} / -w {window}");
+            }
         }
+        label
     }
 }
 
@@ -155,7 +193,7 @@ pub struct Thresholds {
     pub tool_bidir_total_min_mbps: Option<f64>,
 }
 impl Thresholds {
-    fn values(&self) -> [Option<f64>; 6] {
+    pub(super) fn values(&self) -> [Option<f64>; 6] {
         [
             self.upload_min_mbps,
             self.download_min_mbps,
@@ -173,6 +211,7 @@ pub enum Protocol {
     #[default]
     Tcp,
     Udp,
+    Ping,
 }
 
 impl Protocol {
@@ -180,6 +219,7 @@ impl Protocol {
         match self {
             Self::Tcp => "TCP",
             Self::Udp => "UDP",
+            Self::Ping => "Ping",
         }
     }
     pub fn is_udp(self) -> bool {
@@ -278,6 +318,8 @@ impl Measurement {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Link {
+    #[serde(default)]
+    pub pc_capacity: Option<super::options::PcCapacity>,
     pub name: String,
     /// master 为主控；其他值为 agents 中的 id。
     #[serde(default = "master_host")]
@@ -335,6 +377,7 @@ impl Link {
         let overrides = match protocol {
             Protocol::Tcp => &self.tcp_thresholds,
             Protocol::Udp => &self.udp_thresholds,
+            Protocol::Ping => &None,
         };
         if let Some(t) = overrides {
             link.upload_min_mbps = t.upload_min_mbps.or(link.upload_min_mbps);
@@ -633,10 +676,25 @@ pub fn iface_word(value: &str) -> bool {
 
 impl InnerConfig {
     pub fn parameter_variants(&self, protocol: Protocol) -> Vec<Parameters> {
+        if protocol == Protocol::Ping {
+            return self
+                .ping_options
+                .payloads
+                .iter()
+                .map(|p| Parameters {
+                    streams: self.ping_options.count,
+                    tcp_window: None,
+                    udp_mbps: None,
+                    udp_length: Some(p.to_string()),
+                    udp_window: None,
+                })
+                .collect();
+        }
         let o = &self.parameter_options;
         let streams = match protocol {
             Protocol::Tcp => &o.tcp_streams,
             Protocol::Udp => &o.udp_streams,
+            Protocol::Ping => unreachable!(),
         };
         let streams = if streams.is_empty() {
             vec![self.streams(protocol)]
@@ -646,42 +704,61 @@ impl InnerConfig {
         let sizes = match protocol {
             Protocol::Tcp => &o.tcp_windows,
             Protocol::Udp => &o.udp_lengths,
+            Protocol::Ping => unreachable!(),
         };
-        let sizes = if sizes.is_empty() {
+        let sizes = if protocol == Protocol::Tcp && self.run_overrides.tcp_window.is_some() {
+            vec![self.run_overrides.tcp_window.clone()]
+        } else if sizes.is_empty() {
             vec![match protocol {
                 Protocol::Tcp => self.tcp_window.clone(),
                 Protocol::Udp => self.udp_length.clone(),
+                Protocol::Ping => unreachable!(),
             }]
         } else {
             sizes.iter().cloned().map(Some).collect()
         };
-        let rates = if protocol == Protocol::Udp && !o.udp_rates_mbps.is_empty() {
+        let rates = if protocol == Protocol::Udp && self.run_overrides.udp_mbps.is_some() {
+            vec![self.run_overrides.udp_mbps]
+        } else if protocol == Protocol::Udp && !o.udp_rates_mbps.is_empty() {
             o.udp_rates_mbps.iter().copied().map(Some).collect()
         } else {
             vec![self.udp_mbps]
+        };
+        let windows: Vec<Option<String>> = if protocol == Protocol::Udp && !o.udp_windows.is_empty()
+        {
+            o.udp_windows.iter().cloned().map(Some).collect()
+        } else {
+            vec![self.udp_window.clone()]
         };
         let mut result = Vec::new();
         for streams in streams {
             for size in &sizes {
                 for &rate in &rates {
-                    result.push(Parameters {
-                        streams,
-                        tcp_window: if protocol == Protocol::Tcp {
-                            size.clone()
-                        } else {
-                            None
-                        },
-                        udp_mbps: if protocol == Protocol::Udp {
-                            rate
-                        } else {
-                            None
-                        },
-                        udp_length: if protocol == Protocol::Udp {
-                            size.clone()
-                        } else {
-                            None
-                        },
-                    });
+                    for window in &windows {
+                        result.push(Parameters {
+                            streams,
+                            udp_window: if protocol == Protocol::Udp {
+                                window.clone()
+                            } else {
+                                None
+                            },
+                            tcp_window: if protocol == Protocol::Tcp {
+                                size.clone()
+                            } else {
+                                None
+                            },
+                            udp_mbps: if protocol == Protocol::Udp {
+                                rate
+                            } else {
+                                None
+                            },
+                            udp_length: if protocol == Protocol::Udp {
+                                size.clone()
+                            } else {
+                                None
+                            },
+                        });
+                    }
                 }
             }
         }
@@ -693,6 +770,7 @@ impl InnerConfig {
         match protocol {
             Protocol::Tcp => self.tcp_streams,
             Protocol::Udp => self.udp_streams,
+            Protocol::Ping => Some(1),
         }
         .unwrap_or(self.parallel)
     }
@@ -719,6 +797,17 @@ impl InnerConfig {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        self.ping_options.validate()?;
+        self.run_overrides.validate()?;
+        if let Some(policy) = &self.ping_policy {
+            policy.validate()?;
+        }
+        if !(1..=100).contains(&self.rounds) {
+            return Err("整计划轮次应为 1..100".into());
+        }
+        if let Some(workspace) = &self.workspace {
+            return workspace.validate(self);
+        }
         if !adb_program(&self.adb_path)
             || !safe_word(&self.board_iperf)
             || (!self.serial.is_empty() && !safe_word(&self.serial))
@@ -729,15 +818,15 @@ impl InnerConfig {
             );
         }
         // 双向单元的两条腿各占一个端口，所以端口上限留一格给 port + 1。
-        if !(6..=3600).contains(&self.duration_secs)
-            || !(1..=16).contains(&self.parallel)
+        if !(1..=86400).contains(&self.duration_secs)
+            || !(1..=32).contains(&self.parallel)
             || self.port < 1024
             || self.port == u16::MAX
             || !(1..=10).contains(&self.repeats)
             || self.links.len() > 32
         {
             return Err(
-                "duration_secs 需为 6..3600，parallel 为 1..16，port 为 1024..65534（双向占用 port 与 port+1），repeats 为 1..10，最多 32 条链路"
+                "duration_secs 需为 1..86400，parallel 为 1..32，port 为 1024..65534（双向占用 port 与 port+1），repeats 为 1..10，最多 32 条链路"
                     .into(),
             );
         }
@@ -757,18 +846,18 @@ impl InnerConfig {
             return Err("IP 版本至少选择 IPv4 或 IPv6，且不能重复".into());
         }
         for streams in [self.tcp_streams, self.udp_streams].into_iter().flatten() {
-            if !(1..=16).contains(&streams) {
-                return Err("按协议覆盖的并发流数需为 1..16，留空则沿用 parallel".into());
+            if !(1..=32).contains(&streams) {
+                return Err("按协议覆盖的并发流数需为 1..32，留空则沿用 parallel".into());
             }
         }
         let o = &self.parameter_options;
         for values in [&o.tcp_streams, &o.udp_streams] {
-            if values.len() > 16 || !unique(values) || values.iter().any(|v| !(1..=16).contains(v))
+            if values.len() > 16 || !unique(values) || values.iter().any(|v| !(1..=32).contains(v))
             {
-                return Err("流数档位最多 16 项，不重复且为 1..16".into());
+                return Err("流数档位最多 16 项，不重复且为 1..32".into());
             }
         }
-        for values in [&o.tcp_windows, &o.udp_lengths] {
+        for values in [&o.tcp_windows, &o.udp_lengths, &o.udp_windows] {
             if values.len() > 16 || !unique(values) || values.iter().any(|v| !size_token(v)) {
                 return Err("窗口与包长档位最多 16 项，不重复且为数字加可选 k/m/g".into());
             }
@@ -795,7 +884,8 @@ impl InnerConfig {
         if !udp
             && (!o.udp_streams.is_empty()
                 || !o.udp_rates_mbps.is_empty()
-                || !o.udp_lengths.is_empty())
+                || !o.udp_lengths.is_empty()
+                || !o.udp_windows.is_empty())
         {
             return Err("不测 UDP 时不接受 UDP 档位".into());
         }
@@ -808,6 +898,7 @@ impl InnerConfig {
             * self.ip_versions.len()
             * self.directions.len()
             * self.repeats as usize
+            * self.rounds as usize
             * variants
             > 4096
         {
@@ -817,7 +908,10 @@ impl InnerConfig {
         if self
             .udp_mbps
             .is_some_and(|v| !v.is_finite() || v <= 0.0 || v > 1e6)
-            || (udp && self.udp_mbps.is_none() && o.udp_rates_mbps.is_empty())
+            || (udp
+                && self.udp_mbps.is_none()
+                && o.udp_rates_mbps.is_empty()
+                && self.run_overrides.udp_mbps.is_none())
             || (!udp && self.udp_mbps.is_some())
         {
             return Err(
@@ -829,6 +923,7 @@ impl InnerConfig {
         for (label, value) in [
             ("tcp_window", &self.tcp_window),
             ("udp_length", &self.udp_length),
+            ("udp_window", &self.udp_window),
         ] {
             if value.as_deref().is_some_and(|v| !size_token(v)) {
                 return Err(format!("{label} 只能是数字加可选的 k/m/g，例如 4m、1400"));
@@ -837,7 +932,11 @@ impl InnerConfig {
         if self.tcp_window.is_some() && !self.protocols.contains(&Protocol::Tcp) {
             return Err("不测 TCP 时不接受 tcp_window".into());
         }
-        if (self.udp_length.is_some() || self.max_udp_loss_pct.is_some()) && !udp {
+        if (self.udp_length.is_some()
+            || self.udp_window.is_some()
+            || self.max_udp_loss_pct.is_some())
+            && !udp
+        {
             return Err("不测 UDP 时不接受 udp_length / max_udp_loss_pct".into());
         }
         if self
@@ -851,11 +950,17 @@ impl InnerConfig {
         if self.agents.len() > 8 {
             return Err("最多配置 8 台辅测机".into());
         }
+        let used_hosts: std::collections::HashSet<_> = self
+            .links
+            .iter()
+            .filter(|l| l.enabled)
+            .map(|l| l.host.as_str())
+            .collect();
         for agent in &self.agents {
             if !safe_word(&agent.id)
                 || !hosts.insert(&agent.id)
-                || agent.port == 0
-                || agent.address.trim().is_empty()
+                || (used_hosts.contains(agent.id.as_str())
+                    && (agent.port == 0 || agent.address.trim().is_empty()))
                 || agent.address.len() > MAX_AGENT_ADDRESS_BYTES
                 || agent.address.chars().any(char::is_control)
                 || agent.token.len() > MAX_AGENT_TOKEN_BYTES
@@ -867,7 +972,10 @@ impl InnerConfig {
         let bidir = self.directions.contains(&Direction::Bidir);
         let mut endpoints = std::collections::HashSet::new();
         for link in &self.links {
-            if !hosts.contains(link.host.as_str()) {
+            if let Some(capacity) = &link.pc_capacity {
+                capacity.validate()?;
+            }
+            if !safe_word(&link.host) || (link.enabled && !hosts.contains(link.host.as_str())) {
                 return Err(format!("{}: 未配置所属电脑 {}", link.name, link.host));
             }
             if link.name.trim().is_empty()
@@ -999,6 +1107,36 @@ impl InnerConfig {
             {
                 return Err(format!("{}: 未勾选双向并发时不接受双向合计门限", link.name));
             }
+        }
+        Ok(())
+    }
+}
+
+/// Ping 包长轴与次数；验收门限沿用公共 PingCfg 的有线/Wi-Fi 分档策略。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PingOptions {
+    pub count: u32,
+    pub payloads: Vec<u32>,
+}
+impl Default for PingOptions {
+    fn default() -> Self {
+        let cfg = crate::config::PingCfg::default();
+        Self {
+            count: cfg.count,
+            payloads: cfg.payload_sizes,
+        }
+    }
+}
+impl PingOptions {
+    fn validate(&self) -> Result<(), String> {
+        if !(1..=1000).contains(&self.count)
+            || self.payloads.is_empty()
+            || self.payloads.len() > 16
+            || !unique(&self.payloads)
+            || self.payloads.iter().any(|p| *p > crate::ping::MAX_PAYLOAD)
+        {
+            return Err("Ping 次数为 1..1000，包长最多 16 档且为 0..65500、不重复".into());
         }
         Ok(())
     }

@@ -156,6 +156,22 @@ TCP 和 UDP 两条路径上得到相反的结论。
    verify 下一条从头到尾不通的方向永远拿不到 RATE_FAIL（2026-10 用户确认）。没有零增长段、
    或没有旁证时，低于下限仍是「没采到流量」。守在
    `a_confirmed_whole_window_outage_is_judged_by_its_near_zero_average`。
+   **计数器在走、却不在流量路径上**（`RateStats::counter_off_path`）：零增长那道门只拦得住
+   「一个字节都没记」。统计口选错时那块口常有零星背景流量，计数器一直在走，平均值是一个
+   「有效」的近零值——2026-10-14 Windows 实机内环手选 eth1，网卡 0.030 Mbps、同期板侧
+   server 收到 653.7 Mbps，判成 MEASURED；配了门限就是 RATE_FAIL。现在
+   `RateStats::with_tool_trace` 同时算出判定窗口内接收端工具记录的平均
+   （`ToolTimeline::rates`，多流只取 `[SUM]`，覆盖不到窗口三分之二不给数），网卡平均低于它的
+   `COUNTER_PATH_MIN_RATIO`（0.5）且工具 ≥ `COUNTER_PATH_MIN_TOOL_MBPS`（1 Mbps）时判
+   `NOT_EVALUATED / COUNTER_OFF_PATH`，排在有效下限之前。同一条路径上带帧头的网卡计数恒不低于
+   工具载荷（实机比值 1.006–1.052），一半两侧都有一个数量级以上的余量；两边一致地低（链路本来
+   就慢）照常判 RATE_FAIL。只认接收端：发送端写进 socket 的量证明不了对端收到了；ctsTraffic
+   的状态行两侧共用一列，暂不提供速率（`cts_tool_trace` 的 `rates` 为空，行为不变）。按默认规则
+   它会盖住同一单元另一条腿的结论（不在 `LEG_LOCAL_NOT_EVALUATED_CODES` 里）。内环
+   `nic_preferred` 因此自动兜底到工具口径，网卡口径的原始数字照样保留。守在
+   `a_counter_off_the_traffic_path_is_not_judged_on_its_near_zero_average`、
+   `the_counter_path_check_never_swallows_a_real_result` 与
+   `a_board_counter_off_the_traffic_path_is_not_judged_on_its_near_zero_rate`。
 2. **验收层**——`evaluate_rx_acceptance(mode, target, rx_stats)`，四种结果封闭：
    无有效 RX → `NOT_EVALUATED`；无门限 → `MEASURED`；`RX >= 门限` → `PASS`；
    `RX < 门限` → `RATE_FAIL`。它**不接受**发送端参数，所以「TX 影响了判定」在类型上就不可能。
@@ -589,13 +605,13 @@ Windows 文本适配器：`src/cmd/ipconfig.rs` 解析中英文 `ipconfig /all`�
 - 「计划 › 网口」`views/plan/PortSelection` 是唯一的分配编辑器（旧的集合×套件矩阵已并入），按链路集合分组：组复选框走 `domain/plan-build::toggleBinding` / `bindingSelectionState`（整集合 `pair_ids: []`，后来扫描到的同类网口自动参与，组标题标「整组」）；行复选框走 `domain/plan-ports::setPairAssigned`，批量「全选显示 / 取消显示」走 `setPairsAssigned`——已处于目标状态的行不重写，整组分配不会被改写成显式清单。保留集合 ID、端点方向、其他套件和绑定顺序；取消最后一对必须删除绑定，不能写回空数组；逐网口新增绑定使用显式 ID。批量操作仅影响显示行的当前套件，搜索与「全部/跨机/同机」只控制显示，不改集合与分配。`plan.filter` 固定为 `'all'`，旧草稿里的 `cross`/`same` 读入时改写：`pairs::roleKey` 区分跨机与同机，两类网口从不进同一个集合，所以 `'all'` 只多出未分配的集合，执行单元不变；它不在项目文件里。
 - 「计划 › 测试内容」`views/plan/SuiteEditor` 在任务里就地展开共享流量配置（`RecipeFields`），影响面由纯函数 `domain/plan-build::recipeReferences` 点名，未被引用的配置由 `unusedRecipes` 列出并可清理。「门限与默认值」标签承载 `NicPolicyTable` 与 `GlobalDefaults`，标注的优先级（任务门限 › 按网口 › Wi-Fi 频段 › 默认）与 `webui::plan::apply_wifi_pair_targets` 的 `fill_direction_target` / `nic_rx_override_resolves` 顺序一致。
 
-- 控制台浏览器回归在 `ui/e2e/console.spec.ts`，使用 `webui::tests::browser_regression_server` 交付真实鉴权、CSP 和内联页面；扫描与运行响应可控，cookie-only API 请求直接验证 Rust 服务。`state/session::rescan` 的本机阶段失败也保留并标旧双端快照；从未连接过辅测机时，本机阶段失败只记 `localError`，不把会话标成连接失败。控制台导航为「连接 / 计划 / 执行 / 内环测试 / 监控 / 历史」六区：「连接」`views/connect/ConnectView` 合并旧本机与辅测机两页、只留一个重扫入口，`NicTable` 列出全部扫描字段（不再有网卡详情面板）；「历史」`views/runs/HistoryView` 以标签承载子网（`SubnetRuns`）、内环（`InnerRuns`）与组合场景（`ScenarioRuns`）记录。子网重新执行固定以 RESUME 装载，准备面板上可取消。内环「停止测试」在组合场景时停场景、否则停内环，两个分支都必须**调用**（`InnerView::stopCurrent`），守在 e2e「单独运行的内环测试点「停止测试」真的发出停止请求」。
+- 控制台浏览器回归在 `ui/e2e/console.spec.ts`，使用 `webui::tests::browser_regression_server` 交付真实鉴权、CSP 和内联页面；扫描与运行响应可控，cookie-only API 请求直接验证 Rust 服务。`state/session::rescan` 的本机阶段失败也保留并标旧双端快照；从未连接过辅测机时，本机阶段失败只记 `localError`，不把会话标成连接失败。控制台导航分为「子网测试」「内环测试」，两组各有「连接 / 计划 / 执行」，另有「监控 / 历史」：「连接」`views/connect/ConnectView` 合并旧本机与辅测机两页、只留一个重扫入口，`NicTable` 列出全部扫描字段（不再有网卡详情面板）；「历史」`views/runs/HistoryView` 以标签承载子网（`SubnetRuns`）、内环（`InnerRuns`）与组合场景（`ScenarioRuns`）记录。子网重新执行固定以 RESUME 装载，准备面板上可取消。内环「停止测试」在组合场景时停场景、否则停内环，两个分支都必须**调用**（`InnerView::stopCurrent`），守在 e2e「单独运行的内环测试点「停止测试」真的发出停止请求」。
 
 - 子网 `state/plan::invalidatePreview` 增加请求代次并清空预览状态；`preview` 响应仅在请求代次和当前配置快照同时匹配时落地。成功导入项目或恢复默认时调用 `resetRunOptions`，清空项目不保存的 RESUME、截图、探测、强制窗口/带宽并将轮次恢复为 1；历史 `adoptRunRequest` 则从归档恢复这些选项。导入前发出的旧响应不得覆盖新项目，也不得结束新请求的忙碌态。
 
 - 内环扫描选择由纯函数 `domain/inner-setup::innerNicChoices` / `linksFromInnerChoices` 生成，默认展示 192.168 网段或仅 IPv6 的有效电脑网口并隐藏常见隧道/虚拟口，其他候选须显式展开；完整扫描不被裁剪，板侧全部系统接口与测试网口数分开；用户明确选择后由 `state/inner::addInnerScannedLinks` 添加，按电脑、接口名和 IPv4 去重，不把扫描结果全量加入。`innerSetupIssues` 同源生成缺项与修复定位；`InnerView` 参数区用一句话说明上下行的统计口径。`InnerLinkTable` 批量设置只处理当前显示且 enabled 的行，扫描发现网卡不等于链路预检通过。
 
-- ADB 内环入口 `inner::run_cli` 与 `inner::webui::Controller` 共用 `inner::perform`，独立严格配置 `inner::config::InnerConfig`、项目标识 `cpe-inner-project` 与 schema `version: 4`（兼容 v1/v2/v3），不混入子网 Config/Unit；内环单元有独立稳定身份和 24 小时 PASS RESUME，绝不命中子网历史。分层固定：`config` 定义 schema 与 v1→v2 迁移（`protocol`→`protocols`、`board_interface`→`board_rx_interface`，补 `enabled`/`measurement`/`repeats`/`resume`；顺序单向**绝不**迁成 `bidir`，策略保持 `nic_strict`）；`plan` 是**全仓唯一**的笛卡尔积，页面预览、执行器、进度和报告都消费它，展开顺序为 网口 → IP 版本 → 协议 → 参数组合 → 方向 → 轮次；`adb` 适配板侧设备（接口清单、桥成员、`/proc/net/dev` 与 sysfs 两条读取路径、按端口起 server）；`measure` 是纯策略层，来源选择与门限配对只在这里；`mod` 只负责按计划起流采样；`report`/`history` 输出与历史。`inner::remote` 根据链路 host 使用现有 agent client/monitor/owner cleanup 协议，令牌不序列化。`inner::adb` 仅经 ADB 确认自有 server 就绪，不要求主控能路由到被测 LAN；前台 shell 使用本次 PID、停止标记和有限租约回收，未确认回收时停止后续起流。发送端始终运行普通 client：上行 PC client → 板侧 server，下行板侧 client → PC server，不使用 `-R`；`inner::adb_client` 经公共 ProcessExecutor 复用 iperf 参数/重试/事件解析，`inner::receiver_server` 按方向管理本机/agent/板侧 server，server owner 与 client/monitor owner 隔离以便停止后先收日志；接收端按数据走向定（上行采板侧 RX，下行采网口所在电脑 RX），不按谁跑 client 推断。`enabled: false` 的网口保留配置但不执行、不预检，其引用的辅测机也不进连接门禁——无 agent 或 agent 离线都不阻断本机测试。`bidir` 是一个含两条腿的单元：两腿各占 `port` / `port+1`、独立 job 与日志、在作用域线程里同时起流，按两腿截断前真实流量区间的**交集**计算（两条腿先各自扣掉起流爬升 `plan::SETTLE_SECS`；两条腿各多跑 `BIDIR_OVERLAP_MARGIN_SECS`，交集从起点截出配置时长；交集不够长就不下结论；工具口径同样取共同窗口，见下），一腿失败置位单元取消位停止对向并定向回收。网卡口径与子网同规则：有效窗口不完整判 `IPERF_EFFECTIVE_WINDOW_SHORT`，不在没跑满的窗口上下结论；工具口径的 receiver 汇总覆盖不到配置时长（中途退出时 server 仍可能打出一条只覆盖前几秒的汇总）同样拒收。`-P`/`-w`/`-b`/`-l` 按协议分开配置，`tcp_window` / `udp_length` 走 `config::size_token` 白名单、`board_rx_interface` 走 `config::iface_word` 白名单后才拼进命令行或 sysfs 路径。测量策略 `nic_strict` / `nic_preferred` / `tool` 决定来源：网卡口径始终单独留存并仍由 `rate_window::evaluate_rx_acceptance` 产出，字段语义不变；兜底整条腿只选一次来源并记录原因，**可信低速不触发兜底**，工具口径**不继承**网卡门限（无工具门限只出 MEASURED）；工具速率首选接收端 server 逐秒记录在判定窗口上的时间加权平均（`cmd::iperf_window::receiver_rate_over`；多流只认 `[SUM]` 行，覆盖不足 95% 拒收），和网卡口径同一段时间，双向时就是共同窗口；拿不到才退回全程 receiver 汇总（含起流爬升，双向时只有两条腿汇总覆盖同一段才可用）。两者都只认接收端，不取 sender / interval 末行。以前只认全程汇总，`tool` 策略的双向单元只要两条腿起跑差 100ms 以上就无法评价；守在 `a_tool_strategy_bidir_unit_is_judged_on_the_receivers_per_second_rates`；双向合计只相加同来源层次的两端接收速率，配了合计门限才按合计判一次。`max_udp_loss_pct` 超限仅追加 `UDP_LOSS_HIGH`，不推翻速率判定。板侧 server 原文按首尾裁剪后随腿进报告；判定（逐秒接收记录、断流旁证）用裁剪前的完整日志。`inner` 与子网共用纯 `cmd::iperf_window` 和 `rate_window`，不调用子网执行器。`master::webui::http` 在既有鉴权后转发 `/api/inner/*`（含 `plan` 预览与 `runs*` 历史，历史目录名按白名单精确比对、不做路径拼接）；两类启动共用 run_gate 防止并发占线，但配置、运行状态和取消标志分开；组合入口 `/api/scenario/*` 按子网后内环顺序执行，并在 `scenarios/` 保存两份原始配置，历史恢复默认打开两段各自的 RESUME。内环输出 `inner_runs`（`report.html`/`result.json`/`summary.json`/`config.json`/`units.jsonl`），子网历史仍只读 `runs`；历史「装载配置」只回配置不直接开跑。前端 `state/inner`、`domain/inner`、`views/inner/*` 不读写子网计划/连接/运行状态；独立草稿键与导入导出，误导入不得改写另一模式的配置；计划预览来自后端，前端不自算笛卡尔积。
+- ADB 内环入口 `inner::run_cli` 与 `inner::webui::Controller` 共用 `inner::perform`，独立严格配置 `inner::config::InnerConfig`、项目标识 `cpe-inner-project` 与 schema `version: 5`（兼容 v1/v2/v3/v4），不混入子网 Config/Unit；内环单元有独立稳定身份和 24 小时 PASS RESUME，绝不命中子网历史。分层固定：`config` 定义 schema 与 v1→v2 迁移（`protocol`→`protocols`、`board_interface`→`board_rx_interface`，补 `enabled`/`measurement`/`repeats`/`resume`；顺序单向**绝不**迁成 `bidir`，策略保持 `nic_strict`）；`plan` 是**全仓唯一**的笛卡尔积，页面预览、执行器、进度和报告都消费它，展开顺序为 网口 → IP 版本 → 协议 → 参数组合 → 方向 → 轮次；`adb` 适配板侧设备（接口清单、桥成员、`/proc/net/dev` 与 sysfs 两条读取路径、按端口起 server）；`measure` 是纯策略层，来源选择与门限配对只在这里；`mod` 只负责按计划起流采样；`report`/`history` 输出与历史。`inner::remote` 根据链路 host 使用现有 agent client/monitor/owner cleanup 协议，令牌不序列化。`inner::adb` 仅经 ADB 确认自有 server 就绪，不要求主控能路由到被测 LAN；前台 shell 使用本次 PID、停止标记和有限租约回收，未确认回收时停止后续起流。发送端始终运行普通 client：上行 PC client → 板侧 server，下行板侧 client → PC server，不使用 `-R`；`inner::adb_client` 经公共 ProcessExecutor 复用 iperf 参数/重试/事件解析，`inner::receiver_server` 按方向管理本机/agent/板侧 server，server owner 与 client/monitor owner 隔离以便停止后先收日志；接收端按数据走向定（上行采板侧 RX，下行采网口所在电脑 RX），不按谁跑 client 推断。`enabled: false` 的网口保留配置但不执行、不预检，其引用的辅测机也不进连接门禁——无 agent 或 agent 离线都不阻断本机测试。`bidir` 是一个含两条腿的单元：两腿各占 `port` / `port+1`、独立 job 与日志、在作用域线程里同时起流，按两腿截断前真实流量区间的**交集**计算（两条腿先各自扣掉起流爬升 `plan::SETTLE_SECS`；两条腿各多跑 `BIDIR_OVERLAP_MARGIN_SECS`，交集从起点截出配置时长；交集不够长就不下结论；工具口径同样取共同窗口，见下），一腿失败置位单元取消位停止对向并定向回收。网卡口径与子网同规则：有效窗口不完整判 `IPERF_EFFECTIVE_WINDOW_SHORT`，不在没跑满的窗口上下结论；工具口径的 receiver 汇总覆盖不到配置时长（中途退出时 server 仍可能打出一条只覆盖前几秒的汇总）同样拒收。`-P`/`-w`/`-b`/`-l` 按协议分开配置，`tcp_window` / `udp_length` 走 `config::size_token` 白名单、`board_rx_interface` 走 `config::iface_word` 白名单后才拼进命令行或 sysfs 路径。测量策略 `nic_strict` / `nic_preferred` / `tool` 决定来源：网卡口径始终单独留存并仍由 `rate_window::evaluate_rx_acceptance` 产出，字段语义不变；兜底整条腿只选一次来源并记录原因，**可信低速不触发兜底**，工具口径**不继承**网卡门限（无工具门限只出 MEASURED）；工具速率首选接收端 server 逐秒记录在判定窗口上的时间加权平均（`cmd::iperf_window::receiver_rate_over`；多流只认 `[SUM]` 行，覆盖不足 95% 拒收），和网卡口径同一段时间，双向时就是共同窗口；拿不到才退回全程 receiver 汇总（含起流爬升，双向时只有两条腿汇总覆盖同一段才可用）。两者都只认接收端，不取 sender / interval 末行。以前只认全程汇总，`tool` 策略的双向单元只要两条腿起跑差 100ms 以上就无法评价；守在 `a_tool_strategy_bidir_unit_is_judged_on_the_receivers_per_second_rates`；双向合计只相加同来源层次的两端接收速率，配了合计门限才按合计判一次。`max_udp_loss_pct` 超限仅追加 `UDP_LOSS_HIGH`，不推翻速率判定。板侧 server 原文按首尾裁剪后随腿进报告；判定（逐秒接收记录、断流旁证）用裁剪前的完整日志。`inner` 与子网共用纯 `cmd::iperf_window` 和 `rate_window`，不调用子网执行器。`master::webui::http` 在既有鉴权后转发 `/api/inner/*`（含 `plan` 预览与 `runs*` 历史，历史目录名按白名单精确比对、不做路径拼接）；两类启动共用 run_gate 防止并发占线，但配置、运行状态和取消标志分开；组合入口 `/api/scenario/*` 按子网后内环顺序执行，并在 `scenarios/` 保存两份原始配置，历史恢复默认打开两段各自的 RESUME。内环输出 `inner_runs`（`report.html`/`result.json`/`summary.json`/`config.json`/`units.jsonl`），子网历史仍只读 `runs`；历史「装载配置」只回配置不直接开跑。前端 `state/inner`、`domain/inner`、`views/inner/*` 不读写子网计划/连接/运行状态；独立草稿键与导入导出，误导入不得改写另一模式的配置；计划预览来自后端，前端不自算笛卡尔积。
 
 - 项目导入通过 `domain/import-topology::reconcileImportedTopology` 区分未知快照与成功扫描的空网卡表；只清理确认缺失的端点，并提示被删除的集合/绑定。绑定的显式 `pair_ids` 清空时必须删除该绑定，不能变成整集合分配。手工集合协调保留 pair ID 和端点方向。待校验状态随草稿保存，并在取得可信拓扑后自动校验。
 
@@ -749,7 +765,7 @@ Windows 文本适配器：`src/cmd/ipconfig.rs` 解析中英文 `ipconfig /all`�
 
 - `inner::webui::Controller::status` 以 `run_id` 和 `units_from` 配对续传；缺失或跨轮标识、越界游标均回完整列表，不能将上一轮的行数当作新一轮的游标。
 - `inner::report::write_atomic` 同目录写完再替换，保证并发下载只看到完整旧版或新版。`save_progress` 每单元追加 JSONL、刷新摘要；重产物在单元边界按 30 秒间隔节流，`save` 收尾必写。这不是每 30 秒的后台定时刷新，最长陈旧时间受下一单元耗时影响。
-- `history::Summary::finished` 为可选字段；新记录明确区分收尾与中间态，旧记录未知，不能从 `error == None` 推断完成。内环目前只提供 HTML/JSON，无 Excel 出口；子网 Excel 继续由 `report::xlsx` 输出。
+- `history::Summary::finished` 为可选字段；新记录明确区分收尾与中间态，旧记录未知，不能从 `error == None` 推断完成。内环提供 HTML/JSON 与 `inner::xlsx` 生成的 Excel；子网 Excel 继续由 `report::xlsx` 输出。
 
 ### 网卡原始样本快照身份
 
@@ -777,3 +793,17 @@ Windows 文本适配器：`src/cmd/ipconfig.rs` 解析中英文 `ipconfig /all`�
 
 - `inner::history::fresh_pass_ids` 仅从已收尾且无错误的历史实测 PASS 提取身份；`resumed=true` 不提供新证据，避免新生成的跳过记录刷新原始测量的 24 小时有效期。旧记录缺少 `resumed` 时保持兼容，显式非法类型拒绝复用。
 - `master::webui::monitor::api_monitor_start` 在同一次 `console.monitors` 加锁范围内检查上限、创建线程并登记会话。线程内采样与网络访问不持有此锁；线程创建失败不登记。并发请求最多占满 8 路会话，由 `concurrent_monitor_starts_share_the_last_available_slot` 验证。
+
+### 内环工作台与本机快捷测试
+
+- `inner::workspace` 定义集合、共享流量配置、套件任务与分配。`plan::build` 是统一展开入口，先按整计划轮次、分配、任务选择网口，再复用原参数展开；`Unit::execution_config` 保存实际任务配置，`origin` 和 `round` 同源提供预览、HTML、API 和 Excel。未分配网口不进预检与辅测机门禁；动态整集合与显式子集有独立语义。无工作台的旧配置保持原展开及单元身份。
+- `inner::ping_unit` 经公共 `ping::ping_latency_policy` / `acceptance_verdict` 判定，复用本机、已鉴权 agent 与有限租约 ADB 执行；Ping 不要求 iperf3 或网卡计数可用。`inner::xlsx` 直接读取 UnitRow，不重算速率或改判。长日志遵守 Excel 单元格 UTF-16 长度上限，原始记录保留在 JSON/HTML。
+- `inner::webui::Controller` 启动绑定 `plan_hash` 和 `start_token`，定向跳过绑定 `run_id` / `unit_seq`；前端 `state/inner` 在启动结果未知时拒绝重复提交。取消回收完成前不允许新起流。单元关闭后拒收迟到跳过，不清除已接受的当前跳过标记。
+- 前端 `views/inner/InnerWorkspace` 提供共享套件编辑，`App` 为两种模式分别提供连接、计划、执行导航；配置、扫描身份、草稿、导出与历史仍隔离。运行准备不展示上一轮结果，已完成结果仍在历史和本轮进度页。
+- `domain/quick-test` 只生成用户选择的一对本机端点；`state/quick` 暂存完整原计划供恢复。`config::local_only_tests`、`master::webui::plan` 与 `master::ui` 按真实端点决定是否连接 agent；本机路径保持实际本机工具预检、拓扑刷新、RX 采样和原报告输出。未使用的 agent 策略不阻断本机计划，端点工具预检按类型化 Side 判断。
+
+- `inner::options` 提供 `PingPolicy` 与 `RunOverrides`，Ping 验收调用公共分档策略；任务 `repeats` 保留旧单项重复，外层 `rounds` 仍按整计划执行。前端 `InnerDefaults` / `InnerPingOptions` 同源编辑默认与任务 Ping 参数；计划标签和所选套件保存在 `state/inner`，网口编辑仅在对应标签展示。
+- `inner::diagnostics::with_load_latency` 观察 `run_client_observed`、`adb_client::run_observed`、`remote::client_observed` 的正速率 Traffic 事件；每路探针分段并受结束/取消标志控制。`path_mtu` 先检查 DF 能力，复用公共 `ping::payload_search`，IPv6 不发 DF 探测。普通诊断失败不改判，资源回收错误向执行器传播并阻断后续单元。
+- UDP 裁剪复用 `builder::udp_load_for_ceiling` 与 `rate::nic_payload_ceiling_mbps`，不另写上限表。`Link::pc_capacity` 是选口时的已知电脑快照；原始请求保存在 `Unit::requested_parameters` / `UnitRow::requested_parameters`，实际值在 `parameters`，API、预览、HTML 与 Excel 同源展示。不同请求即使裁剪成同值也保持不同身份；不降低验收门限。
+- `inner::compare` 从保存的类型化配置与结果匹配两轮，优先实际 ADB 序列号；门限和名称不构成测试身份，方向、参数、IP 版本、轮次、时长与测量口径构成身份。身份里的板侧统计口（网卡口径、非 Ping）同时印进行标题（`compare::counter_label`），换了统计口的两轮不会出现两行标题相同的「新增」「缺失」。历史复用、用户跳过、重复及缺失结构不当成新的实测结论。`inner::history::compare` 只通过历史目录白名单读取普通文件。
+- `bundle::build_bundle` 为两种模式共用的流式离线打包入口，原子创建临时文件并以 RAII 回收；`master::webui::runs` 保留旧入口转发。内环下载包仍先鉴权，再经 `inner::history::resolve` 精确枚举匹配，目录内部的链接和特殊文件不打包。

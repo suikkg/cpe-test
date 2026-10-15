@@ -176,6 +176,7 @@ fn board_supports_forceflush(adb: &Adb, executor: &Executor<'_>, bin: &str) -> b
     probed
 }
 
+#[cfg(all(test, unix))]
 pub(super) fn run(
     adb: &Adb,
     bin: &str,
@@ -183,6 +184,18 @@ pub(super) fn run(
     owner: &str,
     epoch: Instant,
     cancel: &AtomicBool,
+) -> Result<(IperfClientOut, Vec<IperfFlowEvent>), String> {
+    run_observed(adb, bin, request, owner, epoch, cancel, None)
+}
+
+pub(super) fn run_observed(
+    adb: &Adb,
+    bin: &str,
+    request: &IperfClientReq,
+    owner: &str,
+    epoch: Instant,
+    cancel: &AtomicBool,
+    traffic: Option<&AtomicBool>,
 ) -> Result<(IperfClientOut, Vec<IperfFlowEvent>), String> {
     let mut origin = None;
     let mut events = Vec::new();
@@ -200,6 +213,13 @@ pub(super) fn run(
                 epoch.elapsed().as_millis() as u64,
                 &mut origin,
             );
+            if event.kind == crate::protocol::IperfEventKind::Traffic
+                && event.mbps.is_some_and(|v| v > 0.0)
+            {
+                if let Some(flag) = traffic {
+                    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
             events.push(event);
         },
     );
@@ -391,6 +411,7 @@ with tempfile.TemporaryFile() as log:
         let dir = std::env::temp_dir().join(&fake.owner);
         std::fs::create_dir(&dir).unwrap();
         let context = UnitContext {
+            capability: None,
             adb: &fake.adb,
             cfg: &cfg,
             link: &cfg.links[0],
@@ -425,4 +446,15 @@ with tempfile.TemporaryFile() as log:
             );
         }
     }
+}
+
+/// 有限租约与定向回收同样用于板侧 Ping，停止后确认进程退出再继续。
+pub(super) fn run_command(
+    adb: &Adb,
+    owner: &str,
+    spec: &ProcessSpec,
+    timeout: Duration,
+    cancel: &AtomicBool,
+) -> CmdOut {
+    Executor { adb, owner }.run_streaming(spec, timeout, Some(cancel), &mut |_, _| {})
 }

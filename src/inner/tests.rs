@@ -1,7 +1,7 @@
 use super::*;
 use crate::verdict::Verdict;
 
-fn example() -> InnerConfig {
+pub(super) fn example() -> InnerConfig {
     config::parse_config(include_str!("../../inner.example.json")).unwrap()
 }
 
@@ -105,20 +105,11 @@ fn assembled_bidir(strategy: Measurement, down_start: u64, total: bool) -> UnitR
                     ..Default::default()
                 },
                 server_log: String::new(),
+                diagnostics: Vec::new(),
             }
         })
         .collect();
-    assemble_unit(
-        &cfg,
-        &cfg.links[0],
-        unit,
-        &LinkPreflight {
-            board_iface: "br0".into(),
-            counter_source: Some(CounterSource::ProcNetDev),
-            addresses: TrafficAddresses::ipv4(&cfg.links[0]),
-        },
-        raw,
-    )
+    assemble_unit(&cfg, &cfg.links[0], unit, raw)
 }
 
 #[test]
@@ -139,6 +130,62 @@ fn disjoint_bidirectional_legs_never_produce_an_acceptance_or_total() {
                 .all(|leg| leg.verdict == "NOT_EVALUATED" && leg.mbps.is_none()));
             let aligned = assembled_bidir(strategy, 3_000, total);
             assert_eq!(aligned.verdict, "PASS", "{strategy:?}, {total}");
+        }
+    }
+}
+
+/// 双向两条腿多跑一段余量，重叠比配置时长长；速率只取其中配置时长那一段。
+/// 报告印的是计分时长，对外 JSON 的 `effective_secs` 仍是截断前的可用时长。
+#[test]
+fn the_report_prints_the_scored_duration_not_the_bidirectional_overlap() {
+    let row = assembled_bidir(Measurement::NicStrict, 3_000, false);
+    let overlap = row.overlap_secs.unwrap();
+    assert!(overlap > 20.5, "夹具的重叠应长于配置时长：{overlap}");
+    for leg in &row.legs {
+        assert_eq!(leg.required_secs, 20);
+        assert_eq!(leg.effective_secs, overlap, "JSON 字段语义不变");
+        assert_eq!(leg.scored_secs(), 20.0);
+    }
+    let mut cfg = example();
+    cfg.links.truncate(1);
+    let html = report::render(&RunReport {
+        current_unit: None,
+        schema_version: 2,
+        current: String::new(),
+        created_at: "now".into(),
+        config: cfg,
+        plan: None,
+        probe_only: false,
+        capability: None,
+        units: vec![row],
+        error: None,
+    });
+    assert_eq!(html.matches("有效测量时长</dt><dd>20.00s / 20s").count(), 2);
+    assert!(!html.contains(&format!("{overlap:.2}s / 20s")));
+}
+
+/// 诊断列只放这条腿上真的发生了的事。以前每条腿都挂两句同样的说明（背景怎么
+/// 扣、要保持业务空闲、板侧怎么读计数），正常的腿和出了问题的腿看上去一样。
+/// 唯一允许的常驻行是主控平台本身的计数器说明，它在 Windows / Linux 上为空。
+#[test]
+fn a_clean_leg_carries_no_diagnostics() {
+    let platform = crate::nic::monitor::counter_source_caveat();
+    for strategy in [
+        Measurement::NicStrict,
+        Measurement::NicPreferred,
+        Measurement::Tool,
+    ] {
+        let row = assembled_bidir(strategy, 3_000, false);
+        assert_eq!(row.verdict, "PASS", "{strategy:?}");
+        for leg in &row.legs {
+            assert!(
+                leg.diagnostics
+                    .iter()
+                    .all(|line| Some(line.as_str()) == platform),
+                "{strategy:?} {:?}: {:?}",
+                leg.flow,
+                leg.diagnostics
+            );
         }
     }
 }
@@ -224,6 +271,7 @@ fn capability(link: &Link, host: &str) -> Capability {
     Capability {
         serial: "test".into(),
         board_version: String::new(),
+        board_iperf_error: None,
         board_addresses: "34: br0 inet 192.168.8.1/24 scope global".into(),
         board_counters: counters.into(),
         board_interfaces: adb::board_interfaces(
@@ -596,7 +644,7 @@ fn per_protocol_knobs_are_validated_and_never_leak_into_the_other_protocol() {
         cfg.tcp_window = Some(good.into());
         cfg.validate().unwrap();
     }
-    for bad in [Some(0), Some(17)] {
+    for bad in [Some(0), Some(33)] {
         let mut cfg = example();
         cfg.tcp_streams = bad;
         assert!(cfg.validate().is_err());
@@ -1182,7 +1230,7 @@ fn the_tool_fallback_records_its_source_and_never_inherits_the_nic_threshold() {
 }
 
 #[test]
-fn a_frozen_counter_with_real_tool_traffic_is_evidence_but_a_slow_link_is_not() {
+fn the_counter_source_hint_speaks_only_about_a_frozen_counter() {
     let frozen = NicView {
         avg_mbps: Some(0.0),
         acceptance: evaluate_rx_acceptance(
@@ -1203,7 +1251,9 @@ fn a_frozen_counter_with_real_tool_traffic_is_evidence_but_a_slow_link_is_not() 
     let hint = measure::counter_mismatch_hint(&frozen, &tool(SINGLE, 1), "master", "en0").unwrap();
     assert!(hint.contains("master en0"));
     assert!(!hint.contains("板侧") && !hint.contains("br0"));
-    // 单纯「网卡数字比工具低」不是证据——链路可能本来就慢。
+    // 这条提示只说零增长。计数器在走、却远低于工具接收值的情形在判定前提层
+    // 就拦下了（`COUNTER_OFF_PATH`，见 `RateStats::counter_off_path`），网卡口径
+    // 已经是 NOT_EVALUATED，这里不再重复一遍；可信的低速更不该被提示。
     let slow = nic(Some(12.0), 1.0, Some(800.0));
     assert!(measure::counter_mismatch_hint(&slow, &tool(SINGLE, 1), "板侧", "br0").is_none());
     // 工具侧也没数就更谈不上证据。
@@ -1223,7 +1273,8 @@ fn a_bidirectional_total_only_adds_two_receivers_of_the_same_source_layer() {
     let down = leg(Source::Nic, 400.0);
     let judged = measure::total_verdict(&[&up, &down], Some(900.0), None);
     assert_eq!(judged.verdict, Verdict::Pass);
-    assert!(judged.diagnostics[0].contains("1000.000"));
+    assert!(judged.detail.contains("1000.000"));
+    assert!(judged.diagnostics.is_empty());
     assert_eq!(
         measure::total_verdict(&[&up, &down], Some(1200.0), None).verdict,
         Verdict::RateFail
@@ -1479,6 +1530,7 @@ fn sample_leg(flow: Flow, source: Source, mbps: f64) -> LegRow {
 #[test]
 fn report_escapes_device_output_and_explains_probe_only() {
     let report = RunReport {
+        current_unit: None,
         schema_version: 2,
         current: String::new(),
         created_at: "now".into(),
@@ -1516,6 +1568,11 @@ fn report_keeps_both_calibres_side_by_side_and_names_the_one_it_used() {
     cfg.directions = vec![Direction::Bidir];
     cfg.links[0].measurement = Measurement::NicPreferred;
     let unit = UnitRow {
+        requested_parameters: None,
+        duration_secs: 20,
+        origin: None,
+        round: 1,
+        ping: Vec::new(),
         id: "test-unit".into(),
         index: 1,
         link: "ETH".into(),
@@ -1526,6 +1583,7 @@ fn report_keeps_both_calibres_side_by_side_and_names_the_one_it_used() {
         streams: 4,
         bidir_targets: None,
         parameters: config::Parameters {
+            udp_window: None,
             streams: 1,
             tcp_window: None,
             udp_mbps: None,
@@ -1548,6 +1606,7 @@ fn report_keeps_both_calibres_side_by_side_and_names_the_one_it_used() {
         ],
     };
     let html = report::render(&RunReport {
+        current_unit: None,
         schema_version: 2,
         current: String::new(),
         created_at: "now".into(),
@@ -1609,6 +1668,7 @@ fn board_server_logs_keep_both_ends_so_long_runs_do_not_bloat_the_report() {
 #[test]
 fn the_run_summary_counts_units_not_legs_and_keeps_the_failure_visible() {
     let mut report = RunReport {
+        current_unit: None,
         schema_version: 2,
         current: String::new(),
         created_at: "2026-09-09 10:00:00".into(),
@@ -1618,6 +1678,11 @@ fn the_run_summary_counts_units_not_legs_and_keeps_the_failure_visible() {
         capability: None,
         units: vec![
             UnitRow {
+                requested_parameters: None,
+                duration_secs: 20,
+                origin: None,
+                round: 1,
+                ping: Vec::new(),
                 id: "test-pass".into(),
                 index: 1,
                 link: "ETH".into(),
@@ -1628,6 +1693,7 @@ fn the_run_summary_counts_units_not_legs_and_keeps_the_failure_visible() {
                 streams: 1,
                 bidir_targets: None,
                 parameters: config::Parameters {
+                    udp_window: None,
                     streams: 1,
                     tcp_window: None,
                     udp_mbps: None,
@@ -1650,6 +1716,11 @@ fn the_run_summary_counts_units_not_legs_and_keeps_the_failure_visible() {
                 ],
             },
             UnitRow {
+                requested_parameters: None,
+                duration_secs: 20,
+                origin: None,
+                round: 1,
+                ping: Vec::new(),
                 id: "test-not-evaluated".into(),
                 index: 2,
                 link: "Wi-Fi".into(),
@@ -1660,6 +1731,7 @@ fn the_run_summary_counts_units_not_legs_and_keeps_the_failure_visible() {
                 streams: 1,
                 bidir_targets: None,
                 parameters: config::Parameters {
+                    udp_window: None,
                     streams: 1,
                     tcp_window: None,
                     udp_mbps: None,
@@ -1743,6 +1815,7 @@ fn history_files_round_trip_the_config_without_carrying_the_agent_token() {
     let mut cfg = example();
     cfg.agents[0].token = "private-agent-token".into();
     let report = RunReport {
+        current_unit: None,
         schema_version: 2,
         current: String::new(),
         created_at: "2026-09-09 10:00:00".into(),
@@ -1806,6 +1879,11 @@ fn server_lease_reaps_only_its_child_and_removes_its_resource_directory() {
 
 pub(super) fn unit_row(index: usize) -> UnitRow {
     UnitRow {
+        requested_parameters: None,
+        duration_secs: 20,
+        origin: None,
+        round: 1,
+        ping: Vec::new(),
         id: format!("unit-{index}"),
         index,
         link: "ETH".into(),
@@ -1816,6 +1894,7 @@ pub(super) fn unit_row(index: usize) -> UnitRow {
         streams: 1,
         bidir_targets: None,
         parameters: config::Parameters {
+            udp_window: None,
             streams: 1,
             tcp_window: None,
             udp_mbps: None,
@@ -1843,6 +1922,7 @@ fn progress_saves_append_units_and_throttle_the_full_rewrites() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let mut report = RunReport {
+        current_unit: None,
         schema_version: 2,
         current: String::new(),
         created_at: "now".into(),
@@ -2090,7 +2170,7 @@ fn ipv6_config_is_explicit_and_old_v2_projects_remain_ipv4_only() {
             .ip_versions,
         vec![4]
     );
-    assert_eq!(config::PROJECT_VERSION, 4);
+    assert_eq!(config::PROJECT_VERSION, 5);
 
     let mut cfg = dual_stack_example();
     cfg.ip_versions = vec![6];
@@ -2269,6 +2349,7 @@ fn ipv6_results_keep_version_in_reports_and_resume_rows() {
     assert_eq!(row.ip_version, 6);
     assert_eq!(serde_json::to_value(&row).unwrap()["ip_version"], 6);
     let report = RunReport {
+        current_unit: None,
         schema_version: 3,
         current: String::new(),
         created_at: String::new(),
@@ -2359,7 +2440,7 @@ fn inner_multinic_binding_keeps_host_interface_addresses_and_report_identity_tog
                     );
                 }
             }
-            let row = assemble_unit(&cfg, link, unit, &flight, vec![]);
+            let row = assemble_unit(&cfg, link, unit, vec![]);
             assert_eq!(row.host, host_id);
             assert_eq!(row.link, link.name);
             assert_eq!(row.ip_version, unit.ip_version);
@@ -2433,6 +2514,7 @@ fn an_upload_that_aborted_halfway_is_never_judged() {
             .legs
             .iter()
             .map(|leg| LegRaw {
+                diagnostics: Vec::new(),
                 plan: leg.clone(),
                 receiver: "test".into(),
                 receiver_host: "test".into(),
@@ -2460,17 +2542,7 @@ fn an_upload_that_aborted_halfway_is_never_judged() {
                     .into(),
             })
             .collect();
-        let row = assemble_unit(
-            &cfg,
-            &cfg.links[0],
-            unit,
-            &LinkPreflight {
-                board_iface: "br0".into(),
-                counter_source: Some(CounterSource::ProcNetDev),
-                addresses: TrafficAddresses::ipv4(&cfg.links[0]),
-            },
-            raw,
-        );
+        let row = assemble_unit(&cfg, &cfg.links[0], unit, raw);
         assert_eq!(
             row.verdict, "NOT_EVALUATED",
             "{strategy:?}: {} {}",
@@ -2604,6 +2676,7 @@ fn a_tool_strategy_bidir_unit_is_judged_on_the_receivers_per_second_rates() {
                 ..Default::default()
             },
             server_log: server,
+            diagnostics: Vec::new(),
         }
     };
     let assemble = |steady_mbps: f64| {
@@ -2611,17 +2684,7 @@ fn a_tool_strategy_bidir_unit_is_judged_on_the_receivers_per_second_rates() {
             leg_raw(&unit.legs[0], 3_000, steady_mbps),
             leg_raw(&unit.legs[1], 4_000, steady_mbps),
         ];
-        assemble_unit(
-            &cfg,
-            &cfg.links[0],
-            unit,
-            &LinkPreflight {
-                board_iface: "br0".into(),
-                counter_source: Some(CounterSource::ProcNetDev),
-                addresses: TrafficAddresses::ipv4(&cfg.links[0]),
-            },
-            raw,
-        )
+        assemble_unit(&cfg, &cfg.links[0], unit, raw)
     };
 
     let row = assemble(900.0);
@@ -2636,6 +2699,138 @@ fn a_tool_strategy_bidir_unit_is_judged_on_the_receivers_per_second_rates() {
     // 同一形状、稳态不够：照常判 RATE_FAIL，而不是无法评价。
     let row = assemble(700.0);
     assert_eq!(row.verdict, "RATE_FAIL", "{} {}", row.reason, row.detail);
+}
+
+/// 2026-10-14 Windows 实机内环：板侧统计口手选成 eth1，网卡 RX 0.030 Mbps，同期
+/// 板侧 server 逐秒收到约 650 Mbps，判成了 MEASURED。配了门限的严格口径必须
+/// 判「无法评价」而不是 RATE_FAIL；网卡优先口径据此兜底到工具口径。网卡口径
+/// 的原始数字照样留着，不被兜底改写。
+#[test]
+fn a_board_counter_off_the_traffic_path_is_not_judged_on_its_near_zero_rate() {
+    use crate::protocol::{IperfEventKind, MonitorSample};
+    let leg_raw = |leg: &LegPlan, run_secs: u64, server_mbps: f64, nic_mbps: f64| {
+        let start = 3_000;
+        let mut events = vec![IperfFlowEvent {
+            kind: IperfEventKind::Started,
+            elapsed_ms: start,
+            ..Default::default()
+        }];
+        let mut lines = String::new();
+        for second in 0..run_secs {
+            let line = format!(
+                "[  5] {second}.00-{}.00  sec  78 MBytes  {server_mbps} Mbits/sec",
+                second + 1
+            );
+            lines.push_str(&line);
+            lines.push('\n');
+            events.push(IperfFlowEvent {
+                kind: IperfEventKind::Traffic,
+                elapsed_ms: start + 5 + (second + 1) * 1_000,
+                mbps: Some(server_mbps),
+                line,
+            });
+        }
+        events.push(IperfFlowEvent {
+            kind: IperfEventKind::Ended,
+            elapsed_ms: start + run_secs * 1_000 + 300,
+            ..Default::default()
+        });
+        LegRaw {
+            plan: leg.clone(),
+            receiver: if leg.flow == Flow::Up {
+                "eth1"
+            } else {
+                "以太网"
+            }
+            .into(),
+            receiver_host: if leg.flow == Flow::Up {
+                "板侧"
+            } else {
+                "master"
+            }
+            .into(),
+            counter_source: (leg.flow == Flow::Up).then_some(CounterSource::ProcNetDev),
+            client: IperfClientOut {
+                ok: true,
+                output: lines.clone(),
+                ..Default::default()
+            },
+            events,
+            samples: MonitorStopOut {
+                samples: (1..=run_secs)
+                    .map(|second| MonitorSample {
+                        elapsed_ms: start + second * 1_000,
+                        interval_ms: 1_000,
+                        rx_mbps: nic_mbps,
+                        // 计数器一直在走（零星背景流量），停滞那道门拦不住。
+                        rx_delta_bytes: (nic_mbps * 125_000.0) as u64,
+                        valid: true,
+                        ..Default::default()
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+            server_log: format!("Accepted connection from 192.168.8.103\n{lines}"),
+            diagnostics: Vec::new(),
+        }
+    };
+    for strategy in [Measurement::NicStrict, Measurement::NicPreferred] {
+        let mut cfg = example();
+        cfg.links.truncate(1);
+        cfg.protocols = vec![Protocol::Tcp];
+        cfg.tcp_streams = Some(1);
+        cfg.duration_secs = 20;
+        cfg.directions = vec![Direction::Bidir];
+        cfg.links[0].measurement = strategy;
+        cfg.links[0].upload_min_mbps = Some(500.0);
+        cfg.links[0].download_min_mbps = Some(500.0);
+        if strategy != Measurement::NicStrict {
+            cfg.links[0].tool_upload_min_mbps = Some(500.0);
+            cfg.links[0].tool_download_min_mbps = Some(500.0);
+        }
+        let plan = plan::build(&cfg).unwrap();
+        let unit = &plan.units[0];
+        let run_secs = plan::client_secs(&cfg, unit);
+        let raw = unit
+            .legs
+            .iter()
+            .map(|leg| match leg.flow {
+                Flow::Up => leg_raw(leg, run_secs, 653.7, 0.03),
+                Flow::Down => leg_raw(leg, run_secs, 613.5, 635.7),
+            })
+            .collect();
+        let row = assemble_unit(&cfg, &cfg.links[0], unit, raw);
+        let up = row.legs.iter().find(|leg| leg.flow == Flow::Up).unwrap();
+        assert_eq!(
+            (up.nic_verdict.as_str(), up.nic_reason.as_str()),
+            ("NOT_EVALUATED", "COUNTER_OFF_PATH"),
+            "{strategy:?}: {}",
+            up.detail
+        );
+        assert!(
+            (up.nic_rx_mbps.unwrap() - 0.03).abs() < 1e-6,
+            "网卡口径原样保留"
+        );
+        match strategy {
+            Measurement::NicStrict => {
+                assert_eq!(up.verdict, "NOT_EVALUATED");
+                assert_eq!(
+                    row.verdict, "NOT_EVALUATED",
+                    "{} {}",
+                    row.reason, row.detail
+                );
+            }
+            _ => {
+                assert_eq!(up.source, Source::Tool);
+                assert_eq!(up.verdict, "PASS", "{}", up.detail);
+                assert!(up
+                    .fallback_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.starts_with("COUNTER_OFF_PATH")));
+                assert_eq!(row.verdict, "PASS", "{} {}", row.reason, row.detail);
+            }
+        }
+    }
 }
 
 #[test]
@@ -2659,6 +2854,7 @@ fn parameter_axes_expand_commands_targets_and_resume_identities_together() {
         ..Default::default()
     });
     cfg.parameter_options = config::ParameterOptions {
+        udp_windows: Vec::new(),
         tcp_streams: vec![1, 4],
         tcp_windows: vec!["64k".into(), "4m".into()],
         udp_streams: vec![1, 2],
@@ -2763,7 +2959,7 @@ fn invalid_axes_and_threshold_overrides_are_rejected_before_execution() {
     let mut cfg = example();
     cfg.parameter_options.tcp_streams = vec![1, 1];
     assert!(plan::build(&cfg).is_err());
-    cfg.parameter_options.tcp_streams = vec![17];
+    cfg.parameter_options.tcp_streams = vec![33];
     assert!(plan::build(&cfg).is_err());
     cfg.parameter_options.tcp_streams = vec![1];
     cfg.parameter_options.tcp_windows = vec!["4m;reboot".into()];
@@ -2899,6 +3095,7 @@ fn readable_report_fixture() -> RunReport {
     resumed.reason = "RESUME_SKIP".into();
     resumed.legs.clear();
     RunReport {
+        current_unit: None,
         schema_version: 3,
         current: String::new(),
         created_at: "布局预览 · 示例数据，非真实测试结果".into(),
@@ -3021,4 +3218,336 @@ fn screenshot_option_defaults_matches_subnet_and_does_not_change_resume_identity
             .unwrap()
             .screenshot
     );
+}
+
+fn suite_workspace(cfg: &InnerConfig) -> workspace::Workspace {
+    use workspace::*;
+    Workspace {
+        groups: vec![LinkGroup {
+            all_links: false,
+            id: "ports".into(),
+            name: "测试口".into(),
+            links: cfg.links.iter().map(|l| l.name.clone()).collect(),
+        }],
+        recipes: vec![Recipe {
+            id: "tcp".into(),
+            name: "TCP单流".into(),
+            protocol: Protocol::Tcp,
+            parameters: config::ParameterOptions {
+                tcp_streams: vec![1],
+                ..Default::default()
+            },
+        }],
+        suites: vec![Suite {
+            id: "suite".into(),
+            name: "基线".into(),
+            tasks: vec![Task {
+                repeats: None,
+                id: "tcp-task".into(),
+                name: "TCP".into(),
+                protocol: Protocol::Tcp,
+                recipe: Some("tcp".into()),
+                ip_versions: vec![4],
+                directions: vec![Direction::Upload, Direction::Download],
+                duration_secs: Some(30),
+                thresholds: None,
+                ping_options: None,
+                max_udp_loss_pct: None,
+            }],
+        }],
+        bindings: vec![Binding {
+            group: "ports".into(),
+            suite: "suite".into(),
+            links: vec![cfg.links[0].name.clone()],
+        }],
+    }
+}
+#[test]
+fn inner_workspace_runs_only_assigned_hosts_and_repeats_the_whole_plan() {
+    let mut cfg = example();
+    cfg.workspace = Some(suite_workspace(&cfg));
+    cfg.rounds = 2;
+    // 未分配辅测机链路缺少 IPv6 也不得阻断 IPv4 本机任务。
+    cfg.ip_versions = vec![4, 6];
+    cfg.links[1].local_ipv6 = None;
+    cfg.links[1].gateway_ipv6 = None;
+    let plan = plan::build(&cfg).unwrap();
+    assert_eq!(plan.units.len(), 4);
+    assert!(plan.uses_master);
+    assert!(plan.agents.is_empty());
+    assert!(plan.units.iter().all(|u| u.host == "master"));
+    assert_eq!(
+        plan.units
+            .iter()
+            .map(|u| (u.round, u.direction))
+            .collect::<Vec<_>>(),
+        vec![
+            (1, Direction::Upload),
+            (1, Direction::Download),
+            (2, Direction::Upload),
+            (2, Direction::Download)
+        ]
+    );
+    assert_eq!(
+        plan.units[0]
+            .execution_config
+            .as_ref()
+            .unwrap()
+            .duration_secs,
+        30
+    );
+    assert_ne!(plan.units[0].id, plan.units[2].id);
+    assert!(plan
+        .units
+        .iter()
+        .all(|u| u.origin.as_ref().unwrap().task == "TCP"));
+    assert_eq!(plan::preview(&cfg).unwrap().rows.len(), plan.units.len());
+}
+#[test]
+fn inner_workspace_explicit_selection_and_whole_group_have_distinct_growth_semantics() {
+    let mut cfg = example();
+    cfg.workspace = Some(suite_workspace(&cfg));
+    assert_eq!(plan::build(&cfg).unwrap().links, vec![0]);
+    cfg.workspace.as_mut().unwrap().bindings[0].links.clear();
+    assert_eq!(plan::build(&cfg).unwrap().links, vec![0, 1]);
+    assert_eq!(plan::build(&cfg).unwrap().agents, vec!["agent1"]);
+    cfg.links[1].enabled = false;
+    assert!(plan::build(&cfg).unwrap().agents.is_empty());
+}
+#[test]
+fn inner_workspace_rejects_wrong_references_and_unknown_fields_before_execution() {
+    let mut cfg = example();
+    cfg.workspace = Some(suite_workspace(&cfg));
+    cfg.workspace.as_mut().unwrap().bindings[0].links = vec!["不存在的口".into()];
+    assert!(plan::build(&cfg).unwrap_err().contains("对应集合"));
+    cfg.workspace.as_mut().unwrap().bindings[0].links = vec![cfg.links[0].name.clone()];
+    cfg.workspace.as_mut().unwrap().suites[0].tasks[0].recipe = Some("不存在的配置".into());
+    assert!(plan::build(&cfg).unwrap_err().contains("协议不匹配"));
+    let mut value = serde_json::to_value(&cfg).unwrap();
+    value["workspace"]["typo"] = true.into();
+    assert!(config::parse_config(&value.to_string()).is_err());
+}
+#[test]
+fn inner_ping_payloads_are_independent_units_with_distinct_resume_identities() {
+    let mut cfg = example();
+    cfg.links.truncate(1);
+    cfg.protocols = vec![Protocol::Ping];
+    cfg.tcp_window = None;
+    cfg.ping_options = config::PingOptions {
+        count: 10,
+        payloads: vec![32, 1600],
+    };
+    let plan = plan::build(&cfg).unwrap();
+    assert_eq!(plan.units.len(), 4);
+    assert_eq!(
+        plan.units
+            .iter()
+            .map(|u| &u.id)
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        4
+    );
+    assert_eq!(plan.units[0].parameters.streams, 10);
+    assert_eq!(plan.units[2].parameters.udp_length.as_deref(), Some("1600"));
+}
+#[test]
+fn inner_report_preserves_receiver_rx_curves_without_a_reading_manual() {
+    let report = readable_report_fixture();
+    let html = report::render(&report);
+    assert!(!html.contains("如何读这份报告"));
+    assert!(html.contains("RX") && html.contains("<svg"));
+    let bytes = xlsx::bytes(&report).unwrap();
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+    let mut shared = String::new();
+    use std::io::Read;
+    archive
+        .by_name("xl/sharedStrings.xml")
+        .unwrap()
+        .read_to_string(&mut shared)
+        .unwrap();
+    assert!(shared.contains("网卡RX Mbps"));
+    assert!(shared.contains("工具RX Mbps"));
+}
+
+#[test]
+fn task_thresholds_override_only_assigned_links_and_keep_protocol_fallbacks() {
+    let mut cfg = example();
+    cfg.links[0].measurement = Measurement::NicPreferred;
+    cfg.links[0].tcp_thresholds = Some(config::Thresholds {
+        upload_min_mbps: Some(700.0),
+        download_min_mbps: Some(600.0),
+        ..Default::default()
+    });
+    cfg.links[1].measurement = Measurement::NicStrict;
+    cfg.links[1].tool_upload_min_mbps = None;
+    cfg.links[1].tool_download_min_mbps = None;
+    cfg.links[1].tool_bidir_total_min_mbps = None;
+    cfg.workspace = Some(suite_workspace(&cfg));
+    cfg.workspace.as_mut().unwrap().suites[0].tasks[0].thresholds = Some(config::Thresholds {
+        upload_min_mbps: Some(800.0),
+        tool_upload_min_mbps: Some(750.0),
+        ..Default::default()
+    });
+    let built = plan::build(&cfg).unwrap();
+    assert!(built.agents.is_empty());
+    assert_eq!(built.units[0].legs[0].nic_target_mbps, Some(800.0));
+    assert_eq!(built.units[0].legs[0].tool_target_mbps, Some(750.0));
+    assert_eq!(built.units[1].legs[0].nic_target_mbps, Some(600.0));
+}
+#[test]
+fn udp_window_axes_and_subnet_parameter_bounds_reach_actual_client_arguments() {
+    let mut cfg = example();
+    cfg.links.truncate(1);
+    cfg.protocols = vec![Protocol::Udp];
+    cfg.tcp_window = None;
+    cfg.udp_mbps = Some(100.0);
+    cfg.duration_secs = 86400;
+    cfg.udp_streams = Some(32);
+    cfg.parameter_options.udp_windows = vec!["64k".into(), "4m".into()];
+    let built = plan::build(&cfg).unwrap();
+    assert_eq!(built.units.len(), 4);
+    let effective = built.units[0].parameters.apply(&cfg, Protocol::Udp);
+    let request = client_request(&effective, &cfg.links[0], Protocol::Udp, Flow::Up, cfg.port);
+    assert!(request.extra.windows(2).any(|w| w == ["-w", "64k"]));
+    assert!(request.extra.windows(2).any(|w| w == ["-P", "32"]));
+    assert_ne!(built.units[0].id, built.units[2].id);
+}
+#[test]
+fn all_links_group_includes_new_ports_without_expanding_an_explicit_binding() {
+    let mut cfg = example();
+    cfg.links.truncate(1);
+    cfg.workspace = Some(suite_workspace(&cfg));
+    let workspace = cfg.workspace.as_mut().unwrap();
+    workspace.groups[0].all_links = true;
+    workspace.bindings[0].links.clear();
+    let mut added = cfg.links[0].clone();
+    added.name = "新增口".into();
+    added.local_interface = "新增口".into();
+    added.local_ip = "192.168.8.103".parse().unwrap();
+    cfg.links.push(added);
+    assert_eq!(plan::build(&cfg).unwrap().links, vec![0, 1]);
+    cfg.workspace.as_mut().unwrap().bindings[0].links = vec![cfg.links[0].name.clone()];
+    assert_eq!(plan::build(&cfg).unwrap().links, vec![0]);
+}
+
+#[test]
+fn inner_start_with_a_stale_review_is_rejected_before_device_access() {
+    let cfg = example();
+    let body = serde_json::json!({ "config": cfg, "start_token": "0123456789abcdef0123456789abcdef", "plan_hash": "stale" });
+    let controller = webui::Controller::default();
+    assert!(controller
+        .start(&body.to_string())
+        .unwrap_err()
+        .contains("计划已过期"));
+    assert!(!controller.is_running());
+}
+
+#[test]
+fn a_requested_skip_never_hides_an_unconfirmed_cleanup_or_execution_failure() {
+    let cfg = example();
+    let built = plan::build(&cfg).unwrap();
+    let unit = &built.units[0];
+    for error in ["本机子进程未结束", "辅测机停止响应丢失", "板侧异常"] {
+        assert_eq!(
+            completed_or_skipped(unit, Err(error.into()), true)
+                .err()
+                .unwrap(),
+            error
+        );
+    }
+    let row = completed_or_skipped(unit, Err("用户已取消".into()), true).unwrap();
+    assert_eq!(row.verdict, "SKIP");
+    assert!(!row.resumed);
+    assert_eq!(row.reason, "USER_SKIP");
+    assert!(completed_or_skipped(unit, Err("用户已取消".into()), false).is_err());
+}
+
+#[test]
+fn run_overrides_replace_parameter_axes_without_mutating_shared_recipes() {
+    let mut cfg = example();
+    cfg.links.truncate(1);
+    cfg.workspace = Some(suite_workspace(&cfg));
+    cfg.workspace.as_mut().unwrap().recipes[0]
+        .parameters
+        .tcp_windows = vec!["64k".into(), "4m".into()];
+    cfg.run_overrides.tcp_window = Some("8m".into());
+    let built = plan::build(&cfg).unwrap();
+    assert!(built
+        .units
+        .iter()
+        .all(|u| u.parameters.tcp_window.as_deref() == Some("8m")));
+    assert_eq!(
+        cfg.workspace.as_ref().unwrap().recipes[0]
+            .parameters
+            .tcp_windows
+            .len(),
+        2
+    );
+    cfg.run_overrides.tcp_window = None;
+    let original = plan::build(&cfg).unwrap();
+    assert_eq!(original.units.len(), built.units.len() * 2);
+    assert_ne!(original.units[0].id, built.units[0].id);
+}
+
+#[test]
+fn custom_ping_policy_is_validated_and_has_its_own_resume_identity() {
+    let mut cfg = example();
+    cfg.links.truncate(1);
+    cfg.protocols = vec![Protocol::Ping];
+    cfg.parameter_options = config::ParameterOptions::default();
+    let original = plan::build(&cfg).unwrap();
+    let policy = options::PingPolicy {
+        wired_small_avg_rtt_ms: 0.5,
+        wired_small_max_rtt_ms: 1.0,
+        ..Default::default()
+    };
+    cfg.ping_policy = Some(policy);
+    let changed = plan::build(&cfg).unwrap();
+    assert_ne!(original.units[0].id, changed.units[0].id);
+    let policy = cfg.ping_policy.as_ref().unwrap().to_config();
+    assert_eq!(policy.wired_small_avg_rtt_ms, 0.5);
+    assert_eq!(policy.max_rtt_ms, 1.0);
+    cfg.ping_policy.as_mut().unwrap().wired_small_avg_rtt_ms = 2.0;
+    assert!(cfg.validate().is_err());
+    assert!(config::parse_config(r#"{"ping_policy":{"unexpected":1}}"#).is_err());
+}
+
+#[test]
+fn inner_udp_clipping_uses_shared_subnet_limits_and_keeps_distinct_requested_profiles() {
+    let mut cfg = example();
+    cfg.links.truncate(1);
+    cfg.protocols = vec![Protocol::Udp];
+    cfg.parameter_options = config::ParameterOptions {
+        udp_rates_mbps: vec![2500.0, 3000.0],
+        udp_streams: vec![4],
+        ..Default::default()
+    };
+    cfg.links[0].pc_capacity = Some(options::PcCapacity {
+        role: "SGMII1G".into(),
+        speed_mbps: 1000,
+    });
+    let original = plan::build(&cfg).unwrap();
+    assert_eq!(original.units[0].parameters.streams, 4);
+    cfg.run_overrides.limit_udp_by_link_speed = true;
+    let clipped = plan::build(&cfg).unwrap();
+    assert_eq!(clipped.units.len(), original.units.len());
+    assert_eq!(clipped.units[0].parameters.streams, 1);
+    assert_eq!(clipped.units[0].parameters.udp_mbps, Some(1000.0));
+    assert_eq!(
+        clipped.units[0]
+            .requested_parameters
+            .as_ref()
+            .unwrap()
+            .udp_mbps,
+        Some(2500.0)
+    );
+    let ids: std::collections::HashSet<_> = clipped.units.iter().map(|u| &u.id).collect();
+    assert_eq!(ids.len(), clipped.units.len());
+    assert!(plan::preview(&cfg).unwrap().rows[0]
+        .parameter_label
+        .contains("请求"));
+    cfg.links[0].pc_capacity = None;
+    let unknown = plan::build(&cfg).unwrap();
+    assert_eq!(unknown.units[0].parameters.udp_mbps, Some(2500.0));
+    assert_eq!(unknown.units[0].parameters.streams, 4);
 }

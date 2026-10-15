@@ -160,6 +160,10 @@ pub(super) fn cts_tool_trace(
                 )
             })
             .collect(),
+        // 不带速率：ctsTraffic 状态行两侧共用一列 Bits/Sec，哪一侧代表接收要按
+        // 协议和角色分（`cmd::ctstraffic::rates_by_side`），这里只有一侧的事件。
+        // 「计数器在不在路径上」先只认 iperf3 server 的逐秒接收记录。
+        rates: Vec::new(),
     };
     if udp {
         ToolTrace {

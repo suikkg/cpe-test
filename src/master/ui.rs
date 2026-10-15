@@ -448,98 +448,118 @@ pub fn run_master(opts: MasterOpts) -> i32 {
         logln("未找到 config.json，使用默认配置（可交互输入）");
     }
 
-    // ---- 确定辅测机地址 ----
-    let mut agent_host = cfg.agent_host.trim().to_string();
-    if agent_host.is_empty() {
-        if let Some(last) = last_agent_host() {
-            let inp = ask(&format!("请输入辅测机 IP (回车={last}): "));
-            agent_host = if inp.is_empty() { last } else { inp };
-        }
-        while agent_host.is_empty() {
-            agent_host = ask("请输入辅测机 IP (辅测机 agent 窗口里显示的地址): ");
-            if agent_host.is_empty() && opts.auto {
-                logln("!! --auto 模式必须提供 agent_host（配置文件或 --agent-host）");
-                return 2;
+    let local_only = crate::config::local_only_tests(&cfg);
+    let (agent_host, health, master_info, agent_info) = if local_only {
+        logln("本轮仅使用主控网口，无需连接辅测机。");
+        let master = scan_host(&cfg.ipv4_prefixes);
+        let health = HealthOut {
+            os: master.os.clone(),
+            hostname: master.hostname.clone(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            iperf3: iperf3_version(),
+            ctstraffic: ctstraffic_version(),
+            capabilities: vec![
+                crate::protocol::RELIABLE_LIFECYCLE_CAPABILITY.into(),
+                crate::protocol::CTS_TRAFFIC_CAPABILITY.into(),
+            ],
+        };
+        (String::new(), health, master, HostInfo::default())
+    } else {
+        // ---- 确定辅测机地址 ----
+        let mut agent_host = cfg.agent_host.trim().to_string();
+        if agent_host.is_empty() {
+            if let Some(last) = last_agent_host() {
+                let inp = ask(&format!("请输入辅测机 IP (回车={last}): "));
+                agent_host = if inp.is_empty() { last } else { inp };
+            }
+            while agent_host.is_empty() {
+                agent_host = ask("请输入辅测机 IP (辅测机 agent 窗口里显示的地址): ");
+                if agent_host.is_empty() && opts.auto {
+                    logln("!! --auto 模式必须提供 agent_host（配置文件或 --agent-host）");
+                    return 2;
+                }
             }
         }
-    }
-    // ---- 连接辅测机 ----
-    let health = loop {
+        // ---- 连接辅测机 ----
+        let health = loop {
+            logln(&format!(
+                "正在连接辅测机 {}:{} ...",
+                agent_host, cfg.agent_port
+            ));
+            match agent_health(&agent_host, cfg.agent_port, &cfg.agent_token) {
+                Ok(h) => break h,
+                Err(e) => {
+                    logln(&format!("!! 连接失败: {e}"));
+                    logln("!! 请检查: 1) 辅测机是否已双击运行 start_agent.bat  2) IP 是否输对  3) 防火墙是否放行");
+                    if opts.auto {
+                        return 2;
+                    }
+                    let r = ask("回车重试，输入 n 退出: ");
+                    if r.eq_ignore_ascii_case("n") {
+                        return 2;
+                    }
+                }
+            }
+        };
+        // 只记住真正连通的地址。把输入值提前写入会让一次输错/连不上污染下次
+        // 回车默认值，也违背 LAST_AGENT_FILE「上一次实际连上的地址」的约定。
+        let _ = std::fs::write(LAST_AGENT_FILE, &agent_host);
         logln(&format!(
-            "正在连接辅测机 {}:{} ...",
-            agent_host, cfg.agent_port
+            "辅测机已连接: {} ({}) agent v{} iperf3: {} ctsTraffic: {}",
+            health.hostname,
+            health.os,
+            health.version,
+            health.iperf3.clone().unwrap_or_else(|| "未找到!".into()),
+            health
+                .ctstraffic
+                .clone()
+                .unwrap_or_else(|| "未找到/不支持".into())
         ));
-        match agent_health(&agent_host, cfg.agent_port, &cfg.agent_token) {
-            Ok(h) => break h,
-            Err(e) => {
-                logln(&format!("!! 连接失败: {e}"));
-                logln("!! 请检查: 1) 辅测机是否已双击运行 start_agent.bat  2) IP 是否输对  3) 防火墙是否放行");
-                if opts.auto {
-                    return 2;
-                }
-                let r = ask("回车重试，输入 n 退出: ");
-                if r.eq_ignore_ascii_case("n") {
-                    return 2;
-                }
+        logln(&format!(
+            "辅测机协议能力: {}",
+            if health.capabilities.is_empty() {
+                "未声明（旧版 agent）".into()
+            } else {
+                health.capabilities.join(", ")
             }
-        }
-    };
-    // 只记住真正连通的地址。把输入值提前写入会让一次输错/连不上污染下次
-    // 回车默认值，也违背 LAST_AGENT_FILE「上一次实际连上的地址」的约定。
-    let _ = std::fs::write(LAST_AGENT_FILE, &agent_host);
-    logln(&format!(
-        "辅测机已连接: {} ({}) agent v{} iperf3: {} ctsTraffic: {}",
-        health.hostname,
-        health.os,
-        health.version,
-        health.iperf3.clone().unwrap_or_else(|| "未找到!".into()),
-        health
-            .ctstraffic
-            .clone()
-            .unwrap_or_else(|| "未找到/不支持".into())
-    ));
-    logln(&format!(
-        "辅测机协议能力: {}",
-        if health.capabilities.is_empty() {
-            "未声明（旧版 agent）".into()
-        } else {
-            health.capabilities.join(", ")
-        }
-    ));
+        ));
 
-    if let Err(error) =
-        InfoReq::for_scan(&cfg.ipv4_prefixes).check_capabilities(&health.capabilities)
-    {
-        logln(&format!("!! {error}"));
-        return 2;
-    }
-    // ---- 双端扫描 ----
-    logln("正在扫描本机网卡...");
-    let master_info = scan_host(&cfg.ipv4_prefixes);
-    logln("正在获取辅测机网卡...");
-    let agent_info = match agent_info(
-        &agent_host,
-        cfg.agent_port,
-        &cfg.ipv4_prefixes,
-        &cfg.agent_token,
-    ) {
-        Ok(i) => i,
-        Err(e) => {
-            logln(&format!("!! 获取辅测机网卡失败: {e}"));
+        if let Err(error) =
+            InfoReq::for_scan(&cfg.ipv4_prefixes).check_capabilities(&health.capabilities)
+        {
+            logln(&format!("!! {error}"));
             return 2;
         }
-    };
-    logln("");
-    logln(&format_nic_table("【主控】", &master_info));
-    logln(&format_nic_table("【辅测】", &agent_info));
+        // ---- 双端扫描 ----
+        logln("正在扫描本机网卡...");
+        let master_info = scan_host(&cfg.ipv4_prefixes);
+        logln("正在获取辅测机网卡...");
+        let agent_info = match agent_info(
+            &agent_host,
+            cfg.agent_port,
+            &cfg.ipv4_prefixes,
+            &cfg.agent_token,
+        ) {
+            Ok(i) => i,
+            Err(e) => {
+                logln(&format!("!! 获取辅测机网卡失败: {e}"));
+                return 2;
+            }
+        };
+        logln("");
+        logln(&format_nic_table("【主控】", &master_info));
+        logln(&format_nic_table("【辅测】", &agent_info));
 
-    if master_info.interfaces.is_empty() || agent_info.interfaces.is_empty() {
-        logln(&format!(
+        if master_info.interfaces.is_empty() || agent_info.interfaces.is_empty() {
+            logln(&format!(
             "!! 有一端没有发现符合前缀 {:?} 的网卡。请检查网线/WiFi，或修改 config.json 里的 ipv4_prefixes。",
             cfg.ipv4_prefixes
         ));
-        return 2;
-    }
+            return 2;
+        }
+
+        (agent_host, health, master_info, agent_info)
+    };
 
     // ---- iperf3 预检 ----
     let local_iperf = find_iperf3();
@@ -551,7 +571,7 @@ pub fn run_master(opts: MasterOpts) -> i32 {
         )),
         None => logln("!! 主控未找到 iperf3：ping 可测，灌包会失败。请把 iperf3 放到程序同目录。"),
     }
-    if health.iperf3.is_none() {
+    if !local_only && health.iperf3.is_none() {
         logln("!! 辅测机未找到 iperf3：ping 可测，灌包会失败。");
     }
     let local_cts_platform_supported = ctstraffic_platform_supported();
@@ -943,6 +963,19 @@ fn unit_has_ctstraffic(unit: &Unit) -> bool {
         .any(|leg| matches!(&leg.kind, LegKind::CtsTraffic(_)))
 }
 
+fn backend_uses_side(units: &[Unit], side: Side, cts: bool) -> bool {
+    units.iter().any(|unit| {
+        unit.legs.iter().any(|leg| match &leg.kind {
+            LegKind::IperfSingle(t) if !cts => t.src.side == side || t.dst.side == side,
+            LegKind::IperfGroup { streams, .. } if !cts => streams
+                .iter()
+                .any(|t| t.src.side == side || t.dst.side == side),
+            LegKind::CtsTraffic(t) if cts => t.src.side == side || t.dst.side == side,
+            _ => false,
+        })
+    })
+}
+
 fn units_have_iperf(units: &[Unit]) -> bool {
     units.iter().any(unit_has_iperf)
 }
@@ -957,7 +990,7 @@ fn iperf_preflight_block(
     }
 
     let mut reasons = Vec::new();
-    if !agent_supports_reliable_lifecycle(health) {
+    if backend_uses_side(units, Side::Agent, false) && !agent_supports_reliable_lifecycle(health) {
         let version = if health.version.trim().is_empty() {
             "未知版本"
         } else {
@@ -967,10 +1000,10 @@ fn iperf_preflight_block(
             "辅测机 agent {version} 缺少可靠灌包生命周期能力 {RELIABLE_LIFECYCLE_CAPABILITY}，请替换为与主控配套的新版 agent"
         ));
     }
-    if !local_iperf_available {
+    if backend_uses_side(units, Side::Master, false) && !local_iperf_available {
         reasons.push("主控机未找到 iperf3，请安装或将 iperf3 放到主控程序同目录".into());
     }
-    if health.iperf3.is_none() {
+    if backend_uses_side(units, Side::Agent, false) && health.iperf3.is_none() {
         reasons
             .push("辅测机未找到 iperf3，请安装或将 iperf3.exe 及配套 DLL 放到 agent 同目录".into());
     }
@@ -1005,13 +1038,13 @@ fn ctstraffic_preflight_block(
         return None;
     }
     let mut reasons = Vec::new();
-    if !local_platform_supported {
+    if backend_uses_side(units, Side::Master, true) && !local_platform_supported {
         reasons.push(
             "主控平台不是 Windows 10+ 或系统版本无法确认；ctsTraffic 不支持旧版 Windows/macOS/Linux"
                 .into(),
         );
     }
-    if !health.os.eq_ignore_ascii_case("windows") {
+    if backend_uses_side(units, Side::Agent, true) && !health.os.eq_ignore_ascii_case("windows") {
         reasons.push(format!(
             "辅测机平台为 {}；ctsTraffic 仅支持 Windows 10+",
             if health.os.trim().is_empty() {
@@ -1021,15 +1054,21 @@ fn ctstraffic_preflight_block(
             }
         ));
     }
-    if !agent_supports_ctstraffic(health) {
+    if backend_uses_side(units, Side::Agent, true) && !agent_supports_ctstraffic(health) {
         reasons.push(format!(
             "辅测机 agent 未声明 CTS 生命周期能力 {CTS_TRAFFIC_CAPABILITY}；请确认辅测机为 Windows 10+，并将两端同时升级"
         ));
     }
-    if local_platform_supported && !local_cts_available {
+    if backend_uses_side(units, Side::Master, true)
+        && local_platform_supported
+        && !local_cts_available
+    {
         reasons.push("主控机未找到 ctsTraffic.exe，请放到 cpe_test.exe 同目录或 PATH".into());
     }
-    if agent_supports_ctstraffic(health) && health.ctstraffic.is_none() {
+    if backend_uses_side(units, Side::Agent, true)
+        && agent_supports_ctstraffic(health)
+        && health.ctstraffic.is_none()
+    {
         reasons.push("辅测机未找到 ctsTraffic.exe，请放到 agent 同目录或 PATH".into());
     }
     (!reasons.is_empty()).then(|| IperfPreflightBlock {
@@ -1090,12 +1129,16 @@ struct LiveTopology {
 
 impl crate::master::executor::TopologySource for LiveTopology {
     fn snapshot(&self) -> Result<(HostInfo, HostInfo), String> {
-        let agent = agent_info(
-            &self.agent_host,
-            self.agent_port,
-            &self.prefixes,
-            &self.token,
-        )?;
+        let agent = if self.agent_host.is_empty() {
+            HostInfo::default()
+        } else {
+            agent_info(
+                &self.agent_host,
+                self.agent_port,
+                &self.prefixes,
+                &self.token,
+            )?
+        };
         Ok((scan_host(&self.prefixes), agent))
     }
 }
@@ -1714,6 +1757,20 @@ mod tests {
 
     /// 确定的回归优先于「对比不完整」：只要基线里有一条无法唯一匹配的旧 PING，
     /// 真正的判定变坏也不能只拿到 2——CI 上那就分不出「设备退化」和「历史不全」。
+    #[test]
+    fn local_backends_only_require_the_actual_local_tools() {
+        let mut units = vec![iperf_unit(), ctstraffic_unit(), ping_unit()];
+        for unit in &mut units {
+            builder::for_each_endpoint_mut(unit, |ep| ep.side = Side::Master);
+        }
+        let health = HealthOut::default();
+        assert!(iperf_preflight_block(&units, &health, true).is_none());
+        assert!(ctstraffic_preflight_block(&units, &health, true, true).is_none());
+        let error = iperf_preflight_block(&units, &health, false).unwrap();
+        assert!(error.reason_detail.contains("主控"));
+        assert!(!error.reason_detail.contains("辅测"));
+    }
+
     #[test]
     fn a_regression_outranks_an_incomplete_comparison_in_the_exit_code() {
         assert_eq!(compare_exit_code(false, 0), 0);

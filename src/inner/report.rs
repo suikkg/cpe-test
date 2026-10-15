@@ -42,7 +42,7 @@ pub(super) fn render(report: &RunReport) -> String {
     }
     html.push_str("</header><nav aria-label=\"报告目录\"><a href=\"#overview\">测试概览</a><a href=\"#results\">结果清单</a><a href=\"#details\">单元明细</a><a href=\"#environment\">设备与配置</a></nav>");
     render_overview(&mut html, report);
-    html.push_str("<section id=\"results\"><h2>结果清单</h2><p class=\"muted\">每行一个单元。点击序号查看详情。</p>");
+    html.push_str("<section id=\"results\"><h2>结果清单</h2>");
     if report.units.is_empty() {
         html.push_str(if report.probe_only {
             "<p class=\"notice\">本次只检查设备能力，没有产生吞吐测试结果。</p>"
@@ -76,12 +76,22 @@ pub(super) fn render(report: &RunReport) -> String {
     }
     html.push_str("</section><section id=\"details\"><h2>单元明细</h2><p class=\"muted\">UDP 丢包、发送速率和曲线仅作诊断。</p>");
     for unit in &report.units {
+        if let Some(origin) = &unit.origin {
+            let _ = write!(
+                html,
+                "<p>第 {} 遍 · {} / {} / {}</p>",
+                unit.round,
+                escape(&origin.group),
+                escape(&origin.suite),
+                escape(&origin.task)
+            );
+        }
         let _ = write!(html, "<article id=\"unit-{}\" class=\"unit\"><h3>#{unit_index} {} · {} / IPv{} · {} · 第 {} 轮 {}</h3><p class=\"parameters\">{}</p><div class=\"acceptance\">{}</div><p>{}</p>", unit.index, escape(&unit.link), unit.protocol.label(), unit.ip_version, unit.direction.label(), unit.repeat, unit_badge(unit), escape(&parameter_label(unit)), acceptance_summary(report, unit), escape(&unit_explanation(unit)), unit_index=unit.index);
         let _ = write!(
             html,
             "<p class=\"muted\">测量策略：{}。{}</p>",
             unit.measurement.label(),
-            if unit.direction.is_bidir() {
+            if unit.direction.is_bidir() && unit.protocol != super::config::Protocol::Ping {
                 unit.overlap_secs
                     .map(|v| format!("共同有效重叠 {v:.2}s。"))
                     .unwrap_or_else(|| {
@@ -95,8 +105,8 @@ pub(super) fn render(report: &RunReport) -> String {
                 String::new()
             }
         );
-        if !unit.resumed && unit.legs.is_empty() {
-            html.push_str("<p class=\"notice\">无测量结果，请检查起流和执行环境。</p>");
+        if !unit.resumed && unit.legs.is_empty() && unit.ping.is_empty() && unit.verdict != "SKIP" {
+            html.push_str("<p class=\"notice\">无测量结果。</p>");
         }
         let _ = write!(
             html,
@@ -165,27 +175,20 @@ fn unit_badge(unit: &UnitRow) -> String {
         badge(&unit.verdict)
     }
 }
-fn parameter_label(unit: &UnitRow) -> String {
-    match unit.protocol {
-        super::config::Protocol::Tcp => format!(
-            "{} 条并发流；TCP 窗口 {}（-P {} / -w {}）",
-            unit.parameters.streams,
-            unit.parameters.tcp_window.as_deref().unwrap_or("系统默认"),
-            unit.parameters.streams,
-            unit.parameters.tcp_window.as_deref().unwrap_or("默认")
+pub(super) fn parameter_label(unit: &UnitRow) -> String {
+    let actual = unit.parameters.label(unit.protocol);
+    match &unit.requested_parameters {
+        Some(requested) => format!(
+            "{actual}（请求 {}，按路径上限裁剪）",
+            requested.label(unit.protocol)
         ),
-        super::config::Protocol::Udp => format!(
-            "{} 条并发流；每流 {} Mbps；包长 {}（-P {} / -b {} Mbps / -l {}）",
-            unit.parameters.streams,
-            rate(unit.parameters.udp_mbps),
-            unit.parameters.udp_length.as_deref().unwrap_or("工具默认"),
-            unit.parameters.streams,
-            rate(unit.parameters.udp_mbps),
-            unit.parameters.udp_length.as_deref().unwrap_or("默认")
-        ),
+        None => actual,
     }
 }
 fn unit_explanation(unit: &UnitRow) -> String {
+    if unit.protocol == super::config::Protocol::Ping || unit.reason == "USER_SKIP" {
+        return unit.detail.clone();
+    }
     if unit.resumed {
         return "复用 24 小时内的 PASS，本轮未重新测试。".into();
     }
@@ -195,7 +198,7 @@ fn unit_explanation(unit: &UnitRow) -> String {
         "MEASURED" => "未设门限，仅记录速率。",
         "NOT_EVALUATED" => "无有效验收结果。",
         "SETUP_ERROR" => "起流或执行环境失败。",
-        _ => "请查看本单元记录的判定原因。",
+        _ => "无有效验收结论。",
     };
     if unit.detail.is_empty() {
         prefix.into()
@@ -205,6 +208,9 @@ fn unit_explanation(unit: &UnitRow) -> String {
 }
 /// 只解释已记录的判定；配置仅用来说明双向缺少有效合计时的验收方式。
 fn uses_total(report: &RunReport, unit: &UnitRow) -> bool {
+    if unit.protocol == super::config::Protocol::Ping {
+        return false;
+    }
     unit.direction.is_bidir()
         && (unit.total_target_mbps.is_some()
             || unit.bidir_targets.is_some()
@@ -247,6 +253,14 @@ fn total_target_description(report: &RunReport, unit: &UnitRow) -> String {
     "未能应用".into()
 }
 fn acceptance_summary(report: &RunReport, unit: &UnitRow) -> String {
+    if unit.protocol == super::config::Protocol::Ping {
+        let mut text = String::new();
+        for ping in &unit.ping {
+            let out = &ping.result;
+            let _ = write!(text, "<p>{}：丢包 {:.3}%；平均 RTT {} ms；最大 RTT {} ms</p><details><summary>Ping 原始输出</summary><pre>{}</pre></details>", ping.flow.label(), out.loss_pct, rate(out.rtt_avg), rate(out.rtt_max), escape(&out.raw));
+        }
+        return text;
+    }
     if unit.resumed {
         return "<p class=\"muted\">本轮未重新测试</p>".into();
     }
@@ -299,9 +313,9 @@ fn render_overview(html: &mut String, report: &RunReport) {
     }
     html.push_str("</dl>");
     if pass + fail > 0 {
-        let _ = write!(html, "<p>本轮吞吐验收通过率 <strong>{:.1}%</strong>（{pass} / {}）。只统计本轮 PASS 与 RATE_FAIL；仅测量、无法评价、执行失败和历史复用不计入。</p>", pass as f64 * 100.0 / (pass+fail) as f64, pass+fail);
+        let _ = write!(html, "<p>本轮验收通过率 <strong>{:.1}%</strong>（{pass} / {}）。只统计本轮 PASS 与 RATE_FAIL；仅测量、无法评价、执行失败和历史复用不计入。</p>", pass as f64 * 100.0 / (pass+fail) as f64, pass+fail);
     } else {
-        html.push_str("<p>本轮暂无吞吐验收结论。</p>");
+        html.push_str("<p>本轮暂无验收结论。</p>");
     }
     if let Some(plan) = &report.plan {
         let _ = write!(html, "<p class=\"muted\">计划 {} 条网口 / {} 个单元（双向 {} 个）/ {} 个传输方向；报告已记录 {} 个单元。</p>", plan.links, plan.units, plan.bidir_units, plan.legs, report.units.len());
@@ -313,7 +327,7 @@ fn render_overview(html: &mut String, report: &RunReport) {
             );
         }
     }
-    html.push_str("<details class=\"reading-guide\"><summary>如何读这份报告</summary><ul><li>按网口、协议和方向查看接收速率与门限。</li><li>上行采 CPE RX；下行采电脑网卡 RX。</li><li>网卡和工具门限独立。采样不可信时才可使用工具兜底。</li><li>未设门限：只测量；未获取：无测量值；无法评价：无有效验收结果。</li><li>双向按同来源 RX 合计判定；未设合计门限时按上下行分别判定。</li></ul></details></section>");
+    html.push_str("</section>");
 }
 fn diagnostics(html: &mut String, values: &[String]) {
     if values.is_empty() {
@@ -348,7 +362,7 @@ fn render_leg(html: &mut String, report: &RunReport, unit: &UnitRow, leg: &LegRo
     }
     html.push_str("<h4>两套测量口径</h4><div class=\"table-scroll\" tabindex=\"0\"><table><thead><tr><th scope=\"col\">口径</th><th scope=\"col\">接收速率 Mbps</th><th scope=\"col\">门限 / 判定</th><th scope=\"col\">来源说明</th></tr></thead><tbody>");
     let _ = write!(html, "<tr><th scope=\"row\">网卡 RX</th><td class=\"num\">{}</td><td>{} / {}</td><td>{}</td></tr><tr><th scope=\"row\">工具接收</th><td class=\"num\">{}</td><td>{}</td><td>{}</td></tr></tbody></table></div>", rate(leg.nic_rx_mbps), target(leg.nic_target_mbps), badge(&leg.nic_verdict), leg.counter_source.map(|s| escape(s.label())).unwrap_or_else(|| "电脑网卡计数".into()), rate(leg.tool.receiver_mbps), if leg.source == super::measure::Source::Tool && !uses_total(report, unit) { format!("采用工具口径 / 门限 {}", target(leg.target_mbps)) } else { "参考值，采用来源见判定依据".into() }, escape(&leg.tool.receiver_note));
-    let _ = write!(html, "<h4>采样质量与诊断</h4><dl class=\"quality\"><div><dt>有效测量时长</dt><dd>{:.2}s / {}s</dd></div><div><dt>采样覆盖率</dt><dd>{:.1}%</dd></div><div><dt>背景扣除</dt><dd>{:.2} Mbps</dd></div><div><dt>工具发送（仅诊断）</dt><dd>{} Mbps</dd></div><div><dt>UDP 丢包（仅诊断）</dt><dd>{}</dd></div></dl><p class=\"muted\">接收端 RX 分布 Mbps：P10 {} · 中位 {} · P95 {} · 最小 {} · 最大 {}；滚动窗口覆盖 {:.1}%，计数器零增长占比 {:.1}%。</p>", leg.effective_secs, leg.required_secs, leg.coverage*100.0, leg.background_mbps, rate(leg.tool.sender_mbps), loss(leg, unit), rate(leg.rx.p10_mbps), rate(leg.rx.median_mbps), rate(leg.rx.p95_mbps), rate(leg.rx.min_mbps), rate(leg.rx.max_mbps), leg.rx.rolling_coverage*100.0, leg.rx.stalled_ratio*100.0);
+    let _ = write!(html, "<h4>采样质量与诊断</h4><dl class=\"quality\"><div><dt>有效测量时长</dt><dd>{:.2}s / {}s</dd></div><div><dt>采样覆盖率</dt><dd>{:.1}%</dd></div><div><dt>背景扣除</dt><dd>{:.2} Mbps</dd></div><div><dt>工具发送（仅诊断）</dt><dd>{} Mbps</dd></div><div><dt>UDP 丢包（仅诊断）</dt><dd>{}</dd></div></dl><p class=\"muted\">接收端 RX 分布 Mbps：P10 {} · 中位 {} · P95 {} · 最小 {} · 最大 {}；滚动窗口覆盖 {:.1}%，计数器零增长占比 {:.1}%。</p>", leg.scored_secs(), leg.required_secs, leg.coverage*100.0, leg.background_mbps, rate(leg.tool.sender_mbps), loss(leg, unit), rate(leg.rx.p10_mbps), rate(leg.rx.median_mbps), rate(leg.rx.p95_mbps), rate(leg.rx.min_mbps), rate(leg.rx.max_mbps), leg.rx.rolling_coverage*100.0, leg.rx.stalled_ratio*100.0);
     if let Some(samples) = &leg.rx_samples {
         let chart = crate::report::render_monitor_rx_chart(
             &samples.samples,
@@ -448,7 +462,8 @@ pub(super) fn save_progress(
 fn write_heavy(dir: &Path, report: &RunReport) -> Result<(), String> {
     let json = serde_json::to_vec_pretty(report).map_err(|e| e.to_string())?;
     write_atomic(&dir.join("result.json"), &json)?;
-    write_atomic(&dir.join("report.html"), render(report).as_bytes())
+    write_atomic(&dir.join("report.html"), render(report).as_bytes())?;
+    write_atomic(&dir.join("summary.xlsx"), &super::xlsx::bytes(report)?)
 }
 
 pub(super) fn save(dir: &Path, report: &RunReport) -> Result<(), String> {

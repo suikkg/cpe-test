@@ -23,6 +23,9 @@ pub enum ReasonCode {
     None,
     ActiveStreamsLow,
     ConfiguredLoadTooLow,
+    /// 接收端网卡计数器还在走，却远低于同一窗口内接收端工具记录：这块网卡不在
+    /// 这条流量的路径上（统计口选错、流量走了另一块网卡、硬件转发绕过计数）。
+    CounterOffPath,
     CounterStalled,
     CtsArgsInvalid,
     CtsCleanupFailed,
@@ -125,6 +128,7 @@ impl ReasonCode {
             ReasonCode::None => "",
             ReasonCode::ActiveStreamsLow => "ACTIVE_STREAMS_LOW",
             ReasonCode::ConfiguredLoadTooLow => "CONFIGURED_LOAD_TOO_LOW",
+            ReasonCode::CounterOffPath => "COUNTER_OFF_PATH",
             ReasonCode::CounterStalled => "COUNTER_STALLED",
             ReasonCode::CtsArgsInvalid => "CTSTRAFFIC_ARGS_INVALID",
             ReasonCode::CtsCleanupFailed => "CTSTRAFFIC_CLEANUP_FAILED",
@@ -262,6 +266,7 @@ impl FromStr for ReasonCode {
             "" => ReasonCode::None,
             "ACTIVE_STREAMS_LOW" => ReasonCode::ActiveStreamsLow,
             "CONFIGURED_LOAD_TOO_LOW" => ReasonCode::ConfiguredLoadTooLow,
+            "COUNTER_OFF_PATH" => ReasonCode::CounterOffPath,
             "COUNTER_STALLED" => ReasonCode::CounterStalled,
             "CTSTRAFFIC_ARGS_INVALID" => ReasonCode::CtsArgsInvalid,
             "CTSTRAFFIC_CLEANUP_FAILED" => ReasonCode::CtsCleanupFailed,
@@ -355,9 +360,10 @@ impl FromStr for ReasonCode {
 
 /// 所有码，供穷举式测试使用。
 #[cfg(test)]
-pub const ALL_REASON_CODES: [ReasonCode; 84] = [
+pub const ALL_REASON_CODES: [ReasonCode; 85] = [
     ReasonCode::ActiveStreamsLow,
     ReasonCode::ConfiguredLoadTooLow,
+    ReasonCode::CounterOffPath,
     ReasonCode::CounterStalled,
     ReasonCode::CtsArgsInvalid,
     ReasonCode::CtsCleanupFailed,

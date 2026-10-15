@@ -90,13 +90,24 @@ impl Remote {
         }
         Err(errors.join("；"))
     }
-    pub fn info(&self) -> Result<HostInfo, String> {
+    pub fn supports_ping_df(&self) -> Result<bool, String> {
         let health: HealthOut = self.post("/health", &serde_json::json!({}))?;
-        if health.iperf3.is_none()
-            || !health
-                .capabilities
-                .iter()
-                .any(|v| v == RELIABLE_LIFECYCLE_CAPABILITY)
+        Ok(health
+            .capabilities
+            .iter()
+            .any(|c| c == crate::protocol::PING_DF_CAPABILITY))
+    }
+    pub fn info(&self) -> Result<HostInfo, String> {
+        self.info_for_scan(true)
+    }
+    pub fn info_for_scan(&self, require_iperf: bool) -> Result<HostInfo, String> {
+        let health: HealthOut = self.post("/health", &serde_json::json!({}))?;
+        if require_iperf
+            && (health.iperf3.is_none()
+                || !health
+                    .capabilities
+                    .iter()
+                    .any(|v| v == RELIABLE_LIFECYCLE_CAPABILITY))
         {
             return Err(format!(
                 "辅测机 {} 缺少 iperf3 或可靠资源回收协议，请使用同版本 agent",
@@ -132,12 +143,23 @@ impl Remote {
             ))
         }
     }
+    #[cfg(test)]
     pub fn client(
         &self,
         req: IperfClientReq,
         owner: &str,
         epoch: Instant,
         cancel: &AtomicBool,
+    ) -> Result<(IperfClientOut, Vec<IperfFlowEvent>), String> {
+        self.client_observed(req, owner, epoch, cancel, None)
+    }
+    pub fn client_observed(
+        &self,
+        req: IperfClientReq,
+        owner: &str,
+        epoch: Instant,
+        cancel: &AtomicBool,
+        traffic: Option<&AtomicBool>,
     ) -> Result<(IperfClientOut, Vec<IperfFlowEvent>), String> {
         let id = format!("{owner}-client");
         let started: IperfClientStartOut = self.post(
@@ -186,6 +208,13 @@ impl Remote {
             cursor = status.next_cursor;
             for mut event in status.events {
                 event.elapsed_ms = event.elapsed_ms.saturating_add(origin);
+                if event.kind == crate::protocol::IperfEventKind::Traffic
+                    && event.mbps.is_some_and(|v| v > 0.0)
+                {
+                    if let Some(flag) = traffic {
+                        flag.store(true, Ordering::SeqCst);
+                    }
+                }
                 events.push(event);
             }
             if status.done {
@@ -271,6 +300,7 @@ mod tests {
 
     struct ScanAgent {
         supports_all: bool,
+        has_tools: bool,
     }
     impl Transport for ScanAgent {
         fn send(&self, req: &HttpRequest, _: Duration) -> Result<HttpResponse, String> {
@@ -280,7 +310,7 @@ mod tests {
                     if self.supports_all {
                         capabilities.push(UNFILTERED_INFO_CAPABILITY);
                     }
-                    json!({"hostname":"remote", "os":"windows", "version":"test", "iperf3":"iperf3", "capabilities":capabilities})
+                    json!({"hostname":"remote", "os":"windows", "version":"test", "iperf3":self.has_tools.then_some("iperf3"), "capabilities":capabilities})
                 }
                 "/info" => {
                     assert!(self.supports_all, "旧 agent 必须在扫描前被明确拒绝");
@@ -321,7 +351,10 @@ mod tests {
                     port: 28801,
                     token: String::new(),
                 },
-                Arc::new(ScanAgent { supports_all }),
+                Arc::new(ScanAgent {
+                    supports_all,
+                    has_tools: true,
+                }),
             );
             if supports_all {
                 let info = remote.info().unwrap();
@@ -439,6 +472,32 @@ mod tests {
                 ]
             };
             assert_eq!(*paths, expected);
+        }
+    }
+    #[test]
+    fn ping_scan_does_not_require_iperf_but_still_requires_full_scan_capability() {
+        for supports_all in [true, false] {
+            let remote = Remote::with_transport(
+                AgentConfig {
+                    id: "agent1".into(),
+                    address: "agent.example".into(),
+                    port: 28801,
+                    token: String::new(),
+                },
+                Arc::new(ScanAgent {
+                    supports_all,
+                    has_tools: false,
+                }),
+            );
+            assert!(remote.info().is_err());
+            if supports_all {
+                assert!(remote.info_for_scan(false).is_ok());
+            } else {
+                assert!(remote
+                    .info_for_scan(false)
+                    .unwrap_err()
+                    .contains("完整网卡扫描"));
+            }
         }
     }
 }

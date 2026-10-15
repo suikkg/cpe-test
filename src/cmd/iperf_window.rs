@@ -210,14 +210,21 @@ pub(crate) fn iperf_tool_trace(
                 .filter_map(|event| per_second_interval(&event.line))
                 .map(project)
                 .collect(),
+            // 发送端的速率证明不了对端收到了，不拿它去质疑接收端计数器。
+            rates: Vec::new(),
         }
     };
+    // 多流时每条流各有一行、另有一行 [SUM]：速率只取合计行，否则同一秒算两遍。
+    let multi_stream = server.iter().any(|line| line.sum);
     let mut receiver = ToolTimeline::default();
     for line in server {
         let projected = project((line.start_ms, line.end_ms));
         receiver.reported.push(projected);
         if line.mbps > 0.0 {
             receiver.flowing.push(projected);
+        }
+        if line.sum == multi_stream {
+            receiver.rates.push((projected.0, projected.1, line.mbps));
         }
     }
     ToolTrace { receiver, sender }

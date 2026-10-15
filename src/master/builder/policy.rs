@@ -376,6 +376,19 @@ pub(crate) fn udp_load_for_leg(
     explicit: bool,
     rate_cfg: &RateCheckCfg,
 ) -> UdpLoad {
+    let ceiling = if explicit || !limit || requested.mbps <= 0.0 {
+        None
+    } else {
+        rate::path_payload_ceiling_mbps(&sender.nic, &receiver.nic, rate_cfg)
+    };
+    udp_load_for_ceiling(requested, want_streams, ceiling)
+}
+
+pub(crate) fn udp_load_for_ceiling(
+    requested: ParsedBandwidth,
+    want_streams: u32,
+    ceiling: Option<f64>,
+) -> UdpLoad {
     let want = want_streams.max(1);
     let as_requested = |streams: u32| UdpLoad {
         bits_per_second: requested.bits_per_second,
@@ -384,14 +397,7 @@ pub(crate) fn udp_load_for_leg(
         clipped_from_mbps: None,
         clipped_from_streams: (streams < want).then_some(want),
     };
-    // `explicit` = 这条链路在 link_profiles 里被专门指定过带宽。
-    // 那是操作者对这条链路的明确判断，自动裁剪不该覆盖它——裁剪是给
-    // 没配过的链路兜底用的安全网，不是用来推翻人的决定的。
-    if explicit || !limit || requested.mbps <= 0.0 {
-        return as_requested(want);
-    }
-    let Some(ceiling) = rate::path_payload_ceiling_mbps(&sender.nic, &receiver.nic, rate_cfg)
-    else {
+    let Some(ceiling) = ceiling.filter(|v| v.is_finite() && *v > 0.0) else {
         return as_requested(want);
     };
     let fit = (ceiling / requested.mbps).floor();

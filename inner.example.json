@@ -1,6 +1,6 @@
 {
   "kind": "cpe-inner-project",
-  "version": 4,
+  "version": 5,
   "config": {
     "adb_path": "adb",
     "serial": "",
@@ -19,7 +19,8 @@
       "tcp_windows": [],
       "udp_streams": [],
       "udp_rates_mbps": [],
-      "udp_lengths": []
+      "udp_lengths": [],
+      "udp_windows": []
     },
     "tcp_streams": null,
     "udp_streams": null,
@@ -30,7 +31,7 @@
     "port": 56190,
     "repeats": 1,
     "resume": false,
-  "screenshot": true,
+    "screenshot": true,
     "links": [
       {
         "name": "ETH",
@@ -82,6 +83,24 @@
     ],
     "ip_versions": [
       4
-    ]
+    ],
+    "rounds": 1,
+    "ping_options": {
+      "count": 180,
+      "payloads": [
+        32,
+        1600,
+        65500
+      ]
+    },
+    "udp_window": null,
+    "ping_policy": null,
+    "run_overrides": {
+      "tcp_window": null,
+      "udp_mbps": null,
+      "probe_during_traffic": false,
+      "probe_path_mtu": false,
+      "limit_udp_by_link_speed": false
+    }
   }
 }

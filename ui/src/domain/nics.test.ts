@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { NicInfo } from '../api/dto';
 import { filterByQuery } from './search';
-import { nicKey, nicLinkLocal, nicSearchFields, nicSpeedLabel, nicWifiContext } from './nics';
+import { filterByIpv4Prefixes, nicKey, nicLinkLocal, nicSearchFields, nicSpeedLabel, nicWifiContext } from './nics';
 
 function nic(patch: Partial<NicInfo>): NicInfo {
   return {
@@ -91,5 +91,26 @@ describe('nicWifiContext', () => {
     // 断在边缘的链路信号就是 0%。把它当成「没读到」滤掉，屏幕上会显示成
     // 一块信号正常的网卡，而那正是要查的现象。
     expect(nicWifiContext({ ...base, wifi_signal_pct: 0 })).toBe('信号 0%');
+  });
+});
+
+describe('filterByIpv4Prefixes', () => {
+  const lan = nic({ name: 'en0', ipv4: '192.168.8.100' });
+  const lab = nic({ name: 'en5', ipv4: '10.228.1.2' });
+  const tunnel = nic({ name: 'utun3', ipv4: '', ipv6_ll: 'fe80::3' });
+  const all = [lan, lab, tunnel];
+
+  it('空前缀 = 全部，含只有 IPv6 的口', () => {
+    expect(filterByIpv4Prefixes(all, [])).toEqual(all);
+  });
+
+  it('非空前缀只留 IPv4 落在任一前缀内的口，只有 IPv6 的口不留', () => {
+    // 与后端带前缀扫描同口径：连接前后同一个前缀列出的本机网卡要一样。
+    expect(filterByIpv4Prefixes(all, ['192.168.'])).toEqual([lan]);
+    expect(filterByIpv4Prefixes(all, ['192.168.', '10.'])).toEqual([lan, lab]);
+  });
+
+  it('空串前缀不匹配任何口', () => {
+    expect(filterByIpv4Prefixes(all, [''])).toEqual([]);
   });
 });

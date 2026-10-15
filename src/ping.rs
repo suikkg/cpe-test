@@ -1,6 +1,6 @@
 //! ping 命令构造 + 执行 + 输出解析（Windows 中/英文、macOS/BSD 三种格式）
 
-use crate::protocol::{PingOut, PingReq};
+use crate::protocol::{NicInfo, PingOut, PingReq};
 use crate::util::{run_cmd, run_streaming_controlled_timed, CmdOut};
 use regex::Regex;
 use std::sync::atomic::AtomicBool;
@@ -119,6 +119,14 @@ pub fn run(req: &PingReq) -> PingOut {
 /// 本身报出来**，让调用方丢弃结果而不是把它当成一次 100% 丢包——那是个
 /// 听上去很确定的错答案。
 pub fn run_cancellable(req: &PingReq, cancel: Option<&AtomicBool>) -> (PingOut, bool) {
+    let (out, cancelled, _) = run_cancellable_with_cleanup(req, cancel);
+    (out, cancelled)
+}
+
+pub(crate) fn run_cancellable_with_cleanup(
+    req: &PingReq,
+    cancel: Option<&AtomicBool>,
+) -> (PingOut, bool, bool) {
     let (prog, args) = build(req);
     let cmd_str = format!("{} {}", prog, args.join(" "));
     let timeout = Duration::from_secs(req.count.max(1) as u64 * 5 + 30);
@@ -130,10 +138,15 @@ pub fn run_cancellable(req: &PingReq, cancel: Option<&AtomicBool>) -> (PingOut, 
         }
     };
     let cancelled = out.cancelled;
-    (finish_run(cmd_str, req.count, timeout, out), cancelled)
+    let cleanup_confirmed = out.cleanup_confirmed();
+    (
+        finish_run(cmd_str, req.count, timeout, out),
+        cancelled,
+        cleanup_confirmed,
+    )
 }
 
-fn finish_run(cmd: String, count: u32, timeout: Duration, out: CmdOut) -> PingOut {
+pub(crate) fn finish_run(cmd: String, count: u32, timeout: Duration, out: CmdOut) -> PingOut {
     let raw = out.merged();
     let mut r = parse(&raw, count);
     let exec_error = classify_execution_error(&out, &raw, timeout);
@@ -322,7 +335,10 @@ fn has_packet_summary(text: &str) -> bool {
 /// - Linux/BSD 的 Destination Unreachable 同样没有 RTT，不计入。
 fn count_echo_replies(text: &str) -> u32 {
     let win_reply = Regex::new(r"(?i)(?:的回复[:：]|Reply from\b)").expect("regex");
-    let bsd_reply = Regex::new(r"(?i)\bbytes from\b.*\bicmp_seq[=:]\s*\d+").expect("regex");
+    let bsd_reply = Regex::new(
+        r"(?i)\bbytes from\b.*\b(?:icmp_seq[=:]\s*\d+|seq[=:]\s*\d+\s+(?:ttl|hlim)[=:]\s*\d+)",
+    )
+    .expect("regex");
     let has_rtt = Regex::new(r"(?i)(?:时间|time)\s*[<=]\s*\d+(?:[\.,]\d+)?").expect("regex");
 
     text.lines()
@@ -410,8 +426,8 @@ pub fn resolution_caveat(out: &PingOut) -> Option<&'static str> {
     if integral && avg < 1.0 {
         return Some(
             "本次 RTT 读数全部落在整毫秒上且平均不足 1ms：测量工具（Windows ping）的\
-             时延分辨率就是 1ms，实际往返时延低于它时一律记为 0。**这一档只能判通断，\
-             判不了时延**——要看亚毫秒级的时延，改用负载下时延探针或专用工具。",
+             时延分辨率就是 1ms，实际往返时延低于它时一律记为 0。这一档只能判通断，\
+             判不了时延。",
         );
     }
     None
@@ -640,6 +656,36 @@ round-trip min/avg/max/stddev = 1.100/1.200/1.300/0.100 ms
         assert_eq!(r.rtt_avg, Some(1.2));
     }
 
+    #[test]
+    fn busybox_real_cpe_echo_replies_use_seq_and_preserve_rtt() {
+        let raw = "PING 192.168.8.103 (192.168.8.103) from 192.168.8.1: 32 data bytes\n\
+40 bytes from 192.168.8.103: seq=0 ttl=128 time=0.721 ms\n\
+40 bytes from 192.168.8.103: seq=1 ttl=128 time=0.684 ms\n\
+40 bytes from 192.168.8.103: seq=2 ttl=128 time=0.620 ms\n\
+3 packets transmitted, 3 packets received, 0% packet loss\n\
+round-trip min/avg/max = 0.620/0.675/0.721 ms\n";
+        let out = parse(raw, 3);
+        assert!(out.ok);
+        assert_eq!((out.sent, out.received, out.lost), (3, 3, 0));
+        assert_eq!(out.rtt_min, Some(0.620));
+        assert_eq!(out.rtt_avg, Some(0.675));
+        assert_eq!(out.rtt_max, Some(0.721));
+        let partial = parse(
+            &raw.replace(
+                "40 bytes from 192.168.8.103: seq=1 ttl=128 time=0.684 ms\n",
+                "",
+            ),
+            3,
+        );
+        assert_eq!((partial.sent, partial.received, partial.lost), (3, 2, 1));
+    }
+
+    #[test]
+    fn busybox_sequence_without_echo_ttl_is_not_a_reply() {
+        let out = parse("40 bytes from 192.168.8.1: seq=0 time=1.0 ms\n1 packets transmitted, 1 packets received, 0% packet loss", 1);
+        assert_eq!((out.received, out.lost), (0, 1));
+    }
+
     const MAC_REDIRECT_WITH_PARTIAL_REPLY: &str = r#"
 PING 192.168.8.1 (192.168.8.1): 56 data bytes
 36 bytes from 192.168.8.254: Redirect Host(New addr: 192.168.8.1)
@@ -835,4 +881,160 @@ mod resolution_tests {
         // 缺读数时不下结论。
         assert!(resolution_caveat(&PingOut::default()).is_none());
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PingPayloadClass {
+    Small,
+    Medium,
+    Large,
+}
+impl PingPayloadClass {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Small => "small",
+            Self::Medium => "medium",
+            Self::Large => "large",
+        }
+    }
+}
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PingLatencyPolicy {
+    pub(crate) wifi: bool,
+    pub(crate) class: PingPayloadClass,
+    pub(crate) avg_rtt_ms: f64,
+    pub(crate) max_rtt_ms: f64,
+}
+pub(crate) fn nic_looks_wifi(nic: &NicInfo) -> bool {
+    if nic.is_wifi || !nic.wifi_band.trim().is_empty() {
+        return true;
+    }
+    let role = nic.role.to_ascii_lowercase();
+    let name = nic.name.to_ascii_lowercase();
+    let description = nic.description.to_ascii_lowercase();
+    role.contains("wifi")
+        || name.contains("wi-fi")
+        || name.contains("wifi")
+        || name.contains("wlan")
+        || description.contains("wi-fi")
+        || description.contains("wifi")
+        || description.contains("wireless")
+}
+pub(crate) fn classify_ping_payload(
+    cfg: &crate::config::PingCfg,
+    payload: u32,
+) -> PingPayloadClass {
+    if payload <= cfg.small_max_bytes {
+        PingPayloadClass::Small
+    } else if payload <= cfg.medium_max_bytes {
+        PingPayloadClass::Medium
+    } else {
+        PingPayloadClass::Large
+    }
+}
+pub(crate) fn ping_latency_policy(
+    src: &NicInfo,
+    dst: &NicInfo,
+    payload: u32,
+    cfg: &crate::config::PingCfg,
+) -> PingLatencyPolicy {
+    let wifi = nic_looks_wifi(src) || nic_looks_wifi(dst);
+    let class = classify_ping_payload(cfg, payload);
+    let (avg_rtt_ms, max_rtt_ms) = match (wifi, class) {
+        (false, PingPayloadClass::Small) => (cfg.wired_small_avg_rtt_ms, cfg.max_rtt_ms),
+        (false, PingPayloadClass::Medium) => {
+            (cfg.wired_medium_avg_rtt_ms, cfg.wired_medium_max_rtt_ms)
+        }
+        (false, PingPayloadClass::Large) => {
+            (cfg.wired_large_avg_rtt_ms, cfg.wired_large_max_rtt_ms)
+        }
+        (true, PingPayloadClass::Small) => (cfg.wifi_small_avg_rtt_ms, cfg.wifi_small_max_rtt_ms),
+        (true, PingPayloadClass::Medium) => {
+            (cfg.wifi_medium_avg_rtt_ms, cfg.wifi_medium_max_rtt_ms)
+        }
+        (true, PingPayloadClass::Large) => (cfg.wifi_large_avg_rtt_ms, cfg.wifi_large_max_rtt_ms),
+    };
+    PingLatencyPolicy {
+        wifi,
+        class,
+        avg_rtt_ms,
+        max_rtt_ms,
+    }
+}
+pub(crate) fn ping_acceptance(out: &PingOut, policy: PingLatencyPolicy) -> bool {
+    let avg_ok = out
+        .rtt_avg
+        .is_some_and(|v| v.is_finite() && v <= policy.avg_rtt_ms);
+    let max_ok = out
+        .rtt_max
+        .is_some_and(|v| v.is_finite() && v <= policy.max_rtt_ms);
+    out.ok && out.sent > 0 && out.received == out.sent && avg_ok && max_ok
+}
+
+/// 子网与内环共用 Ping 判定与原因码；网络丢包与命令执行失败严格分开。
+pub(crate) fn acceptance_verdict(
+    out: &PingOut,
+    policy: PingLatencyPolicy,
+    execution: Option<PingExecErrorKind>,
+) -> (crate::verdict::Verdict, crate::reason::ReasonCode) {
+    use crate::reason::ReasonCode;
+    use crate::verdict::Verdict;
+    if execution == Some(PingExecErrorKind::Timeout) {
+        return (Verdict::SetupError, ReasonCode::PingTimeout);
+    }
+    if execution.is_some() {
+        return (Verdict::SetupError, ReasonCode::PingExecError);
+    }
+    if ping_acceptance(out, policy) {
+        return (Verdict::Pass, ReasonCode::PingOk);
+    }
+    let reason = if out.sent == 0 || out.received != out.sent {
+        ReasonCode::PingPacketLossHigh
+    } else if out.rtt_avg.is_none() || out.rtt_max.is_none() {
+        ReasonCode::PingRttMissing
+    } else if !out
+        .rtt_avg
+        .is_some_and(|v| v.is_finite() && v <= policy.avg_rtt_ms)
+    {
+        ReasonCode::PingRttAvgExceeded
+    } else if !out
+        .rtt_max
+        .is_some_and(|v| v.is_finite() && v <= policy.max_rtt_ms)
+    {
+        ReasonCode::PingRttMaxExceeded
+    } else {
+        ReasonCode::PingUnreachable
+    };
+    (Verdict::RateFail, reason)
+}
+
+pub(crate) fn payload_search<F>(lo: u32, hi: u32, mut passes: F) -> Option<(u32, u32)>
+where
+    F: FnMut(u32) -> bool,
+{
+    let mut steps = 0u32;
+    // 先确认上界能不能过：整条链路都是标准以太网时这一步就结束了，
+    // 不必为常见情形付十几轮探测。
+    steps += 1;
+    if passes(hi) {
+        return Some((hi, steps));
+    }
+    // 再确认下界。下界都过不去说明这条链路根本不通（或者 ICMP 被墙），
+    // 那不是「路径 MTU 很小」，是探测本身没有意义。
+    steps += 1;
+    if !passes(lo) {
+        return None;
+    }
+    let (mut low, mut high) = (lo, hi);
+    // 不变式：`low` 能过，`high` 过不去。收敛到相邻即止。
+    while high - low > 1 {
+        let mid = low + (high - low) / 2;
+        steps += 1;
+        if passes(mid) {
+            low = mid;
+        } else {
+            high = mid;
+        }
+    }
+    Some((low, steps))
 }

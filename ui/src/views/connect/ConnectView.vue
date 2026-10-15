@@ -1,11 +1,12 @@
 <script setup lang="ts">
+import QuickTest from './QuickTest.vue';
 import { computed, ref } from 'vue';
 import NicTable from '../../components/NicTable.vue';
 import { freshnessLabel } from '../../domain/freshness';
 import { nicSearchFields } from '../../domain/nics';
 import { filterByQuery } from '../../domain/search';
 import { inner, scenarioBlocksActions } from '../../state/inner';
-import { agentHostname, agentNics, masterHostname, masterNics } from '../../state/inventory';
+import { agentHostname, agentNics, masterHostname, masterNics, masterNicsHiddenByPrefix } from '../../state/inventory';
 import { run } from '../../state/run';
 import { connect, load, rescan, session } from '../../state/session';
 import { ui } from '../../state/ui';
@@ -53,7 +54,9 @@ const agentShown = computed(() => filterByQuery(agentNics.value, ui.connect.quer
 /** 空表要指向对的那一端：连上了而对端为空，是前缀过滤的问题，不是本机的问题。 */
 const masterEmptyHint = computed(() => {
   if (ui.connect.query.trim() && masterNics.value.length) return `没有网卡匹配「${ui.connect.query.trim()}」。`;
-  return connected.value ? `本机没有网卡的 IPv4 落在前缀 ${prefixHint.value} 内。` : '没有扫到网卡，检查网线或 Wi-Fi 后重新扫描。';
+  if (connected.value) return `本机没有网卡的 IPv4 落在前缀 ${prefixHint.value} 内。`;
+  if (masterNicsHiddenByPrefix.value > 0) return `本机没有网卡的 IPv4 落在前缀 ${prefixHint.value} 内，修改前缀后重新扫描。`;
+  return '没有扫到网卡，检查网线或 Wi-Fi 后重新扫描。';
 });
 const agentEmptyHint = computed(() => {
   if (!connected.value && !session.connection) return '未连接辅测机。';
@@ -128,6 +131,7 @@ async function onRescan(): Promise<void> {
         {{ connecting ? '连接中…' : '连接' }}
       </button>
     </form>
+    <QuickTest :disabled="locked" />
     <p class="hint">辅测机上运行 <code>cpe_test.exe agent</code>（或双击后选 3），填它能被本机访问到的 IP。</p>
 
     <p v-if="testInFlight" class="hint" role="status">测试进行中，连接与扫描已锁定。</p>
@@ -165,7 +169,7 @@ async function onRescan(): Promise<void> {
       <span v-if="localLoaded" class="count">iperf3：{{ iperf || '未找到' }}</span>
     </div>
 
-    <h3>主控 · {{ masterHostname || '本机' }} <span class="count">{{ inventoryReady ? `${masterNics.length} 块` : '读取中' }}</span></h3>
+    <h3>主控 · {{ masterHostname || '本机' }} <span class="count">{{ inventoryReady ? `${masterNics.length} 块` : '读取中' }}<template v-if="inventoryReady && masterNicsHiddenByPrefix > 0"> · 前缀外 {{ masterNicsHiddenByPrefix }} 块未显示</template></span></h3>
     <p v-if="!inventoryReady && !session.localError" class="hint" role="status">正在读取本机网卡…</p>
     <NicTable v-else-if="inventoryReady" label="主控网卡" :nics="masterShown" :empty-hint="masterEmptyHint" />
 

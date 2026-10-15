@@ -47,6 +47,18 @@ pub const RATE_DROPOUT_TOLERANCE: f64 = 0.20;
 /// 不取 `target * 0.1`——那个量级还有十分之一的目标速率在跑，属于掉坑
 /// 而不是断流，两者的排查方向完全不同。
 pub const RATE_OUTAGE_RATIO: f64 = 0.01;
+/// 接收端网卡 RX 平均低于同一窗口内接收端工具记录的这个比例，就说明这块网卡的
+/// 计数器不在这条流量的路径上（见 [`RateStats::counter_off_path`]）。
+///
+/// 计数器记的是带帧头的字节，工具记的是载荷：同一条路径上网卡 RX 恒不低于工具
+/// 接收值。2026-10-14 Windows 实机六条腿的比值在 1.006–1.052 之间，统计口选错
+/// 的那条（eth1，网卡 0.030 / 工具 653.7 Mbps）是 0.00005。取一半，两侧都留出
+/// 一个数量级以上的余量。
+pub const COUNTER_PATH_MIN_RATIO: f64 = 0.5;
+/// 工具侧至少收到这么多，才拿它去质疑网卡计数器。
+///
+/// 低于它时两边的差可能只是背景扣除与取整，说明不了计数器在不在路径上。
+pub const COUNTER_PATH_MIN_TOOL_MBPS: f64 = 1.0;
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct RateStats {
@@ -79,6 +91,16 @@ pub(crate) struct RateStats {
     /// 跟着数据一起带走，折算才有唯一的依据；否则每个使用点都得自己去找窗口，
     /// 找漏一个就印出越界的秒数。
     pub window_start_ms: u64,
+    /// 判定窗口的终点（监控时间轴毫秒）。和 `window_start_ms` 一起交给
+    /// [`RateStats::with_tool_trace`]，算工具侧同一段时间收到了多少。
+    pub window_end_ms: u64,
+    /// 判定窗口内接收端工具记录的平均接收速率（Mbps），由
+    /// [`RateStats::with_tool_trace`] 补上；没有接收端逐段记录、或记录覆盖不到
+    /// 窗口三分之二时为 `None`。
+    ///
+    /// **只用来判断计数器在不在流量路径上**（[`RateStats::counter_off_path`]），
+    /// 不进平均值、不和门限比较（ADR-17）。
+    pub tool_receiver_mbps: Option<f64>,
     /// 判定窗口内「计数器连续零增长」的最长一段占已覆盖时长的比例。
     ///
     /// 这是与采样覆盖率**正交**的一种不可信：样本采到了、`valid` 也是 true，
@@ -111,7 +133,32 @@ impl RateStats {
             .stall_span_ms
             .map(|span| trace.stall_evidence(span))
             .unwrap_or_default();
+        self.tool_receiver_mbps = (self.window_end_ms > self.window_start_ms)
+            .then(|| {
+                trace
+                    .receiver
+                    .delivered_mbps((self.window_start_ms, self.window_end_ms))
+            })
+            .flatten();
         self
+    }
+
+    /// 这块网卡的计数器不在这条流量的路径上：返回同一窗口内工具侧的接收速率。
+    ///
+    /// 零增长那道门（[`RateStats::stall_blocks_verdict`]）只拦得住「一个字节都没
+    /// 记」。统计口选错时计数器往往还在走——那块口上有零星的背景流量——于是
+    /// 平均值是一个「有效」的近零值：2026-10-14 实机内环手选 eth1，网卡 RX
+    /// 0.030 Mbps，同期板侧 server 收到 653.7 Mbps，判成 MEASURED；配了门限就是
+    /// RATE_FAIL，把统计口选错写成被测设备不达标。
+    ///
+    /// 只看接收端工具记录：发送端写进 socket 的量证明不了对端收到了。工具值只
+    /// 回答「网卡计数可不可信」，不进平均值、不和门限比较（ADR-17）。
+    pub(crate) fn counter_off_path(&self) -> Option<f64> {
+        let tool = self
+            .tool_receiver_mbps
+            .filter(|value| value.is_finite() && *value >= COUNTER_PATH_MIN_TOOL_MBPS)?;
+        let nic = self.avg_mbps.filter(|value| value.is_finite())?;
+        (nic < tool * COUNTER_PATH_MIN_RATIO).then_some(tool)
     }
 
     /// 零增长够长、而且没有证据证明它是真断流——这时不能拿平均值下结论。
@@ -160,6 +207,9 @@ pub(crate) struct ToolTimeline {
     pub reported: Vec<(u64, u64)>,
     /// 其中速率大于零的段。
     pub flowing: Vec<(u64, u64)>,
+    /// 逐段速率 `(起, 止, Mbps)`，只有接收端填；多流时只放合计行，不和每条流的
+    /// 行重复计数。用于 [`RateStats::counter_off_path`]。
+    pub rates: Vec<(u64, u64, f64)>,
 }
 
 /// 一条腿的工具侧旁证。
@@ -192,6 +242,7 @@ impl ToolTrace {
             ] {
                 into.reported.extend_from_slice(&from.reported);
                 into.flowing.extend_from_slice(&from.flowing);
+                into.rates.extend_from_slice(&from.rates);
             }
         }
         merged
@@ -199,6 +250,34 @@ impl ToolTrace {
 }
 
 impl ToolTimeline {
+    /// `span` 内工具侧收到的平均速率：段内的量按时间加总再除以 `span` 的长度。
+    ///
+    /// 多条独立的流（UDP 组合并后的旁证）各自的段会重叠，加总就是合计；单流的
+    /// 段首尾相接，加总就是时间加权平均。逐段记录覆盖不到 `span` 的三分之二就
+    /// 不给数（和 [`ToolTimeline::evidence`] 同一条线）。覆盖不全时缺的那部分按
+    /// 零计，只会把工具值往小估——质疑网卡计数器的那一侧因此更保守。
+    fn delivered_mbps(&self, span: (u64, u64)) -> Option<f64> {
+        let (start, end) = span;
+        let length = end.saturating_sub(start);
+        if length == 0 || self.rates.is_empty() {
+            return None;
+        }
+        let intervals: Vec<(u64, u64)> = self.rates.iter().map(|(s, e, _)| (*s, *e)).collect();
+        if covered_ms(&intervals, span).saturating_mul(3) < length.saturating_mul(2) {
+            return None;
+        }
+        let megabits: f64 = self
+            .rates
+            .iter()
+            .filter(|(_, _, mbps)| mbps.is_finite() && *mbps >= 0.0)
+            .map(|(s, e, mbps)| {
+                let overlap = (*e).min(end).saturating_sub((*s).max(start));
+                mbps * overlap as f64
+            })
+            .sum();
+        Some(megabits / length as f64)
+    }
+
     /// 工具的汇报要覆盖零增长那段的至少三分之二才下判断；汇报里有数据在走的
     /// 时间占汇报时间三分之二以上算「仍在走」，三分之一以下算「也停了」，
     /// 中间地带不猜。两条线都留出一个汇报周期的对齐误差：逐秒行与网卡样本
@@ -488,13 +567,15 @@ pub(crate) fn offered_floor_mbps(target_mbps: Option<f64>, headroom_pct: f64) ->
 /// RX 平均 <  门限      → RATE_FAIL
 /// ```
 ///
-/// 「有效 RX 平均值」只有三条门槛，全部落在**接收端**：计数器的零增长要么够短、
-/// 要么有工具旁证证明那是真断流（[`StallEvidence`]）；平均值要存在且高于有效流量
-/// 下限；RX 采样覆盖率要够。三条都过了就必须给出 PASS/FAIL——这是用户确认过的
-/// 验收规则：**RX 平均达到门限就是 PASS，不看其他指标**。
+/// 「有效 RX 平均值」只有四条门槛，全部落在**接收端**：计数器的零增长要么够短、
+/// 要么有工具旁证证明那是真断流（[`StallEvidence`]）；计数器在这条流量的路径上
+/// （[`RateStats::counter_off_path`]）；平均值要存在且高于有效流量下限；RX 采样
+/// 覆盖率要够。四条都过了就必须给出 PASS/FAIL——这是用户确认过的验收规则：
+/// **RX 平均达到门限就是 PASS，不看其他指标**。
 ///
-/// 工具旁证（`RateStats::stall_evidence`）只回答「那段零是不是真的」，决定的是
-/// 第一条门槛过没过；它不进平均值，也不参与和门限的比较。
+/// 工具旁证（接收端逐段记录，经 `RateStats::with_tool_trace` 进来）只回答「那段零
+/// 是不是真的」和「计数器在不在路径上」，决定的是前两条门槛过没过；它不进平均值，
+/// 也不参与和门限的比较。
 ///
 /// 因此这里**看不到**发送端：TX 覆盖率、TX-P10、offered 负载、滚动窗口覆盖、
 /// UDP 丢包、工具退出状态一律不进这个函数，它们由
@@ -533,6 +614,20 @@ pub(crate) fn evaluate_rx_acceptance(
                 "判定窗口内接收端 OS 网卡计数器连续 {:.1}% 的时间零增长：{why}；\
                  本轮平均速率不能当结论",
                 stats.stalled_ratio * 100.0
+            ),
+        );
+    }
+    // 计数器还在走、却远低于工具侧同期收到的量：这块网卡不在这条流量的路径上。
+    // 排在有效下限之前——统计口选错时平均值常常就落在下限附近，报「没有可用的
+    // RX 速率」会把排查方向指向采样，而问题在统计口或路由。
+    if let Some(tool_mbps) = stats.counter_off_path() {
+        return VerdictResult::not_evaluated(
+            ReasonCode::CounterOffPath,
+            format!(
+                "接收端网卡 RX 平均 {:.3}Mbps，不到同一窗口内接收端工具记录 {tool_mbps:.3}Mbps \
+                 的 {:.0}%：这块网卡的计数器不在这条流量的路径上；本轮平均速率不能当结论",
+                stats.avg_mbps.unwrap_or_default(),
+                COUNTER_PATH_MIN_RATIO * 100.0
             ),
         );
     }
@@ -960,6 +1055,8 @@ pub(crate) fn monitor_rate_stats(
         avg_mbps: Some(avg),
         series: rate_samples,
         window_start_ms: window.start_ms,
+        window_end_ms: window.end_ms,
+        tool_receiver_mbps: None,
         p10_mbps: percentile(&rolling_sorted, 0.10),
         median_mbps: percentile(&rates, 0.50),
         p95_mbps: percentile(&rates, 0.95),
@@ -1370,6 +1467,7 @@ mod tests {
                     .filter(|(start, _)| flowing(start / 1_000 + 1))
                     .collect(),
                 reported: lines,
+                rates: Vec::new(),
             },
             ..Default::default()
         }
@@ -1457,6 +1555,109 @@ mod tests {
         assert_eq!(stats.stall_evidence, StallEvidence::Unknown);
     }
 
+    /// 接收端 server 逐秒行，带速率。
+    fn server_rates(seconds: u64, mbps: impl Fn(u64) -> f64) -> ToolTrace {
+        let mut receiver = ToolTimeline::default();
+        for second in 0..seconds {
+            let line = (second * 1_000, (second + 1) * 1_000);
+            let rate = mbps(second + 1);
+            receiver.reported.push(line);
+            if rate > 0.0 {
+                receiver.flowing.push(line);
+            }
+            receiver.rates.push((line.0, line.1, rate));
+        }
+        ToolTrace {
+            receiver,
+            ..Default::default()
+        }
+    }
+
+    /// 2026-10-14 Windows 实机内环：板侧统计口手选成 eth1，计数器跟着零星背景
+    /// 流量一直在走（0.030 Mbps），同期板侧 server 逐秒收到约 650 Mbps。停滞那道
+    /// 门拦不住它，以前判 MEASURED 0.030；配了门限就是 RATE_FAIL，把统计口选错
+    /// 写成被测设备不达标。
+    #[test]
+    fn a_counter_off_the_traffic_path_is_not_judged_on_its_near_zero_average() {
+        let out = per_second(20, |_| 0.03);
+        let stats = monitor_rate_stats(&out, &whole(20), true, 0)
+            .with_tool_trace(&server_rates(20, |_| 653.7));
+        assert_eq!(
+            stats.stall_span_ms, None,
+            "计数器一直在走，停滞那道门本来就拦不住"
+        );
+        assert!((stats.tool_receiver_mbps.unwrap() - 653.7).abs() < 1e-9);
+        for (mode, target) in [
+            (RateMode::Verify, Some(500.0)),
+            (RateMode::Auto, None),
+            (RateMode::Observe, None),
+        ] {
+            let judged = evaluate_rx_acceptance(mode, target, &stats);
+            assert_eq!(judged.verdict, Verdict::NotEvaluated, "{mode:?}");
+            assert_eq!(judged.code, ReasonCode::CounterOffPath, "{mode:?}");
+            assert!(judged.detail.contains("653.700"), "{}", judged.detail);
+        }
+        // 平均值落在有效下限以下也一样：问题在统计口，不在「没采到流量」。
+        let out = per_second(20, |_| 0.005);
+        let stats = monitor_rate_stats(&out, &whole(20), true, 0)
+            .with_tool_trace(&server_rates(20, |_| 653.7));
+        let judged = evaluate_rx_acceptance(RateMode::Verify, Some(500.0), &stats);
+        assert_eq!(judged.code, ReasonCode::CounterOffPath, "{}", judged.detail);
+    }
+
+    /// 这道门只认「计数器和工具对不上」，不吞掉任何一种真实的结论。
+    #[test]
+    fn the_counter_path_check_never_swallows_a_real_result() {
+        let judge = |nic: f64, tool: f64, target: Option<f64>| {
+            let stats = monitor_rate_stats(&per_second(20, |_| nic), &whole(20), true, 0)
+                .with_tool_trace(&server_rates(20, |_| tool));
+            evaluate_rx_acceptance(RateMode::Verify, target, &stats)
+        };
+        // 计数器在路径上：带帧头的网卡计数略高于工具载荷，照常判。
+        assert_eq!(judge(686.3, 653.7, Some(600.0)).verdict, Verdict::Pass);
+        // 链路本来就慢：两边一致地低，照常 RATE_FAIL——慢不是计数器的问题。
+        let slow = judge(12.4, 12.0, Some(600.0));
+        assert_eq!(
+            (slow.verdict, slow.code),
+            (Verdict::RateFail, ReasonCode::RxBelowTarget)
+        );
+        // 工具侧几乎没收到：两边的差说明不了计数器在不在路径上，照常按平均值判。
+        let dead = judge(0.02, 0.9, Some(600.0));
+        assert_eq!(
+            (dead.verdict, dead.code),
+            (Verdict::RateFail, ReasonCode::RxBelowTarget)
+        );
+        // 没有接收端逐段记录（ctsTraffic、旧 agent、日志对不上时钟）：行为不变。
+        let stats = monitor_rate_stats(&per_second(20, |_| 0.03), &whole(20), true, 0);
+        assert_eq!(stats.tool_receiver_mbps, None);
+        assert_eq!(
+            evaluate_rx_acceptance(RateMode::Verify, Some(500.0), &stats).code,
+            ReasonCode::RxBelowTarget
+        );
+        // 整窗真断流：计数器和工具都是零，照常按平均值判 RATE_FAIL。
+        let stats = monitor_rate_stats(&per_second(20, |_| 0.0), &whole(20), true, 0)
+            .with_tool_trace(&server_rates(20, |_| 0.0));
+        assert_eq!(stats.stall_evidence, StallEvidence::TrafficStopped);
+        let judged = evaluate_rx_acceptance(RateMode::Verify, Some(500.0), &stats);
+        assert_eq!(judged.verdict, Verdict::RateFail, "{}", judged.detail);
+    }
+
+    /// 工具侧的量按时间加总：单流是时间加权平均，多条独立的流（UDP 组合并后）
+    /// 是合计；记录覆盖不到窗口三分之二就不给数。
+    #[test]
+    fn delivered_tool_rate_sums_streams_and_refuses_thin_coverage() {
+        let one = server_rates(10, |second| if second <= 5 { 400.0 } else { 600.0 });
+        assert_eq!(one.receiver.delivered_mbps((0, 10_000)), Some(500.0));
+        let merged = ToolTrace::merge([&one, &server_rates(10, |_| 100.0)]);
+        assert_eq!(merged.receiver.delivered_mbps((0, 10_000)), Some(600.0));
+        let mut thin = server_rates(10, |_| 600.0);
+        thin.receiver.rates.truncate(6);
+        assert_eq!(thin.receiver.delivered_mbps((0, 10_000)), None);
+        thin.receiver.rates = server_rates(10, |_| 600.0).receiver.rates[..7].to_vec();
+        // 缺的三秒按零计：只会往小估，质疑计数器的那一侧更保守。
+        assert_eq!(thin.receiver.delivered_mbps((0, 10_000)), Some(420.0));
+    }
+
     /// 发送端旁证只在接收端说不上话时才用，并且多流的重叠行只计一次。
     #[test]
     fn tool_evidence_prefers_the_receiver_and_counts_overlapping_lines_once() {
@@ -1464,6 +1665,7 @@ mod tests {
         let sender_says_flowing = ToolTimeline {
             reported: vec![(0, 30_000)],
             flowing: (0..30).map(|s| (s * 1_000, (s + 1) * 1_000)).collect(),
+            rates: Vec::new(),
         };
         let receiver_says_stopped = ToolTimeline {
             reported: (0..30).map(|s| (s * 1_000, (s + 1) * 1_000)).collect(),
@@ -1471,6 +1673,7 @@ mod tests {
                 .filter(|s| !(10..16).contains(s))
                 .map(|s| (s * 1_000, (s + 1) * 1_000))
                 .collect(),
+            rates: Vec::new(),
         };
         let trace = ToolTrace {
             receiver: receiver_says_stopped,

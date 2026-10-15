@@ -30,6 +30,7 @@ use identity::*;
 use iperf_tcp::*;
 use iperf_udp::*;
 use ping::*;
+pub(crate) use policy::udp_load_for_ceiling;
 use policy::*;
 
 pub const PORT_BASE: u16 = 56000;

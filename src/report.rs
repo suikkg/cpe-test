@@ -638,7 +638,7 @@ fn push_unit_list(h: &mut String, groups: &[&UnitGroup<'_>], charts: &Charts) {
             push_non_verdict_diagnostics(h, summary);
         }
         if group.details.is_empty() {
-            h.push_str("<p class=\"summary-note\">本次没有执行行；请结合单元状态和原因查看。</p>");
+            h.push_str("<p class=\"summary-note\">本次没有执行结果。</p>");
         } else {
             h.push_str(&format!(
                 "<div class=\"table-scroll\" role=\"region\" aria-labelledby=\"unit-toggle-{index}\" tabindex=\"0\"><table class=\"results-table\"><caption class=\"sr-only\">{}的逐行执行明细</caption><thead><tr><th scope=\"col\">结果</th><th scope=\"col\">时间</th><th scope=\"col\">方向</th><th scope=\"col\">类型 / 参数</th><th scope=\"col\">传输</th><th scope=\"col\">请求/活跃/要求流</th><th scope=\"col\">网卡 RX 平均</th><th scope=\"col\">网卡 RX-P10</th><th scope=\"col\">网卡 TX 平均</th><th scope=\"col\">流量工具自报（非判定口径）</th><th scope=\"col\">目标</th><th scope=\"col\">采样覆盖率</th><th scope=\"col\">质量指标</th><th scope=\"col\">诊断详情</th></tr></thead><tbody>\n",

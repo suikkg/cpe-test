@@ -43,6 +43,7 @@ fn leg_json(leg: &LegRow) -> Value {
 fn unit_json(unit: &UnitRow) -> Value {
     json!({
         "id": unit.id,
+        "origin": unit.origin, "round": unit.round, "ping": unit.ping.iter().map(|p| json!({"flow": p.flow, "result": {"ok": p.result.ok, "sent": p.result.sent, "received": p.result.received, "lost": p.result.lost, "loss_pct": p.result.loss_pct, "rtt_min": p.result.rtt_min, "rtt_avg": p.result.rtt_avg, "rtt_max": p.result.rtt_max}})).collect::<Vec<_>>(),
         "index": unit.index,
         "link": unit.link,
         "host": unit.host,
@@ -52,7 +53,7 @@ fn unit_json(unit: &UnitRow) -> Value {
         "streams": unit.streams,
         "repeat": unit.repeat,
         "measurement": unit.measurement,
-        "parameters": unit.parameters,
+        "parameters": unit.parameters, "requested_parameters":unit.requested_parameters, "duration_secs":unit.duration_secs,
         "bidir_targets": unit.bidir_targets,
         "verdict": unit.verdict,
         "resumed": unit.resumed,
@@ -71,7 +72,9 @@ fn unit_json(unit: &UnitRow) -> Value {
 struct State {
     running: bool,
     run_id: String,
+    start_token: String,
     current: String,
+    current_unit: Option<usize>,
     error: Option<String>,
     path: Option<PathBuf>,
     units: Vec<Value>,
@@ -82,6 +85,7 @@ struct State {
 pub(crate) struct Controller {
     state: Arc<Mutex<State>>,
     cancel: Arc<AtomicBool>,
+    skip: Arc<AtomicBool>,
 }
 impl Controller {
     #[cfg(test)]
@@ -97,6 +101,22 @@ impl Controller {
             self.cancel.store(true, Ordering::SeqCst);
         }
         json!({"stopping": state.running})
+    }
+    pub(crate) fn skip_unit(&self, body: &str) -> Result<Value, String> {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Request {
+            run_id: String,
+            unit_seq: usize,
+        }
+        let req: Request = serde_json::from_str(body).map_err(|e| e.to_string())?;
+        let state = crate::util::lock_recover(&self.state);
+        if !state.running || state.run_id != req.run_id || state.current_unit != Some(req.unit_seq)
+        {
+            return Err("目标单元已结束或当前运行已变化，请刷新进度后重试".into());
+        }
+        self.skip.store(true, Ordering::SeqCst);
+        Ok(json!({"skipping": true}))
     }
     /// 运行状态。`units_from` 是游标，只回它之后新增的单元。
     ///
@@ -122,8 +142,19 @@ impl Controller {
             "error": s.error,
             "completed": s.units.len(),
             "total": s.total,
+            "start_token": s.start_token,
+            "current_unit": s.current_unit,
+            "skip_requested": self.skip.load(Ordering::SeqCst),
             "units_from": from,
             "units": s.units[from..],
+            // 本轮的历史目录名，就是 `/api/inner/runs` 里那一条的 `id`。`run_id` 是
+            // 进度游标用的进程内标识，和历史对不上；没有它，调用方只能按时间去猜
+            // 「刚跑完的是哪一条历史」。
+            "history_id": s
+                .path
+                .as_ref()
+                .and_then(|path| path.file_name())
+                .and_then(|name| name.to_str()),
             "has_report": s
                 .path
                 .as_ref()
@@ -144,12 +175,43 @@ impl Controller {
         let cfg = config::parse_config(body)?;
         let adb = Adb::connect(&cfg)?;
         // 页面上的扫描要看到所有已配置的电脑；连不上的只记状态，不让整次扫描失败。
-        serde_json::to_value(super::probe(&adb, &cfg, None)?).map_err(|e| e.to_string())
+        serde_json::to_value(super::probe(
+            &adb,
+            &cfg,
+            None,
+            &std::collections::HashSet::new(),
+        )?)
+        .map_err(|e| e.to_string())
     }
     pub(crate) fn start(&self, body: &str) -> Result<Value, String> {
-        let cfg = config::parse_config(body)?;
+        let value: Value = serde_json::from_str(body).map_err(|e| e.to_string())?;
+        let (cfg, start_token, confirmed_hash) = if value.get("start_token").is_some() {
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Request {
+                config: Value,
+                start_token: String,
+                plan_hash: String,
+            }
+            let req: Request = serde_json::from_value(value).map_err(|e| e.to_string())?;
+            if req.start_token.len() != 32
+                || !req.start_token.bytes().all(|b| b.is_ascii_hexdigit())
+            {
+                return Err("启动令牌格式无效".into());
+            }
+            (
+                config::parse_config(&req.config.to_string())?,
+                req.start_token,
+                Some(req.plan_hash),
+            )
+        } else {
+            (config::parse_config(body)?, String::new(), None)
+        };
         let resumed = cfg.resume.then(history::fresh_pass_ids).unwrap_or_default();
         let preview = plan::preview_with_resumed(&cfg, &resumed)?;
+        if confirmed_hash.is_some_and(|hash| hash != preview.plan_hash) {
+            return Err("内环计划已过期，请重新预览".into());
+        }
         if preview.units == 0 {
             return Err("本轮没有勾选任何链路，请至少勾选一条再开始".into());
         }
@@ -164,32 +226,47 @@ impl Controller {
                 std::process::id(),
                 chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
             ),
+            start_token,
             total: preview.units,
             current: "准备检查设备".into(),
             ..Default::default()
         };
         self.cancel.store(false, Ordering::SeqCst);
+        self.skip.store(false, Ordering::SeqCst);
+        let skip = Arc::clone(&self.skip);
         let shared = Arc::clone(&self.state);
         let cancel = Arc::clone(&self.cancel);
         let spawned = std::thread::Builder::new()
             .name("inner-run".into())
             .spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    perform(cfg, false, &cancel, &|report, dir| {
-                        let mut s = crate::util::lock_recover(&shared);
-                        s.current = report.current.clone();
-                        s.error = report.error.clone();
-                        s.path = Some(dir.to_path_buf());
-                        // 只补新的：整份重建是 O(N)，每单元一次就成了 O(N^2)，
-                        // 而且发生在锁里，把每秒一次的 status 轮询一起拖住。
-                        // 单元只增不减，已经序列化过的不会再变。
-                        if report.units.len() < s.units.len() {
-                            s.units.clear();
-                        }
-                        for unit in &report.units[s.units.len()..] {
-                            s.units.push(unit_json(unit));
-                        }
-                    })
+                    perform_controlled(
+                        cfg,
+                        false,
+                        &cancel,
+                        &|report, dir| {
+                            let mut s = crate::util::lock_recover(&shared);
+                            if s.current_unit != report.current_unit
+                                && report.current_unit.is_some()
+                            {
+                                skip.store(false, Ordering::SeqCst);
+                            }
+                            s.current_unit = report.current_unit;
+                            s.current = report.current.clone();
+                            s.error = report.error.clone();
+                            s.path = Some(dir.to_path_buf());
+                            // 只补新的：整份重建是 O(N)，每单元一次就成了 O(N^2)，
+                            // 而且发生在锁里，把每秒一次的 status 轮询一起拖住。
+                            // 单元只增不减，已经序列化过的不会再变。
+                            if report.units.len() < s.units.len() {
+                                s.units.clear();
+                            }
+                            for unit in &report.units[s.units.len()..] {
+                                s.units.push(unit_json(unit));
+                            }
+                        },
+                        Some(&skip),
+                    )
                 }));
                 let mut s = crate::util::lock_recover(&shared);
                 match result {
@@ -201,6 +278,8 @@ impl Controller {
                 }
                 s.running = false;
                 s.current.clear();
+                s.current_unit = None;
+                skip.store(false, Ordering::SeqCst);
             });
         if let Err(e) = spawned {
             // 整个 State 复位，不能只把 `running` 抹掉：上面已经把
@@ -213,6 +292,19 @@ impl Controller {
         Ok(json!({"started":true}))
     }
     /// 内环历史，独立于子网的 runs/。
+    pub(crate) fn excel(&self) -> Result<Value, String> {
+        let dir = crate::util::lock_recover(&self.state)
+            .path
+            .clone()
+            .ok_or("还没有内环结果")?;
+        excel_file(&dir)
+    }
+    pub(crate) fn run_excel(&self, body: &str) -> Result<Value, String> {
+        history::excel(body)
+    }
+    pub(crate) fn bundle_dir(&self, id: &str) -> Option<PathBuf> {
+        history::resolve(id)
+    }
     pub(crate) fn runs(&self) -> Result<Value, String> {
         history::list()
     }
@@ -221,6 +313,9 @@ impl Controller {
     }
     /// 取回某一轮的配置装载回控制台。只回配置，不直接开跑——隔夜的网口拓扑
     /// 可能已经变了，该看到的是重新预览时的差异。
+    pub(crate) fn run_compare(&self, body: &str) -> Result<Value, String> {
+        super::history::compare(body)
+    }
     pub(crate) fn run_config(&self, body: &str) -> Result<Value, String> {
         history::config(body)
     }
@@ -281,6 +376,18 @@ mod tests {
     }
 
     #[test]
+    fn status_names_the_history_entry_of_the_run() {
+        let controller = Controller::default();
+        assert!(controller.status(0, None)["history_id"].is_null());
+        crate::util::lock_recover(&controller.state).path =
+            Some(std::path::Path::new("inner_runs").join("inner_20261014_195534_12324_725219400"));
+        assert_eq!(
+            controller.status(0, None)["history_id"],
+            "inner_20261014_195534_12324_725219400"
+        );
+    }
+
+    #[test]
     fn inner_stop_is_local_to_the_controller_and_idle_stop_is_a_noop() {
         let a = Controller::default();
         let b = Controller::default();
@@ -294,5 +401,57 @@ mod tests {
             a.cancel.as_ref(),
             crate::cancel::cancel_flag()
         ));
+    }
+}
+
+pub(super) fn excel_file(dir: &Path) -> Result<Value, String> {
+    use base64::Engine;
+    let path = dir.join("summary.xlsx");
+    if !regular_file(&path) {
+        return Err("内环 Excel 不是普通文件或尚未生成".into());
+    }
+    let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
+    Ok(
+        json!({"name": "cpe-inner-summary.xlsx", "base64": base64::engine::general_purpose::STANDARD.encode(bytes)}),
+    )
+}
+
+#[cfg(test)]
+mod control_tests {
+    use super::*;
+    #[test]
+    fn skip_is_bound_to_both_run_and_current_unit() {
+        let controller = Controller::default();
+        *crate::util::lock_recover(&controller.state) = State {
+            running: true,
+            run_id: "current".into(),
+            current_unit: Some(3),
+            ..Default::default()
+        };
+        for body in [
+            r#"{"run_id":"old","unit_seq":3}"#,
+            r#"{"run_id":"current","unit_seq":2}"#,
+        ] {
+            assert!(controller.skip_unit(body).is_err());
+            assert!(!controller.skip.load(Ordering::SeqCst));
+        }
+        controller
+            .skip_unit(r#"{"run_id":"current","unit_seq":3}"#)
+            .unwrap();
+        assert!(controller.skip.load(Ordering::SeqCst));
+        crate::util::lock_recover(&controller.state).current_unit = None;
+        assert!(controller
+            .skip_unit(r#"{"run_id":"current","unit_seq":3}"#)
+            .is_err());
+    }
+    #[test]
+    fn status_has_the_start_identity_for_unknown_response_reconciliation() {
+        let controller = Controller::default();
+        crate::util::lock_recover(&controller.state).start_token =
+            "abcdef0123456789abcdef0123456789".into();
+        assert_eq!(
+            controller.status(0, None)["start_token"],
+            "abcdef0123456789abcdef0123456789"
+        );
     }
 }

@@ -137,7 +137,7 @@ onMounted(() => {
     </header>
 
     <p v-if="!topologyReady" class="msg warn" role="status">
-      尚未取得两端网卡。<button type="button" class="linklike" @click="goto('connect')">去连接</button>
+      尚未取得足够网卡（本机两口也可测试）。<button type="button" class="linklike" @click="goto('connect')">去连接</button>
       <template v-if="plan.pendingImportTopology">；导入项目里的网口会保留，扫描成功后自动核对。</template>
     </p>
     <p v-else-if="plan.pendingImportTopology" class="msg warn" role="status">

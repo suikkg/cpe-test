@@ -20,7 +20,7 @@ const host = (name: string, suffix = '') => ({ hostname: name, os: 'Windows', in
 const local = (suffix = '') => ({ host: host('master', suffix), iperf3: 'iperf 3.18', version: 'test' });
 const topology = (suffix = '') => ({ master: host('master', suffix), agent: host('agent', suffix) });
 const success = (route: Route, data: unknown) => route.fulfill({ json: { ok: true, data } });
-const nav = (page: Page, name: string) => page.getByRole('navigation', { name: '控制台区域' }).getByRole('button', { name: new RegExp(`^${name}`) });
+const nav = (page: Page, name: string) => page.getByRole('navigation', { name: '控制台区域' }).getByRole('group', { name: name === '内环测试' ? '内环测试' : ['监控', '历史'].includes(name) ? '工具' : '子网测试', exact: true }).getByRole('button', { name: new RegExp(`^${name === '内环测试' ? '连接' : name}`) });
 
 async function consoleApi(page: Page, running: 'subnet' | 'inner' | 'scenario' | '' = '', entry = `/?token=${token}`) {
   const state = { localSuffix: '', connectSuffix: '', localFail: false, connectFail: false, connect401: false,
@@ -55,10 +55,17 @@ async function consoleApi(page: Page, running: 'subnet' | 'inner' | 'scenario' |
   return state;
 }
 
+/** 本机表在未连辅测机时按前缀框筛（桩里 master-USB 在 10.x）；清空前缀重扫后才是全部。 */
+async function showAllLocalNics(page: Page) {
+  await page.getByLabel('IPv4 前缀过滤').fill('');
+  await page.getByRole('button', { name: '重新扫描', exact: true }).click();
+  await expect(page.getByText('master-USB', { exact: true })).toBeVisible();
+}
+
 async function connectAgent(page: Page) {
   await nav(page, '连接').click();
   await page.getByRole('textbox', { name: /^辅测机地址/ }).fill('192.168.1.3');
-  await page.getByRole('button', { name: '连接', exact: true }).click();
+  await page.getByRole('main').getByRole('button', { name: '连接', exact: true }).click();
   await expect(page.getByText('已连上', { exact: false }).first()).toBeVisible();
 }
 
@@ -89,6 +96,17 @@ test('未连接只扫本机；连接多前缀；一个重扫入口刷新同一�
   expect(state.headers.every((header) => header['x-cpe-token'] === token)).toBe(true);
 });
 
+test('未连接辅测机时本机表按前缀框筛选，清空前缀重扫后显示全部', async ({ page }) => {
+  const state = await consoleApi(page);
+  await expect(page.getByLabel('IPv4 前缀过滤')).toHaveValue('192.168.');
+  await expect(page.getByText('master-USB', { exact: true })).toHaveCount(0);
+  await expect(page.getByText('前缀外 1 块未显示', { exact: false })).toBeVisible();
+  await showAllLocalNics(page);
+  await expect(page.getByText(/前缀外/)).toHaveCount(0);
+  await expect(page.getByText(/已重新扫描本机 · 2 块网卡/)).toBeVisible();
+  expect(state.connections).toHaveLength(0);
+});
+
 for (const failure of ['local', 'connect'] as const) {
   test(`${failure} 断开保留双端旧快照、原身份和时间，重试成功才移除提示`, async ({ page }) => {
     const state = await consoleApi(page);
@@ -115,7 +133,7 @@ for (const running of ['subnet', 'inner', 'scenario'] as const) {
   test(`${running} 首页同步后锁定扫描、连接及表单提交`, async ({ page }) => {
     const state = await consoleApi(page, running);
     await expect(page.getByRole('button', { name: '重新扫描', exact: true })).toBeDisabled();
-    await expect(page.getByRole('button', { name: '连接', exact: true })).toBeDisabled();
+    await expect(page.getByRole('main').getByRole('button', { name: '连接', exact: true })).toBeDisabled();
     await page.getByRole('textbox', { name: /^辅测机地址/ }).press('Enter');
     // 同时守住处理函数：requestSubmit 不受 disabled submit 按钮保护。
     await page.locator('form').evaluate((form: HTMLFormElement) => form.requestSubmit());
@@ -165,6 +183,7 @@ for (const width of [1280, 600]) {
     await expect(page.getByRole('link', { name: '跳转到主要内容' })).toBeFocused();
     await page.keyboard.press('Enter');
     await expect(page.locator('#main-content')).toBeFocused();
+    await showAllLocalNics(page);
     const search = page.getByRole('searchbox', { name: '搜索网卡' });
     await search.fill('USB');
     await expect(page.getByText('master-LAN', { exact: true })).toHaveCount(0);
@@ -228,7 +247,11 @@ for (const endpoint of ['local', 'connect'] as const) {
   });
 }
 
+const innerTab = (page: Page, name: string) => page.getByRole('navigation', { name: '控制台区域' }).getByRole('group', { name: '内环测试', exact: true }).getByRole('button', { name: new RegExp(`^${name}`) });
 async function innerScan(page: Page) {
+  // 既有测试覆盖 v4 草稿的兼容编辑路径；新工作台另有完整回归。
+  await page.addInitScript(() => { if (!localStorage.getItem('cpe_inner_project_v1')) localStorage.setItem('cpe_inner_project_v1', JSON.stringify({ kind: 'cpe-inner-project', version: 4, config: { ip_versions: [4,6] } })); });
+
   await consoleApi(page);
   const state = { reverse: false, probes: [] as Record<string, unknown>[] };
   await page.route('**/api/inner/probe', (route) => {
@@ -251,20 +274,22 @@ async function innerScan(page: Page) {
   await nav(page, '内环测试').click();
   return state;
 }
-const scanInner = (page: Page) => page.getByRole('button', { name: '检查 ADB / 扫描各电脑网卡', exact: true }).click();
+const scanInner = async (page: Page) => { await innerTab(page, '连接').click(); await page.getByRole('button', { name: '检查 ADB / 扫描各电脑网卡', exact: true }).click(); await innerTab(page, '计划').click(); };
 const innerPicker = (page: Page) => page.getByRole('region', { name: '从扫描结果添加网口' });
 
 for (const field of ['地址', '端口', '令牌（可空，不导出）', 'ADB 序列号（单设备可留空）']) {
   test(`内环待添加选择不能跨越连接身份修改：${field}`, async ({ page }) => {
     await innerScan(page);
-    await page.getByText('ADB 与辅测机设置', { exact: true }).click();
+    await page.getByText(/^ADB 与辅测机设置/).click();
     await page.getByRole('button', { name: '添加辅测机', exact: true }).click();
     await page.getByLabel('地址', { exact: true }).fill('192.168.8.200');
     await scanInner(page);
     const pick = () => innerPicker(page).getByRole('checkbox', { name: /agent1.*LAN-B/ });
     await pick().check();
     await expect(pick()).toBeChecked();
+    await innerTab(page, '连接').click(); await page.getByText(/^ADB 与辅测机设置/).click();
     await page.getByLabel(field, { exact: true }).fill(field === '端口' ? '28802' : field === '地址' ? '192.168.8.201' : 'new-identity');
+    await innerTab(page, '计划').click();
     await expect(innerPicker(page)).toHaveCount(0);
     await scanInner(page);
     // 新机器可以具有完全相同的网卡名和源地址，也必须重新明确选择。
@@ -322,16 +347,17 @@ test('单独运行的内环测试点「停止测试」真的发出停止请求',
   let stops = 0;
   await page.route('**/api/inner/stop', (route) => { stops++; return success(route, {}); });
   await nav(page, '内环测试').click();
+  await innerTab(page, '执行').click();
   await page.getByRole('button', { name: '停止测试', exact: true }).click();
   await expect.poll(() => stops).toBe(1);
 });
 
 test('内环多档位输入保留分隔符，真实计划按网口协议门限展开并能保存恢复', async ({ page }) => {
   await innerScan(page);
+  await scanInner(page);
   const screenshot = page.getByRole('checkbox', { name: '测试结束后截图（参与电脑，每单元一次）', exact: true });
   await expect(screenshot).toBeChecked();
   await screenshot.uncheck();
-  await scanInner(page);
   await innerPicker(page).getByRole('checkbox', { name: /主控本机.*LAN-A/ }).check();
   await page.getByRole('button', { name: '添加选中的 1 个网口' }).click();
   await page.getByRole('checkbox', { name: 'IPv6', exact: true }).uncheck();
@@ -349,6 +375,7 @@ test('内环多档位输入保留分隔符，真实计划按网口协议门限�
   await expect(streams).toHaveValue('1 4');
   await page.getByLabel('TCP 窗口 -w').fill('64k,4m');
   await page.getByLabel('UDP 报文长度 -l').fill('64 1400');
+  await innerTab(page, '执行').click();
   await page.getByRole('button', { name: '刷新预览', exact: true }).click();
   await page.getByText('逐单元清单（16 行）', { exact: true }).click();
   const preview = page.getByRole('region', { name: '计划预览', exact: true });
@@ -357,12 +384,18 @@ test('内环多档位输入保留分隔符，真实计划按网口协议门限�
   await expect(preview).toContainText('800.000 Mbps');
   await expect(preview).toContainText('90.000 Mbps');
   await expect(preview).toContainText('80.000 Mbps');
+  await innerTab(page, '计划').click();
+  await page.getByText('高级：并行流数、窗口、报文与端口', { exact: true }).click();
   await streams.fill('1 oops');
+  await innerTab(page, '执行').click();
   await expect(page.getByRole('button', { name: '刷新预览', exact: true })).toBeDisabled();
+  await innerTab(page, '计划').click();
+  await page.getByText('高级：并行流数、窗口、报文与端口', { exact: true }).click();
   await streams.fill('1 4');
   await page.waitForTimeout(300); // 草稿的既有去抖写入
   await page.reload();
   await nav(page, '内环测试').click();
+  await innerTab(page, '计划').click();
   await page.getByText('高级：并行流数、窗口、报文与端口', { exact: true }).click();
   await expect(streams).toHaveValue('1, 4');
   await expect(screenshot).not.toBeChecked();
@@ -375,10 +408,130 @@ test('内环结果主行说明双向合计与无有效验收，历史复用不�
   const row = { index: 1, link: 'ETH', host: 'master', ip_version: 4, protocol: 'tcp', direction: 'bidir', streams: 1, parameters: { streams: 1, tcp_window: '4m', udp_mbps: null, udp_length: null }, bidir_targets: { nic_mbps: 1800, tool_mbps: 1700 }, repeat: 1, measurement: 'nic_preferred', verdict: 'NOT_EVALUATED', reason: 'BIDIR_SOURCE_MISMATCH', detail: '两端来源不同，不能合计验收', diagnostics: [], total_mbps: null, total_target_mbps: null, overlap_secs: 20, legs: [leg('up', 'nic'), leg('down', 'tool')] };
   await page.route('**/api/inner/status*', route => success(route, { running: false, current: '', error: null, completed: 2, total: 2, units_from: 0, has_report: true, units: [row, { ...row, index: 2, resumed: true, verdict: 'PASS', legs: [] }] }));
   await nav(page, '内环测试').click();
+  await innerTab(page, '执行').click();
   const results = page.getByRole('region', { name: '内环执行与结果' });
   await expect(results).toContainText('双向合计 未获取 Mbps'); await expect(results).toContainText('配置网卡合计 1800.00 Mbps');
   await expect(results).toContainText('无法评价（NOT_EVALUATED）'); await expect(results).toContainText('复用历史 PASS');
   await expect(results.getByLabel('本轮结果概览')).toContainText('本轮达标0'); await expect(results).toContainText('-P 1 / -w 4m');
   await results.getByText('测量依据与诊断', { exact: true }).first().click();
   await expect(results).toContainText('已改用工具接收汇总：计数器不可用');
+});
+
+for (const width of [1280, 600]) {
+  test(`子网与内环的导航都按连接、计划、执行排列，组名可见（${width}px）`, async ({ page }) => {
+    // 两组按钮同名：窄屏横排时组名一旦藏掉，就分不出哪一组是内环。
+    await page.setViewportSize({ width, height: 900 });
+    await consoleApi(page);
+    for (const mode of ['子网测试', '内环测试']) {
+      const group = page.getByRole('navigation', { name: '控制台区域' }).getByRole('group', { name: mode, exact: true });
+      await expect(group.getByText(mode, { exact: true })).toBeVisible();
+      await expect(group.getByRole('button')).toHaveText([/^连接/, /^计划/, /^执行/]);
+    }
+  });
+}
+
+test('未连接辅测机时本机两口快捷测试仅预览所选一对并能开始', async ({ page }) => {
+  const state = await consoleApi(page);
+  let previewBody: Record<string, any> = {};
+  let runBody: Record<string, any> = {};
+  await page.route('**/api/plan', route => {
+    previewBody = route.request().postDataJSON();
+    return success(route, { units: [1,2].map(seq => ({ seq, title: `本机 TCP ${seq}`, est_secs: 25, resumed: false, load: ['-P 1'], targets: [] })), est_total_secs: 50, est_full_secs: 50, notices: [], sections: [], trace: [], plan_hash: 'quick-plan', blocking_errors: [] });
+  });
+  await page.route('**/api/run', route => { runBody = route.request().postDataJSON(); return success(route, { started: true }); });
+  await showAllLocalNics(page);
+  const quick = page.getByRole('region', { name: '本机两口快捷测试' });
+  await quick.getByLabel('网口 A', { exact: true }).selectOption('master-LAN');
+  await quick.getByLabel('网口 B', { exact: true }).selectOption('master-USB');
+  await quick.getByRole('button', { name: '预览快捷测试', exact: true }).click();
+  await expect(page.getByText('本机 TCP 1', { exact: true })).toBeVisible();
+  const pairs = previewBody.ui_plan.link_sets.flatMap((set: any) => set.pair_refs);
+  expect(pairs).toHaveLength(1);
+  expect(pairs[0]).toMatchObject({ src: 'master:NAME=master-LAN', dst: 'master:NAME=master-USB' });
+  expect(previewBody.ui_plan.bindings[0].pair_ids).toEqual([pairs[0].id]);
+  expect(state.connections).toHaveLength(0);
+  await page.getByRole('button', { name: '开始测试', exact: true }).click();
+  await expect.poll(() => runBody.plan_hash).toBe('quick-plan');
+  expect(runBody.ui_plan.bindings).toEqual(previewBody.ui_plan.bindings);
+  expect(state.connections).toHaveLength(0);
+});
+
+test('内环套件按明确分配的本机网口执行，真实预览保留档位、轮次和溯源', async ({ page }) => {
+  await innerScan(page); await scanInner(page);
+  await innerPicker(page).getByRole('checkbox', { name: /主控本机.*LAN-A/ }).check();
+  await innerPicker(page).getByRole('checkbox', { name: /主控本机.*LAN-B/ }).check();
+  await page.getByRole('button', { name: '添加选中的 2 个网口', exact: true }).click();
+  await page.getByRole('button', { name: '启用套件计划', exact: true }).click();
+  const workspace = page.getByRole('region', { name: '内环计划工作台' });
+  await workspace.getByRole('checkbox', { name: 'LAN-B 分配 基线测试', exact: true }).uncheck();
+  await workspace.getByRole('tab', { name: /^测试内容/ }).click();
+  await workspace.getByRole('checkbox', { name: 'IPv6', exact: true }).uncheck();
+  const window = workspace.getByLabel('TCP 窗口 -w');
+  await window.fill(''); await window.pressSequentially('64k 4m');
+  await expect(window).toHaveValue('64k 4m');
+  await innerTab(page, '执行').click();
+  await page.getByLabel('整计划轮次', { exact: true }).fill('2');
+  await page.getByRole('button', { name: '刷新预览', exact: true }).click();
+  await page.getByText('逐单元清单（8 行）', { exact: true }).click();
+  const preview = page.getByRole('region', { name: '计划预览', exact: true });
+  await expect(preview).toContainText('LAN-A'); await expect(preview).not.toContainText('/ LAN-B');
+  await expect(preview).toContainText('全部网口 / 基线测试 / TCP');
+  await expect(preview).toContainText('第 2 遍');
+  await expect(preview).toContainText('-w 4m');
+  let start: Record<string, any> = {};
+  await page.route('**/api/inner/run', route => { start = route.request().postDataJSON(); return success(route, { started: true }); });
+  await page.getByRole('button', { name: '开始内环测试', exact: true }).click();
+  await expect.poll(() => start.config?.rounds).toBe(2);
+  expect(start.config.agents).toEqual([]);
+  expect(start.config.workspace.bindings[0].links).toEqual(['LAN-A']);
+  expect(start.plan_hash).toMatch(/^[a-f0-9]{32}$/);
+  expect(start.start_token).toMatch(/^[a-f0-9]{32}$/);
+});
+
+test('内环默认门限、临时覆盖和诊断进入真实预览，编辑标签在导航间保留', async ({ page }) => {
+  await innerScan(page); await scanInner(page);
+  await innerPicker(page).getByRole('checkbox', { name: /主控本机.*LAN-A/ }).check();
+  await page.getByRole('button', { name: '添加选中的 1 个网口', exact: true }).click();
+  await page.getByRole('button', { name: '启用套件计划', exact: true }).click();
+  const workspace = page.getByRole('region', { name: '内环计划工作台' });
+  await workspace.getByRole('tab', { name: '测试内容', exact: true }).click();
+  await workspace.getByRole('checkbox', { name: 'IPv6', exact: true }).uncheck();
+  await workspace.getByRole('tab', { name: '门限与默认值', exact: true }).click();
+  await workspace.getByText('Ping 门限', { exact: true }).click();
+  await workspace.getByRole('button', { name: '自定义 Ping 门限', exact: true }).click();
+  await workspace.getByLabel('有线 · small 平均 RTT 门限 ms', { exact: true }).fill('0.5');
+  await workspace.getByLabel('有线 · small 最大 RTT 门限 ms', { exact: true }).fill('1');
+  await innerTab(page, '执行').click();
+  await page.getByText('临时覆盖与诊断', { exact: true }).click();
+  await page.getByLabel('本轮强制 TCP -w', { exact: true }).fill('8m');
+  await page.getByRole('checkbox', { name: '测负载下时延', exact: true }).check();
+  await page.getByRole('button', { name: '刷新预览', exact: true }).click();
+  await page.getByText(/逐单元清单/).click();
+  await expect(page.getByRole('region', { name: '计划预览', exact: true })).toContainText('-w 8m');
+  let start: Record<string, any> = {};
+  await page.route('**/api/inner/run', route => { start = route.request().postDataJSON(); return success(route, { started:true }); });
+  await page.getByRole('button', { name:'开始内环测试', exact:true }).click();
+  await expect.poll(() => start.config?.run_overrides?.tcp_window).toBe('8m');
+  expect(start.config.run_overrides.probe_during_traffic).toBe(true);
+  expect(start.config.ping_policy.wired_small_avg_rtt_ms).toBe(0.5);
+  await innerTab(page, '计划').click();
+  await expect(workspace.getByRole('tab', {name:'门限与默认值', exact:true})).toHaveAttribute('aria-selected','true');
+});
+
+test('内环历史提供下载包和两轮对比，复用与无法匹配单独列出', async ({ page }) => {
+  await consoleApi(page);
+  await page.route('**/api/inner/runs', route => success(route, ['base','new'].map(id => ({id,created_at:id,units:1,passed:1,rate_failed:0,not_evaluated:0,links:['ETH'],has_report:true,has_excel:true,has_config:true,bytes:1000,finished:true,probe_only:false,error:null}))));
+  let compared: Record<string,any> = {};
+  await page.route('**/api/inner/runs/compare', route => {
+    compared = route.request().postDataJSON();
+    return success(route, {baseline_finished:true,current_finished:true,regressions:1,added:0,missing:0,unmatchable:1,resumed:1,rows:[{title:'ETH / TCP',status:'REGRESSION',baseline_index:1,current_index:1,baseline_verdict:'PASS',current_verdict:'RATE_FAIL',baseline_mbps:950,current_mbps:400}]});
+  });
+  await nav(page, '历史').click();
+  await page.getByRole('tab', {name:'内环',exact:true}).click();
+  const base = page.getByRole('row').filter({has:page.getByRole('cell',{name:'base',exact:true})});
+  await expect(base.getByRole('link',{name:'下载包',exact:true})).toHaveAttribute('href', /\/api\/inner\/runs\/base\/bundle.zip\?token=/);
+  await base.getByRole('button',{name:'设为基线',exact:true}).click();
+  await page.getByRole('row').filter({has:page.getByRole('cell',{name:'new',exact:true})}).getByRole('button',{name:'与基线对比',exact:true}).click();
+  await expect(page.getByRole('region',{name:'内环两轮对比',exact:true})).toContainText('1 项回归');
+  expect(compared).toEqual({baseline:'base',current:'new'});
 });

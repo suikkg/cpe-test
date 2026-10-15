@@ -47,6 +47,8 @@ const connectionLabel = computed(() => {
  * 就是往一轮已经在跑的测试上再叠一轮。
  */
 const runStatus = computed<{ label: string; target: RegionId; live: boolean }>(() => {
+  if (inner.startPhase === 'unknown') return { label: '内环启动结果未确认', target: 'inner', live: false };
+  if (inner.startPhase === 'sending') return { label: '正在启动内环测试', target: 'inner', live: false };
   const subnet = `${runView.value.done}/${runView.value.total}`;
   if (inner.scenarioStartPhase === 'unknown') return { label: '启动结果未确认', target: 'inner', live: false };
   if (inner.scenarioStartPhase === 'sending') return { label: '正在启动组合场景', target: 'inner', live: false };
@@ -71,6 +73,8 @@ const regionIcons: Record<RegionId, string> = {
   connect: 'M5 3h14v6H5z M5 15h14v6H5z M12 9v6 M8 6h.01 M8 18h.01',
   plan: 'M9 5h12 M9 12h12 M9 19h12 M3 4h2v2H3z M3 11h2v2H3z M3 18h2v2H3z',
   run: 'M7 3l14 9-14 9z',
+  'inner-connect': 'M5 3h14v6H5z M5 15h14v6H5z M12 9v6 M8 6h.01 M8 18h.01',
+  'inner-plan': 'M9 5h12 M9 12h12 M9 19h12 M3 4h2v2H3z M3 11h2v2H3z M3 18h2v2H3z',
   inner: 'M5 7h14 M15 3l4 4-4 4 M19 17H5 M9 13l-4 4 4 4',
   monitor: 'M2 12h4l3-8 5 16 3-8h5',
   history: 'M4 5v5h5 M4 10a9 9 0 1 1 0 5 M12 7v5l3 2',
@@ -126,21 +130,23 @@ onMounted(() => {
 
     <div class="app-body">
       <nav class="rail" aria-label="控制台区域">
-        <div v-for="group in navigationGroups" :key="group.label" class="rail-group">
+        <div v-for="group in navigationGroups" :key="group.label" class="rail-group" role="group" :aria-label="group.label">
           <p v-if="group.regions.length > 1" class="rail-heading">{{ group.label }}</p>
-          <button
-            v-for="region in group.regions"
-            :key="region.id"
-            type="button"
-            class="rail-item"
-            :class="{ active: ui.region === region.id }"
-            :aria-current="ui.region === region.id ? 'page' : undefined"
-            @click="goto(region.id)"
-          >
-            <svg class="rail-icon" viewBox="0 0 24 24" aria-hidden="true"><path :d="regionIcons[region.id]"/></svg>
-            <span class="rail-label">{{ region.label }}</span>
-            <span v-if="badges[region.id]" class="rail-badge">{{ badges[region.id] }}</span>
-          </button>
+          <div class="rail-items">
+            <button
+              v-for="region in group.regions"
+              :key="region.id"
+              type="button"
+              class="rail-item"
+              :class="{ active: ui.region === region.id }"
+              :aria-current="ui.region === region.id ? 'page' : undefined"
+              @click="goto(region.id)"
+            >
+              <svg class="rail-icon" viewBox="0 0 24 24" aria-hidden="true"><path :d="regionIcons[region.id]"/></svg>
+              <span class="rail-label">{{ region.label }}</span>
+              <span v-if="badges[region.id]" class="rail-badge">{{ badges[region.id] }}</span>
+            </button>
+          </div>
         </div>
       </nav>
 
@@ -155,7 +161,7 @@ onMounted(() => {
         <RunView v-else-if="ui.region === 'run'" />
         <MonitorView v-else-if="ui.region === 'monitor'" />
         <HistoryView v-else-if="ui.region === 'history'" />
-        <InnerView v-else-if="ui.region === 'inner'" :subnet-running="run.running" @show-subnet-progress="goto('run')" />
+        <InnerView v-else-if="ui.region === 'inner' || ui.region === 'inner-connect' || ui.region === 'inner-plan'" :subnet-running="run.running" staged :page="ui.region === 'inner-connect' ? 'connect' : ui.region === 'inner-plan' ? 'plan' : 'run'" @navigate="goto($event === 'connect' ? 'inner-connect' : $event === 'plan' ? 'inner-plan' : 'inner')" @show-subnet-progress="goto('run')" />
       </main>
     </div>
   </div>
@@ -199,7 +205,7 @@ h1 { margin: 0; font-size: 16px; font-weight: 700; line-height: 1.4; white-space
   padding: 20px 10px 16px; border-right: 1px solid var(--line);
   background: var(--panel-2); overflow-y: auto;
 }
-.rail-group { display: grid; gap: 2px; }
+.rail-group, .rail-items { display: grid; gap: 2px; }
 .rail-heading { margin: 0 10px 6px; color: var(--muted); font-size: 11px; }
 .rail-item {
   display: flex; align-items: center; gap: 10px; width: 100%;
@@ -228,9 +234,11 @@ h1 { margin: 0; font-size: 16px; font-weight: 700; line-height: 1.4; white-space
   .header-status { width: 100%; gap: 8px; }
   .status-readout { flex: 1; }
   .rail { flex-direction: row; gap: 8px; padding: 8px 12px; overflow-x: auto; border-right: 0; border-bottom: 1px solid var(--line); }
-  .rail-group { display: flex; gap: 4px; flex: 0 0 auto; }
+  /* 子网和内环都是「连接 计划 执行」：分组名放在每组上方，横排时也认得出是哪一组。 */
+  .rail-group { flex: 0 0 auto; }
   .rail-group + .rail-group { padding-left: 8px; border-left: 1px solid var(--line); }
-  .rail-heading { display: none; }
+  .rail-heading { margin: 0 12px; font-size: 10.5px; line-height: 1.3; white-space: nowrap; }
+  .rail-items { display: flex; gap: 4px; }
   .rail-item { width: auto; gap: 7px; padding: 8px 12px; }
   .rail-item.active::before { top: auto; bottom: -1px; left: 12px; right: 12px; height: 2px; width: auto; }
   .rail-icon { width: 16px; height: 16px; flex-basis: 16px; }

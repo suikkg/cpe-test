@@ -1,12 +1,18 @@
 import { describe, expect, it } from 'vitest';
 import type { InnerUnit } from './inner';
 import { defaultInnerConfig, innerLink } from './inner';
-import { innerRecordedCounts, innerTargetText, innerRateText, innerUsesTotal, innerTotalTargetText, innerUnitExplanation } from './inner-report';
+import { innerRecordedCounts, innerScoredSecs, innerTargetText, innerRateText, innerUsesTotal, innerTotalTargetText, innerUnitExplanation } from './inner-report';
 const unit = (verdict: string, resumed = false): InnerUnit => ({ index: 1, link: 'ETH', host: 'master', protocol: 'tcp', direction: 'bidir', streams: 1, repeat: 1, measurement: 'nic_preferred', verdict, resumed, reason: '', detail: '', diagnostics: [], total_mbps: null, total_target_mbps: null, overlap_secs: null, legs: [] });
 describe('内环报告只解释已有结果', () => {
   it('按单元统计，复用历史不冒充本轮达标', () => {
     const units = [unit('PASS'), unit('PASS', true), unit('RATE_FAIL'), unit('MEASURED'), unit('NOT_EVALUATED'), unit('SETUP_ERROR')];
     expect(innerRecordedCounts(units)).toEqual({ total: 6, pass: 1, fail: 1, measured: 1, unknown: 1, error: 1, resumed: 1 });
+  });
+  it('有效时长显示计分时长，不显示双向重叠', () => {
+    // 2026-10-14 实机：双向重叠 10.958s，速率只取其中 6s。
+    expect(innerScoredSecs({ effective_secs: 10.958, required_secs: 6 })).toBe(6);
+    // 没跑满的窗口照实显示，判定另报窗口不足。
+    expect(innerScoredSecs({ effective_secs: 4.2, required_secs: 6 })).toBe(4.2);
   });
   it('区分未设门限、未取得测量和真实零值', () => {
     expect(innerTargetText(null)).toBe('未设门限'); expect(innerRateText(null)).toBe('未获取'); expect(innerRateText(0)).toBe('0.00');

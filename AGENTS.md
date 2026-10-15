@@ -70,12 +70,17 @@ shasum -a 256 dist/cpe_test-v<版本号>-windows-config-docs.zip   # 必须等�
    由此推出**两条不许破坏的推论**（ADR-17，详见 `.ai/PROJECT_ARCHITECTURE.md`）：
 
    - 「接收端采样不可信必须判 NOT_EVALUATED 而不是 RATE_FAIL」能被单独审；
-     唯一的旁证入口是 `RateStats::stall_evidence`：接收端计数器长时间零增长时，
+     工具侧旁证只从 `RateStats::with_tool_trace` 进来。其一是
+     `RateStats::stall_evidence`：接收端计数器长时间零增长时，
      用工具侧逐秒记录（接收端 server 优先，TCP 才用发送端）分辨「真断流」与
      「计数器没记账」。旁证**只决定前提层的门槛**（停滞门槛，以及整窗真断流时的
      有效下限），不进平均值、不参与和门限比较；真断流照常按平均值判
      PASS/RATE_FAIL（整窗都不通也一样，平均≈0 照判），分不清就维持 NOT_EVALUATED；
-     停滞门槛是窗口的 5% 且不低于一个采样间隔；
+     停滞门槛是窗口的 5% 且不低于一个采样间隔。
+     同一份接收端逐秒记录还回答另一个前提问题（`RateStats::counter_off_path`）：
+     计数器在走、平均却不到同一窗口内接收端工具记录的一半（工具 ≥1 Mbps）时，
+     这块网卡不在这条流量的路径上，判 `NOT_EVALUATED / COUNTER_OFF_PATH`。
+     它同样只决定前提、不和门限比较；只认 iperf3 server 的接收记录，CTS 不参与；
    - **判定之后不许再改写结果**。UDP 丢包、CTS 丢帧、TX 负载、滚动窗口、
      中途掉速、工具退出状态、起流数不足，全部走 `VerdictResult::diagnostics`。
      历史上正是这些「判定后再叠一层」的代码让同一种故障在 TCP 和 UDP 路径上
@@ -167,6 +172,19 @@ npm run test:e2e                 # 必须先 build；需要 Rust 工具链
 网卡与运行状态由浏览器请求桩控制，不起真实流量；服务不读本机配置、不打开系统浏览器，
 由测试运行器回收。默认端口 29876，可用 `CPE_BROWSER_TEST_PORT` 改；不复用已有服务。
 失败 trace 在 `ui/test-results/`，CI 上传为 `console-browser-traces`。
+
+真机验收不进 CI（没有被测设备），用例在 `ui/e2e/real/`（`*.real.ts`，默认 Playwright 配置匹配不到）：
+
+```bash
+npm run test:real   # 连到已在运行的控制台；环境变量见 e2e/real/acceptance.real.ts 文件头
+```
+
+Windows 上用 `e2e/real/run-windows.ps1 -Exe <cpe_test.exe>`（管理员）：起一个不带 `--config` 的控制台
+（默认判定口径）、临时放通测试端口、跑用例、收尾核对进程与防火墙规则。用例全程走界面——子网本机两口
+快捷测试；内环连接 → 选口 → 套件与分配 → 两轮执行 → 跳过 → 停止——并逐单元断言判定与原因码，核对
+报告曲线数、Excel 与下载包内容（含 CRC）、历史条目（`/api/inner/status` 的 `history_id`），以及板侧与
+本机没有残留 iperf3。**只断言「跑完了」的验收脚本在判定错了时照样通过**：2026-10-14 那轮脚本就是这样
+放过了 BusyBox Ping 误判和统计口选错。
 
 然后**把产物 `src/master/webui.html` 和源码一起提交**，再跑一遍 §1 的四件事。
 

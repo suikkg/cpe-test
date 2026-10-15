@@ -1,6 +1,7 @@
 import { reactive } from 'vue';
 import { api, UnauthorizedError, errorMessage, hasToken } from '../api/client';
 import { clockStamp } from '../domain/freshness';
+import { filterByIpv4Prefixes } from '../domain/nics';
 import type { BootstrapOut, ConnectOut, ConnectReq, LocalOut } from '../api/dto';
 
 /**
@@ -199,7 +200,8 @@ export async function load(): Promise<void> {
  * `/api/connect` 回包里的 `master`（按 IPv4 前缀过滤过的那一份），不是
  * `/api/local`。所以「只重扫本机」做不到——那样按下去表格不会变。
  *
- * - 还没连上：只能扫本机（`/api/local`，有意不按前缀过滤）。
+ * - 还没连上：只能扫本机（`/api/local` 是全量扫描，前缀由 `inventory.masterNics`
+ *   在页面上筛）。
  * - 已连上：两端一起重扫（`/api/connect`），沿用当前的地址、令牌和前缀。
  */
 export async function rescan(): Promise<void> {
@@ -233,7 +235,8 @@ export async function rescan(): Promise<void> {
       const agent = session.connection?.agent.interfaces.length ?? 0;
       session.scanMessage = `已重新扫描 · 本机 ${master} 块 / 辅测 ${agent} 块 · ${stamp()}`;
     } else {
-      session.scanMessage = `已重新扫描本机 · ${local.host.interfaces.length} 块网卡 · ${stamp()}`;
+      const shown = filterByIpv4Prefixes(local.host.interfaces, session.prefixes).length;
+      session.scanMessage = `已重新扫描本机 · ${shown} 块网卡 · ${stamp()}`;
     }
     session.scanKind = 'ok';
   } catch (error) {

@@ -225,11 +225,11 @@ pub struct LegMeasurement {
 
 fn tool_detail(rate: &ToolRate) -> String {
     let aggregate = match rate.aggregate {
-        Aggregate::Sum => "[SUM] 合计行",
-        Aggregate::Single => "单流 receiver 汇总行",
+        Aggregate::Sum => "多流取 [SUM] 合计",
+        Aggregate::Single => "单流",
     };
     format!(
-        "工具口径接收速率 {:.3}Mbps，取自{}的{aggregate}",
+        "工具口径接收速率 {:.3}Mbps，取自{}，{aggregate}",
         rate.mbps,
         rate.origin.label()
     )
@@ -248,8 +248,11 @@ fn tool_verdict(rate: &ToolRate, target: Option<f64>) -> VerdictResult {
         );
     };
     if rate.mbps >= target {
-        VerdictResult::pass()
-            .with_diagnostics(vec![format!("{detail}，达到工具口径门限 {target:.3}Mbps")])
+        // 判定依据写进 detail，不进诊断：诊断列只放这条腿上真的发生了的事。
+        VerdictResult {
+            detail: format!("{detail}，达到工具口径门限 {target:.3}Mbps"),
+            ..VerdictResult::pass()
+        }
     } else {
         VerdictResult::rate_fail(
             ReasonCode::RxBelowTarget,
@@ -435,7 +438,10 @@ pub fn total_verdict(
         );
     };
     if total >= target {
-        VerdictResult::pass().with_diagnostics(vec![format!("{detail}，门限 {target:.3}Mbps")])
+        VerdictResult {
+            detail: format!("{detail}，达到门限 {target:.3}Mbps"),
+            ..VerdictResult::pass()
+        }
     } else {
         VerdictResult::rate_fail(
             ReasonCode::RxBelowTarget,

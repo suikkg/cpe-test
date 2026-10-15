@@ -200,7 +200,7 @@ onMounted(startPolling);
     <p v-if="run.reportError" class="msg bad" role="alert">打开报告失败：{{ run.reportError }}</p>
     <p v-if="view.aborted" class="msg bad" role="alert">
       连续多个灌包单元没有任何测量，已在第 {{ run.status.aborted_at_unit }} 个单元中止剩余队列。
-      先确认被测设备是否掉线或重启，再重跑剩余项；已完成的部分照常出报告。
+      连接异常已触发熔断；已完成的结果已保留。
     </p>
 
     <div class="chips" role="group" aria-label="按判定筛选已完成单元">

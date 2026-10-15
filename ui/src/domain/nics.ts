@@ -70,3 +70,17 @@ export function nicLinkLocal(nic: NicInfo): string {
   if (!nic.ipv6_ll) return '';
   return nic.zone ? `${nic.ipv6_ll}%${nic.zone}` : nic.ipv6_ll;
 }
+
+/**
+ * 按 IPv4 前缀筛网卡，口径与 Rust 扫描时的过滤（`nic::ipv4_match` 加
+ * `scan_*::*_matches_scan`）相同：前缀列表为空 = 全部（含只有 IPv6 的口）；
+ * 非空时只留 IPv4 以任一非空前缀开头的口，只有 IPv6 的口不留。
+ *
+ * 连上辅测机后两端网卡由后端按前缀扫描；没连时本机表来自不过滤的
+ * `/api/local`，同一个前缀框就靠这里在页面上生效。两边口径不同的话，
+ * 同一个前缀连接前后列出的本机网卡会不一样。
+ */
+export function filterByIpv4Prefixes(nics: readonly NicInfo[], prefixes: readonly string[]): NicInfo[] {
+  if (prefixes.length === 0) return [...nics];
+  return nics.filter((nic) => prefixes.some((prefix) => prefix !== '' && nic.ipv4.startsWith(prefix)));
+}

@@ -671,25 +671,26 @@ jobs:
           # 版本号手写，跟着 release: 提交一起改（见上面 files: 那样短的输入
           # 才可以用表达式）。
           body: |
-            cpe_test v6.7.1 项目审查修复。
+            cpe_test v6.8.0 内环流程对齐与控制台修复。
 
             ## 更新内容
 
-            - 修复内环 RESUME 跳过记录延长旧 PASS 有效期的问题。只复用 24 小时内的实测 PASS；跳过记录不续期，原始证据过期或移除后重新测试。
-            - 修复并发启动实时监控突破 8 路会话上限的问题。上限检查与会话登记保持原子性。
-            - 新增两项在旧实现下失败的回归，同步操作说明、架构约束与 Windows 配置文档包。
-            - 保留内环多档参数、按网口 TCP / UDP 门限、默认截图及自包含报告，速率判定规则不变。
+            - 内环采用连接、计划、执行流程，支持链路集合、共享流量配置、套件分配、Ping 和整计划轮次。
+            - 新增内环 Excel、整轮下载包和两轮对比，补齐定向跳过、启动确认、临时覆盖与流量诊断。
+            - 子网支持无需辅测机的本机两口快捷测试；修复本机网卡前缀筛选和刷新后的前缀丢失。
+            - 窄屏导航保留子网测试、内环测试和工具分组名。
+            - 修复 BusyBox Ping 解析及统计口偏离流量路径时的误判。工具旁证只决定计数可信度，RX 门限验收保持单一入口。
+            - 兼容旧内环项目及 IPv4 RESUME 身份，主控与辅测机请使用同一版本。
 
             ## 验证
 
-            本地 988 项 Rust 测试、两平台全目标 clippy、549 项前端单测及 22 项真实 Chromium 回归通过。发布流水线补齐 Windows 原生全目标 clippy，并执行 Windows 原生测试与三平台构建。
+            本地 1027 项 Rust 测试、原生及 Windows MSVC 全目标严格 Clippy、570 项前端单测、构建与产物校验、29 项 Chromium 回归通过。发布流水线执行 Linux 质量门、Windows 原生测试与 Clippy、三平台构建及发布附件校验。
+
+            10 月 14 日 Windows 实机记录覆盖本机快捷 TCP、内环两轮 TCP/UDP/Ping、跳过、停止、报告与下载包一致性及清理。截图、IPv6、RESUME、带门限实流量、辅测机和长稳矩阵未在该轮覆盖；详见仓库验收文档。
 
             ## 使用
 
-            主控和辅测机请使用同一版本。Windows 包包含 ctsTraffic 2.0.4.0；iperf3 需按包内说明放置。内环另需 adb 和板侧 iperf3。
-
-            本轮未进行真实 CPE 线速灌包及 Windows 桌面截图实测。
-            三个平台归档的 SHA-256 见 SHA256SUMS。
+            Windows 包包含 ctsTraffic 2.0.4.0；iperf3 需按包内说明放置。内环另需 adb 和板侧 iperf3。三个归档的 SHA-256 见 SHA256SUMS。
           files: |
             release-assets/cpe_test-${{ github.ref_name }}-windows-x86_64.zip
             release-assets/cpe_test-${{ github.ref_name }}-macos-aarch64.tar.gz

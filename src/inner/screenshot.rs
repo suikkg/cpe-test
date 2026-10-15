@@ -113,7 +113,7 @@ mod tests {
     #[test]
     fn screenshot_is_outside_traffic_and_resume_execution() {
         let source = include_str!("mod.rs");
-        let start = source.find("let mut row = run_unit(").unwrap();
+        let start = source.find("let result = run_unit(").unwrap();
         let shot = source
             .find("row.screenshot = Some(screenshot::capture")
             .unwrap();

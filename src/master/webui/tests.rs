@@ -6570,6 +6570,7 @@ fn every_console_route_declares_its_concurrency_class() {
         "/api/skip-unit",
         "/api/inner/run",
         "/api/inner/stop",
+        "/api/inner/skip-unit",
         "/api/inner/probe",
         "/api/scenario/run",
         "/api/scenario/stop",
@@ -6591,6 +6592,9 @@ fn every_console_route_declares_its_concurrency_class() {
         "/api/runs/compare",
         "/api/inner/status",
         "/api/inner/report",
+        "/api/inner/excel",
+        "/api/inner/runs/excel",
+        "/api/inner/runs/compare",
         "/api/inner/runs",
         "/api/inner/runs/report",
         "/api/inner/runs/config",
@@ -6612,7 +6616,7 @@ fn every_console_route_declares_its_concurrency_class() {
         "/api/monitor/stop",
     ];
     // 路由前缀，不是端点本身。
-    let prefixes = ["/api/inner/"];
+    let prefixes = ["/api/inner/", "/api/inner/runs/"];
 
     let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/master/webui/http.rs");
     let text = std::fs::read_to_string(&source).expect("读 http.rs");
@@ -7074,5 +7078,123 @@ fn the_console_preview_routes_notices_by_kind_not_by_wording() {
     assert!(
         compiled.blocking_errors(false).is_empty(),
         "旧矩阵不按跳过阻断"
+    );
+}
+
+#[test]
+fn local_only_preview_and_config_do_not_require_an_agent() {
+    let mut state = state_with_pair();
+    let mut second = state.master.interfaces[0].clone();
+    second.name = "本机口2".into();
+    second.ipv4 = "192.168.0.105".into();
+    state.master.interfaces.push(second);
+    state.agent = HostInfo::default();
+    state.agent_host.clear();
+    let console = console_with(state);
+    let mut req = request();
+    req.nic_policies.clear();
+    req.pairs[0].dst = "master:NAME=本机口2".into();
+    let body = serde_json::to_string(&req).unwrap();
+    let out = api_plan(&console, &body).unwrap();
+    assert!(!out["units"].as_array().unwrap().is_empty());
+    let cfg: Config = serde_json::from_value(api_config(&console, &body).unwrap()).unwrap();
+    assert!(crate::config::local_only_tests(&cfg));
+    assert!(cfg.agent_host.is_empty());
+    assert!(cfg
+        .tests
+        .iter()
+        .all(|t| t.src.starts_with("master:") && t.dst.starts_with("master:")));
+}
+/// 没连辅测机时本机网卡来自 `/api/local` 的全量扫描，前缀只在页面上筛显示；
+/// 执行端开跑和每个单元前都按 `cfg.ipv4_prefixes` 重扫本机，所以本机计划
+/// 必须把前缀清掉，否则前缀外的本机网口一开跑就「消失」。跨机计划照旧带着前缀。
+#[test]
+fn a_local_only_plan_rescans_the_local_host_without_the_prefix_filter() {
+    let mut state = state_with_pair();
+    let mut second = state.master.interfaces[0].clone();
+    second.name = "本机口2".into();
+    second.ipv4 = "192.168.0.105".into();
+    state.master.interfaces.push(second);
+    state.agent = HostInfo::default();
+    state.agent_host.clear();
+    state.cfg.ipv4_prefixes = vec!["10.9.".into()];
+    let mut req = request();
+    req.nic_policies.clear();
+    req.pairs[0].dst = "master:NAME=本机口2".into();
+
+    let filtered = compile_request(&state, &req).unwrap();
+    assert!(
+        filtered.cfg.ipv4_prefixes.is_empty(),
+        "两块本机网口都不在 10.9. 内，带着前缀开跑会在重扫时丢掉它们"
+    );
+    state.cfg.ipv4_prefixes.clear();
+    let unfiltered = compile_request(&state, &req).unwrap();
+    assert_eq!(filtered.plan_hash, unfiltered.plan_hash, "前缀不进计划指纹");
+
+    let mut cross = state_with_pair();
+    cross.cfg.ipv4_prefixes = vec!["192.168.".into()];
+    let cross_plan = compile_request(&cross, &request()).unwrap();
+    assert_eq!(cross_plan.cfg.ipv4_prefixes, vec!["192.168.".to_string()]);
+}
+
+/// `/api/local` 只换本机网卡快照，不改操作员的前缀设置：`/api/bootstrap`
+/// 回填前缀框读的就是它，以前在这里被清空，刷新一次前缀框就成了「全部」。
+#[test]
+fn scanning_the_local_host_keeps_the_operators_prefix_setting() {
+    let mut state = state_with_pair();
+    state.agent = HostInfo::default();
+    state.agent_host.clear();
+    state.cfg.ipv4_prefixes = vec!["10.228.".into()];
+    let console = console_with(state);
+    let server = Arc::new(Server::http("127.0.0.1:0").unwrap());
+    let port = server.server_addr().to_ip().unwrap().port();
+    let worker = Arc::clone(&console);
+    let worker_server = Arc::clone(&server);
+    let thread = std::thread::spawn(move || {
+        for request in worker_server.incoming_requests() {
+            handle(request, &worker);
+        }
+    });
+    // `/api/local` 会真的扫本机，预算理由见 `the_console_token_gate_covers_both_the_page_and_the_api`。
+    let wait = Duration::from_secs(60);
+
+    let (status, body) = crate::http_client::get("127.0.0.1", port, "/api/local", wait).unwrap();
+    assert_eq!(status, 200, "{body}");
+    let (status, body) =
+        crate::http_client::get("127.0.0.1", port, "/api/bootstrap", wait).unwrap();
+    assert_eq!(status, 200, "{body}");
+    let bootstrap: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(bootstrap["data"]["ipv4_prefixes"], json!(["10.228."]));
+    {
+        let state = lock_recover(&console.state);
+        assert_eq!(state.cfg.ipv4_prefixes, vec!["10.228.".to_string()]);
+        assert_ne!(
+            state.master.hostname, "m",
+            "未连辅测机时本机快照换成这次扫描"
+        );
+    }
+
+    server.unblock();
+    thread.join().expect("请求线程正常收场");
+}
+
+#[test]
+fn local_only_plan_hash_ignores_an_unused_agent_snapshot() {
+    let mut state = state_with_pair();
+    let mut second = state.master.interfaces[0].clone();
+    second.name = "本机口2".into();
+    second.ipv4 = "192.168.0.105".into();
+    state.master.interfaces.push(second);
+    let mut req = request();
+    req.nic_policies.clear();
+    req.pairs[0].dst = "master:NAME=本机口2".into();
+    let first = compile_request(&state, &req).unwrap();
+    state.agent = HostInfo::default();
+    state.agent_host.clear();
+    let second = compile_request(&state, &req).unwrap();
+    assert_eq!(first.plan_hash, second.plan_hash);
+    assert_eq!(
+        second.topology_fingerprint,
+        crate::master::plan::topology_fingerprint(&state.master, &HostInfo::default())
     );
 }

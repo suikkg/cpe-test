@@ -28,6 +28,10 @@ pub(super) struct Summary {
     pub finished: Option<bool>,
     pub units: usize,
     pub passed: usize,
+    #[serde(default)]
+    pub resumed: usize,
+    #[serde(default)]
+    pub skipped: usize,
     pub rate_failed: usize,
     pub not_evaluated: usize,
     /// 参与本轮的网口名，按执行顺序。
@@ -40,7 +44,7 @@ pub(super) fn summarize(report: &super::RunReport) -> Summary {
         report
             .units
             .iter()
-            .filter(|unit| unit.verdict == label)
+            .filter(|unit| !unit.resumed && unit.verdict == label)
             .count()
     };
     let mut links: Vec<String> = Vec::new();
@@ -57,6 +61,8 @@ pub(super) fn summarize(report: &super::RunReport) -> Summary {
         finished: Some(report.error.is_none() && report.current.is_empty()),
         units: report.units.len(),
         passed: count("PASS"),
+        resumed: report.units.iter().filter(|u| u.resumed).count(),
+        skipped: count("SKIP"),
         rate_failed: count("RATE_FAIL"),
         not_evaluated: count("NOT_EVALUATED"),
         links,
@@ -76,12 +82,13 @@ struct Entry {
     #[serde(flatten)]
     summary: Summary,
     has_report: bool,
+    has_excel: bool,
     /// 有 config.json 才谈得上「按原配置重新生成计划」。
     has_config: bool,
     bytes: u64,
 }
 
-fn resolve(id: &str) -> Option<PathBuf> {
+pub(super) fn resolve(id: &str) -> Option<PathBuf> {
     if id.is_empty() || !regular_dir(Path::new(super::RUNS_ROOT)) {
         return None;
     }
@@ -137,6 +144,7 @@ pub(super) fn list() -> Result<serde_json::Value, String> {
                     .and_then(|text| serde_json::from_str(&text).ok())
                     .unwrap_or_default(),
                 has_report: regular_file(&dir, "report.html").is_some(),
+                has_excel: regular_file(&dir, "summary.xlsx").is_some(),
                 has_config: regular_file(&dir, "config.json").is_some(),
                 bytes: dir_size(&dir),
             }
@@ -165,6 +173,26 @@ pub(super) fn report(body: &str) -> Result<serde_json::Value, String> {
     let html =
         std::fs::read_to_string(path).map_err(|error| format!("读不到这一轮的报告：{error}"))?;
     Ok(serde_json::json!({"name": format!("cpe-inner-{id}.html"), "html": html}))
+}
+
+pub(super) fn compare(body: &str) -> Result<serde_json::Value, String> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct CompareReq {
+        baseline: String,
+        current: String,
+    }
+    let req: CompareReq = serde_json::from_str(body).map_err(|e| e.to_string())?;
+    let read = |id: &str| -> Result<serde_json::Value, String> {
+        let dir = resolve(id).ok_or("找不到这一轮内环运行")?;
+        let path = regular_file(&dir, "result.json").ok_or("历史结果不是普通文件")?;
+        serde_json::from_slice(&std::fs::read(path).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())
+    };
+    let mut out = super::compare::reports(&read(&req.baseline)?, &read(&req.current)?)?;
+    out["baseline"] = serde_json::json!(req.baseline);
+    out["current"] = serde_json::json!(req.current);
+    Ok(out)
 }
 
 /// 取回某一轮的配置，供「按原配置重新生成计划」装载回控制台。
@@ -260,6 +288,13 @@ fn fresh_pass_ids_in(root: &Path, now: SystemTime) -> HashSet<String> {
         }
     }
     ids
+}
+
+pub(super) fn excel(body: &str) -> Result<serde_json::Value, String> {
+    let (id, dir) = dir_of(body)?;
+    let mut out = super::webui::excel_file(&dir)?;
+    out["name"] = serde_json::Value::String(format!("cpe-inner-{id}.xlsx"));
+    Ok(out)
 }
 
 #[cfg(test)]

@@ -1,3 +1,4 @@
+import { initialInnerWorkspace } from '../domain/inner-workspace';
 import { reactive, watch } from 'vue';
 import { api, errorMessage, NetworkError, UnauthorizedError } from '../api/client';
 import { defaultInnerConfig, INNER_DRAFT_KEY, innerLink, mergeInnerUnits, normalizeInnerDraft, parseInnerProject, serializeInnerProject } from '../domain/inner';
@@ -8,11 +9,15 @@ import { goto } from './ui';
 import { session } from './session';
 
 export const inner = reactive({
-  config: { ...defaultInnerConfig(), ip_versions: [4, 6] as (4 | 6)[] }, capability: null as InnerCapability | null,
+  scannedSelection: [] as string[], showOtherScanned: false,
+  startPhase: 'idle' as 'idle' | 'sending' | 'accepted' | 'unknown',
+  stage: 'connect' as 'connect' | 'plan' | 'run', preparing: false,
+  config: (() => { const config = { ...defaultInnerConfig(), ip_versions: [4, 6] as (4 | 6)[] }; config.workspace = initialInnerWorkspace(config); return config; })(), capability: null as InnerCapability | null,
   status: { running: false, current: '', error: null, completed: 0, total: 0, units: [], has_report: false } as InnerStatus,
   /** 计划预览由后端产出；配置一改先标记失效，避免拿旧预览去开跑。 */
-  preview: null as InnerPreview | null, previewStale: true, previewError: '',
+  preview: null as InnerPreview | null, previewStale: true, previewError: '', previewFingerprint: '',
   /** 内环历史，独立于子网的 runs/。 */
+  workspaceTab: 'ports' as 'ports' | 'content' | 'limits', selectedSuiteId: '',
   runs: [] as InnerRunEntry[],
   synced: false, busy: false, error: '',
   scenarioStartPhase: 'idle' as 'idle' | 'sending' | 'accepted' | 'unknown',
@@ -44,6 +49,7 @@ let scenarioRequest = 0;
  * 排队。现在只认状态里带回的、自己发出的这枚令牌。
  */
 let pendingStartToken = '';
+let pendingInnerToken = '';
 
 /**
  * 一次性的随机令牌，32 位十六进制。
@@ -57,8 +63,9 @@ function newStartToken(): string {
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 
+function scenarioRunningOrPending(): boolean { return inner.scenario.running || inner.scenarioStartPhase === 'sending' || inner.scenarioStartPhase === 'unknown'; }
 export function scenarioBlocksActions(): boolean {
-  return inner.scenario.running || inner.scenarioStartPhase === 'sending' || inner.scenarioStartPhase === 'unknown';
+  return inner.startPhase === 'sending' || inner.startPhase === 'unknown' || scenarioRunningOrPending();
 }
 
 /**
@@ -98,6 +105,7 @@ watch(innerProbeIdentity, () => {
   // 同步失效也防住「改了又改回」：旧请求属于上一次连接，不能重新填回就绪状态。
   probeRequest++;
   inner.capability = null;
+  inner.scannedSelection = [];
 }, { flush: 'sync' });
 
 export function loadInnerDraft(): void {
@@ -136,9 +144,18 @@ export function loadInnerDraft(): void {
   }, { deep: true });
 }
 
+export function restoreInnerDefaults(): void {
+  if (inner.busy || inner.status.running || scenarioBlocksActions() || !inner.synced) return;
+  const config = { ...defaultInnerConfig(), ...probeConnection(), ip_versions: [4,6] as (4|6)[] };
+  config.workspace = initialInnerWorkspace(config);
+  planRequest++; inner.config = config; inner.preview = null; inner.previewStale = true; inner.previewFingerprint = '';
+  inner.preparing = true; inner.scannedSelection = []; inner.error = '';
+}
 export function importInner(text: string): void {
   if (inner.busy || inner.status.running || scenarioBlocksActions() || !inner.synced) throw new Error('请等待状态同步或当前内环操作完成');
-  inner.config = parseInnerProject(text);
+  const imported = parseInnerProject(text);
+  planRequest++; inner.previewFingerprint = '';
+  inner.config = imported; inner.preparing = true; goto('inner-plan');
   inner.capability = null;
   inner.preview = null;
   inner.previewStale = true;
@@ -165,6 +182,7 @@ export async function refreshInnerPlan(): Promise<void> {
     const preview = await api.post<InnerPreview>('/api/inner/plan', cfg);
     if (!current()) return;
     inner.preview = preview;
+    inner.previewFingerprint = snapshot;
     inner.previewStale = false;
     inner.previewError = '';
   } catch (e) {
@@ -193,12 +211,13 @@ async function readStatus(): Promise<void> {
     const { units_from: _from, ...rest } = delta;
     inner.status = { ...rest, units: mergeInnerUnits(inner.status.units, delta) };
     inner.synced = true;
+    if (inner.startPhase === 'unknown' && pendingInnerToken && delta.start_token === pendingInnerToken) { inner.startPhase = 'accepted'; inner.preparing = false; pendingInnerToken = ''; }
   } catch (e) {
     inner.synced = false;
     inner.error = errorMessage(e);
     unauthorized = e instanceof UnauthorizedError;
   } finally {
-    if (!unauthorized && (inner.status.running || !inner.synced)) timer = setTimeout(() => { void syncInnerStatus(); }, 1000);
+    if (!unauthorized && (inner.status.running || !inner.synced || inner.startPhase === 'unknown')) timer = setTimeout(() => { void syncInnerStatus(); }, 1000);
   }
 }
 async function freshStatusAfterCommand(): Promise<void> {
@@ -226,21 +245,35 @@ export async function probeInner(): Promise<void> {
 
 export async function startInner(): Promise<void> {
   if (inner.busy || inner.status.running || scenarioBlocksActions() || !inner.synced) return;
-  inner.busy = true; inner.error = '';
+  inner.busy = true; inner.error = ''; inner.startPhase = 'sending';
   try {
     const cfg = normalizeInnerDraft(inner.config);
     parseInnerProject(JSON.stringify(cfg));
     if (!cfg.links.some((link) => link.enabled)) throw new Error('本轮没有勾选任何网口，请至少勾选一条再开始');
-    await api.post('/api/inner/run', cfg);
+    if (!inner.preview?.plan_hash || inner.previewStale || inner.previewFingerprint !== JSON.stringify(cfg)) throw new Error('内环计划已过期，请重新预览');
+    pendingInnerToken = newStartToken();
+    await api.post('/api/inner/run', { config: cfg, start_token: pendingInnerToken, plan_hash: inner.preview.plan_hash });
+    inner.startPhase = 'accepted'; inner.preparing = false; pendingInnerToken = '';
     inner.status.running = true;
   } catch (e) {
     inner.error = errorMessage(e);
-    if (e instanceof NetworkError) inner.synced = false;
+    if (e instanceof NetworkError) { inner.synced = false; inner.startPhase = 'unknown'; }
+    else { inner.startPhase = 'idle'; pendingInnerToken = ''; }
   } finally { await freshStatusAfterCommand(); inner.busy = false; }
 }
 
+export function prepareAfterUnknownInner(): void {
+  if (inner.startPhase !== 'unknown' || !inner.synced || inner.status.running) return;
+  inner.startPhase = 'idle'; pendingInnerToken = ''; inner.previewStale = true; inner.preparing = true; inner.error = '';
+}
+export async function skipInnerUnit(): Promise<void> {
+  if (!inner.status.running || inner.status.current_unit == null || inner.status.skip_requested) return;
+  try { await api.post('/api/inner/skip-unit', { run_id: inner.status.run_id, unit_seq: inner.status.current_unit }); }
+  catch(e) { inner.error = errorMessage(e); }
+  finally { await syncInnerStatus(); }
+}
 export async function stopInner(): Promise<void> {
-  if (inner.busy || scenarioBlocksActions()) return;
+  if (inner.busy || scenarioRunningOrPending()) return;
   inner.busy = true; inner.error = '';
   try { await api.post('/api/inner/stop'); }
   catch (e) { inner.error = errorMessage(e); }
@@ -333,7 +366,7 @@ export async function syncScenarioStatus(retryWhenUnknown = false): Promise<void
     // 不继续用错误口令轮询。
     inner.scenarioLastReadIdle = false;
     if (e instanceof UnauthorizedError) session.phase = 'unauthorized';
-    else if (scenarioBlocksActions()) scheduleScenarioStatus();
+    else if (scenarioRunningOrPending()) scheduleScenarioStatus();
   }
 }
 
@@ -399,7 +432,7 @@ export async function loadInnerRunConfig(id: string): Promise<void> {
     // 历史入口语义是「恢复重跑」：沿用当时的计划，但默认只重跑未通过/未完成
     // 的单元；用户仍可在打流参数区取消勾选再做一次全量复测。
     loaded.resume = true;
-    inner.config = loaded;
+    inner.config = loaded; inner.stage = 'run'; inner.preparing = true;
     inner.capability = null;
     inner.preview = null;
     inner.previewStale = true;
