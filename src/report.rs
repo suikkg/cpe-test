@@ -740,7 +740,15 @@ pub fn write_report(path: &Path, rows: &mut [Row], meta: &ReportMeta) -> std::io
     // 看上去像「什么都没跑」，而实际上是「跑了但采样不可信、一条都不能下结论」。
     // 这两格补上之后，八格加起来正好覆盖 Verdict 的全部六个取值。
     // 通过率也走同一个方法：报告顶部、meta.json、历史列表三处说的是同一个数。
-    let rate = totals.pass_rate_pct();
+    let pass_rate = if pass + rate_fail == 0 {
+        "暂无验收结论".to_string()
+    } else {
+        format!(
+            "{pass}/{} = {:.1}%",
+            pass + rate_fail,
+            totals.pass_rate_pct()
+        )
+    };
 
     let mut h = String::with_capacity(80 * 1024);
     h.push_str(
@@ -1010,11 +1018,7 @@ summary:focus-visible, a:focus-visible, .table-scroll:focus-visible, .overview-s
         esc(&meta.elapsed)
     ));
     h.push_str(&format!(
-        "<p class=\"summary-note\">测试单元: {total}（不含 SKIP） · 判定通过率: <strong>{pass}/{judged} = {rate:.1}%</strong>。分母只算 PASS 与 RATE_FAIL——MEASURED 没有验收目标可比，NOT_EVALUATED 是采样不可信不能下结论，SETUP_ERROR 没跑成，SKIP 是上一轮已经过了。</p>\n",
-        total = total,
-        pass = pass,
-        judged = pass + rate_fail,
-        rate = rate,
+        "<p class=\"summary-note\">测试单元: {total}（不含 SKIP） · 判定通过率: <strong>{pass_rate}</strong>。分母只算 PASS 与 RATE_FAIL——MEASURED 没有验收目标可比，NOT_EVALUATED 是采样不可信不能下结论，SETUP_ERROR 没跑成，SKIP 是上一轮已经过了。</p>\n",
     ));
 
     if !meta.run_health.is_empty() {

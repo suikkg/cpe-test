@@ -578,6 +578,8 @@ Windows 文本适配器：`src/cmd/ipconfig.rs` 解析中英文 `ipconfig /all`�
 
 ### 11.1 必须保持
 
+- 内环 `LegRow` 归档及状态 API 保留 `baseline_cutoff_ms`、`window_start_ms`、`window_end_ms`，与 `rx_samples` 共用监控时间轴。它们直接来自本腿事件截止点与实际 `RateStats`，供外部从原始样本复算背景扣除、窗口裁剪与时间加权平均，不得用配置时长或进程总时长反推。
+
 - 两轮对比使用 `Row.comparison_identity`（`ComparisonIdentity` / `ComparisonLeg`），由 `executor::row::unit_row` 从计划保存单元方向、轮次、各腿端点及参数/时长；不改变 `Leg.tag`、行级方向或 RESUME 身份。历史缺字段时只从完整类型化明细还原，重复或不完整的键全部保留并标记 `DeltaKind::Ambiguous`，禁止覆盖或任意配对；`Ambiguous` 排在 `Regressed` / `SlowerButStillSameVerdict` 之后。任一轮判定为 SKIP（只来自 RESUME 复用）的对齐项归为 `DeltaKind::Resumed`，不算回归也不算转好。CLI 退出码由 `master::ui::compare_exit_code` 决定：有回归 1，无回归但不完整 2，否则 0（回归优先）；「不完整」= 有 `Ambiguous` 项**或**基线单元在本轮 `Disappeared`（后者以前不算，半截的 run 会拿到 0 被 CI 放行，守在 `a_run_missing_baseline_units_is_an_incomplete_comparison_not_a_pass`）；API 附加 `ambiguous` 与 `resumed` 计数。
 - 子网扫描统一调用 `InfoReq::for_scan`：空前缀显式全扫，有前缀照常过滤。预览和执行启动都验证完整扫描能力，`LiveTopology` 复用相同请求构造，不添加额外轮询。旧 `/info` 缺省请求仍回落到 agent 默认前缀。
 - 组合场景的启动结果未知由 `state/inner::scenarioStartPhase` 持续保存，`scenarioBlocksActions` 统一拦截冲突操作；断线只续接状态查询，不重发启动。**确认起跑只认状态里带回的本次启动令牌**（`scenario::Request::start_token`，`valid_start_token` 校验，`/api/scenario/status` 原样带回）：不再拿「场景 ID 与开始前不同」判断——初次状态读取失败时基准是空串，任何旧场景都会被误认。别的页面起的场景在跑时保持未确认。单次空闲不解除未知，明确重新准备（`prepareAfterUnknownScenario`）只清本地状态，并**同时作废内环与子网预览**；401 进入统一会话失效流程。监控每条轮询链绑定 `pollEpoch`，停止即作废，旧请求成功/失败都不得改状态或续接。

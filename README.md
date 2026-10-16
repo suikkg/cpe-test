@@ -30,6 +30,13 @@
 
 结果保存在 `inner_runs/inner_*/` 下的 `report.html`、`result.json`、`summary.json`、`config.json` 与 `units.jsonl`，不进入子网 `runs`。左侧「历史」的「内环」标签可以列出历次运行、下载报告，或把当时的配置装载回内环页重新生成计划——装载配置后默认打开内环 RESUME，仍需重新预览并点击开始；隔夜的网口拓扑可能已经变了，该看到的是预览里的差异。组合场景记录保存在 `scenarios/`，在「历史」的「组合场景」标签载入子网计划与内环配置后再次执行。退出码 0 表示完成且 PASS/MEASURED（探测模式为能力探测成功），1 表示 RATE_FAIL/NOT_EVALUATED，2 表示配置、环境、取消或回收失败。内环提供自己的 HTML/JSON 与 Excel 报告；内环 RESUME 与子网 RESUME 分开计算。每单元追加 JSONL 并更新摘要；HTML/完整 JSON 在单元结束时按 30 秒间隔节流更新，收尾必写，因此运行中的下载可能落后于界面已完成数量。历史记录显示明确的收尾状态，旧记录未提供状态时显示未知。
 
+## v6.8.1
+
+- 无 PASS/RATE_FAIL 单元时，子网报告显示「暂无验收结论」，避免把仅测量的整轮显示为 `0/0 = 0.0%`。
+- 内环报告分别标明整计划遍次与单项重复，避免两轮计划都显示「第 1 轮」。
+- 内环 JSON 归档和状态 API 补存背景截止时刻及判定窗口起止，可从原始 RX 样本独立复算平均值；速率与判定算法保持不变。
+- 真机验收增加报告与宽/窄屏 UI 截图、TCP/UDP 双向门限通过及失败、RESUME、错误统计口和工具兜底场景。证据与范围见 [报告、UI 与速率验收](docs/testing/report-ui-rate-acceptance-2026-10-15.md)。
+
 ## v6.8.0
 
 - 内环按「连接 → 计划 → 执行」组织，支持链路集合、共享流量配置、套件分配、整计划轮次与 Ping；新增 Excel、整轮包下载和两轮对比。
@@ -821,7 +828,7 @@ CPE（Customer Premises Equipment）子网测试工具用于在**两台电脑之
 ```
 cpe_test.exe          ← 本工具（单文件）
 iperf3.exe            ← 从 iperf.fr 下载（只测 Ping/ctsTraffic 可不放）
-ctsTraffic.exe        ← v6.8.0 Windows Release 已捆绑（仅 Windows 10+）
+ctsTraffic.exe        ← v6.8.1 Windows Release 已捆绑（仅 Windows 10+）
 start_agent.bat       ← 辅测机双击
 start_ui.bat          ← 主控机双击（图形控制台，推荐）
 start_master.bat      ← 主控机双击（命令行问答式）
@@ -1652,7 +1659,7 @@ cargo build --release --locked
 
 自行编译后，把 `cpe_test.exe`、启动脚本和所需吞吐工具放到两台 Windows 电脑同一目录：
 iperf3 测试需要完整的 iperf3 Windows 发行包；ctsTraffic 测试需要 `ctsTraffic.exe`。
-官方 v6.8.0 Windows Release ZIP 已捆绑固定且校验过的 ctsTraffic 2.0.4.0，但由于发行包差异不内置 iperf3。
+官方 v6.8.1 Windows Release ZIP 已捆绑固定且校验过的 ctsTraffic 2.0.4.0，但由于发行包差异不内置 iperf3。
 
 ### GitHub Actions CI
 
@@ -1675,7 +1682,7 @@ Windows ZIP 包含启动脚本、四份配置、固定 CTS 二进制和第三方
 `tar.gz` 保留 `cpe_test` 可执行位。发布作业会再次核对资产名称、数量、内部结构和哈希。
 
 仓库同时跟踪一份不含可执行程序的
-[`cpe_test-v6.8.0-windows-config-docs.zip`](dist/cpe_test-v6.8.0-windows-config-docs.zip)，
+[`cpe_test-v6.8.1-windows-config-docs.zip`](dist/cpe_test-v6.8.1-windows-config-docs.zip)，
 便于直接从 Git 下载 Windows 配置、文档和启动脚本。其 SHA-256 位于同目录的
 `.zip.sha256` 文件；CI 会逐文件确认压缩包内容与仓库源文件一致。需要开箱即用的程序、
 固定版 ctsTraffic 和许可证全集时，仍应下载上面的正式 Windows Release ZIP。
@@ -1781,4 +1788,4 @@ JSON 配置通过 `parameter_options` 设置数组：`tcp_streams`、`tcp_window
 
 内环与子网一样默认开启测试截图，可在内环打流设置中关闭（配置字段 `screenshot`，默认 `true`）。每个实际执行单元的全部流量结束并回收后，截取参与电脑的桌面一次；双向共用一张，RESUME 跳过及取消不截图。主控使用本机截图，辅测机使用已鉴权的截图接口。PNG 保存在本轮运行目录，HTML 报告内嵌截图，可单独离线查看；控制台显示保存状态或失败原因。截图失败不影响速率判定。截图对象为电脑桌面，板侧测量依据仍为采样和日志。
 
-Windows v6.8.0 正式安装包包含 `inner.example.json`，内环参数可参考该文件填写。
+Windows v6.8.1 正式安装包包含 `inner.example.json`，内环参数可参考该文件填写。

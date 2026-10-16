@@ -1794,6 +1794,24 @@ fn wifi_endpoints_carry_their_radio_context_and_wired_ones_stay_clean() {
 /// 把它们算进分母等于把「没测」记成「没过」——报告顶部、`meta.json` 和历史
 /// 列表三处都读这一个算式，错一次就是三处一起错。
 #[test]
+fn a_report_without_judged_units_does_not_present_a_zero_percent_pass_rate() {
+    for verdict in [
+        Verdict::Measured,
+        Verdict::NotEvaluated,
+        Verdict::SetupError,
+        Verdict::Skip,
+    ] {
+        let html = render(vec![unit_summary("no-judgement", verdict)]);
+        assert!(html.contains("判定通过率: <strong>暂无验收结论</strong>"));
+        assert!(!html.contains("0/0 = 0.0%"));
+    }
+    let mut failed = unit_summary("failed", Verdict::RateFail);
+    failed.sort_key.0 = 1;
+    let html = render(vec![unit_summary("passed", Verdict::Pass), failed]);
+    assert!(html.contains("判定通过率: <strong>1/2 = 50.0%</strong>"));
+}
+
+#[test]
 fn the_pass_rate_denominator_counts_only_the_units_that_got_a_verdict() {
     let totals = crate::report::VerdictTotals {
         total: 10,

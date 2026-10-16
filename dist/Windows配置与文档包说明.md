@@ -1,13 +1,13 @@
-# cpe_test v6.8.0 Windows 配置与文档包
+# cpe_test v6.8.1 Windows 配置与文档包
 
-仓库中的 `cpe_test-v6.8.0-windows-config-docs.zip` 是便于从 Git 直接下载的
+仓库中的 `cpe_test-v6.8.1-windows-config-docs.zip` 是便于从 Git 直接下载的
 Windows 配置、说明文档和启动脚本资料包。包内文件由仓库当前版本生成，并由 CI
 逐文件与源码副本比对，避免配置或文档过期。
 
 这个资料包**不包含可执行程序或吞吐工具**：
 
 - 不包含 `cpe_test.exe`；请从 GitHub Release 下载正式
-  `cpe_test-v6.8.0-windows-x86_64.zip`，或自行编译。
+  `cpe_test-v6.8.1-windows-x86_64.zip`，或自行编译。
 - 不包含 `ctsTraffic.exe`；正式 Windows Release ZIP 会捆绑固定并校验过的
   Microsoft ctsTraffic 2.0.4.0 x64。
 - 不包含 `iperf3.exe` 及其 DLL；需要 iperf3 测试时，请放入完整的 Windows
@@ -28,6 +28,8 @@ Windows 配置、说明文档和启动脚本资料包。包内文件由仓库当
 - `start_ui.bat`（图形控制台）、`start_agent.bat`、`start_master.bat`、`start_master_select_config.bat`。
 - iperf3/ctsTraffic 放置说明、MIT 许可证和第三方声明。
 
-## v6.8.0 行为要点
+## v6.8.1 行为要点
 
 内环按连接、计划与执行组织，支持链路集合、流量配置、套件分配、Ping、整计划轮次、Excel、整轮包与两轮对比。子网可独立执行本机两口快捷测试，本机网卡遵循前缀筛选；窄屏保留导航分组名。修复 BusyBox Ping 解析及统计口偏离流量路径时的误判，旁证只决定计数可信度，不参与 RX 门限比较。旧配置和 IPv4 RESUME 身份保持兼容。Windows 包继续捆绑 ctsTraffic 2.0.4.0，iperf3 与内环所需 adb 由用户准备。
+
+报告无验收单元时显示「暂无验收结论」。内环归档保留判定窗口与背景截止时刻，支持按原始样本独立复算接收速率。

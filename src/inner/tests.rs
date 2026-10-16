@@ -164,6 +164,43 @@ fn the_report_prints_the_scored_duration_not_the_bidirectional_overlap() {
     assert!(!html.contains(&format!("{overlap:.2}s / 20s")));
 }
 
+/// 归档必须带齐复算平均值所需的输入，不能只保留一个无法定位的最终数字。
+#[test]
+fn archived_inner_samples_can_reproduce_the_scored_receiver_average() {
+    let row = assembled_bidir(Measurement::NicStrict, 3_000, false);
+    let saved = serde_json::to_value(&row).unwrap();
+    for leg in saved["legs"].as_array().unwrap() {
+        let start = leg["window_start_ms"].as_u64().unwrap();
+        let end = leg["window_end_ms"].as_u64().unwrap();
+        assert_eq!((start, end), (8_000, 28_000));
+        assert!(leg["baseline_cutoff_ms"].as_u64().unwrap() <= start);
+        let baseline = leg["background_mbps"].as_f64().unwrap();
+        let mut weighted = 0.0;
+        let mut covered = 0;
+        let mut previous_end = start;
+        for sample in leg["rx_samples"]["samples"].as_array().unwrap() {
+            if sample["valid"] != true {
+                continue;
+            }
+            let elapsed = sample["elapsed_ms"].as_u64().unwrap();
+            let interval = sample["interval_ms"].as_u64().unwrap();
+            let left = elapsed
+                .saturating_sub(interval)
+                .max(start)
+                .max(previous_end);
+            let right = elapsed.min(end);
+            if right > left {
+                weighted += (sample["rx_mbps"].as_f64().unwrap() - baseline).max(0.0)
+                    * (right - left) as f64;
+                covered += right - left;
+                previous_end = right;
+            }
+        }
+        assert_eq!(covered, 20_000);
+        assert!((weighted / covered as f64 - leg["nic_rx_mbps"].as_f64().unwrap()).abs() < 1e-9);
+    }
+}
+
 /// 诊断列只放这条腿上真的发生了的事。以前每条腿都挂两句同样的说明（背景怎么
 /// 扣、要保持业务空闲、板侧怎么读计数），正常的腿和出了问题的腿看上去一样。
 /// 唯一允许的常驻行是主控平台本身的计数器说明，它在 Windows / Linux 上为空。
@@ -1493,6 +1530,9 @@ fn sample_leg(flow: Flow, source: Source, mbps: f64) -> LegRow {
         nic_reason: "PASS".into(),
         nic_target_mbps: Some(400.0),
         background_mbps: 0.25,
+        baseline_cutoff_ms: 2500,
+        window_start_ms: 8000,
+        window_end_ms: 27400,
         coverage: 0.999,
         effective_secs: 19.4,
         required_secs: 20,
@@ -3106,6 +3146,21 @@ fn readable_report_fixture() -> RunReport {
         units: vec![total, failed, measured, unknown, setup, resumed],
         error: None,
     }
+}
+
+#[test]
+fn inner_report_distinguishes_whole_plan_rounds_from_per_unit_repeats() {
+    let mut saved = readable_report_fixture();
+    for unit in &mut saved.units {
+        unit.round = 2;
+        unit.repeat = 3;
+    }
+    let html = report::render(&saved);
+    assert_eq!(
+        html.matches("第 2 遍 · 重复 3").count(),
+        saved.units.len() * 2,
+        "结果清单与单元明细都要保留整计划遍次和单项重复"
+    );
 }
 
 #[test]

@@ -69,7 +69,7 @@ pub(super) fn render(report: &RunReport) -> String {
                 .iter()
                 .filter(|u| u.host == host && u.link == link)
             {
-                let _ = write!(html, "<tr><td><a href=\"#unit-{}\">#{}</a></td><td>{} / IPv{}</td><td>{}<small>第 {} 轮</small></td><td class=\"parameters\">{}</td><td>{}</td><td>{}<p class=\"reason\">{}</p></td></tr>", unit.index, unit.index, unit.protocol.label(), unit.ip_version, unit.direction.label(), unit.repeat, escape(&parameter_label(unit)), acceptance_summary(report, unit), unit_badge(unit), escape(&unit_explanation(unit)));
+                let _ = write!(html, "<tr><td><a href=\"#unit-{}\">#{}</a></td><td>{} / IPv{}</td><td>{}<small>第 {} 遍 · 重复 {}</small></td><td class=\"parameters\">{}</td><td>{}</td><td>{}<p class=\"reason\">{}</p></td></tr>", unit.index, unit.index, unit.protocol.label(), unit.ip_version, unit.direction.label(), unit.round, unit.repeat, escape(&parameter_label(unit)), acceptance_summary(report, unit), unit_badge(unit), escape(&unit_explanation(unit)));
             }
             html.push_str("</tbody></table></div>");
         }
@@ -86,7 +86,7 @@ pub(super) fn render(report: &RunReport) -> String {
                 escape(&origin.task)
             );
         }
-        let _ = write!(html, "<article id=\"unit-{}\" class=\"unit\"><h3>#{unit_index} {} · {} / IPv{} · {} · 第 {} 轮 {}</h3><p class=\"parameters\">{}</p><div class=\"acceptance\">{}</div><p>{}</p>", unit.index, escape(&unit.link), unit.protocol.label(), unit.ip_version, unit.direction.label(), unit.repeat, unit_badge(unit), escape(&parameter_label(unit)), acceptance_summary(report, unit), escape(&unit_explanation(unit)), unit_index=unit.index);
+        let _ = write!(html, "<article id=\"unit-{}\" class=\"unit\"><h3>#{unit_index} {} · {} / IPv{} · {} · 第 {} 遍 · 重复 {} {}</h3><p class=\"parameters\">{}</p><div class=\"acceptance\">{}</div><p>{}</p>", unit.index, escape(&unit.link), unit.protocol.label(), unit.ip_version, unit.direction.label(), unit.round, unit.repeat, unit_badge(unit), escape(&parameter_label(unit)), acceptance_summary(report, unit), escape(&unit_explanation(unit)), unit_index=unit.index);
         let _ = write!(
             html,
             "<p class=\"muted\">测量策略：{}。{}</p>",

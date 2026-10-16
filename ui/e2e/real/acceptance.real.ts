@@ -21,8 +21,9 @@
 // 判 NOT_EVALUATED（COUNTER_OFF_PATH / COUNTER_STALLED）才是对的，这条用例会因此失败。
 import { test, expect, type Page } from '@playwright/test';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { mkdirSync, writeFileSync, appendFileSync } from 'node:fs';
+import { join, resolve, dirname } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { readXlsx, readZip, sheetRecords } from './archive';
 
 const env = process.env;
@@ -112,14 +113,86 @@ const nav = (page: Page, group: '子网测试' | '内环测试' | '工具', name
   .getByRole('button', { name: new RegExp(`^${name}`) });
 
 function watchPageErrors(page: Page): Error[] {
+  page.on('response', async response => {
+    if (!/\/api\/(inner\/status|progress)$/.test(new URL(response.url()).pathname)) return;
+    try { const body = await response.json(); const data = body.data;
+      appendFileSync(join(evidenceDir, 'status-timeline.jsonl'), JSON.stringify({time:Date.now(),path:new URL(response.url()).pathname,running:data?.running,run_id:data?.run_id,current_unit:data?.current_unit,current:data?.current,completed:data?.completed})+'\n');
+    } catch {}
+  });
   const errors: Error[] = [];
   page.on('pageerror', error => errors.push(error));
   return errors;
 }
 
+
+function assertPingEvaluation(unit: any): void {
+  expect(unit.ping, '双向 Ping 应保留两端实测数据').toHaveLength(2);
+  expect(unit.detail).toContain('平均 RTT 门限 10 ms；最大 RTT 门限 30 ms');
+  const reasons = unit.ping.map(({result: out}: any) => {
+    expect(out.sent).toBe(5);
+    expect(out.received).toBeGreaterThanOrEqual(0);
+    expect(out.received).toBeLessThanOrEqual(out.sent);
+    if (out.received !== out.sent) return 'PING_PACKET_LOSS_HIGH';
+    if (out.rtt_avg == null || out.rtt_max == null) return 'PING_RTT_MISSING';
+    if (out.rtt_avg > 10) return 'PING_RTT_AVG_EXCEEDED';
+    if (out.rtt_max > 30) return 'PING_RTT_MAX_EXCEEDED';
+    return 'PING_OK';
+  });
+  const reason = reasons.find((value: string) => value !== 'PING_OK') ?? 'PING_OK';
+  expect(unit.verdict, `按实测丢包和 RTT 独立核对：${JSON.stringify(unit.ping)}`).toBe(reason === 'PING_OK' ? 'PASS' : 'RATE_FAIL');
+  expect(unit.reason).toBe(reason);
+}
+
+async function captureUi(page: Page, name: string) {
+  for (const width of [1366, 600, 390]) {
+    await page.setViewportSize({width,height:900});
+    await page.screenshot({path:join(evidenceDir,`${name}-ui-${width}.png`),fullPage:true});
+    const headings=page.getByRole('navigation',{name:'控制台区域'}).locator('.rail-heading');
+    if (await headings.count()) for (const heading of await headings.all()) await expect(heading).toBeVisible();
+  }
+  await page.setViewportSize({width:1366,height:900});
+}
+async function auditReportVisual(page: Page, name: string, html: string, assets?: Map<string, Buffer>) {
+  save(`${name}.html`,html);
+  const context = await page.context().browser()!.newContext();
+  const report = await context.newPage(); const errors=watchPageErrors(report);
+  let source = join(evidenceDir,`${name}.html`);
+  if (assets) {
+    const root = resolve(evidenceDir,`${name}-files`);
+    for (const [relative, bytes] of assets) {
+      const target = resolve(root,relative);
+      if (!target.startsWith(root + (process.platform === 'win32' ? '\\' : '/'))) throw new Error('下载包路径超出报告目录');
+      mkdirSync(dirname(target),{recursive:true});writeFileSync(target,bytes);
+    }
+    source = join(root,'report.html');
+  }
+  await report.goto(pathToFileURL(resolve(source)).href,{waitUntil:'domcontentloaded'});
+  await report.locator('img').evaluateAll(images=>images.forEach(image=>(image as HTMLImageElement).loading='eager'));
+  await expect.poll(()=>report.locator('img').evaluateAll(images=>images.every(image=>(image as HTMLImageElement).complete && (image as HTMLImageElement).naturalWidth>0)),{timeout:15000}).toBe(true);
+  const images=await report.locator('img').evaluateAll(images=>images.map(image=>({width:(image as HTMLImageElement).naturalWidth,height:(image as HTMLImageElement).naturalHeight,src:image.getAttribute('src')?.slice(0,25)})));
+  save(`${name}-images.json`,images);
+  for (const image of images) expect(image.width,'报告中的嵌入图片要能解码').toBeGreaterThan(0);
+  for (const width of [1366,390]) {
+    await report.setViewportSize({width,height:1000});
+    await report.evaluate(()=>window.scrollTo(0,0));
+    await report.screenshot({path:join(evidenceDir,`${name}-overview-${width}.png`)});
+    const sections=report.locator('main > section');
+    for (let i=0;i<Math.min(2,await sections.count());i++) {
+      await sections.nth(i).scrollIntoViewIfNeeded();
+      await report.screenshot({path:join(evidenceDir,`${name}-section${i}-${width}.png`)});
+    }
+  }
+  await report.setViewportSize({width:1366,height:1000});
+  await report.locator('details').evaluateAll(nodes=>nodes.forEach(node=>(node as HTMLDetailsElement).open=true));
+  const charts=report.locator('svg.rate-chart');
+  for(let i=0;i<await charts.count();i++) await charts.nth(i).screenshot({path:join(evidenceDir,`${name}-chart${i+1}.png`)});
+  expect(errors).toEqual([]); await context.close();
+}
+
 async function openConsole(page: Page) {
   await page.goto(`/?token=${encodeURIComponent(token)}`);
   await expect(page.getByRole('heading', { name: '连接', exact: true })).toBeVisible({ timeout: 60_000 });
+  await captureUi(page,'connection');
 }
 
 test('子网：本机两口快捷测试走界面完成，结论、历史与下载包一致', async ({ page }) => {
@@ -160,6 +233,9 @@ test('子网：本机两口快捷测试走界面完成，结论、历史与下�
   const bundle = new Map(readZip(bundleBytes).map(entry => [entry.name.split('/').slice(1).join('/'), entry.data]));
   for (const name of ['report.html', 'summary.xlsx', 'rows.jsonl', 'meta.json']) expect([...bundle.keys()]).toContain(name);
   const html = bundle.get('report.html')!.toString('utf8');
+  expect(html).not.toContain('0/0 = 0.0%');
+  await auditReportVisual(page,'subnet-report',html,bundle);
+  await captureUi(page,'subnet-result');
   for (const text of INSTRUCTION_TEXT) expect(html).not.toContain(text);
   await expectNoIperfLeft(page);
   expect(errors).toEqual([]);
@@ -170,6 +246,8 @@ test.describe.serial('内环：真板全流程', () => {
   let page: Page;
   let errors: Error[] = [];
   let fullRun = '';
+  let fullPingVerdict = 'PASS';
+  let freshPassIds = new Set<string>();
 
   test.beforeAll(async ({ browser }) => {
     page = await browser.newPage();
@@ -263,6 +341,7 @@ test.describe.serial('内环：真板全流程', () => {
     await streams.press('Tab');
     await expect(task('UDP').getByRole('textbox', { name: 'UDP 每流速率 Mbps', exact: true })).toHaveValue('2500');
     await expect(task('PING').getByRole('spinbutton', { name: 'Ping 次数', exact: true })).toHaveValue('5');
+    await captureUi(page,'inner-plan');
 
     await preparePanel();
     await page.getByLabel('整计划轮次', { exact: true }).fill('2');
@@ -270,7 +349,9 @@ test.describe.serial('内环：真板全流程', () => {
     for (const name of ['测负载下时延', '探路径 MTU', '按链路上限裁剪 UDP 发送速率']) {
       await page.getByRole('checkbox', { name, exact: true }).check();
     }
+    await captureUi(page,'inner-review');
     const body = await startInner(6);
+    await captureUi(page,'inner-running');
     save('inner-full-request.json', body);
     expect(body.config.links).toHaveLength(1);
     expect(body.config.links[0]).toMatchObject({ local_ip: innerNicIp, gateway: boardIp });
@@ -310,10 +391,10 @@ test.describe.serial('内环：真板全流程', () => {
       expect(asked).toMatchObject({ streams: 4, udp_mbps: 2500 });
     }
     for (const unit of units.filter(u => u.protocol === 'ping')) {
-      expect(unit.verdict, `#${unit.index} ${unit.reason} ${unit.detail}`).toBe('PASS');
+      assertPingEvaluation(unit);
       expect(unit.ping).toHaveLength(2);
       for (const ping of unit.ping) {
-        expect(ping.result).toMatchObject({ sent: 5, received: 5 });
+        expect(ping.result.sent).toBe(5);
         const { rtt_min: min, rtt_avg: avg, rtt_max: max } = ping.result;
         const pinnedToResolution = [min, avg, max].every((v: number) => Number.isInteger(v)) && avg < 1;
         if (pinnedToResolution) expect(unit.diagnostics.join('\n'), '整毫秒且不足 1ms 的读数要带分辨率说明').toContain('时延分辨率');
@@ -325,6 +406,7 @@ test.describe.serial('内环：真板全流程', () => {
     const historyId: string = done.history_id;
     expect(historyId).toMatch(/^inner_/);
     fullRun = historyId;
+    fullPingVerdict = units.find(unit => unit.protocol === 'ping')!.verdict;
     const history = await api<any[]>(page, '/api/inner/runs');
     const entry = history.find(item => item.id === historyId);
     expect(entry).toMatchObject({ units: 6, finished: true, error: null });
@@ -332,6 +414,8 @@ test.describe.serial('内环：真板全流程', () => {
     const report = await api(page, '/api/inner/report');
     save('inner-full-report.html', report.html);
     const html: string = report.html;
+    await auditReportVisual(page,'inner-full-report',html);
+    await captureUi(page,'inner-full-result');
     // 曲线在无效采样处断开成多条 polyline，按图注数图。
     expect(html.split('原始 RX 曲线，仅作诊断').length - 1, '每条吞吐腿一张接收端 RX 曲线').toBe(legs.length);
     for (const text of INSTRUCTION_TEXT) expect(html).not.toContain(text);
@@ -354,7 +438,11 @@ test.describe.serial('内环：真板全流程', () => {
     }
     const pings = sheetRecords(sheets.get('Ping明细')!);
     expect(pings).toHaveLength(4);
-    expect(pings.every(r => r['发送'] === 5 && r['接收'] === 5)).toBe(true);
+    expect(pings.every(r => r['发送'] === 5)).toBe(true);
+    for (const unit of units.filter(u => u.protocol === 'ping')) for (const ping of unit.ping) {
+      const row = pings.find(r => r['单元序号'] === unit.index && r['方向'] === (ping.flow === 'up' ? '上行' : '下行'))!;
+      expect(row['接收']).toBe(ping.result.received);
+    }
 
     const bundleBytes = await download(page, `/api/inner/runs/${encodeURIComponent(historyId)}/bundle.zip`);
     save('inner-full-bundle.zip', bundleBytes);
@@ -382,7 +470,10 @@ test.describe.serial('内环：真板全流程', () => {
     const units: any[] = done.units;
     expect(units.map(u => [u.protocol, u.verdict === 'SKIP'])).toEqual([['tcp', true], ['udp', false], ['ping', false]]);
     expect(units[0].reason).toBe('USER_SKIP');
-    for (const unit of units.slice(1)) expect([...MEASURED_OK], `#${unit.index} ${unit.reason}`).toContain(unit.verdict);
+    for (const unit of units.slice(1)) {
+      if(unit.protocol === 'ping') assertPingEvaluation(unit);
+      else expect([...MEASURED_OK], `#${unit.index} ${unit.reason}`).toContain(unit.verdict);
+    }
     await expectNoIperfLeft(page);
 
     // 同一份计划的两轮按身份对齐：第 1 遍三项都对得上，第 2 遍在这一轮里缺失。
@@ -391,7 +482,9 @@ test.describe.serial('内环：真板全流程', () => {
     expect(compare).toMatchObject({ added: 0, unmatchable: 0, missing: 3 });
     const statusOf = (index: number) => compare.rows.find((row: any) => row.current_index === index)?.status;
     expect(statusOf(1)).toBe('SKIPPED');
-    for (const index of [2, 3]) expect(['SAME', 'SLOWER', 'CHANGED']).toContain(statusOf(index));
+    expect(['SAME', 'SLOWER', 'CHANGED']).toContain(statusOf(2));
+    const pingVerdict = units.find(unit => unit.protocol === 'ping')!.verdict;
+    expect(statusOf(3)).toBe(pingVerdict === fullPingVerdict ? 'SAME' : fullPingVerdict === 'PASS' ? 'REGRESSION' : 'RECOVERED');
   });
 
   test('停止测试：当前单元收尾即停，不再起新流，板侧与本机都不留 iperf3', async () => {
@@ -410,4 +503,102 @@ test.describe.serial('内环：真板全流程', () => {
     expect([...MEASURED_OK], `${units[0]?.reason}`).toContain(units[0]?.verdict);
     await expectNoIperfLeft(page);
   });
+
+  async function archiveRound(label: string, done: any) {
+    save(`${label}-status.json`,done);
+    const report=await api(page,'/api/inner/report');
+    await auditReportVisual(page,label,report.html);
+    const bytes=await download(page,`/api/inner/runs/${done.history_id}/bundle.zip`);
+    save(`${label}-bundle.zip`,bytes);
+    await captureUi(page,label);
+    await expectNoIperfLeft(page);
+  }
+  async function editLink() {
+    await innerTab('计划').click();
+    const workspace=page.getByRole('region',{name:'内环计划工作台'});
+    await workspace.getByRole('tab',{name:'网口',exact:true}).click();
+    await page.getByRole('button',{name:/^(编辑|检查 \/ 修改)$/,exact:true}).first().click();
+    await page.getByText('高级：统计接口、测量策略与验收门限',{exact:true}).click();
+  }
+  async function setBothThresholds(value:string) {
+    await preparePanel(); await editLink();
+    await page.getByRole('combobox',{name:'测量策略',exact:true}).selectOption('nic_strict');
+    for(const direction of ['上行','下行']) await page.getByRole('spinbutton',{name:`${direction} · 网卡口径 Mbps`,exact:true}).fill(value);
+    await page.getByRole('button',{name:'完成，返回网口清单',exact:true}).click();
+    const workspace=page.getByRole('region',{name:'内环计划工作台'});
+    await workspace.getByRole('tab',{name:'测试内容',exact:true}).click();
+    const udp=workspace.locator('section.panel').filter({has:page.locator('strong',{hasText:/^\d+ · UDP$/})});
+    await udp.getByRole('checkbox',{name:'双向并发',exact:true}).check();
+    await udp.getByRole('checkbox',{name:'下行',exact:true}).uncheck();
+    await preparePanel();
+    await page.getByRole('checkbox',{name:'跳过 24 小时内已通过的单元（RESUME）',exact:true}).uncheck();
+  }
+  test('真实网卡门限：TCP 与 UDP 双向均按 RX 达标判 PASS',async()=>{
+    await setBothThresholds('100');
+    await startInner(3);const done=await finished(3);
+    await archiveRound('threshold-pass',done);
+    expect(done.error).toBeNull();
+    freshPassIds = new Set(done.units.filter((unit: any) => unit.verdict === 'PASS').map((unit: any) => unit.id));
+    for(const unit of done.units) {
+      if (unit.protocol === 'ping') { assertPingEvaluation(unit); continue; }
+      expect(unit.verdict,`${unit.protocol}: ${unit.detail}`).toBe('PASS');
+      for(const leg of unit.legs??[]) {
+        expect(leg.source).toBe('nic');expect(leg.nic_verdict).toBe('PASS');
+        expect(leg.nic_rx_mbps).toBeGreaterThanOrEqual(100);
+      }
+    }
+  });
+  test('RESUME：同一计划的新鲜 PASS 只复用不重新采样',async()=>{
+    await preparePanel();
+    await page.getByRole('checkbox',{name:'跳过 24 小时内已通过的单元（RESUME）',exact:true}).check();
+    await startInner(3);const done=await finished(3);
+    await archiveRound('resume',done);
+    expect(done.error).toBeNull();expect(done.units).toHaveLength(3);
+    for (const unit of done.units) {
+      expect(unit.resumed).toBe(freshPassIds.has(unit.id));
+      if (unit.resumed) expect(unit.legs).toHaveLength(0);
+      else { expect(unit.protocol).toBe('ping'); assertPingEvaluation(unit); }
+    }
+  });
+  test('真实网卡门限：TCP 与 UDP 双向 RX 未达标判 RATE_FAIL',async()=>{
+    await setBothThresholds('2000');
+    await startInner(3);const done=await finished(3);
+    await archiveRound('threshold-fail',done);
+    expect(done.error).toBeNull();
+    for(const unit of done.units.filter((u:any)=>u.protocol!=='ping')) {
+      expect(unit.verdict,`${unit.protocol}: ${unit.detail}`).toBe('RATE_FAIL');
+      for(const leg of unit.legs) {
+        expect(leg.source).toBe('nic');expect(leg.nic_verdict).toBe('RATE_FAIL');
+        expect(leg.nic_rx_mbps).toBeLessThan(2000);expect(leg.nic_reason).toBe('RX_BELOW_TARGET');
+      }
+    }
+  });
+  test('错误统计口：严格网卡策略必须无法评价，不能误判低速失败',async()=>{
+    await preparePanel();await editLink();
+    await page.getByRole('textbox',{name:'板侧桥接口',exact:true}).fill('eth1');
+    await page.getByRole('button',{name:'完成，返回网口清单',exact:true}).click();
+    const workspace=page.getByRole('region',{name:'内环计划工作台'});
+    await workspace.getByRole('tab',{name:'测试内容',exact:true}).click();
+    for(const protocol of ['UDP','PING']) {
+      const panel=workspace.locator('section.panel').filter({has:page.locator('strong',{hasText:new RegExp(`^\\d+ · ${protocol}$`)})});
+      await panel.getByRole('button',{name:'删除任务',exact:true}).click();
+    }
+    const tcp=workspace.locator('section.panel').filter({has:page.locator('strong',{hasText:/^\d+ · TCP$/})});
+    await tcp.getByRole('checkbox',{name:'上行',exact:true}).check();await tcp.getByRole('checkbox',{name:'双向并发',exact:true}).uncheck();
+    await preparePanel();await startInner(1);const done=await finished(1);
+    await archiveRound('offpath-strict',done);
+    expect(done.error).toBeNull();expect(done.units[0].verdict).toBe('NOT_EVALUATED');
+    expect(['COUNTER_OFF_PATH','COUNTER_STALLED']).toContain(done.units[0].legs[0].nic_reason);
+  });
+  test('错误统计口：网卡优先时回退工具且工具门限独立',async()=>{
+    await preparePanel();await editLink();
+    await page.getByRole('combobox',{name:'测量策略',exact:true}).selectOption('nic_preferred');
+    await page.getByRole('button',{name:'完成，返回网口清单',exact:true}).click();
+    await preparePanel();await startInner(1);const done=await finished(1);
+    await archiveRound('offpath-fallback',done);
+    expect(done.error).toBeNull();expect(done.units[0].verdict).toBe('MEASURED');
+    const leg=done.units[0].legs[0];expect(leg.source).toBe('tool');expect(['COUNTER_OFF_PATH','COUNTER_STALLED']).toContain(leg.nic_reason);
+    expect(leg.target_mbps).toBeNull();expect(leg.nic_target_mbps).toBe(2000);
+  });
+
 });
